@@ -164,6 +164,29 @@ describe('Images dashboard', () => {
     ]);
   });
 
+  it('returns directly to the first catalog page', async () => {
+    getImageCapabilities.mockResolvedValue(capabilities());
+    getImageCatalog
+      .mockResolvedValueOnce({ items: [], next_cursor: 'next-1' })
+      .mockResolvedValueOnce({ items: [], next_cursor: 'next-2' })
+      .mockResolvedValueOnce(emptyPage);
+
+    render(<Images />);
+    const next = await screen.findByRole('button', { name: 'Next' });
+    await waitFor(() => expect(next).toBeEnabled());
+    fireEvent.click(next);
+    expect(await screen.findByText('Page 2')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'First catalog page' }));
+
+    expect(await screen.findByText('Page 1')).toBeVisible();
+    await waitFor(() => expect(getImageCatalog).toHaveBeenCalledTimes(3));
+    expect(getImageCatalog.mock.calls.map(([query]) => query.cursor)).toEqual([
+      null,
+      'next-1',
+      null,
+    ]);
+  });
+
   it('pages the failed publication recovery feed independently', async () => {
     getImageCapabilities.mockResolvedValue(capabilities({ publish: true }));
     getImagePublications
@@ -188,6 +211,17 @@ describe('Images dashboard', () => {
           },
         ],
         next_cursor: null,
+      })
+      .mockResolvedValueOnce({
+        items: [
+          {
+            id: 'publication-1',
+            requested_release: 'failed-release-1',
+            source_ref: 'registry/source-1',
+            error_code: 'SOURCE_FAILED',
+          },
+        ],
+        next_cursor: 'failed-next',
       });
 
     render(<Images />);
@@ -204,6 +238,14 @@ describe('Images dashboard', () => {
       getImagePublications.mock.calls.map(([query]) => query.cursor)
     ).toEqual([null, 'failed-next']);
     expect(getImageCatalog).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'First failed publications page' })
+    );
+    expect(await screen.findByText('failed-release-1')).toBeVisible();
+    expect(
+      getImagePublications.mock.calls.map(([query]) => query.cursor)
+    ).toEqual([null, 'failed-next', null]);
   });
 
   it('recovers a stale failed-publication cursor without resetting catalog paging', async () => {

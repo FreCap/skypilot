@@ -78,6 +78,7 @@ def registry_config() -> dict[str, Any]:
                         (f'arn:aws:iam::{COMPUTE_ACCOUNT}:role/EksNodeRole'),
                     'namespace': 'skypilot-image-canaries',
                     'node_selector': {
+                        'kubernetes.io/arch': 'amd64',
                         'skypilot.co/image-pull-role': 'eks-node',
                     },
                 }],

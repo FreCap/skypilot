@@ -32,6 +32,12 @@ import {
   getImagePublications,
   getImageReadiness,
 } from '@/data/connectors/images';
+import {
+  advanceImageCursorHistory,
+  currentImageCursorEntry,
+  firstImageCursorHistory,
+  retreatImageCursorHistory,
+} from '@/data/image-cursor-history';
 import { getWorkspaces } from '@/data/connectors/workspaces';
 
 const EMPTY_FILTERS = {
@@ -107,13 +113,13 @@ export function Images() {
   const [oldServer, setOldServer] = useState(false);
   const [filters, setFilters] = useState(EMPTY_FILTERS);
   const [draftFilters, setDraftFilters] = useState(EMPTY_FILTERS);
-  const [cursorStack, setCursorStack] = useState([null]);
+  const [cursorStack, setCursorStack] = useState(firstImageCursorHistory);
   const [catalog, setCatalog] = useState(null);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState(null);
   const [cursorNotice, setCursorNotice] = useState(null);
   const [failedPublicationCursorStack, setFailedPublicationCursorStack] =
-    useState([null]);
+    useState(firstImageCursorHistory);
   const [failedPublicationPage, setFailedPublicationPage] = useState(null);
   const [failedPublicationLoading, setFailedPublicationLoading] =
     useState(false);
@@ -131,9 +137,12 @@ export function Images() {
   const catalogController = useRef(null);
   const failedPublicationController = useRef(null);
   const readinessController = useRef(null);
-  const cursor = cursorStack[cursorStack.length - 1];
-  const failedPublicationCursor =
-    failedPublicationCursorStack[failedPublicationCursorStack.length - 1];
+  const cursorEntry = currentImageCursorEntry(cursorStack);
+  const cursor = cursorEntry.cursor;
+  const failedPublicationCursorEntry = currentImageCursorEntry(
+    failedPublicationCursorStack
+  );
+  const failedPublicationCursor = failedPublicationCursorEntry.cursor;
 
   useEffect(() => {
     getWorkspaces()
@@ -150,8 +159,8 @@ export function Images() {
       router.replace({ pathname: '/images', query }, undefined, {
         shallow: true,
       });
-      setCursorStack([null]);
-      setFailedPublicationCursorStack([null]);
+      setCursorStack(firstImageCursorHistory());
+      setFailedPublicationCursorStack(firstImageCursorHistory());
       setCatalog(null);
       setFailedPublicationPage(null);
       setCursorNotice(null);
@@ -215,7 +224,7 @@ export function Images() {
       )
         return;
       if (error.code === 'STALE_IMAGE_CURSOR' && cursor) {
-        setCursorStack([null]);
+        setCursorStack(firstImageCursorHistory());
         setCursorNotice(
           'The catalog changed while paging. Reloaded the first page.'
         );
@@ -271,7 +280,7 @@ export function Images() {
       )
         return;
       if (error.code === 'STALE_IMAGE_CURSOR' && failedPublicationCursor) {
-        setFailedPublicationCursorStack([null]);
+        setFailedPublicationCursorStack(firstImageCursorHistory());
         setFailedPublicationNotice(
           'The failed publication feed changed while paging. Reloaded the first page.'
         );
@@ -351,7 +360,7 @@ export function Images() {
     capabilities?.publish &&
       (failedPublications.length ||
         failedPublicationPage?.next_cursor ||
-        failedPublicationCursorStack.length > 1 ||
+        failedPublicationCursorEntry.page > 1 ||
         failedPublicationLoading ||
         failedPublicationError ||
         failedPublicationNotice)
@@ -589,7 +598,7 @@ export function Images() {
                   onClick={() => {
                     setDraftFilters(EMPTY_FILTERS);
                     setFilters(EMPTY_FILTERS);
-                    setCursorStack([null]);
+                    setCursorStack(firstImageCursorHistory());
                     setCursorNotice(null);
                   }}
                 >
@@ -599,7 +608,7 @@ export function Images() {
                   size="sm"
                   onClick={() => {
                     setFilters(draftFilters);
-                    setCursorStack([null]);
+                    setCursorStack(firstImageCursorHistory());
                     setCursorNotice(null);
                   }}
                 >
@@ -677,9 +686,26 @@ export function Images() {
                 </div>
                 <div className="mt-3 flex items-center justify-between border-t border-red-200 pt-3">
                   <span className="text-sm text-red-700">
-                    Page {failedPublicationCursorStack.length}
+                    Page {failedPublicationCursorEntry.page}
                   </span>
                   <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-label="First failed publications page"
+                      disabled={
+                        failedPublicationCursorEntry.page === 1 ||
+                        failedPublicationLoading
+                      }
+                      onClick={() => {
+                        setFailedPublicationNotice(null);
+                        setFailedPublicationCursorStack(
+                          firstImageCursorHistory()
+                        );
+                      }}
+                    >
+                      First
+                    </Button>
                     <Button
                       variant="outline"
                       size="sm"
@@ -691,7 +717,7 @@ export function Images() {
                       onClick={() => {
                         setFailedPublicationNotice(null);
                         setFailedPublicationCursorStack((stack) =>
-                          stack.slice(0, -1)
+                          retreatImageCursorHistory(stack)
                         );
                       }}
                     >
@@ -707,10 +733,12 @@ export function Images() {
                       }
                       onClick={() => {
                         setFailedPublicationNotice(null);
-                        setFailedPublicationCursorStack((stack) => [
-                          ...stack,
-                          failedPublicationPage.next_cursor,
-                        ]);
+                        setFailedPublicationCursorStack((stack) =>
+                          advanceImageCursorHistory(
+                            stack,
+                            failedPublicationPage.next_cursor
+                          )
+                        );
                       }}
                     >
                       Next
@@ -850,16 +878,30 @@ export function Images() {
               </Table>
               <div className="flex items-center justify-between border-t border-gray-200 px-5 py-3">
                 <span className="text-sm text-gray-500">
-                  Page {cursorStack.length}
+                  Page {cursorEntry.page}
                 </span>
                 <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-label="First catalog page"
+                    disabled={cursorEntry.page === 1 || catalogLoading}
+                    onClick={() => {
+                      setCursorNotice(null);
+                      setCursorStack(firstImageCursorHistory());
+                    }}
+                  >
+                    First
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"
                     disabled={cursorStack.length === 1 || catalogLoading}
                     onClick={() => {
                       setCursorNotice(null);
-                      setCursorStack((stack) => stack.slice(0, -1));
+                      setCursorStack((stack) =>
+                        retreatImageCursorHistory(stack)
+                      );
                     }}
                   >
                     Previous
@@ -870,10 +912,9 @@ export function Images() {
                     disabled={!catalog?.next_cursor || catalogLoading}
                     onClick={() => {
                       setCursorNotice(null);
-                      setCursorStack((stack) => [
-                        ...stack,
-                        catalog.next_cursor,
-                      ]);
+                      setCursorStack((stack) =>
+                        advanceImageCursorHistory(stack, catalog.next_cursor)
+                      );
                     }}
                   >
                     Next

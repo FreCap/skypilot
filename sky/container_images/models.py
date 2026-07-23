@@ -48,6 +48,8 @@ _OCI_RUNTIME_ARCHITECTURES = {
     'aarch64': 'arm64',
 }
 _KNOWN_LINUX_RUNTIME_PLATFORMS = frozenset({'linux/amd64', 'linux/arm64'})
+V0_MANAGED_RUNTIME_PLATFORM = 'linux/amd64'
+KUBERNETES_ARCH_LABEL = 'kubernetes.io/arch'
 _AWS_REGISTRY_REGION_PATTERN = re.compile(
     r'^[a-z]{2}(?:-[a-z0-9]+){1,3}-[0-9]+$')
 _GCP_STYLE_REGISTRY_REGION_PATTERN = re.compile(
@@ -333,6 +335,9 @@ class QualifiedKubernetesCluster:
                     not _KUBERNETES_LABEL_NAME_PATTERN.fullmatch(value)):
                 raise ValueError('Qualified EKS node selector is invalid.')
             normalized.append((key, value))
+        if dict(normalized).get(KUBERNETES_ARCH_LABEL) != 'amd64':
+            raise ValueError('Qualified EKS node selector must require '
+                             'kubernetes.io/arch=amd64.')
         object.__setattr__(self, 'node_selector', tuple(sorted(normalized)))
 
 
@@ -550,7 +555,7 @@ class RegistryQualificationPolicy:
         object.__setattr__(self, 'canary_ref', reference)
         platform = validate_oci_platform(self.canary_platform,
                                          'Qualification canary platform')
-        if platform != 'linux/amd64':
+        if platform != V0_MANAGED_RUNTIME_PLATFORM:
             raise ValueError('Managed image canaries support linux/amd64 only.')
         object.__setattr__(self, 'canary_platform', platform)
 
@@ -874,6 +879,7 @@ def runtime_attestation_matches(
     observed_at = evidence.get('observed_at')
     if (not isinstance(observed_at, int) or isinstance(observed_at, bool) or
             evidence.get('status') != 'READY' or
+            evidence.get('platform') != V0_MANAGED_RUNTIME_PLATFORM or
             evidence.get('target_fingerprint') != target.target_fingerprint or
             evidence.get('binding_fingerprint') != binding.fingerprint or
             evidence.get('backend') != backend or

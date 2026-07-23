@@ -91,22 +91,39 @@ describe('Image artifact detail', () => {
       },
       truncated: true,
     });
-    getImageArtifactCollection.mockResolvedValue({
-      items: [
-        {
-          id: 'location-101',
-          distribution: 'gpu-production',
-          target_id: 'east',
-          target_ref: `registry/east@sha256:${'b'.repeat(64)}`,
-          state: 'READY',
-          canonical: false,
-          error_code: null,
-          last_verified_at: 101,
-          attempt_count: 1,
-        },
-      ],
-      next_cursor: null,
-    });
+    getImageArtifactCollection
+      .mockResolvedValueOnce({
+        items: [
+          {
+            id: 'location-101',
+            distribution: 'gpu-production',
+            target_id: 'east',
+            target_ref: `registry/east@sha256:${'b'.repeat(64)}`,
+            state: 'READY',
+            canonical: false,
+            error_code: null,
+            last_verified_at: 101,
+            attempt_count: 1,
+          },
+        ],
+        next_cursor: null,
+      })
+      .mockResolvedValueOnce({
+        items: [
+          {
+            id: 'location-1',
+            distribution: 'gpu-production',
+            target_id: 'west',
+            target_ref: `registry/west@sha256:${'a'.repeat(64)}`,
+            state: 'READY',
+            canonical: false,
+            error_code: null,
+            last_verified_at: 100,
+            attempt_count: 1,
+          },
+        ],
+        next_cursor: 'locations-next',
+      });
 
     render(<ImageDetail />);
 
@@ -130,6 +147,16 @@ describe('Image artifact detail', () => {
       screen.getByRole('button', { name: 'Previous locations page' })
     ).toBeEnabled();
     expect(screen.queryByRole('button', { name: 'Prepare target' })).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'First locations page' })
+    );
+    expect(await screen.findByText('west')).toBeVisible();
+    expect(
+      getImageArtifactCollection.mock.calls.map(
+        ([, , options]) => options.cursor
+      )
+    ).toEqual(['locations-next', null]);
   });
 
   it('recovers only the stale detail collection at its first page', async () => {

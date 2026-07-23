@@ -234,6 +234,20 @@ def _direct_fallback_allowed(policy: models.WorkspaceImagePolicy,
             policy.locality == models.Locality.PREFER and image.ref is not None)
 
 
+def _managed_runtime_platform(placement: models.Placement) -> str:
+    """Returns the only v0 qualified platform or fails closed."""
+    expected = models.V0_MANAGED_RUNTIME_PLATFORM
+    if placement.backend == 'aws_vm':
+        if placement.platform != expected:
+            raise ValueError('IMAGE_RUNTIME_PLATFORM_UNSUPPORTED')
+    elif placement.backend == 'aws_eks':
+        if placement.platform not in (None, expected):
+            raise ValueError('IMAGE_RUNTIME_PLATFORM_UNSUPPORTED')
+    else:
+        raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+    return expected
+
+
 def _unsupported_direct_locality_rank(image: models.ContainerImage,
                                       workspace: str) -> int:
     """Keeps direct-mode multicloud candidates in the same locality class."""
@@ -410,7 +424,17 @@ def _resolve_metadata(
             active.config_snapshot)
         if profile.name != configured_profile.name:
             raise ValueError('PROFILE_NOT_ACTIVE')
-    platform = placement.platform or 'linux/amd64'
+    try:
+        platform = _managed_runtime_platform(placement)
+    except ValueError:
+        if (_direct_fallback_allowed(policy, image) and current_demand is None):
+            return _MetadataResolution(resources=resources,
+                                       direct=True,
+                                       profile=profile,
+                                       policy=policy,
+                                       active=active,
+                                       locality_rank=1)
+        raise
     identity_key = ('identity', workspace, image.ref, image.release,
                     image.artifact_id, platform)
     if identity_key not in cache:

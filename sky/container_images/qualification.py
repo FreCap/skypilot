@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-import time
 from typing import Any
 import uuid
 
@@ -23,6 +22,12 @@ from sky.container_images import transactions
 _AUTOMATIC_ACTOR_HASH = hashlib.sha256(
     b'skypilot-managed-image-qualification-scheduler').hexdigest()
 _AUTOMATIC_WINDOW_SECONDS = 10 * 60
+
+
+def _database_epoch(*, now: int | None = None) -> int:
+    """Samples the central clock for non-mutating qualification decisions."""
+    with orm.Session(catalog_state.engine()) as session:
+        return catalog_state.database_epoch(session, now=now)
 
 
 def _runtime_attestation_key(target: models.ManagedRegistryTarget, backend: str,
@@ -595,7 +600,7 @@ def schedule_automatic_canaries(*,
                                 limit: int = 100,
                                 now: int | None = None) -> int:
     """Creates bounded idempotent runtime canaries only after copy readiness."""
-    current = int(time.time()) if now is None else now
+    current = _database_epoch(now=now)
     scheduled = 0
     for revision in topology_state.list_qualifying_profiles(include_active=True,
                                                             limit=limit):
@@ -649,7 +654,6 @@ def maybe_activate_profile(
         *,
         now: int | None = None) -> topology_state.ProfileRevisionRecord | None:
     """Activates exactly the still-desired revision after all proofs converge."""
-    preflight_current = int(time.time()) if now is None else now
     revision = topology_state.get_profile_revision(profile_revision_id)
     if revision is None:
         return None
@@ -661,6 +665,7 @@ def maybe_activate_profile(
         return None
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
+    preflight_current = _database_epoch(now=now)
     try:
         requirements = _attestation_requirements(profile, revision.attestations)
     except ValueError:

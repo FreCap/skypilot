@@ -301,6 +301,7 @@ def _activate_profile(
                     'target_fingerprint': target.target_fingerprint,
                     'binding_fingerprint': binding.fingerprint,
                     'backend': backend,
+                    'platform': profile.qualification.canary_platform,
                     'runtime_id': runtime_id,
                 }
                 if backend == 'aws_vm':
@@ -347,6 +348,36 @@ def _activate_profile(
                shard.eviction_enabled == expected_eviction[shard.target_id]
                for shard in shards)
     return active
+
+
+def test_profile_attestation_overwrites_fast_and_slow_producer_clocks(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    with image_database.connect() as connection:
+        database_now = int(
+            connection.execute(
+                sqlalchemy.select(
+                    catalog_state.database_epoch_expression())).scalar_one())
+
+    for label, supplied in (('slow', database_now - 86_400),
+                            ('fast', database_now + 86_400)):
+        evidence = {'status': 'READY', 'observed_at': supplied}
+        recorded = topology_state.record_profile_attestation(
+            profile_revision_id=active.id,
+            kind=f'clock-authority:{label}',
+            evidence=evidence,
+            expected_generation=active.desired_generation,
+            expected_config_hash=active.config_hash)
+        with image_database.connect() as connection:
+            after = int(
+                connection.execute(
+                    sqlalchemy.select(catalog_state.database_epoch_expression())
+                ).scalar_one())
+        observed = recorded.attestations[f'clock-authority:{label}'][
+            'observed_at']
+        assert database_now <= observed <= after
+        assert evidence['observed_at'] == supplied
+        database_now = after
 
 
 def _configure_profile(monkeypatch: pytest.MonkeyPatch,
@@ -1986,7 +2017,9 @@ def test_inventory_confirmation_pages_are_successor_resumable(
         kind=key,
         evidence=evidence,
         now=106)
-    assert recorded is not None and recorded.attestations[key] == evidence
+    assert recorded is not None
+    assert recorded.attestations[key] == {**evidence, 'observed_at': 106}
+    assert evidence['observed_at'] == 103
     finalized = topology_state.get_shard(successor.id)
     assert finalized is not None and not finalized.inventory_finalizing
     assert finalized.inventory_lease_token is None
@@ -5968,6 +6001,49 @@ def _short_lived_qualifying_profile(
             schema.registry_shards.c.profile == short_lived.name).values(
                 profile_revision_id=None))
     return short_lived, revision, scheduler_now
+
+
+@pytest.mark.parametrize(('proof_offset', 'host_offset', 'expected'),
+                         ((-1000, -1000, 0), (0, 86_400, 2)))
+def test_automatic_canary_scheduler_uses_database_clock_under_host_skew(
+        image_database, profile: models.ManagedRegistryProfile,
+        monkeypatch: pytest.MonkeyPatch, proof_offset: int, host_offset: int,
+        expected: int) -> None:
+    active = _activate_profile(image_database, profile)
+    with image_database.connect() as connection:
+        database_now = int(
+            connection.execute(
+                sqlalchemy.select(
+                    catalog_state.database_epoch_expression())).scalar_one())
+    target = profile.targets[0]
+    attestations = dict(active.attestations)
+    attestations[models.profile_attestation_key('copy', target.name)] = {
+        'status': 'READY',
+        'observed_at': database_now + proof_offset,
+    }
+    revision = dataclasses.replace(active, attestations=attestations)
+    monkeypatch.setattr(topology_state, 'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    requested: list[dict[str, Any]] = []
+    monkeypatch.setattr(qualification, 'request_canary',
+                        lambda **kwargs: requested.append(kwargs))
+    monkeypatch.setattr(time, 'time', lambda: database_now + host_offset)
+
+    assert qualification.schedule_automatic_canaries() == expected
+    assert len(requested) == expected
+
+
+def test_profile_activation_preflight_ignores_fast_host_clock(
+        image_database, profile: models.ManagedRegistryProfile,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _, revision, scheduler_now = _short_lived_qualifying_profile(
+        image_database, profile)
+    monkeypatch.setattr(time, 'time', lambda: scheduler_now + 86_400)
+
+    activated = qualification.maybe_activate_profile(revision.id)
+
+    assert activated is not None
+    assert activated.state == models.ImageProfileState.ACTIVE
 
 
 def test_profile_activation_rechecks_freshness_after_advisory_lock(

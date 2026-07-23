@@ -1255,7 +1255,8 @@ def test_managed_kubernetes_image_enforces_qualified_node_selector():
         '            spec:\n'
         '              initContainers:\n'
         '              - {name: init-copy-home, image: old:latest}\n')
-    selector = (('skypilot.co/image-pull-role', 'eks-node'),)
+    selector = (('kubernetes.io/arch', 'amd64'), ('skypilot.co/image-pull-role',
+                                                  'eks-node'))
 
     backend_utils._enforce_managed_kubernetes_image(config, managed_ref,
                                                     selector)
@@ -1264,10 +1265,12 @@ def test_managed_kubernetes_image_enforces_qualified_node_selector():
         'node_config']
     assert node_config['spec']['nodeSelector'] == {
         'existing': 'value',
+        'kubernetes.io/arch': 'amd64',
         'skypilot.co/image-pull-role': 'eks-node',
     }
     assert node_config['deployment_spec']['spec']['template']['spec'][
         'nodeSelector'] == {
+            'kubernetes.io/arch': 'amd64',
             'skypilot.co/image-pull-role': 'eks-node',
         }
 
@@ -1288,7 +1291,8 @@ def test_managed_kubernetes_image_rejects_conflicting_qualified_selector():
     with pytest.raises(exceptions.InvalidCloudConfigs,
                        match='qualification conflicts'):
         backend_utils._enforce_managed_kubernetes_image(
-            config, managed_ref, (('skypilot.co/image-pull-role', 'eks-node'),))
+            config, managed_ref, (('kubernetes.io/arch', 'amd64'),
+                                  ('skypilot.co/image-pull-role', 'eks-node')))
 
 
 def test_make_safe_symlink_command_default_uses_sudo():

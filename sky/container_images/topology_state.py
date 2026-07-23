@@ -634,7 +634,8 @@ def record_profile_attestation_in_session(
     """Transaction-scoped variant for operation and attestation atomicity."""
     if not isinstance(kind, str) or not kind or len(kind) > 128:
         raise ValueError('Attestation kind must be a bounded identifier.')
-    encoded_evidence = json.dumps(evidence,
+    authoritative_evidence = dict(evidence)
+    encoded_evidence = json.dumps(authoritative_evidence,
                                   sort_keys=True,
                                   separators=(',', ':'))
     if len(encoded_evidence.encode()) > 16 * 1024:
@@ -650,8 +651,14 @@ def record_profile_attestation_in_session(
             str(row['config_hash']) != expected_config_hash):
         raise StaleProfileRevisionError(
             'Attestation no longer matches the desired profile revision.')
+    authoritative_evidence['observed_at'] = current
+    encoded_evidence = json.dumps(authoritative_evidence,
+                                  sort_keys=True,
+                                  separators=(',', ':'))
+    if len(encoded_evidence.encode()) > 16 * 1024:
+        raise ValueError('Profile attestation exceeds 16 KiB.')
     attestations = json.loads(str(row['attestations_json']))
-    attestations[kind] = evidence
+    attestations[kind] = authoritative_evidence
     encoded = json.dumps(attestations, sort_keys=True, separators=(',', ':'))
     if len(encoded.encode()) > 256 * 1024:
         raise ValueError('Profile attestation set exceeds 256 KiB.')

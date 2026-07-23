@@ -137,6 +137,21 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
         config.parse_access_bindings(invalid['access_bindings'])
 
 
+@pytest.mark.parametrize('architecture', [None, 'arm64'])
+def test_eks_qualification_requires_exact_amd64_selector(
+        registry_config: dict[str, Any], architecture: str | None) -> None:
+    invalid = copy.deepcopy(registry_config)
+    selector = invalid['access_bindings']['aws-eks-pullers'][
+        'qualified_clusters'][0]['node_selector']
+    if architecture is None:
+        selector.pop(models.KUBERNETES_ARCH_LABEL)
+    else:
+        selector[models.KUBERNETES_ARCH_LABEL] = architecture
+
+    with pytest.raises(ValueError, match='kubernetes.io/arch=amd64'):
+        config.parse_access_bindings(invalid['access_bindings'])
+
+
 @pytest.mark.parametrize('mutation', ['empty', 'missing-region'])
 def test_ec2_canary_binding_requires_explicit_security_groups_in_every_region(
         registry_config: dict[str, Any], mutation: str) -> None:

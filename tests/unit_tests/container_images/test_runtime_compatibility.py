@@ -140,6 +140,7 @@ def _active_revision(
             'target_fingerprint': target.target_fingerprint,
             'binding_fingerprint': binding.fingerprint,
             'backend': 'aws_vm',
+            'platform': profile.qualification.canary_platform,
             'runtime_id': 'us-west-2',
             'host_image_id': dict(binding.qualified_node_images)['us-west-2'],
             'instance_profile_arn': models.ec2_instance_profile_arn(binding),
@@ -456,6 +457,84 @@ def test_metadata_filter_defers_attestation_age_to_demand_transaction(
                          platform='linux/amd64'), 'research')
     assert result is not None
     reserve.assert_not_called()
+
+
+@pytest.mark.parametrize('platform', [None, 'linux/arm64'])
+def test_managed_ec2_rejects_unknown_and_arm64_before_catalog_lookup(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        platform: str | None) -> None:
+    active = _active_revision(profile, observed_at=999)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    published = mock.Mock(side_effect=AssertionError('catalog was consulted'))
+    monkeypatch.setattr(runtime, '_published_identity', published)
+
+    with pytest.raises(ValueError, match='IMAGE_RUNTIME_PLATFORM_UNSUPPORTED'):
+        runtime._resolve_metadata(
+            _FakeResources(
+                models.ContainerImage(release='boltz-l4',
+                                      distribution=profile.name)),
+            models.Placement(provider='aws',
+                             region='us-west-2',
+                             backend='aws_vm',
+                             platform=platform), 'research')
+
+    published.assert_not_called()
+
+
+def test_managed_preferred_arm64_preserves_exact_ref_direct_fallback(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _active_revision(profile, observed_at=999)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_PREFERRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+    _wire_metadata(monkeypatch, profile, policy, active)
+    published = mock.Mock(side_effect=AssertionError('catalog was consulted'))
+    monkeypatch.setattr(runtime, '_published_identity', published)
+    resources = _FakeResources(
+        models.ContainerImage(ref=SOURCE, distribution=profile.name))
+
+    resolution = runtime._resolve_metadata(
+        resources,
+        models.Placement(provider='aws',
+                         region='us-west-2',
+                         backend='aws_vm',
+                         platform='linux/arm64'), 'research')
+
+    assert resolution.direct
+    assert resolution.resources is resources
+    published.assert_not_called()
+
+
+def test_unknown_eks_platform_uses_exact_qualified_amd64_selector(
+        profile: models.ManagedRegistryProfile) -> None:
+    placement = models.Placement(provider='aws',
+                                 region='boltz-west',
+                                 backend='aws_eks',
+                                 platform=None)
+    policy = models.WorkspaceImagePolicy(
+        mode=models.WorkspaceImageMode.MANAGED_REQUIRED,
+        default_profile=profile.name,
+        allowed_profiles=(profile.name,),
+        locality=models.Locality.PREFER)
+
+    assert runtime._managed_runtime_platform(  # pylint: disable=protected-access
+        placement) == models.V0_MANAGED_RUNTIME_PLATFORM
+    target = runtime._target_for_placement(profile, policy, placement)
+    binding_result = runtime._runtime_binding(profile, target, placement)
+    node_selector = dict(binding_result[-1])
+    assert node_selector[models.KUBERNETES_ARCH_LABEL] == 'amd64'
+
+    with pytest.raises(ValueError, match='IMAGE_RUNTIME_PLATFORM_UNSUPPORTED'):
+        runtime._managed_runtime_platform(  # pylint: disable=protected-access
+            dataclasses.replace(placement, platform='linux/arm64'))
 
 
 def test_shared_multi_region_eks_binding_resolves_target_by_cluster_arn_region(

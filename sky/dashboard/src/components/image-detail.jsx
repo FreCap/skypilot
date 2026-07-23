@@ -30,6 +30,12 @@ import {
   getImageArtifactDetail,
   getImageCapabilities,
 } from '@/data/connectors/images';
+import {
+  advanceImageCursorHistory,
+  currentImageCursorEntry,
+  firstImageCursorHistory,
+  retreatImageCursorHistory,
+} from '@/data/image-cursor-history';
 
 const ARTIFACT_COLLECTIONS = [
   'releases',
@@ -41,7 +47,10 @@ const ARTIFACT_COLLECTIONS = [
 
 function initialCollectionCursorStacks() {
   return Object.fromEntries(
-    ARTIFACT_COLLECTIONS.map((collection) => [collection, [null]])
+    ARTIFACT_COLLECTIONS.map((collection) => [
+      collection,
+      firstImageCursorHistory(),
+    ])
   );
 }
 
@@ -101,6 +110,8 @@ function CollectionPager({
   loading,
   error,
   notice,
+  canPrevious,
+  onFirst,
   onPrevious,
   onNext,
 }) {
@@ -127,8 +138,17 @@ function CollectionPager({
           <Button
             variant="outline"
             size="sm"
-            aria-label={`Previous ${label} page`}
+            aria-label={`First ${label} page`}
             disabled={page === 1 || loading}
+            onClick={onFirst}
+          >
+            First
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label={`Previous ${label} page`}
+            disabled={!canPrevious || loading}
             onClick={onPrevious}
           >
             Previous
@@ -245,16 +265,20 @@ export function ImageDetail() {
   const pageArtifactCollection = useCallback(
     async (collection, direction) => {
       if (!imageId || !workspace || !detail) return;
-      const currentStack = collectionCursorStacks[collection] || [null];
+      const currentStack =
+        collectionCursorStacks[collection] || firstImageCursorHistory();
       let nextStack;
       if (direction === 'next') {
         const nextCursor = detail.next_cursors?.[collection];
         if (!nextCursor) return;
-        nextStack = [...currentStack, nextCursor];
+        nextStack = advanceImageCursorHistory(currentStack, nextCursor);
+      } else if (direction === 'first') {
+        nextStack = firstImageCursorHistory();
       } else {
         if (currentStack.length === 1) return;
-        nextStack = currentStack.slice(0, -1);
+        nextStack = retreatImageCursorHistory(currentStack);
       }
+      const requestedCursor = currentImageCursorEntry(nextStack).cursor;
 
       collectionControllers.current[collection]?.abort();
       const controller = new AbortController();
@@ -284,18 +308,18 @@ export function ImageDetail() {
             {
               workspace,
               limit: 100,
-              cursor: nextStack[nextStack.length - 1],
+              cursor: requestedCursor,
             },
             controller.signal
           );
         } catch (requestError) {
           if (
             requestError.code !== 'STALE_IMAGE_CURSOR' ||
-            nextStack[nextStack.length - 1] === null
+            requestedCursor === null
           ) {
             throw requestError;
           }
-          nextStack = [null];
+          nextStack = firstImageCursorHistory();
           page = await getImageArtifactCollection(
             imageId,
             collection,
@@ -372,7 +396,8 @@ export function ImageDetail() {
   const viewingFirstCollectionPages = useMemo(
     () =>
       ARTIFACT_COLLECTIONS.every(
-        (collection) => collectionCursorStacks[collection].length === 1
+        (collection) =>
+          currentImageCursorEntry(collectionCursorStacks[collection]).page === 1
       ),
     [collectionCursorStacks]
   );
@@ -582,11 +607,15 @@ export function ImageDetail() {
               </div>
               <CollectionPager
                 collection="releases"
-                page={collectionCursorStacks.releases.length}
+                page={
+                  currentImageCursorEntry(collectionCursorStacks.releases).page
+                }
                 nextCursor={detail.next_cursors?.releases}
                 loading={Boolean(collectionLoading.releases)}
                 error={collectionErrors.releases}
                 notice={collectionNotices.releases}
+                canPrevious={collectionCursorStacks.releases.length > 1}
+                onFirst={() => pageArtifactCollection('releases', 'first')}
                 onPrevious={() =>
                   pageArtifactCollection('releases', 'previous')
                 }
@@ -613,11 +642,15 @@ export function ImageDetail() {
               </div>
               <CollectionPager
                 collection="sources"
-                page={collectionCursorStacks.sources.length}
+                page={
+                  currentImageCursorEntry(collectionCursorStacks.sources).page
+                }
                 nextCursor={detail.next_cursors?.sources}
                 loading={Boolean(collectionLoading.sources)}
                 error={collectionErrors.sources}
                 notice={collectionNotices.sources}
+                canPrevious={collectionCursorStacks.sources.length > 1}
+                onFirst={() => pageArtifactCollection('sources', 'first')}
                 onPrevious={() => pageArtifactCollection('sources', 'previous')}
                 onNext={() => pageArtifactCollection('sources', 'next')}
               />
@@ -699,11 +732,15 @@ export function ImageDetail() {
             <div className="px-5 pb-4">
               <CollectionPager
                 collection="locations"
-                page={collectionCursorStacks.locations.length}
+                page={
+                  currentImageCursorEntry(collectionCursorStacks.locations).page
+                }
                 nextCursor={detail.next_cursors?.locations}
                 loading={Boolean(collectionLoading.locations)}
                 error={collectionErrors.locations}
                 notice={collectionNotices.locations}
+                canPrevious={collectionCursorStacks.locations.length > 1}
+                onFirst={() => pageArtifactCollection('locations', 'first')}
                 onPrevious={() =>
                   pageArtifactCollection('locations', 'previous')
                 }
@@ -768,11 +805,16 @@ export function ImageDetail() {
             <div className="px-5 pb-4">
               <CollectionPager
                 collection="publications"
-                page={collectionCursorStacks.publications.length}
+                page={
+                  currentImageCursorEntry(collectionCursorStacks.publications)
+                    .page
+                }
                 nextCursor={detail.next_cursors?.publications}
                 loading={Boolean(collectionLoading.publications)}
                 error={collectionErrors.publications}
                 notice={collectionNotices.publications}
+                canPrevious={collectionCursorStacks.publications.length > 1}
+                onFirst={() => pageArtifactCollection('publications', 'first')}
                 onPrevious={() =>
                   pageArtifactCollection('publications', 'previous')
                 }
@@ -825,11 +867,15 @@ export function ImageDetail() {
             <div className="px-5 pb-4">
               <CollectionPager
                 collection="demands"
-                page={collectionCursorStacks.demands.length}
+                page={
+                  currentImageCursorEntry(collectionCursorStacks.demands).page
+                }
                 nextCursor={detail.next_cursors?.demands}
                 loading={Boolean(collectionLoading.demands)}
                 error={collectionErrors.demands}
                 notice={collectionNotices.demands}
+                canPrevious={collectionCursorStacks.demands.length > 1}
+                onFirst={() => pageArtifactCollection('demands', 'first')}
                 onPrevious={() => pageArtifactCollection('demands', 'previous')}
                 onNext={() => pageArtifactCollection('demands', 'next')}
               />

@@ -1943,6 +1943,12 @@ def get_config_schema():
                                 'type': 'object',
                                 'minProperties': 1,
                                 'maxProperties': 16,
+                                'required': ['kubernetes.io/arch'],
+                                'properties': {
+                                    'kubernetes.io/arch': {
+                                        'const': 'amd64',
+                                    },
+                                },
                                 'propertyNames': {
                                     'type': 'string',
                                     'minLength': 1,

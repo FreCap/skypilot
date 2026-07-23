@@ -445,7 +445,11 @@ def test_initial_canary_client_failure_terminalizes_without_provider_child(
 
 def _eks_node(uid: str, instance_id: str, *, selector_value: str = 'eks-node'):
     return SimpleNamespace(metadata=SimpleNamespace(
-        uid=uid, labels={'skypilot.co/image-pull-role': selector_value}),
+        uid=uid,
+        labels={
+            'kubernetes.io/arch': 'amd64',
+            'skypilot.co/image-pull-role': selector_value,
+        }),
                            spec=SimpleNamespace(
                                provider_id=f'aws:///us-west-2a/{instance_id}',
                                unschedulable=False))
@@ -500,7 +504,8 @@ def test_eks_qualification_proves_every_selected_node_role(
     assert count == 2
     assert len(node_set_hash) == 64
     core.list_node.assert_called_once_with(
-        label_selector='skypilot.co/image-pull-role=eks-node',
+        label_selector=('kubernetes.io/arch=amd64,'
+                        'skypilot.co/image-pull-role=eks-node'),
         limit=canary_worker_service._MAX_QUALIFIED_EKS_NODES + 1,
         _request_timeout=canary_worker_service.kubernetes.API_TIMEOUT)
 

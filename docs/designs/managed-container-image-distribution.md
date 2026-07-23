@@ -541,6 +541,17 @@ attachment, success, failure, and timeout. Tests may substitute an explicit
 literal epoch, but production finalizers use the database wall clock after the
 wait and roll back every earlier write when the fence fails.
 
+PostgreSQL also owns every persisted qualification observation time. The shared
+profile-attestation transaction locks the candidate revision, samples
+`clock_timestamp()`, and overwrites any producer-supplied `observed_at` before
+hashing and storing the evidence. Producer clocks remain useful only for local
+diagnostics and never determine freshness or ordering. Automatic-canary
+scheduling and activation preflight sample the database clock too; the final
+activation transaction still repeats freshness validation after acquiring its
+complete lock set. A slow or fast worker therefore cannot make a fresh proof
+immediately stale, place a proof in the future, or wedge a profile in
+QUALIFYING.
+
 The same database-clock rule governs shared work admission and retention, not
 only result finalization. Copy and eviction claims use the database clock for
 their indexed candidate scan, then sample it again after locking the selected
@@ -1065,10 +1076,17 @@ manifest or an index whose exact platform child was selected at publication.
 `container_image_sources` preserves root digest, root media type, requested
 platform, and selected child digest; `container_images` is keyed by runtime child
 digest and platform. Pull plans use only the child digest. Placement fails closed
-when the runtime architecture does not match. V0 defaults publication to AMD64
-and never builds or selects ARM64 speculatively. Full index replication remains
-post-v0 because parent and every child then need capacity, demand, and deletion
-ownership.
+when the runtime architecture does not match. V0 managed AWS routes support only
+`linux/amd64`: an EC2 placement must report that exact platform, while an EKS
+placement may omit architecture only because its exact qualified node selector
+must contain `kubernetes.io/arch: amd64`. An explicit non-AMD64 EKS placement is
+still rejected. The same EKS selector is proved by the canary and injected into
+every workload pull plan. Unknown or ARM64 EC2 placements, heterogeneous EKS
+selectors, and selectors without the AMD64 label cannot use managed locality.
+An exact-reference direct route remains available where workspace policy allows
+it. V0 never builds or selects ARM64 speculatively. Full index replication and
+architecture-specific AMIs and canaries remain post-v0 because every platform
+then needs its own capacity, demand, qualification, and deletion ownership.
 
 ## PostgreSQL data model
 
@@ -1409,6 +1427,7 @@ container_registries:
           node_role: arn:aws:iam::210987654321:role/EksNodeRole
           namespace: skypilot-image-canaries
           node_selector:
+            kubernetes.io/arch: amd64
             skypilot.co/image-pull-role: eks-node
     compute-canary:
       kind: aws_assume_role
@@ -1505,13 +1524,16 @@ The runtime binding also declares the minimum launch tuple needed for an
 automatic canary. EC2 qualification pins one IAM role, instance-profile name,
 AMI, instance type, and bounded regional subnet/security-group allowlist. EKS
 qualification pins one kubeconfig context, cluster ARN, node role, and dedicated
-namespace. The separately referenced `canary_launch` authority may only launch,
-inspect, and tear down these tagged canaries; it has no ECR write or lifecycle
-permission. The fixed digest-pinned `canary_ref` is copied by the copy worker
-into Terraform's non-catalog qualification repository. The canary worker pulls
-that regional digest through the declared runtime identity, and the lifecycle
-worker deletes it through `qualification_delete_authority`. A target cannot use
-its ordinary `delete_authority: disabled` setting to skip qualification cleanup.
+namespace. Every qualified EKS node selector must include the exact
+`kubernetes.io/arch: amd64` label in addition to any operator isolation labels.
+The separately referenced `canary_launch` authority may only launch, inspect,
+and tear down these tagged canaries; it has no ECR write or lifecycle permission.
+The fixed digest-pinned `canary_ref` is copied by the copy worker into
+Terraform's non-catalog qualification repository. The canary worker pulls that
+regional digest through the declared runtime identity, and the lifecycle worker
+deletes it through `qualification_delete_authority`. Runtime evidence records
+the fixed `linux/amd64` platform. A target cannot use its ordinary
+`delete_authority: disabled` setting to skip qualification cleanup.
 
 `canary_worst_case_cost_usd` is reserved atomically with the operation lease
 before any child launch. It is a conservative operator-set ceiling for one run,
@@ -2179,13 +2201,18 @@ samples per artifact through three fixed lateral-limit statements and matching
 artifact indexes. `publications_truncated`, `sources_truncated`, and
 `locations_truncated` mark partial summaries; the UI labels them as partial and
 uses the paginated artifact endpoints for complete detail. Every artifact
-collection has independent bounded Previous and Next controls backed by its own
-opaque cursor stack; navigating one collection does not eagerly materialize or
-refetch the others. The Dashboard also pages the workspace failed-publication
-feed independently, so an unbound failure remains discoverable and retryable
-beyond the first page. Stale collection or publication cursors reset only their
-own view to its first page with an explicit notice. Summary cards say that their
-counts cover the visible page rather than presenting a bounded page as a total.
+collection has independent Previous and Next controls backed by its own fixed-
+window opaque cursor history. Each history retains at most 20 `{cursor, page}`
+entries, preserves the absolute page number after trimming, and can continue
+moving forward without a page-count limit. Once older cursors leave the window,
+Previous stops at the oldest retained entry and an explicit First control
+reloads page 1. Navigating one collection does not eagerly materialize or refetch
+the others. The catalog and workspace failed-publication feed use the same
+bounded helper and independent histories, so an unbound failure remains
+discoverable and retryable beyond the first page. Stale collection or
+publication cursors reset only their own view to its first page with an explicit
+notice. Summary cards say that their counts cover the visible page rather than
+presenting a bounded page as a total.
 
 Catalog and detail reads remain available to workspace readers, but source and
 publication projections reveal credential-binding names and fingerprints only
@@ -2389,6 +2416,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   confirmation, unattached-cluster retention, worker cleanup, and terminal
   compaction derive shared epochs from PostgreSQL, while local grant expiry and
   worker housekeeping use only monotonic process time;
+- fast and slow qualification-producer tests proving profile-attestation
+  `observed_at`, automatic-canary scheduling, activation preflight, and final
+  freshness checks use PostgreSQL time rather than any worker or scheduler wall
+  clock;
 - locked new-demand tests proving that runtime-proof validation and
   `demand.created_at` use the same database epoch, stale proof rejection rolls
   back both demand and watermark, and an exact existing replay survives both
@@ -2453,9 +2484,15 @@ drained and every image table is empty; it is never part of Helm rollback.
   plans, plus many-target readiness fixtures proving one statement, a 100-group
   cap, queue lower-bound flags, and no per-group query growth;
 - Dashboard pagination tests proving independent artifact-collection and failed-
-  publication cursor stacks, bounded page replacement rather than eager history
+  publication cursor histories, a 20-entry maximum across arbitrarily many
+  forward pages, preserved absolute page numbers, the First-page escape after
+  history trimming, bounded page replacement rather than eager row
   accumulation, local stale-cursor recovery, and continued retry access beyond
   the first failed-publication page;
+- managed-runtime architecture tests rejecting ARM64 and unknown EC2
+  placements, rejecting missing or non-AMD64 EKS selectors, accepting an
+  unknown EKS placement only with its exact qualified AMD64 selector, and
+  preserving policy-allowed exact-reference direct fallback;
 - profile-history pagination beyond one page plus PostgreSQL plan evidence that
   the newest-first workspace query uses its exact keyset index, and capability
   tests proving it requests only the bounded configured ACTIVE profile set;
@@ -3056,3 +3093,18 @@ slow host clock. During repair, `origin/improvements` advanced again to
 invalidated the earlier review identity. The acceptance streak remains zero
 until both reviewers accept one immutable current-base head three consecutive
 times.
+
+The paired review at `8283818d8f7cd0740b6bc248564d8274068fcabc`
+returned Codex `RESHAPE` and Fable `PURSUE`, so the acceptance streak remained
+zero. Codex found that qualification evidence still retained producer wall
+time, v0 runtime qualification was not structurally bound to AMD64 placements,
+and Dashboard cursor histories grew once per forward page despite the bounded-
+memory contract. This revision makes the shared attestation transaction replace
+producer observation time with its locked PostgreSQL epoch, uses PostgreSQL time
+for automatic scheduling and activation preflight, requires exact AMD64 EC2 or
+selector-bound EKS managed placements, and gives every image pager a shared
+20-entry cursor-history window with an absolute page number and First-page
+escape. During repair, `origin/improvements` advanced to `252c30d4e4`; that base
+was integrated before implementation and independently invalidated the reviewed
+identity. The acceptance streak remains zero until both reviewers accept one
+immutable current-base head three consecutive times.
