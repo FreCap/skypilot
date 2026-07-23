@@ -124,7 +124,7 @@ describe('useVolumeDetails request ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
-  it('coalesces duplicate manual refreshes and releases ownership after success', async () => {
+  it('scopes duplicate manual refresh invalidation to the current volume key', async () => {
     const initial = deferred();
     const refresh = deferred();
     dashboardCache.get
@@ -149,9 +149,11 @@ describe('useVolumeDetails request ownership', () => {
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
 
     expect(duplicateRefreshPromise).toBe(firstRefreshPromise);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledWith(getVolumes);
-    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
 
     await act(async () => {
       refresh.resolve([{ name: 'volume-a', status: 'NEW' }]);
@@ -173,11 +175,10 @@ describe('useVolumeDetails request ownership', () => {
 
     expect(result.current.volumeData.status).toBe('NEWER');
     expect(result.current.loading).toBe(false);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
-    expect(dashboardCache.invalidateFunction).toHaveBeenNthCalledWith(
-      2,
-      getVolumes
-    );
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(2, getVolumes, [
+      { name: 'volume-a' },
+    ]);
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
   });
 
@@ -203,7 +204,11 @@ describe('useVolumeDetails request ownership', () => {
     });
 
     expect(duplicateRefreshPromise).toBe(firstRefreshPromise);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
@@ -220,7 +225,11 @@ describe('useVolumeDetails request ownership', () => {
     });
 
     expect(recoveredRefreshPromise).not.toBe(firstRefreshPromise);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(2, getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
 
     await act(async () => {
       await recoveredRefreshPromise;
@@ -274,15 +283,14 @@ describe('useVolumeDetails request ownership', () => {
     });
 
     expect(newRefreshPromise).not.toBe(oldRefreshPromise);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
-    expect(dashboardCache.invalidateFunction).toHaveBeenNthCalledWith(
-      1,
-      getVolumes
-    );
-    expect(dashboardCache.invalidateFunction).toHaveBeenNthCalledWith(
-      2,
-      getVolumes
-    );
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(1, getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(2, getVolumes, [
+      { name: 'volume-a' },
+    ]);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
 
     await act(async () => {
       newRefresh.resolve([{ name: 'volume-a', status: 'volume-a-new' }]);
