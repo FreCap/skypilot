@@ -2340,6 +2340,15 @@ Kubernetes wrapper before any success, validation failure, provider failure,
 drain, lease loss, cleanup failure, or other exception leaves
 `_run_eks_canary`. No outer canary traceback frame may therefore retain a live
 installed credential after the function exits.
+EC2 and EKS also separate work failure from the final cleanup winner. If
+teardown failure, drain, or lease loss replaces an active provider failure, the
+worker exits the losing exception handler, drops its traceback and response
+state, and only then raises the deterministic winning error with no cause or
+context. The same boundary preserves the original provider exception when
+teardown succeeds, so useful ordinary diagnostics are not erased. Cleanup may
+therefore determine custody without making a losing provider response,
+request-local authorization header, or other provider state reachable from the
+winning exception or its serialized envelope.
 Transparent library-side refresh is removed from the raw API call path. The
 wrapper converts a kubeconfig credential's declared wall-clock expiry into one
 monotonic refresh deadline when the credential is accepted, preserving the
@@ -3893,3 +3902,19 @@ been invalidated or closed. This revision defines an explicit outer EKS client
 lifetime that always scrubs after required teardown and before any result or
 exception leaves, with closure-aware regressions for both successful and
 exceptional exits. The acceptance streak remains zero.
+
+Codex exact-head review round 8 at
+`89c0c48f0c50b2f684b15bd102d3acecf88c0777` was stopped without a verdict by
+the platform safety filter after it independently reproduced one adjacent
+exception-precedence leak. When provider work failed after EKS pod creation and
+teardown then failed, `CANARY_TEARDOWN_FAILED` retained the losing provider
+error as implicit context. The serialized envelope therefore retained that
+error's response body and request-local authorization header even though the
+installed Kubernetes credential was correctly scrubbed and closed. This
+revision puts both EC2 and EKS canary lifetimes behind one detached cleanup
+winner contract. Successful cleanup preserves the ordinary provider exception;
+teardown failure, cleanup lease loss, and cleanup-time drain discard the losing
+provider graph before raising their deterministic winner. Exact object-graph
+and serialized-envelope regressions cover all four EKS precedence outcomes and
+the equivalent EC2 teardown-failure schedule. The acceptance streak remains
+zero.

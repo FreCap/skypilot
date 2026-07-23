@@ -19,6 +19,7 @@ import urllib.request
 
 import pytest
 
+from sky import exceptions
 from sky.container_images import aws
 from sky.container_images import budgets
 from sky.container_images import canary_worker_service
@@ -1059,6 +1060,185 @@ def test_eks_success_scrubs_installed_credential_before_return(
     raw_core.read_namespaced_pod.assert_called_once()
     raw_core.read_namespaced_pod_log.assert_called_once()
     raw_core.read_node.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ('winner', 'expected_type', 'expected_message'),
+    [
+        ('provider', RuntimeError, 'LOSING_EKS_PROVIDER_SECRET'),
+        ('teardown', ValueError, 'CANARY_TEARDOWN_FAILED'),
+        ('lease', worker_lease.LeaseLostError, 'cleanup lease lost'),
+        ('drain', canary_worker_service._CanaryDrainRequested, ''),
+    ],
+)
+def test_eks_cleanup_precedence_handles_provider_state_after_scrub(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        winner: str, expected_type: type[Exception],
+        expected_message: str) -> None:
+    marker = 'LOSING_EKS_PROVIDER_SECRET'
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    reference = f'{target.registry}/qualification@{_DIGEST}'
+    heartbeat = _OwnedHeartbeat()
+    drain_event = threading.Event()
+    fenced, core, configuration, api_client, raw_core = (
+        _installed_eks_fenced_client('INSTALLED_EXEC_TOKEN', heartbeat))
+    monkeypatch.setattr(core, '_should_refresh', lambda: False)
+    provider_error = RuntimeError(marker)
+    provider_error.response = {  # type: ignore[attr-defined]
+        'headers': {
+            'Authorization': f'Bearer {marker}',
+        },
+        'body': marker,
+    }
+    raw_core.create_namespaced_pod = mock.Mock()
+    raw_core.read_namespaced_pod = mock.Mock(side_effect=provider_error)
+    eks = mock.Mock()
+    eks.describe_cluster.return_value = {
+        'cluster': {
+            'arn': qualified.cluster_arn,
+            'endpoint': 'https://eks.example',
+        }
+    }
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        lambda *_args, **_kwargs: fenced)
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: eks)
+    monkeypatch.setattr(canary_worker_service, '_qualified_eks_nodes',
+                        lambda *_args, **_kwargs: (1, 'f' * 64))
+
+    def cleanup(*_args, **_kwargs):
+        if winner == 'provider':
+            return True
+        if winner == 'teardown':
+            return False
+        if winner == 'lease':
+            raise worker_lease.LeaseLostError('cleanup lease lost')
+        assert winner == 'drain'
+        drain_event.set()
+        return True
+
+    monkeypatch.setattr(canary_worker_service, '_delete_eks_pod', cleanup)
+
+    with pytest.raises(expected_type, match=expected_message) as exc_info:
+        canary_worker_service._run_eks_canary(operation,
+                                              payload,
+                                              _revision(profile),
+                                              profile,
+                                              target,
+                                              binding,
+                                              _DIGEST,
+                                              reference,
+                                              heartbeat,
+                                              drain_event=drain_event)
+
+    error = exc_info.value
+    rendered = json.dumps(exceptions.serialize_exception(error),
+                          default=str,
+                          sort_keys=True)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    if winner == 'provider':
+        assert error is provider_error
+        assert marker in rendered
+    else:
+        assert marker not in rendered
+        _assert_canary_traceback_value_free(error, marker)
+    assert fenced._client is None
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+    raw_core.create_namespaced_pod.assert_called_once()
+    raw_core.read_namespaced_pod.assert_called_once()
+
+
+def test_ec2_teardown_failure_drops_losing_provider_state(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    marker = 'LOSING_EC2_PROVIDER_SECRET'
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    heartbeat = _OwnedHeartbeat()
+    runtime_ec2 = mock.Mock()
+    cleanup_ec2 = mock.Mock()
+    iam = mock.Mock()
+    clients = iter((runtime_ec2, iam, cleanup_ec2))
+    provider_error = RuntimeError(marker)
+    provider_error.response = {  # type: ignore[attr-defined]
+        'headers': {
+            'Authorization': f'Bearer {marker}',
+        },
+        'body': marker,
+    }
+
+    def launch(_method_name: str, _deadline: float, on_start, **_kwargs):
+        on_start()
+        return {'Instances': [{'InstanceId': 'i-canary'}]}
+
+    runtime_ec2.call_before_deadline.side_effect = launch
+    tagged_instances = mock.Mock(side_effect=([], provider_error, []))
+    terminate = mock.Mock(return_value=False)
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: next(clients))
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_instance_profile_role',
+                        lambda *_args, **_kwargs: binding.principals[0])
+    monkeypatch.setattr(canary_worker_service, '_tagged_instances',
+                        tagged_instances)
+    monkeypatch.setattr(canary_worker_service, '_terminate_ec2_instances',
+                        terminate)
+
+    with pytest.raises(ValueError, match='CANARY_TEARDOWN_FAILED') as exc_info:
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
+
+    error = exc_info.value
+    rendered = json.dumps(exceptions.serialize_exception(error),
+                          default=str,
+                          sort_keys=True)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in rendered
+    _assert_canary_traceback_value_free(error, marker)
+    runtime_ec2.call_before_deadline.assert_called_once()
+    assert tagged_instances.call_count == 3
+    terminate.assert_called_once()
 
 
 def test_eks_cleanup_refresh_observes_shared_deadline_before_raw_delete(

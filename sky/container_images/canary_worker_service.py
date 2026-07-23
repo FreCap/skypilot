@@ -362,6 +362,20 @@ def _preflight_error(operation: catalog_state.OperationRecord,
     return ValueError(error_code)
 
 
+def _detached_cleanup_winner(error: Exception) -> Exception | None:
+    """Returns a cleanup/control winner detached from losing provider state."""
+    if (isinstance(error, ValueError) and
+            str(error) == 'CANARY_TEARDOWN_FAILED'):
+        return ValueError('CANARY_TEARDOWN_FAILED')
+    if isinstance(error, (_CanaryDrainRequested, _CanaryCleanupDeadlineExceeded,
+                          worker_lease.LeaseLostError)):
+        error = error.with_traceback(None)
+        error.__cause__ = None
+        error.__context__ = None
+        return error
+    return None
+
+
 def _canary_role(
         profile: models.ManagedRegistryProfile,
         runtime_binding: models.RegistryAccessBinding) -> aws.AwsRoleBinding:
@@ -639,7 +653,7 @@ def _ec2_user_data(reference: str, nonce: str, timeout_seconds: int) -> str:
     ))
 
 
-def _run_ec2_canary(
+def _run_ec2_canary_inner(
         operation: catalog_state.OperationRecord,
         payload: dict[str, Any],
         revision: topology_state.ProfileRevisionRecord,
@@ -928,6 +942,39 @@ def _run_ec2_canary(
     }
 
 
+def _run_ec2_canary(
+        operation: catalog_state.OperationRecord,
+        payload: dict[str, Any],
+        revision: topology_state.ProfileRevisionRecord,
+        profile: models.ManagedRegistryProfile,
+        target: models.ManagedRegistryTarget,
+        binding: models.RegistryAccessBinding,
+        digest: str,
+        reference: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> dict[str, Any]:
+    """Runs an EC2 canary behind a detached cleanup-precedence boundary."""
+    winning_error: Exception | None = None
+    try:
+        return _run_ec2_canary_inner(operation,
+                                     payload,
+                                     revision,
+                                     profile,
+                                     target,
+                                     binding,
+                                     digest,
+                                     reference,
+                                     heartbeat,
+                                     drain_event=drain_event)
+    except Exception as error:  # pylint: disable=broad-except
+        winning_error = _detached_cleanup_winner(error)
+        if winning_error is None:
+            raise
+    assert winning_error is not None
+    raise winning_error.with_traceback(None) from None
+
+
 def _api_error_status(error: BaseException) -> int | None:
     status = getattr(error, 'status', None)
     return int(status) if isinstance(status, int) else None
@@ -1088,7 +1135,7 @@ def _delete_eks_pod(core: Any,
     return False
 
 
-def _run_eks_canary(
+def _run_eks_canary_inner(
         operation: catalog_state.OperationRecord,
         payload: dict[str, Any],
         revision: topology_state.ProfileRevisionRecord,
@@ -1327,6 +1374,39 @@ def _run_eks_canary(
         raise ValueError('CANARY_FAILED')
     evidence['teardown_verified'] = True
     return evidence
+
+
+def _run_eks_canary(
+        operation: catalog_state.OperationRecord,
+        payload: dict[str, Any],
+        revision: topology_state.ProfileRevisionRecord,
+        profile: models.ManagedRegistryProfile,
+        target: models.ManagedRegistryTarget,
+        binding: models.RegistryAccessBinding,
+        digest: str,
+        reference: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> dict[str, Any]:
+    """Runs an EKS canary behind a detached cleanup-precedence boundary."""
+    winning_error: Exception | None = None
+    try:
+        return _run_eks_canary_inner(operation,
+                                     payload,
+                                     revision,
+                                     profile,
+                                     target,
+                                     binding,
+                                     digest,
+                                     reference,
+                                     heartbeat,
+                                     drain_event=drain_event)
+    except Exception as error:  # pylint: disable=broad-except
+        winning_error = _detached_cleanup_winner(error)
+        if winning_error is None:
+            raise
+    assert winning_error is not None
+    raise winning_error.with_traceback(None) from None
 
 
 def _fail_owned_canary(operation: catalog_state.OperationRecord,
