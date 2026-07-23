@@ -3022,6 +3022,12 @@ def get_config_schema():
             'install_conda': {
                 'type': 'boolean',
             },
+            # Enabled by default. Set to false to stop GCP from writing or
+            # reading capacity and quota hints, returning provisioning to its
+            # pre-cache behavior.
+            'gcp_capacity_cache': {
+                'type': 'boolean',
+            },
         }
     }
 

@@ -94,10 +94,12 @@ def test_region_pinned_one_node_spot_uses_exact_zone_cache_keys(monkeypatch):
         key = backend._capacity_cache_key(launchable, clouds.Region(_REGION),
                                           zones, 1, _ACCOUNT)
         assert key == capacity_cache.ResourceKey(
+            cloud='aws',
             account=_ACCOUNT,
             region=_REGION,
             zone=launchable.zone,
             instance_type=_INSTANCE_TYPE,
+            accelerators=backend._canonical_accelerators(launchable),
             num_nodes=1,
         )
 

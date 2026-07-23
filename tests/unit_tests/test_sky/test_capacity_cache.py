@@ -1,4 +1,4 @@
-"""Tests for the short-lived AWS capacity hints."""
+"""Tests for the short-lived capacity hints."""
 # pylint: disable=protected-access
 import json
 
@@ -11,10 +11,12 @@ from sky.utils.db import kv_cache
 
 def _key(**overrides):
     values = {
+        'cloud': 'aws',
         'account': '0001',
         'region': 'us-east-1',
         'zone': 'us-east-1a',
         'instance_type': 'g6.4xlarge',
+        'accelerators': 'L4:1',
         'num_nodes': 1,
     }
     values.update(overrides)
@@ -23,9 +25,11 @@ def _key(**overrides):
 
 def _quota_key(**overrides):
     values = {
+        'cloud': 'aws',
         'account': '0001',
         'region': 'us-east-1',
         'instance_type': 'g6.4xlarge',
+        'accelerators': 'L4:1',
         'num_nodes': 1,
     }
     values.update(overrides)
@@ -47,6 +51,10 @@ def test_resource_dimensions_are_part_of_key():
     assert base != capacity_cache._cache_key(_key(zone='us-east-1b'))
     assert base != capacity_cache._cache_key(_key(instance_type='g6.8xlarge'))
     assert base != capacity_cache._cache_key(_key(num_nodes=8))
+    # A machine type does not always determine the accelerator, and one
+    # cloud's exhaustion says nothing about another's.
+    assert base != capacity_cache._cache_key(_key(accelerators='V100:1'))
+    assert base != capacity_cache._cache_key(_key(cloud='gcp'))
 
 
 def test_round_trip_and_ttl_expiry(cache_db, monkeypatch):
@@ -121,6 +129,10 @@ def test_quota_dimensions_are_isolated():
         _quota_key(instance_type='g6.8xlarge'))
     assert base != capacity_cache._quota_cooldown_cache_key(
         _quota_key(num_nodes=8))
+    assert base != capacity_cache._quota_cooldown_cache_key(
+        _quota_key(accelerators='V100:1'))
+    assert base != capacity_cache._quota_cooldown_cache_key(
+        _quota_key(cloud='gcp'))
 
 
 def test_active_filters_candidates(monkeypatch):
@@ -147,9 +159,11 @@ def test_service_observation_is_exact_and_redacted(cache_db, monkeypatch):
         'available': True,
         'hints': [{
             'kind': 'capacity',
+            'cloud': 'aws',
             'region': 'us-east-1',
             'zone': 'us-east-1a',
             'instance_type': 'g6.4xlarge',
+            'accelerators': 'L4:1',
             'num_nodes': 1,
             'observed_at': 1000.0,
             'expires_at': 1120.0,
@@ -195,3 +209,104 @@ def test_quota_observation_is_regional(cache_db, monkeypatch):
     assert hint['region'] == 'us-east-1'
     assert hint['zone'] is None
     assert hint['instance_type'] == 'g6.4xlarge'
+
+
+def test_observation_never_carries_the_account(cache_db):
+    """The account is absent from the stored value, not stripped on read."""
+    del cache_db
+    key = _key(account='secret-project')
+    capacity_cache.mark_exhausted(
+        key, capacity_cache.ServiceObservation('svc', 'hash-a'))
+
+    stored = kv_cache.list_active_cache_entries_by_prefix(
+        capacity_cache._service_observation_prefix(
+            capacity_cache._CAPACITY_OBSERVATION_KEY_PREFIX, 'svc'), 10)
+    assert stored
+    for _, value, _ in stored:
+        payload = json.loads(value)
+        assert 'secret-project' not in json.dumps(payload['resource'])
+        assert payload['resource']['cloud'] == 'aws'
+
+
+def test_hints_from_multiple_clouds_are_returned_together(cache_db):
+    """One prefix scan must surface every provider's hints for a service."""
+    del cache_db
+    observation = capacity_cache.ServiceObservation('svc', 'hash-a')
+    capacity_cache.mark_exhausted(_key(cloud='aws'), observation)
+    capacity_cache.mark_exhausted(
+        _key(cloud='gcp', region='asia-northeast3', zone='asia-northeast3-b'),
+        observation)
+
+    hints = capacity_cache.active_service_observations('svc', 'hash-a')['hints']
+    assert sorted(hint['cloud'] for hint in hints) == ['aws', 'gcp']
+
+
+def test_no_stored_value_or_key_contains_the_account(cache_db):
+    """The account must not appear in any stored key or value."""
+    del cache_db
+    secret = 'secret-project-1234'
+    observation = capacity_cache.ServiceObservation('svc', 'hash-a')
+    capacity_cache.mark_exhausted(_key(account=secret), observation)
+    capacity_cache.mark_quota_failure(_quota_key(account=secret), observation)
+
+    # Canonical keys are digests, so the identifier is absent from the key.
+    assert secret not in capacity_cache._cache_key(_key(account=secret))
+    assert secret not in capacity_cache._quota_cooldown_cache_key(
+        _quota_key(account=secret))
+
+    for prefix in (capacity_cache._CAPACITY_OBSERVATION_KEY_PREFIX,
+                   capacity_cache._QUOTA_OBSERVATION_KEY_PREFIX):
+        rows = kv_cache.list_active_cache_entries_by_prefix(
+            capacity_cache._service_observation_prefix(prefix, 'svc'), 10)
+        assert rows
+        for key, value, _ in rows:
+            assert secret not in key
+            # canonical_key is embedded in the value, so this also covers it.
+            assert secret not in value
+
+    result = capacity_cache.active_service_observations('svc', 'hash-a')
+    assert secret not in json.dumps(result)
+    assert len(result['hints']) == 2
+
+
+def test_success_wins_against_a_delayed_failure_write(cache_db):
+    """A failure torn down slowly must not re-suppress a proven-good demand.
+
+    Worker A fails and is torn down; before its hint lands, worker B succeeds
+    on the identical demand and clears. A's delayed write must be dropped.
+    """
+    del cache_db
+    key = _key()
+
+    capacity_cache.mark_exhausted(key)  # an earlier failure
+    capacity_cache.clear(key)  # worker B proves capacity
+    capacity_cache.mark_exhausted(key)  # worker A's delayed write
+
+    assert capacity_cache.active_exhausted_keys([key]) == set()
+
+
+def test_quota_success_wins_against_a_delayed_failure_write(cache_db):
+    del cache_db
+    key = _quota_key()
+
+    capacity_cache.mark_quota_failure(key)
+    capacity_cache.clear_quota_cooldown(key)
+    capacity_cache.mark_quota_failure(key)
+
+    assert not capacity_cache.is_quota_cooldown_active(key)
+
+
+def test_success_tombstone_expires_so_later_failures_still_cache(
+        cache_db, monkeypatch):
+    """The tombstone only covers the teardown window, not forever."""
+    del cache_db
+    now = {'value': 1000.0}
+    monkeypatch.setattr(capacity_cache.time, 'time', lambda: now['value'])
+    monkeypatch.setattr(kv_cache.time, 'time', lambda: now['value'])
+    key = _key()
+
+    capacity_cache.clear(key)
+    now['value'] += capacity_cache._SUCCESS_TOMBSTONE_TTL_SECONDS + 1
+    capacity_cache.mark_exhausted(key)
+
+    assert capacity_cache.active_exhausted_keys([key]) == {key}

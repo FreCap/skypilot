@@ -307,6 +307,10 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
         if errors:
             error = common.ProvisionerError('Failed to launch instances.')
             error.errors = errors
+            # How many nodes this attempt asked for. Callers use it to tell a
+            # failure that covered the whole demand from one that covered only
+            # a subset, which decides whether the failure may be cached.
+            error.requested_count = to_start_count
             raise error
         if head_instance_id is None:
             head_instance_id = created_instance_ids[0]
@@ -388,6 +392,12 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
             raise
         error = common.ProvisionerError('Failed to launch instances.')
         error.errors = errors
+        # `requested_count` is deliberately left unset here. This handler
+        # catches an API-level failure that may have been raised before any
+        # create was attempted, so it cannot prove the failure covered the
+        # whole demand. Leaving it unset keeps such a failure out of the
+        # capacity cache rather than risking a hint for a demand that was
+        # never really attempted.
         raise error from e
 
 
