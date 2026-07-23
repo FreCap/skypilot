@@ -737,10 +737,15 @@ fallback child. The configured worst-case reservation remains the cost ceiling,
 so Spot savings never weaken the daily budget fence. EKS qualification uses an
 existing declared cluster and does not choose that cluster's capacity type.
 Serve and job placement remain owned by their normal SkyPilot resource policy,
-not by the image plane. The default `true` is omitted from persisted profile and
-binding-fingerprint projections so existing default-behavior revisions retain
-their identities. An explicit `false` is projected and therefore requires the
-normal profile revision increment.
+not by the image plane. Newly parsed profiles always project the default
+`true`, so changing from the pre-field on-demand behavior to Spot changes both
+the profile hash and binding fingerprint and requires the normal profile
+revision increment. A legacy persisted snapshot with no field restores an
+internal unspecified state, preserves its old fingerprint projection, and
+continues to replay on-demand under its existing idempotent token. Explicit
+`false` is also projected and selects on-demand for a newly staged revision.
+Public config and new snapshots accept only booleans, never the legacy internal
+unspecified value.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -3941,6 +3946,14 @@ message-collision outcomes plus the equivalent EC2 teardown-failure schedule.
 Round 10 at `a2eaa6410939ce32b4dec6c043c7919370e093f8` was intentionally
 stopped before a verdict when this remaining downstream string discriminator
 was found. The acceptance streak remains zero.
+Round 11 at `0ec9c51c4775748402ef0f59093553169b4b08eb` was intentionally
+stopped before a verdict when rollout analysis found that preserving the old
+binding identity while changing its absent-field default from on-demand to Spot
+could replay one existing EC2 client token with different launch parameters.
+The revised three-state snapshot contract preserves old missing-field
+on-demand replay, while every new profile projects its boolean market policy
+and therefore requires an identity-changing revision. The acceptance streak
+remains zero.
 Before the repaired-head acceptance run, `origin/improvements` advanced
 to `0758b9b32e5828a0befd6cde1fe09dce62e6f605`. Integrating it preserves the
 new managed-job cancellation attribution and transient-INIT recovery contracts

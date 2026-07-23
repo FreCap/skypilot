@@ -379,18 +379,19 @@ class RegistryAccessBinding:
     instance_profile: str | None = None
     canary_authority: str | None = None
     canary_instance_type: str | None = None
-    canary_use_spot: bool = True
+    canary_use_spot: bool | None = None
     canary_subnets: tuple[tuple[str, tuple[str, ...]], ...] = ()
     canary_security_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
     qualified_clusters: tuple[QualifiedKubernetesCluster, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.canary_use_spot, bool):
+        if (self.canary_use_spot is not None and
+                not isinstance(self.canary_use_spot, bool)):
             raise ValueError('EC2 canary Spot preference must be a boolean.')
         if (self.kind != RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY and
-                not self.canary_use_spot):
-            raise ValueError('Only EC2 runtime bindings accept an on-demand '
-                             'canary override.')
+                self.canary_use_spot is not None):
+            raise ValueError('Only EC2 runtime bindings accept a canary '
+                             'capacity preference.')
         object.__setattr__(
             self, 'id',
             validate_control_plane_identifier(self.id,
@@ -491,7 +492,7 @@ class RegistryAccessBinding:
     def fingerprint(self) -> str:
         payload = dataclasses.asdict(self)
         payload['kind'] = self.kind.value
-        if self.canary_use_spot:
+        if self.canary_use_spot is None:
             payload.pop('canary_use_spot')
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True,
@@ -764,7 +765,7 @@ class ManagedRegistryProfile:
                     for field in dataclasses.fields(value)
                 }
                 if (isinstance(value, RegistryAccessBinding) and
-                        value.canary_use_spot):
+                        value.canary_use_spot is None):
                     normalized.pop('canary_use_spot')
                 return normalized
             if isinstance(value, tuple):
@@ -796,6 +797,10 @@ class ManagedRegistryProfile:
         def binding(raw: dict[str, Any]) -> RegistryAccessBinding:
             payload = dict(raw)
             payload['kind'] = RegistryAccessBindingKind(payload['kind'])
+            if ('canary_use_spot' in payload and
+                    not isinstance(payload['canary_use_spot'], bool)):
+                raise ValueError(
+                    'EC2 canary Spot preference must be a boolean.')
             for field in ('purposes', 'principals', 'qualified_node_images'):
                 payload[field] = tuple(
                     tuple(item) if isinstance(item, list) else item

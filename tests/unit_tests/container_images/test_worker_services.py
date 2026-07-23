@@ -2026,11 +2026,11 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
                           (None, 'expected', 'QUALIFICATION_FAILED'),
                           ('x86_64', 'other', 'QUALIFICATION_FAILED'),
                           ('x86_64', None, 'QUALIFICATION_FAILED')))
-@pytest.mark.parametrize('use_spot', [True, False])
+@pytest.mark.parametrize('use_spot', [True, False, None])
 def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
         architecture: str | None, image_id_case: str | None,
-        expected_error: str | None, use_spot: bool) -> None:
+        expected_error: str | None, use_spot: bool | None) -> None:
     operation = _canary_operation()
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')

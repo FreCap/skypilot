@@ -147,6 +147,9 @@ def _binding_from_config(name: str,
                 any(not isinstance(items, list)
                     for items in canary_security_groups.values())):
             raise ValueError('EC2 canary network values must be lists.')
+        canary_use_spot = value.get('canary_use_spot', True)
+        if not isinstance(canary_use_spot, bool):
+            raise ValueError('EC2 canary Spot preference must be a boolean.')
         kwargs.update(
             principals=tuple(value.get('principals', ())),
             instance_profile=value.get('instance_profile'),
@@ -156,7 +159,7 @@ def _binding_from_config(name: str,
                        for region, ami in node_images.items())),
             canary_authority=value.get('canary_authority'),
             canary_instance_type=value.get('canary_instance_type'),
-            canary_use_spot=value.get('canary_use_spot', True),
+            canary_use_spot=canary_use_spot,
             canary_subnets=tuple(
                 sorted((str(region), tuple(str(item)
                                            for item in items))

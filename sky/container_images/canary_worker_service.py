@@ -790,7 +790,7 @@ def _run_ec2_canary_inner(
                 'SecurityGroupIds': list(
                     dict(binding.canary_security_groups)[target.region]),
             }
-            if binding.canary_use_spot:
+            if binding.canary_use_spot is True:
                 kwargs['InstanceMarketOptions'] = {
                     'MarketType': 'spot',
                     'SpotOptions': {

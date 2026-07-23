@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import pickle
 from typing import Any
 import uuid
@@ -101,19 +103,42 @@ def test_profile_snapshot_is_complete_deterministic_and_revalidated(
     assert restored.physical_manifest_hash == profile.physical_manifest_hash
     assert restored.canonical.target_fingerprint != (
         restored.targets[0].target_fingerprint)
+    snapshot_ec2 = next(binding for binding in snapshot['access_bindings']
+                        if binding['kind'] == 'aws_ec2_instance_identity')
+    assert snapshot_ec2['canary_use_spot'] is True
     assert all('canary_use_spot' not in binding
-               for binding in snapshot['access_bindings'])
+               for binding in snapshot['access_bindings']
+               if binding['kind'] != 'aws_ec2_instance_identity')
+
+    legacy = copy.deepcopy(snapshot)
+    legacy_ec2 = next(binding for binding in legacy['access_bindings']
+                      if binding['kind'] == 'aws_ec2_instance_identity')
+    legacy_ec2.pop('canary_use_spot')
+    legacy_profile = models.ManagedRegistryProfile.from_snapshot(legacy)
+    legacy_binding = legacy_profile.bindings['aws-vm-pullers']
+    assert legacy_binding.canary_use_spot is None
+    assert legacy_profile.to_snapshot() == legacy
+    assert legacy_binding.fingerprint == hashlib.sha256(
+        json.dumps(legacy_ec2, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+    assert legacy_profile.config_hash == hashlib.sha256(
+        json.dumps(legacy, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+    assert legacy_profile.config_hash != profile.config_hash
+    assert legacy_binding.fingerprint != profile.bindings[
+        'aws-vm-pullers'].fingerprint
 
     forged = copy.deepcopy(snapshot)
     forged['canonical']['registry'] = 'attacker.example'
     with pytest.raises(ValueError):
         models.ManagedRegistryProfile.from_snapshot(forged)
 
-    forged = copy.deepcopy(snapshot)
-    next(binding for binding in forged['access_bindings'] if binding['kind'] ==
-         'aws_ec2_instance_identity')['canary_use_spot'] = 1
-    with pytest.raises(ValueError, match='Spot preference'):
-        models.ManagedRegistryProfile.from_snapshot(forged)
+    for invalid_spot in (1, None):
+        forged = copy.deepcopy(snapshot)
+        next(binding for binding in forged['access_bindings'] if binding['kind']
+             == 'aws_ec2_instance_identity')['canary_use_spot'] = invalid_spot
+        with pytest.raises(ValueError, match='Spot preference'):
+            models.ManagedRegistryProfile.from_snapshot(forged)
 
     forged = copy.deepcopy(snapshot)
     next(binding for binding in forged['access_bindings'] if binding['kind'] !=
@@ -172,10 +197,12 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
     with pytest.raises(ValueError, match='principal ARN'):
         config.parse_access_bindings(invalid['access_bindings'])
 
-    invalid = copy.deepcopy(registry_config)
-    invalid['access_bindings']['aws-vm-pullers']['canary_use_spot'] = 1
-    with pytest.raises(ValueError, match='Spot preference'):
-        config.parse_access_bindings(invalid['access_bindings'])
+    for invalid_spot in (1, None, 'true'):
+        invalid = copy.deepcopy(registry_config)
+        invalid['access_bindings']['aws-vm-pullers'][
+            'canary_use_spot'] = invalid_spot
+        with pytest.raises(ValueError, match='Spot preference'):
+            config.parse_access_bindings(invalid['access_bindings'])
 
 
 def test_ec2_canary_spot_schema_accepts_boolean_only(
@@ -185,9 +212,11 @@ def test_ec2_canary_spot_schema_accepts_boolean_only(
     explicit['access_bindings']['aws-vm-pullers']['canary_use_spot'] = False
     jsonschema.validate(explicit, schema)
 
-    explicit['access_bindings']['aws-vm-pullers']['canary_use_spot'] = 1
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(explicit, schema)
+    for invalid_spot in (1, None, 'true'):
+        explicit['access_bindings']['aws-vm-pullers'][
+            'canary_use_spot'] = invalid_spot
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(explicit, schema)
 
 
 @pytest.mark.parametrize('architecture', [None, 'arm64'])
