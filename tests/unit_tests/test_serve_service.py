@@ -1245,7 +1245,7 @@ def test_reserve_controller_socket_is_exclusive_but_not_ready():
 @pytest.mark.parametrize(
     'start_method',
     [
-        method for method in ('fork', 'spawn')
+        method for method in ('fork', 'forkserver', 'spawn')
         if method in multiprocessing.get_all_start_methods()
     ],
 )
