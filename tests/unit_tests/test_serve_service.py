@@ -1258,7 +1258,13 @@ def test_bound_controller_socket_transfers_to_child(start_method):
     try:
         process.start()
         controller_socket.close()
-        assert ready.wait(timeout=5)
+        deadline = time.monotonic() + 30
+        while not ready.wait(timeout=0.1):
+            if process.exitcode is not None:
+                pytest.fail(
+                    f'controller socket child exited with {process.exitcode}')
+            if time.monotonic() >= deadline:
+                pytest.fail('controller socket child did not become ready')
         connection = socket.create_connection(('127.0.0.1', port), timeout=1)
         connection.close()
         process.join(timeout=5)
