@@ -122,6 +122,15 @@ take over after adoption. This prevents a live old fleet of 50 or 156 logical
 slots from restarting at 1 or 10 while still avoiding paid-demand inference
 from opportunistic fill.
 
+During a controller or load-balancer role handoff, a fresh report may
+conservatively mark every ready replica's async occupancy unknown. Unknown
+occupancy is a retention signal, not measured saturation. In logical mode its
+work floor is therefore the replica's utilization-adjusted capacity. The
+normal target calculation divides by that same capacity, preserving exactly
+the materialized slots without adding utilization headroom a second time.
+Known in-flight, queued, and rejected work retains the normal utilization
+margin. Physical-backend mode keeps its existing raw-capacity semantics.
+
 This total-capacity adoption flag is armed only by autoscaler construction. An
 ordinary in-process version update still resets the replacement target to its
 cold baseline and enters through the configured scale-up wave.
@@ -240,6 +249,9 @@ Unit regressions cover:
 - restart adoption uses total ready demand-owned capacity across old and latest
   versions while excluding reserved fill, retirement rows, and overlapping
   provisioning replacements;
+- a handoff snapshot that marks the whole logical fleet occupancy-unknown
+  retains exactly that fleet and does not manufacture a utilization-driven
+  scale-up, while known queued work still receives normal headroom;
 - production wave settings do not reduce the recovered target from 50 to 10;
 - exact-card shaping completes an already adopted target instead of returning
   an empty map, while the manager launches only the separately authorized
@@ -290,8 +302,12 @@ git diff --check
    version launches only one configured wave, rather than the full recovered
    target, and a second controller restart does not count pending replacements
    again as demand.
-6. Confirm request queue depth and rejections fall as ready capacity arrives.
-7. Confirm a valid later version applies normally after a quarantine.
+6. During the load-balancer handoff, confirm an all-replica unknown-occupancy
+   report holds the recovered target instead of raising it by the utilization
+   margin. Confirm the next known-idle report begins the normal downscale
+   delay.
+7. Confirm request queue depth and rejections fall as ready capacity arrives.
+8. Confirm a valid later version applies normally after a quarantine.
 
 Rollback the image if needed. The additive columns are harmless to the old
 binary, committed specs are unchanged, and an old binary will ignore quarantine
