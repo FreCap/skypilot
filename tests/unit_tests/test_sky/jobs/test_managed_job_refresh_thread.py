@@ -120,7 +120,7 @@ class TestSuicideOnLockLoss:
         any in-flight submit_jobs racing this path on another worker
         process short-circuits maybe_start_controllers rather than
         spawning a new controller that we'd then orphan."""
-        signal_file = tmp_path / 'restart_signal'
+        signal_file = tmp_path / 'missing-parent' / 'restart_signal'
         monkeypatch.setattr(mjrt.constants,
                             'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
                             str(signal_file))
@@ -141,6 +141,7 @@ class TestSuicideOnLockLoss:
             thread._suicide_on_lock_loss()
 
         assert signal_file.exists()
+        assert signal_file.parent.exists()
         # File must be created BEFORE kill_controllers and SIGTERM,
         # otherwise a fresh submit_jobs slipped in just before the
         # kill could still spawn a controller.
@@ -319,7 +320,7 @@ class TestBecomeLeaderOrdering:
 
     def test_signal_file_touched_before_lock_acquire(self, tmp_path,
                                                      monkeypatch):
-        signal_file = tmp_path / 'restart_signal'
+        signal_file = tmp_path / 'missing-parent' / 'restart_signal'
         monkeypatch.setattr(mjrt.constants,
                             'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
                             str(signal_file))
@@ -337,6 +338,8 @@ class TestBecomeLeaderOrdering:
         def on_acquire(*_args, **_kwargs):
             # The gate file must already be in place by the time we start
             # blocking on acquire — that is the whole point of the fix.
+            assert signal_file.parent.exists(), (
+                'signal file parent must exist before acquiring the lock')
             assert signal_file.exists(), (
                 'signal file must be touched before acquiring the lock')
             order.append('acquire')
@@ -362,6 +365,66 @@ class TestBecomeLeaderOrdering:
         assert order == ['acquire', 'sleep', 'recovery']
         # The finally block removes the gate file even when recovery fails.
         assert not signal_file.exists()
+        assert signal_file.parent.exists()
+
+    def test_run_missing_signal_parent_avoids_retry_backoff(
+            self, tmp_path, monkeypatch):
+        """A missing signal-file parent must not trap run() in retries.
+
+        The leader path should create the parent directory, acquire the lock,
+        run one event tick, and step down on the next lock probe. Falling into
+        the outer retry loop would sleep `_ACQUIRE_RETRY_INTERVAL_SECONDS`
+        instead and never reach lock.acquire().
+        """
+        signal_file = tmp_path / 'missing-parent' / 'restart_signal'
+        monkeypatch.setattr(mjrt.constants,
+                            'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
+                            str(signal_file))
+        monkeypatch.setattr(mjrt.managed_job_state,
+                            'has_jobs_requiring_recovery_grace_wait',
+                            lambda: False)
+
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        lock.is_locked.return_value = False
+        lock.is_session_alive.side_effect = [True, False]
+
+        sleep_calls = []
+        suicides = []
+
+        def on_sleep(seconds, *_args, **_kwargs):
+            sleep_calls.append(seconds)
+            if seconds == mjrt._ACQUIRE_RETRY_INTERVAL_SECONDS:
+                raise AssertionError(
+                    'run() took the retry backoff instead of becoming leader')
+
+        def on_suicide(_thread):
+            suicides.append(True)
+
+        with mock.patch('sky.utils.locks.get_lock', return_value=lock), \
+                mock.patch.object(
+                    mjrt.managed_job_utils,
+                    'ha_recovery_for_consolidation_mode'), \
+                mock.patch('sky.skylet.events.ManagedJobEvent') as event_cls, \
+                mock.patch.object(
+                    mjrt.ManagedJobRefreshDaemonThread,
+                    '_suicide_on_lock_loss',
+                    autospec=True,
+                    side_effect=on_suicide), \
+                mock.patch.object(
+                    mjrt.time,
+                    'monotonic',
+                    side_effect=[0, 0, mjrt._LOCK_PROBE_INTERVAL_SECONDS]), \
+                mock.patch.object(mjrt.time, 'sleep', side_effect=on_sleep):
+            thread.run()
+
+        lock.acquire.assert_called_once_with()
+        assert sleep_calls == [1]
+        event_cls.return_value.run.assert_called_once_with()
+        assert suicides == [True]
+        assert signal_file.parent.exists()
 
     def test_skips_wait_when_no_jobs_require_grace_period(
             self, tmp_path, monkeypatch):
