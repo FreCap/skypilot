@@ -3894,6 +3894,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'version {version}, generation '
                         f'{reconcile_generation}.')
             return
+        if launch_budget is not None and launch_budget < 0:
+            logger.warning('Discarding logical scale-up with negative launch '
+                           f'budget {launch_budget}.')
+            return
+        if launch_budget == 0:
+            logger.info('Deferring logical scale-up until the current launch '
+                        'wave has remaining authority.')
+            return
         snapshot = self._logical_reconcile_snapshot
         assert snapshot is not None
         # An unknown backend may have recovered while this decision waited for
@@ -3949,11 +3957,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             accelerator_shapes: dict[str, int] | None = None,
             launch_budget: int | None = None) -> None:
         """Persist complete shapes while the global demand lock is held."""
-
-        if launch_budget is not None and launch_budget < 0:
-            logger.warning('Discarding logical scale-up with negative launch '
-                           f'budget {launch_budget}.')
-            return
 
         uses_shared_capacity = self._uses_shared_zero_cost_demand_budget()
         infos_by_service = None
@@ -4066,7 +4069,6 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         committed = _committed_capacity(snapshot)
         committed_by_card = _committed_by_card(snapshot)
-        initial_committed = committed
         zero_cost_demand_budget = None
         if infos_by_service is not None:
             capacity_replica_infos = [
@@ -4086,6 +4088,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         paid_location_launch_budget = self._build_paid_location_launch_budget(
             existing_replica_infos)
         deferred_cards: set[str] = set()
+        launched_capacity = 0
         while True:
             if not self._logical_target_fence_holds(
                     version,
@@ -4102,7 +4105,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             committed = _committed_capacity(current_snapshot)
             committed_by_card = _committed_by_card(current_snapshot)
             if (launch_budget is not None and
-                    committed - initial_committed >= launch_budget):
+                    launched_capacity >= launch_budget):
                 break
             selected_card = None
             if card_targets:
@@ -4154,6 +4157,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info('Logical scale-up made no placement progress; '
                             'retrying on the next reconciliation tick.')
                 break
+            launched_capacity += sum(
+                max(1, int(getattr(info, 'planned_capacity', 1)))
+                for info in existing_replica_infos[before:])
 
     def notify_version_pending(self, version: int) -> None:
         with self._logical_state_lock:

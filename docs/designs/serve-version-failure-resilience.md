@@ -113,9 +113,14 @@ scale-up decision carries a separate latest-version launch-capacity ceiling.
 That ceiling is the latest version's already committed capacity plus the
 current configured rollout wave. The replica manager checks the full aggregate
 and exact-card generation fence, but stops launching when the separate ceiling
-is reached. Subsequent ticks inside the wave cooldown retain the same ceiling;
-the next elapsed wave advances it. Whole multi-GPU backends may round one wave
-up by at most one backend width.
+is reached. Subsequent ticks inside the wave cooldown retain the same ceiling
+and can spend any authority left unused by lock contention or failed
+placement. Zero-authority ticks return before taking the global shared-capacity
+lock. The manager accounts the planned width of rows it actually appends, not
+concurrent load-balancer snapshot changes. The next elapsed wave advances the
+ceiling. Whole multi-GPU backends may round one wave up by at most one backend
+width. Degraded unknown-capacity replacements share this same wave budget with
+ordinary rollout launches.
 
 Configured waves therefore continue to limit replacement launches even when
 restart adoption already holds a much larger aggregate target. They do not

@@ -3439,6 +3439,103 @@ class TestLogicalCapacityPlanning:
         assert build_zero_cost_budget.call_args.kwargs[
             'demand_count_override'] == 10
 
+    def test_logical_scale_up_zero_budget_skips_shared_capacity_lock(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 7, 50, (('L4', 50),), (('L4', 1),))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
+
+        with mock.patch.object(replica_managers.locks,
+                               'get_lock') as get_lock, \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_grouped') as grouped:
+            mgr.scale_up_to_logical_capacity(
+                target_capacity=50,
+                version=1,
+                reconcile_generation=7,
+                target_capacity_by_accelerator={'L4': 50},
+                accelerator_shapes={'L4': 1},
+                launch_budget=0)
+
+        get_lock.assert_not_called()
+        grouped.assert_not_called()
+
+    def test_logical_launch_budget_counts_appended_width_not_snapshot_drift(
+            self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        old = mock.Mock(replica_id=100,
+                        is_terminal=False,
+                        is_ready=True,
+                        version=1,
+                        planned_capacity=1,
+                        resources_override={'accelerators': {
+                            'L4': 1
+                        }})
+        old.status_property.is_scale_down = False
+        old.get_spot_location.return_value = None
+        existing = [old]
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={100: 0},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 7, 5)
+        launched_ids = []
+
+        def _append_one(_resources_override, _used_ids, infos, _budget,
+                        logical_reconcile_fence):
+            assert logical_reconcile_fence == (1, 7, 5)
+            if not launched_ids:
+                # Concurrent LB publication makes an existing ready row gain
+                # one observed slot. That is not launch progress for this
+                # manager call and must not consume its budget.
+                mgr._logical_reconcile_snapshot = (
+                    replica_managers.LogicalReconcileSnapshot(
+                        version=1,
+                        generation=7,
+                        observed_slots_by_replica_id={100: 1},
+                        in_flight_by_replica_id={},
+                        unknown_replica_ids=frozenset(),
+                        received_at=replica_managers.time.monotonic()))
+            replica_id = 101 + len(launched_ids)
+            launched_ids.append(replica_id)
+            info = mock.Mock(replica_id=replica_id,
+                             is_terminal=False,
+                             is_ready=False,
+                             version=1,
+                             planned_capacity=1,
+                             resources_override=None)
+            info.status_property.is_scale_down = False
+            info.get_spot_location.return_value = None
+            infos.append(info)
+            return True
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=existing), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_append_one):
+            mgr.scale_up_to_logical_capacity(target_capacity=5,
+                                             version=1,
+                                             reconcile_generation=7,
+                                             launch_budget=2)
+
+        assert launched_ids == [101, 102]
+
     def test_saturated_exact_card_does_not_block_other_card_target(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
