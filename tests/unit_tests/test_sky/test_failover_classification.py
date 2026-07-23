@@ -155,6 +155,31 @@ def test_placement_outcome_ignores_non_capacity_codes():
                          'UNSUPPORTED_OPERATION')) == 'failed'
 
 
+def test_placement_outcome_keeps_heterogeneous_aggregate_conservative():
+    # AWS retries every subnet and appends one entry per distinct failure, so
+    # a batch mixing capacity with an unrelated error is not exhaustion.
+    assert backend._placement_outcome(
+        _aggregate_error('InvalidParameterValue',
+                         'InsufficientInstanceCapacity')) == 'failed'
+    assert backend._placement_outcome(
+        _aggregate_error('InsufficientInstanceCapacity',
+                         'InsufficientInstanceCapacity')) == 'capacity_failed'
+
+
+def test_placement_outcome_ignores_summary_only_batch():
+    assert backend._placement_outcome(
+        _aggregate_error('VM_MIN_COUNT_NOT_REACHED')) == 'failed'
+
+
+def test_placement_outcome_separates_tpu_quota_from_tpu_capacity():
+    # sky/provision/gcp/tpu_node.py raises RESOURCE_EXHAUSTED for quota
+    # exhaustion and CapacityExceeded for an exhausted zone.
+    assert backend._placement_outcome(
+        _aggregate_error('RESOURCE_EXHAUSTED')) == 'quota_failed'
+    assert backend._placement_outcome(
+        _aggregate_error('CapacityExceeded')) == 'capacity_failed'
+
+
 def test_gcp_capacity_codes_do_not_reach_the_aws_capacity_cache():
     # The wider placement set must not leak into the AWS-only cache gate.
     assert backend._classify_capacity_error(

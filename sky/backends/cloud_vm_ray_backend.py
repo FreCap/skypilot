@@ -815,6 +815,9 @@ _PROVIDER_QUOTA_ERROR_CODES = _QUOTA_ERROR_CODES | frozenset({
     'QUOTA_EXCEEDED',
     'quotaExceeded',
     'type.googleapis.com/google.rpc.QuotaFailure',
+    # The only producer, `sky/provision/gcp/tpu_node.py`, raises this for TPU
+    # quota exhaustion, not for an exhausted pool.
+    'RESOURCE_EXHAUSTED',
 })
 # Codes that identify physical capacity exhaustion across providers, used to
 # label recorded placement outcomes. This is deliberately wider than
@@ -822,12 +825,21 @@ _PROVIDER_QUOTA_ERROR_CODES = _QUOTA_ERROR_CODES | frozenset({
 # AWS capacity cache. UNSUPPORTED_OPERATION is excluded: the failover zone
 # blocker treats it as capacity-like, but it is observed on preemption during
 # creation rather than on an exhausted pool.
+# NOTE(fcapponi): GCP also reports zonal TPU exhaustion as the bare numeric
+# operation code 8, which `_provider_error_codes` stringifies to '8'. That
+# token is too collision-prone to put in a cross-provider set; recognizing it
+# needs provider-scoped normalization first.
 _PLACEMENT_CAPACITY_ERROR_CODES = _CAPACITY_ERROR_CODES | frozenset({
     'ZONE_RESOURCE_POOL_EXHAUSTED',
     'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
-    'RESOURCE_EXHAUSTED',
     'insufficientCapacity',
+    'CapacityExceeded',
 })
+# Codes that report that a request failed without saying why. They are dropped
+# before classification so that a provider which pairs a summary code with the
+# causal one still classifies, while a genuinely unknown code keeps the
+# conservative outcome.
+_NEUTRAL_PLACEMENT_ERROR_CODES = frozenset({'VM_MIN_COUNT_NOT_REACHED'})
 
 
 def _record_capacity_metric(reason: str, action: str) -> None:
@@ -1067,8 +1079,16 @@ def _placement_outcome(error: Exception,
     # the generic VM_MIN_COUNT_NOT_REACHED summary ahead of the code that
     # says why the minimum was not reached. Quota is checked above, so a
     # mixed batch still reports the regional quota denial.
-    if any(code in _PLACEMENT_CAPACITY_ERROR_CODES
-           for code in _provider_error_codes(error)):
+    #
+    # Requiring every remaining code to be a capacity code keeps the
+    # conservative reading of a heterogeneous batch: AWS retries each subnet
+    # and appends one entry per distinct failure, so an aggregate that mixes
+    # capacity with an unrelated error is not capacity exhaustion.
+    codes = [
+        code for code in _provider_error_codes(error)
+        if code not in _NEUTRAL_PLACEMENT_ERROR_CODES
+    ]
+    if codes and all(code in _PLACEMENT_CAPACITY_ERROR_CODES for code in codes):
         return 'capacity_failed'
     return 'failed'
 
