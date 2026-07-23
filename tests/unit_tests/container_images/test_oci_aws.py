@@ -717,7 +717,10 @@ def test_ecr_role_acquisition_fences_actual_sts_boundary(
                                  session_name='test',
                                  catalog_tag='catalog',
                                  profile_tag='profile')
-    lost = mock.Mock(side_effect=RuntimeError('lease lost at STS boundary'))
+    lost = mock.Mock(side_effect=[
+        None,
+        RuntimeError('lease lost at STS boundary'),
+    ])
 
     with pytest.raises(RuntimeError, match='lease lost at STS boundary'):
         aws.EcrRepository.from_role(binding,
@@ -727,7 +730,8 @@ def test_ecr_role_acquisition_fences_actual_sts_boundary(
     session.assert_called_once_with(profile=None)
     ambient_session.client.assert_called_once_with('sts',
                                                    region_name='us-east-1')
-    lost.assert_called_once_with()
+    assert lost.call_count == 2
+    lost.assert_has_calls([mock.call(), mock.call()])
     sts.assume_role.assert_not_called()
 
 
