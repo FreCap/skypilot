@@ -3353,6 +3353,9 @@ class SkyServeController:
                                     'replace_unknown_replica_ids'] = (
                                         logical_target.
                                         replace_unknown_replica_ids)
+                            if logical_target.launch_budget is not None:
+                                replacement_kwargs['launch_budget'] = (
+                                    logical_target.launch_budget)
                             if logical_target.target_capacity_by_accelerator:
                                 replacement_kwargs[
                                     'target_capacity_by_accelerator'] = dict(

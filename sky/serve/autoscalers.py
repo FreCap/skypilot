@@ -57,6 +57,7 @@ class LogicalScaleTarget:
     target_capacity_by_accelerator: tuple[tuple[str, int], ...] = ()
     accelerator_shapes: tuple[tuple[str, int], ...] = ()
     replace_unknown_replica_ids: tuple[int, ...] = ()
+    launch_budget: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4436,15 +4437,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 getattr(info.status_property, 'is_scale_down', False)
                 is not True and not getattr(info, 'reserved_fill', False)))
 
-    def _total_demand_owned_logical_capacity(
+    def _total_ready_demand_owned_logical_capacity(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> int:
-        """Demand-owned planned slots across every active rollout version."""
+        """Ready demand-owned slots across every active rollout version."""
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
-            if (not info.is_terminal and getattr(
+            if (info.is_ready and not info.is_terminal and getattr(
                 info.status_property, 'is_scale_down', False) is not True and
                 not getattr(info, 'reserved_fill', False)))
 
@@ -5304,7 +5305,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # tiny target and retire the whole live fleet in one tick. Do not
             # repeat this after the one-shot snap: an adopted downscale target
             # must remain below committed capacity while retirement catches up.
-            committed = self._total_demand_owned_logical_capacity(replica_infos)
+            committed = self._total_ready_demand_owned_logical_capacity(
+                replica_infos)
             self.target_num_replicas = max(
                 self.target_num_replicas,
                 self._clip_concurrency_demand_target(committed))
@@ -6017,16 +6019,26 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if card is not None:
                 committed_by_card[card] = (committed_by_card.get(card, 0) +
                                            self._committed_capacity(info))
+        launch_budget = self._logical_actuation_wave_budget
+        launch_authority_left = launch_budget
         if use_card_targets:
-            self.cold_launch_authority_by_accelerator = {
-                card: card_target - committed_by_card.get(card, 0)
-                for card, card_target in target_by_card.items()
-                if committed_by_card.get(card, 0) < card_target
-            }
+            for card, card_target in target_by_card.items():
+                shortage = max(0, card_target - committed_by_card.get(card, 0))
+                if launch_authority_left is not None:
+                    shortage = min(shortage, launch_authority_left)
+                    launch_authority_left -= shortage
+                if shortage > 0:
+                    self.cold_launch_authority_by_accelerator[card] = shortage
         card_shortage = (use_card_targets and any(
             committed_by_card.get(card, 0) < card_target
             for card, card_target in target_by_card.items()))
         if committed < target or card_shortage:
+            if launch_budget is not None and launch_budget > 0:
+                # Completing the full exact-card fence can consume the map's
+                # transition delta in the first restart tick. Later launch
+                # waves still need to advance the cooldown when they are
+                # authorized, even though that complete map no longer changes.
+                self._last_scale_up_wave_at = time.time()
             replace_unknown_replica_ids = tuple(
                 sorted(info.replica_id
                        for info in latest_nonterminal_replicas
@@ -6041,6 +6053,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         version=self.latest_version,
                         reconcile_generation=self._reconcile_generation,
                         target_capacity=target,
+                        launch_budget=launch_budget,
                         target_capacity_by_accelerator=tuple(
                             target_by_card.items()) if use_card_targets else (),
                         accelerator_shapes=tuple(

@@ -77,12 +77,16 @@ This covers a capped queue without making queue saturation itself an authority
 switch. Queue saturation is an observed reason to scale the active runtime,
 not permission to select arbitrary historical configuration.
 
-### Restart adoption from total demand-owned capacity
+### Restart adoption from total ready demand-owned capacity
 
 On the first fresh concurrency recompute after controller construction, the
-aggregate target is seeded from demand-owned logical capacity across every
-nonterminal replica row, not only the latest version. Reserved-fill capacity
-and rows already marked for logical retirement remain excluded.
+aggregate target is seeded from ready demand-owned logical capacity across
+every version, not only the latest version. Reserved-fill capacity and rows
+already marked for logical retirement remain excluded. Provisioning rows are
+also excluded from this restart seed: during a rolling update they overlap the
+old ready fleet and summing both versions would turn replacement work into new
+demand on every controller deploy. The manager still counts those rows for
+duplicate-launch suppression.
 
 The recovered total is bounded by `max_replicas`. It is a one-shot upward
 safety floor, not a fresh demand sample and not permission to downscale. The
@@ -95,7 +99,7 @@ This total-capacity adoption flag is armed only by autoscaler construction. An
 ordinary in-process version update still resets the replacement target to its
 cold baseline and enters through the configured scale-up wave.
 
-### Exact-card actuation continuity
+### Exact-card actuation continuity and bounded replacement launches
 
 Once an aggregate target is adopted, exact-card transition shaping must not
 return an empty actuation map merely because the latest-version committed
@@ -104,9 +108,18 @@ complete active fleet may provide transitional exact-card evidence, and the
 actuation map is completed up to the adopted aggregate target. It remains
 bounded by that target and `max_replicas`; it cannot create additional demand.
 
-Configured waves continue to limit a newly adopted increase. They do not
-revoke capacity that restart adoption or an earlier demand decision already
-holds.
+The complete exact-card map is a safety fence, not launch authority. A logical
+scale-up decision carries a separate latest-version launch-capacity ceiling.
+That ceiling is the latest version's already committed capacity plus the
+current configured rollout wave. The replica manager checks the full aggregate
+and exact-card generation fence, but stops launching when the separate ceiling
+is reached. Subsequent ticks inside the wave cooldown retain the same ceiling;
+the next elapsed wave advances it. Whole multi-GPU backends may round one wave
+up by at most one backend width.
+
+Configured waves therefore continue to limit replacement launches even when
+restart adoption already holds a much larger aggregate target. They do not
+revoke old-version capacity or weaken the aggregate retirement fence.
 
 ### Ingress-port compatibility
 
@@ -187,11 +200,13 @@ Unit regressions cover:
 - a newer commit supersedes a quarantined version;
 - controller recovery selects the newest non-quarantined committed version;
 - version history and update status surface quarantine metadata;
-- restart adoption uses total demand-owned capacity across old and latest
-  versions while excluding reserved fill and retirement rows;
+- restart adoption uses total ready demand-owned capacity across old and latest
+  versions while excluding reserved fill, retirement rows, and overlapping
+  provisioning replacements;
 - production wave settings do not reduce the recovered target from 50 to 10;
 - exact-card shaping completes an already adopted target instead of returning
-  an empty map;
+  an empty map, while the manager launches only the separately authorized
+  latest-version wave;
 - the rolling-update regression enables the production wave limiter.
 
 Run:
@@ -234,7 +249,10 @@ git diff --check
    controller does not retry it, and the old service scales under queued load.
 5. Restart a controller with old-version demand-owned capacity above one wave.
    Confirm its first logical target starts at total demand-owned capacity and
-   does not descend to the minimum or first wave.
+   does not descend to the minimum or first wave. Confirm the replacement
+   version launches only one configured wave, rather than the full recovered
+   target, and a second controller restart does not count pending replacements
+   again as demand.
 6. Confirm request queue depth and rejections fall as ready capacity arrives.
 7. Confirm a valid later version applies normally after a quarantine.
 
