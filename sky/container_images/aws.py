@@ -738,6 +738,8 @@ def assumed_client(
     }
     if binding.external_id is not None:
         assume_kwargs['ExternalId'] = binding.external_id
+    if provider_fence is not None:
+        provider_fence()
     # Worker pods receive a dedicated workload identity (for example, IRSA).
     # Do not inherit the API server's workspace-level AWS profile here: that
     # profile can name a credentials-file entry which is intentionally absent

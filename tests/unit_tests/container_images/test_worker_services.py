@@ -2743,15 +2743,15 @@ def test_lifecycle_lease_loss_before_sts_blocks_credential_acquisition(
 
     monkeypatch.setattr(lifecycle_worker_service, '_LeaseHeartbeat',
                         LosingHeartbeat)
-    sts = mock.Mock()
-    monkeypatch.setattr(lifecycle_worker_service.aws.aws_adaptor, 'client',
-                        lambda _service: sts)
+    session = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.aws.aws_adaptor, 'session',
+                        session)
 
     with pytest.raises(worker_lease.LeaseLostError,
                        match='lease lost before STS'):
         lifecycle_worker_service.evict_location(location, mock.Mock())
 
-    sts.assume_role.assert_not_called()
+    session.assert_not_called()
 
 
 def test_copy_and_inventory_use_operational_revision_not_newer_candidate(
