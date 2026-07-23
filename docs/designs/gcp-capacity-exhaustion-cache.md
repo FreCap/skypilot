@@ -60,17 +60,30 @@ failures take the conservative failover path. GCP breaks that rule benignly: it
 always emits `VM_MIN_COUNT_NOT_REACHED` as a summary alongside the code that
 explains the cause. Treating it as unknown would mean GCP never classifies.
 
-Introduce an explicit neutral set, currently `{'VM_MIN_COUNT_NOT_REACHED'}`,
-that is filtered out before the all-known check. The check then applies to the
-remaining codes, and an empty remainder stays unclassified. This keeps the
-conservative default for genuinely unknown codes while letting the informative
-GCP code decide.
+PR #874 already introduced the neutral set `_NEUTRAL_PLACEMENT_ERROR_CODES`,
+currently `{'VM_MIN_COUNT_NOT_REACHED'}`, and applies it in `_placement_outcome`
+by filtering neutral codes and then requiring every remaining code to be a
+capacity code. `_classify_capacity_error` reuses that same set and discipline,
+so an empty remainder stays unclassified and a genuinely unknown code keeps the
+conservative path.
+
+The all-remaining-must-match rule matters beyond GCP: the AWS provisioner
+retries each subnet and appends one entry per distinct failure, so an aggregate
+mixing capacity with an unrelated error must not be read as exhaustion.
 
 The GCP capacity codes are `ZONE_RESOURCE_POOL_EXHAUSTED`,
-`ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS` and `insufficientCapacity`.
-`UNSUPPORTED_OPERATION` is excluded: the failover zone blocker treats it as
-capacity-like, but it is observed on preemption during creation rather than an
-exhausted pool, and suppressing future launches on it would be wrong.
+`ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS`, `insufficientCapacity` and, for
+TPU, `CapacityExceeded`. Two exclusions are deliberate. `UNSUPPORTED_OPERATION`
+is observed on preemption during creation rather than an exhausted pool, so
+suppressing future launches on it would be wrong. `RESOURCE_EXHAUSTED` is TPU
+*quota* exhaustion in its only producer, `sky/provision/gcp/tpu_node.py`, and is
+classified as quota rather than capacity.
+
+One gap stays open. GCP also reports zonal exhaustion as the bare numeric
+operation code 8, which `_provider_error_codes` stringifies to `'8'`. That token
+is too collision-prone for a cross-provider set, so recognizing it requires
+provider-scoped normalization rather than a raw set entry. Until that lands,
+those failures take the conservative path and are simply not cached.
 
 ### Key identity
 
