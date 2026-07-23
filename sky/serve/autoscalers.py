@@ -3546,10 +3546,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             getattr(spec, 'target_utilization_percentage', 100))
         self.expected_request_duration_seconds: float | None = getattr(
             spec, 'expected_request_duration_seconds', None)
-        self.provision_lead_time_seconds: float | None = getattr(
-            spec, 'provision_lead_time_seconds', None)
+        self.initial_provision_lead_time_seconds: float | str | None = getattr(
+            spec, 'initial_provision_lead_time_seconds', None)
         self.adaptive_demand_estimation: bool = (getattr(
-            spec, 'adaptive_demand_estimation', False) is True)
+            spec, 'adaptive_demand_estimation', True) is not False)
         # Live demand-estimation state. Both estimators supersede their
         # configured counterpart only while they hold enough fresh evidence;
         # configuration remains the fallback and the cold-start value.
@@ -4501,8 +4501,24 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return self.expected_request_duration_seconds
 
     @property
+    def configured_provision_lead_seconds(self) -> float:
+        """Resolve the configured seed, including the 'auto' sentinel.
+
+        'auto' (the default) means the service has not declared a lead and
+        wants one measured. Until it has, assume the order of magnitude
+        every supported cloud actually takes to provision a GPU replica:
+        assuming zero would size a young service's first bursts as if
+        capacity were instant.
+        """
+        configured = self.initial_provision_lead_time_seconds
+        if isinstance(configured,
+                      (int, float)) and not isinstance(configured, bool):
+            return float(configured)
+        return constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS
+
+    @property
     def effective_provision_lead_seconds(self) -> float:
-        """Observed launch-to-ready quantile, falling back to configuration."""
+        """Observed launch-to-ready quantile, falling back to the seed."""
         if (self.adaptive_demand_estimation and
                 len(self._provision_lead_samples)
                 >= constants.AUTOSCALER_ADAPTIVE_LEAD_MIN_SAMPLES and
@@ -4512,7 +4528,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 len(ordered) - 1,
                 int(constants.AUTOSCALER_ADAPTIVE_LEAD_QUANTILE * len(ordered)))
             return ordered[index]
-        return self.provision_lead_time_seconds or 0.0
+        return self.configured_provision_lead_seconds
 
     def _ingest_prediction_time_history(self,
                                         prediction_time_history: Any) -> None:
@@ -5917,12 +5933,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             getattr(spec, 'target_utilization_percentage', 100))
         self.expected_request_duration_seconds = getattr(
             spec, 'expected_request_duration_seconds', None)
-        self.provision_lead_time_seconds = getattr(
-            spec, 'provision_lead_time_seconds', None)
+        self.initial_provision_lead_time_seconds = getattr(
+            spec, 'initial_provision_lead_time_seconds', None)
         # Measurements describe the workload, not the spec revision, so an
         # update keeps them. Disabling the feature must take effect at once.
         self.adaptive_demand_estimation = (getattr(
-            spec, 'adaptive_demand_estimation', False) is True)
+            spec, 'adaptive_demand_estimation', True) is not False)
         self.max_scale_up_rate_percentage = getattr(
             spec, 'max_scale_up_rate_percentage', None)
         self.scale_up_rate_min_replicas = getattr(spec,

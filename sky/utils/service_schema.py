@@ -285,9 +285,14 @@ def get_service_schema():
                         'type': 'number',
                         'exclusiveMinimum': 0,
                     },
-                    'provision_lead_time_seconds': {
-                        'type': 'number',
-                        'minimum': 0,
+                    'initial_provision_lead_time_seconds': {
+                        'anyOf': [{
+                            'type': 'number',
+                            'minimum': 0,
+                        }, {
+                            'type': 'string',
+                            'enum': ['auto'],
+                        }],
                     },
                     'adaptive_demand_estimation': {
                         'type': 'boolean',

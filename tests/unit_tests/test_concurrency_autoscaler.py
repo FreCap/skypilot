@@ -33,7 +33,7 @@ def _spec(knob=1.0,
           replica_unit='physical_backend',
           target_utilization_percentage=100,
           expected_request_duration_seconds=None,
-          provision_lead_time_seconds=None,
+          initial_provision_lead_time_seconds=None,
           adaptive_demand_estimation=None,
           max_scale_up_rate_percentage=None,
           scale_up_rate_min_replicas=None,
@@ -57,7 +57,8 @@ def _spec(knob=1.0,
         replica_unit=replica_unit,
         target_utilization_percentage=target_utilization_percentage,
         expected_request_duration_seconds=expected_request_duration_seconds,
-        provision_lead_time_seconds=provision_lead_time_seconds,
+        initial_provision_lead_time_seconds=(
+            initial_provision_lead_time_seconds),
         adaptive_demand_estimation=adaptive_demand_estimation,
         max_scale_up_rate_percentage=max_scale_up_rate_percentage,
         scale_up_rate_min_replicas=scale_up_rate_min_replicas,
@@ -486,6 +487,9 @@ class TestTargetMath(unittest.TestCase):
             replica_unit='logical',
             target_utilization_percentage=90,
             expected_request_duration_seconds=30,
+            # Opt out of the assumed provisioning lead to exercise pure
+            # deadline discounting.
+            initial_provision_lead_time_seconds=0,
             lb_request_queue={
                 'timeout_seconds': 20,
                 'timeout_seconds_by_priority': [{
@@ -511,6 +515,42 @@ class TestTargetMath(unittest.TestCase):
         self.assertEqual(autoscaler._weighted_queue_work, 10)
         self.assertEqual(autoscaler.target_num_replicas, 12)
 
+    def test_default_assumed_lead_removes_deadline_discount(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=30,
+            lb_request_queue={
+                'timeout_seconds': 20,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 0,
+                    'timeout_seconds': 600,
+                }, {
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=110,
+                queue_depth_by_priority={
+                    0: 100,
+                    50: 10,
+                })
+
+        self._recompute(autoscaler, [])
+
+        # The default assumes a 600s provisioning lead, which consumes the
+        # whole 600s timeout budget: every queued request must be planned
+        # for now, not discounted against a deadline that new capacity
+        # cannot meet.
+        self.assertEqual(autoscaler.configured_provision_lead_seconds,
+                         constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS)
+        self.assertEqual(autoscaler._weighted_queue_work, 110)
+
     def test_provision_lead_shrinks_queue_patience(self):
         autoscaler = _make_autoscaler(
             knob=1,
@@ -518,7 +558,7 @@ class TestTargetMath(unittest.TestCase):
             replica_unit='logical',
             target_utilization_percentage=100,
             expected_request_duration_seconds=30,
-            provision_lead_time_seconds=540,
+            initial_provision_lead_time_seconds=540,
             lb_request_queue={
                 'timeout_seconds': 20,
                 'timeout_seconds_by_priority': [{
@@ -5319,12 +5359,12 @@ class TestAdaptiveDemandEstimation(unittest.TestCase):
     @staticmethod
     def _autoscaler(**kwargs):
         kwargs.setdefault('adaptive_demand_estimation', True)
+        kwargs.setdefault('initial_provision_lead_time_seconds', 540)
         return _make_autoscaler(knob=1,
                                 min_replicas=0,
                                 max_replicas=1000,
                                 replica_unit='logical',
                                 expected_request_duration_seconds=30,
-                                provision_lead_time_seconds=540,
                                 **kwargs)
 
     # Bucket index 8 has upper bound 60s; index 7 is 30s.
@@ -5406,6 +5446,44 @@ class TestAdaptiveDemandEstimation(unittest.TestCase):
 
         self.assertEqual(autoscaler._measured_duration_samples, 0)
         self.assertEqual(autoscaler.effective_request_duration_seconds, 30)
+
+    def test_auto_seed_is_used_until_enough_samples(self):
+        autoscaler = self._autoscaler(
+            initial_provision_lead_time_seconds='auto')
+
+        self.assertEqual(autoscaler.effective_provision_lead_seconds,
+                         constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS)
+
+        replicas = []
+        for index in range(8):
+            replica = _replica(index + 1)
+            replica.created_at = 1000.0
+            replica.status_property.first_ready_time = 1000.0 + 60 * (index + 1)
+            replicas.append(replica)
+        autoscaler._observe_provision_leads(replicas)
+
+        # Measurement replaces the assumption once the service has proven
+        # its own launch latency.
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 420.0)
+
+    def test_unset_lead_defaults_to_auto_seed(self):
+        autoscaler = self._autoscaler(initial_provision_lead_time_seconds=None)
+
+        self.assertEqual(autoscaler.effective_provision_lead_seconds,
+                         constants.AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS)
+
+    def test_explicit_zero_lead_is_honored(self):
+        autoscaler = self._autoscaler(initial_provision_lead_time_seconds=0)
+
+        # An explicit 0 is a declaration, not an absent value.
+        self.assertEqual(autoscaler.effective_provision_lead_seconds, 0.0)
+
+    def test_adaptive_estimation_is_on_by_default(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      replica_unit='logical',
+                                      expected_request_duration_seconds=30)
+
+        self.assertTrue(autoscaler.adaptive_demand_estimation)
 
     def test_measured_lead_supersedes_config(self):
         autoscaler = self._autoscaler()

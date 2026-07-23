@@ -528,6 +528,13 @@ DEFAULT_READINESS_PROBE_TIMEOUT_SECONDS = 15
 # Adaptive demand estimation. Measured request duration and provisioning
 # lead supersede their configured values once enough live evidence exists,
 # so a stale hand-set number cannot silently mis-size the fleet forever.
+# Seed used while a service has not yet measured its own launch-to-ready
+# time (`initial_provision_lead_time_seconds: auto`). Provisioning a GPU
+# replica takes minutes on every supported cloud, so assuming zero would
+# size the first bursts of a service's life as if capacity were instant.
+AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS = 600.0
+# Sentinel accepted by initial_provision_lead_time_seconds.
+AUTOSCALER_PROVISION_LEAD_AUTO = 'auto'
 # Minimum completed requests before a measured duration is trusted. One
 # decision tick of a small fleet should not redefine the sizing constant.
 AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES = 20

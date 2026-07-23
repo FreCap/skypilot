@@ -34,12 +34,17 @@ Four structural causes:
 ## Behavior contract
 
 1. **Queue work is weighted by the *remaining* SLA budget after capacity
-   lands.** With the new `replica_policy.provision_lead_time_seconds` knob
-   (default 0 = current behavior), the weight becomes
-   `min(1, duration / max(duration, timeout - lead))`. A 600 s-timeout
+   lands.** The weight becomes
+   `min(1, duration / max(duration, timeout - lead))`, where `lead` comes
+   from `replica_policy.initial_provision_lead_time_seconds`. A 600 s-timeout
    request with a 540 s lead counts as 0.5 replicas, not 0.05. This orders
    capacity ahead of saturation, which on gradually rising load keeps the
-   queue away from its cap entirely.
+   queue away from its cap entirely. The knob defaults to `auto`, which is
+   defined by the follow-up
+   [adaptive demand estimation](serve-adaptive-demand-estimation.md)
+   design: assume 10 minutes until the service measures its own launch
+   latency. An explicit number pins the lead; an explicit `0` restores the
+   pre-existing deadline-discounting behavior.
 2. **The scale-up target ceiling counts the whole fleet.** The aggregate
    ceiling (`committed + budget`) uses non-terminal, non-retiring capacity
    across *all* versions, so a saturated old-version fleet can grow to meet
@@ -114,8 +119,8 @@ with all failure rates roughly doubled. When provisioning latency exceeds
 the SLA budget, reactive scaling cannot save a burst's front edge; only warm
 headroom (`min_replicas` / overprovision) or shorter provisioning can.
 Operators should set `expected_request_duration_seconds` honestly (the
-fleet's 30 s vs observed ~45-60 s under-sizes every estimate) and set
-`provision_lead_time_seconds` to the observed p75 launch-to-ready time.
+fleet's 30 s vs observed ~45-60 s under-sizes every estimate). The lead is
+measured rather than configured; see the adaptive design.
 
 ## Alternatives considered
 
@@ -162,7 +167,10 @@ that requests dispatch before their priority timeout.
 ## Rollout
 
 The wave-base and plateau fixes are default-on behavior fixes confined to
-the controller's autoscaler. The knob defaults to 0 (no sizing change) so
-other services are unaffected until they opt in; boltz-l4-fleet sets
-`provision_lead_time_seconds: 540` in its next fleet update. No API version
-bump and no load balancer changes.
+the controller's autoscaler. The lead knob's default (`auto`, and therefore
+a real sizing change for every service) is introduced together with the
+measurement that justifies it in the
+[adaptive demand estimation](serve-adaptive-demand-estimation.md) design,
+whose rollout section quantifies the cost. A service can pin
+`initial_provision_lead_time_seconds` to a number, or to `0` for the
+pre-existing behavior. No API version bump and no load balancer changes.

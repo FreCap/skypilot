@@ -7,7 +7,7 @@ The concurrency autoscaler sizes every target from two hand-set numbers:
 - `replica_policy.expected_request_duration_seconds` converts queued,
   rejected, and arriving requests into concurrent work. It multiplies into
   every demand estimate.
-- `replica_policy.provision_lead_time_seconds` (see
+- `replica_policy.initial_provision_lead_time_seconds` (see
   [SLA-aware scale-up](serve-sla-aware-scaleup.md)) sets how much of a
   request's SLA budget is already spent before new capacity can serve.
 
@@ -33,7 +33,21 @@ controller's planned per-replica capacity.
 
 ## Behavior contract
 
-Under `replica_policy.adaptive_demand_estimation: true` (default `false`):
+Adaptive estimation is **on by default**
+(`replica_policy.adaptive_demand_estimation`, default `true`; set it to
+`false` to pin static configured estimates). A service that never touches
+its configuration measures its own workload:
+
+0. **The provisioning lead is a seed, not a setting.**
+   `initial_provision_lead_time_seconds` defaults to `auto`: assume
+   `AUTOSCALER_DEFAULT_PROVISION_LEAD_SECONDS` (10 minutes) until the
+   service has measured its own launch-to-ready time, then use the
+   measurement. Provisioning a GPU replica takes minutes on every supported
+   cloud, so assuming zero would size a young service's first bursts as if
+   capacity were instant. An explicit number pins the seed (still superseded
+   by measurement); an explicit `0` opts out of lead accounting entirely.
+
+Then, whenever adaptive estimation is enabled:
 
 1. **Measured request duration supersedes the configured duration.** The
    autoscaler folds newly completed requests from the load balancer's
@@ -89,16 +103,46 @@ Cost is +11-17% replica-hours, which is the fleet being correctly sized for
 work that was always there.
 
 **The knob stops needing to be right.** A policy with no configured lead at
-all (`provision_lead_time_seconds` unset) that learns it from scratch
-reaches 0.0% on the slow ramp and 2.3% on the fast ramp, against 0.0% and
-1.9% for a correctly hand-tuned 540 s. Operators no longer have to guess a
-value that only a measurement can know.
+all that learns it from scratch reaches 0.0% on the slow ramp and 2.3% on
+the fast ramp, against 0.0% and 1.9% for a correctly hand-tuned 540 s.
+Operators no longer have to guess a value that only a measurement can know.
+
+**The new default vs today's default**, measured end to end (default-on
+adaptive with the 10-minute `auto` seed, against the current shipped
+behavior). This is the change every service gets on upgrade:
+
+| scenario | today | new default | mean wait | replica-hours |
+|---|---|---|---|---|
+| slow ramp | 1.4% | **0.3%** | 60 s -> 7 s | +23% |
+| fast ramp | 5.8% | **2.5%** | 79 s -> 14 s | +34% |
+| sustained | 5.9% | **5.8%** | 20 s -> 8 s | +21% |
+| cold spike | 9.6% | **9.5%** | 23 s -> 11 s | +37% |
+| step burst | 9.6% | 9.7% | 32 s -> 13 s | +35% |
+
+With the duration also misconfigured (the fleet's real state) the same
+comparison is 2.8% -> 0.0% on the slow ramp and 9.2% -> 1.8% on the fast
+ramp, with waits falling from ~150-200 s to ~10-25 s.
+
+The cost is real and is the honest price of the new default: roughly
++20-37% replica-hours during load, because the fleet is now sized for work
+that was always there rather than planned to arrive at the deadline. A
+service that prefers the old economics sets `adaptive_demand_estimation:
+false`, or `initial_provision_lead_time_seconds: 0` to keep measurement
+while restoring pure deadline discounting.
+
+**The 10-minute seed earns its place.** Starting from no assumption
+(`0`) and learning only from observed launches gives 0.8% on the slow ramp
+and 4.8% on the fast ramp, against 0.3% and 2.5% with the seed: the seed
+covers the cold-start window before the first launches have been measured,
+which for a young or long-idle service is exactly when a burst arrives.
 
 ## Alternatives considered
 
-- **Default-on.** Rejected: enabling measurement silently re-sizes every
-  existing service on upgrade, including ones whose configuration is
-  deliberately conservative. Opt-in keeps the upgrade inert.
+- **Opt-in instead of default-on.** Rejected by product decision: a
+  correct default matters more than an inert upgrade, and the whole point
+  is that nobody re-tunes these numbers. The cost of the new default is
+  quantified below and an explicit `false` (or an explicit lead) restores
+  the previous behavior for a service that wants it.
 - **Bucket midpoints instead of upper bounds.** More accurate on average,
   but biases the estimate short inside a bucket. Sizing prefers to run long.
 - **Percentile duration (p75) instead of an EMA mean.** The duration feeds
@@ -132,11 +176,17 @@ observed launch-to-ready, and that the demand target rises accordingly.
 
 ## Rollout
 
-Opt-in per service. No API version bump: the new demand-feed field is
-additive and an older controller simply never sends it, leaving the
-autoscaler on configured values. Enable on boltz-l4-fleet in the same fleet
-update that sets `provision_lead_time_seconds`; the configured values then
-act as the cold-start seed and the permanent fallback.
+Default-on for every service, including existing ones, at the next
+controller restart. Old persisted specs deserialize with the field absent,
+which resolves to enabled, and with no configured lead, which resolves to
+the 10-minute `auto` seed. Both effects are intentional; the cost table
+above is what an operator should expect to see.
+
+No API version bump: the new demand-feed field is additive and an older
+controller simply never sends it, leaving the autoscaler on configured
+values. Opt-outs (`adaptive_demand_estimation: false`, or an explicit
+`initial_provision_lead_time_seconds`) are available per service without a
+code change.
 
 TODO(FreCap): once the fleet has run on measured values, revisit whether
 `expected_request_duration_seconds` should become optional rather than
