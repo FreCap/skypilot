@@ -118,9 +118,12 @@ Sensitivity (service 60 s, provisioning 8-15 min): the same ordering holds
 with all failure rates roughly doubled. When provisioning latency exceeds
 the SLA budget, reactive scaling cannot save a burst's front edge; only warm
 headroom (`min_replicas` / overprovision) or shorter provisioning can.
-Operators should set `expected_request_duration_seconds` honestly (the
-fleet's 30 s vs observed ~45-60 s under-sizes every estimate). The lead is
-measured rather than configured; see the adaptive design.
+Operators should set `expected_request_duration_seconds` honestly, and it
+is now measured rather than trusted; see the adaptive design. (An earlier
+revision claimed the fleet's configured 30 s ran against an observed
+45-60 s. That was an assumption from this simulator's default service time,
+not a measurement: the first production data shows 97% of requests
+completing within 30 s.)
 
 ## Alternatives considered
 
