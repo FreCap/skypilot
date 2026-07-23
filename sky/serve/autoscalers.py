@@ -1,6 +1,7 @@
 """Autoscalers: perform autoscaling by monitoring metrics."""
 import bisect
 from collections.abc import Iterable
+from collections.abc import Sequence
 import copy
 import dataclasses
 import enum
@@ -119,6 +120,36 @@ class AutoscalerDecision:
 
 def _scale_down_replica_id(target: int | LogicalScaleDownTarget) -> int:
     return target if isinstance(target, int) else target.replica_id
+
+
+def _prediction_bucket_representative(index: int,
+                                      bounds: Sequence[float]) -> float:
+    """One duration standing in for every request in a histogram bucket.
+
+    The buckets are log-scale and wide (the 10s-30s bucket spans 3x), so the
+    choice of representative moves the estimate far more than it looks. The
+    geometric midpoint is the unbiased summary of a log-scale bucket; taking
+    the upper bound instead inflates the estimate by the square root of the
+    bucket's width, measured at 1.70x against a real production
+    distribution where 97% of requests landed in that one bucket.
+
+    That inflation matters because it is invisible. Conservatism in fleet
+    sizing belongs in the knobs an operator can see and tune
+    (target_utilization_percentage, the provisioning lead, SLA weighting),
+    not hidden inside a histogram summary where it silently compounds with
+    them.
+    """
+    upper = bounds[min(index, len(bounds) - 1)]
+    if index >= len(bounds):
+        # The final bucket is unbounded above; its lower bound is the only
+        # honest floor available.
+        return upper
+    lower = bounds[index - 1] if index > 0 else 0.0
+    if lower <= 0:
+        # The first bucket starts at zero, whose geometric mean is
+        # degenerate; use the arithmetic midpoint.
+        return upper / 2.0
+    return math.sqrt(lower * upper)
 
 
 def _generate_scale_up_decisions(
@@ -4585,10 +4616,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     continue
                 delta = count - seen[index]
                 seen[index] = count
-                # Represent a bucket by its upper bound: sizing may run
-                # slightly long, never short. The final implicit bucket has
-                # no upper bound, so it is represented by the last one.
-                representative = bounds[min(index, len(bounds) - 1)]
+                representative = _prediction_bucket_representative(
+                    index, bounds)
                 total_new += delta
                 weighted_new += delta * representative
         if total_new <= 0:

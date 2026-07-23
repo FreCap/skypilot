@@ -11,10 +11,18 @@ The concurrency autoscaler sizes every target from two hand-set numbers:
   [SLA-aware scale-up](serve-sla-aware-scaleup.md)) sets how much of a
   request's SLA budget is already spent before new capacity can serve.
 
-Both drift. boltz-l4-fleet configures a 30 s duration against an observed
-45-60 s, so every target it computes is undersized by roughly half. The lead
-is worse: it is a property of spot capacity and cloud provisioning latency
+Both drift, and neither is verified against reality. The lead is the worse
+of the two: it is a property of spot capacity and cloud provisioning latency
 that changes hour to hour, and no operator re-tunes it.
+
+Correction (2026-07-23): an earlier revision of this document asserted that
+boltz-l4-fleet's configured 30 s duration ran against an observed 45-60 s.
+That figure was an assumption carried over from the simulator's default
+service time, not a measurement. The first production prediction-time data
+says the opposite: across 547 completions, 97% finished within the
+(10 s, 30 s] bucket, and the fleet's configured 30 s is a reasonable value.
+The case for measuring rests on drift and on the unknown lead, not on that
+fleet being misconfigured.
 
 Meanwhile the system already measures both facts and throws them away for
 sizing purposes:
@@ -51,10 +59,10 @@ Then, whenever adaptive estimation is enabled:
 
 1. **Measured request duration supersedes the configured duration.** The
    autoscaler folds newly completed requests from the load balancer's
-   prediction-time histograms into an EMA (alpha 0.2). Each histogram bucket
-   contributes its upper bound, so the estimate errs long rather than short.
-   Only `succeeded` outcomes count: a fast failure describes an error path,
-   not how long serving occupies a slot.
+   prediction-time histograms into an EMA (alpha 0.2). Each bucket
+   contributes its geometric midpoint, the unbiased summary of a log-scale
+   bucket. Only `succeeded` outcomes count: a fast failure describes an
+   error path, not how long serving occupies a slot.
 2. **Observed launch-to-ready supersedes the configured lead.** Each replica
    that reaches ready contributes one `first_ready_time - created_at`
    sample, capped at the 50 most recent; the estimate is their p75. Sizing
@@ -143,8 +151,13 @@ which for a young or long-idle service is exactly when a burst arrives.
   is that nobody re-tunes these numbers. The cost of the new default is
   quantified below and an explicit `false` (or an explicit lead) restores
   the previous behavior for a service that wants it.
-- **Bucket midpoints instead of upper bounds.** More accurate on average,
-  but biases the estimate short inside a bucket. Sizing prefers to run long.
+- **Bucket upper bounds instead of midpoints.** Shipped first, then
+  reverted against production data: the buckets are log-scale and wide (the
+  10 s-30 s bucket spans 3x), and with 97% of real requests inside that one
+  bucket the upper bound inflated the estimate 1.70x (29.8 s vs 17.5 s).
+  Conservatism in sizing belongs in the knobs an operator can see and tune,
+  not hidden in a histogram summary where it compounds with them
+  invisibly.
 - **Percentile duration (p75) instead of an EMA mean.** The duration feeds
   aggregate work (count x duration), where the mean is the correct
   aggregate; a percentile would systematically over-size. The lead is a
