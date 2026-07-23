@@ -235,7 +235,8 @@ def test_get_next_cluster_name_uses_resource_scan_for_constrained_task():
 
     free_resources.assert_called_once_with('pool-a',
                                            replicas=[constrained, roomy],
-                                           cluster_records=cluster_records)
+                                           cluster_records=cluster_records,
+                                           resolved_handles=mock.ANY)
     assert selected == 'replica-roomy'
     set_cluster.assert_called_once_with(23, 'replica-roomy')
     set_infra.assert_not_called()
@@ -286,10 +287,7 @@ def test_get_next_cluster_name_reuses_resource_scan_cluster_snapshot_for_infra(
 
     assert selected == 'replica-a'
     get_clusters.assert_called_once_with(['replica-a'])
-    assert worker.handle.call_args_list == [
-        mock.call(cluster_record),
-        mock.call(cluster_record),
-    ]
+    worker.handle.assert_called_once_with(cluster_record)
     set_cluster.assert_called_once_with(29, 'replica-a')
     set_infra.assert_called_once_with(29, cloud=None, region=None, zone=None)
 
