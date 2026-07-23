@@ -1245,6 +1245,10 @@ def test_publication_retry_delay_uses_database_epoch(
         now=21)
     failed = catalog_state.get_publication(claimed.id, 'research')
     assert failed is not None and failed.next_retry_at == 30
+    pending_operation = catalog_state.get_operation(mutation.operation.id,
+                                                    'research')
+    assert pending_operation is not None
+    assert pending_operation.state == models.ImageOperationState.PENDING
     assert catalog_state.claim_publication_inspection(worker_id='copy-2',
                                                       lease_seconds=60,
                                                       now=29) is None
@@ -1252,6 +1256,49 @@ def test_publication_retry_delay_uses_database_epoch(
                                                            lease_seconds=60,
                                                            now=30)
     assert reclaimed is not None and reclaimed.id == claimed.id
+
+
+def test_terminal_inspection_failure_terminalizes_publication_operation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    mutation = publication.publish(
+        source_ref=_SOURCE,
+        release='terminal-inspection-failure',
+        distribution=profile.name,
+        workspace='research',
+        actor_hash='1' * 64,
+        idempotency_key='terminal-inspection-failure-key',
+        now=20)
+    claimed = catalog_state.claim_publication_inspection(worker_id='copy-1',
+                                                         lease_seconds=60,
+                                                         now=20)
+    assert claimed is not None and claimed.inspection_lease_token is not None
+
+    assert catalog_state.fail_publication_inspection(
+        claimed.id,
+        claimed.inspection_lease_token,
+        models.ImageLocationErrorCode.SOURCE_CONTENT_UNSUPPORTED.value,
+        terminal=True,
+        now=21)
+
+    failed = catalog_state.get_publication(claimed.id, 'research')
+    operation = catalog_state.get_operation(mutation.operation.id, 'research')
+    assert failed is not None
+    assert failed.state == models.ImagePublicationState.FAILED
+    assert operation is not None
+    assert operation.state == models.ImageOperationState.FAILED
+    assert operation.error_code == (
+        models.ImageLocationErrorCode.SOURCE_CONTENT_UNSUPPORTED.value)
+    assert operation.result_kind == 'publication'
+    assert operation.result_id == failed.id
+    assert operation.result == {
+        'image_id': None,
+        'publication_id': failed.id,
+        'release': 'terminal-inspection-failure',
+        'state': models.ImagePublicationState.FAILED.value,
+    }
 
 
 def _complete_location(location: topology_state.LocationRecord, *,

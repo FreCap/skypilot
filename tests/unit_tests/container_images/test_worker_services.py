@@ -2926,6 +2926,56 @@ def _dockerconfig_binding() -> models.RegistryAccessBinding:
         })
 
 
+def test_aws_source_reader_confines_private_peer_to_exact_ecr_authority(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = '123456789012.dkr.ecr.us-east-1.amazonaws.com'
+    binding = models.RegistryAccessBinding(
+        id='ecr-source',
+        kind=models.RegistryAccessBindingKind.AWS_ASSUME_ROLE,
+        purposes=('source_read',),
+        authority='arn:aws:iam::123456789012:role/SkyPilotImageSource')
+    source = catalog_state.SourceRecord(
+        id='00000000-0000-4000-8000-000000000010',
+        workspace='research',
+        image_id='00000000-0000-4000-8000-000000000011',
+        source_ref=f'{authority}/example/runtime@{_DIGEST}',
+        source_root_digest=_DIGEST,
+        source_root_media_type='',
+        requested_platform='linux/amd64',
+        selected_child_digest='',
+        source_auth_binding_id=binding.id,
+        source_auth_fingerprint=binding.fingerprint,
+        created_at=10)
+    monkeypatch.setattr(copy_worker_service.config, 'get_source_binding',
+                        lambda _: binding)
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    credentials = mock.Mock()
+    mint = mock.Mock(return_value=credentials)
+    monkeypatch.setattr(copy_worker_service.aws, 'mint_ecr_source_credentials',
+                        mint)
+    reader = mock.sentinel.reader
+    constructor = mock.Mock(return_value=reader)
+    monkeypatch.setattr(copy_worker_service.providers, 'RegistryV2Source',
+                        constructor)
+    fence = mock.Mock()
+
+    assert copy_worker_service._source_reader(source, 'gpu-production',
+                                              fence) is reader
+
+    constructor.assert_called_once_with(source.source_ref,
+                                        mock.ANY,
+                                        provider_fence=fence,
+                                        private_peer_authority=authority)
+    resolver = constructor.call_args.args[1]
+    assert resolver() is credentials
+    mint.assert_called_once()
+    assert mint.call_args.kwargs['region'] == 'us-east-1'
+    assert mint.call_args.kwargs['account'] == '123456789012'
+    assert mint.call_args.kwargs['expected_authority'] == authority
+    assert mint.call_args.kwargs['provider_fence'] is fence
+
+
 def test_source_secret_allowlist_blocks_ambient_rbac(
         monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv('SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST', '[]')

@@ -457,13 +457,15 @@ defaults to `linux/amd64`; additional platforms are explicit, never speculative.
    larger than one batch resumes deterministically without repeating provider
    I/O.
 6. A worker crash or ambiguous source read leaves unbound INSPECTING until its
-   lease expires; another worker then reinspects from the immutable source root. Retry
-   of an unbound pre-inspection failure locks only its publication and requeues
-   inspection. Once bound, retry locks the shared canonical location before
-   dependent publications, returns retained failures to PENDING, and reuses the
-   location. A bound PENDING publication is never eligible for source inspection
-   again; only canonical convergence may finish it. It never creates a second
-   physical copy. Exceeding the per-artifact
+   lease expires; another worker then reinspects from the immutable source root.
+   Retry of an unbound pre-inspection failure locks only its publication and
+   requeues inspection. A terminal pre-inspection failure atomically marks both
+   the publication and its bound operation FAILED, so synchronous waiters cannot
+   remain PENDING after the work has ended. Once bound, retry locks the shared
+   canonical location before dependent publications, returns retained failures
+   to PENDING, and reuses the location. A bound PENDING publication is never
+   eligible for source inspection again; only canonical convergence may finish
+   it. It never creates a second physical copy. Exceeding the per-artifact
    release ceiling is a typed `IMAGE_LIMIT_EXCEEDED` failure rather than a
    source-content validation failure.
 
@@ -475,13 +477,26 @@ and checks the actual connected peer immediately after every TCP connection and
 before TLS, HTTP bytes, or credentials. This closes direct private addresses,
 DNS rebinding, bearer realms, and signed-URL redirects over private, link-local,
 or multicast IPv4 and IPv6 space. Multicast is rejected explicitly instead of
-depending on Python's version-specific `is_global` classification. Basic source
-credentials may authenticate a bearer realm only on the
-same normalized authority. Token requests never follow redirects. A blob may
-follow at most one public HTTPS redirect without forwarding source
-authorization. Manifest, token, config, and blob inspection bodies are streamed
-under explicit byte limits. Private-network source registries require a future
-qualified operator-controlled network policy and are not accepted by v0.
+depending on Python's version-specific `is_global` classification.
+
+One narrow AWS exception supports ECR PrivateLink and private DNS. When and only
+when an `aws_assume_role` source binding matches the source's exact validated
+`<account>.dkr.ecr.<region>.amazonaws.com` authority, the worker may accept a
+private connected peer for that exact registry hostname. The adapter first
+assumes the configured role and mints an ECR token for the same account and
+authority. HTTPS certificate and hostname verification, digest verification,
+lease fencing, body bounds, and disabled proxy inheritance remain mandatory.
+The exception is hostname-exact: a different bearer realm or blob redirect
+still uses the public connected-peer guard and receives no source
+authorization. Thus an AWS service endpoint reached privately is supported, but
+an arbitrary private-network OCI registry is not.
+
+Basic source credentials may authenticate a bearer realm only on the same
+normalized authority. Token requests never follow redirects. A blob may follow
+at most one public HTTPS redirect without forwarding source authorization.
+Manifest, token, config, and blob inspection bodies are streamed under explicit
+byte limits. Other private-network source registries require a future qualified
+operator-controlled network policy and are not accepted by v0.
 
 An existing READY release is immutable. A conflicting digest is rejected. A
 failed replacement never changes another release or any deployment already
