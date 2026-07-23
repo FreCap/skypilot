@@ -132,6 +132,21 @@ leaves it unset: it can fire before any create is attempted, so it cannot prove
 what the failure covered, and an unset value keeps that failure out of the
 cache.
 
+### Success beats a delayed failure
+
+A failed provision is torn down before its exception surfaces, so a worker that
+failed can write its hint after a sibling worker has already succeeded on the
+identical demand and cleared it. `clear` is an unconditional delete with no
+ordering, so without a guard the stale failure would win and re-suppress a zone
+that was just proven to have capacity.
+
+A success therefore records a short tombstone keyed the same way, and
+`mark_exhausted` and `mark_quota_failure` drop a write while it is live. The
+window only has to cover the teardown delay. A genuine new failure inside it is
+simply not cached, which is the fail-open direction.
+
+This race pre-existed in the AWS cache; the guard fixes it there too.
+
 ### Presentation
 
 `active_service_observations` returned hints described as AWS-specific, and the

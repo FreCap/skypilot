@@ -15,12 +15,21 @@ _CACHE_KEY_PREFIX = 'capacity_exhausted:v2:'
 _QUOTA_COOLDOWN_KEY_PREFIX = 'quota_cooldown:v2:'
 _CAPACITY_OBSERVATION_KEY_PREFIX = 'capacity_observation:v2:'
 _QUOTA_OBSERVATION_KEY_PREFIX = 'quota_observation:v2:'
+_SUCCESS_TOMBSTONE_KEY_PREFIX = 'capacity_success:v2:'
 _CAPACITY_TTL_SECONDS = 120
 # Quota may recover as soon as sibling instances terminate. Keep this fixed and
 # deliberately brief: after the last recorded failure, it trades at most 15
 # seconds of delayed re-probing for cross-worker suppression of an otherwise
 # immediate external retry storm.
 _QUOTA_COOLDOWN_TTL_SECONDS = 15
+# A proven success suppresses failure writes for the same demand for this long.
+# A failed attempt is torn down before its exception surfaces, so a worker that
+# failed can write its hint after a sibling worker has already succeeded on the
+# identical demand and cleared it. Without ordering, that stale failure would
+# win and re-suppress a zone just proven to have capacity. The window only has
+# to cover the teardown delay; a genuine new failure inside it is simply not
+# cached, which is the fail-open direction.
+_SUCCESS_TOMBSTONE_TTL_SECONDS = 60
 
 
 class ResourceKey(NamedTuple):
@@ -79,6 +88,22 @@ def _cache_key(key: ResourceKey) -> str:
     return f'{_CACHE_KEY_PREFIX}{_key_digest(key)}'
 
 
+def _success_tombstone_key(key: ResourceKey | QuotaCooldownKey) -> str:
+    return f'{_SUCCESS_TOMBSTONE_KEY_PREFIX}{_key_digest(key)}'
+
+
+def _recent_success(key: ResourceKey | QuotaCooldownKey) -> bool:
+    """Whether this exact demand was proven launchable a moment ago."""
+    return kv_cache.get_cache_entry(_success_tombstone_key(key)) is not None
+
+
+def _record_success(key: ResourceKey | QuotaCooldownKey) -> None:
+    kv_cache.add_or_extend_cache_entries([
+        (_success_tombstone_key(key), '1',
+         time.time() + _SUCCESS_TOMBSTONE_TTL_SECONDS)
+    ])
+
+
 def _quota_cooldown_cache_key(key: QuotaCooldownKey) -> str:
     return f'{_QUOTA_COOLDOWN_KEY_PREFIX}{_key_digest(key)}'
 
@@ -134,7 +159,14 @@ def _service_observation_entry(
 
 def mark_exhausted(key: ResourceKey,
                    observation: ServiceObservation | None = None) -> None:
-    """Marks ``key`` exhausted for a short, bounded period."""
+    """Marks ``key`` exhausted for a short, bounded period.
+
+    A failure that lost the race against a concurrent success for the same
+    demand is dropped, so a stale hint cannot re-suppress a zone that was just
+    proven to have capacity.
+    """
+    if _recent_success(key):
+        return
     expires_at = time.time() + _CAPACITY_TTL_SECONDS
     canonical_key = _cache_key(key)
     entries = [(canonical_key, '1', expires_at)]
@@ -157,12 +189,15 @@ def active_exhausted_keys(
 
 def clear(key: ResourceKey) -> None:
     """Clears the exact capacity hint after a successful provision."""
+    _record_success(key)
     kv_cache.delete_cache_entry(_cache_key(key))
 
 
 def mark_quota_failure(key: QuotaCooldownKey,
                        observation: ServiceObservation | None = None) -> None:
     """Starts or extends a brief cooldown after an exact quota failure."""
+    if _recent_success(key):
+        return
     expires_at = time.time() + _QUOTA_COOLDOWN_TTL_SECONDS
     canonical_key = _quota_cooldown_cache_key(key)
     entries = [(canonical_key, '1', expires_at)]
@@ -181,6 +216,7 @@ def is_quota_cooldown_active(key: QuotaCooldownKey) -> bool:
 
 def clear_quota_cooldown(key: QuotaCooldownKey) -> None:
     """Clears the exact quota cooldown after a successful provision."""
+    _record_success(key)
     kv_cache.delete_cache_entry(_quota_cooldown_cache_key(key))
 
 

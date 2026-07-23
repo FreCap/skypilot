@@ -267,3 +267,46 @@ def test_no_stored_value_or_key_contains_the_account(cache_db):
     result = capacity_cache.active_service_observations('svc', 'hash-a')
     assert secret not in json.dumps(result)
     assert len(result['hints']) == 2
+
+
+def test_success_wins_against_a_delayed_failure_write(cache_db):
+    """A failure torn down slowly must not re-suppress a proven-good demand.
+
+    Worker A fails and is torn down; before its hint lands, worker B succeeds
+    on the identical demand and clears. A's delayed write must be dropped.
+    """
+    del cache_db
+    key = _key()
+
+    capacity_cache.mark_exhausted(key)  # an earlier failure
+    capacity_cache.clear(key)  # worker B proves capacity
+    capacity_cache.mark_exhausted(key)  # worker A's delayed write
+
+    assert capacity_cache.active_exhausted_keys([key]) == set()
+
+
+def test_quota_success_wins_against_a_delayed_failure_write(cache_db):
+    del cache_db
+    key = _quota_key()
+
+    capacity_cache.mark_quota_failure(key)
+    capacity_cache.clear_quota_cooldown(key)
+    capacity_cache.mark_quota_failure(key)
+
+    assert not capacity_cache.is_quota_cooldown_active(key)
+
+
+def test_success_tombstone_expires_so_later_failures_still_cache(
+        cache_db, monkeypatch):
+    """The tombstone only covers the teardown window, not forever."""
+    del cache_db
+    now = {'value': 1000.0}
+    monkeypatch.setattr(capacity_cache.time, 'time', lambda: now['value'])
+    monkeypatch.setattr(kv_cache.time, 'time', lambda: now['value'])
+    key = _key()
+
+    capacity_cache.clear(key)
+    now['value'] += capacity_cache._SUCCESS_TOMBSTONE_TTL_SECONDS + 1
+    capacity_cache.mark_exhausted(key)
+
+    assert capacity_cache.active_exhausted_keys([key]) == {key}
