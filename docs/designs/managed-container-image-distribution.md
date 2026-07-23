@@ -3545,3 +3545,22 @@ revision integrates that base's GCP capacity classification, SQLite contention
 retry, and landed exception-compatibility fixes while retaining strict envelope
 shape validation, constructor-safe note serialization, tolerant attribute
 restoration, and sanitized fallbacks. The acceptance streak remains zero.
+
+### Live prototype verification, July 23, 2026
+
+The first managed OpenDDE cold launch reached `READY` in 482.65 seconds, versus
+434.55 seconds for its paired baseline. This is not a performance improvement
+and does not support a faster-deployment claim. Phase logs exposed an
+implementation defect before the image pull: the AWS Ray template omitted the
+resolved `credential_helper: ecr-login` field. The node therefore installed the
+AWS CLI, requested an ECR bearer token, persisted Docker login state, and spent
+about 34 seconds in an authentication path that the qualified host contract is
+designed to avoid. The image pull itself took about 100.8 seconds, and the
+service subsequently staged about 9.9 GB of workload data.
+
+The repair preserves the optional credential-helper field in the rendered AWS
+cluster configuration and has a regression test for both helper-backed and
+ordinary login configurations. A fresh cold launch is required after deploying
+that repair. The remaining image pull, instance bootstrap, and workload-data
+staging must be measured separately; this result does not justify moving a
+lazy OCI snapshotter or a separate model-data distribution plane into v0.

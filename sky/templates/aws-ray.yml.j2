@@ -22,6 +22,10 @@ docker:
       {{docker_login_config.password | indent(6) }}
     server: |-
       {{docker_login_config.server}}
+    {%- if docker_login_config.credential_helper is not none %}
+    credential_helper: |-
+      {{docker_login_config.credential_helper}}
+    {%- endif %}
   {%- endif %}
 {%- endif %}
 
