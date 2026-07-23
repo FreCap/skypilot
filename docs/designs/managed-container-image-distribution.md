@@ -1686,6 +1686,15 @@ the launched or replay-discovered child ID. The worker then performs an ID-scope
 and profile tags, and derives host AMI, architecture, instance profile, and
 lifecycle state from that one response. The observed AMI must equal the qualified
 regional AMI. The console marker is read from that same child.
+Before the pull, EC2 canary user data configures the same exact value-free
+`credHelpers[registry] = ecr-login` route used by normal managed workload
+initialization. Merely finding the helper binary in the AMI is not runtime-pull
+evidence. The guest script uses an exit trap to invoke the instance's configured
+terminate-on-shutdown path after either success or failure, so a failed pull
+does not consume the entire canary deadline. Console marker inspection accepts
+the exact nonce-bearing marker in the SDK response first, then supports a
+strictly valid base64-encoded response for compatible EC2 API implementations.
+It never loosely decodes malformed console output.
 An unexpected operation-tagged ID, missing exact child, or tag mismatch can never
 be spliced into evidence. Every child ID observed through launch, replay, polling,
 or cleanup is retained in the teardown set, and an identity mismatch fails only
@@ -2638,6 +2647,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   intent commit, stable result shape, bounded error, and CLI remediation tests;
 - canary nonce/principal proof, child-launch crash deduplication, forced teardown,
   automatic refresh, concurrent daily-cost reservation, stale-binding tests,
+  exact shared EC2 helper-route configuration, plaintext and strict-base64
+  console marker responses, malformed console rejection, guest failure
+  self-termination,
   expired-owner/successor interleavings at attach/fail/provider boundaries,
   pre-create client failure, stable EC2 `ClientToken` replay, provider-call
   pre/post lease fences, database authorization immediately before both EC2 and

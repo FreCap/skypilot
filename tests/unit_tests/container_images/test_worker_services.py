@@ -28,6 +28,7 @@ from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.provision import docker_utils
 
 _DIGEST = 'sha256:' + 'a' * 64
 _CONFIG_DIGEST = 'sha256:' + 'b' * 64
@@ -35,6 +36,23 @@ _ARTIFACT_ID = '00000000-0000-4000-8000-000000000001'
 _LOCATION_ID = '00000000-0000-4000-8000-000000000002'
 _SHARD_ID = '00000000-0000-4000-8000-000000000003'
 _REVISION_ID = '00000000-0000-4000-8000-000000000004'
+
+
+@pytest.mark.parametrize(
+    ('output', 'expected'),
+    (
+        ('boot log\nSKYPILOT_IMAGE_CANARY_SUCCESS:nonce\n', True),
+        (base64.b64encode(
+            b'boot log\nSKYPILOT_IMAGE_CANARY_SUCCESS:nonce\n').decode(), True),
+        ('boot log without marker', False),
+        ('not valid base64 \u2026', False),
+        (None, False),
+    ),
+)
+def test_ec2_console_marker_supports_sdk_response_shapes(
+        output: object, expected: bool) -> None:
+    assert canary_worker_service._console_has_marker(
+        output, 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce') is expected
 
 
 def _canary_operation(
@@ -1058,9 +1076,7 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             }]
         })
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
-    ec2.get_console_output.return_value = {
-        'Output': base64.b64encode(marker.encode()).decode()
-    }
+    ec2.get_console_output.return_value = {'Output': marker}
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
@@ -1113,6 +1129,9 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
     assert mock.call(
         InstanceIds=['i-canary']) in (ec2.describe_instances.call_args_list)
     launch = ec2.run_instances.call_args.kwargs
+    assert docker_utils.credential_helper_config_cmd(
+        target.registry) in launch['UserData']
+    assert "trap 'shutdown -h now' EXIT" in launch['UserData']
     assert launch['InstanceInitiatedShutdownBehavior'] == 'terminate'
     assert launch['SecurityGroupIds'] == list(
         dict(binding.canary_security_groups)[target.region])

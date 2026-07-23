@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from collections.abc import Callable
 import concurrent.futures
 import contextlib
@@ -23,6 +24,7 @@ from sky.container_images import qualification
 from sky.container_images import topology_state
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.provision import docker_utils
 from sky.server import database_migrations
 
 _DEFAULT_LEASE_SECONDS = 15 * 60
@@ -383,16 +385,31 @@ def _terminate_ec2_instances(
     return False
 
 
-def _ec2_user_data(reference: str, nonce: str, timeout_seconds: int) -> str:
+def _ec2_user_data(reference: str, registry: str, nonce: str,
+                   timeout_seconds: int) -> str:
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{nonce}'
     return '\n'.join((
         '#!/usr/bin/env bash',
         'set -euo pipefail',
+        "trap 'shutdown -h now' EXIT",
+        docker_utils.credential_helper_config_cmd(registry),
         f'timeout {timeout_seconds} docker pull {shlex.quote(reference)}',
         f'docker image inspect {shlex.quote(reference)} >/dev/null',
         f'echo {shlex.quote(marker)} >/dev/console',
-        'shutdown -h now',
     ))
+
+
+def _console_has_marker(output: Any, marker: str) -> bool:
+    if not isinstance(output, str):
+        return False
+    if marker in output:
+        return True
+    try:
+        decoded = base64.b64decode(output,
+                                   validate=True).decode(errors='replace')
+    except (binascii.Error, ValueError):
+        return False
+    return marker in decoded
 
 
 def _run_ec2_canary(operation: catalog_state.OperationRecord,
@@ -482,7 +499,8 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 'MinCount': 1,
                 'MaxCount': 1,
                 'InstanceInitiatedShutdownBehavior': 'terminate',
-                'UserData': _ec2_user_data(reference, payload['nonce'],
+                'UserData': _ec2_user_data(reference, target.registry,
+                                           payload['nonce'],
                                            payload['timeout_seconds']),
                 'TagSpecifications': [{
                     'ResourceType': resource_type,
@@ -554,9 +572,7 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             if state in ('stopped', 'terminated'):
                 output = ec2.get_console_output(InstanceId=instance_id,
                                                 Latest=True).get('Output')
-                if isinstance(output, str):
-                    decoded = base64.b64decode(output).decode(errors='replace')
-                    success = marker in decoded
+                success = _console_has_marker(output, marker)
                 break
             time.sleep(_POLL_SECONDS)
         else:

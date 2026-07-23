@@ -73,7 +73,7 @@ def _extract_region_from_ecr_server(server: str) -> str:
     raise ValueError(f'Invalid ECR server format: {server}')
 
 
-def _credential_helper_config_cmd(server: str) -> str:
+def credential_helper_config_cmd(server: str) -> str:
     """Atomically merges one value-free helper route into root's config."""
     if _ECR_SERVER_PATTERN.fullmatch(server) is None:
         raise ValueError(
@@ -342,7 +342,7 @@ class DockerInitializer:
                 # The qualified host image already contains this helper. Only
                 # write its value-free Docker routing entry here. Never install
                 # AWS CLI or persist an ECR bearer token on the workload node.
-                self._run(_credential_helper_config_cmd(
+                self._run(credential_helper_config_cmd(
                     docker_login_config.server),
                           wait_for_docker_daemon=True)
             elif docker_login_config.password:
