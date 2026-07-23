@@ -979,7 +979,7 @@ def _respawn_controller(
     # captured values may be stale after an in-place update, while a durably
     # quarantined version must not crash-loop the replacement controller.
     try:
-        snapshot = serve_state.get_latest_applicable_version_spec(service_name)
+        snapshot = serve_state.get_recovery_version_spec(service_name)
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to reload the latest applicable version/spec for '
                      f'{service_name}: {common_utils.format_exception(e)}; '
@@ -1362,9 +1362,8 @@ def _start(service_name: str,
     # On recovery, resume the latest applicable committed version, not raw
     # MAX(version). This skips both interrupted NULL-yaml placeholders and
     # versions whose deterministic preflight failure was durably quarantined.
-    recovery_snapshot = (
-        serve_state.get_latest_applicable_version_spec(service_name)
-        if is_recovery else None)
+    recovery_snapshot = (serve_state.get_recovery_version_spec(service_name)
+                         if is_recovery else None)
     recovery_version = (recovery_snapshot[0]
                         if recovery_snapshot is not None else None)
 

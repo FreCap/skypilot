@@ -72,6 +72,14 @@ class LogicalScaleDownTarget:
     accelerator_shapes: tuple[tuple[str, int], ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class UnrecoverableRolloutFailure:
+    """Typed evidence that a candidate version never became serviceable."""
+
+    version: int
+    reason: str
+
+
 @dataclasses.dataclass
 class AutoscalerDecision:
     """Autoscaling decisions.
@@ -257,6 +265,13 @@ class Autoscaler:
         # latest_version, so we can fail early if the initial version got
         # unrecoverable failure.
         self.latest_version_ever_ready: int = self.latest_version - 1
+        # Set only for a never-ready candidate whose persisted replica state
+        # satisfies ReplicaStatusProperty.unrecoverable_failure(). The
+        # controller durably quarantines this exact version before respawning
+        # onto the proven active runtime. Generic provisioning/capacity
+        # failures deliberately never populate this signal.
+        self._unrecoverable_rollout_failure: (UnrecoverableRolloutFailure |
+                                              None) = None
         self.update_mode = serve_utils.DEFAULT_UPDATE_MODE
         # [boltz fork] Reserved-capacity fill (opt-in): snapshot state fed
         # by the controller's poller thread via collect_reserved_capacity.
@@ -313,6 +328,12 @@ class Autoscaler:
         if self.num_overprovision is None:
             return self.target_num_replicas
         return self.target_num_replicas + self.num_overprovision
+
+    @property
+    def unrecoverable_rollout_failure(
+            self) -> UnrecoverableRolloutFailure | None:
+        """Return this tick's typed never-ready rollout failure, if any."""
+        return self._unrecoverable_rollout_failure
 
     def _calculate_target_num_replicas(self) -> int:
         """Calculate target number of replicas."""
@@ -1500,6 +1521,7 @@ class Autoscaler:
         """
 
         # Handle latest version unrecoverable failure first.
+        self._unrecoverable_rollout_failure = None
         latest_replicas: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
             if info.version == self.latest_version:
@@ -1511,15 +1533,33 @@ class Autoscaler:
             if version < self.latest_version
         ]
         if self.latest_version_ever_ready < self.latest_version:
-            for info in latest_replicas:
-                if info.status_property.unrecoverable_failure():
-                    if previous_versions:
-                        self._notify_rollout_blocked(max(previous_versions))
-                    # Stop scaling if one of replica of the latest version
-                    # failed, it is likely that a fatal error happens to the
-                    # user application and may lead to a infinte termination
-                    # and restart.
-                    return []
+            unrecoverable = [
+                info for info in latest_replicas
+                if info.status_property.unrecoverable_failure()
+            ]
+            if unrecoverable:
+                if previous_versions:
+                    self._notify_rollout_blocked(max(previous_versions))
+                    evidence = ', '.join(
+                        f'{info.replica_id}:{info.status.value}' for info in
+                        sorted(unrecoverable,
+                               key=lambda replica: replica.replica_id)[:20])
+                    if len(unrecoverable) > 20:
+                        evidence += f', and {len(unrecoverable) - 20} more'
+                    self._unrecoverable_rollout_failure = (
+                        UnrecoverableRolloutFailure(
+                            version=self.latest_version,
+                            reason=(
+                                f'Version {self.latest_version} never became '
+                                'ready and has unrecoverable replica evidence: '
+                                f'{evidence}.')))
+                # Stop scaling if one replica of the latest version has a
+                # typed never-ready failure. With a previous active version,
+                # the controller consumes the signal above by quarantining
+                # this exact candidate and respawning onto the proven runtime.
+                # Without a fallback, preserve the historical fail-closed
+                # behavior rather than retrying a broken initial version.
+                return []
             if (previous_versions and latest_replicas and
                     all(info.is_terminal for info in latest_replicas) and
                     any(info.status in

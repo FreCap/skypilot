@@ -3100,6 +3100,49 @@ class SkyServeController:
         while True:
             self._reconcile_pending_update_once(wait=True)
 
+    def _quarantine_unrecoverable_rollout(
+        self,
+        failure: autoscalers.UnrecoverableRolloutFailure,
+    ) -> bool:
+        """Durably reject a never-ready runtime before controller recovery."""
+        with self._routing_state_lock:
+            if failure.version != self._applied_version:
+                logger.info(
+                    f'Ignoring stale rollout-failure signal for version '
+                    f'{failure.version}; applied version is '
+                    f'{self._applied_version}.')
+                return False
+        quarantined_at = time.time()
+        try:
+            quarantined = serve_state.quarantine_version(
+                self._service_name,
+                failure.version,
+                failure.reason,
+                quarantined_at=quarantined_at,
+                expected_service_hash=self._service_hash,
+                expected_controller_owner=self._controller_owner)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                f'Failed to quarantine unrecoverable service version '
+                f'{failure.version}: {common_utils.format_exception(e)}')
+            return False
+        if not quarantined:
+            logger.error(f'Refusing to fail open from service version '
+                         f'{failure.version}: its quarantine write lost the '
+                         'controller ownership fence.')
+            return False
+        with self._update_condition:
+            self._quarantined_version = failure.version
+            self._quarantined_at = quarantined_at
+            self._quarantine_reason = failure.reason
+            self._update_apply_error = failure.reason
+            self._update_apply_failures = 1
+        logger.error(
+            f'Quarantined never-ready service version {failure.version}; '
+            'terminating this controller child so recovery can elect the '
+            f'proven active runtime: {failure.reason}')
+        return True
+
     def _apply_service_update(self, version: int, service: Any,
                               update_mode: serve_utils.UpdateMode) -> None:
         """Apply a persisted update to the live controller state."""
@@ -3276,6 +3319,20 @@ class SkyServeController:
                 # for better decoupling.
                 scaling_options = decision_autoscaler.generate_scaling_decisions(
                     replica_infos, active_versions)
+                rollout_failure = (
+                    decision_autoscaler.unrecoverable_rollout_failure)
+                if isinstance(rollout_failure,
+                              autoscalers.UnrecoverableRolloutFailure):
+                    if self._quarantine_unrecoverable_rollout(rollout_failure):
+                        # In-process rollback would require reversing manager,
+                        # autoscaler, routing, and launch-fence mutations. A
+                        # hard child exit delegates that transition to the
+                        # existing parent supervisor, whose recovery election
+                        # reads the durable quarantine and active-version
+                        # fallback before constructing any runtime objects.
+                        os._exit(1)  # pylint: disable=protected-access
+                    time.sleep(self._autoscaler.get_decision_interval())
+                    continue
                 if (isinstance(decision_autoscaler,
                                autoscalers.ConcurrencyAutoscaler) and
                         decision_autoscaler.replica_unit == 'logical'):

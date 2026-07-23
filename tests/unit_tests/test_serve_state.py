@@ -2280,6 +2280,25 @@ class TestRecoveryVersionSelection:
         assert serve_state.get_latest_applicable_version_spec('svc') == (
             3, 'spec-3')
 
+    def test_recovery_prefers_proven_active_version_below_quarantine(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc', spec='spec-1')
+        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+        serve_state.add_or_update_version('svc', 3, 'spec-3', 'yaml: v3')
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.READY, active_versions=[1])
+
+        assert serve_state.quarantine_version('svc', 3, 'never ready')
+        # Version 2 is committed but never became an active routing version.
+        assert serve_state.get_latest_applicable_version_spec('svc') == (
+            2, 'spec-2')
+        assert serve_state.get_recovery_version_spec('svc') == (1, 'spec-1')
+
+        # A later commit supersedes the quarantine and remains eligible for a
+        # fresh rollout on recovery.
+        serve_state.add_or_update_version('svc', 4, 'spec-4', 'yaml: v4')
+        assert serve_state.get_recovery_version_spec('svc') == (4, 'spec-4')
+
     def test_quarantine_rejects_placeholder_and_is_idempotent(
             self, _mock_serve_db):
         assert serve_state.add_version('svc') == 1
