@@ -786,8 +786,8 @@ def test_locked_qualification_expiry_uses_only_authorized_direct_fallback(
                                  platform='linux/amd64')
 
     if mode == models.WorkspaceImageMode.MANAGED_PREFERRED:
-        assert runtime.resolve_for_placement(resources, placement, **
-                                             arguments) is resources
+        assert runtime.resolve_for_placement(resources, placement,
+                                             **arguments) is resources
     else:
         with pytest.raises(transactions.DemandQualificationStaleError,
                            match='QUALIFICATION_STALE'):
