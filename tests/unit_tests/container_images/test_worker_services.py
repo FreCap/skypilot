@@ -852,6 +852,71 @@ def test_eks_dynamic_credential_refresh_observes_drain_before_raw_call(
     replacement.api_client.close.assert_called_once_with()
 
 
+@pytest.mark.parametrize('failure_kind', ('lease', 'drain', 'deadline'))
+def test_eks_initial_canary_fence_scrubs_installed_credential_before_escape(
+        monkeypatch: pytest.MonkeyPatch, failure_kind: str) -> None:
+    marker = 'INITIAL_CANARY_FENCE_EXEC_TOKEN'
+    configuration = SimpleNamespace(api_key={'authorization': marker},
+                                    api_key_prefix={'authorization': 'Bearer'},
+                                    username=marker,
+                                    password=marker,
+                                    cert_file=marker,
+                                    key_file=marker,
+                                    refresh_api_key_hook=None)
+    api_client = SimpleNamespace(configuration=configuration,
+                                 default_headers={'Authorization': marker},
+                                 cookie=marker,
+                                 close=mock.Mock())
+    raw_call = mock.Mock()
+    raw_core = SimpleNamespace(api_client=api_client, list_node=raw_call)
+    monkeypatch.setattr(canary_worker_service.kubernetes, '_bounded_core_api',
+                        lambda *_args, **_kwargs: (raw_core, None))
+    core = canary_worker_service.kubernetes.ProviderFencedCoreApi(
+        'bounded-context',
+        exec_credential_timeout_seconds=2,
+        provider_fence=lambda: None)
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    fenced = canary_worker_service._FencedClient(core, heartbeat)
+    drain_event = None
+    expected_error: type[BaseException]
+    if failure_kind == 'lease':
+        heartbeat.assert_owned.side_effect = worker_lease.LeaseLostError(
+            'canary lease lost')
+        expected_error = worker_lease.LeaseLostError
+    elif failure_kind == 'drain':
+        drain_event = threading.Event()
+        drain_event.set()
+        expected_error = canary_worker_service._CanaryDrainRequested
+    else:
+        monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                            lambda: 2.0)
+        expected_error = canary_worker_service._CanaryCleanupDeadlineExceeded
+
+    with pytest.raises(expected_error) as exc_info:
+        if failure_kind == 'deadline':
+            fenced.call_before_cleanup_deadline('list_node', 1.0)
+        else:
+            canary_worker_service._ordinary_provider_call(
+                fenced, 'list_node', drain_event)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in str(error)
+    _assert_canary_traceback_value_free(error, marker)
+    raw_call.assert_not_called()
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert configuration.username is None
+    assert configuration.password is None
+    assert configuration.cert_file is None
+    assert configuration.key_file is None
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+
+
 def test_eks_cleanup_refresh_observes_shared_deadline_before_raw_delete(
         monkeypatch: pytest.MonkeyPatch) -> None:
     current = [0.0]

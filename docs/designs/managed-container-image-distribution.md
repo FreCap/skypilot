@@ -2327,6 +2327,13 @@ drain/deadline fence that wins during refresh is invoked with no credential
 exception active, so it cannot acquire that failure as hidden context. A
 descendant that inherited a pipe therefore cannot extend the credential budget
 or leak a credential or diagnostic secret.
+When the Kubernetes wrapper is composed with the canary's generic fenced
+client, the generic wrapper delegates its initial lease, drain, and deadline
+fence to `ProviderFencedCoreApi` instead of running the same fence while its own
+traceback frame still owns the live credential-bearing wrapper. The inner
+wrapper captures an initial control failure, invalidates and scrubs the client,
+then propagates the detached original control type. Non-Kubernetes providers
+retain the generic wrapper's direct pre-call fence.
 Transparent library-side refresh is removed from the raw API call path. The
 wrapper converts a kubeconfig credential's declared wall-clock expiry into one
 monotonic refresh deadline when the credential is accepted, preserving the
@@ -2818,8 +2825,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   exception's traceback locals through a bounded cycle-safe object-graph walk,
   plus the nested exception graph, serialized envelope, and captured logs for
   unpredictable child-generated secrets; installed-client invalidation on
-  refresh, provider, and control failures; direct-child reaping, no transparent
-  API-client refresh hook, one-minute monotonic
+  refresh, provider, and control failures, including an initial canary lease,
+  drain, or deadline failure before Kubernetes refresh; direct-child reaping,
+  no transparent API-client refresh hook, one-minute monotonic
   in-cluster projected-token rotation, monotonic declared-expiry conversion,
   rejection when a final fence or pre-call callback consumes the remaining
   headroom, backward and forward wall-clock jump immunity,
@@ -3849,3 +3857,19 @@ and immediately before the raw method. Tests now use bounded cycle-safe
 object-graph traversal rather than shallow local-value representations. This
 was a precommit review of a moving worktree, so it is repair evidence rather
 than an exact-head acceptance; the acceptance streak remains zero.
+
+Codex exact-head review round 5 at
+`9ffa23a6e4ce560acee8e04404aceb0876ce7fa8` was stopped without a verdict when
+the GitHub async-lifecycle check rejected the deliberate synchronous
+`BaseException` isolation boundaries. The exact `claude-fable-5` max-effort
+plan-mode request returned HTTP 429 with zero input or output tokens, so it was
+neither acceptance nor rejection. Round 6 at
+`2294fda8b3566270702def6453d8823532d10cd7` confirmed the immutable head facts
+and then reproduced one residual boundary before it was stopped: the generic
+canary wrapper ran its own initial provider fence before delegating to
+`ProviderFencedCoreApi`, so the escaping control exception's traceback could
+still reach the installed credential through `_FencedClient.self`. This
+revision delegates that initial Kubernetes fence to the credential-owning inner
+wrapper, which scrubs and invalidates before propagation, and adds an
+object-graph regression for the exact pre-fence schedule. The acceptance streak
+remains zero.

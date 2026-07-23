@@ -122,10 +122,12 @@ class _FencedClient:
                     raise deadline_error()
                 raise ValueError('CANARY_TIMEOUT')
 
-        provider_fence()
+        # The Kubernetes wrapper must own the first fence so it can scrub its
+        # installed credential before any control exception escapes.
         if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
             return self._client.call_with_provider_fence(
                 method_name, provider_fence, on_start, *args, **kwargs)
+        provider_fence()
         assert value is not None
         if on_start is not None:
             on_start()
