@@ -3628,8 +3628,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._last_scale_down_allowance: int = 0
         self._last_pending_allowance: int = 0
         # Replica ids whose declared async occupancy could not be sampled.
-        # They contribute their full per-version capacity to outstanding work:
-        # unknown is a potentially-full replica, never an idle zero.
+        # They contribute a retention floor to outstanding work: raw capacity
+        # in physical mode and utilization-adjusted capacity in logical mode.
+        # Unknown is a potentially-full replica, never an idle zero, but it is
+        # not measured saturation that authorizes extra utilization headroom.
         self._unknown_in_flight_replica_ids: set[int] = set()
         self._report_received_at: float | None = None
         self._reconcile_generation: int = 0
@@ -4730,9 +4732,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 for info in (replica_infos or [])
                 if not info.is_terminal
             }
-            fallback_capacity = max(
-                (self._replica_capacity(info) for info in infos_by_id.values()),
-                default=self.target_concurrency_per_replica)
+            default_capacity = self.target_concurrency_per_replica
+            if self.replica_unit == 'logical':
+                default_capacity = self._effective_logical_capacity_per_gpu()
+            fallback_capacity = max((self._unknown_occupancy_work(info)
+                                     for info in infos_by_id.values()),
+                                    default=default_capacity)
             original_unknown_floor = 0.0
             replacement_unknown_floor = 0.0
             for replica_id in self._unknown_in_flight_replica_ids:
@@ -4743,7 +4748,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     # potentially multi-GPU unknown replica to one GPU.
                     original_unknown_floor += fallback_capacity
                 else:
-                    capacity = self._replica_capacity(info)
+                    capacity = self._unknown_occupancy_work(info)
                     if getattr(info, 'unknown_capacity_replacement',
                                False) is True:
                         replacement_unknown_floor += capacity
@@ -4754,14 +4759,35 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # creates recursive phantom demand. The larger side is the safe
             # possible-work floor; when either side recovers, the other still
             # protects its own capacity.
-            unknown_floor = max(original_unknown_floor,
-                                replacement_unknown_floor)
+            # Repeated fractional utilization capacities (for example ten
+            # 0.9-slot floors) can accumulate a positive binary-float tail.
+            # Normalize only this modeled floor so ceil(work / capacity) does
+            # not manufacture a slot from arithmetic noise.
+            unknown_floor = round(
+                max(original_unknown_floor, replacement_unknown_floor), 12)
         self._weighted_queue_work = self._queue_work()
         self._rejected_concurrency = self._rejected_work()
         return float(
             sum(self._in_flight_by_replica_id.values()) +
             self._weighted_queue_work + self._rejected_concurrency +
             unknown_floor)
+
+    def _unknown_occupancy_work(self,
+                                info: 'replica_managers.ReplicaInfo') -> float:
+        """Work floor that preserves an occupancy-unknown replica.
+
+        Unknown occupancy is a retention signal, not observed demand. In
+        logical mode, express it at the configured utilization-adjusted work
+        capacity so dividing by that same capacity preserves exactly the
+        materialized slots. Charging the raw saturation capacity here would
+        apply utilization headroom a second time and turn a controller/LB
+        handoff that marks the whole fleet unknown into a phantom scale-up.
+        Physical-backend mode retains its existing raw-capacity semantics.
+        """
+        capacity = self._replica_capacity(info)
+        if self.replica_unit == 'logical':
+            capacity *= self._effective_logical_capacity_per_gpu()
+        return capacity
 
     def _fixed_concurrency_work_by_accelerator(
         self,
@@ -4824,7 +4850,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             destination = (replacement_unknown if getattr(
                 info, 'unknown_capacity_replacement', False) is True else
                            original_unknown)
-            add(replica_id, self._replica_capacity(info), destination)
+            add(replica_id, self._unknown_occupancy_work(info), destination)
         # Mirror _outstanding_work(): an uncertain bounded replacement wave
         # overlaps its original, so only the larger side contributes.
         unknown = (replacement_unknown if sum(replacement_unknown.values())

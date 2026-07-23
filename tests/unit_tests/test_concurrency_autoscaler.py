@@ -286,8 +286,9 @@ class TestTargetMath(unittest.TestCase):
 
         self._recompute(autoscaler, replicas)
 
-        # (1 in flight + 2 queued + 4 rejected + 1 unknown) / 2 per GPU.
-        self.assertEqual(autoscaler.target_num_replicas, 4)
+        # The unknown slot contributes its full two-work retention capacity:
+        # (1 in flight + 2 queued + 4 rejected + 2 unknown) / 2 per GPU.
+        self.assertEqual(autoscaler.target_num_replicas, 5)
 
     def test_logical_duration_normalizes_only_rejected_pressure(self):
         autoscaler = _make_autoscaler(
@@ -357,6 +358,70 @@ class TestTargetMath(unittest.TestCase):
         new = _replica(2, gpu_count=1, version=2)  # 3 * 1 = 3
         _report(autoscaler, in_flight={1: 0, 2: 0}, unknown=(1, 2))
         self.assertEqual(autoscaler._outstanding_work([old, new]), 5)
+
+    def test_logical_unknown_fleet_does_not_create_utilization_scale_up(self):
+        # A controller/LB role handoff can conservatively mark every ready
+        # replica occupancy-unknown for one report. That is a retention floor,
+        # not observed saturation: utilization headroom must not inflate 10
+        # existing slots into ceil(10 / 0.9) == 12 phantom demand slots.
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            max_replicas=20,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        replicas = [_replica(replica_id) for replica_id in range(1, 11)]
+        _report(autoscaler,
+                in_flight={replica_id: 0 for replica_id in range(1, 11)},
+                unknown=range(1, 11),
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._outstanding_work(replicas), 9)
+        self.assertEqual(autoscaler.target_num_replicas, 10)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 10})
+        self.assertFalse(any(d.operator == _SCALE_UP for d in decisions))
+
+    def test_logical_unknown_floor_keeps_headroom_for_observed_work(self):
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            max_replicas=20,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+        )
+        replicas = [_replica(1), _replica(2)]
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                queue_depth=1,
+                unknown=(1, 2))
+
+        self._recompute(autoscaler, replicas)
+
+        # Two unknown slots retain themselves at 1.8 work. The one observed
+        # queued job still receives normal utilization headroom, producing a
+        # four-slot target rather than hiding behind the uncertainty floor.
+        self.assertAlmostEqual(autoscaler._outstanding_work(replicas), 2.8)
+        self.assertEqual(autoscaler.target_num_replicas, 4)
+
+    def test_logical_unknown_missing_row_uses_adjusted_fallback(self):
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            max_replicas=20,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+        )
+        _report(autoscaler, in_flight={}, unknown=(101,))
+
+        self._recompute(autoscaler, [])
+
+        self.assertEqual(autoscaler._outstanding_work([]), 0.9)
+        self.assertEqual(autoscaler.target_num_replicas, 1)
 
     def test_zero_outstanding_scales_to_min(self):
         autoscaler = _make_autoscaler(knob=1.0, min_replicas=0)
