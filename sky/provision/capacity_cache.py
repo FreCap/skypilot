@@ -1,4 +1,4 @@
-"""Short-lived, process-shared hints for AWS capacity and quota storms."""
+"""Short-lived, process-shared hints for capacity and quota storms."""
 from collections.abc import Iterable
 import hashlib
 import json
@@ -7,10 +7,14 @@ from typing import NamedTuple
 
 from sky.utils.db import kv_cache
 
-_CACHE_KEY_PREFIX = 'aws:capacity_exhausted:v1:'
-_QUOTA_COOLDOWN_KEY_PREFIX = 'aws:quota_cooldown:v1:'
-_CAPACITY_OBSERVATION_KEY_PREFIX = 'aws:capacity_observation:v1:'
-_QUOTA_OBSERVATION_KEY_PREFIX = 'aws:quota_observation:v1:'
+# The cloud is carried inside the key payload rather than the prefix, so one
+# prefix scan still returns every provider's hints for a service. Bumped to v2
+# when the key gained its cloud and accelerator components: entries written
+# under v1 simply expire, since no hint outlives its TTL.
+_CACHE_KEY_PREFIX = 'capacity_exhausted:v2:'
+_QUOTA_COOLDOWN_KEY_PREFIX = 'quota_cooldown:v2:'
+_CAPACITY_OBSERVATION_KEY_PREFIX = 'capacity_observation:v2:'
+_QUOTA_OBSERVATION_KEY_PREFIX = 'quota_observation:v2:'
 _CAPACITY_TTL_SECONDS = 120
 # Quota may recover as soon as sibling instances terminate. Keep this fixed and
 # deliberately brief: after the last recorded failure, it trades at most 15
@@ -20,21 +24,36 @@ _QUOTA_COOLDOWN_TTL_SECONDS = 15
 
 
 class ResourceKey(NamedTuple):
-    """The exact AWS spot shape covered by an exhaustion hint."""
+    """The exact spot shape covered by an exhaustion hint.
 
+    ``accelerators`` is a canonical string rather than a dict so the key stays
+    hashable and its serialization stable. It is required because a machine
+    type does not always determine the accelerator: GCP's N1 family attaches
+    them separately, so keying on the machine type alone would let one
+    accelerator's exhaustion suppress a different accelerator's demand.
+    """
+
+    cloud: str
     account: str
     region: str
     zone: str
     instance_type: str
+    accelerators: str
     num_nodes: int
 
 
 class QuotaCooldownKey(NamedTuple):
-    """An exact AWS Spot demand covered by a brief quota cooldown."""
+    """An exact Spot demand covered by a brief quota cooldown.
 
+    Accelerators are part of the key because provider quota is granted per
+    accelerator type, so one accelerator's denial says nothing about another.
+    """
+
+    cloud: str
     account: str
     region: str
     instance_type: str
+    accelerators: str
     num_nodes: int
 
 
@@ -63,12 +82,28 @@ def _service_observation_prefix(prefix: str, service_name: str) -> str:
     return f'{prefix}{digest}:'
 
 
+def _redacted_resource(key: ResourceKey | QuotaCooldownKey) -> dict:
+    """Returns the displayable part of a key.
+
+    The account is deliberately absent rather than stripped on read, so a
+    cloud account or project identifier never enters an observation value.
+    """
+    return {
+        'cloud': key.cloud,
+        'region': key.region,
+        'zone': getattr(key, 'zone', None),
+        'instance_type': key.instance_type,
+        'accelerators': key.accelerators or None,
+        'num_nodes': key.num_nodes,
+    }
+
+
 def _service_observation_entry(
     prefix: str,
     observation: ServiceObservation,
     kind: str,
     canonical_key: str,
-    resource: tuple,
+    key: ResourceKey | QuotaCooldownKey,
     expires_at: float,
 ) -> tuple[str, str, float]:
     observation_prefix = _service_observation_prefix(prefix,
@@ -76,12 +111,12 @@ def _service_observation_entry(
     canonical_digest = hashlib.sha256(canonical_key.encode('utf-8')).hexdigest()
     value = json.dumps(
         {
-            'version': 1,
+            'version': 2,
             'kind': kind,
             'service_name': observation.service_name,
             'service_hash': observation.service_hash,
             'canonical_key': canonical_key,
-            'resource': list(resource),
+            'resource': _redacted_resource(key),
             'observed_at': time.time(),
         },
         separators=(',', ':'))
@@ -143,7 +178,7 @@ def clear_quota_cooldown(key: QuotaCooldownKey) -> None:
 def active_service_observations(service_name: str,
                                 service_hash: str,
                                 limit: int = 100) -> dict:
-    """Return redacted, active AWS hints observed by one Serve incarnation."""
+    """Return redacted, active hints observed by one Serve incarnation."""
     if (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or
             limit > 200):
         raise ValueError('limit must be an integer from 1 to 200.')
@@ -163,12 +198,12 @@ def active_service_observations(service_name: str,
             payload = json.loads(value)
         except (TypeError, json.JSONDecodeError):
             continue
-        if (not isinstance(payload, dict) or payload.get('version') != 1 or
+        if (not isinstance(payload, dict) or payload.get('version') != 2 or
                 payload.get('service_name') != service_name or
                 payload.get('service_hash') != service_hash or
                 payload.get('kind') not in ('capacity', 'quota') or
                 not isinstance(payload.get('canonical_key'), str) or
-                not isinstance(payload.get('resource'), list)):
+                not isinstance(payload.get('resource'), dict)):
             continue
         parsed.append((payload, shadow_expiry))
         canonical_keys.append(payload['canonical_key'])
@@ -181,22 +216,14 @@ def active_service_observations(service_name: str,
             continue
         _, canonical_expiry = canonical
         resource = payload['resource']
-        kind = payload['kind']
-        expected_length = 5 if kind == 'capacity' else 4
-        if len(resource) != expected_length:
-            continue
-        # resource[0] is the AWS account. It is intentionally omitted.
-        if kind == 'capacity':
-            _, region, zone, instance_type, num_nodes = resource
-        else:
-            _, region, instance_type, num_nodes = resource
-            zone = None
         hints.append({
-            'kind': kind,
-            'region': region,
-            'zone': zone,
-            'instance_type': instance_type,
-            'num_nodes': num_nodes,
+            'kind': payload['kind'],
+            'cloud': resource.get('cloud'),
+            'region': resource.get('region'),
+            'zone': resource.get('zone'),
+            'instance_type': resource.get('instance_type'),
+            'accelerators': resource.get('accelerators'),
+            'num_nodes': resource.get('num_nodes'),
             'observed_at': payload.get('observed_at'),
             'expires_at': min(shadow_expiry, canonical_expiry),
         })

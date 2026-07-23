@@ -3022,6 +3022,12 @@ def get_config_schema():
             'install_conda': {
                 'type': 'boolean',
             },
+            # Opt-in while the GCP capacity classification is validated in
+            # production. When false, GCP writes and reads no capacity or
+            # quota hints and provisioning behaves exactly as before.
+            'gcp_capacity_cache': {
+                'type': 'boolean',
+            },
         }
     }
 

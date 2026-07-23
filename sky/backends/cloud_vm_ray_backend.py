@@ -892,6 +892,20 @@ _PLACEMENT_CAPACITY_ERROR_CODES = _CAPACITY_ERROR_CODES | frozenset({
 # causal one still classifies, while a genuinely unknown code keeps the
 # conservative outcome.
 _NEUTRAL_PLACEMENT_ERROR_CODES = frozenset({'VM_MIN_COUNT_NOT_REACHED'})
+# Cache-gating code sets, scoped per provider. These decide whether a failure
+# suppresses a later launch, so each provider only ever matches its own codes.
+_GCP_CAPACITY_ERROR_CODES = frozenset({
+    'ZONE_RESOURCE_POOL_EXHAUSTED',
+    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+    'insufficientCapacity',
+    'CapacityExceeded',
+})
+_GCP_QUOTA_ERROR_CODES = frozenset({
+    'QUOTA_EXCEEDED',
+    'quotaExceeded',
+    'RESOURCE_EXHAUSTED',
+    'type.googleapis.com/google.rpc.QuotaFailure',
+})
 
 
 def _record_capacity_metric(reason: str, action: str) -> None:
@@ -938,23 +952,39 @@ def _provider_error_codes(error: BaseException) -> list[str]:
 
 def _classify_capacity_error(cloud: 'clouds.Cloud',
                              error: BaseException) -> str | None:
-    """Classifies an AWS failure using structured codes only.
+    """Classifies a provider failure using structured codes only.
 
-    AWS's provisioner records every failed RunInstances attempt on a
+    A provisioner records every failed create attempt on a
     ``ProvisionerError``. A batch is classified only when every code is a known
-    capacity/quota code. Quota dominates a mixed known batch because it is
-    regional; any unknown code takes the conservative normal failover path.
+    capacity/quota code for that provider. Quota dominates a mixed known batch
+    because it is regional; any unknown code takes the conservative normal
+    failover path.
+
+    Codes are matched per provider so one cloud's capacity code can never
+    classify another cloud's failure.
     """
-    if not isinstance(cloud, clouds.AWS):
+    if isinstance(cloud, clouds.AWS):
+        capacity_codes = _CAPACITY_ERROR_CODES
+        quota_codes = _QUOTA_ERROR_CODES
+    elif isinstance(cloud, clouds.GCP):
+        capacity_codes = _GCP_CAPACITY_ERROR_CODES
+        quota_codes = _GCP_QUOTA_ERROR_CODES
+    else:
         return None
-    codes = _provider_error_codes(error)
-    known_codes = _CAPACITY_ERROR_CODES | _QUOTA_ERROR_CODES
+    # GCP pairs the causal code with a `VM_MIN_COUNT_NOT_REACHED` summary that
+    # says only that the request failed. Dropping it keeps the all-known check
+    # meaningful without weakening it for a genuinely unknown code.
+    codes = [
+        code for code in _provider_error_codes(error)
+        if code not in _NEUTRAL_PLACEMENT_ERROR_CODES
+    ]
+    known_codes = capacity_codes | quota_codes
     if codes and all(code in known_codes for code in codes):
-        # A quota denial is regional and makes sibling-AZ attempts for this
+        # A quota denial is regional and makes sibling-zone attempts for this
         # demand futile, so it dominates an otherwise-known capacity/quota
         # aggregate. Unknown codes remain unclassified and take the normal,
         # conservative failover path.
-        if any(code in _QUOTA_ERROR_CODES for code in codes):
+        if any(code in quota_codes for code in codes):
             return 'quota'
         return 'capacity'
     return None
@@ -996,20 +1026,76 @@ def _record_insufficient_quota_notification(
         return False
 
 
+def _canonical_accelerators(to_provision: 'resources_lib.Resources') -> str:
+    """Returns a stable string for the requested accelerators.
+
+    A machine type does not always determine the accelerator (GCP's N1 family
+    attaches them separately), so the accelerator has to be part of any key
+    that suppresses a later launch.
+    """
+    accelerators = to_provision.accelerators or {}
+    return ','.join(
+        f'{name}:{count}' for name, count in sorted(accelerators.items()))
+
+
+def _capacity_cache_cloud_name(
+        to_provision: 'resources_lib.Resources') -> str | None:
+    """Returns the cache-eligible cloud name, or None when not eligible."""
+    if isinstance(to_provision.cloud, clouds.AWS):
+        return 'aws'
+    if isinstance(to_provision.cloud, clouds.GCP):
+        # GCP suppression is opt-in per deployment while the classification is
+        # being validated in production. Off means no key, so nothing is ever
+        # written or read and behavior is exactly as before.
+        if skypilot_config.get_nested(('provision', 'gcp_capacity_cache'),
+                                      False):
+            return 'gcp'
+    return None
+
+
+_GCP_IDENTITY_PROJECT_RE = re.compile(r'\[project_id=([^\]]+)\]')
+
+
+def _capacity_cache_account(
+        cloud: Optional['clouds.Cloud'],
+        cloud_user_identity: list[str] | None) -> str | None:
+    """Returns the account that scopes cache keys, or None to skip caching.
+
+    Hints must never be shared across accounts, so a cloud whose identity
+    cannot be resolved simply does not participate. No extra provider call is
+    made: the identity has already been fetched for this provisioning attempt.
+    """
+    if not cloud_user_identity:
+        return None
+    identity = str(cloud_user_identity[-1])
+    if isinstance(cloud, clouds.AWS):
+        return identity
+    if isinstance(cloud, clouds.GCP):
+        # GCP formats its identity as `<account> [project_id=<project>]`. Only
+        # the project scopes capacity, and taking it alone keeps the user's
+        # email address out of the cache key.
+        match = _GCP_IDENTITY_PROJECT_RE.search(identity)
+        return match.group(1) if match is not None else None
+    return None
+
+
 def _capacity_cache_key(
         to_provision: 'resources_lib.Resources', region: 'clouds.Region',
         zones: list['clouds.Zone'] | None, num_nodes: int,
         account: str | None) -> Optional['capacity_cache.ResourceKey']:
     """Returns a key only for the exact, safe-to-cache incident path."""
-    if (not isinstance(to_provision.cloud, clouds.AWS) or
-            not to_provision.use_spot or zones is None or len(zones) != 1 or
-            not account or not to_provision.instance_type):
+    cloud_name = _capacity_cache_cloud_name(to_provision)
+    if (cloud_name is None or not to_provision.use_spot or zones is None or
+            len(zones) != 1 or not account or not to_provision.instance_type):
         return None
-    return capacity_cache.ResourceKey(account=account,
-                                      region=region.name,
-                                      zone=zones[0].name,
-                                      instance_type=to_provision.instance_type,
-                                      num_nodes=num_nodes)
+    return capacity_cache.ResourceKey(
+        cloud=cloud_name,
+        account=account,
+        region=region.name,
+        zone=zones[0].name,
+        instance_type=to_provision.instance_type,
+        accelerators=_canonical_accelerators(to_provision),
+        num_nodes=num_nodes)
 
 
 def _capacity_cache_exhausted_zone_names(
@@ -1036,14 +1122,16 @@ def _quota_cooldown_key(
         num_nodes: int,
         account: str | None) -> Optional['capacity_cache.QuotaCooldownKey']:
     """Returns a demand-specific key for a brief Spot quota cooldown."""
-    if (not isinstance(to_provision.cloud, clouds.AWS) or
-            not to_provision.use_spot or not account or
+    cloud_name = _capacity_cache_cloud_name(to_provision)
+    if (cloud_name is None or not to_provision.use_spot or not account or
             not to_provision.instance_type):
         return None
     return capacity_cache.QuotaCooldownKey(
+        cloud=cloud_name,
         account=account,
         region=region.name,
         instance_type=to_provision.instance_type,
+        accelerators=_canonical_accelerators(to_provision),
         num_nodes=num_nodes)
 
 
@@ -1520,9 +1608,8 @@ class RetryingVmProvisioner:
             to_provision, 'region should have been set by the optimizer.')
         region = clouds.Region(to_provision.region)
 
-        capacity_cache_account = None
-        if (isinstance(to_provision.cloud, clouds.AWS) and cloud_user_identity):
-            capacity_cache_account = str(cloud_user_identity[-1])
+        capacity_cache_account = _capacity_cache_account(
+            to_provision.cloud, cloud_user_identity)
         quota_cooldown_key = _quota_cooldown_key(to_provision, region,
                                                  num_nodes,
                                                  capacity_cache_account)
@@ -1532,7 +1619,7 @@ class RetryingVmProvisioner:
                 self._blocked_resources,
                 to_provision.copy(region=region.name, zone=None))
             raise exceptions.ResourcesUnavailableError(
-                'Skipping an AWS Spot demand still in a brief quota-failure '
+                'Skipping a Spot demand still in a brief quota-failure '
                 f'cooldown for {to_provision.instance_type} in {region.name}.')
 
         # Optimization - check if user has non-zero quota for
@@ -1619,7 +1706,7 @@ class RetryingVmProvisioner:
                         num_nodes, capacity_cache_account)
                     if exhausted_zone_names:
                         logger.info(
-                            'Skipping a recently capacity-exhausted AWS spot '
+                            'Skipping a recently capacity-exhausted spot '
                             f'attempt in {sorted(exhausted_zone_names)}.')
                         remaining_unblocked_zones = [
                             zone for zone in remaining_unblocked_zones

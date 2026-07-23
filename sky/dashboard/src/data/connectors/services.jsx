@@ -747,9 +747,11 @@ export function normalizeServicePlacement(payload) {
       hints: Array.isArray(capacity.hints)
         ? capacity.hints.map((hint) => ({
             kind: hint.kind || 'capacity',
+            cloud: hint.cloud || null,
             region: hint.region || null,
             zone: hint.zone || null,
             instanceType: hint.instance_type || null,
+            accelerators: hint.accelerators || null,
             numNodes: finiteOrNull(hint.num_nodes),
             observedAt: finiteOrNull(hint.observed_at),
             expiresAt: finiteOrNull(hint.expires_at),

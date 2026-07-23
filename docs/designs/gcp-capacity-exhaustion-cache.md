@@ -102,22 +102,37 @@ Today's `boltz-l4-fleet` traffic is entirely `a2-highgpu-1g` + `A100:1` and
 `g2-standard-4` + `L4:1`, so the collision is not currently exercised, but it is
 reachable as soon as an N1 shape enters the fleet.
 
-Cache keys gain a cloud discriminator, so namespaces become `gcp:capacity_exhausted:v1:`
-alongside the existing `aws:` ones. Because the capacity TTL is 120s, no
-migration is needed: any key written under the old namespace expires within two
-minutes of rollout.
+Cache keys gain a cloud discriminator. As implemented, the cloud lives inside
+the key payload and the prefixes drop their `aws:` scope, becoming
+`capacity_exhausted:v2:` and friends. Keeping one prefix per kind means a single
+prefix scan still returns every provider's hints for a service, which the
+observations API depends on. Because the capacity TTL is 120s, no migration is
+needed: any key written under the old namespace expires within two minutes of
+rollout.
 
-The project identity is already available. `capacity_cache_account` is derived
+The project identity is already available. `capacity_cache_account` derives it
 from `cloud_user_identity`, which is fetched regardless of cloud, so the GCP
-path needs no additional API call.
+path needs no additional provider call. GCP formats that identity as
+`<account> [project_id=<project>]`; only the project is extracted, both because
+the project is what scopes capacity and because it keeps the user's email
+address out of the cache key. An identity with no parseable project yields no
+key, so that demand simply does not participate.
 
 ### Presentation
 
-`active_service_observations` returns hints described as AWS-specific, and the
-Serve placement page renders them under an "AWS launch suppression" heading. Both
-become provider-neutral, with the provider carried per hint so the UI can label
-each row. This is a visible API shape change on the placement endpoint and is
-the main reason this work is separated from PR #874.
+`active_service_observations` returned hints described as AWS-specific, and the
+Serve placement page rendered them under an "AWS launch suppression" heading.
+Both are now provider-neutral, with `cloud` and `accelerators` carried per hint
+so the UI can attribute each row. The observation payload moved to version 2
+and carries an explicit object rather than a positional list, which removes the
+index arithmetic that previously decoded it.
+
+The account is now excluded when the observation is written rather than
+redacted when it is read, so no account or project identifier ever enters an
+observation value.
+
+This is a visible API shape change on the placement endpoint and is the main
+reason this work was separated from PR #874.
 
 ## Alternatives
 
@@ -148,11 +163,14 @@ hint would refuse zones that still have capacity.
 4. Provider-neutral observations in the placement API and the dashboard label.
 
 Milestones 1 and 2 are independently landable and carry no behavior change,
-which keeps the risky gate-opening step small.
+which keeps the risky gate-opening step small. They were implemented as
+separate commits in one change set for review, since the key-shape change in
+milestone 2 has no consumer until milestone 3.
 
 ## Rollout
 
-The suppression gates ship behind a config flag defaulting to off, so the cache
+The suppression gates ship behind `provision.gcp_capacity_cache`, a boolean
+defaulting to off, so the cache
 can be enabled per deployment after the classification has been observed to be
 correct in production. Because outcome classification landed first, the
 placement history already labels GCP exhaustion as `capacity_failed`, so the

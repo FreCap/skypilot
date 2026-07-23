@@ -481,17 +481,17 @@ function CapacityHintsCard({ state }) {
   return (
     <Card>
       <div className="border-b px-4 py-3">
-        <h3 className="font-semibold">AWS launch suppression</h3>
+        <h3 className="font-semibold">Launch suppression</h3>
         <p className="mt-1 text-sm text-gray-500">
           These short-lived hints suppress only the exact instance demand
           shown—not every instance type in the zone or region.
         </p>
       </div>
       {!state.available ? (
-        <SectionUnavailable label="AWS capacity hints" />
+        <SectionUnavailable label="Capacity hints" />
       ) : state.hints.length === 0 ? (
         <div className="p-5 text-sm text-gray-500">
-          No active AWS capacity or quota hints for this service.
+          No active capacity or quota hints for this service.
         </div>
       ) : (
         <div className="overflow-x-auto">
@@ -499,6 +499,7 @@ function CapacityHintsCard({ state }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Scope</TableHead>
+                <TableHead>Provider</TableHead>
                 <TableHead>Region / zone</TableHead>
                 <TableHead>Instance type</TableHead>
                 <TableHead>Nodes</TableHead>
@@ -508,12 +509,17 @@ function CapacityHintsCard({ state }) {
             <TableBody>
               {state.hints.map((hint, index) => (
                 <TableRow
-                  key={`${hint.kind}-${hint.region}-${hint.zone}-${hint.instanceType}-${index}`}
+                  key={`${hint.kind}-${hint.cloud}-${hint.region}-${hint.zone}-${hint.instanceType}-${index}`}
                 >
                   <TableCell>
                     <StatusPill tone="warning">
-                      {hint.kind === 'quota' ? 'Regional quota' : 'AZ capacity'}
+                      {hint.kind === 'quota'
+                        ? 'Regional quota'
+                        : 'Zonal capacity'}
                     </StatusPill>
+                  </TableCell>
+                  <TableCell className="uppercase">
+                    {hint.cloud || '-'}
                   </TableCell>
                   <TableCell>
                     {hint.region || '-'}
@@ -521,6 +527,7 @@ function CapacityHintsCard({ state }) {
                   </TableCell>
                   <TableCell className="font-medium">
                     {hint.instanceType || '-'}
+                    {hint.accelerators ? ` (${hint.accelerators})` : ''}
                   </TableCell>
                   <TableCell>{hint.numNodes ?? '-'}</TableCell>
                   <TableCell>

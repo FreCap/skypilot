@@ -921,9 +921,11 @@ describe('service placement', () => {
       hints: [
         {
           kind: 'capacity',
+          cloud: 'aws',
           region: 'us-east-1',
           zone: 'us-east-1a',
           instance_type: 'g6.4xlarge',
+          accelerators: 'L4:1',
           num_nodes: 2,
           expires_at: 1120,
         },
@@ -965,7 +967,9 @@ describe('service placement', () => {
     });
     expect(placement.capacityHints.hints[0]).toMatchObject({
       kind: 'capacity',
+      cloud: 'aws',
       instanceType: 'g6.4xlarge',
+      accelerators: 'L4:1',
       numNodes: 2,
     });
     expect(placement.history.events[0]).toMatchObject({

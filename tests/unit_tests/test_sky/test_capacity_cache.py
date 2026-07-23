@@ -1,4 +1,4 @@
-"""Tests for the short-lived AWS capacity hints."""
+"""Tests for the short-lived capacity hints."""
 # pylint: disable=protected-access
 import json
 
@@ -11,10 +11,12 @@ from sky.utils.db import kv_cache
 
 def _key(**overrides):
     values = {
+        'cloud': 'aws',
         'account': '0001',
         'region': 'us-east-1',
         'zone': 'us-east-1a',
         'instance_type': 'g6.4xlarge',
+        'accelerators': 'L4:1',
         'num_nodes': 1,
     }
     values.update(overrides)
@@ -23,9 +25,11 @@ def _key(**overrides):
 
 def _quota_key(**overrides):
     values = {
+        'cloud': 'aws',
         'account': '0001',
         'region': 'us-east-1',
         'instance_type': 'g6.4xlarge',
+        'accelerators': 'L4:1',
         'num_nodes': 1,
     }
     values.update(overrides)
@@ -47,6 +51,10 @@ def test_resource_dimensions_are_part_of_key():
     assert base != capacity_cache._cache_key(_key(zone='us-east-1b'))
     assert base != capacity_cache._cache_key(_key(instance_type='g6.8xlarge'))
     assert base != capacity_cache._cache_key(_key(num_nodes=8))
+    # A machine type does not always determine the accelerator, and one
+    # cloud's exhaustion says nothing about another's.
+    assert base != capacity_cache._cache_key(_key(accelerators='V100:1'))
+    assert base != capacity_cache._cache_key(_key(cloud='gcp'))
 
 
 def test_round_trip_and_ttl_expiry(cache_db, monkeypatch):
@@ -121,6 +129,10 @@ def test_quota_dimensions_are_isolated():
         _quota_key(instance_type='g6.8xlarge'))
     assert base != capacity_cache._quota_cooldown_cache_key(
         _quota_key(num_nodes=8))
+    assert base != capacity_cache._quota_cooldown_cache_key(
+        _quota_key(accelerators='V100:1'))
+    assert base != capacity_cache._quota_cooldown_cache_key(
+        _quota_key(cloud='gcp'))
 
 
 def test_active_filters_candidates(monkeypatch):
@@ -147,9 +159,11 @@ def test_service_observation_is_exact_and_redacted(cache_db, monkeypatch):
         'available': True,
         'hints': [{
             'kind': 'capacity',
+            'cloud': 'aws',
             'region': 'us-east-1',
             'zone': 'us-east-1a',
             'instance_type': 'g6.4xlarge',
+            'accelerators': 'L4:1',
             'num_nodes': 1,
             'observed_at': 1000.0,
             'expires_at': 1120.0,
@@ -195,3 +209,33 @@ def test_quota_observation_is_regional(cache_db, monkeypatch):
     assert hint['region'] == 'us-east-1'
     assert hint['zone'] is None
     assert hint['instance_type'] == 'g6.4xlarge'
+
+
+def test_observation_never_carries_the_account(cache_db):
+    """The account is absent from the stored value, not stripped on read."""
+    del cache_db
+    key = _key(account='secret-project')
+    capacity_cache.mark_exhausted(
+        key, capacity_cache.ServiceObservation('svc', 'hash-a'))
+
+    stored = kv_cache.list_active_cache_entries_by_prefix(
+        capacity_cache._service_observation_prefix(
+            capacity_cache._CAPACITY_OBSERVATION_KEY_PREFIX, 'svc'), 10)
+    assert stored
+    for _, value, _ in stored:
+        payload = json.loads(value)
+        assert 'secret-project' not in json.dumps(payload['resource'])
+        assert payload['resource']['cloud'] == 'aws'
+
+
+def test_hints_from_multiple_clouds_are_returned_together(cache_db):
+    """One prefix scan must surface every provider's hints for a service."""
+    del cache_db
+    observation = capacity_cache.ServiceObservation('svc', 'hash-a')
+    capacity_cache.mark_exhausted(_key(cloud='aws'), observation)
+    capacity_cache.mark_exhausted(
+        _key(cloud='gcp', region='asia-northeast3', zone='asia-northeast3-b'),
+        observation)
+
+    hints = capacity_cache.active_service_observations('svc', 'hash-a')['hints']
+    assert sorted(hint['cloud'] for hint in hints) == ['aws', 'gcp']
