@@ -970,28 +970,44 @@ class CopyWorkerService:
 
     def _claim(self) -> tuple[str, Any] | None:
         if self._claims_since_inventory >= 16:
+            if self._stop.is_set():
+                return None
             inventory = topology_state.claim_inventory_shard(
                 worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+            if self._stop.is_set():
+                return None
             self._claims_since_inventory = 0
             if inventory is not None:
                 return 'inventory', inventory
         for _ in range(2):
             if self._claim_inspection_next:
+                if self._stop.is_set():
+                    return None
                 publication = catalog_state.claim_publication_inspection(
                     worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                if self._stop.is_set():
+                    return None
                 self._claim_inspection_next = False
                 if publication is not None:
                     self._claims_since_inventory += 1
                     return 'publication', publication
             else:
+                if self._stop.is_set():
+                    return None
                 location = topology_state.claim_next_location(
                     worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                if self._stop.is_set():
+                    return None
                 self._claim_inspection_next = True
                 if location is not None:
                     self._claims_since_inventory += 1
                     return 'location', location
+        if self._stop.is_set():
+            return None
         inventory = topology_state.claim_inventory_shard(
             worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+        if self._stop.is_set():
+            return None
         self._claims_since_inventory = 0
         if inventory is not None:
             return 'inventory', inventory
@@ -1026,8 +1042,12 @@ class CopyWorkerService:
                 schedule_now = time.monotonic()
                 if (schedule_now - last_config_refresh
                         >= _CONFIG_REFRESH_SECONDS):
+                    if self._stop.is_set():
+                        break
                     try:
                         skypilot_config.safe_reload_config()
+                        if self._stop.is_set():
+                            break
                         if manifest_directory is not None:
                             _ingest_qualification_manifests(manifest_directory)
                     except (OSError, TypeError, ValueError):

@@ -180,6 +180,35 @@ tests:
               secretName: db-ca
         documentIndex: 2
 
+  - it: should default missing legacy worker grace values during reuse upgrades
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      imageCopyWorker.terminationGracePeriodSeconds: null
+      imageLifecycleWorker.enabled: true
+      imageLifecycleWorker.serviceAccount.create: false
+      imageLifecycleWorker.serviceAccount.name: lifecycle-worker
+      imageLifecycleWorker.terminationGracePeriodSeconds: null
+      imageCanaryWorker.enabled: true
+      imageCanaryWorker.serviceAccount.create: false
+      imageCanaryWorker.serviceAccount.name: canary-worker
+      imageCanaryWorker.terminationGracePeriodSeconds: null
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+        documentIndex: 1
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 600
+        documentIndex: 2
+
   - it: should use auto migration ownership only when the migration job is disabled
     set:
       apiService.dbConnectionSecretName: external-db

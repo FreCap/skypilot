@@ -1067,9 +1067,13 @@ ring rotation without scanning the catalog.
 Every lifecycle claim uses the same durable background lease heartbeat as copy
 work. The AWS adapter invokes the exact lease fence immediately before and after
 its STS `AssumeRole` request; caller-side checks alone are not credential
-fencing. The worker synchronously re-proves ownership in the hook immediately
-before every ECR call, records `DELETE` intent before the destructive call, and
-rechecks ownership again before database completion. Lease loss sets
+fencing. Both STS authority acquisition and the assumed service client use an
+explicit 10-second connect timeout, 60-second read timeout, and one total
+attempt. A hidden SDK retry therefore cannot consume the canary custody budget
+or continue indefinitely after worker drain. The worker synchronously re-proves
+ownership in the hook immediately before every ECR call, records `DELETE` intent
+before the destructive call, and rechecks ownership again before database
+completion. Lease loss sets
 cancellation state and starts no later provider call. A call that may already
 have started is never treated as cancelled, present, or absent; it converges
 only to QUARANTINED unless its conclusive response was durably recorded as
@@ -1124,15 +1128,26 @@ or reflect the complete untrusted payload into an error message.
 
 Built-in exceptions are constructed from positional arguments only, after which
 ordinary string-key attributes are restored independently. For a known SkyPilot
-exception, only ordinary attributes named by an unbound keyword-capable
-constructor parameter are passed to its constructor. Remaining forward-version
-attributes are restored after construction, so an older client preserves the
-known exception type when a newer server adds an ordinary attribute. An
-attribute that is read-only, slotted, or otherwise unsettable is skipped without
-replacing the original error. Dunder attributes are never constructor arguments.
-Valid Python 3.11 exception notes are emitted outside the attribute map for
-old-client compatibility, while the decoder also accepts the legacy attribute
-form and restores notes only after construction.
+exception, the serialized arguments, rendered message, and ordinary attributes
+are the canonical wire state; `BaseException.args` is not assumed to have the
+same shape as the subclass constructor. Reconstruction first binds matching
+ordinary attributes to named constructor parameters, then binds serialized
+arguments only to remaining positional parameters. This preserves subclasses
+such as validation errors whose constructor-only context is stored in ordinary
+attributes. If a current subclass constructor transforms its input into an
+already-rendered message, the decoder may restore the validated `BaseException`
+state without invoking that transformation a second time, but only when the
+serialized arguments themselves reproduce the separately serialized message.
+Subclasses that intentionally exclude arguments remain constructor-restored from
+their named attributes. The decoder verifies the reconstructed type, arguments,
+and rendered message before accepting it. Remaining forward-version attributes
+are restored after construction, so an older client preserves the known
+exception type when a newer server adds an ordinary attribute. An attribute that
+is read-only, slotted, or otherwise unsettable is skipped without replacing the
+original error. Dunder attributes are never constructor arguments. Valid Python
+3.11 exception notes are emitted outside the attribute map for old-client
+compatibility, while the decoder also accepts the legacy attribute form and
+restores notes only after construction.
 
 For `locality: prefer`, candidate generation assigns READY managed, authenticated
 direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
@@ -2191,10 +2206,14 @@ of every destructive provider call.
 
 Shutdown is a no-new-work fence. Every worker rechecks its process stop event
 after heartbeat or configuration work and immediately before each maintenance
-call, queue claim, and executor submission. A stop observed at any boundary
-exits the claim loop without beginning more database or provider work. Work
-already submitted drains through the executor; lease fencing and durable state
-still own any ambiguous provider result.
+call, queue claim, and executor submission. Copy checks before and after every
+independently blocking inventory, publication, and location claim; it cannot
+begin a later claim after an earlier claim observes shutdown. It also checks
+between configuration reload and qualification-manifest ingestion. Lifecycle
+checks between each independent maintenance substep. A stop observed at any
+boundary exits the claim loop without beginning more database or provider work.
+Work already submitted drains through the executor; lease fencing and durable
+state still own any ambiguous provider result.
 
 The canary worker additionally passes the same stop event into every submitted
 canary. A task that has not created a provider child exits without launching
@@ -2204,20 +2223,28 @@ Cancellation never interrupts teardown itself. A persisted child claimed before
 shutdown therefore runs in cleanup-only mode and cannot be recreated. This
 reduces shutdown observation from the 3,600-second runtime maximum to one
 bounded provider call or the 10-second poll interval, followed by custody
-cleanup. Once an unstarted task or verified teardown has no live provider child,
-the exact owner advances its lease expiry to PostgreSQL's current time under the
-same token. The replacement worker can reclaim it immediately without waiting
-for the normal 15-minute lease. A failed release remains safe and falls back to
-ordinary lease-expiry recovery.
+cleanup. Verified cleanup rechecks the process stop event before any success or
+failure terminalization. If shutdown arrived during teardown, that exact owner
+releases the still-RUNNING token instead, so successful cleanup cannot race into
+terminal qualification. Once an unstarted task or verified teardown has no live
+provider child, the exact owner advances its lease expiry to PostgreSQL's current
+time under the same token. The replacement worker can reclaim it immediately
+without waiting for the normal 15-minute lease. A failed release remains safe
+and falls back to ordinary lease-expiry recovery.
 
-The canary Deployment enforces a termination grace of at least 600 seconds. The
-grace covers cancellation observation, the 300-second wall-clock EC2 teardown
-settling budget, bounded provider-call overhead, and margin. The process exits
-immediately when cleanup completes, so the configured ceiling does not add a
-fixed rollout delay. The same drain applies to disable and scale-down. If the
-grace expires or bounded provider cleanup itself fails, the operation and
-concrete child identity remain RUNNING for lease-expiry recovery rather than
-being falsely terminalized.
+EC2 teardown uses one absolute 300-second deadline. It checks that deadline
+immediately before and after every tag discovery, termination, and exact-state
+provider call. A call that crosses the deadline makes cleanup unverified and no
+later provider call starts. The canary Deployment enforces a termination grace
+of at least 600 seconds. The grace covers cancellation observation, that
+300-second EC2 settling budget, bounded provider-call overhead, and margin. The
+process exits immediately when cleanup completes, so the configured ceiling does
+not add a fixed rollout delay. The same drain applies to disable and scale-down.
+For `helm upgrade --reuse-values`, legacy value maps that omit the three worker
+grace keys render copy/lifecycle/canary defaults of 30/30/600 seconds; an
+explicit canary value below 600 remains invalid. If the grace expires or bounded
+provider cleanup itself fails, the operation and concrete child identity remain
+RUNNING for lease-expiry recovery rather than being falsely terminalized.
 
 Restart recovery verifies actual registry state for immutable copy work and
 pre-delete claims. An expired
@@ -2638,14 +2665,18 @@ drained and every image table is empty; it is never part of Helm rollback.
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
 - deterministic stop-during-heartbeat tests for copy, lifecycle, and canary
-  workers proving that shutdown begins no later maintenance, claim, or executor
-  submission; provider-level canary drain tests proving cancellation cannot
-  create a new child and always enters uncancelled teardown for an owned child;
-  a slow-provider test proving EC2 settling cannot start another call after its
-  300-second wall-clock budget;
+  workers proving that shutdown begins no later maintenance, internal copy
+  claim, manifest-ingestion, lifecycle-maintenance, or executor submission;
+  provider-level canary drain tests proving cancellation cannot create a new
+  child, always enters uncancelled teardown for an owned child, and cannot
+  terminalize success or failure when shutdown arrives during verified cleanup;
+  slow-provider tests proving EC2 settling checks its absolute deadline around
+  every provider call, treats an over-budget result as unverified, and cannot
+  start another call after its 300-second wall-clock budget;
   PostgreSQL tests proving a verified drain is immediately reclaimable while a
   stale token cannot release its successor; plus Helm rendering and schema tests
-  enforcing the canary's 600-second minimum custody-cleanup grace;
+  enforcing the canary's 600-second minimum custody-cleanup grace and legacy
+  `--reuse-values` defaults of 30/30/600;
 - worker-clock skew and blocking-lock tests proving that copy and eviction
   claims, provider grants and throttles, retry delays, consumer terminal
   confirmation, unattached-cluster retention, worker cleanup, and terminal
@@ -2738,8 +2769,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   fail before health or provider work when any central schema is stale;
 - exception-envelope tests proving unknown and known non-exception types share
   one value-free sanitized result, forward-version ordinary attributes preserve
-  a known SkyPilot exception type, and unsettable attributes cannot replace the
-  original error;
+  a known SkyPilot exception type, unsettable attributes cannot replace the
+  original error, and every currently defined SkyPilot exception class has an
+  exact serialize/deserialize round trip for type, arguments, message, notes,
+  and restorable ordinary state;
 - Dashboard A-to-B workspace-switch tests with workspace A already rendered,
   proving both pending and failed capability replacement immediately remove A's
   data, mutation controls, open dialogs, retries, and hidden errors, plus
@@ -3564,3 +3597,16 @@ PR #368 merged as `e712186072fede57d08841e0ac7e0d184b174c18` before the
 round-one repairs above were committed. The corrections therefore continue as
 a focused follow-up from `966a8d014ca81610f3b24ceb35e221384b0aab2b`; they do
 not rewrite the merge or treat the merged state as reviewed acceptance.
+
+Codex final-acceptance round 1 at
+`71c6dca4f5b91facca3a8696fea4d0692003c249` returned `RESHAPE`; the exact
+`claude-fable-5` plan-mode request again returned HTTP 429 before using any
+token, so no paired acceptance was recorded. Codex reproduced five blocking
+boundaries on the otherwise green 26-check head: EC2 teardown could start calls
+after its deadline, shutdown during verified cleanup could still terminalize a
+canary, copy could begin later internal claims after observing shutdown, legacy
+Helm reuse values omitted required grace keys, and several current SkyPilot
+exceptions did not round-trip their canonical state. The adjacent audit also
+made STS retry and timeout bounds, configuration-to-ingestion shutdown, and
+lifecycle maintenance substep shutdown explicit. This revision closes those
+boundaries as one batch. The acceptance streak remains zero.

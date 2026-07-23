@@ -339,13 +339,13 @@ def _instance_states(ec2: Any, instance_ids: set[str]) -> dict[str, str | None]:
     }
 
 
-def _terminate_ec2_instances(
-        ec2: Any,
-        operation_id: str,
-        instance_ids: list[str],
-        *,
-        settle_absence: bool,
-        initial_unidentified_child_observed: bool = False) -> bool:
+def _terminate_ec2_instances(ec2: Any,
+                             operation_id: str,
+                             instance_ids: list[str],
+                             *,
+                             settle_absence: bool,
+                             initial_unidentified_child_observed: bool = False,
+                             cleanup_deadline: float | None = None) -> bool:
     known_ids = {
         instance_id for instance_id in instance_ids
         if isinstance(instance_id, str) and instance_id
@@ -355,11 +355,14 @@ def _terminate_ec2_instances(
         for instance_id in instance_ids))
     clean_observations_after_ambiguity = 0
     termination_requested: set[str] = set()
-    cleanup_deadline = time.monotonic() + _EC2_TEARDOWN_SECONDS
+    if cleanup_deadline is None:
+        cleanup_deadline = time.monotonic() + _EC2_TEARDOWN_SECONDS
     for attempt in range(_EC2_TEARDOWN_ATTEMPTS):
-        if attempt > 0 and time.monotonic() >= cleanup_deadline:
+        if time.monotonic() >= cleanup_deadline:
             return False
         tagged = _tagged_instances(ec2, operation_id)
+        if time.monotonic() >= cleanup_deadline:
+            return False
         unidentified_in_observation = _remember_instance_ids(tagged, known_ids)
         if unidentified_in_observation:
             unidentified_child_observed = True
@@ -378,11 +381,19 @@ def _terminate_ec2_instances(
         }
         to_terminate = sorted(known_ids - termination_requested - terminal_ids)
         if to_terminate:
+            if time.monotonic() >= cleanup_deadline:
+                return False
             ec2.terminate_instances(InstanceIds=to_terminate)
+            if time.monotonic() >= cleanup_deadline:
+                return False
             termination_requested.update(to_terminate)
         all_known_terminated = False
         if known_ids:
+            if time.monotonic() >= cleanup_deadline:
+                return False
             states = _instance_states(ec2, known_ids)
+            if time.monotonic() >= cleanup_deadline:
+                return False
             all_known_terminated = (set(states) == known_ids and all(
                 state == 'terminated' for state in states.values()))
             if (all_known_terminated and not settle_absence and
@@ -614,24 +625,34 @@ def _run_ec2_canary(
                 heartbeat.assert_owned()
                 raise RuntimeError('EC2 canary teardown authority unavailable.')
             else:
-                live_instances = _tagged_instances(ec2, operation.id)
-                unidentified_tagged_child_observed |= _remember_instance_ids(
-                    live_instances, known_instance_ids)
-                teardown_verified = _terminate_ec2_instances(
-                    ec2,
-                    operation.id,
-                    sorted(known_instance_ids),
-                    settle_absence=(persisted_child or
-                                    ((launch_attempted or bool(instances)) and
-                                     not launch_confirmed)),
-                    initial_unidentified_child_observed=(
-                        unidentified_tagged_child_observed))
+                cleanup_deadline = (time.monotonic() + _EC2_TEARDOWN_SECONDS)
+                if time.monotonic() >= cleanup_deadline:
+                    teardown_verified = False
+                else:
+                    live_instances = _tagged_instances(ec2, operation.id)
+                    if time.monotonic() >= cleanup_deadline:
+                        teardown_verified = False
+                    else:
+                        unidentified_tagged_child_observed |= (
+                            _remember_instance_ids(live_instances,
+                                                   known_instance_ids))
+                        teardown_verified = _terminate_ec2_instances(
+                            ec2,
+                            operation.id,
+                            sorted(known_instance_ids),
+                            settle_absence=(persisted_child or (
+                                (launch_attempted or bool(instances)) and
+                                not launch_confirmed)),
+                            initial_unidentified_child_observed=(
+                                unidentified_tagged_child_observed),
+                            cleanup_deadline=cleanup_deadline)
         except worker_lease.LeaseLostError:
             raise
         except Exception:  # pylint: disable=broad-except
             teardown_verified = False
         if not teardown_verified:
             raise ValueError('CANARY_TEARDOWN_FAILED')
+        _raise_if_draining(drain_event)
     if not success:
         raise ValueError('CANARY_PULL_FAILED')
     assert instance_id is not None
@@ -980,6 +1001,7 @@ def _run_eks_canary(
                                 (create_attempted and not create_confirmed)))
         if not teardown_verified:
             raise ValueError('CANARY_TEARDOWN_FAILED')
+        _raise_if_draining(drain_event)
     if evidence is None:
         raise ValueError('CANARY_FAILED')
     evidence['teardown_verified'] = True
@@ -1051,9 +1073,12 @@ def run_canary(operation: catalog_state.OperationRecord,
                     if operation.child_launch_id is not None:
                         return False
                     raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+                _raise_if_draining(drain_event)
                 heartbeat.assert_owned()
+                _raise_if_draining(drain_event)
                 if qualification.complete_canary(operation, evidence):
                     return True
+                _raise_if_draining(drain_event)
                 _fail_owned_canary(operation, 'CANARY_FAILED', heartbeat)
                 return False
             except _CanaryDrainRequested:
@@ -1070,9 +1095,17 @@ def run_canary(operation: catalog_state.OperationRecord,
                     # Preserve the deterministic child for successor teardown.
                     # Terminalizing here would discard its only durable owner.
                     return False
+                if drain_event is not None and drain_event.is_set():
+                    qualification.release_drained_canary(operation,
+                                                         teardown_verified=True)
+                    return False
                 _fail_owned_canary(operation, code, heartbeat)
                 return False
             except Exception:  # pylint: disable=broad-except
+                if drain_event is not None and drain_event.is_set():
+                    qualification.release_drained_canary(operation,
+                                                         teardown_verified=True)
+                    return False
                 _fail_owned_canary(operation, 'CANARY_FAILED', heartbeat)
                 return False
     except worker_lease.LeaseLostError:

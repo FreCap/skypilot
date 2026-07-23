@@ -708,7 +708,8 @@ def test_service_quota_calls_are_synchronously_provider_fenced(
 def test_ecr_role_acquisition_fences_actual_sts_boundary(
         monkeypatch: pytest.MonkeyPatch) -> None:
     sts = mock.Mock()
-    monkeypatch.setattr(aws.aws_adaptor, 'client', lambda _service: sts)
+    client = mock.Mock(return_value=sts)
+    monkeypatch.setattr(aws.aws_adaptor, 'client', client)
     binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
                                  external_id=None,
                                  session_name='test',
@@ -723,6 +724,44 @@ def test_ecr_role_acquisition_fences_actual_sts_boundary(
                                     provider_fence=lost)
     lost.assert_called_once_with()
     sts.assume_role.assert_not_called()
+    client.assert_called_once_with('sts',
+                                   connect_timeout=10,
+                                   read_timeout=60,
+                                   total_max_attempts=1)
+
+
+def test_assumed_client_bounds_sts_and_service_sdk_attempts(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    sts = mock.Mock()
+    sts.assume_role.return_value = {
+        'Credentials': {
+            'AccessKeyId': 'access',
+            'SecretAccessKey': 'secret',
+            'SessionToken': 'token',
+        }
+    }
+    adaptor_client = mock.Mock(return_value=sts)
+    monkeypatch.setattr(aws.aws_adaptor, 'client', adaptor_client)
+    session = mock.Mock()
+    session.client.return_value = mock.sentinel.ecr
+    monkeypatch.setattr(aws.aws_adaptor.boto3, 'Session',
+                        mock.Mock(return_value=session))
+    binding = aws.AwsRoleBinding(role_arn='arn:aws:iam::123:role/test',
+                                 external_id=None,
+                                 session_name='test',
+                                 catalog_tag='catalog',
+                                 profile_tag='profile')
+
+    assert aws.assumed_client(binding, 'ecr', 'us-east-1') is mock.sentinel.ecr
+
+    adaptor_client.assert_called_once_with('sts',
+                                           connect_timeout=10,
+                                           read_timeout=60,
+                                           total_max_attempts=1)
+    config = session.client.call_args.kwargs['config']
+    assert config.connect_timeout == 10
+    assert config.read_timeout == 60
+    assert config.retries['total_max_attempts'] == 1
 
 
 def test_ecr_sdk_client_is_fenced_before_and_after_each_call() -> None:

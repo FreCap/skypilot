@@ -31,6 +31,9 @@ from sky.container_images import providers
 from sky.container_images import topology_state
 
 _UPLOAD_PART_BYTES = 20 * 1024 * 1024
+_AWS_CONNECT_TIMEOUT_SECONDS = 10
+_AWS_READ_TIMEOUT_SECONDS = 60
+_AWS_TOTAL_MAX_ATTEMPTS = 1
 _ECR_ACCEPTED_MANIFEST_TYPES = [
     'application/vnd.oci.image.manifest.v1+json',
     'application/vnd.docker.distribution.manifest.v2+json',
@@ -738,7 +741,10 @@ def assumed_client(
     }
     if binding.external_id is not None:
         assume_kwargs['ExternalId'] = binding.external_id
-    sts = aws_adaptor.client('sts')
+    sts = aws_adaptor.client('sts',
+                             connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
+                             read_timeout=_AWS_READ_TIMEOUT_SECONDS,
+                             total_max_attempts=_AWS_TOTAL_MAX_ATTEMPTS)
     if provider_fence is not None:
         provider_fence()
     response = sts.assume_role(**assume_kwargs)
@@ -750,12 +756,13 @@ def assumed_client(
         aws_secret_access_key=credentials['SecretAccessKey'],
         aws_session_token=credentials['SessionToken'],
         region_name=region)
-    return cast(Any, session).client(service,
-                                     region_name=region,
-                                     config=aws_adaptor.botocore.config.Config(
-                                         connect_timeout=10,
-                                         read_timeout=60,
-                                         retries={'max_attempts': 1}))
+    return cast(Any, session).client(
+        service,
+        region_name=region,
+        config=aws_adaptor.botocore.config.Config(
+            connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=_AWS_READ_TIMEOUT_SECONDS,
+            retries={'total_max_attempts': _AWS_TOTAL_MAX_ATTEMPTS}))
 
 
 def _assumed_ecr_client(

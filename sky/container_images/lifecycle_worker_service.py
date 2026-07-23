@@ -527,9 +527,17 @@ class LifecycleWorkerService:
         self._stop.set()
 
     def _maintenance(self) -> None:
+        if self._stop.is_set():
+            return
         _reconcile_publication_fanout()
+        if self._stop.is_set():
+            return
         catalog_state.compact_terminal_records()
+        if self._stop.is_set():
+            return
         demand_state.compact_terminal_demands()
+        if self._stop.is_set():
+            return
         topology_state.compact_stale_workers(max_age_seconds=24 * 60 * 60)
 
     def run_forever(self) -> None:

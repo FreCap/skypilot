@@ -1,5 +1,6 @@
 """Test exception serialization and deserialization."""
 
+import inspect
 import pickle
 
 import pytest
@@ -273,6 +274,10 @@ def test_deserialize_partial_dict():
         'args': None,
     },
     {
+        'type': 'ValueError',
+        'message': None,
+    },
+    {
         'type': 'int',
     },
 ])
@@ -360,6 +365,19 @@ def test_deserialize_tolerates_attribute_the_constructor_rejects():
     assert deserialized.not_a_constructor_argument == 1
 
 
+def test_known_exception_missing_constructor_state_is_sanitized():
+    """Canonical-state bypass is limited to declared transformed classes."""
+    deserialized = exceptions.deserialize_exception({
+        'type': 'KubernetesValidationError',
+        'message': 'bad value',
+        'args': ('bad value',),
+        'attributes': {},
+    })
+
+    assert type(deserialized) is RuntimeError
+    assert str(deserialized) == 'Server error response is malformed.'
+
+
 def test_attribute_that_cannot_be_set_does_not_lose_the_error():
     """An unsettable attribute must not fail the whole deserialization.
 
@@ -384,3 +402,73 @@ def test_attribute_that_cannot_be_set_does_not_lose_the_error():
     assert isinstance(deserialized, ValueError)
     assert str(deserialized) == 'boom'
     assert getattr(deserialized, 'context') == 'while encoding'
+
+
+def test_all_current_skypilot_exceptions_round_trip_exactly():
+    """Every current exception class must declare a restorable wire shape."""
+    factories = {
+        exceptions.CloudError: lambda: exceptions.CloudError(
+            'failure', 'aws', 'MockError'),
+        exceptions.ResourcesUnavailableError:
+            lambda: exceptions.ResourcesUnavailableError(
+                'unavailable',
+                no_failover=True,
+                failover_history=[ValueError('capacity')]),
+        exceptions.KubeAPIUnreachableError:
+            lambda: exceptions.KubeAPIUnreachableError(
+                'unreachable', failover_history=[ValueError('network')]),
+        exceptions.KubernetesValidationError:
+            lambda: exceptions.KubernetesValidationError(['spec', 'image'],
+                                                         'bad value'),
+        exceptions.ProvisionPrechecksError:
+            lambda: exceptions.ProvisionPrechecksError([ValueError('quota')]),
+        exceptions.SkyPilotExcludeArgsBaseException:
+            exceptions.SkyPilotExcludeArgsBaseException,
+        exceptions.CommandFailureException:
+            lambda: exceptions.CommandFailureException('sky launch', 'failed',
+                                                       'bad command', 'stderr'),
+        exceptions.CommandError: lambda: exceptions.CommandError(
+            2, 'sky launch', 'bad command', 'stderr'),
+        exceptions.ClusterNotUpError: lambda: exceptions.ClusterNotUpError(
+            'cluster is down', cluster_status=status_lib.ClusterStatus.UP),
+        exceptions.FetchClusterInfoError:
+            lambda: exceptions.FetchClusterInfoError(
+                exceptions.FetchClusterInfoError.Reason.WORKER),
+        exceptions.WorkspaceAmbiguousError:
+            lambda: exceptions.WorkspaceAmbiguousError(['beta', 'alpha'],
+                                                       'saved choice expired'),
+        exceptions.AWSAzFetchingError: lambda: exceptions.AWSAzFetchingError(
+            'us-east-1', exceptions.AWSAzFetchingError.Reason.AUTH_FAILURE),
+        exceptions.ApiServerConnectionError: lambda: exceptions.
+                                             ApiServerConnectionError('api'),
+        exceptions.ApiServerAuthenticationError:
+            lambda: exceptions.ApiServerAuthenticationError('api'),
+        exceptions.ExecutionRetryableError:
+            lambda: exceptions.ExecutionRetryableError('retry', 'later', 3),
+        exceptions.ExecutionPausedError:
+            lambda: exceptions.ExecutionPausedError('paused', 'waiting', 5,
+                                                    {'signal': 'ready'}),
+        exceptions.ServerTemporarilyUnavailableError:
+            lambda: exceptions.ServerTemporarilyUnavailableError('maintenance'),
+    }
+    exception_classes = {
+        value for value in vars(exceptions).values()
+        if (inspect.isclass(value) and value.__module__ == exceptions.__name__
+            and issubclass(value, Exception))
+    }
+
+    for exception_class in exception_classes:
+        factory = factories.get(exception_class,
+                                lambda cls=exception_class: cls('message'))
+        error = factory()
+        error.round_trip_context = {'class': exception_class.__name__}
+        error.add_note(f'note for {exception_class.__name__}')
+        serialized = exceptions.serialize_exception(error)
+
+        restored = exceptions.deserialize_exception(serialized)
+
+        assert type(restored) is exception_class
+        assert restored.args == error.args
+        assert str(restored) == str(error)
+        assert restored.__dict__ == error.__dict__
+        assert exceptions.serialize_exception(restored) == serialized

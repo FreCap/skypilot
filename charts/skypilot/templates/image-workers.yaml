@@ -1,5 +1,8 @@
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
+{{- $copyTerminationGracePeriodSeconds := default 30 .Values.imageCopyWorker.terminationGracePeriodSeconds -}}
+{{- $lifecycleTerminationGracePeriodSeconds := default 30 .Values.imageLifecycleWorker.terminationGracePeriodSeconds -}}
+{{- $canaryTerminationGracePeriodSeconds := default 600 .Values.imageCanaryWorker.terminationGracePeriodSeconds -}}
 {{- if and (or .Values.imageCopyWorker.enabled .Values.imageLifecycleWorker.enabled .Values.imageCanaryWorker.enabled) (not $databaseConfigured) -}}
 {{- fail "Managed image workers require external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString" -}}
 {{- end -}}
@@ -12,7 +15,7 @@
 {{- if and .Values.imageCanaryWorker.enabled (not .Values.imageCanaryWorker.serviceAccount.create) (not .Values.imageCanaryWorker.serviceAccount.name) -}}
 {{- fail "imageCanaryWorker.serviceAccount.name is required when serviceAccount.create=false" -}}
 {{- end -}}
-{{- if and .Values.imageCanaryWorker.enabled (lt (int .Values.imageCanaryWorker.terminationGracePeriodSeconds) 600) -}}
+{{- if and .Values.imageCanaryWorker.enabled (lt (int $canaryTerminationGracePeriodSeconds) 600) -}}
 {{- fail "imageCanaryWorker.terminationGracePeriodSeconds must be at least 600 seconds" -}}
 {{- end -}}
 {{- $sourceCredentialIdentities := dict -}}
@@ -109,7 +112,7 @@ spec:
     spec:
       serviceAccountName: {{ include "skypilot.imageCopyWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: {{ .Values.imageCopyWorker.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ int $copyTerminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -290,7 +293,7 @@ spec:
     spec:
       serviceAccountName: {{ include "skypilot.imageLifecycleWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: {{ .Values.imageLifecycleWorker.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ int $lifecycleTerminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -457,7 +460,7 @@ spec:
     spec:
       serviceAccountName: {{ include "skypilot.imageCanaryWorkerServiceAccountName" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: {{ .Values.imageCanaryWorker.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ int $canaryTerminationGracePeriodSeconds }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}

@@ -32,6 +32,8 @@ COMMAND_NOT_FOUND_EXIT_CODE = 127
 # Architecture, such as arm64, not supported by the dependency
 ARCH_NOT_SUPPORTED_EXIT_CODE = 133
 
+_MISSING_EXCEPTION_MESSAGE = object()
+
 
 def is_safe_exception(exc: BaseException) -> bool:
     """Returns True if the exception is safe to send to clients.
@@ -133,28 +135,93 @@ def _restore_exception_attributes(e: BaseException,
             pass
 
 
-def _partition_constructor_attributes(
+def _construct_skypilot_exception(
     exception_class: type[BaseException],
     args: Sequence[Any],
     attributes: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Separates explicit constructor kwargs from restorable attributes."""
+) -> tuple[BaseException, dict[str, Any]]:
+    """Reconstructs a SkyPilot exception from its canonical wire state.
+
+    ``BaseException.args`` need not mirror a subclass constructor. Bind named
+    state first, then map serialized arguments only to still-unbound positional
+    parameters. Forward-version attributes remain independently restorable.
+    """
     try:
         signature = inspect.signature(exception_class)
-        bound = signature.bind_partial(*args)
     except (TypeError, ValueError):
-        return {}, attributes
-    constructor_attributes: dict[str, Any] = {}
-    restorable_attributes: dict[str, Any] = {}
+        return exception_class(*args), attributes
+
+    constructor_args: list[Any] = []
+    constructor_kwargs: dict[str, Any] = {}
+    restorable_attributes = dict(attributes)
     for attribute, value in attributes.items():
         parameter = signature.parameters.get(attribute)
-        if (parameter is not None and attribute not in bound.arguments and
+        if (parameter is not None and
                 parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
                                    inspect.Parameter.KEYWORD_ONLY)):
-            constructor_attributes[attribute] = value
-        else:
-            restorable_attributes[attribute] = value
-    return constructor_attributes, restorable_attributes
+            constructor_kwargs[attribute] = value
+            del restorable_attributes[attribute]
+
+    arg_index = 0
+    for parameter in signature.parameters.values():
+        if parameter.name in constructor_kwargs:
+            continue
+        if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+            if arg_index < len(args):
+                constructor_args.append(args[arg_index])
+                arg_index += 1
+        elif parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            if arg_index < len(args):
+                constructor_kwargs[parameter.name] = args[arg_index]
+                arg_index += 1
+        elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            constructor_args.extend(args[arg_index:])
+            arg_index = len(args)
+
+    return (exception_class(*constructor_args,
+                            **constructor_kwargs), restorable_attributes)
+
+
+def _exception_matches_wire(e: BaseException, args: Sequence[Any],
+                            message: Any) -> bool:
+    """Checks the state that current serializers promise to preserve."""
+    if isinstance(e, SkyPilotExcludeArgsBaseException):
+        if args:
+            return False
+    elif e.args != tuple(args):
+        return False
+    return (message is _MISSING_EXCEPTION_MESSAGE or
+            (isinstance(message, str) and str(e) == message))
+
+
+def _restore_transformed_exception(
+    exception_class: type[BaseException],
+    args: Sequence[Any],
+    attributes: dict[str, Any],
+    message: Any,
+) -> BaseException | None:
+    """Restores a known class whose constructor transforms its input.
+
+    This path is accepted only when the serialized arguments independently
+    reproduce the serialized message. It therefore handles current exceptions
+    that already store a rendered message without trusting arbitrary attribute
+    state to manufacture one.
+    """
+    if (exception_class
+            not in (ApiServerAuthenticationError, ApiServerConnectionError) or
+            not args or not isinstance(message, str) or
+            str(BaseException(*args)) != message or
+            issubclass(exception_class, SkyPilotExcludeArgsBaseException)):
+        return None
+    try:
+        e = BaseException.__new__(exception_class)
+        BaseException.__init__(e, *args)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    _restore_exception_attributes(e, attributes)
+    if not _exception_matches_wire(e, args, message):
+        return None
+    return e
 
 
 def deserialize_exception(serialized: Any) -> Exception:
@@ -174,6 +241,10 @@ def deserialize_exception(serialized: Any) -> Exception:
         return RuntimeError('Server error response is malformed.')
     args = serialized.get('args', ())
     if not isinstance(args, (list, tuple)):
+        return RuntimeError('Server error response is malformed.')
+    message = serialized.get('message', _MISSING_EXCEPTION_MESSAGE)
+    if (message is not _MISSING_EXCEPTION_MESSAGE and
+            not isinstance(message, str)):
         return RuntimeError('Server error response is malformed.')
     raw_attributes = serialized.get('attributes', {})
     if (not isinstance(raw_attributes, dict) or
@@ -205,15 +276,26 @@ def deserialize_exception(serialized: Any) -> Exception:
             e = exception_class(*args)
             restorable_attributes = attributes
         else:
-            (constructor_attributes,
-             restorable_attributes) = _partition_constructor_attributes(
-                 exception_class, args, attributes)
-            e = exception_class(*args, **constructor_attributes)
+            e, restorable_attributes = _construct_skypilot_exception(
+                exception_class, args, attributes)
     except Exception:  # pylint: disable=broad-exception-caught
-        return RuntimeError('Server error response is malformed.')
+        e = None
+        restorable_attributes = {}
+    if e is None:
+        e = _restore_transformed_exception(exception_class, args, attributes,
+                                           message)
+        if e is None:
+            return RuntimeError('Server error response is malformed.')
+    else:
+        _restore_exception_attributes(e, restorable_attributes)
+        if (not hasattr(builtins, exception_type) and
+                not _exception_matches_wire(e, args, message)):
+            e = _restore_transformed_exception(exception_class, args,
+                                               attributes, message)
+            if e is None:
+                return RuntimeError('Server error response is malformed.')
     if not isinstance(e, Exception):
         return RuntimeError('Server error response is malformed.')
-    _restore_exception_attributes(e, restorable_attributes)
     _restore_exception_attributes(e, dunder_attributes)
     notes = serialized.get('notes', legacy_notes)
     if (isinstance(notes, list) and
