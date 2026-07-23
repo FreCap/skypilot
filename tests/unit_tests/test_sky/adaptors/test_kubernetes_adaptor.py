@@ -1,15 +1,22 @@
 """Tests for Kubernetes adaptor."""
+# pylint: disable=protected-access
 
 import concurrent.futures
 import gc
+import json
 import os
+import shlex
+import sys
 import tempfile
+import threading
 import time
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from sky import exceptions as sky_exceptions
 from sky.adaptors import kubernetes
 from sky.utils import annotations
 
@@ -125,7 +132,7 @@ def test_kubeconfig_refresh_interval_refreshes_client(monkeypatch):
     """
     api_clients = []
 
-    def track_get_api_client(context=None):
+    def track_get_api_client(_context=None):
         mock_client = MagicMock()
         api_clients.append(mock_client)
         return mock_client
@@ -164,7 +171,7 @@ def test_kubeconfig_refresh_interval_no_refresh_when_interval_not_elapsed(
     """When interval has not elapsed, no refresh runs (single client)."""
     api_clients = []
 
-    def track_get_api_client(context=None):
+    def track_get_api_client(_context=None):
         mock_client = MagicMock()
         api_clients.append(mock_client)
         return mock_client
@@ -214,6 +221,937 @@ def test_kubeconfig_refresh_interval_invalid_value_disables_refresh(
 
     interval = kubernetes._get_kubeconfig_refresh_interval_seconds()  # pylint: disable=protected-access
     assert interval == 0.0
+
+
+def _write_exec_kubeconfig(tmp_path, script, *, command=sys.executable):
+    path = tmp_path / 'exec-kubeconfig.json'
+    path.write_text(json.dumps({
+        'apiVersion': 'v1',
+        'kind': 'Config',
+        'clusters': [{
+            'cluster': {
+                'server': 'https://bounded.example.test',
+                'insecure-skip-tls-verify': True,
+            },
+            'name': 'bounded-cluster',
+        }],
+        'contexts': [{
+            'context': {
+                'cluster': 'bounded-cluster',
+                'user': 'bounded-user',
+            },
+            'name': 'bounded-context',
+        }],
+        'current-context': 'bounded-context',
+        'users': [{
+            'name': 'bounded-user',
+            'user': {
+                'exec': {
+                    'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                    'command': command,
+                    'args': ['-c', script],
+                },
+            },
+        }],
+    }),
+                    encoding='utf-8')
+    return path
+
+
+class _ExecConfig(dict):
+
+    def safe_get(self, key):
+        return self.get(key)
+
+
+class _ExecCluster:
+    value = {}
+
+
+def _object_graph_contains_marker(root, marker: str) -> bool:
+    """Traverses an object graph without invoking application properties."""
+    seen: set[int] = set()
+    pending = [root]
+    while pending:
+        if len(seen) >= 50000:
+            raise AssertionError('Credential object-graph traversal exceeded.')
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, str):
+            if marker in current:
+                return True
+            continue
+        if isinstance(current, bytes):
+            if marker.encode() in current:
+                return True
+            continue
+        if current is None or isinstance(current, (bool, int, float, complex)):
+            continue
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+            continue
+        if isinstance(current, (list, tuple, set, frozenset)):
+            pending.extend(current)
+            continue
+        if isinstance(current, BaseException):
+            pending.extend(current.args)
+            pending.extend((current.__cause__, current.__context__))
+            pending.extend(vars(current).values())
+            continue
+        if isinstance(current, types.MethodType):
+            pending.append(current.__self__)
+            continue
+        if isinstance(current, (types.ModuleType, types.FunctionType, type)):
+            continue
+        try:
+            pending.extend(vars(current).values())
+        except TypeError:
+            continue
+    return False
+
+
+def _kubernetes_traceback_contains(error: BaseException, marker: str) -> bool:
+    """Searches adaptor frame object graphs, excluding the test caller."""
+    adaptor_path = os.path.realpath(kubernetes.__file__)
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if marker in repr(current):
+            return True
+        pending.extend((current.__cause__, current.__context__))
+        traceback = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if os.path.realpath(frame.f_code.co_filename) == adaptor_path:
+                for value in frame.f_locals.values():
+                    if _object_graph_contains_marker(value, marker):
+                        return True
+            traceback = traceback.tb_next
+    return False
+
+
+def _assert_value_free_credential_error(error: BaseException, marker: str,
+                                        captured_logs: str) -> None:
+    assert marker not in str(error)
+    assert marker not in repr(error)
+    assert not _kubernetes_traceback_contains(error, marker)
+    assert marker not in json.dumps(sky_exceptions.serialize_exception(error),
+                                    sort_keys=True)
+    assert marker not in captured_logs
+
+
+def test_bounded_core_api_exec_credential_has_no_transparent_refresh(
+        monkeypatch, tmp_path):
+    response = json.dumps({
+        'apiVersion': 'client.authentication.k8s.io/v1beta1',
+        'kind': 'ExecCredential',
+        'status': {
+            'token': 'bounded-token',
+            'expirationTimestamp': '2099-01-01T00:00:00Z',
+        },
+    })
+    path = _write_exec_kubeconfig(
+        tmp_path, f'import sys; sys.stdout.write({response!r})')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    monkeypatch.setattr(kubernetes.time, 'time', lambda: 100.0)
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: 1000.0)
+    fences = []
+
+    core, refresh_deadline = kubernetes._bounded_core_api(  # pylint: disable=protected-access
+        'bounded-context',
+        exec_credential_timeout_seconds=2,
+        provider_fence=lambda: fences.append('fence'))
+    try:
+        configuration = core.api_client.configuration
+        assert configuration.host == 'https://bounded.example.test'
+        assert configuration.api_key['authorization'] == (
+            'Bearer bounded-token')
+        assert configuration.refresh_api_key_hook is None
+        assert refresh_deadline == 4070909695.0
+        assert fences == ['fence'] * 4
+    finally:
+        core.api_client.close()
+
+
+def test_bounded_in_cluster_core_api_schedules_explicit_token_rotation(
+        monkeypatch):
+    current = [100.0]
+    configuration = SimpleNamespace(refresh_api_key_hook=object())
+    api_client = SimpleNamespace(configuration=configuration)
+    core = SimpleNamespace(api_client=api_client)
+    fences = []
+    monkeypatch.setattr(kubernetes, '_get_api_client',
+                        lambda _context: api_client)
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        lambda api_client: core)
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: current[0])
+
+    def provider_fence():
+        fences.append('fence')
+        if len(fences) == 2:
+            current[0] = 130.0
+
+    result, refresh_deadline = kubernetes._bounded_core_api(
+        kubernetes.in_cluster_context_name(),
+        exec_credential_timeout_seconds=2,
+        provider_fence=provider_fence)
+
+    assert result is core
+    assert configuration.refresh_api_key_hook is None
+    assert refresh_deadline == 160.0
+    assert fences == ['fence', 'fence']
+
+
+def test_bounded_in_cluster_core_api_closes_partial_client_on_failure(
+        monkeypatch, caplog):
+    marker = 'IN_CLUSTER_CONSTRUCTOR_SECRET'
+    configuration = SimpleNamespace(refresh_api_key_hook=MagicMock())
+    api_client = SimpleNamespace(configuration=configuration, close=MagicMock())
+    monkeypatch.setattr(kubernetes, '_get_api_client',
+                        lambda _context: api_client)
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        MagicMock(side_effect=RuntimeError(marker)))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api(kubernetes.in_cluster_context_name(),
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=lambda: None)
+
+    error = exc_info.value
+    assert str(error) == (
+        'Failed to load bounded in-cluster Kubernetes credentials.')
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_value_free_credential_error(error, marker, caplog.text)
+    api_client.close.assert_called_once_with()
+
+
+def test_exec_credential_expiry_converts_once_to_monotonic_deadline(
+        monkeypatch):
+    monkeypatch.setattr(kubernetes.time, 'time', lambda: 1000.0)
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: 500.0)
+
+    valid, deadline = kubernetes._exec_credential_refresh_deadline(
+        '1970-01-01T00:20:00Z')
+
+    assert valid
+    assert deadline == 695.0
+
+
+def test_exec_credential_expiry_requires_one_bounded_api_call(monkeypatch):
+    monkeypatch.setattr(kubernetes.time, 'time', lambda: 1000.0)
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: 500.0)
+
+    valid, deadline = kubernetes._exec_credential_refresh_deadline(
+        '1970-01-01T00:16:44Z')
+
+    assert not valid
+    assert deadline is None
+
+
+def test_provider_fenced_refresh_ignores_later_wall_clock_jumps(monkeypatch):
+    client = SimpleNamespace(api_client=MagicMock())
+    clocks = {'wall': 100.0, 'monotonic': 1000.0}
+    monkeypatch.setattr(kubernetes.time, 'time', lambda: clocks['wall'])
+    monkeypatch.setattr(kubernetes.time, 'monotonic',
+                        lambda: clocks['monotonic'])
+    monkeypatch.setattr(kubernetes, '_bounded_core_api',
+                        lambda *_args, **_kwargs: (client, 1060.0))
+    monkeypatch.setattr(kubernetes, '_get_kubeconfig_refresh_interval_seconds',
+                        lambda: 0)
+    core = kubernetes.ProviderFencedCoreApi('bounded-context',
+                                            exec_credential_timeout_seconds=2,
+                                            provider_fence=lambda: None)
+
+    clocks['wall'] = -3500.0
+    clocks['monotonic'] = 1059.0
+    assert not core._should_refresh()
+    clocks['wall'] = 5000.0
+    assert not core._should_refresh()
+    clocks['monotonic'] = 1060.0
+    assert core._should_refresh()
+
+
+def test_provider_fenced_interval_uses_only_monotonic_elapsed_time(monkeypatch):
+    client = SimpleNamespace(api_client=MagicMock())
+    clocks = {'wall': 100.0, 'monotonic': 1000.0}
+    monkeypatch.setattr(kubernetes.time, 'time', lambda: clocks['wall'])
+    monkeypatch.setattr(kubernetes.time, 'monotonic',
+                        lambda: clocks['monotonic'])
+    monkeypatch.setattr(kubernetes, '_bounded_core_api',
+                        lambda *_args, **_kwargs: (client, None))
+    monkeypatch.setattr(kubernetes, '_get_kubeconfig_refresh_interval_seconds',
+                        lambda: 60)
+    core = kubernetes.ProviderFencedCoreApi('bounded-context',
+                                            exec_credential_timeout_seconds=2,
+                                            provider_fence=lambda: None)
+
+    clocks['wall'] = 5000.0
+    clocks['monotonic'] = 1059.0
+    assert not core._should_refresh()
+    clocks['wall'] = -3500.0
+    assert not core._should_refresh()
+    clocks['monotonic'] = 1060.0
+    assert core._should_refresh()
+
+
+def test_bounded_core_api_terminates_timed_out_exec_credential(
+        monkeypatch, tmp_path, caplog):
+    marker = 'TIMEOUT_CREDENTIAL_SECRET'
+    script = ('import os,time; '
+              'os.write(1, b"TIMEOUT_CREDENTIAL_" + b"SECRET"); time.sleep(60)')
+    path = _write_exec_kubeconfig(tmp_path, script)
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    started = time.monotonic()
+
+    with pytest.raises(config_exception, match='bounded timeout') as exc_info:
+        kubernetes._bounded_core_api(  # pylint: disable=protected-access
+            'bounded-context',
+            exec_credential_timeout_seconds=0.05,
+            provider_fence=lambda: None)
+
+    assert time.monotonic() - started < 2
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+
+
+@pytest.mark.skipif(os.name == 'nt',
+                    reason='POSIX process-group descendant regression')
+def test_bounded_core_api_terminates_timed_out_exec_credential_group(
+        monkeypatch, tmp_path, caplog):
+    marker = 'DESCENDANT_CREDENTIAL_SECRET'
+    parent_pid = tmp_path / 'parent-pid'
+    child_started = tmp_path / 'child-started'
+    child_survived = tmp_path / 'child-survived'
+    parent_script = (f'printf "%s" "$$" > {shlex.quote(str(parent_pid))}; '
+                     f'(sleep 1.5; printf survived > '
+                     f'{shlex.quote(str(child_survived))}) & '
+                     f'child=$!; printf "%s" "$child" > '
+                     f'{shlex.quote(str(child_started))}; '
+                     'printf DESCENDANT_CREDENTIAL_SECRET; sleep 60')
+    path = _write_exec_kubeconfig(tmp_path, parent_script, command='/bin/sh')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception, match='bounded timeout') as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=1,
+                                     provider_fence=lambda: None)
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+    assert parent_pid.exists()
+    assert child_started.exists()
+    with pytest.raises(ChildProcessError):
+        os.waitpid(int(parent_pid.read_text()), os.WNOHANG)
+    time.sleep(1.6)
+    assert not child_survived.exists()
+
+
+@pytest.mark.parametrize(
+    ('stream', 'message'),
+    ((1, 'response exceeds 1 MiB'), (2, 'diagnostics exceed 1 MiB')),
+    ids=('stdout', 'stderr'))
+def test_bounded_core_api_stops_exec_credential_output_flood(
+        monkeypatch, tmp_path, caplog, stream, message):
+    marker = 'FLOOD_CREDENTIAL_SECRET'
+    script = (f'import os,time; os.write({stream}, '
+              f'b"FLOOD_CREDENTIAL_" + b"SECRET" + '
+              f'b"x" * {kubernetes._MAX_EXEC_CREDENTIAL_OUTPUT_BYTES + 1}); '
+              'time.sleep(60)')
+    path = _write_exec_kubeconfig(tmp_path, script)
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    started = time.monotonic()
+
+    with pytest.raises(config_exception, match=message) as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=5,
+                                     provider_fence=lambda: None)
+
+    assert time.monotonic() - started < 2
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+
+
+def test_bounded_core_api_does_not_reflect_exec_credential_stderr(
+        monkeypatch, tmp_path, caplog):
+    marker = 'credential=secret'
+    path = _write_exec_kubeconfig(
+        tmp_path,
+        'import sys; sys.stderr.write("credential=" + "secret"); sys.exit(7)')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=lambda: None)
+
+    assert str(exc_info.value) == 'exec: process returned 7'
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+
+
+@pytest.mark.parametrize(
+    'script', ('import sys; sys.stdout.write("credential=secret-not-json")',
+               'import os; os.write(1, b"\\xffcredential=secret-not-utf8")'),
+    ids=('invalid-json', 'invalid-utf8'))
+def test_bounded_core_api_does_not_retain_malformed_credential_output(
+        monkeypatch, tmp_path, script, caplog):
+    path = _write_exec_kubeconfig(tmp_path, script)
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=lambda: None)
+
+    error = exc_info.value
+    assert str(error) == 'exec: failed to decode process output'
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_value_free_credential_error(error, 'credential=secret', caplog.text)
+
+
+@pytest.mark.parametrize(
+    ('response', 'message', 'marker'),
+    ((None, 'exec: malformed response object', None),
+     ('SCALAR_SECRET', 'exec: malformed response object', 'SCALAR_SECRET'),
+     (['LIST_SECRET'], 'exec: malformed response object', 'LIST_SECRET'),
+     ({
+         'untrusted': 'MISSING_FIELD_SECRET',
+     }, "exec: malformed response. missing key 'apiVersion'",
+      'MISSING_FIELD_SECRET'), ({
+          'apiVersion': 'client.authentication.k8s.io/v1beta1',
+          'kind': 'ExecCredential',
+          'status': ['STATUS_SECRET'],
+      }, 'exec: malformed response status', 'STATUS_SECRET')),
+    ids=('null', 'scalar', 'list', 'missing-field', 'malformed-status'))
+def test_bounded_core_api_rejects_malformed_response_shapes_value_free(
+        monkeypatch, tmp_path, caplog, response, message, marker):
+    encoded = json.dumps(response)
+    path = _write_exec_kubeconfig(tmp_path,
+                                  f'import sys; sys.stdout.write({encoded!r})')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=lambda: None)
+
+    error = exc_info.value
+    assert str(error) == message
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    if marker is not None:
+        _assert_value_free_credential_error(error, marker, caplog.text)
+
+
+@pytest.mark.parametrize(
+    ('response', 'message', 'marker'),
+    (({
+        'apiVersion': 'VERSION_SECRET',
+        'kind': 'ExecCredential',
+        'status': {
+            'token': 'TOKEN_SECRET',
+        },
+    }, 'exec: response api version does not match request', 'VERSION_SECRET'),
+     ({
+         'apiVersion': 'client.authentication.k8s.io/v1beta1',
+         'kind': 'KIND_SECRET',
+         'status': {
+             'token': 'TOKEN_SECRET',
+         },
+     }, 'exec: response kind is not ExecCredential', 'KIND_SECRET'),
+     ({
+         'apiVersion': 'client.authentication.k8s.io/v1beta1',
+         'kind': 'ExecCredential',
+         'status': {
+             'expirationTimestamp': 'EXPIRY_ONLY_SECRET',
+         },
+     }, 'exec: missing token or complete client certificate data',
+      'EXPIRY_ONLY_SECRET'),
+     ({
+         'apiVersion': 'client.authentication.k8s.io/v1beta1',
+         'kind': 'ExecCredential',
+         'status': {
+             'token': 'TOKEN_WITH_BAD_EXPIRY_SECRET',
+             'expirationTimestamp': 'BAD_EXPIRY_SECRET',
+         },
+     }, 'exec: unusable credential expiration timestamp', 'BAD_EXPIRY_SECRET')),
+    ids=('api-version', 'kind', 'missing-credential', 'expiration'))
+def test_bounded_core_api_validates_complete_value_free_response(
+        monkeypatch, tmp_path, caplog, response, message, marker):
+    encoded = json.dumps(response)
+    path = _write_exec_kubeconfig(tmp_path,
+                                  f'import sys; sys.stdout.write({encoded!r})')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=lambda: None)
+
+    error = exc_info.value
+    assert str(error) == message
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_value_free_credential_error(error, marker, caplog.text)
+
+
+class _InjectedCredentialPipe:
+    """Injects deterministic bytes and read failures into a reader thread."""
+
+    def __init__(self, values):
+        self._values = iter(values)
+
+    def read(self, _size):
+        value = next(self._values)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class _InjectedCredentialProcess:
+    """Minimal process double for bounded exec-credential collection."""
+
+    def __init__(self, stdout_values):
+        self.stdout = _InjectedCredentialPipe(stdout_values)
+        self.stderr = _InjectedCredentialPipe((b'',))
+        self.returncode = 0
+        self.pid = 999999999
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        del timeout
+        return self.returncode
+
+
+class _InjectedCredentialAbort(BaseException):
+    """Exercises isolation for failures outside the Exception hierarchy."""
+
+
+@pytest.mark.parametrize(
+    ('stdout_values', 'marker'),
+    (((OSError('OSERROR_BEFORE_OUTPUT_SECRET'),),
+      'OSERROR_BEFORE_OUTPUT_SECRET'),
+     ((b'{"apiVersion":', OSError('OSERROR_AFTER_PARTIAL_SECRET')),
+      'OSERROR_AFTER_PARTIAL_SECRET'), ((json.dumps({
+          'apiVersion': 'client.authentication.k8s.io/v1beta1',
+          'kind': 'ExecCredential',
+          'status': {
+              'token': 'TOKEN_AFTER_OSERROR_SECRET',
+          },
+      }).encode(), OSError('OSERROR_AFTER_VALID_SECRET')),
+                                        'OSERROR_AFTER_VALID_SECRET'),
+     ((RuntimeError('RUNTIME_BEFORE_OUTPUT_SECRET'),),
+      'RUNTIME_BEFORE_OUTPUT_SECRET'),
+     ((b'{"apiVersion":', RuntimeError('RUNTIME_AFTER_PARTIAL_SECRET')),
+      'RUNTIME_AFTER_PARTIAL_SECRET'), ((json.dumps({
+          'apiVersion': 'client.authentication.k8s.io/v1beta1',
+          'kind': 'ExecCredential',
+          'status': {
+              'token': 'TOKEN_AFTER_RUNTIME_FAILURE_SECRET',
+          },
+      }).encode(), RuntimeError('RUNTIME_AFTER_VALID_SECRET')),
+                                        'RUNTIME_AFTER_VALID_SECRET')),
+    ids=('oserror-before-output', 'oserror-after-partial',
+         'oserror-after-valid', 'runtime-before-output',
+         'runtime-after-partial', 'runtime-after-valid'))
+def test_exec_credential_pipe_read_failure_is_fail_closed(
+        monkeypatch, caplog, stdout_values, marker):
+    process = _InjectedCredentialProcess(stdout_values)
+    monkeypatch.setattr(kubernetes.subprocess, 'Popen',
+                        lambda *_args, **_kwargs: process)
+    config = _ExecConfig(command='ignored',
+                         apiVersion='client.authentication.k8s.io/v1beta1')
+    result = kubernetes._run_bounded_exec_credential_isolated(
+        config,
+        _ExecCluster(),
+        None,
+        timeout_seconds=2,
+        provider_fence=lambda: None)
+
+    assert result.status is None
+    assert result.failure_message == (
+        'exec: failed to read credential process output')
+    assert result.control_error is None
+    assert marker not in repr(result)
+    assert marker not in caplog.text
+
+
+@pytest.mark.parametrize('failure_type',
+                         (RuntimeError, _InjectedCredentialAbort),
+                         ids=('exception', 'base-exception'))
+def test_exec_credential_unexpected_collection_failure_reaps_process(
+        monkeypatch, caplog, failure_type):
+    marker = 'POLL_FAILURE_SECRET'
+    process = _InjectedCredentialProcess((b'',))
+    process.poll = MagicMock(side_effect=failure_type(marker))
+    process.wait = MagicMock(return_value=0)
+    monkeypatch.setattr(kubernetes.subprocess, 'Popen',
+                        lambda *_args, **_kwargs: process)
+    config = _ExecConfig(command='ignored',
+                         apiVersion='client.authentication.k8s.io/v1beta1')
+    result = kubernetes._run_bounded_exec_credential_isolated(
+        config,
+        _ExecCluster(),
+        None,
+        timeout_seconds=2,
+        provider_fence=lambda: None)
+
+    assert result.status is None
+    assert result.failure_message == (
+        'exec: credential command failed inside isolation boundary')
+    assert result.control_error is None
+    assert marker not in repr(result)
+    assert marker not in caplog.text
+    process.wait.assert_called()
+
+
+def test_bounded_core_api_accepts_complete_client_certificate(
+        monkeypatch, tmp_path):
+    response = json.dumps({
+        'apiVersion': 'client.authentication.k8s.io/v1beta1',
+        'kind': 'ExecCredential',
+        'status': {
+            'clientCertificateData': 'CERTIFICATE_DATA',
+            'clientKeyData': 'PRIVATE_KEY_DATA',
+        },
+    })
+    path = _write_exec_kubeconfig(
+        tmp_path, f'import sys; sys.stdout.write({response!r})')
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+
+    core, refresh_deadline = kubernetes._bounded_core_api(
+        'bounded-context',
+        exec_credential_timeout_seconds=2,
+        provider_fence=lambda: None)
+
+    try:
+        configuration = core.api_client.configuration
+        assert refresh_deadline is None
+        with open(configuration.cert_file, encoding='utf-8') as cert_file:
+            assert cert_file.read() == 'CERTIFICATE_DATA'
+        with open(configuration.key_file, encoding='utf-8') as key_file:
+            assert key_file.read() == 'PRIVATE_KEY_DATA'
+        assert configuration.refresh_api_key_hook is None
+    finally:
+        core.api_client.close()
+
+
+@pytest.mark.parametrize('failure_type',
+                         (RuntimeError, _InjectedCredentialAbort),
+                         ids=('exception', 'base-exception'))
+def test_bounded_core_api_drain_wins_without_hidden_credential_context(
+        monkeypatch, caplog, failure_type):
+
+    class _User(dict):
+
+        @property
+        def value(self):
+            return self
+
+    response = json.dumps({
+        'apiVersion': 'client.authentication.k8s.io/v1beta1',
+        'kind': 'ExecCredential',
+        'status': {
+            'token': 'LOADER_TOKEN_SECRET',
+        },
+    })
+    config = _ExecConfig(
+        command=sys.executable,
+        apiVersion='client.authentication.k8s.io/v1beta1',
+        args=['-c', f'import sys; sys.stdout.write({response!r})'])
+    user = _User(exec=config)
+
+    def fail_loader(_configuration):
+        raise failure_type('loader failed')
+
+    loader = SimpleNamespace(_user=user,
+                             _cluster=SimpleNamespace(path=None, value={}),
+                             _temp_file_path=None,
+                             _get_base_path=lambda _path: None,
+                             load_and_set=fail_loader)
+    monkeypatch.setattr(kubernetes.kubernetes.config.kube_config,
+                        '_get_kube_config_loader_for_yaml_file',
+                        lambda *_args, **_kwargs: loader)
+    fence_count = 0
+
+    def provider_fence():
+        nonlocal fence_count
+        fence_count += 1
+        if fence_count == 4:
+            raise RuntimeError('drain won')
+
+    with pytest.raises(RuntimeError, match='drain won') as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=provider_fence)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_value_free_credential_error(error, 'LOADER_TOKEN_SECRET',
+                                        caplog.text)
+
+
+def _provider_client_with_token(marker, *, method=None):
+    configuration = SimpleNamespace(
+        api_key={'authorization': f'Bearer {marker}'},
+        api_key_prefix={'authorization': 'Bearer'},
+        username=None,
+        password=None,
+        cert_file=None,
+        key_file=None,
+        refresh_api_key_hook=None)
+    api_client = SimpleNamespace(configuration=configuration,
+                                 default_headers={},
+                                 cookie=None,
+                                 close=MagicMock())
+    return SimpleNamespace(api_client=api_client,
+                           list_node=method or MagicMock())
+
+
+def _provider_fenced_core_for_test(client, deadline):
+    core = object.__new__(kubernetes.ProviderFencedCoreApi)
+    core._context = 'bounded-context'
+    core._exec_credential_timeout_seconds = 2
+    core._refresh_lock = threading.Lock()
+    core._client = client
+    core._credential_refresh_deadline = deadline
+    core._last_refresh_monotonic = 0
+    return core
+
+
+def test_bounded_in_cluster_core_rejects_deadline_consumed_by_final_fence(
+        monkeypatch, caplog):
+    marker = 'EXPIRED_IN_CLUSTER_TOKEN_SECRET'
+    current = [100.0]
+    client = _provider_client_with_token(marker)
+    core = SimpleNamespace(api_client=client.api_client)
+    monkeypatch.setattr(kubernetes, '_get_api_client',
+                        lambda _context: client.api_client)
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        lambda api_client: core)
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: current[0])
+    fence_count = 0
+
+    def provider_fence():
+        nonlocal fence_count
+        fence_count += 1
+        if fence_count == 2:
+            current[0] = 160.0
+
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api(kubernetes.in_cluster_context_name(),
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=provider_fence)
+
+    assert str(exc_info.value) == (
+        'Kubernetes credential expired before client admission.')
+    assert client.api_client.configuration.api_key == {}
+    client.api_client.close.assert_called_once_with()
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+
+
+def test_provider_fenced_constructor_rejects_elapsed_candidate(
+        monkeypatch, caplog):
+    marker = 'EXPIRED_CONSTRUCTOR_TOKEN_SECRET'
+    client = _provider_client_with_token(marker)
+    monkeypatch.setattr(kubernetes, '_bounded_core_api',
+                        lambda *_args, **_kwargs: (client, 99.0))
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: 100.0)
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes.ProviderFencedCoreApi('bounded-context',
+                                         exec_credential_timeout_seconds=2,
+                                         provider_fence=lambda: None)
+
+    assert client.api_client.configuration.api_key == {}
+    client.api_client.close.assert_called_once_with()
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+
+
+def test_provider_fenced_refresh_failure_scrubs_installed_credential(
+        monkeypatch, caplog):
+    marker = 'OLD_EXEC_TOKEN_SECRET'
+    initial = _provider_client_with_token(marker)
+    core = _provider_fenced_core_for_test(initial, None)
+    monkeypatch.setattr(core, '_should_refresh', lambda: True)
+    monkeypatch.setattr(
+        kubernetes, '_bounded_core_api_isolated',
+        lambda *_args, **_kwargs: kubernetes._BoundedCoreApiResult(
+            None, None, 'fixed refresh failure', None))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        core.call_with_provider_fence('list_node', lambda: None, None)
+
+    assert core._client is None
+    assert initial.api_client.configuration.api_key == {}
+    initial.api_client.close.assert_called_once_with()
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+
+
+def test_provider_fenced_refresh_rejects_deadline_consumed_by_fence(
+        monkeypatch, caplog):
+    old_marker = 'OLD_REFRESH_TOKEN_SECRET'
+    new_marker = 'NEW_REFRESH_TOKEN_SECRET'
+    initial = _provider_client_with_token(old_marker)
+    replacement = _provider_client_with_token(new_marker)
+    core = _provider_fenced_core_for_test(initial, None)
+    current = [100.0]
+    monkeypatch.setattr(core, '_should_refresh', lambda: True)
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: current[0])
+    monkeypatch.setattr(
+        kubernetes, '_bounded_core_api_isolated',
+        lambda *_args, **_kwargs: kubernetes._BoundedCoreApiResult(
+            replacement, 101.0, None, None))
+    fence_count = 0
+
+    def provider_fence():
+        nonlocal fence_count
+        fence_count += 1
+        if fence_count == 2:
+            current[0] = 101.0
+
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    with pytest.raises(config_exception) as exc_info:
+        core.call_with_provider_fence('list_node', provider_fence, None)
+
+    assert core._client is None
+    initial.list_node.assert_not_called()
+    replacement.list_node.assert_not_called()
+    assert initial.api_client.configuration.api_key == {}
+    assert replacement.api_client.configuration.api_key == {}
+    initial.api_client.close.assert_called_once_with()
+    replacement.api_client.close.assert_called_once_with()
+    _assert_value_free_credential_error(exc_info.value, old_marker, caplog.text)
+    _assert_value_free_credential_error(exc_info.value, new_marker, caplog.text)
+
+
+def test_provider_fenced_rechecks_deadline_after_on_start(monkeypatch, caplog):
+    marker = 'PRECALL_TOKEN_SECRET'
+    current = [100.0]
+    client = _provider_client_with_token(marker)
+    core = _provider_fenced_core_for_test(client, 101.0)
+    monkeypatch.setattr(core, '_should_refresh', lambda: False)
+    monkeypatch.setattr(kubernetes.time, 'monotonic', lambda: current[0])
+
+    def on_start():
+        current[0] = 101.0
+
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+    with pytest.raises(config_exception) as exc_info:
+        core.call_with_provider_fence('list_node', lambda: None, on_start)
+
+    assert core._client is None
+    client.list_node.assert_not_called()
+    assert client.api_client.configuration.api_key == {}
+    client.api_client.close.assert_called_once_with()
+    _assert_value_free_credential_error(exc_info.value, marker, caplog.text)
+
+
+def test_provider_fenced_core_refresh_observes_new_stop_before_raw_call(
+        monkeypatch):
+    initial = SimpleNamespace(api_client=MagicMock(), list_node=MagicMock())
+    replacement = SimpleNamespace(api_client=MagicMock(), list_node=MagicMock())
+    stopped = False
+
+    def build_isolated(*_args, **_kwargs):
+        nonlocal stopped
+        stopped = True
+        return kubernetes._BoundedCoreApiResult(replacement, None, None, None)
+
+    def provider_fence():
+        if stopped:
+            raise RuntimeError('worker stopped')
+
+    monkeypatch.setattr(kubernetes, '_bounded_core_api',
+                        lambda *_args, **_kwargs: (initial, None))
+    monkeypatch.setattr(kubernetes, '_bounded_core_api_isolated',
+                        build_isolated)
+    core = kubernetes.ProviderFencedCoreApi('bounded-context',
+                                            exec_credential_timeout_seconds=2,
+                                            provider_fence=provider_fence)
+    monkeypatch.setattr(core, '_should_refresh', lambda: True)
+
+    with pytest.raises(RuntimeError, match='worker stopped'):
+        core.call_with_provider_fence('list_node', provider_fence, None)
+
+    initial.list_node.assert_not_called()
+    replacement.list_node.assert_not_called()
+    initial.api_client.close.assert_called_once_with()
+    replacement.api_client.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize('method_fails', (False, True),
+                         ids=('response', 'failure'))
+def test_provider_fenced_core_control_error_drops_losing_method_state(
+        monkeypatch, method_fails):
+    marker = 'LOSING_KUBERNETES_METHOD_SECRET'
+    method = MagicMock()
+    if method_fails:
+        method.side_effect = RuntimeError(marker)
+    else:
+        method.return_value = {'secret': marker}
+    raw_client = _provider_client_with_token(marker, method=method)
+    core = _provider_fenced_core_for_test(raw_client, None)
+    monkeypatch.setattr(core, '_should_refresh', lambda: False)
+    fence_count = 0
+
+    def provider_fence():
+        nonlocal fence_count
+        fence_count += 1
+        if fence_count == 3:
+            raise RuntimeError('drain won')
+
+    with pytest.raises(RuntimeError, match='drain won') as exc_info:
+        core.call_with_provider_fence('list_node', provider_fence, None)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert not _kubernetes_traceback_contains(error, marker)
+    assert core._client is None
+    assert raw_client.api_client.configuration.api_key == {}
+    raw_client.api_client.close.assert_called_once_with()
+    method.assert_called_once_with()
 
 
 def _create_test_kubeconfig(num_contexts):

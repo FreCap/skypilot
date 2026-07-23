@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import concurrent.futures
 import contextlib
 import os
@@ -41,12 +42,30 @@ logger = sky_logging.init_logger(__name__)
 _LeaseHeartbeat = worker_lease.LeaseHeartbeat
 
 
+class _QualificationDrainRequested(RuntimeError):
+    """Stops nondurable qualification work after process drain is observed."""
+
+
+def _raise_if_stopping(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop is not None and should_stop():
+        raise _QualificationDrainRequested()
+
+
 def _ecr_hooks(
     limiter: budgets.ProviderBudgetLimiter,
     shard: topology_state.ShardRecord,
+    provider_fence: Callable[[], None] | None = None,
 ) -> aws.EcrCallHooks:
     """Binds provider-budget callbacks to one immutable shard record."""
-    return aws.EcrCallHooks(before_call=lambda: limiter.before_call(shard),
+
+    def before_call() -> None:
+        if provider_fence is not None:
+            provider_fence()
+        limiter.before_call(shard)
+        if provider_fence is not None:
+            provider_fence()
+
+    return aws.EcrCallHooks(before_call=before_call,
                             on_throttle=lambda: limiter.record_throttle(shard))
 
 
@@ -231,8 +250,12 @@ def evict_location(
         return completed is not None and not present
 
 
-def _reconcile_publication_fanout(limit: int = 100) -> int:
-    return transactions.reconcile_pending_canonical_publications(limit)
+def _reconcile_publication_fanout(
+        limit: int = 100,
+        *,
+        should_stop: Callable[[], bool] | None = None) -> int:
+    return transactions.reconcile_pending_canonical_publications(
+        limit, should_stop=should_stop)
 
 
 def _reconcile_cluster_terminal(demand: demand_state.DemandRecord,
@@ -258,16 +281,25 @@ def _reconcile_cluster_terminal(demand: demand_state.DemandRecord,
             session, demand.id, demand.workspace, authoritative=True, now=now)
 
 
-def _reconcile_terminal_consumers(now: int | None = None,
-                                  limit: int = 500) -> int:
+def _reconcile_terminal_consumers(
+        now: int | None = None,
+        limit: int = 500,
+        *,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Releases fences only from each consumer's authoritative lifecycle."""
+    if should_stop is not None and should_stop():
+        return 0
     if now is None:
         with orm.Session(catalog_state.engine()) as session:
             current = catalog_state.database_epoch(session)
     else:
         current = now
+    if should_stop is not None and should_stop():
+        return 0
     candidates = demand_state.list_consumer_reconciliation_candidates(
         older_than=current - _CONSUMER_RECONCILIATION_SECONDS, limit=limit)
+    if should_stop is not None and should_stop():
+        return 0
     cluster_names: set[str] = set()
     service_identities: list[tuple[str, int, str]] = []
     job_identities: list[tuple[int, int]] = []
@@ -275,6 +307,8 @@ def _reconcile_terminal_consumers(now: int | None = None,
     demand_service_identity: dict[str, tuple[str, int, str]] = {}
     demand_job_identity: dict[str, tuple[int, int]] = {}
     for demand in candidates:
+        if should_stop is not None and should_stop():
+            return 0
         consumer = demand.placement.get('consumer')
         if not isinstance(consumer, dict):
             continue
@@ -311,24 +345,40 @@ def _reconcile_terminal_consumers(now: int | None = None,
                 job_identity = (parsed_job_id, task_id)
                 job_identities.append(job_identity)
                 demand_job_identity[demand.id] = job_identity
+    if should_stop is not None and should_stop():
+        return 0
     cluster_consumers = global_user_state.get_cluster_image_consumers(
         sorted(cluster_names))
+    if should_stop is not None and should_stop():
+        return 0
     try:
+        if should_stop is not None and should_stop():
+            return 0
         service_states = serve_state.get_service_version_terminal_states(
             list(set(service_identities)))
     except Exception:  # pylint: disable=broad-except
         service_states = {}
+    if should_stop is not None and should_stop():
+        return 0
     try:
+        if should_stop is not None and should_stop():
+            return 0
         job_states = managed_job_state.get_job_task_terminal_states(
             list(set(job_identities)))
     except Exception:  # pylint: disable=broad-except
         job_states = {}
+    if should_stop is not None and should_stop():
+        return 0
     reconciled = 0
     for demand in candidates:
+        if should_stop is not None and should_stop():
+            break
         authoritative_terminal = False
         if demand.consumer_kind == 'cluster':
             cluster_name = demand_cluster_identity.get(demand.id)
             if cluster_name is None:
+                if should_stop is not None and should_stop():
+                    break
                 demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             legacy_name_owner = ':incarnation:' not in demand.consumer_owner
@@ -336,17 +386,25 @@ def _reconcile_terminal_consumers(now: int | None = None,
             if (cluster_name in cluster_consumers and
                 (legacy_name_owner or active_consumer is None or active_consumer
                  == (demand.consumer_kind, demand.consumer_owner))):
+                if should_stop is not None and should_stop():
+                    break
                 demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             if not demand.consumer_attached:
                 if demand.first_terminal_observed_at is None:
+                    if should_stop is not None and should_stop():
+                        break
                     demand_state.defer_consumer_reconciliation(demand.id,
                                                                now=now)
                     continue
                 if (current - demand.created_at
                         < _UNATTACHED_REQUEST_RETENTION_SECONDS):
+                    if should_stop is not None and should_stop():
+                        break
                     demand_state.defer_terminal_confirmation(demand.id, now=now)
                     continue
+            if should_stop is not None and should_stop():
+                break
             if _reconcile_cluster_terminal(demand, cluster_name, now=now):
                 reconciled += 1
             continue
@@ -355,6 +413,8 @@ def _reconcile_terminal_consumers(now: int | None = None,
             state = (service_states.get(current_service_identity)
                      if current_service_identity is not None else None)
             if state is not True:
+                if should_stop is not None and should_stop():
+                    break
                 demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             authoritative_terminal = True
@@ -363,17 +423,25 @@ def _reconcile_terminal_consumers(now: int | None = None,
             state = (job_states.get(current_job_identity)
                      if current_job_identity is not None else None)
             if state is not True:
+                if should_stop is not None and should_stop():
+                    break
                 demand_state.defer_consumer_reconciliation(demand.id, now=now)
                 continue
             authoritative_terminal = True
         else:
+            if should_stop is not None and should_stop():
+                break
             demand_state.defer_consumer_reconciliation(demand.id, now=now)
             continue
         if (demand.first_terminal_observed_at is not None and
                 current - demand.first_terminal_observed_at
                 < _TERMINAL_CONFIRMATION_SECONDS):
+            if should_stop is not None and should_stop():
+                break
             demand_state.defer_terminal_confirmation(demand.id, now=now)
             continue
+        if should_stop is not None and should_stop():
+            break
         if demand_state.observe_consumer_terminal(
                 demand.id,
                 demand.workspace,
@@ -383,16 +451,31 @@ def _reconcile_terminal_consumers(now: int | None = None,
     return reconciled
 
 
-def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
-                                      *,
-                                      limit: int = 8,
-                                      now: int | None = None) -> bool:
+def reconcile_qualification_lifecycle(
+        limiter: budgets.ProviderBudgetLimiter,
+        *,
+        limit: int = 8,
+        now: int | None = None,
+        should_stop: Callable[[], bool] | None = None) -> bool:
     """Deletes canaries only after every declared runtime tuple proved pull."""
-    for revision in topology_state.list_qualifying_profiles(include_active=True,
-                                                            limit=limit):
+    if should_stop is not None and should_stop():
+        return False
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
+    revisions = topology_state.list_qualifying_profiles(include_active=True,
+                                                        limit=limit)
+    if should_stop is not None and should_stop():
+        return False
+    for revision in revisions:
+        if should_stop is not None and should_stop():
+            return False
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
         for target in (profile.canonical,) + profile.targets:
+            if should_stop is not None and should_stop():
+                return False
             copy_key = models.profile_attestation_key('copy', target.name)
             copy_evidence = revision.attestations.get(copy_key)
             if (not isinstance(copy_evidence, dict) or
@@ -413,9 +496,13 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                 continue
             runtime_ready = True
             for backend, binding_id in target.runtime_pull:
+                if should_stop is not None and should_stop():
+                    return False
                 binding = profile.bindings[binding_id]
                 for runtime_id in qualification.runtime_ids(
                         target, backend, binding):
+                    if should_stop is not None and should_stop():
+                        return False
                     runtime_key = models.profile_attestation_key(
                         'runtime', target.name, backend, binding.fingerprint,
                         runtime_id)
@@ -432,22 +519,55 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                     break
             if not runtime_ready:
                 continue
+            if should_stop is not None and should_stop():
+                return False
             shard = topology_state.get_target_shard(revision.workspace,
                                                     profile.name, target.name)
+            if should_stop is not None and should_stop():
+                return False
             if shard is None:
                 continue
             repository_name, repository_arn = (
                 qualification.qualification_repository(revision, target))
             binding = profile.bindings[target.qualification_delete_authority]
-            repository = aws.EcrRepository.from_role(
-                _lifecycle_role(binding, profile),
-                target.region,
-                repository_name,
-                hooks=_ecr_hooks(limiter, shard))
+            if should_stop is not None and should_stop():
+                return False
+            try:
+                repository = aws.EcrRepository.from_role(
+                    _lifecycle_role(binding, profile),
+                    target.region,
+                    repository_name,
+                    hooks=_ecr_hooks(limiter,
+                                     shard,
+                                     provider_fence=provider_fence),
+                    provider_fence=provider_fence)
+            except _QualificationDrainRequested:
+                return False
+            if should_stop is not None and should_stop():
+                return False
             digest = models.validate_sha256_digest(
                 copy_evidence['runtime_digest'], 'Qualification canary digest')
-            if not repository.exact_delete(digest):
-                continue
+            try:
+                request_outcome = repository.delete_request_outcome(digest)
+                _raise_if_stopping(should_stop)
+                if request_outcome != aws.DeleteRequestOutcome.CONCLUDED:
+                    raise aws.AmbiguousProviderOutcomeError(
+                        'ECR qualification deletion did not conclude.')
+                try:
+                    present = repository.exact_manifest_exists(digest)
+                except _QualificationDrainRequested:
+                    raise
+                except Exception as error:  # pylint: disable=broad-except
+                    raise aws.AmbiguousProviderOutcomeError(
+                        'ECR qualification deletion has no exact final '
+                        'presence proof.') from error
+                _raise_if_stopping(should_stop)
+                if present:
+                    continue
+            except _QualificationDrainRequested:
+                return False
+            if should_stop is not None and should_stop():
+                return False
             revision = topology_state.record_profile_attestation(
                 profile_revision_id=revision.id,
                 kind=lifecycle_key,
@@ -462,35 +582,63 @@ def reconcile_qualification_lifecycle(limiter: budgets.ProviderBudgetLimiter,
                 expected_generation=revision.desired_generation,
                 expected_config_hash=revision.config_hash,
                 now=now)
+        if should_stop is not None and should_stop():
+            return False
         qualification.maybe_activate_profile(revision.id)
     return True
 
 
-def reconcile_failed_canonical_reservations(limiter: budgets.
-                                            ProviderBudgetLimiter,
-                                            *,
-                                            limit: int = 8) -> bool:
+def reconcile_failed_canonical_reservations(
+        limiter: budgets.ProviderBudgetLimiter,
+        *,
+        limit: int = 8,
+        should_stop: Callable[[], bool] | None = None) -> bool:
     """Reclaims capacity only after an exact canonical-absence proof."""
-    for location in topology_state.list_failed_canonical_reap_candidates(
-            limit=limit):
+    if should_stop is not None and should_stop():
+        return False
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
+    locations = topology_state.list_failed_canonical_reap_candidates(
+        limit=limit)
+    if should_stop is not None and should_stop():
+        return False
+    for location in locations:
+        if should_stop is not None and should_stop():
+            return False
         shard = topology_state.get_shard(location.shard_id)
+        if should_stop is not None and should_stop():
+            return False
         if (shard is None or
                 shard.target_fingerprint != location.target_fingerprint):
             continue
         resolved = _profile_target_for_location(location, shard)
+        if should_stop is not None and should_stop():
+            return False
         if resolved is None:
             continue
         profile, target = resolved
         binding = profile.bindings[target.qualification_delete_authority]
-        repository = aws.EcrRepository.from_role(
-            _lifecycle_role(binding, profile),
-            shard.region,
-            shard.repository_name,
-            hooks=_ecr_hooks(limiter, shard))
+        if should_stop is not None and should_stop():
+            return False
+        try:
+            repository = aws.EcrRepository.from_role(
+                _lifecycle_role(binding, profile),
+                shard.region,
+                shard.repository_name,
+                hooks=_ecr_hooks(limiter, shard, provider_fence=provider_fence),
+                provider_fence=provider_fence)
+        except _QualificationDrainRequested:
+            return False
+        if should_stop is not None and should_stop():
+            return False
         try:
             present = repository.exact_manifest_exists(location.runtime_digest)
             if present:
                 continue
+            if should_stop is not None and should_stop():
+                return False
             topology_state.reap_failed_canonical_reservation(
                 location.id,
                 expected_updated_at=location.updated_at,
@@ -498,6 +646,8 @@ def reconcile_failed_canonical_reservations(limiter: budgets.
         except (aws.ProviderThrottledError,
                 budgets.ProviderBudgetUnavailableError):
             continue
+        except _QualificationDrainRequested:
+            return False
         except Exception:  # pylint: disable=broad-except
             continue
     return True
@@ -527,9 +677,17 @@ class LifecycleWorkerService:
         self._stop.set()
 
     def _maintenance(self) -> None:
-        _reconcile_publication_fanout()
+        if self._stop.is_set():
+            return
+        _reconcile_publication_fanout(should_stop=self._stop.is_set)
+        if self._stop.is_set():
+            return
         catalog_state.compact_terminal_records()
+        if self._stop.is_set():
+            return
         demand_state.compact_terminal_demands()
+        if self._stop.is_set():
+            return
         topology_state.compact_stale_workers(max_age_seconds=24 * 60 * 60)
 
     def run_forever(self) -> None:
@@ -568,35 +726,64 @@ class LifecycleWorkerService:
                     self.worker_id, in_flight=len(futures), success=bool(done))
                 if self._health is not None:
                     self._health.heartbeat(heartbeat_ok)
+                if self._stop.is_set():
+                    break
                 if schedule_now - last_maintenance >= 5 * 60:
+                    if self._stop.is_set():
+                        break
                     self._maintenance()
                     last_maintenance = schedule_now
+                if self._stop.is_set():
+                    break
                 if (schedule_now - last_consumer_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS):
-                    _reconcile_terminal_consumers()
+                    _reconcile_terminal_consumers(should_stop=self._stop.is_set)
                     last_consumer_reconciliation = schedule_now
+                if self._stop.is_set():
+                    break
                 if (schedule_now - last_qualification_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS and
                         qualification_future is None and
                         len(futures) < self.max_in_flight):
-                    qualification_future = executor.submit(
-                        reconcile_qualification_lifecycle, self._budget_limiter)
+                    if self._stop.is_set():
+                        break
+                    qualification_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
+                        reconcile_qualification_lifecycle,
+                        self._budget_limiter,
+                        should_stop=self._stop.is_set)
+                    if qualification_future is None:
+                        break
                     futures.add(qualification_future)
                     last_qualification_reconciliation = schedule_now
+                if self._stop.is_set():
+                    break
                 if (schedule_now - last_canonical_reconciliation
                         >= _CONSUMER_RECONCILIATION_SECONDS and
                         canonical_future is None and
                         len(futures) < self.max_in_flight):
-                    canonical_future = executor.submit(
+                    if self._stop.is_set():
+                        break
+                    canonical_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
                         reconcile_failed_canonical_reservations,
-                        self._budget_limiter)
+                        self._budget_limiter,
+                        should_stop=self._stop.is_set)
+                    if canonical_future is None:
+                        break
                     futures.add(canonical_future)
                     last_canonical_reconciliation = schedule_now
+                if self._stop.is_set():
+                    break
                 if schedule_now - last_policy_refresh >= 60:
                     workspace_retentions = (
                         _refresh_workspace_eviction_retentions(
                             workspace_retentions))
                     last_policy_refresh = schedule_now
+                if self._stop.is_set():
+                    break
                 if workspace_retentions is None:
                     self._stop.wait(1 if futures else 5)
                     continue
@@ -610,11 +797,18 @@ class LifecycleWorkerService:
                     )
                     if claim is None:
                         break
-                    futures.add(
-                        executor.submit(evict_location,
-                                        claim,
-                                        self._budget_limiter,
-                                        lease_seconds=self.lease_seconds))
+                    if self._stop.is_set():
+                        break
+                    submitted_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
+                        evict_location,
+                        claim,
+                        self._budget_limiter,
+                        lease_seconds=self.lease_seconds)
+                    if submitted_future is None:
+                        break
+                    futures.add(submitted_future)
                 self._stop.wait(1 if futures else 5)
 
 

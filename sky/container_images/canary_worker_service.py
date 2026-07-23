@@ -30,13 +30,20 @@ from sky.server import database_migrations
 _DEFAULT_LEASE_SECONDS = 15 * 60
 _POLL_SECONDS = 10
 _MAX_QUALIFIED_EKS_NODES = 1000
+# The 60-observation Spot association proof has its own five-minute cadence.
+# Keep the absolute cleanup budget below the Helm 600-second shutdown grace
+# while leaving bounded headroom for client acquisition and provider calls.
+_EC2_TEARDOWN_SECONDS = 8 * 60
 _EC2_CONSOLE_SETTLE_SECONDS = 10 * 60
 _EC2_CONSOLE_POLL_SECONDS = 5
 _EC2_TEARDOWN_ATTEMPTS = 60
 _EC2_TEARDOWN_POLL_SECONDS = 5
+_SPOT_REQUEST_CANCELLABLE_STATES = frozenset({'active', 'disabled', 'open'})
+_SPOT_REQUEST_TERMINAL_STATES = frozenset({'cancelled', 'closed', 'failed'})
 _EKS_TEARDOWN_SECONDS = 60
 _EKS_TEARDOWN_POLL_SECONDS = 2
 _EKS_ABSENCE_SETTLE_SECONDS = kubernetes.API_TIMEOUT + 1
+_KUBERNETES_EXEC_CREDENTIAL_TIMEOUT_SECONDS = 15
 _LeaseHeartbeat = worker_lease.LeaseHeartbeat
 _CANARY_ERROR_CODES = frozenset({
     'CANARY_DUPLICATE_CHILD',
@@ -53,6 +60,48 @@ _CANARY_ERROR_CODES = frozenset({
 })
 
 
+class _CanaryDrainRequested(Exception):
+    """Requests prompt canary teardown without terminalizing its operation."""
+
+
+class _CanaryCleanupDeadlineExceeded(Exception):
+    """Stops mandatory cleanup before a provider call can exceed its budget."""
+
+
+class _CanaryTeardownFailed(ValueError):
+    """Identifies a custody-preserving teardown failure before detachment."""
+
+    def __init__(self) -> None:
+        super().__init__('CANARY_TEARDOWN_FAILED')
+
+
+def _raise_if_draining(drain_event: threading.Event | None) -> None:
+    if drain_event is not None and drain_event.is_set():
+        raise _CanaryDrainRequested()
+
+
+def _wait_for_canary_poll(drain_event: threading.Event | None) -> None:
+    if drain_event is None:
+        time.sleep(_POLL_SECONDS)
+    elif drain_event.wait(_POLL_SECONDS):
+        raise _CanaryDrainRequested()
+
+
+# This synchronous fence has no cancellation checkpoint. It deliberately
+# detaches every control failure before the caller re-raises it after cleanup.
+def _capture_provider_fence_error(
+        provider_fence: Callable[[], None]) -> BaseException | None:
+    """Returns a control error detached from any losing provider failure."""
+    try:
+        provider_fence()
+    except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
+        error = error.with_traceback(None)
+        error.__cause__ = None
+        error.__context__ = None
+        return error  # noqa: ASYNC104
+    return None
+
+
 class _FencedClient:
     """Proves the canary lease around every provider SDK call."""
 
@@ -61,74 +110,211 @@ class _FencedClient:
         self._client = client
         self._heartbeat = heartbeat
 
+    def _call_target(self, method_name: str) -> Callable[..., Any] | None:
+        if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
+            return None
+        value = getattr(self._client, method_name)
+        if not callable(value):
+            raise TypeError(
+                f'Provider attribute {method_name!r} is not callable.')
+        return value
+
+    def invalidate_kubernetes_credentials(self) -> None:
+        """Drops an installed Kubernetes client before this wrapper escapes."""
+        client = self._client
+        if isinstance(client, kubernetes.ProviderFencedCoreApi):
+            client.close()
+            self._client = None
+
     def _call(self,
-              value: Callable[..., Any],
+              method_name: str,
+              value: Callable[..., Any] | None,
               args: tuple[Any, ...],
               kwargs: dict[str, Any],
               *,
               deadline: float | None = None,
+              deadline_error: Callable[[], Exception] | None = None,
+              drain_event: threading.Event | None = None,
               on_start: Callable[[], None] | None = None) -> Any:
-        self._heartbeat.assert_owned()
-        if deadline is not None and time.monotonic() >= deadline:
-            raise ValueError('CANARY_TIMEOUT')
+
+        def provider_fence() -> None:
+            self._heartbeat.assert_owned()
+            _raise_if_draining(drain_event)
+            if deadline is not None and time.monotonic() >= deadline:
+                if deadline_error is not None:
+                    raise deadline_error()
+                raise ValueError('CANARY_TIMEOUT')
+
+        # The Kubernetes wrapper must own the first fence so it can scrub its
+        # installed credential before any control exception escapes.
+        if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
+            return self._client.call_with_provider_fence(
+                method_name, provider_fence, on_start, *args, **kwargs)
+        provider_fence()
+        assert value is not None
         if on_start is not None:
             on_start()
+        provider_error: Exception | None = None
+        result: Any = None
         try:
             result = value(*args, **kwargs)
-        except Exception:  # pylint: disable=broad-except
-            self._heartbeat.assert_owned()
-            raise
-        self._heartbeat.assert_owned()
+        except Exception as error:  # pylint: disable=broad-except
+            provider_error = error
+        if provider_error is not None:
+            control_error = _capture_provider_fence_error(provider_fence)
+            if control_error is not None:
+                provider_error = None
+                del value
+                args = ()
+                kwargs = {}
+                raise control_error.with_traceback(None) from None
+            raise provider_error
+        control_error = _capture_provider_fence_error(provider_fence)
+        if control_error is not None:
+            result = None
+            del value
+            args = ()
+            kwargs = {}
+            raise control_error.with_traceback(None) from None
         return result
 
     def __getattr__(self, name: str) -> Any:
+        if isinstance(self._client, kubernetes.ProviderFencedCoreApi):
+            if name == 'api_client':
+                return self._client.api_client
+
+            def kubernetes_call(*args: Any, **kwargs: Any) -> Any:
+                return self._call(name, None, args, kwargs)
+
+            return kubernetes_call
         value = getattr(self._client, name)
         if not callable(value):
             return value
 
-        def call(*args: Any, **kwargs: Any) -> Any:
-            return self._call(value, args, kwargs)
+        def provider_call(*args: Any, **kwargs: Any) -> Any:
+            return self._call(name, value, args, kwargs)
 
-        return call
+        return provider_call
 
-    def call_before_deadline(self, name: str, deadline: float,
+    def call_while_not_draining(self, method_name: str,
+                                drain_event: threading.Event | None, *args: Any,
+                                **kwargs: Any) -> Any:
+        """Rechecks drain after the lease fence and before the raw call."""
+        value = self._call_target(method_name)
+        return self._call(method_name,
+                          value,
+                          args,
+                          kwargs,
+                          drain_event=drain_event)
+
+    def call_before_deadline(self, method_name: str, deadline: float,
                              on_start: Callable[[], None], *args: Any,
                              **kwargs: Any) -> Any:
         """Fences ownership, then deadline, immediately before create."""
-        value = getattr(self._client, name)
-        if not callable(value):
-            raise TypeError(f'Provider attribute {name!r} is not callable.')
-        return self._call(value,
+        value = self._call_target(method_name)
+        return self._call(method_name,
+                          value,
                           args,
                           kwargs,
                           deadline=deadline,
                           on_start=on_start)
 
+    def call_before_cleanup_deadline(self, method_name: str, deadline: float,
+                                     *args: Any, **kwargs: Any) -> Any:
+        """Fences ownership and cleanup budget immediately before the call."""
+        value = self._call_target(method_name)
+        return self._call(method_name,
+                          value,
+                          args,
+                          kwargs,
+                          deadline=deadline,
+                          deadline_error=_CanaryCleanupDeadlineExceeded)
 
-def _assumed_client(role: aws.AwsRoleBinding, service: str, region: str,
-                    heartbeat: worker_lease.LeaseHeartbeat) -> _FencedClient:
-    heartbeat.assert_owned()
+
+def _ordinary_provider_call(client: Any, method_name: str,
+                            drain_event: threading.Event | None, *args: Any,
+                            **kwargs: Any) -> Any:
+    """Starts one ordinary provider call only while the worker is active."""
+    if isinstance(client, _FencedClient):
+        return client.call_while_not_draining(method_name, drain_event, *args,
+                                              **kwargs)
+    _raise_if_draining(drain_event)
+    result = getattr(client, method_name)(*args, **kwargs)
+    _raise_if_draining(drain_event)
+    return result
+
+
+def _cleanup_provider_call(client: Any, method_name: str, deadline: float,
+                           *args: Any, **kwargs: Any) -> Any:
+    """Starts one mandatory cleanup call only inside its absolute budget."""
+    if isinstance(client, _FencedClient):
+        return client.call_before_cleanup_deadline(method_name, deadline, *args,
+                                                   **kwargs)
+    if time.monotonic() >= deadline:
+        raise _CanaryCleanupDeadlineExceeded()
+    return getattr(client, method_name)(*args, **kwargs)
+
+
+def _assumed_client(role: aws.AwsRoleBinding,
+                    service: str,
+                    region: str,
+                    heartbeat: worker_lease.LeaseHeartbeat,
+                    *,
+                    drain_event: threading.Event | None = None,
+                    cleanup_deadline: float | None = None) -> _FencedClient:
+
+    def provider_fence() -> None:
+        heartbeat.assert_owned()
+        _raise_if_draining(drain_event)
+        if (cleanup_deadline is not None and
+                time.monotonic() >= cleanup_deadline):
+            raise _CanaryCleanupDeadlineExceeded()
+
+    provider_fence()
+    provider_error: Exception | None = None
+    client: Any | None = None
     try:
         client = aws.assumed_client(role,
                                     service,
                                     region,
-                                    provider_fence=heartbeat.assert_owned)
-    except Exception:  # pylint: disable=broad-except
-        heartbeat.assert_owned()
-        raise
-    heartbeat.assert_owned()
+                                    provider_fence=provider_fence)
+    except Exception as error:  # pylint: disable=broad-except
+        provider_error = error
+    if provider_error is not None:
+        control_error = _capture_provider_fence_error(provider_fence)
+        if control_error is not None:
+            provider_error = None
+            raise control_error.with_traceback(None) from None
+        raise provider_error
+    control_error = _capture_provider_fence_error(provider_fence)
+    if control_error is not None:
+        client = None
+        raise control_error.with_traceback(None) from None
+    assert client is not None
     return _FencedClient(client, heartbeat)
 
 
 def _kubernetes_core(context: str,
-                     heartbeat: worker_lease.LeaseHeartbeat) -> _FencedClient:
-    heartbeat.assert_owned()
-    try:
-        core = kubernetes.core_api(context)
-    except Exception:  # pylint: disable=broad-except
+                     heartbeat: worker_lease.LeaseHeartbeat,
+                     *,
+                     drain_event: threading.Event | None = None,
+                     cleanup_deadline: float | None = None) -> _FencedClient:
+
+    def provider_fence() -> None:
         heartbeat.assert_owned()
-        raise
-    heartbeat.assert_owned()
+        _raise_if_draining(drain_event)
+        if (cleanup_deadline is not None and
+                time.monotonic() >= cleanup_deadline):
+            raise _CanaryCleanupDeadlineExceeded()
+
+    provider_fence()
+    # The bounded adaptor rechecks this fence after any credential failure and
+    # returns only a sanitized control exception when drain/deadline wins.
+    core = kubernetes.provider_fenced_core_api(
+        context,
+        exec_credential_timeout_seconds=(
+            _KUBERNETES_EXEC_CREDENTIAL_TIMEOUT_SECONDS),
+        provider_fence=provider_fence)
     return _FencedClient(core, heartbeat)
 
 
@@ -140,47 +326,69 @@ def _ec2_client_token(operation_id: str) -> str:
 
 def _attach_canary_child(operation: catalog_state.OperationRecord,
                          child_id: str,
-                         heartbeat: worker_lease.LeaseHeartbeat) -> None:
+                         heartbeat: worker_lease.LeaseHeartbeat,
+                         *,
+                         drain_event: threading.Event | None = None) -> None:
     assert operation.lease_token is not None
     heartbeat.assert_owned()
+    _raise_if_draining(drain_event)
     try:
         attached = qualification.attach_canary_child(operation.id,
                                                      operation.lease_token,
                                                      child_id)
     except ValueError as error:
         # A different durable child cannot be discarded by terminal failure.
-        raise ValueError('CANARY_TEARDOWN_FAILED') from error
+        raise _CanaryTeardownFailed() from error
     except Exception as error:  # pylint: disable=broad-except
         if operation.child_launch_id is not None:
-            raise ValueError('CANARY_TEARDOWN_FAILED') from error
+            raise _CanaryTeardownFailed() from error
         raise
     if not attached:
         raise worker_lease.LeaseLostError(
             'Canary operation lease or launch deadline was lost.')
     heartbeat.assert_owned()
+    _raise_if_draining(drain_event)
 
 
 def _authorized_launch_deadline(
-        operation: catalog_state.OperationRecord, child_id: str,
-        heartbeat: worker_lease.LeaseHeartbeat) -> float:
+        operation: catalog_state.OperationRecord,
+        child_id: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> float:
     """Maps the locked database deadline onto this process's monotonic clock."""
     assert operation.lease_token is not None
     started_at = time.monotonic()
     heartbeat.assert_owned()
+    _raise_if_draining(drain_event)
     remaining = qualification.authorize_canary_launch(operation.id,
                                                       operation.lease_token,
                                                       child_id)
     if remaining is None:
         raise ValueError('CANARY_TIMEOUT')
     heartbeat.assert_owned()
+    _raise_if_draining(drain_event)
     return started_at + remaining
 
 
 def _preflight_error(operation: catalog_state.OperationRecord,
                      error_code: str) -> ValueError:
     if operation.child_launch_id is not None:
-        return ValueError('CANARY_TEARDOWN_FAILED')
+        return _CanaryTeardownFailed()
     return ValueError(error_code)
+
+
+def _detached_cleanup_winner(error: Exception) -> Exception | None:
+    """Returns a cleanup/control winner detached from losing provider state."""
+    if isinstance(error, _CanaryTeardownFailed):
+        return _CanaryTeardownFailed()
+    if isinstance(error, (_CanaryDrainRequested, _CanaryCleanupDeadlineExceeded,
+                          worker_lease.LeaseLostError)):
+        error = error.with_traceback(None)
+        error.__cause__ = None
+        error.__context__ = None
+        return error
+    return None
 
 
 def _canary_role(
@@ -241,8 +449,14 @@ def _load_contract(
     return payload, revision, profile, target, binding, digest, reference
 
 
-def _instance_profile_role(iam: Any, instance_profile: str) -> str:
-    response = iam.get_instance_profile(InstanceProfileName=instance_profile)
+def _instance_profile_role(iam: Any,
+                           instance_profile: str,
+                           *,
+                           drain_event: threading.Event | None = None) -> str:
+    response = _ordinary_provider_call(iam,
+                                       'get_instance_profile',
+                                       drain_event,
+                                       InstanceProfileName=instance_profile)
     profile = response.get('InstanceProfile', {})
     roles = profile.get('Roles', [])
     if len(roles) != 1 or not isinstance(roles[0].get('Arn'), str):
@@ -250,21 +464,104 @@ def _instance_profile_role(iam: Any, instance_profile: str) -> str:
     return str(roles[0]['Arn'])
 
 
-def _tagged_instances(ec2: Any, operation_id: str) -> list[dict[str, Any]]:
-    response = ec2.describe_instances(Filters=[{
-        'Name': 'tag:SkyPilotCanaryOperation',
-        'Values': [operation_id],
-    }, {
-        'Name': 'instance-state-name',
-        'Values': [
-            'pending', 'running', 'stopping', 'stopped', 'shutting-down',
-            'terminated'
-        ],
-    }])
-    return [
-        instance for reservation in response.get('Reservations', [])
-        for instance in reservation.get('Instances', [])
-    ]
+def _tagged_instances(
+        ec2: Any,
+        operation_id: str,
+        *,
+        drain_event: threading.Event | None = None,
+        cleanup_deadline: float | None = None) -> list[dict[str, Any]]:
+    """Returns the complete operation-tagged EC2 instance inventory."""
+    instances: list[dict[str, Any]] = []
+    next_token: str | None = None
+    observed_tokens: set[str] = set()
+    while True:
+        kwargs: dict[str, Any] = {
+            'Filters': [{
+                'Name': 'tag:SkyPilotCanaryOperation',
+                'Values': [operation_id],
+            }, {
+                'Name': 'instance-state-name',
+                'Values': [
+                    'pending', 'running', 'stopping', 'stopped',
+                    'shutting-down', 'terminated'
+                ],
+            }],
+            'MaxResults': 1000,
+        }
+        if next_token is not None:
+            kwargs['NextToken'] = next_token
+        if cleanup_deadline is None:
+            response = _ordinary_provider_call(ec2, 'describe_instances',
+                                               drain_event, **kwargs)
+        else:
+            response = _cleanup_provider_call(ec2, 'describe_instances',
+                                              cleanup_deadline, **kwargs)
+        reservations = response.get('Reservations', [])
+        if (not isinstance(reservations, list) or not all(
+                isinstance(reservation, dict) for reservation in reservations)):
+            raise ValueError('QUALIFICATION_FAILED')
+        for reservation in reservations:
+            page = reservation.get('Instances', [])
+            if (not isinstance(page, list) or
+                    not all(isinstance(instance, dict) for instance in page)):
+                raise ValueError('QUALIFICATION_FAILED')
+            instances.extend(page)
+        raw_next_token = response.get('NextToken')
+        if raw_next_token is None:
+            return instances
+        if (not isinstance(raw_next_token, str) or not raw_next_token or
+                raw_next_token in observed_tokens):
+            raise ValueError('QUALIFICATION_FAILED')
+        observed_tokens.add(raw_next_token)
+        next_token = raw_next_token
+
+
+def _tagged_spot_requests(ec2: Any, operation_id: str, *,
+                          cleanup_deadline: float) -> list[dict[str, Any]]:
+    """Returns the complete operation-tagged Spot request inventory."""
+    requests: list[dict[str, Any]] = []
+    next_token: str | None = None
+    observed_tokens: set[str] = set()
+    while True:
+        kwargs: dict[str, Any] = {
+            'Filters': [{
+                'Name': 'tag:SkyPilotCanaryOperation',
+                'Values': [operation_id],
+            }],
+            'MaxResults': 1000,
+        }
+        if next_token is not None:
+            kwargs['NextToken'] = next_token
+        response = _cleanup_provider_call(ec2,
+                                          'describe_spot_instance_requests',
+                                          cleanup_deadline, **kwargs)
+        page = response.get('SpotInstanceRequests', [])
+        if (not isinstance(page, list) or
+                not all(isinstance(request, dict) for request in page)):
+            raise ValueError('QUALIFICATION_FAILED')
+        requests.extend(page)
+        raw_next_token = response.get('NextToken')
+        if raw_next_token is None:
+            return requests
+        if (not isinstance(raw_next_token, str) or not raw_next_token or
+                raw_next_token in observed_tokens):
+            raise ValueError('QUALIFICATION_FAILED')
+        observed_tokens.add(raw_next_token)
+        next_token = raw_next_token
+
+
+def _spot_requests_by_id(ec2: Any, request_ids: set[str],
+                         cleanup_deadline: float) -> list[dict[str, Any]]:
+    response = _cleanup_provider_call(
+        ec2,
+        'describe_spot_instance_requests',
+        cleanup_deadline,
+        SpotInstanceRequestIds=sorted(request_ids))
+    requests = response.get('SpotInstanceRequests', [])
+    if (not isinstance(requests, list) or
+            not all(isinstance(request, dict) for request in requests)):
+        raise ValueError('QUALIFICATION_FAILED')
+    return requests
 
 
 def _instance_id(instance: dict[str, Any]) -> str:
@@ -287,10 +584,101 @@ def _remember_instance_ids(instances: list[dict[str, Any]],
     return unidentified_child_observed
 
 
-def _exact_canary_instance(ec2: Any, instance_id: str,
-                           expected_tags: dict[str, str]) -> dict[str, Any]:
+def _remember_instance_spot_request_ids(
+        instances: list[dict[str, Any]], known_request_ids: set[str],
+        request_ids_with_instances: set[str]) -> bool:
+    """Retains request IDs and concrete request-to-instance associations."""
+    unidentified_child_observed = False
+    for instance in instances:
+        value = instance.get('SpotInstanceRequestId')
+        if value is None:
+            continue
+        if isinstance(value, str) and value:
+            known_request_ids.add(value)
+            instance_id = instance.get('InstanceId')
+            if isinstance(instance_id, str) and instance_id:
+                request_ids_with_instances.add(value)
+        else:
+            unidentified_child_observed = True
+    return unidentified_child_observed
+
+
+def _remember_spot_request_children(
+        requests: list[dict[str, Any]], known_request_ids: set[str],
+        known_instance_ids: set[str],
+        request_ids_with_instances: set[str]) -> bool:
+    """Retains both halves of each request-to-instance custody edge."""
+    unidentified_child_observed = False
+    for request in requests:
+        request_id = request.get('SpotInstanceRequestId')
+        valid_request_id = isinstance(request_id, str) and bool(request_id)
+        if valid_request_id:
+            assert isinstance(request_id, str)
+            known_request_ids.add(request_id)
+        else:
+            unidentified_child_observed = True
+        instance_id = request.get('InstanceId')
+        if instance_id is None:
+            continue
+        if isinstance(instance_id, str) and instance_id:
+            known_instance_ids.add(instance_id)
+            if valid_request_id:
+                assert isinstance(request_id, str)
+                request_ids_with_instances.add(request_id)
+        else:
+            unidentified_child_observed = True
+    return unidentified_child_observed
+
+
+def _index_exact_spot_requests(
+    requests: list[dict[str, Any]], known_request_ids: set[str],
+    known_instance_ids: set[str], request_ids_with_instances: set[str]
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Indexes an exact request read and reports incomplete provider state."""
+    unidentified_child_observed = _remember_spot_request_children(
+        requests, known_request_ids, known_instance_ids,
+        request_ids_with_instances)
+    requests_by_id: dict[str, dict[str, Any]] = {}
+    for request in requests:
+        request_id = request.get('SpotInstanceRequestId')
+        if (not isinstance(request_id, str) or not request_id or
+                request_id in requests_by_id):
+            unidentified_child_observed = True
+            continue
+        requests_by_id[request_id] = request
+    if set(requests_by_id) != known_request_ids:
+        unidentified_child_observed = True
+    return requests_by_id, unidentified_child_observed
+
+
+def _spot_request_state_sets(
+    requests_by_id: dict[str, dict[str,
+                                   Any]],) -> tuple[set[str], set[str], bool]:
+    cancellable: set[str] = set()
+    terminal: set[str] = set()
+    unidentified_child_observed = False
+    for request_id, request in requests_by_id.items():
+        state = request.get('State')
+        if state in _SPOT_REQUEST_CANCELLABLE_STATES:
+            cancellable.add(request_id)
+        elif state in _SPOT_REQUEST_TERMINAL_STATES:
+            terminal.add(request_id)
+        else:
+            unidentified_child_observed = True
+    return cancellable, terminal, unidentified_child_observed
+
+
+def _exact_canary_instance(
+        ec2: Any,
+        instance_id: str,
+        expected_tags: dict[str, str],
+        *,
+        drain_event: threading.Event | None = None) -> dict[str, Any]:
     """Reads all attested EC2 fields from one exact, correctly tagged child."""
-    response = ec2.describe_instances(InstanceIds=[instance_id])
+    response = _ordinary_provider_call(ec2,
+                                       'describe_instances',
+                                       drain_event,
+                                       InstanceIds=[instance_id])
     instances = [
         instance for reservation in response.get('Reservations', [])
         for instance in reservation.get('Instances', [])
@@ -316,8 +704,12 @@ def _exact_canary_instance(ec2: Any, instance_id: str,
     return instance
 
 
-def _instance_states(ec2: Any, instance_ids: set[str]) -> dict[str, str | None]:
-    response = ec2.describe_instances(InstanceIds=sorted(instance_ids))
+def _instance_states(ec2: Any, instance_ids: set[str],
+                     cleanup_deadline: float) -> dict[str, str | None]:
+    response = _cleanup_provider_call(ec2,
+                                      'describe_instances',
+                                      cleanup_deadline,
+                                      InstanceIds=sorted(instance_ids))
     return {
         str(instance['InstanceId']): (instance.get('State') or {}).get('Name')
         for reservation in response.get('Reservations', [])
@@ -326,13 +718,17 @@ def _instance_states(ec2: Any, instance_ids: set[str]) -> dict[str, str | None]:
     }
 
 
-def _terminate_ec2_instances(
-        ec2: Any,
-        operation_id: str,
-        instance_ids: list[str],
-        *,
-        settle_absence: bool,
-        initial_unidentified_child_observed: bool = False) -> bool:
+def _terminate_ec2_instances(ec2: Any,
+                             operation_id: str,
+                             instance_ids: list[str],
+                             *,
+                             settle_absence: bool,
+                             spot_request_expected: bool = False,
+                             initial_spot_request_ids: list[str] | None = None,
+                             initial_spot_request_ids_with_instances: list[str]
+                             | None = None,
+                             initial_unidentified_child_observed: bool = False,
+                             cleanup_deadline: float | None = None) -> bool:
     known_ids = {
         instance_id for instance_id in instance_ids
         if isinstance(instance_id, str) and instance_id
@@ -340,11 +736,108 @@ def _terminate_ec2_instances(
     unidentified_child_observed = (initial_unidentified_child_observed or any(
         not isinstance(instance_id, str) or not instance_id
         for instance_id in instance_ids))
+    known_spot_request_ids = {
+        request_id for request_id in (initial_spot_request_ids or [])
+        if isinstance(request_id, str) and request_id
+    }
+    spot_request_ids_with_instances = {
+        request_id
+        for request_id in (initial_spot_request_ids_with_instances or [])
+        if isinstance(request_id, str) and request_id
+    }
+    known_spot_request_ids.update(spot_request_ids_with_instances)
+    unidentified_child_observed |= any(
+        not isinstance(request_id, str) or not request_id
+        for request_id in (initial_spot_request_ids or []))
+    unidentified_child_observed |= any(
+        not isinstance(request_id, str) or not request_id
+        for request_id in (initial_spot_request_ids_with_instances or []))
+    spot_request_observed = bool(known_spot_request_ids)
     clean_observations_after_ambiguity = 0
+    unassociated_spot_request_observations = 0
+    previous_unassociated_spot_request_ids: frozenset[str] | None = None
+    previous_unassociated_spot_request_states: tuple[tuple[str, str | None],
+                                                     ...] | None = None
+    previous_known_instance_ids = frozenset(known_ids)
     termination_requested: set[str] = set()
+    if cleanup_deadline is None:
+        cleanup_deadline = time.monotonic() + _EC2_TEARDOWN_SECONDS
+    poll_epoch = time.monotonic()
     for attempt in range(_EC2_TEARDOWN_ATTEMPTS):
-        tagged = _tagged_instances(ec2, operation_id)
+        if time.monotonic() >= cleanup_deadline:
+            return False
+        try:
+            tagged = _tagged_instances(ec2,
+                                       operation_id,
+                                       cleanup_deadline=cleanup_deadline)
+        except _CanaryCleanupDeadlineExceeded:
+            return False
+        if time.monotonic() >= cleanup_deadline:
+            return False
         unidentified_in_observation = _remember_instance_ids(tagged, known_ids)
+        if spot_request_expected:
+            unidentified_in_observation |= (_remember_instance_spot_request_ids(
+                tagged, known_spot_request_ids,
+                spot_request_ids_with_instances))
+            try:
+                tagged_requests = _tagged_spot_requests(
+                    ec2, operation_id, cleanup_deadline=cleanup_deadline)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            if tagged_requests:
+                spot_request_observed = True
+            unidentified_in_observation |= _remember_spot_request_children(
+                tagged_requests, known_spot_request_ids, known_ids,
+                spot_request_ids_with_instances)
+        exact_requests_by_id: dict[str, dict[str, Any]] = {}
+        if known_spot_request_ids:
+            try:
+                exact_requests = _spot_requests_by_id(ec2,
+                                                      known_spot_request_ids,
+                                                      cleanup_deadline)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            exact_requests_by_id, incomplete_exact_inventory = (
+                _index_exact_spot_requests(exact_requests,
+                                           known_spot_request_ids, known_ids,
+                                           spot_request_ids_with_instances))
+            unidentified_in_observation |= incomplete_exact_inventory
+        (cancellable_spot_request_ids, terminal_spot_request_ids,
+         unknown_spot_request_state
+        ) = _spot_request_state_sets(exact_requests_by_id)
+        unidentified_in_observation |= unknown_spot_request_state
+        if cancellable_spot_request_ids:
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            try:
+                _cleanup_provider_call(
+                    ec2,
+                    'cancel_spot_instance_requests',
+                    cleanup_deadline,
+                    SpotInstanceRequestIds=sorted(cancellable_spot_request_ids))
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            try:
+                post_cancel_requests = _spot_requests_by_id(
+                    ec2, known_spot_request_ids, cleanup_deadline)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            exact_requests_by_id, incomplete_exact_inventory = (
+                _index_exact_spot_requests(post_cancel_requests,
+                                           known_spot_request_ids, known_ids,
+                                           spot_request_ids_with_instances))
+            unidentified_in_observation |= incomplete_exact_inventory
+            (_, terminal_spot_request_ids, unknown_spot_request_state
+            ) = _spot_request_state_sets(exact_requests_by_id)
+            unidentified_in_observation |= unknown_spot_request_state
         if unidentified_in_observation:
             unidentified_child_observed = True
             clean_observations_after_ambiguity = 0
@@ -362,19 +855,89 @@ def _terminate_ec2_instances(
         }
         to_terminate = sorted(known_ids - termination_requested - terminal_ids)
         if to_terminate:
-            ec2.terminate_instances(InstanceIds=to_terminate)
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            try:
+                _cleanup_provider_call(ec2,
+                                       'terminate_instances',
+                                       cleanup_deadline,
+                                       InstanceIds=to_terminate)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
             termination_requested.update(to_terminate)
         all_known_terminated = False
         if known_ids:
-            states = _instance_states(ec2, known_ids)
+            if time.monotonic() >= cleanup_deadline:
+                return False
+            try:
+                states = _instance_states(ec2, known_ids, cleanup_deadline)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
+            if time.monotonic() >= cleanup_deadline:
+                return False
             all_known_terminated = (set(states) == known_ids and all(
                 state == 'terminated' for state in states.values()))
-            if (all_known_terminated and not settle_absence and
-                    ambiguity_resolved):
-                return True
-        if not known_ids and not settle_absence and ambiguity_resolved:
+        all_spot_requests_terminal = (
+            not spot_request_expected or
+            (bool(known_spot_request_ids) and
+             terminal_spot_request_ids == known_spot_request_ids))
+        all_spot_requests_have_instances = (bool(known_spot_request_ids) and
+                                            spot_request_ids_with_instances
+                                            == known_spot_request_ids)
+        unassociated_spot_request_ids = frozenset(
+            known_spot_request_ids - spot_request_ids_with_instances)
+        unassociated_spot_request_states: list[tuple[str, str | None]] = []
+        for request_id in sorted(unassociated_spot_request_ids):
+            request_state = exact_requests_by_id.get(request_id,
+                                                     {}).get('State')
+            unassociated_spot_request_states.append(
+                (request_id,
+                 request_state if isinstance(request_state, str) else None))
+        unassociated_spot_request_state_signature = tuple(
+            unassociated_spot_request_states)
+        if (spot_request_expected and settle_absence and
+                unassociated_spot_request_ids):
+            inventory_changed = (unassociated_spot_request_ids
+                                 != previous_unassociated_spot_request_ids or
+                                 unassociated_spot_request_state_signature
+                                 != previous_unassociated_spot_request_states or
+                                 frozenset(known_ids)
+                                 != previous_known_instance_ids)
+            if (unidentified_in_observation or not all_spot_requests_terminal or
+                (known_ids and not all_known_terminated)):
+                unassociated_spot_request_observations = 0
+            elif inventory_changed:
+                unassociated_spot_request_observations = 1
+            else:
+                unassociated_spot_request_observations += 1
+        else:
+            unassociated_spot_request_observations = 0
+        previous_unassociated_spot_request_ids = (unassociated_spot_request_ids)
+        previous_unassociated_spot_request_states = (
+            unassociated_spot_request_state_signature)
+        previous_known_instance_ids = frozenset(known_ids)
+        spot_associations_settled = (not spot_request_expected or
+                                     not settle_absence or
+                                     all_spot_requests_have_instances or
+                                     unassociated_spot_request_observations
+                                     >= _EC2_TEARDOWN_ATTEMPTS)
+        instance_absence_settled = (not settle_absence or
+                                    (spot_request_expected and
+                                     spot_request_observed))
+        spot_request_presence_settled = (not spot_request_expected or
+                                         spot_request_observed)
+        teardown_complete = (ambiguity_resolved and
+                             all_spot_requests_terminal and
+                             (not known_ids or all_known_terminated) and
+                             instance_absence_settled and
+                             spot_associations_settled and
+                             spot_request_presence_settled)
+        if teardown_complete:
             return True
-        if attempt == _EC2_TEARDOWN_ATTEMPTS - 1:
+        if (attempt == _EC2_TEARDOWN_ATTEMPTS - 1 or
+                time.monotonic() >= cleanup_deadline):
             # A full provider-settle window with repeated exact tag absence is
             # the only safe no-child conclusion after an ambiguous launch. If
             # any child appeared, the final exact-state read must cover every
@@ -382,8 +945,16 @@ def _terminate_ec2_instances(
             # too late remains successor-owned cleanup instead of being
             # terminalized as an ordinary qualification failure.
             return (ambiguity_resolved and
-                    (not known_ids or all_known_terminated))
-        time.sleep(_EC2_TEARDOWN_POLL_SECONDS)
+                    (not known_ids or all_known_terminated) and
+                    (not spot_request_expected or
+                     (all_spot_requests_terminal and
+                      spot_associations_settled) or not known_spot_request_ids))
+        # Anchor the settling cadence to one absolute epoch. Provider latency
+        # consumes the interval instead of being added to every sleep, while
+        # the distinct cleanup deadline bounds all overhead.
+        next_poll_at = (poll_epoch + (attempt + 1) * _EC2_TEARDOWN_POLL_SECONDS)
+        now = time.monotonic()
+        time.sleep(max(0.0, min(next_poll_at, cleanup_deadline) - now))
     return False
 
 
@@ -414,9 +985,14 @@ def _console_has_marker(output: Any, marker: str) -> bool:
     return marker in decoded
 
 
-def _wait_for_console_marker(ec2: Any, instance_id: str, marker: str,
-                             deadline: float,
-                             heartbeat: worker_lease.LeaseHeartbeat) -> bool:
+def _wait_for_console_marker(
+        ec2: Any,
+        instance_id: str,
+        marker: str,
+        deadline: float,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> bool:
     """Waits for EC2 to post a terminal child's buffered console output."""
     settle_deadline = min(
         deadline,
@@ -424,29 +1000,47 @@ def _wait_for_console_marker(ec2: Any, instance_id: str, marker: str,
     )
     while True:
         heartbeat.assert_owned()
+        _raise_if_draining(drain_event)
         now = time.monotonic()
         if now >= deadline:
             raise ValueError('CANARY_TIMEOUT')
         if now >= settle_deadline:
             return False
-        output = ec2.get_console_output(InstanceId=instance_id,
-                                        Latest=True).get('Output')
+        output = _ordinary_provider_call(ec2,
+                                         'get_console_output',
+                                         drain_event,
+                                         InstanceId=instance_id,
+                                         Latest=True).get('Output')
+        now = time.monotonic()
+        if now >= deadline:
+            raise ValueError('CANARY_TIMEOUT')
+        if now >= settle_deadline:
+            return False
         if _console_has_marker(output, marker):
             return True
-        time.sleep(
-            min(_EC2_CONSOLE_POLL_SECONDS,
-                max(0.0, settle_deadline - time.monotonic())))
+        wait_seconds = min(_EC2_CONSOLE_POLL_SECONDS,
+                           max(0.0, settle_deadline - time.monotonic()))
+        if drain_event is None:
+            time.sleep(wait_seconds)
+        elif drain_event.wait(wait_seconds):
+            raise _CanaryDrainRequested()
 
 
-def _run_ec2_canary(operation: catalog_state.OperationRecord,
-                    payload: dict[str, Any],
-                    revision: topology_state.ProfileRevisionRecord,
-                    profile: models.ManagedRegistryProfile,
-                    target: models.ManagedRegistryTarget,
-                    binding: models.RegistryAccessBinding, digest: str,
-                    reference: str,
-                    heartbeat: worker_lease.LeaseHeartbeat) -> dict[str, Any]:
+def _run_ec2_canary_inner(
+        operation: catalog_state.OperationRecord,
+        payload: dict[str, Any],
+        revision: topology_state.ProfileRevisionRecord,
+        profile: models.ManagedRegistryProfile,
+        target: models.ManagedRegistryTarget,
+        binding: models.RegistryAccessBinding,
+        digest: str,
+        reference: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> dict[str, Any]:
     del revision
+    if operation.child_launch_id is None:
+        _raise_if_draining(drain_event)
     if (binding.kind
             != models.RegistryAccessBindingKind.AWS_EC2_INSTANCE_IDENTITY or
             binding.instance_profile is None or
@@ -460,15 +1054,22 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
         role = _canary_role(profile, binding)
     except Exception as error:  # pylint: disable=broad-except
         if operation.child_launch_id is not None:
-            raise ValueError('CANARY_TEARDOWN_FAILED') from error
+            raise _CanaryTeardownFailed() from error
         raise
     child_id = f'ec2:{target.region}:{operation.id}'
     persisted_child = operation.child_launch_id is not None
-    _attach_canary_child(operation, child_id, heartbeat)
+    if not persisted_child:
+        _raise_if_draining(drain_event)
+    _attach_canary_child(operation,
+                         child_id,
+                         heartbeat,
+                         drain_event=None if persisted_child else drain_event)
     deadline: float | None = None
     ec2: _FencedClient | None = None
     instances: list[dict[str, Any]] = []
     known_instance_ids: set[str] = set()
+    known_spot_request_ids: set[str] = set()
+    spot_request_ids_with_instances: set[str] = set()
     unidentified_tagged_child_observed = False
     instance_id: str | None = None
     launch_attempted = False
@@ -483,28 +1084,56 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
 
     def mark_launch_attempted() -> None:
         nonlocal launch_attempted
+        _raise_if_draining(drain_event)
         launch_attempted = True
 
     try:
-        ec2 = _assumed_client(role, 'ec2', target.region, heartbeat)
+        _raise_if_draining(drain_event)
+        ec2 = _assumed_client(
+            role,
+            'ec2',
+            target.region,
+            heartbeat,
+            drain_event=None if persisted_child else drain_event)
+        _raise_if_draining(drain_event)
+        catalog_authority_id = catalog_state.get_catalog_authority_id()
+        _raise_if_draining(drain_event)
         expected_tags = {
             'SkyPilotCanaryOperation': operation.id,
-            'SkyPilotCatalog': catalog_state.get_catalog_authority_id(),
+            'SkyPilotCatalog': catalog_authority_id,
             'SkyPilotProfile': profile.name,
         }
-        instances = _tagged_instances(ec2, operation.id)
+        instances = _tagged_instances(ec2,
+                                      operation.id,
+                                      drain_event=drain_event)
         unidentified_tagged_child_observed |= _remember_instance_ids(
             instances, known_instance_ids)
+        if binding.canary_use_spot is True:
+            unidentified_tagged_child_observed |= (
+                _remember_instance_spot_request_ids(
+                    instances, known_spot_request_ids,
+                    spot_request_ids_with_instances))
+        _raise_if_draining(drain_event)
         if len(instances) > 1:
             raise ValueError('CANARY_DUPLICATE_CHILD')
         if instances:
             instance_id = _instance_id(instances[0])
             known_instance_ids.add(instance_id)
             launch_confirmed = True
-            deadline = _authorized_launch_deadline(operation, child_id,
-                                                   heartbeat)
-        iam = _assumed_client(role, 'iam', target.region, heartbeat)
-        actual_role = _instance_profile_role(iam, binding.instance_profile)
+            _raise_if_draining(drain_event)
+            deadline = _authorized_launch_deadline(operation,
+                                                   child_id,
+                                                   heartbeat,
+                                                   drain_event=drain_event)
+        iam = _assumed_client(role,
+                              'iam',
+                              target.region,
+                              heartbeat,
+                              drain_event=drain_event)
+        actual_role = _instance_profile_role(iam,
+                                             binding.instance_profile,
+                                             drain_event=drain_event)
+        _raise_if_draining(drain_event)
         if actual_role != binding.principals[0]:
             raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
         if not instances:
@@ -536,13 +1165,31 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 'SecurityGroupIds': list(
                     dict(binding.canary_security_groups)[target.region]),
             }
-            deadline = _authorized_launch_deadline(operation, child_id,
-                                                   heartbeat)
+            if binding.canary_use_spot is True:
+                kwargs['InstanceMarketOptions'] = {
+                    'MarketType': 'spot',
+                    'SpotOptions': {
+                        'SpotInstanceType': 'one-time',
+                        'InstanceInterruptionBehavior': 'terminate',
+                    },
+                }
+                kwargs['TagSpecifications'].append({
+                    'ResourceType': 'spot-instances-request',
+                    'Tags': tags,
+                })
+            _raise_if_draining(drain_event)
+            deadline = _authorized_launch_deadline(operation,
+                                                   child_id,
+                                                   heartbeat,
+                                                   drain_event=drain_event)
+            _raise_if_draining(drain_event)
             response: dict[str, Any] = {}
             try:
                 response = ec2.call_before_deadline('run_instances', deadline,
                                                     mark_launch_attempted,
                                                     **kwargs)
+            except _CanaryDrainRequested:
+                raise
             except worker_lease.LeaseLostError:
                 raise
             except ValueError:
@@ -550,11 +1197,15 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             except Exception:  # pylint: disable=broad-except
                 # The stable ClientToken turns one bounded retry and every
                 # successor replay into readback of the same provider child.
-                deadline = _authorized_launch_deadline(operation, child_id,
-                                                       heartbeat)
+                _raise_if_draining(drain_event)
+                deadline = _authorized_launch_deadline(operation,
+                                                       child_id,
+                                                       heartbeat,
+                                                       drain_event=drain_event)
                 response = ec2.call_before_deadline('run_instances', deadline,
                                                     mark_launch_attempted,
                                                     **kwargs)
+            _raise_if_draining(drain_event)
             launched = response.get('Instances', [])
             if len(launched) != 1:
                 raise RuntimeError(
@@ -566,23 +1217,47 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             # full discovery-settling path.
             instance_id = _instance_id(instances[0])
             known_instance_ids.add(instance_id)
+            if binding.canary_use_spot is True:
+                unidentified_tagged_child_observed |= (
+                    _remember_instance_spot_request_ids(
+                        instances, known_spot_request_ids,
+                        spot_request_ids_with_instances))
             launch_confirmed = True
         if instance_id is None:
             instance_id = _instance_id(instances[0])
         assert deadline is not None
         while time.monotonic() < deadline:
+            _raise_if_draining(drain_event)
             heartbeat.assert_owned()
-            matching_instances = _tagged_instances(ec2, operation.id)
+            _raise_if_draining(drain_event)
+            matching_instances = _tagged_instances(ec2,
+                                                   operation.id,
+                                                   drain_event=drain_event)
             unidentified_tagged_child_observed |= _remember_instance_ids(
                 matching_instances, known_instance_ids)
+            if binding.canary_use_spot is True:
+                unidentified_tagged_child_observed |= (
+                    _remember_instance_spot_request_ids(
+                        matching_instances, known_spot_request_ids,
+                        spot_request_ids_with_instances))
+            _raise_if_draining(drain_event)
             if len(matching_instances) > 1:
                 raise ValueError('CANARY_DUPLICATE_CHILD')
             if not matching_instances:
                 raise RuntimeError('EC2 canary child disappeared.')
             if _instance_id(matching_instances[0]) != instance_id:
                 raise ValueError('CANARY_DUPLICATE_CHILD')
-            instance = _exact_canary_instance(ec2, instance_id, expected_tags)
+            instance = _exact_canary_instance(ec2,
+                                              instance_id,
+                                              expected_tags,
+                                              drain_event=drain_event)
             known_instance_ids.add(_instance_id(instance))
+            if binding.canary_use_spot is True:
+                unidentified_tagged_child_observed |= (
+                    _remember_instance_spot_request_ids(
+                        [instance], known_spot_request_ids,
+                        spot_request_ids_with_instances))
+            _raise_if_draining(drain_event)
             instance_image_id = instance.get('ImageId')
             if instance_image_id != dict(
                     binding.qualified_node_images)[target.region]:
@@ -600,42 +1275,73 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
                 actual_profile_arn = observed_profile_arn
             elif actual_profile_arn is None:
                 if state in ('pending', 'running'):
-                    time.sleep(_POLL_SECONDS)
+                    _wait_for_canary_poll(drain_event)
                     continue
                 raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             if state in ('stopped', 'terminated'):
-                success = _wait_for_console_marker(ec2, instance_id, marker,
-                                                   deadline, heartbeat)
+                success = _wait_for_console_marker(ec2,
+                                                   instance_id,
+                                                   marker,
+                                                   deadline,
+                                                   heartbeat,
+                                                   drain_event=drain_event)
                 break
-            time.sleep(_POLL_SECONDS)
+            _wait_for_canary_poll(drain_event)
         else:
             raise ValueError('CANARY_TIMEOUT')
     finally:
         try:
             if (not persisted_child and not launch_attempted and not instances):
                 teardown_verified = True
-            elif ec2 is None:
-                heartbeat.assert_owned()
-                raise RuntimeError('EC2 canary teardown authority unavailable.')
             else:
-                live_instances = _tagged_instances(ec2, operation.id)
-                unidentified_tagged_child_observed |= _remember_instance_ids(
-                    live_instances, known_instance_ids)
-                teardown_verified = _terminate_ec2_instances(
-                    ec2,
-                    operation.id,
-                    sorted(known_instance_ids),
-                    settle_absence=(persisted_child or
-                                    ((launch_attempted or bool(instances)) and
-                                     not launch_confirmed)),
-                    initial_unidentified_child_observed=(
-                        unidentified_tagged_child_observed))
+                cleanup_deadline = (time.monotonic() + _EC2_TEARDOWN_SECONDS)
+                if time.monotonic() >= cleanup_deadline:
+                    teardown_verified = False
+                else:
+                    cleanup_ec2 = _assumed_client(
+                        role,
+                        'ec2',
+                        target.region,
+                        heartbeat,
+                        cleanup_deadline=cleanup_deadline)
+                    live_instances = _tagged_instances(
+                        cleanup_ec2,
+                        operation.id,
+                        cleanup_deadline=cleanup_deadline)
+                    if time.monotonic() >= cleanup_deadline:
+                        teardown_verified = False
+                    else:
+                        unidentified_tagged_child_observed |= (
+                            _remember_instance_ids(live_instances,
+                                                   known_instance_ids))
+                        if binding.canary_use_spot is True:
+                            unidentified_tagged_child_observed |= (
+                                _remember_instance_spot_request_ids(
+                                    live_instances, known_spot_request_ids,
+                                    spot_request_ids_with_instances))
+                        teardown_verified = _terminate_ec2_instances(
+                            cleanup_ec2,
+                            operation.id,
+                            sorted(known_instance_ids),
+                            settle_absence=(persisted_child or (
+                                (launch_attempted or bool(instances)) and
+                                not launch_confirmed)),
+                            spot_request_expected=(binding.canary_use_spot
+                                                   is True),
+                            initial_spot_request_ids=sorted(
+                                known_spot_request_ids),
+                            initial_spot_request_ids_with_instances=sorted(
+                                spot_request_ids_with_instances),
+                            initial_unidentified_child_observed=(
+                                unidentified_tagged_child_observed),
+                            cleanup_deadline=cleanup_deadline)
         except worker_lease.LeaseLostError:
             raise
         except Exception:  # pylint: disable=broad-except
             teardown_verified = False
         if not teardown_verified:
-            raise ValueError('CANARY_TEARDOWN_FAILED')
+            raise _CanaryTeardownFailed()
+        _raise_if_draining(drain_event)
     if not success:
         raise ValueError('CANARY_PULL_FAILED')
     assert instance_id is not None
@@ -661,6 +1367,39 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
     }
 
 
+def _run_ec2_canary(
+        operation: catalog_state.OperationRecord,
+        payload: dict[str, Any],
+        revision: topology_state.ProfileRevisionRecord,
+        profile: models.ManagedRegistryProfile,
+        target: models.ManagedRegistryTarget,
+        binding: models.RegistryAccessBinding,
+        digest: str,
+        reference: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> dict[str, Any]:
+    """Runs an EC2 canary behind a detached cleanup-precedence boundary."""
+    winning_error: Exception | None = None
+    try:
+        return _run_ec2_canary_inner(operation,
+                                     payload,
+                                     revision,
+                                     profile,
+                                     target,
+                                     binding,
+                                     digest,
+                                     reference,
+                                     heartbeat,
+                                     drain_event=drain_event)
+    except Exception as error:  # pylint: disable=broad-except
+        winning_error = _detached_cleanup_winner(error)
+        if winning_error is None:
+            raise
+    assert winning_error is not None
+    raise winning_error.with_traceback(None) from None
+
+
 def _api_error_status(error: BaseException) -> int | None:
     status = getattr(error, 'status', None)
     return int(status) if isinstance(status, int) else None
@@ -672,13 +1411,18 @@ def _qualified_eks_nodes(
     target: models.ManagedRegistryTarget,
     qualified: models.QualifiedKubernetesCluster,
     heartbeat: worker_lease.LeaseHeartbeat,
+    *,
+    drain_event: threading.Event | None = None,
 ) -> tuple[int, str]:
     """Proves the runtime role for the complete bounded selector set."""
     selector = ','.join(
         f'{key}={value}' for key, value in qualified.node_selector)
-    response = core.list_node(label_selector=selector,
-                              limit=_MAX_QUALIFIED_EKS_NODES + 1,
-                              _request_timeout=kubernetes.API_TIMEOUT)
+    response = _ordinary_provider_call(core,
+                                       'list_node',
+                                       drain_event,
+                                       label_selector=selector,
+                                       limit=_MAX_QUALIFIED_EKS_NODES + 1,
+                                       _request_timeout=kubernetes.API_TIMEOUT)
     continuation = getattr(getattr(response, 'metadata', None), '_continue',
                            None)
     nodes = [
@@ -705,12 +1449,24 @@ def _qualified_eks_nodes(
         provider_ids.append(provider_id.rsplit('/', 1)[-1])
     if len(set(provider_ids)) != len(provider_ids):
         raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
-    ec2 = _assumed_client(role, 'ec2', target.region, heartbeat)
-    iam = _assumed_client(role, 'iam', target.region, heartbeat)
+    _raise_if_draining(drain_event)
+    ec2 = _assumed_client(role,
+                          'ec2',
+                          target.region,
+                          heartbeat,
+                          drain_event=drain_event)
+    iam = _assumed_client(role,
+                          'iam',
+                          target.region,
+                          heartbeat,
+                          drain_event=drain_event)
     instances: list[dict[str, Any]] = []
     for offset in range(0, len(provider_ids), 100):
-        result = ec2.describe_instances(InstanceIds=provider_ids[offset:offset +
-                                                                 100])
+        result = _ordinary_provider_call(
+            ec2,
+            'describe_instances',
+            drain_event,
+            InstanceIds=provider_ids[offset:offset + 100])
         instances.extend(item for reservation in result.get('Reservations', [])
                          for item in reservation.get('Instances', []))
     if ({item.get('InstanceId') for item in instances} != set(provider_ids)):
@@ -720,7 +1476,10 @@ def _qualified_eks_nodes(
         profile_arn = (instance.get('IamInstanceProfile') or {}).get('Arn')
         if not isinstance(profile_arn, str) or '/' not in profile_arn:
             raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
-        roles.add(_instance_profile_role(iam, profile_arn.rsplit('/', 1)[-1]))
+        roles.add(
+            _instance_profile_role(iam,
+                                   profile_arn.rsplit('/', 1)[-1],
+                                   drain_event=drain_event))
     if roles != {qualified.node_role}:
         raise ValueError('QUALIFIED_KUBERNETES_NODE_ROLE_REQUIRED')
     node_set_hash = hashlib.sha256('\n'.join(
@@ -728,27 +1487,42 @@ def _qualified_eks_nodes(
     return len(nodes), node_set_hash
 
 
-def _delete_eks_pod(core: Any, pod_name: str, namespace: str, *,
-                    settle_absence: bool) -> bool:
+def _delete_eks_pod(core: Any,
+                    pod_name: str,
+                    namespace: str,
+                    *,
+                    settle_absence: bool,
+                    cleanup_deadline: float | None = None) -> bool:
     """Deletes one deterministic pod and fences ambiguous late creation."""
+    if cleanup_deadline is None:
+        cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
     try:
-        core.delete_namespaced_pod(pod_name,
-                                   namespace,
-                                   grace_period_seconds=0,
-                                   propagation_policy='Background',
-                                   _request_timeout=kubernetes.API_TIMEOUT)
+        _cleanup_provider_call(core,
+                               'delete_namespaced_pod',
+                               cleanup_deadline,
+                               pod_name,
+                               namespace,
+                               grace_period_seconds=0,
+                               propagation_policy='Background',
+                               _request_timeout=kubernetes.API_TIMEOUT)
+    except _CanaryCleanupDeadlineExceeded:
+        return False
     except worker_lease.LeaseLostError:
         raise
     except Exception as error:  # pylint: disable=broad-except
         if _api_error_status(error) != 404:
             return False
-    cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
     absence_started: float | None = None
     while time.monotonic() < cleanup_deadline:
         try:
-            core.read_namespaced_pod(pod_name,
-                                     namespace,
-                                     _request_timeout=kubernetes.API_TIMEOUT)
+            _cleanup_provider_call(core,
+                                   'read_namespaced_pod',
+                                   cleanup_deadline,
+                                   pod_name,
+                                   namespace,
+                                   _request_timeout=kubernetes.API_TIMEOUT)
+        except _CanaryCleanupDeadlineExceeded:
+            return False
         except worker_lease.LeaseLostError:
             raise
         except Exception as error:  # pylint: disable=broad-except
@@ -767,12 +1541,16 @@ def _delete_eks_pod(core: Any, pod_name: str, namespace: str, *,
             # initial delete. Delete that same deterministic name again.
             absence_started = None
             try:
-                core.delete_namespaced_pod(
-                    pod_name,
-                    namespace,
-                    grace_period_seconds=0,
-                    propagation_policy='Background',
-                    _request_timeout=kubernetes.API_TIMEOUT)
+                _cleanup_provider_call(core,
+                                       'delete_namespaced_pod',
+                                       cleanup_deadline,
+                                       pod_name,
+                                       namespace,
+                                       grace_period_seconds=0,
+                                       propagation_policy='Background',
+                                       _request_timeout=kubernetes.API_TIMEOUT)
+            except _CanaryCleanupDeadlineExceeded:
+                return False
             except worker_lease.LeaseLostError:
                 raise
             except Exception as error:  # pylint: disable=broad-except
@@ -782,15 +1560,21 @@ def _delete_eks_pod(core: Any, pod_name: str, namespace: str, *,
     return False
 
 
-def _run_eks_canary(operation: catalog_state.OperationRecord,
-                    payload: dict[str, Any],
-                    revision: topology_state.ProfileRevisionRecord,
-                    profile: models.ManagedRegistryProfile,
-                    target: models.ManagedRegistryTarget,
-                    binding: models.RegistryAccessBinding, digest: str,
-                    reference: str,
-                    heartbeat: worker_lease.LeaseHeartbeat) -> dict[str, Any]:
+def _run_eks_canary_inner(
+        operation: catalog_state.OperationRecord,
+        payload: dict[str, Any],
+        revision: topology_state.ProfileRevisionRecord,
+        profile: models.ManagedRegistryProfile,
+        target: models.ManagedRegistryTarget,
+        binding: models.RegistryAccessBinding,
+        digest: str,
+        reference: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> dict[str, Any]:
     del revision
+    if operation.child_launch_id is None:
+        _raise_if_draining(drain_event)
     if binding.kind != models.RegistryAccessBindingKind.AWS_EKS_KUBELET_IDENTITY:
         raise _preflight_error(operation, 'QUALIFICATION_FAILED')
     try:
@@ -806,7 +1590,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
         role = _canary_role(profile, binding)
     except Exception as error:  # pylint: disable=broad-except
         if operation.child_launch_id is not None:
-            raise ValueError('CANARY_TEARDOWN_FAILED') from error
+            raise _CanaryTeardownFailed() from error
         raise
     if ':cluster/' not in cluster_arn:
         raise _preflight_error(operation, 'CANARY_PRINCIPAL_UNVERIFIED')
@@ -814,7 +1598,12 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
     pod_name = f'sky-img-canary-{operation.id.replace("-", "")[:20]}'
     child_id = f'eks:{context}:{namespace}:{pod_name}'
     persisted_child = operation.child_launch_id is not None
-    _attach_canary_child(operation, child_id, heartbeat)
+    if not persisted_child:
+        _raise_if_draining(drain_event)
+    _attach_canary_child(operation,
+                         child_id,
+                         heartbeat,
+                         drain_event=None if persisted_child else drain_event)
     core: _FencedClient | None = None
     create_attempted = False
     create_confirmed = False
@@ -856,14 +1645,29 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
 
     def mark_create_attempted() -> None:
         nonlocal create_attempted
+        _raise_if_draining(drain_event)
         create_attempted = True
 
     try:
-        core = _kubernetes_core(context, heartbeat)
-        deadline = _authorized_launch_deadline(operation, child_id, heartbeat)
-        eks = _assumed_client(role, 'eks', target.region, heartbeat)
-        actual_cluster = eks.describe_cluster(name=cluster_name).get(
-            'cluster', {})
+        if not persisted_child:
+            _raise_if_draining(drain_event)
+        core = _kubernetes_core(context, heartbeat, drain_event=drain_event)
+        _raise_if_draining(drain_event)
+        deadline = _authorized_launch_deadline(operation,
+                                               child_id,
+                                               heartbeat,
+                                               drain_event=drain_event)
+        _raise_if_draining(drain_event)
+        eks = _assumed_client(role,
+                              'eks',
+                              target.region,
+                              heartbeat,
+                              drain_event=drain_event)
+        actual_cluster = _ordinary_provider_call(eks,
+                                                 'describe_cluster',
+                                                 drain_event,
+                                                 name=cluster_name).get(
+                                                     'cluster', {})
         endpoint = actual_cluster.get('endpoint')
         configured_endpoint = getattr(
             getattr(getattr(core, 'api_client', None), 'configuration', None),
@@ -873,9 +1677,13 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
                 not isinstance(configured_endpoint, str) or
                 endpoint.rstrip('/') != configured_endpoint.rstrip('/')):
             raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
+        _raise_if_draining(drain_event)
         node_count, node_set_hash = _qualified_eks_nodes(
-            core, role, target, qualified, heartbeat)
-        deadline = _authorized_launch_deadline(operation, child_id, heartbeat)
+            core, role, target, qualified, heartbeat, drain_event=drain_event)
+        deadline = _authorized_launch_deadline(operation,
+                                               child_id,
+                                               heartbeat,
+                                               drain_event=drain_event)
         try:
             core.call_before_deadline('create_namespaced_pod',
                                       deadline,
@@ -884,6 +1692,7 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
                                       body,
                                       _request_timeout=kubernetes.API_TIMEOUT)
             create_confirmed = True
+            _raise_if_draining(drain_event)
         except worker_lease.LeaseLostError:
             raise
         except Exception as error:  # pylint: disable=broad-except
@@ -892,9 +1701,16 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
             create_confirmed = True
         pod = None
         while time.monotonic() < deadline:
+            _raise_if_draining(drain_event)
             heartbeat.assert_owned()
-            pod = core.read_namespaced_pod(
-                pod_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
+            _raise_if_draining(drain_event)
+            pod = _ordinary_provider_call(
+                core,
+                'read_namespaced_pod',
+                drain_event,
+                pod_name,
+                namespace,
+                _request_timeout=kubernetes.API_TIMEOUT)
             labels = getattr(getattr(pod, 'metadata', None), 'labels', {}) or {}
             containers = getattr(getattr(pod, 'spec', None), 'containers', [])
             if (labels.get('skypilot.co/image-canary-operation') != operation.id
@@ -906,18 +1722,25 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
                 break
             if phase == 'Failed':
                 raise ValueError('CANARY_PULL_FAILED')
-            time.sleep(_POLL_SECONDS)
+            _wait_for_canary_poll(drain_event)
         else:
             raise ValueError('CANARY_TIMEOUT')
-        logs = core.read_namespaced_pod_log(
-            pod_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
+        logs = _ordinary_provider_call(core,
+                                       'read_namespaced_pod_log',
+                                       drain_event,
+                                       pod_name,
+                                       namespace,
+                                       _request_timeout=kubernetes.API_TIMEOUT)
         if not isinstance(logs, str) or logs.strip() != payload['nonce']:
             raise ValueError('CANARY_PULL_FAILED')
         node_name = getattr(getattr(pod, 'spec', None), 'node_name', None)
         if not isinstance(node_name, str) or not node_name:
             raise ValueError('CANARY_PRINCIPAL_UNVERIFIED')
-        node = core.read_node(node_name,
-                              _request_timeout=kubernetes.API_TIMEOUT)
+        node = _ordinary_provider_call(core,
+                                       'read_node',
+                                       drain_event,
+                                       node_name,
+                                       _request_timeout=kubernetes.API_TIMEOUT)
         node_uid = getattr(getattr(node, 'metadata', None), 'uid', None)
         provider_id = getattr(getattr(node, 'spec', None), 'provider_id', None)
         if (not isinstance(node_uid, str) or not isinstance(provider_id, str) or
@@ -942,36 +1765,98 @@ def _run_eks_canary(operation: catalog_state.OperationRecord,
             'nonce_hash': hashlib.sha256(payload['nonce'].encode()).hexdigest(),
         }
     finally:
-        if not persisted_child and not create_attempted:
-            teardown_verified = True
-        elif core is None:
-            heartbeat.assert_owned()
-            raise ValueError('CANARY_TEARDOWN_FAILED')
-        else:
-            teardown_verified = _delete_eks_pod(
-                core,
-                pod_name,
-                namespace,
-                settle_absence=(persisted_child or
-                                (create_attempted and not create_confirmed)))
-        if not teardown_verified:
-            raise ValueError('CANARY_TEARDOWN_FAILED')
+        try:
+            if not persisted_child and not create_attempted:
+                teardown_verified = True
+            else:
+                cleanup_deadline = time.monotonic() + _EKS_TEARDOWN_SECONDS
+                if core is None:
+                    try:
+                        core = _kubernetes_core(
+                            context,
+                            heartbeat,
+                            cleanup_deadline=cleanup_deadline)
+                    except worker_lease.LeaseLostError:
+                        raise
+                    except Exception:  # pylint: disable=broad-except
+                        core = None
+                if core is not None:
+                    teardown_verified = _delete_eks_pod(
+                        core,
+                        pod_name,
+                        namespace,
+                        settle_absence=(persisted_child or
+                                        (create_attempted and
+                                         not create_confirmed)),
+                        cleanup_deadline=cleanup_deadline)
+            if not teardown_verified:
+                raise _CanaryTeardownFailed()
+            _raise_if_draining(drain_event)
+        finally:
+            if core is not None:
+                core.invalidate_kubernetes_credentials()
     if evidence is None:
         raise ValueError('CANARY_FAILED')
     evidence['teardown_verified'] = True
     return evidence
 
 
-def _fail_owned_canary(operation: catalog_state.OperationRecord, code: str,
-                       heartbeat: worker_lease.LeaseHeartbeat) -> None:
+def _run_eks_canary(
+        operation: catalog_state.OperationRecord,
+        payload: dict[str, Any],
+        revision: topology_state.ProfileRevisionRecord,
+        profile: models.ManagedRegistryProfile,
+        target: models.ManagedRegistryTarget,
+        binding: models.RegistryAccessBinding,
+        digest: str,
+        reference: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> dict[str, Any]:
+    """Runs an EKS canary behind a detached cleanup-precedence boundary."""
+    winning_error: Exception | None = None
+    try:
+        return _run_eks_canary_inner(operation,
+                                     payload,
+                                     revision,
+                                     profile,
+                                     target,
+                                     binding,
+                                     digest,
+                                     reference,
+                                     heartbeat,
+                                     drain_event=drain_event)
+    except Exception as error:  # pylint: disable=broad-except
+        winning_error = _detached_cleanup_winner(error)
+        if winning_error is None:
+            raise
+    assert winning_error is not None
+    raise winning_error.with_traceback(None) from None
+
+
+def _fail_owned_canary(operation: catalog_state.OperationRecord,
+                       code: str,
+                       heartbeat: worker_lease.LeaseHeartbeat,
+                       *,
+                       drain_event: threading.Event | None = None) -> None:
+    _raise_if_draining(drain_event)
     heartbeat.assert_owned()
+    _raise_if_draining(drain_event)
     qualification.fail_owned_canary(operation, code, teardown_verified=True)
 
 
 def run_canary(operation: catalog_state.OperationRecord,
                *,
-               lease_seconds: int = _DEFAULT_LEASE_SECONDS) -> bool:
+               lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+               drain_event: threading.Event | None = None) -> bool:
     """Runs or resumes one provider child under continuous lease ownership."""
+    if operation.child_launch_id is None:
+        try:
+            _raise_if_draining(drain_event)
+        except _CanaryDrainRequested:
+            qualification.release_drained_canary(operation,
+                                                 teardown_verified=True)
+            return False
     token = operation.lease_token
     if token is None:
         return False
@@ -983,6 +1868,8 @@ def run_canary(operation: catalog_state.OperationRecord,
         with heartbeat:
             try:
                 try:
+                    if operation.child_launch_id is None:
+                        _raise_if_draining(drain_event)
                     (payload, revision, profile, target, binding, digest,
                      reference) = _load_contract(operation)
                 except Exception:  # pylint: disable=broad-except
@@ -991,37 +1878,78 @@ def run_canary(operation: catalog_state.OperationRecord,
                         # and tear down its provider resource safely.
                         return False
                     raise
+                if operation.child_launch_id is None:
+                    _raise_if_draining(drain_event)
                 if payload['backend'] == 'aws_vm':
-                    evidence = _run_ec2_canary(operation, payload, revision,
-                                               profile, target, binding, digest,
-                                               reference, heartbeat)
+                    evidence = _run_ec2_canary(operation,
+                                               payload,
+                                               revision,
+                                               profile,
+                                               target,
+                                               binding,
+                                               digest,
+                                               reference,
+                                               heartbeat,
+                                               drain_event=drain_event)
                 elif payload['backend'] == 'aws_eks':
-                    evidence = _run_eks_canary(operation, payload, revision,
-                                               profile, target, binding, digest,
-                                               reference, heartbeat)
+                    evidence = _run_eks_canary(operation,
+                                               payload,
+                                               revision,
+                                               profile,
+                                               target,
+                                               binding,
+                                               digest,
+                                               reference,
+                                               heartbeat,
+                                               drain_event=drain_event)
                 else:
                     if operation.child_launch_id is not None:
                         return False
                     raise ValueError('IMAGE_LOCALITY_UNSUPPORTED')
+                _raise_if_draining(drain_event)
                 heartbeat.assert_owned()
+                _raise_if_draining(drain_event)
                 if qualification.complete_canary(operation, evidence):
                     return True
-                _fail_owned_canary(operation, 'CANARY_FAILED', heartbeat)
+                _raise_if_draining(drain_event)
+                _fail_owned_canary(operation,
+                                   'CANARY_FAILED',
+                                   heartbeat,
+                                   drain_event=drain_event)
+                return False
+            except _CanaryDrainRequested:
+                qualification.release_drained_canary(operation,
+                                                     teardown_verified=True)
                 return False
             except worker_lease.LeaseLostError:
                 return False
+            except _CanaryTeardownFailed:
+                # Preserve the deterministic child for successor teardown.
+                # Terminalizing here would discard its only durable owner.
+                return False
             except ValueError as error:
                 code = str(error)
-                if code not in _CANARY_ERROR_CODES:
+                if (code not in _CANARY_ERROR_CODES or
+                        code == 'CANARY_TEARDOWN_FAILED'):
                     code = 'CANARY_FAILED'
-                if code == 'CANARY_TEARDOWN_FAILED':
-                    # Preserve the deterministic child for successor teardown.
-                    # Terminalizing here would discard its only durable owner.
+                if drain_event is not None and drain_event.is_set():
+                    qualification.release_drained_canary(operation,
+                                                         teardown_verified=True)
                     return False
-                _fail_owned_canary(operation, code, heartbeat)
+                _fail_owned_canary(operation,
+                                   code,
+                                   heartbeat,
+                                   drain_event=drain_event)
                 return False
             except Exception:  # pylint: disable=broad-except
-                _fail_owned_canary(operation, 'CANARY_FAILED', heartbeat)
+                if drain_event is not None and drain_event.is_set():
+                    qualification.release_drained_canary(operation,
+                                                         teardown_verified=True)
+                    return False
+                _fail_owned_canary(operation,
+                                   'CANARY_FAILED',
+                                   heartbeat,
+                                   drain_event=drain_event)
                 return False
     except worker_lease.LeaseLostError:
         return False
@@ -1069,16 +1997,25 @@ class CanaryWorkerService:
                     self.worker_id, in_flight=len(futures), success=bool(done))
                 if self._health is not None:
                     self._health.heartbeat(heartbeat_ok)
-                while len(futures) < self.max_in_flight:
+                if self._stop.is_set():
+                    break
+                while (len(futures) < self.max_in_flight and
+                       not self._stop.is_set()):
                     operation = qualification.claim_canary(
                         worker_id=self.worker_id,
                         lease_seconds=self.lease_seconds)
                     if operation is None:
                         break
+                    if self._stop.is_set():
+                        with contextlib.suppress(Exception):
+                            qualification.release_drained_canary(
+                                operation, teardown_verified=True)
+                        break
                     futures.add(
                         executor.submit(run_canary,
                                         operation,
-                                        lease_seconds=self.lease_seconds))
+                                        lease_seconds=self.lease_seconds,
+                                        drain_event=self._stop))
                 self._stop.wait(1 if futures else 5)
 
 

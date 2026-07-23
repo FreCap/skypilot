@@ -31,6 +31,9 @@ from sky.container_images import providers
 from sky.container_images import topology_state
 
 _UPLOAD_PART_BYTES = 20 * 1024 * 1024
+_AWS_CONNECT_TIMEOUT_SECONDS = 10
+_AWS_READ_TIMEOUT_SECONDS = 60
+_AWS_TOTAL_MAX_ATTEMPTS = 1
 _ECR_ACCEPTED_MANIFEST_TYPES = [
     'application/vnd.oci.image.manifest.v1+json',
     'application/vnd.docker.distribution.manifest.v2+json',
@@ -724,6 +727,20 @@ def assumed_client(
     provider_fence: Callable[[], None] | None = None,
 ) -> Any:
     """Mints one short-lived role session for a bounded worker adapter."""
+
+    def fenced_provider_call(call: Callable[[], Any]) -> Any:
+        if provider_fence is not None:
+            provider_fence()
+        try:
+            result = call()
+        except Exception:
+            if provider_fence is not None:
+                provider_fence()
+            raise
+        if provider_fence is not None:
+            provider_fence()
+        return result
+
     assume_kwargs: dict[str, Any] = {
         'RoleArn': binding.role_arn,
         'RoleSessionName': binding.session_name,
@@ -738,30 +755,46 @@ def assumed_client(
     }
     if binding.external_id is not None:
         assume_kwargs['ExternalId'] = binding.external_id
-    if provider_fence is not None:
-        provider_fence()
     # Worker pods receive a dedicated workload identity (for example, IRSA).
-    # Do not inherit the API server's workspace-level AWS profile here: that
-    # profile can name a credentials-file entry which is intentionally absent
-    # from the separately permissioned worker.
-    sts = aws_adaptor.session(profile=None).client('sts', region_name=region)
-    if provider_fence is not None:
-        provider_fence()
-    response = sts.assume_role(**assume_kwargs)
-    if provider_fence is not None:
-        provider_fence()
+    # Do not inherit the API server's workspace AWS profile because its
+    # credentials-file entry is intentionally absent from the worker pod.
+    ambient_session = aws_adaptor.session_with_client_defaults(
+        connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=_AWS_READ_TIMEOUT_SECONDS,
+        total_max_attempts=_AWS_TOTAL_MAX_ATTEMPTS,
+        profile=None)
+    credentials = fenced_provider_call(ambient_session.get_credentials)
+    if credentials is None:
+        raise aws_adaptor.botocore_exceptions().NoCredentialsError()
+    # Force deferred IRSA/profile-role refresh to finish under the bounded
+    # botocore-session defaults, then fence again before the explicit STS call.
+    frozen = fenced_provider_call(credentials.get_frozen_credentials)
+    sts_session = aws_adaptor.boto3.Session(
+        aws_access_key_id=frozen.access_key,
+        aws_secret_access_key=frozen.secret_key,
+        aws_session_token=frozen.token,
+        region_name=region)
+    sts = cast(Any, sts_session).client(
+        'sts',
+        region_name=region,
+        config=aws_adaptor.botocore.config.Config(
+            connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=_AWS_READ_TIMEOUT_SECONDS,
+            retries={'total_max_attempts': _AWS_TOTAL_MAX_ATTEMPTS}))
+    response = fenced_provider_call(lambda: sts.assume_role(**assume_kwargs))
     credentials = response['Credentials']
     session = aws_adaptor.boto3.Session(
         aws_access_key_id=credentials['AccessKeyId'],
         aws_secret_access_key=credentials['SecretAccessKey'],
         aws_session_token=credentials['SessionToken'],
         region_name=region)
-    return cast(Any, session).client(service,
-                                     region_name=region,
-                                     config=aws_adaptor.botocore.config.Config(
-                                         connect_timeout=10,
-                                         read_timeout=60,
-                                         retries={'max_attempts': 1}))
+    return fenced_provider_call(lambda: cast(Any, session).client(
+        service,
+        region_name=region,
+        config=aws_adaptor.botocore.config.Config(
+            connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=_AWS_READ_TIMEOUT_SECONDS,
+            retries={'total_max_attempts': _AWS_TOTAL_MAX_ATTEMPTS})))
 
 
 def _assumed_ecr_client(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import json
 import secrets
@@ -377,6 +378,41 @@ def heartbeat_canary(operation_id: str,
     return changed == 1
 
 
+def release_drained_canary(operation: catalog_state.OperationRecord,
+                           *,
+                           teardown_verified: bool,
+                           now: int | None = None) -> bool:
+    """Makes a child-free or teardown-verified canary promptly reclaimable."""
+    if teardown_verified is not True:
+        raise ValueError(
+            'Canary drain teardown must be verified before release.')
+    if operation.lease_token is None:
+        return False
+    table = schema.operations
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = session.execute(
+            sqlalchemy.select(
+                table.c.kind, table.c.state, table.c.lease_token,
+                table.c.lease_expires_at).where(table.c.id == operation.id).
+            with_for_update()).mappings().first()
+        if (row is None or row['kind'] != 'PROFILE_CANARY' or
+                row['state'] != models.ImageOperationState.RUNNING.value or
+                row['lease_token'] != operation.lease_token or
+                row['lease_expires_at'] is None):
+            return False
+        current = catalog_state.database_epoch(session, now=now)
+        if int(row['lease_expires_at']) <= current:
+            return False
+        changed = session.execute(table.update().where(
+            table.c.id == operation.id, table.c.kind == 'PROFILE_CANARY',
+            table.c.state == models.ImageOperationState.RUNNING.value,
+            table.c.lease_token == operation.lease_token,
+            table.c.lease_expires_at
+            > current).values(lease_expires_at=current,
+                              updated_at=current)).rowcount
+    return changed == 1
+
+
 def attach_canary_child(operation_id: str,
                         lease_token: str,
                         child_launch_id: str,
@@ -596,27 +632,44 @@ def fail_owned_canary(operation: catalog_state.OperationRecord,
             now=now)
 
 
-def schedule_automatic_canaries(*,
-                                limit: int = 100,
-                                now: int | None = None) -> int:
+def schedule_automatic_canaries(
+        *,
+        limit: int = 100,
+        now: int | None = None,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Creates bounded idempotent runtime canaries only after copy readiness."""
+    if should_stop is not None and should_stop():
+        return 0
     current = _database_epoch(now=now)
     scheduled = 0
-    for revision in topology_state.list_qualifying_profiles(include_active=True,
-                                                            limit=limit):
+    if should_stop is not None and should_stop():
+        return scheduled
+    revisions = topology_state.list_qualifying_profiles(include_active=True,
+                                                        limit=limit)
+    if should_stop is not None and should_stop():
+        return scheduled
+    for revision in revisions:
+        if should_stop is not None and should_stop():
+            break
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
         if not profile.qualification.automatic_canaries:
             continue
         for target in (profile.canonical,) + profile.targets:
+            if should_stop is not None and should_stop():
+                return scheduled
             copy_key = models.profile_attestation_key('copy', target.name)
             if not _fresh(revision.attestations.get(copy_key),
                           now=current,
                           max_age_seconds=_AUTOMATIC_WINDOW_SECONDS):
                 continue
             for backend, binding_id in target.runtime_pull:
+                if should_stop is not None and should_stop():
+                    return scheduled
                 binding = profile.bindings[binding_id]
                 for runtime_id in runtime_ids(target, backend, binding):
+                    if should_stop is not None and should_stop():
+                        return scheduled
                     runtime_key = _runtime_attestation_key(
                         target, backend, binding, runtime_id)
                     if _fresh(revision.attestations.get(runtime_key),
@@ -633,6 +686,8 @@ def schedule_automatic_canaries(*,
                         'runtime_id': runtime_id,
                         'window': current // _AUTOMATIC_WINDOW_SECONDS,
                     })
+                    if should_stop is not None and should_stop():
+                        return scheduled
                     try:
                         request_canary(
                             workspace=revision.workspace,

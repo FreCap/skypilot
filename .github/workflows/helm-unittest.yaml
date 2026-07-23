@@ -40,3 +40,7 @@ jobs:
     - name: Run helm unit tests
       run: |
         helm unittest charts/skypilot
+
+    - name: Run schema-bypass template guards
+      run: |
+        bash charts/skypilot/tests/image_workers_template_guards.sh

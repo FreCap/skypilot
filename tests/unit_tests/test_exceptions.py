@@ -1,5 +1,6 @@
 """Test exception serialization and deserialization."""
 
+import inspect
 import pickle
 
 import pytest
@@ -234,19 +235,20 @@ def test_deserialize_partial_dict():
     e = exceptions.deserialize_exception({})
     assert isinstance(e, RuntimeError)
 
-    # Unknown type with message uses message in fallback
+    # A future server type must not reflect its identity or payload.
     e = exceptions.deserialize_exception({
         'type': 'NonExistent',
-        'message': 'details'
+        'message': 'credential=secret'
     })
-    assert isinstance(e, Exception)
-    assert 'NonExistent' in str(e)
-    assert 'details' in str(e)
+    assert isinstance(e, RuntimeError)
+    assert str(e) == 'Server error response is malformed.'
+    assert 'NonExistent' not in str(e)
+    assert 'credential=secret' not in str(e)
 
-    # Unknown type without message still works
+    # Unknown types without a message use the identical value-free result.
     e = exceptions.deserialize_exception({'type': 'NonExistent'})
-    assert isinstance(e, Exception)
-    assert 'NonExistent' in str(e)
+    assert isinstance(e, RuntimeError)
+    assert str(e) == 'Server error response is malformed.'
 
 
 @pytest.mark.parametrize('bad_input', [
@@ -272,6 +274,10 @@ def test_deserialize_partial_dict():
         'args': None,
     },
     {
+        'type': 'ValueError',
+        'message': None,
+    },
+    {
         'type': 'int',
     },
 ])
@@ -280,6 +286,38 @@ def test_deserialize_malformed_envelope_never_raises(bad_input):
 
     assert isinstance(restored, RuntimeError)
     assert str(restored) == 'Server error response is malformed.'
+
+
+def test_exception_attribute_cannot_replace_canonical_args():
+    restored = exceptions.deserialize_exception({
+        'type': 'ValueError',
+        'message': 'safe',
+        'args': ('safe',),
+        'attributes': {
+            'args': ('credential=secret',),
+        },
+    })
+
+    assert type(restored) is RuntimeError
+    assert str(restored) == 'Server error response is malformed.'
+    assert 'credential=secret' not in str(restored)
+
+
+def test_exception_attribute_cannot_shadow_add_note():
+    restored = exceptions.deserialize_exception({
+        'type': 'ValueError',
+        'message': 'safe',
+        'args': ('safe',),
+        'attributes': {
+            'add_note': 'credential=secret',
+        },
+        'notes': ['validated note'],
+    })
+
+    assert type(restored) is ValueError
+    assert str(restored) == 'safe'
+    assert restored.__notes__ == ['validated note']
+    assert callable(restored.add_note)
 
 
 def test_wrap_unsafe_exceptions():
@@ -344,8 +382,97 @@ def test_builtin_exception_with_notes_round_trips():
     assert deserialized.__notes__ == ["when serializing dict item 'bad'"]
 
 
+def test_raised_exception_context_round_trips_and_reserializes_exactly():
+    original = None
+    try:
+        raise ValueError('inner failure')
+    except ValueError:
+        try:
+            # Implicit chaining is the behavior under test.
+            # pylint: disable-next=raise-missing-from
+            raise exceptions.ResourcesUnavailableError('outer failure',
+                                                       no_failover=True)
+        except exceptions.ResourcesUnavailableError as error:
+            original = error
+
+    assert original is not None
+    serialized = exceptions.serialize_exception(original)
+    restored = exceptions.deserialize_exception(serialized)
+
+    assert isinstance(restored, exceptions.ResourcesUnavailableError)
+    assert restored.no_failover is True
+    assert isinstance(restored.__context__, ValueError)
+    assert str(restored.__context__) == 'inner failure'
+    assert exceptions.serialize_exception(restored) == serialized
+
+
+def test_unsafe_nested_exception_context_uses_safe_wire_type():
+
+    class MockBotoError(Exception):
+        pass
+
+    MockBotoError.__module__ = 'botocore.exceptions'
+    outer = RuntimeError('outer')
+    outer.__context__ = MockBotoError('provider failure')
+
+    serialized = exceptions.serialize_exception(outer)
+    restored = exceptions.deserialize_exception(serialized)
+
+    assert serialized['context']['type'] == 'CloudError'
+    assert isinstance(restored.__context__, exceptions.CloudError)
+    assert restored.__context__.cloud_provider == 'botocore'
+    assert restored.__context__.error_type == 'MockBotoError'
+    assert exceptions.serialize_exception(restored) == serialized
+
+
+def test_exception_context_cycle_is_replaced_by_fixed_error():
+    outer = ValueError('outer')
+    inner = TypeError('inner')
+    outer.__context__ = inner
+    inner.__context__ = outer
+
+    serialized = exceptions.serialize_exception(outer)
+    cycle_tail = serialized['context']['context']
+    restored = exceptions.deserialize_exception(serialized)
+
+    assert cycle_tail == exceptions._sanitized_exception_envelope()  # pylint: disable=protected-access
+    assert isinstance(restored.__context__, TypeError)
+    assert isinstance(restored.__context__.__context__, RuntimeError)
+    assert str(restored.__context__.__context__) == (
+        'Server error response is malformed.')
+    assert exceptions.serialize_exception(restored) == serialized
+
+
+def test_exception_context_depth_is_bounded_to_eight_levels():
+    errors = [ValueError(f'level-{index}') for index in range(10)]
+    for outer, inner in zip(errors, errors[1:]):
+        outer.__context__ = inner
+
+    serialized = exceptions.serialize_exception(errors[0])
+    current = serialized
+    for index in range(8):
+        assert current['type'] == 'ValueError'
+        assert current['message'] == f'level-{index}'
+        current = current['context']
+    assert current == exceptions._sanitized_exception_envelope()  # pylint: disable=protected-access
+
+
+def test_malformed_nested_context_is_sanitized_without_losing_outer_error():
+    restored = exceptions.deserialize_exception({
+        'type': 'ValueError',
+        'message': 'outer',
+        'args': ('outer',),
+        'attributes': {},
+        'context': ['not', 'an', 'envelope'],
+    })
+
+    assert isinstance(restored, ValueError)
+    assert isinstance(restored.__context__, RuntimeError)
+    assert str(restored.__context__) == 'Server error response is malformed.'
+
+
 def test_deserialize_tolerates_attribute_the_constructor_rejects():
-    """An unusable attribute must not mask the original error."""
+    """A forward-version attribute must not mask the known error type."""
     deserialized = exceptions.deserialize_exception({
         'type': 'ResourcesUnavailableError',
         'message': 'boom',
@@ -354,7 +481,22 @@ def test_deserialize_tolerates_attribute_the_constructor_rejects():
             'not_a_constructor_argument': 1
         },
     })
-    assert 'boom' in str(deserialized)
+    assert isinstance(deserialized, exceptions.ResourcesUnavailableError)
+    assert str(deserialized) == 'boom'
+    assert deserialized.not_a_constructor_argument == 1
+
+
+def test_known_exception_missing_constructor_state_is_sanitized():
+    """Canonical-state bypass is limited to declared transformed classes."""
+    deserialized = exceptions.deserialize_exception({
+        'type': 'KubernetesValidationError',
+        'message': 'bad value',
+        'args': ('bad value',),
+        'attributes': {},
+    })
+
+    assert type(deserialized) is RuntimeError
+    assert str(deserialized) == 'Server error response is malformed.'
 
 
 def test_attribute_that_cannot_be_set_does_not_lose_the_error():
@@ -381,3 +523,78 @@ def test_attribute_that_cannot_be_set_does_not_lose_the_error():
     assert isinstance(deserialized, ValueError)
     assert str(deserialized) == 'boom'
     assert getattr(deserialized, 'context') == 'while encoding'
+
+
+def test_all_current_skypilot_exceptions_round_trip_exactly():
+    """Every current exception class must declare a restorable wire shape."""
+    factories = {
+        exceptions.CloudError: lambda: exceptions.CloudError(
+            'failure', 'aws', 'MockError'),
+        exceptions.ResourcesUnavailableError:
+            lambda: exceptions.ResourcesUnavailableError(
+                'unavailable',
+                no_failover=True,
+                failover_history=[ValueError('capacity')]),
+        exceptions.KubeAPIUnreachableError:
+            lambda: exceptions.KubeAPIUnreachableError(
+                'unreachable', failover_history=[ValueError('network')]),
+        exceptions.KubernetesValidationError:
+            lambda: exceptions.KubernetesValidationError(['spec', 'image'],
+                                                         'bad value'),
+        exceptions.ProvisionPrechecksError:
+            lambda: exceptions.ProvisionPrechecksError([ValueError('quota')]),
+        exceptions.SkyPilotExcludeArgsBaseException:
+            exceptions.SkyPilotExcludeArgsBaseException,
+        exceptions.CommandFailureException:
+            lambda: exceptions.CommandFailureException('sky launch', 'failed',
+                                                       'bad command', 'stderr'),
+        exceptions.CommandError: lambda: exceptions.CommandError(
+            2, 'sky launch', 'bad command', 'stderr'),
+        exceptions.ClusterNotUpError: lambda: exceptions.ClusterNotUpError(
+            'cluster is down', cluster_status=status_lib.ClusterStatus.UP),
+        exceptions.FetchClusterInfoError:
+            lambda: exceptions.FetchClusterInfoError(
+                exceptions.FetchClusterInfoError.Reason.WORKER),
+        exceptions.WorkspaceAmbiguousError:
+            lambda: exceptions.WorkspaceAmbiguousError(['beta', 'alpha'],
+                                                       'saved choice expired'),
+        exceptions.AWSAzFetchingError: lambda: exceptions.AWSAzFetchingError(
+            'us-east-1', exceptions.AWSAzFetchingError.Reason.AUTH_FAILURE),
+        exceptions.ApiServerConnectionError: lambda: exceptions.
+                                             ApiServerConnectionError('api'),
+        exceptions.ApiServerAuthenticationError:
+            lambda: exceptions.ApiServerAuthenticationError('api'),
+        exceptions.ExecutionRetryableError:
+            lambda: exceptions.ExecutionRetryableError('retry', 'later', 3),
+        exceptions.ExecutionPausedError:
+            lambda: exceptions.ExecutionPausedError('paused', 'waiting', 5,
+                                                    {'signal': 'ready'}),
+        exceptions.ServerTemporarilyUnavailableError:
+            lambda: exceptions.ServerTemporarilyUnavailableError('maintenance'),
+    }
+    exception_classes = {
+        value for value in vars(exceptions).values()
+        if (inspect.isclass(value) and value.__module__ == exceptions.__name__
+            and issubclass(value, Exception))
+    }
+
+    for exception_class in exception_classes:
+        factory = factories.get(exception_class,
+                                lambda cls=exception_class: cls('message'))
+        error = factory()
+        error.round_trip_context = {'class': exception_class.__name__}
+        error.__context__ = ValueError(
+            f'context for {exception_class.__name__}')
+        error.add_note(f'note for {exception_class.__name__}')
+        serialized = exceptions.serialize_exception(error)
+
+        restored = exceptions.deserialize_exception(serialized)
+
+        assert type(restored) is exception_class
+        assert restored.args == error.args
+        assert str(restored) == str(error)
+        assert restored.__dict__ == error.__dict__
+        assert isinstance(restored.__context__, ValueError)
+        assert str(
+            restored.__context__) == (f'context for {exception_class.__name__}')
+        assert exceptions.serialize_exception(restored) == serialized

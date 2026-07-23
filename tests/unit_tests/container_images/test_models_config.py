@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import pickle
 from typing import Any
 import uuid
 
+import jsonschema
 import pytest
 
 from sky.container_images import config
 from sky.container_images import models
+from sky.utils import schemas
 
 ACCOUNT = '123456789012'
 DIGEST = 'sha256:' + 'a' * 64
@@ -99,21 +103,78 @@ def test_profile_snapshot_is_complete_deterministic_and_revalidated(
     assert restored.physical_manifest_hash == profile.physical_manifest_hash
     assert restored.canonical.target_fingerprint != (
         restored.targets[0].target_fingerprint)
+    snapshot_ec2 = next(binding for binding in snapshot['access_bindings']
+                        if binding['kind'] == 'aws_ec2_instance_identity')
+    assert snapshot_ec2['canary_use_spot'] is True
+    assert all('canary_use_spot' not in binding
+               for binding in snapshot['access_bindings']
+               if binding['kind'] != 'aws_ec2_instance_identity')
+
+    legacy = copy.deepcopy(snapshot)
+    legacy_ec2 = next(binding for binding in legacy['access_bindings']
+                      if binding['kind'] == 'aws_ec2_instance_identity')
+    legacy_ec2.pop('canary_use_spot')
+    legacy_profile = models.ManagedRegistryProfile.from_snapshot(legacy)
+    legacy_binding = legacy_profile.bindings['aws-vm-pullers']
+    assert legacy_binding.canary_use_spot is None
+    assert legacy_profile.to_snapshot() == legacy
+    assert legacy_binding.fingerprint == hashlib.sha256(
+        json.dumps(legacy_ec2, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+    assert legacy_profile.config_hash == hashlib.sha256(
+        json.dumps(legacy, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+    assert legacy_profile.config_hash != profile.config_hash
+    assert legacy_binding.fingerprint != profile.bindings[
+        'aws-vm-pullers'].fingerprint
 
     forged = copy.deepcopy(snapshot)
     forged['canonical']['registry'] = 'attacker.example'
     with pytest.raises(ValueError):
         models.ManagedRegistryProfile.from_snapshot(forged)
 
+    for invalid_spot in (1, None):
+        forged = copy.deepcopy(snapshot)
+        next(binding for binding in forged['access_bindings'] if binding['kind']
+             == 'aws_ec2_instance_identity')['canary_use_spot'] = invalid_spot
+        with pytest.raises(ValueError, match='Spot preference'):
+            models.ManagedRegistryProfile.from_snapshot(forged)
+
+    forged = copy.deepcopy(snapshot)
+    next(binding for binding in forged['access_bindings'] if binding['kind'] !=
+         'aws_ec2_instance_identity')['canary_use_spot'] = False
+    with pytest.raises(ValueError, match='Only EC2 runtime bindings'):
+        models.ManagedRegistryProfile.from_snapshot(forged)
+
 
 def test_profile_requires_exact_runtime_and_canary_bindings(
         registry_config: dict[str, Any]) -> None:
     bindings = config.parse_access_bindings(registry_config['access_bindings'])
-    assert set(config.parse_profiles(registry_config['profiles'],
-                                     bindings)) == {'gpu-production'}
+    profiles = config.parse_profiles(registry_config['profiles'], bindings)
+    assert set(profiles) == {'gpu-production'}
+    profile = profiles['gpu-production']
     ec2_binding = bindings['aws-vm-pullers']
     assert models.ec2_instance_profile_arn(ec2_binding) == (
         'arn:aws:iam::210987654321:instance-profile/SkyPilotNodeProfile')
+    assert ec2_binding.canary_use_spot
+
+    on_demand = copy.deepcopy(registry_config)
+    on_demand['access_bindings']['aws-vm-pullers']['canary_use_spot'] = False
+    on_demand_bindings = config.parse_access_bindings(
+        on_demand['access_bindings'])
+    assert not on_demand_bindings['aws-vm-pullers'].canary_use_spot
+    on_demand_profile = config.parse_profiles(
+        on_demand['profiles'], on_demand_bindings)['gpu-production']
+    on_demand_snapshot = on_demand_profile.to_snapshot()
+    on_demand_binding = next(
+        binding for binding in on_demand_snapshot['access_bindings']
+        if binding['kind'] == 'aws_ec2_instance_identity')
+    assert on_demand_binding['canary_use_spot'] is False
+    assert (models.ManagedRegistryProfile.from_snapshot(on_demand_snapshot) ==
+            on_demand_profile)
+    assert on_demand_profile.config_hash != profile.config_hash
+    assert (on_demand_profile.bindings['aws-vm-pullers'].fingerprint
+            != ec2_binding.fingerprint)
 
     invalid = copy.deepcopy(registry_config)
     invalid['profiles']['gpu-production']['targets'][0]['runtime_pull'][
@@ -135,6 +196,27 @@ def test_profile_requires_exact_runtime_and_canary_bindings(
     ]
     with pytest.raises(ValueError, match='principal ARN'):
         config.parse_access_bindings(invalid['access_bindings'])
+
+    for invalid_spot in (1, None, 'true'):
+        invalid = copy.deepcopy(registry_config)
+        invalid['access_bindings']['aws-vm-pullers'][
+            'canary_use_spot'] = invalid_spot
+        with pytest.raises(ValueError, match='Spot preference'):
+            config.parse_access_bindings(invalid['access_bindings'])
+
+
+def test_ec2_canary_spot_schema_accepts_boolean_only(
+        registry_config: dict[str, Any]) -> None:
+    schema = schemas.get_config_schema()['properties']['container_registries']
+    explicit = copy.deepcopy(registry_config)
+    explicit['access_bindings']['aws-vm-pullers']['canary_use_spot'] = False
+    jsonschema.validate(explicit, schema)
+
+    for invalid_spot in (1, None, 'true'):
+        explicit['access_bindings']['aws-vm-pullers'][
+            'canary_use_spot'] = invalid_spot
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(explicit, schema)
 
 
 @pytest.mark.parametrize('architecture', [None, 'arm64'])

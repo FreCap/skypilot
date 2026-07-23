@@ -7,15 +7,19 @@ import base64
 import contextlib
 import dataclasses
 import json
+import pathlib
 import socket
 import threading
+import types
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 import urllib.error
 import urllib.request
 
 import pytest
 
+from sky import exceptions
 from sky.container_images import aws
 from sky.container_images import budgets
 from sky.container_images import canary_worker_service
@@ -352,6 +356,60 @@ def test_cluster_terminal_confirmation_uses_locked_reconciliation(
     reconcile.assert_called_once_with(demand, 'orphan-cluster', now=current)
 
 
+def test_terminal_reconciliation_stops_between_independent_demands(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = 200_000
+    first = dataclasses.replace(_cluster_demand(created_at=current - 100_000),
+                                id='demand-one',
+                                consumer_kind='unknown',
+                                placement={'consumer': {}})
+    second = dataclasses.replace(first, id='demand-two')
+    stop = threading.Event()
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'list_consumer_reconciliation_candidates',
+                        lambda **_: [first, second])
+    monkeypatch.setattr(lifecycle_worker_service.global_user_state,
+                        'get_cluster_image_consumers', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', lambda _: {})
+    defer = mock.Mock(side_effect=lambda *_args, **_kwargs: stop.set())
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'defer_consumer_reconciliation', defer)
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(
+        current, should_stop=stop.is_set) == 0
+
+    defer.assert_called_once_with(first.id, now=current)
+
+
+def test_terminal_reconciliation_stops_between_bulk_queries(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = 200_000
+    demand = _cluster_demand(created_at=current - 100_000)
+    stop = threading.Event()
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'list_consumer_reconciliation_candidates',
+                        lambda **_: [demand])
+    monkeypatch.setattr(
+        lifecycle_worker_service.global_user_state,
+        'get_cluster_image_consumers',
+        mock.Mock(side_effect=lambda _names: (stop.set() or {})))
+    service_states = mock.Mock()
+    job_states = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', service_states)
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', job_states)
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(
+        current, should_stop=stop.is_set) == 0
+
+    service_states.assert_not_called()
+    job_states.assert_not_called()
+
+
 def test_lifecycle_policy_refresh_keeps_last_valid_retentions(
         monkeypatch: pytest.MonkeyPatch) -> None:
     previous = {'research': 123, 'retained': None}
@@ -488,13 +546,195 @@ def test_unverified_canary_teardown_remains_reclaimable(
          mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
     monkeypatch.setattr(
         canary_worker_service, '_run_ec2_canary',
-        mock.Mock(side_effect=ValueError('CANARY_TEARDOWN_FAILED')))
+        mock.Mock(side_effect=canary_worker_service._CanaryTeardownFailed()))
     fail = mock.Mock()
     monkeypatch.setattr(canary_worker_service.qualification,
                         'fail_owned_canary', fail)
 
     assert not canary_worker_service.run_canary(operation)
     fail.assert_not_called()
+
+
+def test_provider_teardown_code_collision_terminalizes_as_failure(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _canary_operation()
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        ({
+            'backend': 'aws_vm'
+        }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
+         mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
+    provider_error = ValueError('CANARY_TEARDOWN_FAILED')
+    monkeypatch.setattr(canary_worker_service, '_run_ec2_canary',
+                        mock.Mock(side_effect=provider_error))
+    fail = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+
+    assert not canary_worker_service.run_canary(operation)
+    fail.assert_called_once_with(operation,
+                                 'CANARY_FAILED',
+                                 teardown_verified=True)
+
+
+def test_unstarted_canary_drain_does_not_load_or_terminalize(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _canary_operation()
+    drain_event = threading.Event()
+    drain_event.set()
+    load_contract = mock.Mock()
+    fail = mock.Mock()
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service, '_load_contract', load_contract)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    assert not canary_worker_service.run_canary(operation,
+                                                drain_event=drain_event)
+
+    load_contract.assert_not_called()
+    fail.assert_not_called()
+    release.assert_called_once_with(operation, teardown_verified=True)
+
+
+def test_canary_drain_is_forwarded_without_terminalizing(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _canary_operation()
+    drain_event = threading.Event()
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        ({
+            'backend': 'aws_vm'
+        }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
+         mock.sentinel.binding, _DIGEST, mock.sentinel.reference))
+    run_ec2 = mock.Mock(
+        side_effect=canary_worker_service._CanaryDrainRequested())
+    fail = mock.Mock()
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service, '_run_ec2_canary', run_ec2)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    assert not canary_worker_service.run_canary(operation,
+                                                drain_event=drain_event)
+
+    assert run_ec2.call_args.kwargs['drain_event'] is drain_event
+    fail.assert_not_called()
+    release.assert_called_once_with(operation, teardown_verified=True)
+
+
+@pytest.mark.parametrize('backend', ['aws_vm', 'aws_eks'])
+def test_canary_drain_during_verified_teardown_releases_without_terminalizing(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        backend: str) -> None:
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding(backend)
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    runtime_id = (target.region if backend == 'aws_vm' else
+                  binding.qualified_clusters[0].context)
+    operation = dataclasses.replace(_canary_operation(),
+                                    child_launch_id=f'{backend}:persisted')
+    payload = {
+        'backend': backend,
+        'nonce': '5' * 32,
+        'runtime_id': runtime_id,
+        'timeout_seconds': 900,
+    }
+    drain_event = threading.Event()
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        (payload, _revision(profile), profile, target, binding, _DIGEST,
+         f'{target.registry}/qualification@{_DIGEST}'))
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    teardown = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: (drain_event.set() or True))
+    if backend == 'aws_vm':
+        monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                            lambda *_args, **_kwargs: mock.Mock())
+        monkeypatch.setattr(
+            canary_worker_service, '_tagged_instances',
+            mock.Mock(side_effect=(RuntimeError('provider read failed'), [])))
+        monkeypatch.setattr(canary_worker_service, '_terminate_ec2_instances',
+                            teardown)
+    else:
+        core = mock.Mock()
+        eks = mock.Mock()
+        eks.describe_cluster.side_effect = RuntimeError('provider read failed')
+        monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                            lambda *_args, **_kwargs: core)
+        monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                            lambda *_args, **_kwargs: eks)
+        monkeypatch.setattr(canary_worker_service,
+                            '_authorized_launch_deadline',
+                            lambda *_args, **_kwargs: 1000.0)
+        monkeypatch.setattr(canary_worker_service, '_delete_eks_pod', teardown)
+    complete = mock.Mock()
+    fail = mock.Mock()
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification, 'complete_canary',
+                        complete)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    assert not canary_worker_service.run_canary(operation,
+                                                drain_event=drain_event)
+
+    teardown.assert_called_once()
+    complete.assert_not_called()
+    fail.assert_not_called()
+    release.assert_called_once_with(operation, teardown_verified=True)
+
+
+@pytest.mark.parametrize(
+    'error', [ValueError('CANARY_PULL_FAILED'),
+              RuntimeError('boom')])
+def test_canary_drain_after_verified_helper_error_releases_without_failure(
+        monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    operation = _canary_operation()
+    drain_event = threading.Event()
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        ({
+            'backend': 'aws_vm'
+        }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
+         mock.sentinel.binding, _DIGEST, mock.sentinel.reference))
+
+    def finish_then_fail(*_args: object, **_kwargs: object) -> None:
+        drain_event.set()
+        raise error
+
+    monkeypatch.setattr(canary_worker_service, '_run_ec2_canary',
+                        finish_then_fail)
+    fail = mock.Mock()
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    assert not canary_worker_service.run_canary(operation,
+                                                drain_event=drain_event)
+
+    fail.assert_not_called()
+    release.assert_called_once_with(operation, teardown_verified=True)
 
 
 def test_persisted_canary_child_survives_contract_reload_failure(
@@ -561,6 +801,594 @@ def test_initial_canary_client_failure_terminalizes_without_provider_child(
                                    teardown_verified=True)
 
 
+def test_ec2_drain_of_persisted_child_runs_uncancelled_teardown(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    operation = dataclasses.replace(
+        _canary_operation(),
+        child_launch_id=f'ec2:{target.region}:{_canary_operation().id}')
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '3' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    drain_event = threading.Event()
+    drain_event.set()
+    heartbeat = _OwnedHeartbeat()
+    ec2 = mock.Mock()
+    acquisitions = []
+    tagged_instances = mock.Mock(return_value=[])
+    terminate = mock.Mock(return_value=True)
+
+    def assumed_client(*_args, **kwargs):
+        acquisitions.append(kwargs)
+        return ec2
+
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        assumed_client)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service, '_tagged_instances',
+                        tagged_instances)
+    monkeypatch.setattr(canary_worker_service, '_terminate_ec2_instances',
+                        terminate)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._run_ec2_canary(
+            operation,
+            payload,
+            _revision(profile),
+            profile,
+            target,
+            binding,
+            _DIGEST,
+            f'{target.registry}/qualification@{_DIGEST}',
+            heartbeat,
+            drain_event=drain_event)
+
+    ec2.run_instances.assert_not_called()
+    assert len(acquisitions) == 1
+    assert acquisitions[0]['cleanup_deadline'] == (
+        tagged_instances.call_args.kwargs['cleanup_deadline'])
+    assert 'drain_event' not in acquisitions[0]
+    tagged_instances.assert_called_once()
+    assert tagged_instances.call_args.args == (ec2, operation.id)
+    assert isinstance(tagged_instances.call_args.kwargs['cleanup_deadline'],
+                      float)
+    terminate.assert_called_once()
+
+
+def test_eks_drain_of_persisted_child_runs_uncancelled_teardown(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_eks')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    qualified = binding.qualified_clusters[0]
+    operation = dataclasses.replace(_canary_operation(),
+                                    child_launch_id='eks:persisted-child')
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '4' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    drain_event = threading.Event()
+    drain_event.set()
+    heartbeat = _OwnedHeartbeat()
+    cleanup_core = mock.Mock()
+    acquisitions = []
+
+    def kubernetes_core(*_args, **kwargs):
+        acquisitions.append(kwargs)
+        if kwargs.get('drain_event') is drain_event:
+            raise canary_worker_service._CanaryDrainRequested()
+        assert kwargs.get('cleanup_deadline') is not None
+        return cleanup_core
+
+    delete_pod = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        kubernetes_core)
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service, '_delete_eks_pod', delete_pod)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._run_eks_canary(
+            operation,
+            payload,
+            _revision(profile),
+            profile,
+            target,
+            binding,
+            _DIGEST,
+            f'{target.registry}/qualification@{_DIGEST}',
+            heartbeat,
+            drain_event=drain_event)
+
+    assert len(acquisitions) == 2
+    assert acquisitions[0]['drain_event'] is drain_event
+    assert 'cleanup_deadline' not in acquisitions[0]
+    assert acquisitions[1]['cleanup_deadline'] == (
+        delete_pod.call_args.kwargs['cleanup_deadline'])
+    cleanup_core.create_namespaced_pod.assert_not_called()
+    delete_pod.assert_called_once()
+
+
+def test_eks_dynamic_credential_refresh_observes_drain_before_raw_call(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    drain_event = threading.Event()
+    initial = SimpleNamespace(api_client=mock.Mock(), list_node=mock.Mock())
+    replacement = SimpleNamespace(api_client=mock.Mock(), list_node=mock.Mock())
+
+    def build_isolated(*_args, **_kwargs):
+        drain_event.set()
+        return canary_worker_service.kubernetes._BoundedCoreApiResult(
+            replacement, None, None, None)
+
+    monkeypatch.setattr(canary_worker_service.kubernetes, '_bounded_core_api',
+                        lambda *_args, **_kwargs: (initial, None))
+    monkeypatch.setattr(canary_worker_service.kubernetes,
+                        '_bounded_core_api_isolated', build_isolated)
+    core = canary_worker_service.kubernetes.ProviderFencedCoreApi(
+        'bounded-context',
+        exec_credential_timeout_seconds=2,
+        provider_fence=lambda: None)
+    monkeypatch.setattr(core, '_should_refresh', lambda: True)
+    fenced = canary_worker_service._FencedClient(core, _OwnedHeartbeat())
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._ordinary_provider_call(fenced, 'list_node',
+                                                      drain_event)
+
+    initial.list_node.assert_not_called()
+    replacement.list_node.assert_not_called()
+    initial.api_client.close.assert_called_once_with()
+    replacement.api_client.close.assert_called_once_with()
+
+
+def _installed_eks_fenced_client(
+    marker: str,
+    heartbeat: Any,
+    *,
+    host: str = 'https://eks.example'
+) -> tuple[Any, Any, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+    configuration = SimpleNamespace(host=host,
+                                    api_key={'authorization': marker},
+                                    api_key_prefix={'authorization': 'Bearer'},
+                                    username=marker,
+                                    password=marker,
+                                    cert_file=marker,
+                                    key_file=marker,
+                                    refresh_api_key_hook=None)
+    api_client = SimpleNamespace(configuration=configuration,
+                                 default_headers={'Authorization': marker},
+                                 cookie=marker,
+                                 close=mock.Mock())
+    raw_core = SimpleNamespace(api_client=api_client, list_node=mock.Mock())
+    core = object.__new__(
+        canary_worker_service.kubernetes.ProviderFencedCoreApi)
+    core._context = 'bounded-context'
+    core._exec_credential_timeout_seconds = 2
+    core._refresh_lock = threading.Lock()
+    core._client = raw_core
+    core._credential_refresh_deadline = None
+    core._last_refresh_monotonic = 0.0
+    fenced = canary_worker_service._FencedClient(core, heartbeat)
+    return fenced, core, configuration, api_client, raw_core
+
+
+@pytest.mark.parametrize('failure_kind', ('lease', 'drain', 'deadline'))
+def test_eks_initial_canary_fence_scrubs_installed_credential_before_escape(
+        monkeypatch: pytest.MonkeyPatch, failure_kind: str) -> None:
+    marker = 'INITIAL_CANARY_FENCE_EXEC_TOKEN'
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    fenced, core, configuration, api_client, raw_core = (
+        _installed_eks_fenced_client(marker, heartbeat))
+    drain_event = None
+    expected_error: type[BaseException]
+    if failure_kind == 'lease':
+        heartbeat.assert_owned.side_effect = worker_lease.LeaseLostError(
+            'canary lease lost')
+        expected_error = worker_lease.LeaseLostError
+    elif failure_kind == 'drain':
+        drain_event = threading.Event()
+        drain_event.set()
+        expected_error = canary_worker_service._CanaryDrainRequested
+    else:
+        monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                            lambda: 2.0)
+        expected_error = canary_worker_service._CanaryCleanupDeadlineExceeded
+
+    with pytest.raises(expected_error) as exc_info:
+        if failure_kind == 'deadline':
+            fenced.call_before_cleanup_deadline('list_node', 1.0)
+        else:
+            canary_worker_service._ordinary_provider_call(
+                fenced, 'list_node', drain_event)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in str(error)
+    _assert_canary_traceback_value_free(error, marker)
+    raw_core.list_node.assert_not_called()
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert configuration.username is None
+    assert configuration.password is None
+    assert configuration.cert_file is None
+    assert configuration.key_file is None
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+
+
+def test_eks_outer_validation_failure_scrubs_installed_credential_before_escape(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    marker = 'OUTER_EKS_VALIDATION_EXEC_TOKEN'
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    heartbeat = _OwnedHeartbeat()
+    fenced, core, configuration, api_client, _ = (_installed_eks_fenced_client(
+        marker, heartbeat, host='https://wrong.example'))
+    eks = mock.Mock()
+    eks.describe_cluster.return_value = {
+        'cluster': {
+            'arn': qualified.cluster_arn,
+            'endpoint': 'https://right.example',
+        }
+    }
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        lambda *_args, **_kwargs: fenced)
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: eks)
+
+    with pytest.raises(ValueError,
+                       match='CANARY_PRINCIPAL_UNVERIFIED') as exc_info:
+        canary_worker_service._run_eks_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in str(error)
+    _assert_canary_traceback_value_free(error, marker)
+    assert fenced._client is None
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+
+
+def test_eks_success_scrubs_installed_credential_before_return(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    marker = 'OUTER_EKS_SUCCESS_EXEC_TOKEN'
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    reference = f'{target.registry}/qualification@{_DIGEST}'
+    heartbeat = _OwnedHeartbeat()
+    fenced, core, configuration, api_client, raw_core = (
+        _installed_eks_fenced_client(marker, heartbeat))
+    monkeypatch.setattr(core, '_should_refresh', lambda: False)
+    node = _eks_node('node-a', 'i-a')
+    pod = SimpleNamespace(metadata=SimpleNamespace(labels={
+        'skypilot.co/image-canary-operation': operation.id,
+    }),
+                          spec=SimpleNamespace(
+                              containers=[SimpleNamespace(image=reference)],
+                              node_name='node-a'),
+                          status=SimpleNamespace(phase='Succeeded'))
+    raw_core.create_namespaced_pod = mock.Mock()
+    raw_core.read_namespaced_pod = mock.Mock(return_value=pod)
+    raw_core.read_namespaced_pod_log = mock.Mock(return_value=payload['nonce'])
+    raw_core.read_node = mock.Mock(return_value=node)
+    eks = mock.Mock()
+    eks.describe_cluster.return_value = {
+        'cluster': {
+            'arn': qualified.cluster_arn,
+            'endpoint': 'https://eks.example',
+        }
+    }
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        lambda *_args, **_kwargs: fenced)
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: eks)
+    monkeypatch.setattr(canary_worker_service, '_qualified_eks_nodes',
+                        lambda *_args, **_kwargs: (1, 'f' * 64))
+    monkeypatch.setattr(canary_worker_service, '_delete_eks_pod',
+                        lambda *_args, **_kwargs: True)
+
+    evidence = canary_worker_service._run_eks_canary(operation, payload,
+                                                     _revision(profile),
+                                                     profile, target, binding,
+                                                     _DIGEST, reference,
+                                                     heartbeat)
+
+    assert evidence['teardown_verified']
+    assert fenced._client is None
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+    raw_core.create_namespaced_pod.assert_called_once()
+    raw_core.read_namespaced_pod.assert_called_once()
+    raw_core.read_namespaced_pod_log.assert_called_once()
+    raw_core.read_node.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ('winner', 'expected_type', 'expected_message'),
+    [
+        ('provider', RuntimeError, 'LOSING_EKS_PROVIDER_SECRET'),
+        ('provider-code-collision', ValueError, 'CANARY_TEARDOWN_FAILED'),
+        ('teardown', ValueError, 'CANARY_TEARDOWN_FAILED'),
+        ('lease', worker_lease.LeaseLostError, 'cleanup lease lost'),
+        ('drain', canary_worker_service._CanaryDrainRequested, ''),
+    ],
+)
+def test_eks_cleanup_precedence_handles_provider_state_after_scrub(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        winner: str, expected_type: type[Exception],
+        expected_message: str) -> None:
+    marker = 'LOSING_EKS_PROVIDER_SECRET'
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_eks',
+        'nonce': '2' * 32,
+        'runtime_id': qualified.context,
+        'timeout_seconds': 900,
+    }
+    reference = f'{target.registry}/qualification@{_DIGEST}'
+    heartbeat = _OwnedHeartbeat()
+    drain_event = threading.Event()
+    fenced, core, configuration, api_client, raw_core = (
+        _installed_eks_fenced_client('INSTALLED_EXEC_TOKEN', heartbeat))
+    monkeypatch.setattr(core, '_should_refresh', lambda: False)
+    if winner == 'provider-code-collision':
+        provider_error = ValueError('CANARY_TEARDOWN_FAILED')
+    else:
+        provider_error = RuntimeError(marker)
+    provider_error.response = {  # type: ignore[attr-defined]
+        'headers': {
+            'Authorization': f'Bearer {marker}',
+        },
+        'body': marker,
+    }
+    raw_core.create_namespaced_pod = mock.Mock()
+    raw_core.read_namespaced_pod = mock.Mock(side_effect=provider_error)
+    eks = mock.Mock()
+    eks.describe_cluster.return_value = {
+        'cluster': {
+            'arn': qualified.cluster_arn,
+            'endpoint': 'https://eks.example',
+        }
+    }
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_kubernetes_core',
+                        lambda *_args, **_kwargs: fenced)
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: eks)
+    monkeypatch.setattr(canary_worker_service, '_qualified_eks_nodes',
+                        lambda *_args, **_kwargs: (1, 'f' * 64))
+
+    def cleanup(*_args, **_kwargs):
+        if winner in ('provider', 'provider-code-collision'):
+            return True
+        if winner == 'teardown':
+            return False
+        if winner == 'lease':
+            raise worker_lease.LeaseLostError('cleanup lease lost')
+        assert winner == 'drain'
+        drain_event.set()
+        return True
+
+    monkeypatch.setattr(canary_worker_service, '_delete_eks_pod', cleanup)
+
+    with pytest.raises(expected_type, match=expected_message) as exc_info:
+        canary_worker_service._run_eks_canary(operation,
+                                              payload,
+                                              _revision(profile),
+                                              profile,
+                                              target,
+                                              binding,
+                                              _DIGEST,
+                                              reference,
+                                              heartbeat,
+                                              drain_event=drain_event)
+
+    error = exc_info.value
+    rendered = json.dumps(exceptions.serialize_exception(error),
+                          default=str,
+                          sort_keys=True)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    if winner in ('provider', 'provider-code-collision'):
+        assert error is provider_error
+        assert marker in rendered
+    else:
+        assert marker not in rendered
+        _assert_canary_traceback_value_free(error, marker)
+    if winner == 'teardown':
+        assert isinstance(error, canary_worker_service._CanaryTeardownFailed)
+    assert fenced._client is None
+    assert core._client is None
+    assert configuration.api_key == {}
+    assert configuration.api_key_prefix == {}
+    assert api_client.default_headers == {}
+    assert api_client.cookie is None
+    api_client.close.assert_called_once_with()
+    raw_core.create_namespaced_pod.assert_called_once()
+    raw_core.read_namespaced_pod.assert_called_once()
+
+
+def test_ec2_teardown_failure_drops_losing_provider_state(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    marker = 'LOSING_EC2_PROVIDER_SECRET'
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    operation = _canary_operation()
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    heartbeat = _OwnedHeartbeat()
+    runtime_ec2 = mock.Mock()
+    cleanup_ec2 = mock.Mock()
+    iam = mock.Mock()
+    clients = iter((runtime_ec2, iam, cleanup_ec2))
+    provider_error = RuntimeError(marker)
+    provider_error.response = {  # type: ignore[attr-defined]
+        'headers': {
+            'Authorization': f'Bearer {marker}',
+        },
+        'body': marker,
+    }
+
+    def launch(_method_name: str, _deadline: float, on_start, **_kwargs):
+        on_start()
+        return {'Instances': [{'InstanceId': 'i-canary'}]}
+
+    runtime_ec2.call_before_deadline.side_effect = launch
+    tagged_instances = mock.Mock(side_effect=([], provider_error, []))
+    terminate = mock.Mock(return_value=False)
+    monkeypatch.setattr(canary_worker_service, '_canary_role',
+                        lambda *_args, **_kwargs: mock.sentinel.role)
+    monkeypatch.setattr(canary_worker_service, '_attach_canary_child',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        lambda *_args, **_kwargs: next(clients))
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(
+        canary_worker_service, '_authorized_launch_deadline',
+        lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
+    monkeypatch.setattr(canary_worker_service, '_instance_profile_role',
+                        lambda *_args, **_kwargs: binding.principals[0])
+    monkeypatch.setattr(canary_worker_service, '_tagged_instances',
+                        tagged_instances)
+    monkeypatch.setattr(canary_worker_service, '_terminate_ec2_instances',
+                        terminate)
+
+    with pytest.raises(ValueError, match='CANARY_TEARDOWN_FAILED') as exc_info:
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}', heartbeat)
+
+    error = exc_info.value
+    rendered = json.dumps(exceptions.serialize_exception(error),
+                          default=str,
+                          sort_keys=True)
+    assert isinstance(error, canary_worker_service._CanaryTeardownFailed)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in rendered
+    _assert_canary_traceback_value_free(error, marker)
+    runtime_ec2.call_before_deadline.assert_called_once()
+    assert tagged_instances.call_count == 3
+    terminate.assert_called_once()
+
+
+def test_eks_cleanup_refresh_observes_shared_deadline_before_raw_delete(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    initial = SimpleNamespace(api_client=mock.Mock(),
+                              delete_namespaced_pod=mock.Mock())
+    replacement = SimpleNamespace(api_client=mock.Mock(),
+                                  delete_namespaced_pod=mock.Mock())
+
+    def build_isolated(*_args, **_kwargs):
+        current[0] = 61.0
+        return canary_worker_service.kubernetes._BoundedCoreApiResult(
+            replacement, None, None, None)
+
+    monkeypatch.setattr(canary_worker_service.kubernetes, '_bounded_core_api',
+                        lambda *_args, **_kwargs: (initial, None))
+    monkeypatch.setattr(canary_worker_service.kubernetes,
+                        '_bounded_core_api_isolated', build_isolated)
+    core = canary_worker_service.kubernetes.ProviderFencedCoreApi(
+        'bounded-context',
+        exec_credential_timeout_seconds=2,
+        provider_fence=lambda: None)
+    monkeypatch.setattr(core, '_should_refresh', lambda: True)
+    fenced = canary_worker_service._FencedClient(core, _OwnedHeartbeat())
+
+    assert not canary_worker_service._delete_eks_pod(fenced,
+                                                     'canary-pod',
+                                                     'default',
+                                                     settle_absence=False,
+                                                     cleanup_deadline=60.0)
+
+    initial.delete_namespaced_pod.assert_not_called()
+    replacement.delete_namespaced_pod.assert_not_called()
+    initial.api_client.close.assert_called_once_with()
+    replacement.api_client.close.assert_called_once_with()
+
+
 def _eks_node(uid: str, instance_id: str, *, selector_value: str = 'eks-node'):
     return SimpleNamespace(metadata=SimpleNamespace(
         uid=uid,
@@ -612,7 +1440,7 @@ def test_eks_qualification_proves_every_selected_node_role(
         lambda _role, service, _region, **_kwargs: ec2
         if service == 'ec2' else iam)
     monkeypatch.setattr(canary_worker_service, '_instance_profile_role',
-                        lambda _iam, _name: qualified.node_role)
+                        lambda _iam, _name, **_kwargs: qualified.node_role)
     heartbeat = _OwnedHeartbeat()
     fenced_core = canary_worker_service._FencedClient(core, heartbeat)
 
@@ -658,7 +1486,7 @@ def test_eks_qualification_rejects_heterogeneous_selected_node_roles(
         if service == 'ec2' else mock.Mock())
     monkeypatch.setattr(
         canary_worker_service, '_instance_profile_role',
-        lambda _iam, name: qualified.node_role
+        lambda _iam, name, **_kwargs: qualified.node_role
         if name == 'qualified' else 'arn:aws:iam::123:role/OtherNodeRole')
 
     with pytest.raises(ValueError,
@@ -668,6 +1496,41 @@ def test_eks_qualification_rejects_heterogeneous_selected_node_roles(
         canary_worker_service._qualified_eks_nodes(fenced_core,
                                                    mock.sentinel.role, target,
                                                    qualified, heartbeat)
+
+
+def test_eks_qualification_rechecks_drain_after_node_response_parsing(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    drain_event = threading.Event()
+
+    class DrainOnMetadata:
+
+        def __init__(self) -> None:
+            self.items = [_eks_node('node-a', 'i-a')]
+
+        @property
+        def metadata(self) -> object:
+            drain_event.set()
+            return SimpleNamespace(_continue=None)
+
+    core = mock.Mock()
+    core.list_node.return_value = DrainOnMetadata()
+    assumed_client = mock.Mock()
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        assumed_client)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._qualified_eks_nodes(core,
+                                                   mock.sentinel.role,
+                                                   target,
+                                                   qualified,
+                                                   _OwnedHeartbeat(),
+                                                   drain_event=drain_event)
+
+    assumed_client.assert_not_called()
 
 
 def _artifact() -> catalog_state.ArtifactRecord:
@@ -853,6 +1716,70 @@ class _OwnedHeartbeat(contextlib.AbstractContextManager['_OwnedHeartbeat']):
         return None
 
 
+def _canary_object_graph_contains(root: object, marker: str) -> bool:
+    seen: set[int] = set()
+    pending = [root]
+    while pending:
+        if len(seen) >= 50000:
+            raise AssertionError('Canary object-graph traversal exceeded.')
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, str):
+            if marker in current:
+                return True
+            continue
+        if isinstance(current, bytes):
+            if marker.encode() in current:
+                return True
+            continue
+        if current is None or isinstance(current, (bool, int, float, complex)):
+            continue
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+            continue
+        if isinstance(current, (list, tuple, set, frozenset)):
+            pending.extend(current)
+            continue
+        if isinstance(current, BaseException):
+            pending.extend(current.args)
+            pending.extend((current.__cause__, current.__context__))
+            pending.extend(vars(current).values())
+            continue
+        if isinstance(current, types.MethodType):
+            pending.append(current.__self__)
+            continue
+        if isinstance(current, types.FunctionType):
+            pending.extend(current.__defaults__ or ())
+            pending.extend((current.__kwdefaults__ or {}).values())
+            for cell in current.__closure__ or ():
+                try:
+                    pending.append(cell.cell_contents)
+                except ValueError:
+                    pass
+            continue
+        if isinstance(current, (types.ModuleType, type)):
+            continue
+        try:
+            pending.extend(vars(current).values())
+        except TypeError:
+            continue
+    return False
+
+
+def _assert_canary_traceback_value_free(error: BaseException,
+                                        marker: str) -> None:
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_globals.get('__name__') == canary_worker_service.__name__:
+            for value in frame.f_locals.values():
+                assert not _canary_object_graph_contains(value, marker)
+        traceback = traceback.tb_next
+
+
 def test_canary_provider_call_rechecks_lease_after_response() -> None:
     provider = mock.Mock()
     provider.describe_instances.return_value = {'Reservations': []}
@@ -868,6 +1795,35 @@ def test_canary_provider_call_rechecks_lease_after_response() -> None:
     assert heartbeat.assert_owned.call_count == 2
 
 
+@pytest.mark.parametrize('provider_fails', (False, True),
+                         ids=('response', 'failure'))
+def test_canary_control_error_drops_losing_provider_state(
+        provider_fails: bool) -> None:
+    marker = 'LOSING_PROVIDER_SECRET'
+
+    class _Provider:
+
+        def describe_instances(self):
+            if provider_fails:
+                raise RuntimeError(marker)
+            return {'secret': marker}
+
+    provider = _Provider()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = (
+        None, worker_lease.LeaseLostError('canary lease lost'))
+    client = canary_worker_service._FencedClient(provider, heartbeat)
+
+    with pytest.raises(worker_lease.LeaseLostError) as exc_info:
+        client.describe_instances()
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert marker not in str(error)
+    _assert_canary_traceback_value_free(error, marker)
+
+
 def test_canary_provider_call_rejects_stale_owner_before_request() -> None:
     provider = mock.Mock()
     heartbeat = mock.Mock(spec=['assert_owned'])
@@ -879,6 +1835,97 @@ def test_canary_provider_call_rejects_stale_owner_before_request() -> None:
         client.describe_instances()
 
     provider.describe_instances.assert_not_called()
+
+
+def test_canary_provider_call_rechecks_drain_after_ownership_renewal() -> None:
+    drain_event = threading.Event()
+    provider = mock.Mock()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = drain_event.set
+    client = canary_worker_service._FencedClient(provider, heartbeat)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._ordinary_provider_call(client,
+                                                      'describe_instances',
+                                                      drain_event)
+
+    provider.describe_instances.assert_not_called()
+
+
+def test_canary_client_acquisition_rechecks_drain_inside_provider_fence(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    drain_event = threading.Event()
+    raw_started = mock.Mock()
+
+    def acquire(_role: object, _service: str, _region: str, *,
+                provider_fence) -> object:
+        drain_event.set()
+        provider_fence()
+        raw_started()
+        return mock.sentinel.client
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client', acquire)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._assumed_client(mock.sentinel.role,
+                                              'ec2',
+                                              'us-west-2',
+                                              _OwnedHeartbeat(),
+                                              drain_event=drain_event)
+
+    raw_started.assert_not_called()
+
+
+def test_canary_client_acquisition_drain_drops_losing_credential_error(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = 'LOSING_CREDENTIAL_SECRET'
+    drain_event = threading.Event()
+
+    def acquire(_role: object, _service: str, _region: str, *,
+                provider_fence) -> object:
+        del provider_fence
+        drain_event.set()
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client', acquire)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested) as exc_info:
+        canary_worker_service._assumed_client(mock.sentinel.role,
+                                              'ec2',
+                                              'us-west-2',
+                                              _OwnedHeartbeat(),
+                                              drain_event=drain_event)
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_canary_traceback_value_free(error, marker)
+
+
+def test_canary_cleanup_client_acquisition_rechecks_shared_deadline(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [99.0]
+    raw_started = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+
+    def acquire(_role: object, _service: str, _region: str, *,
+                provider_fence) -> object:
+        current[0] = 100.0
+        provider_fence()
+        raw_started()
+        return mock.sentinel.client
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client', acquire)
+
+    with pytest.raises(canary_worker_service._CanaryCleanupDeadlineExceeded):
+        canary_worker_service._assumed_client(mock.sentinel.role,
+                                              'ec2',
+                                              'us-west-2',
+                                              _OwnedHeartbeat(),
+                                              cleanup_deadline=100.0)
+
+    raw_started.assert_not_called()
 
 
 @pytest.mark.parametrize('method_name',
@@ -965,8 +2012,9 @@ def test_expired_database_authorization_blocks_eks_create_with_slow_host_clock(
         'runtime_id': qualified.context,
     }
     core = mock.Mock()
-    monkeypatch.setattr(canary_worker_service.kubernetes, 'core_api',
-                        lambda _context: core)
+    monkeypatch.setattr(canary_worker_service.kubernetes,
+                        'provider_fenced_core_api',
+                        lambda _context, **_kwargs: core)
     monkeypatch.setattr(canary_worker_service.catalog_state,
                         'get_catalog_authority_id', lambda: 'catalog')
     assumed_client = mock.Mock(side_effect=AssertionError(
@@ -1063,15 +2111,17 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
      (None, 'expected', 'expected', 'QUALIFICATION_FAILED'),
      ('x86_64', 'other', 'expected', 'QUALIFICATION_FAILED'),
      ('x86_64', None, 'expected', 'QUALIFICATION_FAILED')))
+@pytest.mark.parametrize('use_spot', [True, False, None])
 def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
         architecture: str | None, image_id_case: str | None, profile_case: str,
-        expected_error: str | None) -> None:
+        expected_error: str | None, use_spot: bool | None) -> None:
     operation = _canary_operation()
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=use_spot)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',
@@ -1164,6 +2214,23 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
                 'InstanceId': 'i-canary'
             }]
         })
+    spot_request = {
+        'SpotInstanceRequestId': 'sir-canary',
+        'InstanceId': 'i-canary',
+        'State': 'active',
+    }
+    cancelled_spot_request = {
+        **spot_request,
+        'State': 'cancelled',
+    }
+    if use_spot:
+        ec2.describe_spot_instance_requests.side_effect = ({
+            'SpotInstanceRequests': [spot_request],
+        }, {
+            'SpotInstanceRequests': [spot_request],
+        }, {
+            'SpotInstanceRequests': [cancelled_spot_request],
+        })
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
     ec2.get_console_output.return_value = {'Output': marker}
     iam = mock.Mock()
@@ -1175,12 +2242,14 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         }
     }
     provider_fences: list[object] = []
+    acquired_services: list[str] = []
 
     def assumed_client(_role: object,
                        service: str,
                        _region: str,
                        *,
                        provider_fence: object = None) -> object:
+        acquired_services.append(service)
         provider_fences.append(provider_fence)
         return ec2 if service == 'ec2' else iam
 
@@ -1223,10 +2292,28 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         target.registry) in launch['UserData']
     assert "trap 'shutdown -h now' EXIT" in launch['UserData']
     assert launch['InstanceInitiatedShutdownBehavior'] == 'terminate'
+    if use_spot:
+        assert launch['InstanceMarketOptions'] == {
+            'MarketType': 'spot',
+            'SpotOptions': {
+                'SpotInstanceType': 'one-time',
+                'InstanceInterruptionBehavior': 'terminate',
+            },
+        }
+        assert ec2.cancel_spot_instance_requests.call_args_list == [
+            mock.call(SpotInstanceRequestIds=['sir-canary'])
+        ]
+    else:
+        assert 'InstanceMarketOptions' not in launch
+        ec2.describe_spot_instance_requests.assert_not_called()
+        ec2.cancel_spot_instance_requests.assert_not_called()
     assert launch['SecurityGroupIds'] == list(
         dict(binding.canary_security_groups)[target.region])
+    expected_resource_types = {'instance', 'volume', 'network-interface'}
+    if use_spot:
+        expected_resource_types.add('spot-instances-request')
     assert {item['ResourceType'] for item in launch['TagSpecifications']
-           } == {'instance', 'volume', 'network-interface'}
+           } == expected_resource_types
     for specification in launch['TagSpecifications']:
         assert {
             tag['Key']: tag['Value'] for tag in specification['Tags']
@@ -1235,7 +2322,447 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             'SkyPilotCatalog': 'catalog',
             'SkyPilotProfile': profile.name,
         }
-    assert provider_fences == [heartbeat.assert_owned, heartbeat.assert_owned]
+    assert "trap 'shutdown -h now' EXIT" in launch['UserData']
+    assert acquired_services == ['ec2', 'iam', 'ec2']
+    assert len(provider_fences) == 3
+    assert all(callable(fence) for fence in provider_fences)
+
+
+def test_ec2_spot_ambiguous_launch_cancels_request_and_terminates_racing_child(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    operation = _canary_operation()
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=True)
+    assert binding.instance_profile is not None
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    empty_instances = {'Reservations': []}
+    terminated_instance = {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-racing',
+                'State': {
+                    'Name': 'terminated',
+                },
+            }]
+        }]
+    }
+    ec2 = mock.Mock()
+    ec2.run_instances.side_effect = (
+        TimeoutError('first accepted response lost'),
+        TimeoutError('second accepted response lost'),
+    )
+    ec2.describe_instances.side_effect = (
+        empty_instances,  # Initial operation-tag discovery.
+        empty_instances,  # Immediate cleanup discovery.
+        empty_instances,  # First bounded cleanup observation.
+        empty_instances,  # The request-to-instance edge is not tagged yet.
+        terminated_instance,  # Exact racing-instance termination proof.
+    )
+    open_request = {
+        'SpotInstanceRequestId': 'sir-racing',
+        'State': 'open',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-racing',
+        'State': 'cancelled',
+    }
+    cancelled_with_instance = {
+        'SpotInstanceRequestId': 'sir-racing',
+        'InstanceId': 'i-racing',
+        'State': 'cancelled',
+    }
+    ec2.describe_spot_instance_requests.side_effect = ({
+        'SpotInstanceRequests': [open_request],
+    }, {
+        'SpotInstanceRequests': [open_request],
+    }, {
+        'SpotInstanceRequests': [cancelled_request],
+    }, {
+        'SpotInstanceRequests': [cancelled_with_instance],
+    }, {
+        'SpotInstanceRequests': [cancelled_with_instance],
+    })
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': binding.principals[0],
+            }]
+        }
+    }
+    clients = {'ec2': ec2, 'iam': iam}
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region, **_kwargs: clients[service])
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
+
+    with pytest.raises(TimeoutError, match='second accepted response lost'):
+        canary_worker_service._run_ec2_canary(
+            operation, payload, _revision(profile), profile, target, binding,
+            _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+            _OwnedHeartbeat())
+
+    launch = ec2.run_instances.call_args.kwargs
+    assert {
+        specification['ResourceType']
+        for specification in launch['TagSpecifications']
+    } == {
+        'instance',
+        'network-interface',
+        'spot-instances-request',
+        'volume',
+    }
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-racing'])
+    ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-racing'])
+    assert ec2.describe_spot_instance_requests.call_count == 5
+
+
+def test_ec2_spot_terminal_request_without_child_consumes_full_settle_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    open_request = {
+        'SpotInstanceRequestId': 'sir-no-child',
+        'State': 'open',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-no-child',
+        'State': 'cancelled',
+    }
+    ec2.describe_spot_instance_requests.side_effect = (
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 3)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert ec2.describe_instances.call_count == 3
+    assert ec2.describe_spot_instance_requests.call_count == 7
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-no-child'])
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_spot_late_terminal_transition_preserves_custody(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    active_request = {
+        'SpotInstanceRequestId': 'sir-late-terminal',
+        'State': 'active',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-late-terminal',
+        'State': 'cancelled',
+    }
+    ec2.describe_spot_instance_requests.side_effect = (
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 3)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert ec2.describe_instances.call_count == 3
+    assert ec2.describe_spot_instance_requests.call_count == 8
+    assert ec2.cancel_spot_instance_requests.call_count == 2
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_spot_terminal_transition_restarts_settle_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    open_request = {
+        'SpotInstanceRequestId': 'sir-terminal-transition',
+        'State': 'open',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-terminal-transition',
+        'State': 'cancelled',
+    }
+    closed_request = {
+        'SpotInstanceRequestId': 'sir-terminal-transition',
+        'State': 'closed',
+    }
+    ec2.describe_spot_instance_requests.side_effect = (
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [closed_request],
+        },
+        {
+            'SpotInstanceRequests': [closed_request],
+        },
+        {
+            'SpotInstanceRequests': [closed_request],
+        },
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 3)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert ec2.describe_instances.call_count == 3
+    assert ec2.describe_spot_instance_requests.call_count == 7
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-terminal-transition'])
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_spot_cleanup_preserves_custody_until_request_is_terminal(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    active_request = {
+        'SpotInstanceRequestId': 'sir-active',
+        'State': 'active',
+    }
+    ec2.describe_spot_instance_requests.return_value = {
+        'SpotInstanceRequests': [active_request],
+    }
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 1)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-active'])
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_tagged_instance_discovery_reads_every_page(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = ({
+        'Reservations': [],
+        'NextToken': 'next-page',
+    }, {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-second-page',
+            }]
+        }],
+    })
+
+    instances = canary_worker_service._tagged_instances(ec2,
+                                                        'operation',
+                                                        cleanup_deadline=300.0)
+
+    assert [instance['InstanceId'] for instance in instances
+           ] == ['i-second-page']
+    filters = [{
+        'Name': 'tag:SkyPilotCanaryOperation',
+        'Values': ['operation'],
+    }, {
+        'Name': 'instance-state-name',
+        'Values': [
+            'pending', 'running', 'stopping', 'stopped', 'shutting-down',
+            'terminated'
+        ],
+    }]
+    assert ec2.describe_instances.call_args_list == [
+        mock.call(Filters=filters, MaxResults=1000),
+        mock.call(Filters=filters, MaxResults=1000, NextToken='next-page'),
+    ]
+
+
+def test_ec2_spot_cleanup_terminates_second_page_instance(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    running_instance = {
+        'InstanceId': 'i-second-page',
+        'SpotInstanceRequestId': 'sir-second-page',
+        'State': {
+            'Name': 'running',
+        },
+    }
+    terminated_instance = {
+        **running_instance,
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+
+    def describe_instances(**kwargs: object) -> dict[str, object]:
+        if 'InstanceIds' in kwargs:
+            return {
+                'Reservations': [{
+                    'Instances': [terminated_instance],
+                }]
+            }
+        if kwargs.get('NextToken') == 'next-page':
+            return {
+                'Reservations': [{
+                    'Instances': [running_instance],
+                }]
+            }
+        return {
+            'Reservations': [],
+            'NextToken': 'next-page',
+        }
+
+    ec2.describe_instances.side_effect = describe_instances
+    closed_request = {
+        'SpotInstanceRequestId': 'sir-second-page',
+        'State': 'closed',
+    }
+    ec2.describe_spot_instance_requests.return_value = {
+        'SpotInstanceRequests': [closed_request],
+    }
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 1)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert any(
+        call.kwargs.get('NextToken') == 'next-page'
+        for call in ec2.describe_instances.call_args_list)
+    ec2.terminate_instances.assert_called_once_with(
+        InstanceIds=['i-second-page'])
+
+
+@pytest.mark.parametrize(
+    ('next_token', 'expected_calls'),
+    [
+        ('', 1),
+        (7, 1),
+        ('same-page', 2),
+    ],
+    ids=['empty-token', 'non-string-token', 'cyclic-token'],
+)
+def test_tagged_instance_discovery_rejects_invalid_pagination(
+        monkeypatch: pytest.MonkeyPatch, next_token: object,
+        expected_calls: int) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {
+        'Reservations': [],
+        'NextToken': next_token,
+    }
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        canary_worker_service._tagged_instances(ec2,
+                                                'operation',
+                                                cleanup_deadline=300.0)
+
+    assert ec2.describe_instances.call_count == expected_calls
+
+
+def test_tagged_spot_request_discovery_reads_every_page(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    ec2 = mock.Mock()
+    ec2.describe_spot_instance_requests.side_effect = ({
+        'SpotInstanceRequests': [{
+            'SpotInstanceRequestId': 'sir-one',
+        }],
+        'NextToken': 'next-page',
+    }, {
+        'SpotInstanceRequests': [{
+            'SpotInstanceRequestId': 'sir-two',
+        }],
+    })
+
+    requests = canary_worker_service._tagged_spot_requests(
+        ec2, 'operation', cleanup_deadline=300.0)
+
+    assert [request['SpotInstanceRequestId'] for request in requests
+           ] == ['sir-one', 'sir-two']
+    assert ec2.describe_spot_instance_requests.call_args_list == [
+        mock.call(Filters=[{
+            'Name': 'tag:SkyPilotCanaryOperation',
+            'Values': ['operation'],
+        }],
+                  MaxResults=1000),
+        mock.call(Filters=[{
+            'Name': 'tag:SkyPilotCanaryOperation',
+            'Values': ['operation'],
+        }],
+                  MaxResults=1000,
+                  NextToken='next-page'),
+    ]
 
 
 @pytest.mark.parametrize('invalid_instance_id', [None, 7],
@@ -1247,7 +2774,8 @@ def test_ec2_canary_malformed_launch_identity_settles_and_terminates_late_child(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',
@@ -1328,7 +2856,8 @@ def test_ec2_canary_malformed_discovered_identity_uses_settling_teardown(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     payload = {
         'backend': 'aws_vm',
         'nonce': '1' * 32,
@@ -1387,7 +2916,8 @@ def test_ec2_canary_persistent_malformed_discovery_preserves_custody(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     payload = {
         'backend': 'aws_vm',
         'nonce': '1' * 32,
@@ -1453,7 +2983,8 @@ def test_ec2_canary_terminal_child_plus_malformed_discovery_preserves_custody(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     payload = {
         'backend': 'aws_vm',
         'nonce': '1' * 32,
@@ -1551,6 +3082,161 @@ def test_ec2_teardown_resolves_prior_malformed_inventory_after_clean_window(
     ec2.terminate_instances.assert_not_called()
 
 
+def test_ec2_teardown_stops_at_wall_clock_bound_after_slow_provider_call(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_SECONDS', 300)
+    ec2 = mock.Mock()
+
+    def slow_running_inventory(**_kwargs: object) -> dict[str, object]:
+        current[0] = 301.0
+        return {
+            'Reservations': [{
+                'Instances': [{
+                    'InstanceId': 'i-known',
+                    'State': {
+                        'Name': 'running'
+                    },
+                }]
+            }]
+        }
+
+    ec2.describe_instances.side_effect = slow_running_inventory
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2,
+        'operation', [],
+        settle_absence=True,
+        initial_unidentified_child_observed=True)
+
+    ec2.describe_instances.assert_called_once()
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_spot_production_settle_budget_includes_provider_latency(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # Model cleanup-client acquisition and preliminary discovery having already
+    # consumed 90 seconds of the absolute pod-shutdown budget.
+    current = [90.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    monkeypatch.setattr(
+        canary_worker_service.time, 'sleep',
+        lambda seconds: current.__setitem__(0, current[0] + seconds))
+    ec2 = mock.Mock()
+    closed_request = {
+        'SpotInstanceRequestId': 'sir-no-child',
+        'State': 'closed',
+    }
+
+    def describe_instances(**_kwargs: object) -> dict[str, object]:
+        current[0] += 0.05
+        return {'Reservations': []}
+
+    def describe_spot_requests(**_kwargs: object) -> dict[str, object]:
+        current[0] += 0.05
+        return {'SpotInstanceRequests': [closed_request]}
+
+    ec2.describe_instances.side_effect = describe_instances
+    ec2.describe_spot_instance_requests.side_effect = describe_spot_requests
+
+    assert canary_worker_service._terminate_ec2_instances(
+        ec2,
+        'operation', [],
+        settle_absence=True,
+        spot_request_expected=True,
+        cleanup_deadline=float(canary_worker_service._EC2_TEARDOWN_SECONDS))
+
+    assert ec2.describe_instances.call_count == (
+        canary_worker_service._EC2_TEARDOWN_ATTEMPTS)
+    assert ec2.describe_spot_instance_requests.call_count == (
+        2 * canary_worker_service._EC2_TEARDOWN_ATTEMPTS)
+    assert current[0] < canary_worker_service._EC2_TEARDOWN_SECONDS
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_cleanup_rechecks_deadline_after_lease_heartbeat(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [299.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    provider = mock.Mock()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = lambda: current.__setitem__(0, 301.0)
+    ec2 = canary_worker_service._FencedClient(provider, heartbeat)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2,
+        'operation', [],
+        settle_absence=True,
+        initial_unidentified_child_observed=True,
+        cleanup_deadline=300.0)
+
+    provider.describe_instances.assert_not_called()
+    provider.terminate_instances.assert_not_called()
+
+
+def test_ec2_teardown_starts_no_state_read_after_slow_termination(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_SECONDS', 300)
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-known',
+                'State': {
+                    'Name': 'running'
+                },
+            }]
+        }]
+    }
+    ec2.terminate_instances.side_effect = lambda **_kwargs: current.__setitem__(
+        0, 301.0)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', ['i-known'], settle_absence=False)
+
+    ec2.describe_instances.assert_called_once()
+    ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-known'])
+
+
+def test_ec2_teardown_rejects_state_read_that_crosses_deadline(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_SECONDS', 300)
+    ec2 = mock.Mock()
+    terminated = {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-known',
+                'State': {
+                    'Name': 'terminated'
+                },
+            }]
+        }]
+    }
+
+    def describe_instances(**kwargs: object) -> dict[str, object]:
+        if 'InstanceIds' in kwargs:
+            current[0] = 301.0
+        return terminated
+
+    ec2.describe_instances.side_effect = describe_instances
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', ['i-known'], settle_absence=False)
+
+    assert ec2.describe_instances.call_count == 2
+    ec2.terminate_instances.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ('late_state', 'terminalizes'), [
         ('terminated', True),
@@ -1564,7 +3250,8 @@ def test_ec2_ambiguous_settling_consumes_full_window_before_terminalizing(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',
@@ -1731,7 +3418,8 @@ def test_ec2_canary_rejects_mismatched_tagged_child_and_tears_down_all(
     target = profile.target('aws-us-west-2')
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
-    binding = profile.bindings[binding_id]
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
     assert binding.instance_profile is not None
     payload = {
         'backend': 'aws_vm',
@@ -1875,8 +3563,9 @@ def test_eks_canary_fences_clients_and_verifies_teardown(
 
     monkeypatch.setattr(canary_worker_service.aws, 'assumed_client',
                         assumed_client)
-    monkeypatch.setattr(canary_worker_service.kubernetes, 'core_api',
-                        lambda _context: core)
+    monkeypatch.setattr(canary_worker_service.kubernetes,
+                        'provider_fenced_core_api',
+                        lambda _context, **_kwargs: core)
     monkeypatch.setattr(canary_worker_service.catalog_state,
                         'get_catalog_authority_id', lambda: 'catalog')
     monkeypatch.setattr(canary_worker_service.qualification,
@@ -1894,9 +3583,8 @@ def test_eks_canary_fences_clients_and_verifies_teardown(
 
     assert evidence['node_uid'] == 'node-a'
     assert evidence['teardown_verified'] is True
-    assert provider_fences == [
-        heartbeat.assert_owned, heartbeat.assert_owned, heartbeat.assert_owned
-    ]
+    assert len(provider_fences) == 3
+    assert all(callable(fence) for fence in provider_fences)
     core.delete_namespaced_pod.assert_called_once()
 
 
@@ -2392,9 +4080,406 @@ def test_copy_maintenance_also_recovers_pending_publication_fanout(
 
     assert copy_worker_service._qualification_maintenance(limiter)
 
-    reconcile_fanout.assert_called_once_with()
-    reconcile_profiles.assert_called_once_with(limiter)
-    schedule_canaries.assert_called_once_with()
+    reconcile_fanout.assert_called_once_with(should_stop=None)
+    reconcile_profiles.assert_called_once_with(limiter, should_stop=None)
+    schedule_canaries.assert_called_once_with(should_stop=None)
+
+
+def test_copy_qualification_page_stops_between_targets(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    stop = threading.Event()
+    revision = _revision(profile)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    reconcile = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: (stop.set() or True))
+    monkeypatch.setattr(copy_worker_service, 'reconcile_qualification_copy',
+                        reconcile)
+
+    assert copy_worker_service.reconcile_qualification_profiles(
+        mock.sentinel.limiter, should_stop=stop.is_set) == 1
+
+    reconcile.assert_called_once()
+    assert reconcile.call_args.args == (revision, profile.canonical)
+
+
+def test_copy_qualification_stops_after_metadata_before_database_write(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    stop = threading.Event()
+    revision = _revision(profile)
+    target = profile.canonical
+    destination = mock.Mock()
+    destination.repository_metadata.side_effect = (lambda: stop.set() or {
+        'repository_arn': 'unused'
+    })
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_target_shard',
+                        lambda *_args: _shard(profile, target.name))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_repository', lambda *_args:
+                        ('qualification', 'qualification-arn'))
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        lambda *_args, **_kwargs: destination)
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    record = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'record_profile_attestation', record)
+
+    with pytest.raises(copy_worker_service._QualificationDrainRequested):
+        copy_worker_service.reconcile_qualification_copy(
+            revision, target, limiter=mock.Mock(), should_stop=stop.is_set)
+
+    record.assert_not_called()
+
+
+def test_copy_qualification_transfer_receives_live_stop_event(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    stop = threading.Event()
+    revision = _revision(profile)
+    target = profile.canonical
+    repository_name = 'qualification'
+    repository_arn = 'qualification-arn'
+    destination = mock.Mock()
+    destination.repository_metadata.return_value = {
+        'repository_arn': repository_arn,
+        'repository_uri': f'{target.registry}/{repository_name}',
+        'tag_mutability': 'IMMUTABLE',
+        'encryption_type': 'AES256',
+        'kms_key': None,
+    }
+    graph = SimpleNamespace(runtime_digest=_DIGEST, platform='linux/amd64')
+
+    def copy_graph(_graph, _read_blob, cancel_event):
+        assert not cancel_event.is_set()
+        stop.set()
+        assert cancel_event.is_set()
+        return aws.CopyOutcome.WRITTEN
+
+    destination.copy_graph.side_effect = copy_graph
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_target_shard',
+                        lambda *_args: _shard(profile, target.name))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_repository', lambda *_args:
+                        (repository_name, repository_arn))
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        lambda *_args, **_kwargs: destination)
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    record = mock.Mock(return_value=revision)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'record_profile_attestation', record)
+    monkeypatch.setattr(copy_worker_service, '_qualification_database_epoch',
+                        lambda **_kwargs: 100)
+    monkeypatch.setattr(copy_worker_service, '_qualification_copy_needed',
+                        lambda *_args: True)
+    reader = SimpleNamespace(read_blob=mock.sentinel.read_blob)
+    monkeypatch.setattr(copy_worker_service.providers, 'RegistryV2Source',
+                        lambda *_args, **_kwargs: reader)
+    monkeypatch.setattr(copy_worker_service, '_inspection_graph',
+                        lambda *_args, **_kwargs: graph)
+
+    with pytest.raises(copy_worker_service._QualificationDrainRequested):
+        copy_worker_service.reconcile_qualification_copy(
+            revision, target, limiter=mock.Mock(), should_stop=stop.is_set)
+
+    destination.verify_graph.assert_not_called()
+    assert record.call_count == 1
+
+
+def test_candidate_shard_probe_stops_after_first_provider_proof(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    candidate_profile = _policy_profile(profile)
+    target = candidate_profile.targets[0]
+    base_shard = dataclasses.replace(_shard(profile),
+                                     inventory_epoch=3,
+                                     inventory_started_at=80,
+                                     inventory_completed_at=90)
+    shards = [
+        dataclasses.replace(base_shard,
+                            id=f'shard-{index}',
+                            shard_index=index,
+                            physical_fingerprint=f'{index:064x}')
+        for index in range(target.shard_count)
+    ]
+    revision = dataclasses.replace(_revision(candidate_profile),
+                                   state=models.ImageProfileState.QUALIFYING)
+    stop = threading.Event()
+    from_role = mock.Mock(return_value=mock.sentinel.repository)
+    matching = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: stop.set() or ({}, 100, 10))
+    record = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'list_target_shards', lambda *_args: shards)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'get_profile_revision',
+                        lambda *_args: _revision(profile))
+    monkeypatch.setattr(copy_worker_service, '_expected_shard_attestation',
+                        lambda *_args: ('live-key', {}))
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        from_role)
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(copy_worker_service, '_matching_shard_metadata',
+                        matching)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'record_candidate_shard_attestation', record)
+
+    with pytest.raises(copy_worker_service._QualificationDrainRequested):
+        copy_worker_service._reconcile_candidate_shard_attestation(
+            revision,
+            candidate_profile,
+            target,
+            limiter=mock.Mock(),
+            now=100,
+            should_stop=stop.is_set)
+
+    from_role.assert_called_once()
+    matching.assert_called_once()
+    record.assert_not_called()
+
+
+def test_automatic_canary_scheduler_stops_between_runtime_transactions(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.canonical
+    copy_key = models.profile_attestation_key('copy', target.name)
+    revision = dataclasses.replace(
+        _revision(profile),
+        attestations={copy_key: {
+            'status': 'READY',
+            'observed_at': 100,
+        }})
+    stop = threading.Event()
+    monkeypatch.setattr(copy_worker_service.qualification, '_database_epoch',
+                        lambda **_kwargs: 100)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    request = mock.Mock(
+        side_effect=lambda **_kwargs: (stop.set() or mock.sentinel.operation))
+    monkeypatch.setattr(copy_worker_service.qualification, 'request_canary',
+                        request)
+
+    assert copy_worker_service.qualification.schedule_automatic_canaries(
+        should_stop=stop.is_set) == 1
+
+    request.assert_called_once()
+    assert request.call_args.kwargs['target_id'] == target.name
+
+
+def test_qualification_lifecycle_stops_after_provider_acquisition(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.canonical
+    backend, binding_id = target.runtime_pull[0]
+    binding = profile.bindings[binding_id]
+    runtime_id = lifecycle_worker_service.qualification.runtime_ids(
+        target, backend, binding)[0]
+    copy_key = models.profile_attestation_key('copy', target.name)
+    runtime_key = models.profile_attestation_key('runtime', target.name,
+                                                 backend, binding.fingerprint,
+                                                 runtime_id)
+    revision = dataclasses.replace(_revision(profile),
+                                   attestations={
+                                       copy_key: {
+                                           'status': 'READY',
+                                           'observed_at': 100,
+                                           'runtime_digest': _DIGEST,
+                                       },
+                                       runtime_key: {
+                                           'status': 'READY',
+                                           'observed_at': 100,
+                                           'runtime_digest': _DIGEST,
+                                       },
+                                   })
+    stop = threading.Event()
+    repository = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'get_target_shard', lambda *_args: mock.sentinel.shard)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'qualification_repository', lambda *_args:
+                        ('qualification', 'repository-arn'))
+    monkeypatch.setattr(lifecycle_worker_service, '_lifecycle_role',
+                        lambda *_args: mock.sentinel.role)
+    monkeypatch.setattr(
+        lifecycle_worker_service.aws.EcrRepository, 'from_role',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (stop.set() or repository)))
+
+    assert not lifecycle_worker_service.reconcile_qualification_lifecycle(
+        mock.sentinel.limiter, should_stop=stop.is_set)
+
+    repository.exact_delete.assert_not_called()
+
+
+@pytest.mark.parametrize('stop_after_delete', [True, False],
+                         ids=['stop-before-readback', 'concluded-absence'])
+def test_qualification_lifecycle_fences_delete_readback_boundary(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        stop_after_delete: bool) -> None:
+    target = profile.canonical
+    copy_key = models.profile_attestation_key('copy', target.name)
+    attestations = {
+        copy_key: {
+            'status': 'READY',
+            'observed_at': 100,
+            'runtime_digest': _DIGEST,
+        }
+    }
+    for backend, binding_id in target.runtime_pull:
+        binding = profile.bindings[binding_id]
+        for runtime_id in lifecycle_worker_service.qualification.runtime_ids(
+                target, backend, binding):
+            attestations[models.profile_attestation_key(
+                'runtime', target.name, backend, binding.fingerprint,
+                runtime_id)] = {
+                    'status': 'READY',
+                    'observed_at': 100,
+                    'runtime_digest': _DIGEST,
+                }
+    revision = dataclasses.replace(_revision(profile),
+                                   attestations=attestations)
+    stop = threading.Event()
+    raw_client = mock.Mock()
+
+    def delete_image(**_kwargs):
+        if stop_after_delete:
+            stop.set()
+        return {}
+
+    raw_client.batch_delete_image.side_effect = delete_image
+    raw_client.batch_get_image.return_value = {
+        'images': [],
+        'failures': [{
+            'failureCode': 'ImageNotFound',
+        }],
+    }
+
+    def repository_from_role(*_args, **kwargs):
+        client = aws._ProviderFencedEcrClient(  # pylint: disable=protected-access
+            raw_client, kwargs['provider_fence'])
+        client = aws._HookedEcrClient(  # pylint: disable=protected-access
+            client, kwargs['hooks'])
+        return aws.EcrRepository(client,
+                                 'qualification',
+                                 provider_fence=kwargs['provider_fence'])
+
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'get_target_shard',
+                        lambda *_args: _shard(profile, target.name))
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'qualification_repository', lambda *_args:
+                        ('qualification', 'qualification-arn'))
+    monkeypatch.setattr(lifecycle_worker_service, '_lifecycle_role',
+                        lambda *_args: mock.sentinel.role)
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        repository_from_role)
+    record = mock.Mock(return_value=revision)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'record_profile_attestation', record)
+    activate = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'maybe_activate_profile', activate)
+
+    reconciled = lifecycle_worker_service.reconcile_qualification_lifecycle(
+        mock.Mock(), should_stop=stop.is_set)
+
+    raw_client.batch_delete_image.assert_called_once()
+    if stop_after_delete:
+        assert not reconciled
+        raw_client.batch_get_image.assert_not_called()
+        record.assert_not_called()
+        activate.assert_not_called()
+    else:
+        assert reconciled
+        raw_client.batch_get_image.assert_called_once()
+        record.assert_called_once()
+        activate.assert_called_once_with(revision.id)
+
+
+def test_failed_reservation_reaper_stops_after_provider_acquisition(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    stop = threading.Event()
+    location = SimpleNamespace(shard_id='shard-id',
+                               target_fingerprint='fingerprint',
+                               runtime_digest=_DIGEST,
+                               id='location-id',
+                               updated_at=100)
+    shard = SimpleNamespace(target_fingerprint='fingerprint',
+                            region=profile.canonical.region,
+                            repository_name='canonical')
+    repository = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_failed_canonical_reap_candidates',
+                        lambda **_kwargs: [location])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
+                        lambda _shard_id: shard)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_profile_target_for_location', lambda *_args:
+                        (profile, profile.canonical))
+    monkeypatch.setattr(lifecycle_worker_service, '_lifecycle_role',
+                        lambda *_args: mock.sentinel.role)
+    monkeypatch.setattr(
+        lifecycle_worker_service.aws.EcrRepository, 'from_role',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (stop.set() or repository)))
+
+    assert not lifecycle_worker_service.reconcile_failed_canonical_reservations(
+        mock.sentinel.limiter, should_stop=stop.is_set)
+
+    repository.exact_manifest_exists.assert_not_called()
+
+
+def test_manifest_ingestion_stops_between_independent_files(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    for name in ('a.json', 'b.json'):
+        (tmp_path / name).write_text(json.dumps({'profile': name}),
+                                     encoding='utf-8')
+    stop = threading.Event()
+    ingest = mock.Mock(side_effect=lambda **_kwargs: stop.set())
+    monkeypatch.setattr(copy_worker_service.qualification, 'ingest_manifest',
+                        ingest)
+
+    assert copy_worker_service._ingest_qualification_manifests(
+        str(tmp_path), should_stop=stop.is_set) == 1
+
+    ingest.assert_called_once()
+    assert ingest.call_args.kwargs['profile_name'] == 'a.json'
+
+
+def test_publication_fanout_stops_between_location_transactions(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    stop = threading.Event()
+    session = mock.MagicMock()
+    session.execute.return_value.scalars.return_value.all.return_value = [
+        'location-one', 'location-two'
+    ]
+    session_context = mock.MagicMock()
+    session_context.__enter__.return_value = session
+    monkeypatch.setattr(transactions.catalog_state, 'engine',
+                        lambda: mock.sentinel.engine)
+    monkeypatch.setattr(transactions.orm, 'Session',
+                        mock.Mock(return_value=session_context))
+    reconcile = mock.Mock(side_effect=lambda _location_id: (stop.set() or 1))
+    monkeypatch.setattr(transactions, 'reconcile_canonical_publications',
+                        reconcile)
+
+    assert transactions.reconcile_pending_canonical_publications(
+        should_stop=stop.is_set) == 1
+
+    reconcile.assert_called_once_with('location-one')
 
 
 def test_publication_release_limit_keeps_typed_error(
@@ -2743,15 +4828,20 @@ def test_lifecycle_lease_loss_before_sts_blocks_credential_acquisition(
 
     monkeypatch.setattr(lifecycle_worker_service, '_LeaseHeartbeat',
                         LosingHeartbeat)
-    session = mock.Mock()
-    monkeypatch.setattr(lifecycle_worker_service.aws.aws_adaptor, 'session',
-                        session)
+    ambient_session = mock.Mock()
+    session_with_defaults = mock.Mock(return_value=ambient_session)
+    monkeypatch.setattr(lifecycle_worker_service.aws.aws_adaptor,
+                        'session_with_client_defaults', session_with_defaults)
 
     with pytest.raises(worker_lease.LeaseLostError,
                        match='lease lost before STS'):
         lifecycle_worker_service.evict_location(location, mock.Mock())
 
-    session.assert_not_called()
+    session_with_defaults.assert_called_once_with(connect_timeout=10,
+                                                  read_timeout=60,
+                                                  total_max_attempts=1,
+                                                  profile=None)
+    ambient_session.get_credentials.assert_not_called()
 
 
 def test_copy_and_inventory_use_operational_revision_not_newer_candidate(
@@ -2894,7 +4984,7 @@ def test_candidate_shard_probe_never_mutates_operational_state(
                         lambda *_args, **_kwargs: repository)
     monkeypatch.setattr(copy_worker_service.aws,
                         'applied_ecr_images_per_repository_quota',
-                        lambda *_args: 100)
+                        lambda *_args, **_kwargs: 100)
     record = mock.Mock(return_value=candidate)
     monkeypatch.setattr(copy_worker_service.topology_state,
                         'record_candidate_shard_attestation', record)
@@ -3065,6 +5155,431 @@ def test_worker_health_http_surface(monkeypatch: pytest.MonkeyPatch) -> None:
         assert error.value.code == 503
     finally:
         health_server.stop()
+
+
+def test_copy_worker_stop_during_heartbeat_fences_new_work(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(copy_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(
+        copy_worker_service.topology_state, 'heartbeat_worker',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (service.stop() or True)))
+    reload_config = mock.Mock()
+    qualification_maintenance = mock.Mock()
+    claim = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.skypilot_config,
+                        'safe_reload_config', reload_config)
+    monkeypatch.setattr(copy_worker_service, '_qualification_maintenance',
+                        qualification_maintenance)
+    monkeypatch.setattr(service, '_claim', claim)
+    monkeypatch.delenv('SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR',
+                       raising=False)
+
+    service.run_forever()
+
+    reload_config.assert_called_once_with()
+    qualification_maintenance.assert_not_called()
+    claim.assert_not_called()
+    executor.submit.assert_not_called()
+
+
+def test_copy_worker_stop_during_config_reload_skips_manifest_ingestion(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(copy_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    heartbeat = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state, 'heartbeat_worker',
+                        heartbeat)
+    monkeypatch.setattr(copy_worker_service.time, 'monotonic', lambda: 61.0)
+    monkeypatch.setenv('SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR',
+                       '/qualification')
+    monkeypatch.setattr(copy_worker_service.skypilot_config,
+                        'safe_reload_config',
+                        mock.Mock(side_effect=service.stop))
+    ingest = mock.Mock()
+    monkeypatch.setattr(copy_worker_service, '_ingest_qualification_manifests',
+                        ingest)
+
+    service.run_forever()
+
+    ingest.assert_not_called()
+    heartbeat.assert_not_called()
+    executor.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('claim_kind',
+                         ['initial_inventory', 'publication', 'location'])
+def test_copy_internal_claim_sequence_starts_no_later_claim_after_stop(
+        monkeypatch: pytest.MonkeyPatch, claim_kind: str) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    events: list[str] = []
+
+    def stop_during(kind: str):
+
+        def claim(**_kwargs: object) -> object:
+            events.append(kind)
+            service.stop()
+            return mock.sentinel.claimed
+
+        return claim
+
+    inventory = mock.Mock(return_value=None)
+    publication = mock.Mock(return_value=None)
+    location = mock.Mock(return_value=None)
+    if claim_kind == 'initial_inventory':
+        service._claims_since_inventory = 16
+        inventory.side_effect = stop_during('inventory')
+        expected = ['inventory']
+    elif claim_kind == 'publication':
+        service._claims_since_inventory = 0
+        service._claim_inspection_next = True
+        publication.side_effect = stop_during('publication')
+        expected = ['publication']
+    else:
+        service._claims_since_inventory = 0
+        service._claim_inspection_next = False
+        location.side_effect = stop_during('location')
+        expected = ['location']
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'claim_inventory_shard', inventory)
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'claim_publication_inspection', publication)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'claim_next_location', location)
+
+    assert service._claim() is None
+    assert events == expected
+
+
+def test_lifecycle_worker_stop_during_heartbeat_fences_new_work(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = lifecycle_worker_service.LifecycleWorkerService(
+        worker_id='lifecycle-worker',
+        version='test',
+        max_in_flight=1,
+        retention_seconds=60)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(lifecycle_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'register_worker', mock.Mock())
+    monkeypatch.setattr(
+        lifecycle_worker_service.topology_state, 'heartbeat_worker',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (service.stop() or True)))
+    maintenance = mock.Mock()
+    consumers = mock.Mock()
+    qualification_lifecycle = mock.Mock()
+    canonical_reconciliation = mock.Mock()
+    policy_refresh = mock.Mock()
+    eviction_claim = mock.Mock()
+    monkeypatch.setattr(service, '_maintenance', maintenance)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_reconcile_terminal_consumers', consumers)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        'reconcile_qualification_lifecycle',
+                        qualification_lifecycle)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        'reconcile_failed_canonical_reservations',
+                        canonical_reconciliation)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_refresh_workspace_eviction_retentions',
+                        policy_refresh)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'claim_next_eviction', eviction_claim)
+
+    service.run_forever()
+
+    maintenance.assert_not_called()
+    consumers.assert_not_called()
+    qualification_lifecycle.assert_not_called()
+    canonical_reconciliation.assert_not_called()
+    policy_refresh.assert_not_called()
+    eviction_claim.assert_not_called()
+    executor.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('stop_after', [0, 1, 2])
+def test_lifecycle_maintenance_starts_no_later_substep_after_stop(
+        monkeypatch: pytest.MonkeyPatch, stop_after: int) -> None:
+    service = lifecycle_worker_service.LifecycleWorkerService(
+        worker_id='lifecycle-worker',
+        version='test',
+        max_in_flight=1,
+        retention_seconds=60)
+    steps = [mock.Mock() for _ in range(4)]
+    steps[stop_after].side_effect = lambda *_args, **_kwargs: service.stop()
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_reconcile_publication_fanout', steps[0])
+    monkeypatch.setattr(lifecycle_worker_service.catalog_state,
+                        'compact_terminal_records', steps[1])
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'compact_terminal_demands', steps[2])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'compact_stale_workers', steps[3])
+
+    service._maintenance()
+
+    for index, step in enumerate(steps):
+        assert step.call_count == int(index <= stop_after)
+
+
+def test_canary_worker_stop_during_heartbeat_fences_paid_work(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = canary_worker_service.CanaryWorkerService(
+        worker_id='canary-worker', version='test', max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(canary_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(canary_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(
+        canary_worker_service.topology_state, 'heartbeat_worker',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (service.stop() or True)))
+    claim = mock.Mock()
+    monkeypatch.setattr(canary_worker_service.qualification, 'claim_canary',
+                        claim)
+
+    service.run_forever()
+
+    claim.assert_not_called()
+    executor.submit.assert_not_called()
+
+
+def test_copy_worker_stop_during_claim_prevents_submission(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(copy_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(copy_worker_service.topology_state, 'heartbeat_worker',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(copy_worker_service.time, 'monotonic', lambda: 1.0)
+    claim = mock.Mock(side_effect=lambda:
+                      (service.stop() or ('publication', mock.sentinel.record)))
+    monkeypatch.setattr(service, '_claim', claim)
+    monkeypatch.delenv('SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR',
+                       raising=False)
+
+    service.run_forever()
+
+    claim.assert_called_once_with()
+    executor.submit.assert_not_called()
+
+
+def test_lifecycle_worker_stop_during_claim_prevents_submission(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = lifecycle_worker_service.LifecycleWorkerService(
+        worker_id='lifecycle-worker',
+        version='test',
+        max_in_flight=1,
+        retention_seconds=60)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(lifecycle_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'register_worker', mock.Mock())
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    monkeypatch.setattr(lifecycle_worker_service.time, 'monotonic',
+                        lambda: 61.0)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_CONSUMER_RECONCILIATION_SECONDS', 1000)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_refresh_workspace_eviction_retentions',
+                        mock.Mock(return_value={}))
+    claim = mock.Mock(
+        side_effect=lambda **_kwargs: (service.stop() or mock.sentinel.record))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'claim_next_eviction', claim)
+
+    service.run_forever()
+
+    claim.assert_called_once_with(worker_id='lifecycle-worker',
+                                  retention_seconds=60,
+                                  workspace_retention_seconds={},
+                                  lease_seconds=service.lease_seconds)
+    executor.submit.assert_not_called()
+
+
+def test_copy_worker_stop_inside_submission_gate_never_invokes_claimed_task(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = copy_worker_service.CopyWorkerService(worker_id='copy-worker',
+                                                    version='test',
+                                                    max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    future = mock.Mock()
+    target = mock.Mock(return_value=True)
+
+    def submit(entry, *args, **kwargs):
+        service.stop()
+        assert entry(*args, **kwargs) is False
+        return future
+
+    executor.submit.side_effect = submit
+    monkeypatch.setattr(copy_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(copy_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(copy_worker_service.topology_state, 'heartbeat_worker',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(copy_worker_service.time, 'monotonic', lambda: 1.0)
+    monkeypatch.setattr(
+        service, '_claim',
+        mock.Mock(return_value=('publication', mock.sentinel.record)))
+    monkeypatch.setattr(copy_worker_service, 'inspect_publication', target)
+    monkeypatch.delenv('SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR',
+                       raising=False)
+
+    service.run_forever()
+
+    executor.submit.assert_called_once()
+    target.assert_not_called()
+
+
+def test_lifecycle_worker_stop_inside_submission_gate_never_invokes_claimed_task(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = lifecycle_worker_service.LifecycleWorkerService(
+        worker_id='lifecycle-worker',
+        version='test',
+        max_in_flight=1,
+        retention_seconds=60)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    future = mock.Mock()
+    target = mock.Mock(return_value=True)
+
+    def submit(entry, *args, **kwargs):
+        service.stop()
+        assert entry(*args, **kwargs) is False
+        return future
+
+    executor.submit.side_effect = submit
+    monkeypatch.setattr(lifecycle_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'register_worker', mock.Mock())
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    monkeypatch.setattr(lifecycle_worker_service.time, 'monotonic',
+                        lambda: 61.0)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_CONSUMER_RECONCILIATION_SECONDS', 1000)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_refresh_workspace_eviction_retentions',
+                        mock.Mock(return_value={}))
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'claim_next_eviction',
+                        mock.Mock(return_value=mock.sentinel.record))
+    monkeypatch.setattr(lifecycle_worker_service, 'evict_location', target)
+
+    service.run_forever()
+
+    executor.submit.assert_called_once()
+    target.assert_not_called()
+
+
+def test_canary_worker_stop_during_claim_prevents_submission(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = canary_worker_service.CanaryWorkerService(
+        worker_id='canary-worker', version='test', max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    monkeypatch.setattr(canary_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(canary_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(canary_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    claim = mock.Mock(side_effect=lambda **_kwargs:
+                      (service.stop() or mock.sentinel.operation))
+    monkeypatch.setattr(canary_worker_service.qualification, 'claim_canary',
+                        claim)
+    release = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'release_drained_canary', release)
+
+    service.run_forever()
+
+    claim.assert_called_once_with(worker_id='canary-worker',
+                                  lease_seconds=service.lease_seconds)
+    release.assert_called_once_with(mock.sentinel.operation,
+                                    teardown_verified=True)
+    executor.submit.assert_not_called()
+
+
+def test_canary_worker_submits_shared_drain_event(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    service = canary_worker_service.CanaryWorkerService(
+        worker_id='canary-worker', version='test', max_in_flight=1)
+    executor = mock.Mock()
+    executor_context = mock.MagicMock()
+    executor_context.__enter__.return_value = executor
+    future = mock.Mock()
+    executor.submit.side_effect = lambda *_args, **_kwargs: (service.stop() or
+                                                             future)
+    monkeypatch.setattr(canary_worker_service.concurrent.futures,
+                        'ThreadPoolExecutor',
+                        mock.Mock(return_value=executor_context))
+    monkeypatch.setattr(canary_worker_service.topology_state, 'register_worker',
+                        mock.Mock())
+    monkeypatch.setattr(canary_worker_service.topology_state,
+                        'heartbeat_worker', mock.Mock(return_value=True))
+    operation = _canary_operation()
+    monkeypatch.setattr(canary_worker_service.qualification, 'claim_canary',
+                        mock.Mock(return_value=operation))
+
+    service.run_forever()
+
+    executor.submit.assert_called_once_with(canary_worker_service.run_canary,
+                                            operation,
+                                            lease_seconds=service.lease_seconds,
+                                            drain_event=service._stop)
 
 
 @pytest.mark.parametrize(('worker_module', 'service_name'),

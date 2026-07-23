@@ -651,6 +651,10 @@
                         }
                     }
                 },
+                "terminationGracePeriodSeconds": {
+                    "type": "integer",
+                    "minimum": 600
+                },
                 "tolerations": {
                     "type": "array"
                 }
@@ -754,6 +758,10 @@
                         }
                     }
                 },
+                "terminationGracePeriodSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                },
                 "tolerations": {
                     "type": "array"
                 }
@@ -835,6 +843,10 @@
                             ]
                         }
                     }
+                },
+                "terminationGracePeriodSeconds": {
+                    "type": "integer",
+                    "minimum": 1
                 },
                 "tolerations": {
                     "type": "array"

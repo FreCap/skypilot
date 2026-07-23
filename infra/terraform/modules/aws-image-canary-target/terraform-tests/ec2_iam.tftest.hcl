@@ -48,15 +48,16 @@ mock_provider "aws" {
 }
 
 variables {
-  role_name               = "image-canary"
-  canary_worker_role_arns = ["arn:aws:iam::123456789012:role/image-canary-worker"]
-  catalog_authority       = "00000000-0000-4000-8000-000000000001"
-  runtime_role_arns       = ["arn:aws:iam::123456789012:role/runtime"]
-  instance_profile_arns   = ["arn:aws:iam::123456789012:instance-profile/runtime"]
-  ami_arns                = ["arn:aws:ec2:us-east-1::image/ami-0123456789abcdef0"]
-  subnet_arns             = ["arn:aws:ec2:us-east-1:123456789012:subnet/subnet-0123456789abcdef0"]
-  security_group_arns     = ["arn:aws:ec2:us-east-1:123456789012:security-group/sg-0123456789abcdef0"]
-  canary_instance_types   = ["t3.micro"]
+  role_name                    = "image-canary"
+  canary_worker_role_arns      = ["arn:aws:iam::123456789012:role/image-canary-worker"]
+  catalog_authority            = "00000000-0000-4000-8000-000000000001"
+  ec2_runtime_role_arns        = ["arn:aws:iam::123456789012:role/runtime"]
+  ec2_instance_profile_arns    = ["arn:aws:iam::123456789012:instance-profile/runtime"]
+  ami_arns                     = ["arn:aws:ec2:us-east-1::image/ami-0123456789abcdef0"]
+  subnet_arns                  = ["arn:aws:ec2:us-east-1:123456789012:subnet/subnet-0123456789abcdef0"]
+  security_group_arns          = ["arn:aws:ec2:us-east-1:123456789012:security-group/sg-0123456789abcdef0"]
+  canary_instance_types        = ["t3.micro"]
+  spot_service_linked_role_arn = "arn:aws:iam::123456789012:role/aws-service-role/spot.amazonaws.com/AWSServiceRoleForEC2Spot"
 }
 
 run "ec2_launch_authority_matches_each_resource_context" {
@@ -113,7 +114,7 @@ run "ec2_launch_authority_matches_each_resource_context" {
       ]).condition : condition
       if condition.test == "ArnEquals" &&
       condition.variable == "ec2:InstanceProfile" &&
-      toset(condition.values) == toset(var.instance_profile_arns)
+      toset(condition.values) == toset(var.ec2_instance_profile_arns)
     ]) == 1
     error_message = "The instance authorization must require an exact runtime instance profile."
   }
@@ -193,9 +194,10 @@ run "ec2_launch_authority_matches_each_resource_context" {
       ]).resources) == toset([
       "arn:aws:ec2:us-east-1:123456789012:instance/*",
       "arn:aws:ec2:us-east-1:123456789012:network-interface/*",
+      "arn:aws:ec2:us-east-1:123456789012:spot-instances-request/*",
       "arn:aws:ec2:us-east-1:123456789012:volume/*",
     ])
-    error_message = "Tag-on-create authority must cover exactly the three resources emitted by the canary worker."
+    error_message = "Tag-on-create authority must cover exactly the four resources emitted by the Spot canary worker."
   }
 }
 

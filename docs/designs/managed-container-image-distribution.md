@@ -659,8 +659,10 @@ handler cannot clear a successor claim or rewind its cursor.
 
 A PROFILE_CANARY operation is the only operation row that also acts as its work
 queue. RUNNING then carries a random lease, expiry, one bounded child launch ID,
-and teardown deadline. The canary resource is tagged with operation/profile/
-generation, may exercise only one target/backend, and always auto-terminates. A
+and teardown deadline. Every canary child is tagged with operation/profile/
+generation and may exercise only one target/backend. EC2 guest exit traps request
+shutdown even when pull or inspection fails, while provider teardown remains the
+authoritative removal proof. A
 continuous lease heartbeat starts before credential acquisition. The actual STS,
 EC2, EKS, IAM, and Kubernetes call boundaries synchronously prove ownership both
 before and after each call. A provider create uses a stronger ordered fence.
@@ -683,11 +685,25 @@ create remains RUNNING for successor cleanup and never discards the deterministi
 child identity by terminalizing the operation. EC2 `RunInstances` uses one stable
 operation-derived `ClientToken`, and EKS uses one deterministic namespaced pod
 name, so a lost response or successor replay converges on the same child rather
-than launching a second paid resource. An ambiguous launch response remains
-reclaimable until that idempotent replay identifies the child or bounded
-provider settling proves repeated absence. EC2 cleanup follows the known child
-through `shutting-down` to `terminated`; EKS cleanup accounts for a timed-out
-create that becomes visible after the first delete. A persisted child also
+than launching a second paid resource. A Spot launch tags the
+`spot-instances-request` itself with the same catalog, operation, and profile
+identity. Cleanup discovers the complete tagged request inventory, cancels every
+open, active, or disabled request, retains every associated instance ID before
+and after cancellation, and requires both a terminal request state and exact
+instance termination. Since cancellation does not terminate an already launched
+instance, neither proof can substitute for the other. An ambiguous launch
+response remains reclaimable until the tagged Spot request is cancelled and
+terminal. A terminal request without a concrete request-to-instance association
+does not collapse the absence window: every request transition or newly visible
+child resets bounded settling, cleanup repeatedly exact-reads every known
+request and rediscovers every page of tagged instances, and a late association
+is retained and terminated. Malformed, empty, or cyclic pagination fails closed.
+Only a concrete association to an exactly terminated instance may finish early;
+otherwise the terminal no-instance outcome must remain stable for the complete
+60-observation cadence. On-demand ambiguity still requires the complete
+instance-absence window. EC2 cleanup follows every known child through
+`shutting-down` to `terminated`; EKS cleanup accounts for a timed-out create
+that becomes visible after the first delete. A persisted child also
 remains reclaimable if its immutable contract cannot be reloaded, because no
 terminal transition may substitute for provider teardown; an incompatible
 worker rotates that expired queue row without clearing its child identity so a
@@ -737,22 +753,70 @@ charge the previous UTC window.
 EC2 canary bindings require at least one explicit security group in every
 qualified AMI region. The worker always sends those groups and applies the
 catalog, operation, and profile tag specifications to the instance, every
-created EBS volume, and every created network interface. The generated IAM role
-authorizes `RunInstances` against the exact AMI, subnet, security groups,
-instance type, and runtime instance profile. AWS evaluates the created resource
-classes separately. Instance and EBS-volume authorization requires the catalog
-and operation request tags. The implicit network-interface authorization
-context does not expose either those request tags or `ec2:InstanceType`, so its
-separate statement instead requires the exact declared subnet. That statement
-cannot authorize an independent network-interface create: the role has no
-`CreateNetworkInterface` action, and the complete `RunInstances` call must still
-pass every exact image, network, instance, profile, and tagged-resource
-statement. Exact AMI policy resources use EC2's accountless authorization ARN,
+created EBS volume, every created network interface, and, for Spot, the request
+itself. The generated IAM role authorizes `RunInstances` against the exact AMI,
+subnet, security groups, instance type, runtime instance profile, and created
+resource classes. AWS evaluates those classes separately. Instance and
+EBS-volume authorization requires the catalog and operation request tags. The
+implicit network-interface authorization context exposes neither those tags nor
+`ec2:InstanceType`, so its separate statement instead requires the exact
+declared subnet. That statement cannot authorize an independent interface
+create because the role has no `CreateNetworkInterface` action, and the complete
+`RunInstances` call must still satisfy every exact image, network, instance,
+profile, and tagged-resource statement. Spot-request authorization requires the
+same catalog and operation tags. Exact AMI policy resources use EC2's
+accountless authorization ARN,
 `arn:<partition>:ec2:<region>::image/<ami-id>`; the separately qualified AMI ID,
 observed owner account, and compute-account binding retain ownership identity.
-A separate `ec2:CreateTags` statement is limited by
-`ec2:CreateAction=RunInstances`; it is not combined with launch conditions. The
-role never relies on an implicit VPC default security group.
+
+EC2 passable roles and instance profiles are separate inputs from EKS
+inspect-only node profiles. `iam:PassRole` names only EC2 runtime roles, and the
+mandatory instance-resource authorization uses `ArnEquals` on
+`ec2:InstanceProfile` with only the EC2 launchable profiles. Instance-only
+condition keys are not attached to the AMI, network, volume, or Spot-request
+authorizations. EKS node profiles receive `iam:GetInstanceProfile` only and the
+two profile sets are disjoint. Every role, profile, image, network, cluster,
+key, and permissions-boundary input is an exact ARN with no IAM wildcard or
+policy-variable syntax. Target resources are constrained to the active
+partition, account, and region as appropriate. `iam:PassedToService` is derived
+from the partition DNS suffix, including `ec2.amazonaws.com.cn` in `aws-cn`.
+The role may list Spot requests but may cancel only regional request resources
+carrying the exact catalog ownership tag. A separate `ec2:CreateTags` statement
+is limited by `ec2:CreateAction=RunInstances`; it is not combined with launch
+conditions. The role never relies on an implicit VPC default security group.
+EC2 qualification canaries use one-time Spot capacity with terminate-on-
+interruption by default. `canary_use_spot: false` is the explicit escape hatch
+for an account or region that requires on-demand qualification. A failed Spot
+launch remains a retryable canary operation; the worker does not silently
+change market type under the same idempotent client token or launch a second
+fallback child. The configured worst-case reservation remains the cost ceiling,
+so Spot savings never weaken the daily budget fence. EKS qualification uses an
+existing declared cluster and does not choose that cluster's capacity type.
+Serve and job placement remain owned by their normal SkyPilot resource policy,
+not by the image plane. Newly parsed profiles always project the default
+`true`, so changing from the pre-field on-demand behavior to Spot changes both
+the profile hash and binding fingerprint and requires the normal profile
+revision increment. A legacy persisted snapshot with no field restores an
+internal unspecified state, preserves its old fingerprint projection, and
+continues to replay on-demand under its existing idempotent token. Explicit
+`false` is also projected and selects on-demand for a newly staged revision.
+Public config and new snapshots accept only booleans, never the legacy internal
+unspecified value.
+Each compute account applies `aws-image-canary-account` exactly once before
+planning any EC2 canary target. That account-scoped module owns
+`AWSServiceRoleForEC2Spot`; every regional `aws-image-canary-target` requires
+and shares its output instead of racing to create an account-global role. This
+keeps a target ready for the public Spot default even when a staged profile
+revision explicitly selects on-demand. An existing role is imported into the
+account module with the active AWS partition. The account-global role is
+destruction-protected because every region and any other Spot workload shares
+it; deliberate decommission removes regional targets and grants first. If a
+qualified AMI or snapshot is encrypted with a customer-managed KMS key, the
+regional target module receives that exact key ARN and grants the Spot
+service-linked role only the AWS-documented launch operations. AWS-managed EBS
+keys need no grant. Omitting a required customer-managed key makes
+qualification fail closed; the canary worker never receives direct KMS
+authority.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -1092,9 +1156,18 @@ ring rotation without scanning the catalog.
 Every lifecycle claim uses the same durable background lease heartbeat as copy
 work. The AWS adapter invokes the exact lease fence immediately before and after
 its STS `AssumeRole` request; caller-side checks alone are not credential
-fencing. The worker synchronously re-proves ownership in the hook immediately
-before every ECR call, records `DELETE` intent before the destructive call, and
-rechecks ownership again before database completion. Lease loss sets
+fencing. Both STS authority acquisition and the assumed service client use an
+explicit 10-second connect timeout, 60-second read timeout, and one total
+attempt. The botocore session that resolves the worker's ambient credentials
+inherits that same default client configuration before its credential-provider
+chain is constructed. Deferred IRSA `AssumeRoleWithWebIdentity`, profile-role,
+and other nested credential clients therefore cannot silently restore the SDK's
+longer retry policy while signing the explicit STS request. A hidden credential
+refresh or SDK retry cannot consume the canary custody budget or continue
+indefinitely after worker drain. The worker synchronously re-proves
+ownership in the hook immediately before every ECR call, records `DELETE` intent
+before the destructive call, and rechecks ownership again before database
+completion. Lease loss sets
 cancellation state and starts no later provider call. A call that may already
 have started is never treated as cancelled, present, or absent; it converges
 only to QUARANTINED unless its conclusive response was durably recorded as
@@ -1140,17 +1213,47 @@ ordinary provisioning, quotas, setup, or user code are not rewritten by the
 image feature.
 Exception-envelope decoding is itself a bounded compatibility boundary. The
 decoder accepts only a string exception type, a list or tuple of positional
-arguments, and a dictionary with string attribute keys. Unknown types retain
-the existing generic fallback, while malformed fields or a constructor that
-rejects the supplied shape return a generic built-in error. Invalid envelopes
-never raise a secondary decoder exception or reflect the complete untrusted
-payload into an error message. Built-in exceptions are constructed from
-positional arguments only, after which ordinary string-key attributes are
-restored independently; an attribute that is read-only, slotted, or otherwise
-unsettable is skipped without replacing the original error. Dunder attributes
+arguments, and a dictionary with string attribute keys. Unknown types and known
+objects that are not exception classes both return the same fixed, value-free
+`RuntimeError`; neither the supplied type nor message is reflected. Malformed
+fields or a constructor that rejects the supplied shape return that generic
+built-in error too. Invalid envelopes never raise a secondary decoder exception
+or reflect the complete untrusted payload into an error message.
+
+Built-in exceptions are constructed from positional arguments only, after which
+ordinary string-key attributes are restored independently. For a known SkyPilot
+exception, the serialized arguments, rendered message, and ordinary attributes
+are the canonical wire state; `BaseException.args` is not assumed to have the
+same shape as the subclass constructor. Reconstruction first binds matching
+ordinary attributes to named constructor parameters, then binds serialized
+arguments only to remaining positional parameters. This preserves subclasses
+such as validation errors whose constructor-only context is stored in ordinary
+attributes. If a current subclass constructor transforms its input into an
+already-rendered message, the decoder may restore the validated `BaseException`
+state without invoking that transformation a second time, but only when the
+serialized arguments themselves reproduce the separately serialized message.
+Subclasses that intentionally exclude arguments remain constructor-restored from
+their named attributes. The decoder verifies the reconstructed type, arguments,
+and rendered message before accepting it. Remaining forward-version attributes
+are restored after construction, so an older client preserves the known
+exception type when a newer server adds an ordinary attribute. An attribute that
+is read-only, slotted, or otherwise unsettable is skipped without replacing the
+original error. `args` is reserved wire state and is never admissible inside the
+ordinary attribute map; a contradictory duplicate is malformed rather than
+being allowed to replace the constructed exception's message. Dunder attributes
 are never constructor arguments. Valid Python 3.11 exception notes are emitted
 outside the attribute map for old-client compatibility, while the decoder also
-accepts the legacy attribute form and restores notes only after construction.
+accepts the legacy attribute form and restores notes only after construction. A
+forward attribute that shadows `add_note` is dropped and cannot be invoked;
+notes fall back to the validated `__notes__` slot so malformed input never
+raises a secondary exception. The real `BaseException.__context__`
+slot is a separate optional envelope field rather than an ordinary attribute.
+Context serialization applies the same safe-exception wrapping and canonical
+decoder rules recursively, stops at eight levels, and replaces a cycle,
+malformed nested envelope, or over-depth tail with the same fixed value-free
+`RuntimeError`. Restoring or reserializing a valid raised-inside-except chain
+therefore preserves its exact safe types and state without permitting an
+attacker-controlled type name or unbounded graph.
 
 For `locality: prefer`, candidate generation assigns READY managed, authenticated
 direct, and WARMING managed paths locality ranks 0, 1, and 2. It selects the best
@@ -1563,6 +1666,7 @@ container_registries:
         us-west-2: ami-0fedcba9876543210
       canary_authority: compute-canary
       canary_instance_type: t3.micro
+      canary_use_spot: true  # defaults to true; set false for on-demand
       canary_subnets:
         us-east-1: [subnet-0123456789abcdef0]
         us-west-2: [subnet-0fedcba9876543210]
@@ -1694,13 +1798,15 @@ attestations without the observed architecture are intentionally invalid and
 must be refreshed by a new canary. A pull-only marker or the configured canary
 platform is not architecture evidence. A target cannot use its ordinary
 `delete_authority: disabled` setting to skip qualification cleanup.
-The operation-tag query remains the duplicate detector and teardown inventory,
-but it cannot supply attestation fields. Every polling read must return exactly
-the launched or replay-discovered child ID. The worker then performs an ID-scoped
-`DescribeInstances` read, verifies that same ID and the exact operation, catalog,
-and profile tags, and derives host AMI, architecture, instance profile, and
-lifecycle state from that one response. The observed AMI must equal the qualified
-regional AMI. The console marker is read from that same child.
+The operation-tag instance query remains the duplicate detector and attestation
+inventory, but it cannot supply attestation fields. The independent
+operation-tag Spot-request query is teardown-only custody inventory. Every
+polling instance read must return exactly the launched or replay-discovered child
+ID. The worker then performs an ID-scoped `DescribeInstances` read, verifies that
+same ID and the exact operation, catalog, and profile tags, and derives host AMI,
+architecture, instance profile, and lifecycle state from that one response. The
+observed AMI must equal the qualified regional AMI. The console marker is read
+from that same child.
 An absent instance-profile ARN while that exact child is still pending or
 running is retried within the same bounded deadline because EC2 may expose the
 instance before its profile attachment. Once the exact expected ARN is
@@ -1732,9 +1838,11 @@ after all observed children are verified terminated.
 
 `canary_worst_case_cost_usd` is reserved atomically with the operation lease
 before any child launch. It is a conservative operator-set ceiling for one run,
-not an observed bill. `canary_timeout_seconds` bounds launch, pull, observation,
-and teardown. Once that deadline passes, an exact live owner may only discover
-and tear down the already-persisted deterministic child and record
+not an observed bill. `canary_timeout_seconds` bounds ordinary launch, pull, and
+observation. Mandatory custody teardown has the separate absolute EC2 or EKS
+cleanup budget below, so an ordinary timeout cannot prevent child removal. Once
+the ordinary deadline passes, an exact live owner may only discover and tear
+down the already-persisted deterministic child and record
 `CANARY_TIMEOUT` after verified teardown; an unverified teardown remains
 reclaimable work. It cannot attach a new child, publish success, or perform
 another launch. V0 supports only `linux/amd64`;
@@ -2118,16 +2226,19 @@ Helm exposes three disabled-by-default deployments:
 imageCopyWorker.enabled
 imageCopyWorker.replicaCount
 imageCopyWorker.maxInFlight
+imageCopyWorker.terminationGracePeriodSeconds
 imageCopyWorker.serviceAccount
 
 imageLifecycleWorker.enabled
 imageLifecycleWorker.replicaCount
 imageLifecycleWorker.maxInFlight
+imageLifecycleWorker.terminationGracePeriodSeconds
 imageLifecycleWorker.serviceAccount
 
 imageCanaryWorker.enabled
 imageCanaryWorker.replicaCount
 imageCanaryWorker.maxInFlight
+imageCanaryWorker.terminationGracePeriodSeconds
 imageCanaryWorker.serviceAccount
 ```
 
@@ -2228,9 +2339,186 @@ inspection is read-only, and destination authority remains fenced after it.
 Lifecycle additionally makes durable `DELETE` intent a synchronous precondition
 of every destructive provider call.
 
-Shutdown stops new claims, cancels work that has not started provider I/O, and
-lets leases expire after ambiguous I/O. Restart recovery verifies actual
-registry state for immutable copy work and pre-delete claims. An expired
+Shutdown is a no-new-work fence. Every worker rechecks its process stop event
+after heartbeat or configuration work and immediately before each maintenance
+call, queue claim, and executor submission. Copy and lifecycle route every
+executor submission through one shared stop-aware admission helper. The helper
+submits only an entry wrapper, whose single stop-event read is the admission
+linearization point. If shutdown wins that read, the wrapper returns before
+invoking the task, so no database or provider boundary starts and the durable
+claim remains safely lease-recoverable. If the wrapper wins, the operation was
+admitted before shutdown and is treated as already in flight. This closes a
+signal arriving after the caller's final check or inside `Executor.submit`
+without holding a lock across provider work. Copy checks before and after every
+independently blocking inventory, publication, and location claim; it cannot
+begin a later claim after an earlier claim observes shutdown. It also checks
+between configuration reload and qualification-manifest ingestion, and the
+ingestor checks again before every independently persisted file. Lifecycle
+checks between each independent maintenance substep. Synchronously invoked
+bounded helpers receive the same stop predicate and check it before their first
+bulk state query and before every per-location or per-demand transaction. A stop
+observed at any boundary finishes only an already-open atomic transaction and
+exits without beginning more database or provider work. Submitted individual
+lease-owned operations drain through the executor; bounded qualification pages
+also stop between independent profile, target, reservation, and automatic
+runtime-canary scheduling items. Copy-role qualification threads the same live
+predicate into each per-target and per-shard helper, its source-registry reader,
+every ECR provider fence, and the transfer cancellation event. Lifecycle-role
+qualification applies the predicate inside exact-delete request and readback,
+so a stop observed after a delete response cannot begin the later presence
+proof. Both roles recheck stop between provider acquisition, provider proof,
+and the next database transaction. Lease fencing and durable state still own
+any ambiguous provider result.
+
+The canary worker additionally passes the same stop event into every submitted
+canary. A task that has not created a provider child exits without launching
+one. A task that may own a child observes the event between bounded provider
+calls and on every runtime poll, then enters its existing `finally` teardown.
+Every ordinary provider client acquisition and SDK call uses a drain-aware lease
+fence: it proves the lease, then rechecks drain immediately before the raw call.
+Compound EC2 and EKS helpers repeat that fence before every page, authority
+acquisition, log read, node read, and role lookup. Cancellation never interrupts
+teardown itself. Teardown uses separate explicit cleanup calls that deliberately
+ignore drain while retaining lease and deadline fencing. A persisted child
+claimed before shutdown therefore runs in cleanup-only mode and cannot be
+recreated or continue ordinary qualification reads. This reduces shutdown
+observation from the 3,600-second runtime maximum to one bounded provider call
+or the 10-second poll interval, followed by custody cleanup. Verified cleanup
+rechecks the process stop event before any success or failure terminalization.
+If shutdown arrived during teardown, that exact owner releases the still-RUNNING
+token instead, so successful cleanup cannot race into terminal qualification.
+Once an unstarted task or verified teardown has no live provider child, the
+exact owner advances its lease expiry to PostgreSQL's current time under the same
+token. The replacement worker can reclaim it immediately without waiting for the
+normal 15-minute lease. A failed release remains safe and falls back to ordinary
+lease-expiry recovery.
+
+EC2 teardown uses one absolute 480-second deadline within the 600-second
+shutdown grace. Its terminal no-child proof remains 60 observations at a
+five-second absolute cadence, so provider-call latency consumes the current
+interval instead of accumulating after every fixed sleep. The remaining budget
+is bounded headroom for credential acquisition, complete paginated discovery,
+and provider calls. Teardown establishes that deadline before acquiring a fresh
+cleanup-only EC2 client and never reuses the ordinary runtime client, whose
+fixed one-hour assumed credentials may expire at the allowed 3,600-second
+runtime limit. Ambient credential materialization, STS role assumption, and
+service-client creation all receive the same lease and cleanup deadline fence.
+Teardown checks that deadline immediately before and after every preliminary
+discovery, every page of instance and Spot-request discovery, request
+cancellation, post-cancel exact request read, instance termination, and
+exact-state provider call. A cancellation-versus-fulfillment race therefore
+adds the returned instance ID to the retained set before teardown can succeed.
+A Spot cleanup is verified only when every discovered request is `cancelled`,
+`closed`, or `failed`, and every associated or operation-tagged instance is
+`terminated`.
+The shared deadline is passed into the provider wrapper. That wrapper
+proves the lease first, rechecks the deadline after any blocking heartbeat
+database round trip, and only then invokes the raw SDK call. A call that crosses
+the deadline makes cleanup unverified and no later provider call starts. EKS
+cleanup applies the same call-start ordering to its own bounded delete/read
+settling deadline. Its canary-specific Kubernetes client executes kubeconfig
+`exec` credentials with a 15-second subprocess timeout in an isolated process
+group. Concurrent bounded readers retain at most 1 MiB each from stdout and
+stderr. Each reader reports clean EOF, overflow, and read failure separately;
+overflow or any read failure terminates the complete group and fails closed.
+Timeout, overflow, and read failure use bounded terminate-then-kill waits and
+always reap the direct child. Reader threads catch every exception category, so
+no unexpected reader failure can accept a buffered prefix or reach
+`threading.excepthook` with plugin diagnostics.
+
+Subprocess capture, complete `ExecCredential` validation, declared-expiration
+parsing, loader application, Kubernetes client construction, and the final
+provider fence form one credential-isolation boundary. It accepts only the
+requested exact `apiVersion`, `kind: ExecCredential`, a mapping `status`, and
+either one nonempty token or a complete nonempty certificate and key pair.
+Malformed expiration values and credentials without enough declared lifetime
+for one bounded API call fail with a fixed value-free classification. On any
+failure the boundary clears byte buffers and credential-bearing references,
+detaches control exceptions from sensitive tracebacks, exits every active
+exception handler, and returns only a value-free failure classification or the
+original sanitized drain/deadline control exception. The outer caller alone
+raises that result. No transient plugin stdout, stderr, decoded payload,
+credential value generated or parsed inside the boundary, decoder or loader
+exception, or prior credential failure may survive in the public exception
+message, cause, context, traceback-frame object graph, serialized envelope, or
+logs. This does not prohibit a successfully returned Kubernetes client from
+owning its installed credential while the client remains usable. Before any
+refresh, provider, or control exception escapes a provider-wrapper frame, that
+wrapper scrubs installed API keys, authentication prefixes, username/password,
+certificate/key references, cookies, and authentication headers, closes the
+client, and replaces it with a credential-free invalid state. The next
+lease-valid call must rebuild it under the existing deadline. Provider
+exceptions are detached from dependency tracebacks before propagation, so
+request-local authorization headers cannot remain reachable. A later
+drain/deadline fence that wins during refresh is invoked with no credential
+exception active, so it cannot acquire that failure as hidden context. A
+descendant that inherited a pipe therefore cannot extend the credential budget
+or leak a credential or diagnostic secret.
+When the Kubernetes wrapper is composed with the canary's generic fenced
+client, the generic wrapper delegates its initial lease, drain, and deadline
+fence to `ProviderFencedCoreApi` instead of running the same fence while its own
+traceback frame still owns the live credential-bearing wrapper. The inner
+wrapper captures an initial control failure, invalidates and scrubs the client,
+then propagates the detached original control type. Non-Kubernetes providers
+retain the generic wrapper's direct pre-call fence.
+The EKS canary also owns one explicit outer client lifetime. Its `finally`
+block completes any required child teardown first, then closes and scrubs the
+Kubernetes wrapper before any success, validation failure, provider failure,
+drain, lease loss, cleanup failure, or other exception leaves
+`_run_eks_canary`. No outer canary traceback frame may therefore retain a live
+installed credential after the function exits.
+EC2 and EKS also separate work failure from the final cleanup winner. If
+teardown failure, drain, or lease loss replaces an active provider failure, the
+worker exits the losing exception handler, drops its traceback and response
+state, and only then raises the deterministic winning error with no cause or
+context. An internal typed teardown signal remains distinct through
+`run_canary` terminalization, so only a genuine unverified teardown preserves
+the durable child for successor cleanup. An unrelated provider `ValueError`
+with the same message remains an ordinary provider failure and terminalizes as
+`CANARY_FAILED` after successful cleanup. The same boundary preserves the
+original provider exception when teardown succeeds, so useful ordinary
+diagnostics are not erased. Cleanup may therefore determine custody without
+making a losing provider response, request-local authorization header, or other
+provider state reachable from the winning exception or its serialized envelope.
+Transparent library-side refresh is removed from the raw API call path. The
+wrapper converts a kubeconfig credential's declared wall-clock expiry into one
+monotonic refresh deadline when the credential is accepted, preserving the
+existing API-timeout headroom. Configured refresh intervals are monotonic too.
+Later wall-clock jumps cannot extend or prematurely reset either deadline.
+In-cluster projected service-account credentials have no exposed token expiry,
+so the wrapper explicitly rebuilds that client on the Kubernetes library's
+one-minute monotonic token-refresh cadence under the same fence.
+The wrapper revalidates the monotonic deadline after the final acquisition
+fence, after refresh admission, and immediately before the raw method. A
+credential that loses its API-call headroom during loader or fence work is
+scrubbed and rejected without a provider call.
+Every refresh receives the current ordinary drain fence or cleanup deadline,
+rechecks that fence after credential acquisition, and only then invokes the raw
+Kubernetes method. Cleanup establishes its one 60-second deadline before any
+replacement client acquisition, so a missing or expired client cannot create a
+fresh auth budget outside teardown. Unsupported legacy auth-provider commands
+are rejected on this bounded EKS canary path rather than executed without a
+timeout. Every canary provider wrapper also leaves a failed SDK call's exception
+handler before rechecking drain, lease, or deadline state. If that control fence
+wins, the wrapper clears the losing provider error and response before raising
+the detached control exception, so it cannot acquire provider diagnostics as
+hidden context. The canary Deployment enforces a termination grace of at least
+600 seconds. The grace covers the 480-second absolute EC2 cleanup budget,
+including the 60-observation settling cadence and bounded provider-call
+overhead, plus process-exit margin. The process exits immediately when cleanup
+completes, so the
+configured ceiling does not add a fixed rollout delay. The same drain applies to
+disable and scale-down. For `helm upgrade --reuse-values`, legacy value maps that
+omit the three worker grace keys render copy/lifecycle/canary defaults of
+30/30/600 seconds. Null is treated as a legacy omission, while an explicit zero,
+non-integral value, string, or canary value below 600 remains invalid in both
+schema validation and the independent template guard. If the
+grace expires or bounded provider cleanup itself fails, the operation and
+concrete child identity remain RUNNING for lease-expiry recovery rather than
+being falsely terminalized.
+
+Restart recovery verifies actual registry state for immutable copy work and
+pre-delete claims. An expired
 destructive intent quarantines its exact physical reference without trusting a
 read to bound an older delete.
 
@@ -2549,8 +2837,12 @@ CLI or Dashboard locates such a publication for explicit retry.
 3. While old 023 API replicas still serve traffic, confirm they ignore the
    additive 024 tables. Roll every API replica to the new binary, then prove no
    old pod remains before feature activation.
-4. Apply Terraform in one dedicated registry account, import its qualification
-   manifest, and stage the desired profile revision without activating it.
+4. Apply Terraform in one dedicated registry account. In each compute account,
+   apply the account-global Spot bootstrap once, then every regional canary
+   target and any customer-managed AMI KMS grants. Keep EC2 passable roles and
+   profiles separate from EKS inspect-only node profiles. Import the
+   qualification manifest and stage the desired profile revision without
+   activating it.
 5. Deploy one copy worker, one lifecycle worker, and one runtime-canary worker
    with separate identities.
 6. Let each worker attest only its own capability, run actual-principal EC2 and
@@ -2630,6 +2922,13 @@ drained and every image table is empty; it is never part of Helm rollback.
   regional-delete, identity-policy, repository-policy, and
   permissions-boundary tests via
   `terraform test -test-directory=terraform-tests`;
+- clean-account Spot service-linked-role planning, existing-role import
+  instructions, regional customer-managed AMI KMS grants, and least-privilege
+  Spot request tag, describe, and cancel policy tests; mixed EC2/EKS plans prove
+  only EC2 runtime roles are passable, the required instance-resource
+  permission pins `ec2:InstanceProfile`, instance-only conditions do not poison
+  other resource authorizations, EKS node profiles remain inspect-only, and an
+  EKS-only target has no EC2 launch or `PassRole` authority;
 - EC2 instance and EKS kubelet runtime pull-auth refresh tests, preinstalled
   helper/AMI enforcement, homogeneous EKS-node-role validation, multi-cluster
   attestation, no managed-path CLI install/login, plus
@@ -2643,10 +2942,66 @@ drained and every image table is empty; it is never part of Helm rollback.
   duplicate environment, volume, and mount-path collisions, excludes API-only
   inputs from the Job, mounts shared database TLS material into every database
   consumer, and keeps two same-namespace source-secret grants distinct under a
-  63-character fullname;
+  63-character fullname; schema-bypassed template tests independently reject
+  explicit zero, sub-600, non-integral, and string canary grace values;
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
+- lost-response Spot tests where cancellation first reports a terminal request
+  without an instance, a request-to-instance edge appears on a later exact
+  read, a late request transition cannot reuse an earlier absence interval, and
+  a true terminal no-child outcome consumes the complete settling window;
+  paginated instance discovery must terminate a running child found only on a
+  later page and reject malformed or cyclic cursors; the production 60-poll
+  absolute cadence must complete with nonzero provider latency inside its
+  distinct 480-second deadline;
+- deterministic stop-during-heartbeat tests for copy, lifecycle, and canary
+  workers proving that shutdown begins no later maintenance, internal copy
+  claim, manifest-ingestion item, lifecycle-maintenance item, publication fanout
+  transaction, terminal-consumer query or transaction, qualification item, or
+  executor submission; stop-aware admission tests set shutdown inside the
+  submission boundary after the caller's final check and prove the entry wrapper
+  never invokes the claimed task; per-target copy and per-shard qualification
+  tests prove
+  stop after a provider proof cannot start the next database transaction or
+  shard, the source reader receives the live predicate, transfer cancellation
+  observes it without a snapshot, and lifecycle stop after a concluded delete
+  cannot begin exact readback; provider-level canary drain tests proving
+  cancellation cannot create a new child, cannot begin an ordinary authority
+  acquisition or provider read after a lease heartbeat observes drain, always
+  enters uncancelled teardown for an owned child, and cannot terminalize success or
+  failure when shutdown arrives during verified cleanup; slow-provider tests
+  proving EC2 settling passes one absolute deadline through the real fenced
+  client, rechecks it after a heartbeat that crosses the deadline, treats an
+  over-budget result as unverified, cannot start that or any later provider call
+  after its 480-second wall-clock budget, and acquires fresh cleanup credentials
+  under that deadline instead of reusing a one-hour runtime session;
+  PostgreSQL tests proving a verified drain is immediately reclaimable while a
+  stale token cannot release its successor; plus Helm rendering and schema tests
+  enforcing the canary's 600-second minimum custody-cleanup grace and legacy
+  `--reuse-values` defaults of 30/30/600;
+- real deferred-IRSA credential-provider tests proving its nested unsigned STS
+  client inherits 10/60/one-attempt defaults without making a network request;
+  real kubeconfig exec tests proving bounded success, whole-process-group
+  termination when a descendant inherits a pipe, early stdout and stderr flood
+  rejection, fail-closed injected stdout and stderr reader failures before and
+  after partial or syntactically valid output, exact API version and kind,
+  complete credential shape, fixed invalid-expiration handling, and value-free
+  failures with empty cause and context chains; tests traverse every public
+  exception's traceback locals through a bounded cycle-safe object-graph walk,
+  plus the nested exception graph, serialized envelope, and captured logs for
+  unpredictable child-generated secrets; installed-client invalidation on
+  refresh, provider, and control failures, including an initial canary lease,
+  drain, or deadline failure before Kubernetes refresh, plus explicit
+  outer-canary invalidation after success, validation failure, provider failure,
+  drain, lease loss, or teardown; direct-child reaping, no transparent
+  API-client refresh hook, one-minute monotonic
+  in-cluster projected-token rotation, monotonic declared-expiry conversion,
+  rejection when a final fence or pre-call callback consumes the remaining
+  headroom, backward and forward wall-clock jump immunity,
+  ordinary refresh stopped before a raw call, cleanup refresh stopped at the
+  shared deadline, and persisted-child drain entering cleanup-only before
+  ordinary auth acquisition;
 - worker-clock skew and blocking-lock tests proving that copy and eviction
   claims, provider grants and throttles, retry delays, consumer terminal
   confirmation, unattached-cluster retention, worker cleanup, and terminal
@@ -2688,13 +3043,18 @@ drained and every image table is empty; it is never part of Helm rollback.
   EKS creates, slow-host-clock denial after database expiry,
   renewal-crosses-deadline rejection for EC2/EKS, and a
   production failure caller blocked past lease expiry without stale-clock
-  terminalization;
+  terminalization; Spot-specific regressions lose both accepted launch
+  responses, discover an open operation-tagged request with no instance, race
+  fulfillment against cancellation, retain the late instance ID, and require
+  terminal request plus terminated instance proof before terminalization;
 - idempotency collision-matrix, canonical publication fan-out, controller
   restart, shard-ceiling, and inventory-drift tests;
 - source/destination/compute account separation, cross-identity attestation,
   negative STS trust, permissions-boundary, repository-policy size/principal,
-  KMS grant, protected destroy, empty import, desired-generation fencing, and
-  old-revision drain tests;
+  KMS grant, protected destroy, empty import, exact-ARN wildcard and
+  policy-variable rejection, target account/region/partition validation,
+  partition-derived China PassRole service names, desired-generation fencing,
+  and old-revision drain tests;
 - policy-only profile revision location reuse and physical-layout-change
   rejection after first release, including a constant-row custody marker plan,
   READY-versus-stage interleavings, and activation revalidation;
@@ -2742,6 +3102,16 @@ drained and every image table is empty; it is never part of Helm rollback.
 - worker-entrypoint tests proving copy, lifecycle, and runtime-canary processes
   verify global state, Serve, and Managed Jobs before health construction and
   fail before health or provider work when any central schema is stale;
+- exception-envelope tests proving unknown and known non-exception types share
+  one value-free sanitized result, forward-version ordinary attributes preserve
+  a known SkyPilot exception type, unsettable attributes cannot replace the
+  original error, a duplicate `attributes.args` cannot replace canonical wire
+  state, a shadowed `add_note` cannot raise or reflect its value, and every
+  currently defined SkyPilot exception class has an exact serialize/deserialize
+  round trip for type, arguments, message, notes,
+  restorable ordinary state, and the real raised-inside-except context slot;
+  unsafe nested types use the safe wrapper, while cycles, malformed nested
+  envelopes, and chains beyond eight levels end in the fixed sanitized error;
 - Dashboard A-to-B workspace-switch tests with workspace A already rendered,
   proving both pending and failed capability replacement immediately remove A's
   data, mutation controls, open dialogs, retries, and hidden errors, plus
@@ -3546,6 +3916,245 @@ retry, and landed exception-compatibility fixes while retaining strict envelope
 shape validation, constructor-safe note serialization, tolerant attribute
 restoration, and sanitized fallbacks. The acceptance streak remains zero.
 
+Codex final-acceptance round 1 at
+`e6d46103b872433ad504517ba11db76f8fa5c967` returned `RESHAPE`; Fable again
+could not start because its exact `claude-fable-5` request reached the account
+limit before using any token. Codex re-proved the latest EC2 custody repair and
+the complete 26-check GitHub rollup, then reproduced two independent boundary
+defects. A stop signal arriving during a worker heartbeat could still begin
+maintenance, claim, and submit new work; the canary Deployment's 30-second
+termination grace could then kill a paid canary before its bounded runtime and
+teardown completed. Separately, unknown exception types reflected untrusted type
+and message values, while a forward-version ordinary attribute could replace a
+known SkyPilot exception with a generic fallback. This revision makes shutdown
+a no-new-work fence for all three workers, actively cancels canary runtime waits
+into uncancelled custody teardown, enforces a 600-second cleanup grace, sanitizes
+unknown exception identities, and partitions known constructor fields from
+restorable forward-version attributes. The acceptance streak remains zero.
+
+PR #368 merged as `e712186072fede57d08841e0ac7e0d184b174c18` before the
+round-one repairs above were committed. The corrections therefore continue as
+a focused follow-up from `966a8d014ca81610f3b24ceb35e221384b0aab2b`; they do
+not rewrite the merge or treat the merged state as reviewed acceptance.
+
+Codex final-acceptance round 1 at
+`71c6dca4f5b91facca3a8696fea4d0692003c249` returned `RESHAPE`; the exact
+`claude-fable-5` plan-mode request again returned HTTP 429 before using any
+token, so no paired acceptance was recorded. Codex reproduced five blocking
+boundaries on the otherwise green 26-check head: EC2 teardown could start calls
+after its deadline, shutdown during verified cleanup could still terminalize a
+canary, copy could begin later internal claims after observing shutdown, legacy
+Helm reuse values omitted required grace keys, and several current SkyPilot
+exceptions did not round-trip their canonical state. The adjacent audit also
+made STS retry and timeout bounds, configuration-to-ingestion shutdown, and
+lifecycle maintenance substep shutdown explicit. This revision closes those
+boundaries as one batch. The acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`b1ebe1a9594cc7a696afcfaf5675ec1de2e43092` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request reached its weekly limit before
+using any token, so no paired acceptance was recorded. Codex independently
+re-ran the 352-test feature matrix, 108 worker tests, real PostgreSQL drain proof,
+all 191 Helm tests, and the complete 26-check GitHub rollup, then reproduced
+three compound boundary defects. An EC2 cleanup heartbeat could cross the shared
+deadline before an unfenced raw AWS call, ordinary EKS and EC2 qualification
+could acquire a later authority or begin a later provider read after drain, and
+synchronous manifest, publication-fanout, and terminal-consumer loops could
+start later independent transactions after stop. This revision moves deadline
+and drain checks inside the provider fence and threads the stop predicate through
+every independently startable synchronous item. The acceptance streak remains
+zero.
+
+Codex final-acceptance round 1 at
+`15db7837245a07a632b1587ba8a0b0fbe649c58c` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request again reached its seven-day limit
+before using any token, so no paired acceptance was recorded. Codex verified
+the repaired canary deadline fence, compound maintenance stops, all 191 Helm
+tests, and the complete 26-check GitHub rollup, then reproduced five remaining
+cross-boundary defects. Per-target copy qualification dropped the live stop
+predicate inside provider and database work; deferred IRSA credential refresh
+could use botocore's longer retry defaults; kubeconfig exec acquisition and
+transparent refresh were outside EKS drain and cleanup fences; the real
+`BaseException.__context__` slot was not serialized; and the Helm template
+silently treated explicit zero as an omitted canary grace. This revision closes
+those boundaries together with one bounded credential design rather than adding
+caller-only checks. The acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`9f722c8ecd2f7e06cb1775dc2e84c211d944b6ab` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request returned HTTP 429 before using any
+token, so no paired acceptance was recorded. Codex independently confirmed the
+complete 26-check GitHub rollup and prior five-boundary repair, then reproduced
+two P1 gaps: a kubeconfig exec descendant could retain a pipe beyond the nominal
+timeout while unbounded stdout or stderr exhausted memory, and copy or lifecycle
+could submit a claimed operation when shutdown arrived after the caller's final
+check. The adjacent exact-tree audit found that in-cluster projected tokens lost
+rotation when transparent refresh was removed, EC2 cleanup could reuse an
+expired one-hour runtime session, and malformed exception attributes could
+replace canonical `args` or crash a shadowed `add_note` call. This revision
+defines one stop-aware executor admission point, bounded process-group exec,
+explicit in-cluster rotation, fresh deadline-fenced cleanup credentials, and a
+total canonical exception boundary as one repair batch. The acceptance streak
+remains zero.
+
+Codex final-acceptance round 2 at
+`0d139ff186e1558fedb2185e32eaaa83b4b738b8` was stopped before verdict after its
+adversarial malformed-output probe exposed raw credential bytes retained by the
+JSON decoder in both `__cause__` and `__context__`, despite the top-level error
+message being fixed. The exact `claude-fable-5` max-effort plan-mode request
+returned HTTP 429 with zero input or output tokens, so no paired acceptance was
+recorded. This revision makes malformed output leave the exception handler
+before raising the fixed error and requires an empty exception chain as part of
+the value-free credential boundary. The acceptance streak remains zero.
+
+Codex final-acceptance round 3 at
+`6b50f1d10b87ddb32d4a8ffbaa21105881a6b971` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request again returned HTTP 429 with zero
+input or output tokens, so no paired acceptance was recorded. Codex confirmed
+all 26 exact-head checks and the empty decoder cause/context repair, then
+reproduced one P1 and two P2 residual boundaries. Credential bytes, decoded
+status, loader state, and a losing refresh exception remained reachable through
+public traceback locals or hidden context; untrusted API-version and expiration
+values could also enter public or serialized errors. Pipe-reader failures were
+treated as clean EOF, allowing a valid prefix to be accepted, and projected
+token rotation used adjustable wall time instead of a monotonic deadline. This
+revision defines the single credential-isolation boundary, fail-closed reader
+state, exact response validation, and monotonic refresh contract above. The
+acceptance streak remains zero.
+
+Codex precommit review round 4 reproduced three remaining boundary failures:
+an installed exec credential remained reachable through the later wrapper
+exception's `self` object graph, reader exceptions outside `OSError` and
+`ValueError` could accept a valid buffered prefix and reach
+`threading.excepthook`, and loader or fence time could consume a credential's
+API-call headroom before the raw call. Its verdict was `RESHAPE`. This revision
+adds credential-scrubbing invalidation on every exceptional provider-wrapper
+exit, detaches provider dependency tracebacks, makes reader failures total and
+fail closed, and revalidates monotonic headroom at client admission, refresh,
+and immediately before the raw method. Tests now use bounded cycle-safe
+object-graph traversal rather than shallow local-value representations. This
+was a precommit review of a moving worktree, so it is repair evidence rather
+than an exact-head acceptance; the acceptance streak remains zero.
+
+Codex exact-head review round 5 at
+`9ffa23a6e4ce560acee8e04404aceb0876ce7fa8` was stopped without a verdict when
+the GitHub async-lifecycle check rejected the deliberate synchronous
+`BaseException` isolation boundaries. The exact `claude-fable-5` max-effort
+plan-mode request returned HTTP 429 with zero input or output tokens, so it was
+neither acceptance nor rejection. Round 6 at
+`2294fda8b3566270702def6453d8823532d10cd7` confirmed the immutable head facts
+and then reproduced one residual boundary before it was stopped: the generic
+canary wrapper ran its own initial provider fence before delegating to
+`ProviderFencedCoreApi`, so the escaping control exception's traceback could
+still reach the installed credential through `_FencedClient.self`. This
+revision delegates that initial Kubernetes fence to the credential-owning inner
+wrapper, which scrubs and invalidates before propagation, and adds an
+object-graph regression for the exact pre-fence schedule. The acceptance streak
+remains zero.
+
+Codex exact-head review round 7 at
+`1d62e047b831d124656759f9bf33788498c8275d` was stopped without a verdict after
+its closure-aware reproduction confirmed the initial lease, drain, and deadline
+repair, then found an adjacent residual. A validation failure after successful
+Kubernetes client acquisition, reproduced with
+`CANARY_PRINCIPAL_UNVERIFIED`, escaped `_run_eks_canary` while that outer
+traceback frame still owned the live installed credential. The client had not
+been invalidated or closed. This revision defines an explicit outer EKS client
+lifetime that always scrubs after required teardown and before any result or
+exception leaves, with closure-aware regressions for both successful and
+exceptional exits. The acceptance streak remains zero.
+
+Codex exact-head review round 8 at
+`89c0c48f0c50b2f684b15bd102d3acecf88c0777` was stopped without a verdict by
+the platform safety filter after it independently reproduced one adjacent
+exception-precedence leak. When provider work failed after EKS pod creation and
+teardown then failed, `CANARY_TEARDOWN_FAILED` retained the losing provider
+error as implicit context. The serialized envelope therefore retained that
+error's response body and request-local authorization header even though the
+installed Kubernetes credential was correctly scrubbed and closed. This
+revision puts both EC2 and EKS canary lifetimes behind one detached cleanup
+winner contract. Successful cleanup preserves the ordinary provider exception;
+teardown failure, cleanup lease loss, and cleanup-time drain discard the losing
+provider graph before raising their deterministic winner. A typed internal
+teardown signal remains distinct through durable terminalization, preventing an
+unrelated provider `ValueError` with the same message from preserving the child
+as an unverified teardown. Exact object-graph, serialized-envelope, and
+end-to-end terminalization regressions cover the EKS precedence and
+message-collision outcomes plus the equivalent EC2 teardown-failure schedule.
+Round 10 at `a2eaa6410939ce32b4dec6c043c7919370e093f8` was intentionally
+stopped before a verdict when this remaining downstream string discriminator
+was found. The acceptance streak remains zero.
+Round 11 at `0ec9c51c4775748402ef0f59093553169b4b08eb` was intentionally
+stopped before a verdict when rollout analysis found that preserving the old
+binding identity while changing its absent-field default from on-demand to Spot
+could replay one existing EC2 client token with different launch parameters.
+The revised three-state snapshot contract preserves old missing-field
+on-demand replay, while every new profile projects its boolean market policy
+and therefore requires an identity-changing revision. The acceptance streak
+remains zero.
+Before the repaired-head acceptance runs, `origin/improvements` advanced
+through `0758b9b32e5828a0befd6cde1fe09dce62e6f605` and
+`742315b8f847b2c414b2a25cf25c30863feb9c82`, preserving the managed-job
+cancellation attribution, transient-INIT recovery, and recovery signal-parent
+contracts. It then advanced to
+`cd52f3e099dad3e63741cc6d8317eceb342d16da`, whose inherited change uses slim
+Serve status snapshots for control writes. The exact round-13 candidate had
+that commit as both base and merge base, a 39-file base-relative diff, and a
+24-test inherited Serve status suite. No semantic overlap or conflict survived
+review. All gates are rerun against each actual merge candidate.
+
+Codex exact-head review round 12 at
+`795b0e561d3fc7f2af8b44bb7dd21f3671db5826` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort request returned HTTP 429 before inference, so it
+was neither acceptance nor rejection. Codex confirmed the three-state market
+identity contract and all 26 GitHub checks, then independently reproduced two
+Spot activation blockers. A one-time request was not tagged, discovered, or
+cancelled, so two lost accepted `RunInstances` responses could be followed by
+five minutes of empty instance inventory, false teardown success, and a later
+orphan launch. Separately, the generated fresh-account path did not provision
+the mandatory `AWSServiceRoleForEC2Spot` or customer-managed AMI KMS grant.
+This revision makes the request a first-class custody child, proves both request
+and instance teardown across cancellation-versus-fulfillment, adds one
+account-scoped Spot bootstrap and regional conditional KMS grants, and keeps the
+legacy on-demand replay contract unchanged. The acceptance streak remains zero
+until both reviewers accept one immutable repaired head.
+
+Codex exact-head review round 13 at
+`7623fb052641734faa57ad7668dbbee5d16af437` returned `RESHAPE`; the separate
+`claude-fable-5` max-effort request again returned HTTP 429 with zero tokens and
+provided no verdict. Codex verified the exact 39-file candidate, all 26 GitHub
+checks, the 671-test feature matrix, PostgreSQL, managed-job, inherited Serve,
+Terraform, Helm, and static-analysis gates, then reproduced three blockers in
+one transitive pass. First, an immediate post-cancel read could report a
+terminal Spot request before eventual consistency exposed its running
+`InstanceId`, allowing false teardown success. Second, the target module
+combined EC2 runtime and EKS node roles under one `iam:PassRole` grant and did
+not pin `ec2:InstanceProfile`. Third, this integration history still described
+the prior base and 26-file candidate. This revision gives every terminal
+unassociated request its own restartable full settling window, splits EC2
+passable identities from EKS inspect-only profiles, pins every launch to the
+exact EC2 profile set, and synchronizes this canonical design. It also makes the
+partition-neutral account import and destruction protection explicit. The
+acceptance streak remains zero.
+
+Codex exact-head review round 14 at
+`cc024e434dd1662d2302d9505ead48b50ac38c6c` returned `RESHAPE`; the separate
+`claude-fable-5` max-effort request again returned HTTP 429 with zero tokens and
+provided no verdict. Codex verified all 26 GitHub checks, the 674-test feature
+matrix, PostgreSQL, managed-job, inherited Serve, Terraform, Helm, and static
+analysis, then reproduced four blockers in one transitive pass. First,
+`DescribeInstances` did not follow `NextToken`, so a paid child on a later page
+could be omitted while cleanup returned success. Second, the 300-second
+deadline left only five seconds for roughly 180 provider calls after its 59
+fixed sleeps, making the terminal no-child proof permanently fail under normal
+latency. Third, exact-ARN Terraform inputs accepted IAM wildcards and policy
+variables. Fourth, `iam:PassedToService` hardcoded the standard-partition EC2
+principal and broke China targets. This revision paginates and validates the
+complete instance inventory, uses a 480-second cleanup budget with an absolute
+60-observation cadence, validates every policy-bearing ARN and target scope,
+and derives the EC2 service principal from the active partition. The acceptance
+streak remains zero.
+
 ### Live prototype verification, July 23, 2026
 
 The first managed OpenDDE cold launch reached `READY` in 482.65 seconds, versus
@@ -3590,3 +4199,20 @@ started the managed container 204.71 seconds after provisioning began, and
 passed HTTP readiness at 301.20 seconds. The test did not receive the
 production fleet's R2 and payload-encryption secrets, so it proves the managed
 pull and executable image boundary but not model readiness or inference.
+
+Before round 15, `origin/improvements` advanced through
+`8e37b6dfc27849d09a7a94e323da2c8e5a34de98` to
+`cb8e0f125ec27329b2da6c31b08e3fcd38e50031`, then to
+`a9eb25b514c9d841c622ad17dbceb9f1e7119548`. The merges bring in the executable
+builder prototype, credential-helper preservation, delayed EC2 console-output
+proof, managed-job refresh fencing, Serve controller changes, per-sweep YAML
+read deduplication, boot-time provider-lookup removal, Kubernetes autodown
+reconciliation, and the empty-SSM-target guard. The overlapping canary path
+retains the worker-only ambient identity, bounded STS and service clients,
+drain-safe provider fences, Spot request custody, 480-second teardown budget,
+and exact IAM inputs. It also uses the shared value-free ECR credential-helper
+command, strictly decodes both documented console response shapes, waits for
+delayed terminal console output inside the original canary deadline, and
+applies the corrected per-resource `RunInstances` IAM contexts. Every
+exact-head gate and acceptance review is rerun against the resulting merge
+commit.

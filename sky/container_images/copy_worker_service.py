@@ -50,14 +50,40 @@ _QUALIFICATION_ACTOR_HASH = hashlib.sha256(
 logger = sky_logging.init_logger(__name__)
 
 
+class _QualificationDrainRequested(RuntimeError):
+    """Stops nondurable qualification work after process drain is observed."""
+
+
+def _raise_if_stopping(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop is not None and should_stop():
+        raise _QualificationDrainRequested()
+
+
+class _StopPredicateEvent(threading.Event):
+    """Exposes a live stop predicate to transfer code expecting an Event."""
+
+    def __init__(self, should_stop: Callable[[], bool] | None) -> None:
+        super().__init__()
+        self._should_stop = should_stop
+
+    def is_set(self) -> bool:
+        return (super().is_set() or
+                (self._should_stop is not None and self._should_stop()))
+
+
 def _qualification_database_epoch(*, now: int | None = None) -> int:
     """Returns the shared clock used by qualification freshness checks."""
     with orm.Session(catalog_state.engine()) as session:
         return catalog_state.database_epoch(session, now=now)
 
 
-def _ingest_qualification_manifests(directory: str) -> int:
+def _ingest_qualification_manifests(
+        directory: str,
+        *,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Ingests a bounded ConfigMap projection without provider I/O."""
+    if should_stop is not None and should_stop():
+        return 0
     root = pathlib.Path(directory)
     if not root.is_dir():
         logger.warning('Image qualification manifest directory is unavailable.')
@@ -68,6 +94,8 @@ def _ingest_qualification_manifests(directory: str) -> int:
         paths = paths[:_QUALIFICATION_MANIFEST_LIMIT]
     ingested = 0
     for path in paths:
+        if should_stop is not None and should_stop():
+            break
         try:
             payload = path.read_bytes()
             if len(payload) > 4 * 1024 * 1024:
@@ -79,6 +107,8 @@ def _ingest_qualification_manifests(directory: str) -> int:
             if not isinstance(profile, str):
                 raise ValueError('Qualification manifest profile is missing.')
             digest = hashlib.sha256(payload).hexdigest()
+            if should_stop is not None and should_stop():
+                break
             qualification.ingest_manifest(
                 profile_name=profile,
                 manifest=manifest,
@@ -333,14 +363,19 @@ def _ecr_hooks(
     limiter: budgets.ProviderBudgetLimiter,
     shard: topology_state.ShardRecord,
     heartbeat: worker_lease.LeaseHeartbeat | None = None,
+    provider_fence: Callable[[], None] | None = None,
 ) -> aws.EcrCallHooks:
 
     def before_call() -> None:
         if heartbeat is not None:
             heartbeat.assert_owned()
+        if provider_fence is not None:
+            provider_fence()
         limiter.before_call(shard)
         if heartbeat is not None:
             heartbeat.assert_owned()
+        if provider_fence is not None:
+            provider_fence()
 
     return aws.EcrCallHooks(before_call=before_call,
                             on_throttle=lambda: limiter.record_throttle(shard))
@@ -626,18 +661,26 @@ def _reconcile_candidate_shard_attestation(
     limiter: budgets.ProviderBudgetLimiter,
     now: int,
     state_now: int | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> bool:
     """Probes one candidate authority without mutating operational inventory."""
+    _raise_if_stopping(should_stop)
     if revision.state != models.ImageProfileState.QUALIFYING:
         return True
     shards = topology_state.list_target_shards(revision.workspace, profile.name,
                                                target.name)
+    _raise_if_stopping(should_stop)
     if (len(shards) != target.shard_count or
             any(shard.target_fingerprint != target.target_fingerprint
                 for shard in shards)):
         return False
     probed = 0
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
     for shard in shards:
+        _raise_if_stopping(should_stop)
         live_key, expected = _expected_shard_attestation(revision, shard)
         evidence = revision.attestations.get(live_key)
         if (isinstance(evidence, dict) and evidence.get('status') == 'READY' and
@@ -656,22 +699,33 @@ def _reconcile_candidate_shard_attestation(
                 not 0 <= now - shard.inventory_completed_at <=
                 _CONFIG_REFRESH_SECONDS * 10):
             return False
+        _raise_if_stopping(should_stop)
         operational = topology_state.get_profile_revision(
             shard.profile_revision_id)
+        _raise_if_stopping(should_stop)
         if (operational is None or
                 operational.state != models.ImageProfileState.ACTIVE):
             return False
         binding = profile.bindings[target.write_authority]
         role = _aws_role(binding, profile, 'verify')
-        repository = aws.EcrRepository.from_role(role,
-                                                 shard.region,
-                                                 shard.repository_name,
-                                                 hooks=_ecr_hooks(
-                                                     limiter, shard))
-        verified = _matching_shard_metadata(repository, role, shard, expected)
+        _raise_if_stopping(should_stop)
+        repository = aws.EcrRepository.from_role(
+            role,
+            shard.region,
+            shard.repository_name,
+            hooks=_ecr_hooks(limiter, shard, provider_fence=provider_fence),
+            provider_fence=provider_fence)
+        _raise_if_stopping(should_stop)
+        verified = _matching_shard_metadata(repository,
+                                            role,
+                                            shard,
+                                            expected,
+                                            provider_fence=provider_fence)
+        _raise_if_stopping(should_stop)
         if verified is None:
             return False
         metadata, applied_quota, headroom = verified
+        _raise_if_stopping(should_stop)
         recorded = topology_state.record_candidate_shard_attestation(
             profile_revision_id=revision.id,
             expected_generation=revision.desired_generation,
@@ -694,6 +748,7 @@ def _reconcile_candidate_shard_attestation(
                 'inventory_completed_at': shard.inventory_completed_at,
             },
             now=state_now)
+        _raise_if_stopping(should_stop)
         if recorded is None:
             return False
         probed += 1
@@ -729,32 +784,46 @@ def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
     return False
 
 
-def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
-                                 target: models.ManagedRegistryTarget,
-                                 *,
-                                 limiter: budgets.ProviderBudgetLimiter,
-                                 now: int | None = None) -> bool:
+def reconcile_qualification_copy(
+        revision: topology_state.ProfileRevisionRecord,
+        target: models.ManagedRegistryTarget,
+        *,
+        limiter: budgets.ProviderBudgetLimiter,
+        now: int | None = None,
+        should_stop: Callable[[], bool] | None = None) -> bool:
     """Attests live infrastructure and copies the fixed canary as copy role."""
+    _raise_if_stopping(should_stop)
+
+    def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
+    _raise_if_stopping(should_stop)
     shard = topology_state.get_target_shard(revision.workspace, profile.name,
                                             target.name)
+    _raise_if_stopping(should_stop)
     if shard is None:
         return False
     repository_name, repository_arn = qualification.qualification_repository(
         revision, target)
     binding = profile.bindings[target.write_authority]
-    destination = aws.EcrRepository.from_role(_aws_role(binding, profile,
-                                                        'destination_write'),
-                                              target.region,
-                                              repository_name,
-                                              hooks=_ecr_hooks(limiter, shard))
+    _raise_if_stopping(should_stop)
+    destination = aws.EcrRepository.from_role(
+        _aws_role(binding, profile, 'destination_write'),
+        target.region,
+        repository_name,
+        hooks=_ecr_hooks(limiter, shard, provider_fence=provider_fence),
+        provider_fence=provider_fence)
+    _raise_if_stopping(should_stop)
     metadata = destination.repository_metadata()
+    _raise_if_stopping(should_stop)
     expected_uri = f'{target.registry}/{repository_name}'
     if (metadata['repository_arn'] != repository_arn or
             metadata['repository_uri'] != expected_uri or
             metadata['tag_mutability'] != 'IMMUTABLE'):
         raise ValueError('Qualification repository live identity drifted.')
+    _raise_if_stopping(should_stop)
     revision = topology_state.record_profile_attestation(
         profile_revision_id=revision.id,
         kind=models.profile_attestation_key('infrastructure', target.name),
@@ -771,28 +840,40 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
         now=now)
+    _raise_if_stopping(should_stop)
     candidate_now = _qualification_database_epoch(now=now)
+    _raise_if_stopping(should_stop)
     _reconcile_candidate_shard_attestation(revision,
                                            profile,
                                            target,
                                            limiter=limiter,
                                            now=candidate_now,
-                                           state_now=now)
+                                           state_now=now,
+                                           should_stop=should_stop)
+    _raise_if_stopping(should_stop)
     copy_due_now = _qualification_database_epoch(now=now)
+    _raise_if_stopping(should_stop)
     if not _qualification_copy_needed(revision, profile, target, copy_due_now):
         return True
     reader = providers.RegistryV2Source(profile.qualification.canary_ref,
-                                        lambda: None)
+                                        lambda: None,
+                                        provider_fence=provider_fence)
+    _raise_if_stopping(should_stop)
     graph = _inspection_graph(reader, profile.qualification.canary_platform,
                               profile.limits.max_artifact_bytes)
-    outcome = destination.copy_graph(graph, reader.read_blob, threading.Event())
+    _raise_if_stopping(should_stop)
+    outcome = destination.copy_graph(graph, reader.read_blob,
+                                     _StopPredicateEvent(should_stop))
+    _raise_if_stopping(should_stop)
     if (outcome == aws.CopyOutcome.AMBIGUOUS and
             not destination.verify_graph(graph)):
         raise aws.AmbiguousProviderOutcomeError(
             'Qualification canary copy requires readback retry.')
+    _raise_if_stopping(should_stop)
     if not destination.verify_graph(graph):
         raise aws.DestinationContentMismatchError(
             'Qualification canary did not verify after copy.')
+    _raise_if_stopping(should_stop)
     topology_state.record_profile_attestation(
         profile_revision_id=revision.id,
         kind=models.profile_attestation_key('copy', target.name),
@@ -808,35 +889,60 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
         now=now)
+    _raise_if_stopping(should_stop)
     return True
 
 
-def reconcile_qualification_profiles(limiter: budgets.ProviderBudgetLimiter,
-                                     *,
-                                     limit: int = 8,
-                                     now: int | None = None) -> int:
+def reconcile_qualification_profiles(
+        limiter: budgets.ProviderBudgetLimiter,
+        *,
+        limit: int = 8,
+        now: int | None = None,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Runs a bounded fair page of independent copy-role attestations."""
     completed = 0
-    for revision in topology_state.list_qualifying_profiles(include_active=True,
-                                                            limit=limit):
+    if should_stop is not None and should_stop():
+        return completed
+    revisions = topology_state.list_qualifying_profiles(include_active=True,
+                                                        limit=limit)
+    if should_stop is not None and should_stop():
+        return completed
+    for revision in revisions:
+        if should_stop is not None and should_stop():
+            break
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
         for target in (profile.canonical,) + profile.targets:
+            if should_stop is not None and should_stop():
+                return completed
             try:
                 if reconcile_qualification_copy(revision,
                                                 target,
                                                 limiter=limiter,
-                                                now=now):
+                                                now=now,
+                                                should_stop=should_stop):
                     completed += 1
+            except _QualificationDrainRequested:
+                return completed
             except Exception:  # pylint: disable=broad-except
                 logger.warning('Managed image copy qualification probe failed.')
     return completed
 
 
-def _qualification_maintenance(limiter: budgets.ProviderBudgetLimiter) -> bool:
-    transactions.reconcile_pending_canonical_publications()
-    reconcile_qualification_profiles(limiter)
-    qualification.schedule_automatic_canaries()
+def _qualification_maintenance(
+        limiter: budgets.ProviderBudgetLimiter,
+        *,
+        should_stop: Callable[[], bool] | None = None) -> bool:
+    if should_stop is not None and should_stop():
+        return False
+    transactions.reconcile_pending_canonical_publications(
+        should_stop=should_stop)
+    if should_stop is not None and should_stop():
+        return False
+    reconcile_qualification_profiles(limiter, should_stop=should_stop)
+    if should_stop is not None and should_stop():
+        return False
+    qualification.schedule_automatic_canaries(should_stop=should_stop)
     return True
 
 
@@ -978,28 +1084,44 @@ class CopyWorkerService:
 
     def _claim(self) -> tuple[str, Any] | None:
         if self._claims_since_inventory >= 16:
+            if self._stop.is_set():
+                return None
             inventory = topology_state.claim_inventory_shard(
                 worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+            if self._stop.is_set():
+                return None
             self._claims_since_inventory = 0
             if inventory is not None:
                 return 'inventory', inventory
         for _ in range(2):
             if self._claim_inspection_next:
+                if self._stop.is_set():
+                    return None
                 publication = catalog_state.claim_publication_inspection(
                     worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                if self._stop.is_set():
+                    return None
                 self._claim_inspection_next = False
                 if publication is not None:
                     self._claims_since_inventory += 1
                     return 'publication', publication
             else:
+                if self._stop.is_set():
+                    return None
                 location = topology_state.claim_next_location(
                     worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+                if self._stop.is_set():
+                    return None
                 self._claim_inspection_next = True
                 if location is not None:
                     self._claims_since_inventory += 1
                     return 'location', location
+        if self._stop.is_set():
+            return None
         inventory = topology_state.claim_inventory_shard(
             worker_id=self.worker_id, lease_seconds=self.lease_seconds)
+        if self._stop.is_set():
+            return None
         self._claims_since_inventory = 0
         if inventory is not None:
             return 'inventory', inventory
@@ -1034,49 +1156,78 @@ class CopyWorkerService:
                 schedule_now = time.monotonic()
                 if (schedule_now - last_config_refresh
                         >= _CONFIG_REFRESH_SECONDS):
+                    if self._stop.is_set():
+                        break
                     try:
                         skypilot_config.safe_reload_config()
+                        if self._stop.is_set():
+                            break
                         if manifest_directory is not None:
-                            _ingest_qualification_manifests(manifest_directory)
+                            _ingest_qualification_manifests(
+                                manifest_directory,
+                                should_stop=self._stop.is_set)
                     except (OSError, TypeError, ValueError):
                         logger.warning(
                             'Image worker configuration refresh failed.')
                     last_config_refresh = schedule_now
-                if (schedule_now - last_qualification_refresh
-                        >= _CONFIG_REFRESH_SECONDS and
-                        qualification_future is None and
-                        len(futures) < self.max_in_flight):
-                    qualification_future = executor.submit(
-                        _qualification_maintenance, self._budget_limiter)
-                    futures.add(qualification_future)
-                    last_qualification_refresh = schedule_now
+                if self._stop.is_set():
+                    break
                 heartbeat_ok = topology_state.heartbeat_worker(
                     self.worker_id, in_flight=len(futures), success=bool(done))
                 if self._health is not None:
                     self._health.heartbeat(heartbeat_ok)
+                if self._stop.is_set():
+                    break
+                if (schedule_now - last_qualification_refresh
+                        >= _CONFIG_REFRESH_SECONDS and
+                        qualification_future is None and
+                        len(futures) < self.max_in_flight):
+                    if self._stop.is_set():
+                        break
+                    qualification_future = worker_lease.submit_if_not_stopped(
+                        executor,
+                        self._stop,
+                        _qualification_maintenance,
+                        self._budget_limiter,
+                        should_stop=self._stop.is_set)
+                    if qualification_future is None:
+                        break
+                    futures.add(qualification_future)
+                    last_qualification_refresh = schedule_now
                 while len(futures
                          ) < self.max_in_flight and not self._stop.is_set():
                     claim = self._claim()
                     if claim is None:
                         break
+                    if self._stop.is_set():
+                        break
                     kind, record = claim
                     if kind == 'publication':
-                        futures.add(
-                            executor.submit(inspect_publication,
-                                            record,
-                                            lease_seconds=self.lease_seconds))
+                        submitted_future = worker_lease.submit_if_not_stopped(
+                            executor,
+                            self._stop,
+                            inspect_publication,
+                            record,
+                            lease_seconds=self.lease_seconds)
                     elif kind == 'location':
-                        futures.add(
-                            executor.submit(copy_location,
-                                            record,
-                                            limiter=self._budget_limiter,
-                                            lease_seconds=self.lease_seconds))
+                        submitted_future = worker_lease.submit_if_not_stopped(
+                            executor,
+                            self._stop,
+                            copy_location,
+                            record,
+                            limiter=self._budget_limiter,
+                            lease_seconds=self.lease_seconds)
                     else:
-                        futures.add(
-                            executor.submit(reconcile_inventory,
-                                            record,
-                                            limiter=self._budget_limiter,
-                                            lease_seconds=self.lease_seconds))
+                        submitted_future = worker_lease.submit_if_not_stopped(
+                            executor,
+                            self._stop,
+                            reconcile_inventory,
+                            record,
+                            limiter=self._budget_limiter,
+                            lease_seconds=self.lease_seconds)
+                    if submitted_future is None:
+                        break
+                    futures.add(submitted_future)
                 self._stop.wait(1 if futures else 5)
 
 

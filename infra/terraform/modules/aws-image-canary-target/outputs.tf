@@ -13,3 +13,13 @@ output "binding" {
     external_id = var.external_id
   })
 }
+
+output "spot_service_linked_role_arn" {
+  description = "Canonical EC2 Spot service-linked role used by this target."
+  value       = local.spot_service_linked_role_arn
+}
+
+output "spot_kms_grant_ids" {
+  description = "KMS grants created for customer-managed encrypted Spot AMIs."
+  value       = { for arn, grant in aws_kms_grant.spot_encrypted_ami : arn => grant.grant_id }
+}

@@ -3,11 +3,39 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import concurrent.futures
 import threading
+from typing import Any
 
 
 class LeaseLostError(RuntimeError):
     """The worker no longer owns the durable provider-operation fence."""
+
+
+def _run_if_not_stopped(stop_event: threading.Event, function: Callable[...,
+                                                                        bool],
+                        args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+    """Runs work only when its worker-thread admission point wins shutdown."""
+    # This read is the admission linearization point. If shutdown was published
+    # first, no target code, database call, or provider call can begin. If this
+    # read wins, the task is already admitted and drains as in-flight work.
+    if stop_event.is_set():
+        return False
+    return function(*args, **kwargs)
+
+
+def submit_if_not_stopped(
+    executor: concurrent.futures.Executor,
+    stop_event: threading.Event,
+    function: Callable[..., bool],
+    *args: Any,
+    **kwargs: Any,
+) -> concurrent.futures.Future[bool] | None:
+    """Submits a task behind a live stop check and an entry admission check."""
+    if stop_event.is_set():
+        return None
+    return executor.submit(_run_if_not_stopped, stop_event, function, args,
+                           kwargs)
 
 
 class LeaseHeartbeat:
