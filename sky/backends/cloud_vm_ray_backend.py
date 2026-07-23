@@ -1044,11 +1044,11 @@ def _capacity_cache_cloud_name(
     if isinstance(to_provision.cloud, clouds.AWS):
         return 'aws'
     if isinstance(to_provision.cloud, clouds.GCP):
-        # GCP suppression is opt-in per deployment while the classification is
-        # being validated in production. Off means no key, so nothing is ever
-        # written or read and behavior is exactly as before.
+        # Enabled by default, with `provision.gcp_capacity_cache: false` as the
+        # escape hatch. Setting it false means no key is built, so nothing is
+        # ever written or read and behavior returns to pre-cache provisioning.
         if skypilot_config.get_nested(('provision', 'gcp_capacity_cache'),
-                                      False):
+                                      True):
             return 'gcp'
     return None
 

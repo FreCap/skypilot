@@ -169,16 +169,26 @@ milestone 2 has no consumer until milestone 3.
 
 ## Rollout
 
-The suppression gates ship behind `provision.gcp_capacity_cache`, a boolean
-defaulting to off, so the cache
-can be enabled per deployment after the classification has been observed to be
-correct in production. Because outcome classification landed first, the
-placement history already labels GCP exhaustion as `capacity_failed`, so the
-`capacity failed` counter can be compared before and after enabling the gates to
-confirm suppression is not hiding real failures.
+The suppression gates are controlled by `provision.gcp_capacity_cache`, a
+boolean **enabled by default**, with `false` as the escape hatch.
 
-Rollback is a flag flip. Since hints expire in 120s, disabling the flag returns
-behavior to the current state within two minutes with no cleanup.
+An earlier revision of this design defaulted it to off. That was reconsidered
+because the measured evidence is unambiguous (216 of 216 GCP failures over 24h
+were genuine zonal exhaustion, with no quota codes mixed in) and because the
+surrounding guards already bound the blast radius: a hint lasts 120s, matches
+one exact demand including its accelerators, applies only to single-zone Spot
+attempts, fails open on any cache error, and is cleared by a successful
+provision of the same shape.
+
+Because outcome classification landed first, the placement history already
+labels GCP exhaustion as `capacity_failed`, so that counter can be compared
+before and after rollout to confirm suppression is not hiding real failures.
+Watch that `capacity_failed` falls while `succeeded` holds steady: a drop in
+`succeeded` would mean suppression is skipping attempts that would have worked.
+
+Rollback is a flag flip to `false`. Since hints expire in 120s, disabling
+returns behavior to pre-cache provisioning within two minutes and needs no
+cleanup.
 
 ## Test Plan
 

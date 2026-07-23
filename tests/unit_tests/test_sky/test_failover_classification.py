@@ -272,7 +272,8 @@ def test_cache_key_is_exact_aws_spot_zone_only():
                                        [zone_a, zone_b], 4, 'acct') is None
     assert backend._capacity_cache_key(_to_provision(), region, [zone_a], 4,
                                        None) is None
-    assert backend._capacity_cache_key(_to_provision(cloud=clouds.GCP()),
+    # A cloud with no structured capacity codes never participates.
+    assert backend._capacity_cache_key(_to_provision(cloud=clouds.Azure()),
                                        region, [zone_a], 4, 'acct') is None
 
 
@@ -288,7 +289,7 @@ def test_quota_cooldown_key_is_exact_spot_regional_demand():
     assert backend._quota_cooldown_key(_to_provision(), region, 4, None) is None
     assert backend._quota_cooldown_key(_to_provision(use_spot=False), region, 4,
                                        'acct') is None
-    assert backend._quota_cooldown_key(_to_provision(cloud=clouds.GCP()),
+    assert backend._quota_cooldown_key(_to_provision(cloud=clouds.Azure()),
                                        region, 4, 'acct') is None
 
 
@@ -504,17 +505,19 @@ def _gcp_provision(*, accelerators=None, instance_type='g2-standard-4'):
                                    use_spot=True)
 
 
-def test_gcp_cache_key_requires_the_opt_in_flag(monkeypatch):
+def test_gcp_cache_key_is_on_by_default_and_can_be_disabled(monkeypatch):
     region = clouds.Region('asia-northeast3')
     zone = clouds.Zone('asia-northeast3-b')
 
-    # Default is off, so GCP writes and reads nothing.
+    # Disabling is the escape hatch: no key means nothing is written or read.
+    _enable_gcp_cache(monkeypatch, enabled=False)
     assert backend._capacity_cache_key(_gcp_provision(), region, [zone], 1,
                                        'proj') is None
     assert backend._quota_cooldown_key(_gcp_provision(), region, 1,
                                        'proj') is None
 
-    _enable_gcp_cache(monkeypatch)
+    # With no configuration at all, GCP participates.
+    monkeypatch.undo()
     key = backend._capacity_cache_key(_gcp_provision(accelerators={'L4': 1}),
                                       region, [zone], 1, 'proj')
     assert key == capacity_cache.ResourceKey(cloud='gcp',
