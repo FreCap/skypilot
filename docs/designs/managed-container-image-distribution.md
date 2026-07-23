@@ -4200,15 +4200,17 @@ passed HTTP readiness at 301.20 seconds. The test did not receive the
 production fleet's R2 and payload-encryption secrets, so it proves the managed
 pull and executable image boundary but not model readiness or inference.
 
-Before round 15, `origin/improvements` advanced to
-`8e37b6dfc27849d09a7a94e323da2c8e5a34de98`. The merge brings in the executable
+Before round 15, `origin/improvements` advanced through
+`8e37b6dfc27849d09a7a94e323da2c8e5a34de98` to
+`cb8e0f125ec27329b2da6c31b08e3fcd38e50031`. The merges bring in the executable
 builder prototype, credential-helper preservation, delayed EC2 console-output
-proof, managed-job refresh fencing, Serve controller changes, and Kubernetes
-autodown reconciliation. The overlapping canary path retains the worker-only
-ambient identity, bounded STS and service clients, drain-safe provider fences,
-Spot request custody, 480-second teardown budget, and exact IAM inputs. It also
-uses the shared value-free ECR credential-helper command, strictly decodes both
-documented console response shapes, waits for delayed terminal console output
-inside the original canary deadline, and applies the corrected per-resource
-`RunInstances` IAM contexts. Every exact-head gate and acceptance review is
-rerun against the resulting merge commit.
+proof, managed-job refresh fencing, Serve controller changes and per-sweep YAML
+read deduplication, and Kubernetes autodown reconciliation. The overlapping
+canary path retains the worker-only ambient identity, bounded STS and service
+clients, drain-safe provider fences, Spot request custody, 480-second teardown
+budget, and exact IAM inputs. It also uses the shared value-free ECR
+credential-helper command, strictly decodes both documented console response
+shapes, waits for delayed terminal console output inside the original canary
+deadline, and applies the corrected per-resource `RunInstances` IAM contexts.
+Every exact-head gate and acceptance review is rerun against the resulting merge
+commit.
