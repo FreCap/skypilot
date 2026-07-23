@@ -2293,12 +2293,15 @@ settling deadline. Its canary-specific Kubernetes client executes kubeconfig
 `exec` credentials with a 15-second subprocess timeout in an isolated process
 group. Concurrent bounded readers retain at most 1 MiB each from stdout and
 stderr; either overflow terminates the complete group. Timeout and overflow use
-bounded terminate-then-kill waits, always reap the direct child, and never copy
-plugin stderr into an exception. A descendant that inherited a pipe therefore
-cannot extend the credential budget or leak a diagnostic secret. Transparent
-library-side refresh is removed from the raw API call path. The wrapper caches a
-kubeconfig credential only until its declared expiry or the configured
-kubeconfig refresh interval. In-cluster projected service-account credentials
+bounded terminate-then-kill waits and always reap the direct child. No plugin
+stdout, stderr, decoder payload, or decoder exception may survive in the public
+exception, its cause, or its context; decode failures leave the handler before a
+fixed value-free error is raised. A descendant that inherited a pipe therefore
+cannot extend the credential budget or leak a credential or diagnostic secret.
+Transparent library-side refresh is removed from the raw API call path. The
+wrapper caches a kubeconfig credential only until its declared expiry or the
+configured kubeconfig refresh interval. In-cluster projected service-account
+credentials
 have no exposed token expiry, so the wrapper explicitly rebuilds that client on
 the Kubernetes library's one-minute token-refresh cadence under the same fence.
 Every refresh receives the current ordinary drain fence or cleanup deadline,
@@ -2769,8 +2772,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   client inherits 10/60/one-attempt defaults without making a network request;
   real kubeconfig exec tests proving bounded success, whole-process-group
   termination when a descendant inherits a pipe, early stdout and stderr flood
-  rejection, value-free stderr failures, direct-child reaping, no transparent
-  API-client refresh hook, explicit in-cluster projected-token rotation,
+  rejection, value-free stderr and malformed-output failures with empty cause
+  and context chains, direct-child reaping, no transparent API-client refresh
+  hook, explicit in-cluster projected-token rotation,
   ordinary refresh stopped before a raw call, cleanup refresh stopped at the
   shared deadline, and persisted-child drain entering cleanup-only before
   ordinary auth acquisition;
@@ -3758,3 +3762,13 @@ defines one stop-aware executor admission point, bounded process-group exec,
 explicit in-cluster rotation, fresh deadline-fenced cleanup credentials, and a
 total canonical exception boundary as one repair batch. The acceptance streak
 remains zero.
+
+Codex final-acceptance round 2 at
+`0d139ff186e1558fedb2185e32eaaa83b4b738b8` was stopped before verdict after its
+adversarial malformed-output probe exposed raw credential bytes retained by the
+JSON decoder in both `__cause__` and `__context__`, despite the top-level error
+message being fixed. The exact `claude-fable-5` max-effort plan-mode request
+returned HTTP 429 with zero input or output tokens, so no paired acceptance was
+recorded. This revision makes malformed output leave the exception handler
+before raising the fixed error and requires an empty exception chain as part of
+the value-free credential boundary. The acceptance streak remains zero.

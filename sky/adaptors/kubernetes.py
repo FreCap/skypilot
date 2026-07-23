@@ -236,6 +236,14 @@ def _read_bounded_exec_credential_output(pipe: Any, output: bytearray,
         return
 
 
+def _decode_exec_credential_output(output: bytearray) -> tuple[bool, Any]:
+    """Decodes outside the caller's exception chain to discard raw payloads."""
+    try:
+        return True, json.loads(output.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        return False, None
+
+
 def _signal_exec_credential_process_group(process: Any, *, force: bool) -> None:
     """Signals the isolated plugin tree without ever waiting unboundedly."""
     if platform.system() == 'Windows':
@@ -379,11 +387,11 @@ def _run_bounded_exec_credential(
         # Exec plugin diagnostics may contain credential material. Preserve only
         # the bounded status, never raw stderr, in the exception surface.
         raise config_error_cls(f'exec: process returned {process.returncode}')
-    try:
-        payload = json.loads(stdout.decode('utf-8'))
-    except (UnicodeDecodeError, ValueError) as error:
-        raise config_error_cls(
-            'exec: failed to decode process output') from error
+    decoded, payload = _decode_exec_credential_output(stdout)
+    if not decoded:
+        # Raise after the decoder's handler has exited. Otherwise Python retains
+        # the decoder and its raw payload in __context__, even with `from None`.
+        raise config_error_cls('exec: failed to decode process output')
     if not isinstance(payload, dict):
         raise config_error_cls('exec: malformed response object')
     for key in ('apiVersion', 'kind', 'status'):

@@ -400,6 +400,29 @@ def test_bounded_core_api_does_not_reflect_exec_credential_stderr(
     assert 'credential=secret' not in str(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    'script', ('import sys; sys.stdout.write("credential=secret-not-json")',
+               'import os; os.write(1, b"\\xffcredential=secret-not-utf8")'),
+    ids=('invalid-json', 'invalid-utf8'))
+def test_bounded_core_api_does_not_retain_malformed_credential_output(
+        monkeypatch, tmp_path, script):
+    path = _write_exec_kubeconfig(tmp_path, script)
+    monkeypatch.setattr(kubernetes, '_get_config_file', lambda: str(path))
+    config_exception = (
+        kubernetes.kubernetes.config.config_exception.ConfigException)
+
+    with pytest.raises(config_exception) as exc_info:
+        kubernetes._bounded_core_api('bounded-context',
+                                     exec_credential_timeout_seconds=2,
+                                     provider_fence=lambda: None)
+
+    error = exc_info.value
+    assert str(error) == 'exec: failed to decode process output'
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert 'credential=secret' not in repr(error)
+
+
 def test_provider_fenced_core_refresh_observes_new_stop_before_raw_call(
         monkeypatch):
     initial = SimpleNamespace(api_client=MagicMock(), list_node=MagicMock())
