@@ -122,6 +122,7 @@ _LAUNCHED_RESERVED_WORKER_PATTERN = re.compile(
 # 10.133.0.5: ray.worker.default,
 _LAUNCHING_IP_PATTERN = re.compile(
     rf'({IP_ADDR_REGEX}): ray[._]worker[._](?:default|reserved)')
+_KUBERNETES_AUTODOWN_RECONCILIATION_BUFFER_SECONDS = 5 * 60
 SSH_CONNECTION_ERROR_PATTERN = re.compile(
     r'^ssh:.*(timed out|connection refused)$', re.IGNORECASE)
 _SSH_CONNECTION_TIMED_OUT_PATTERN = re.compile(r'^ssh:.*timed out$',
@@ -3171,6 +3172,11 @@ def _update_cluster_status(
         record['status_updated_at'] = written_at
         return record
 
+    if _maybe_reconcile_stalled_kubernetes_autodown(handle, record,
+                                                    node_statuses,
+                                                    _get_ray_config):
+        return _handle_autostopping_cluster(print_newline=False)
+
     # Determining if the cluster is healthy (UP):
     #
     # For non-spot clusters: If ray status shows all nodes are healthy, it is
@@ -3594,6 +3600,73 @@ def _update_cluster_status(
         cluster_name,
         include_user_info=include_user_info,
         summary_response=summary_response)
+
+
+def _kubernetes_autodown_reconciliation_grace_seconds(
+        handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle') -> int:
+    """Return enough time for declared down hooks to finish."""
+    hooks = handle.launched_resources.hooks or []
+    down_hook_timeout = sum(
+        hook.get('timeout', constants.DEFAULT_HOOK_TIMEOUT_SECONDS)
+        for hook in hooks
+        if 'down' in (hook.get('events') or constants.HOOK_EVENTS))
+    return (max(constants.DEFAULT_HOOK_TIMEOUT_SECONDS, down_hook_timeout) +
+            _KUBERNETES_AUTODOWN_RECONCILIATION_BUFFER_SECONDS)
+
+
+def _maybe_reconcile_stalled_kubernetes_autodown(
+    handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
+    record: dict[str, Any],
+    node_statuses: dict[str, tuple[status_lib.ClusterStatus, str | None]],
+    get_ray_config: Callable[[], dict[str, Any]],
+) -> bool:
+    """Re-drive a Kubernetes autodown that its skylet did not finish.
+
+    The durable Kubernetes Event is the fast path: it is emitted after hooks
+    and immediately before the first delete attempt. Older runtimes can fail
+    before emitting the Event, so the original AUTOSTOPPING transition also
+    provides a conservative, hook-aware deadline.
+
+    Returns True after the provider termination call completes.
+    """
+    cloud = handle.launched_resources.cloud
+    if (record['status'] != status_lib.ClusterStatus.AUTOSTOPPING or
+            record['autostop'] < 0 or not record['to_down'] or
+            not isinstance(cloud, clouds.Kubernetes) or not node_statuses or
+            len(node_statuses) > handle.launched_nodes):
+        return False
+
+    ray_config = get_ray_config()
+    provider_config = ray_config.get('provider')
+    if provider_config is None:
+        return False
+
+    autostop_event = k8s_instance.get_cluster_autostop_event(
+        provider_config,
+        handle.cluster_name_on_cloud,
+        since=record['launched_at'])
+    reason = 'durable Kubernetes autodown Event'
+    if autostop_event is None:
+        transition_times = global_user_state.get_last_status_change_times(
+            {record['cluster_hash']}, status_lib.ClusterStatus.AUTOSTOPPING)
+        transitioned_at = transition_times.get(record['cluster_hash'])
+        if transitioned_at is None:
+            return False
+        grace_seconds = _kubernetes_autodown_reconciliation_grace_seconds(
+            handle)
+        age_seconds = time.time() - transitioned_at
+        if age_seconds < grace_seconds:
+            return False
+        reason = (f'AUTOSTOPPING for {int(age_seconds)}s, exceeding the '
+                  f'{grace_seconds}s hook-aware grace period')
+
+    logger.warning(f'Reconciling stalled Kubernetes autodown for '
+                   f'{handle.cluster_name!r} ({reason}).')
+    provision_lib.terminate_instances(
+        provider_name=repr(cloud),
+        cluster_name_on_cloud=handle.cluster_name_on_cloud,
+        provider_config=provider_config)
+    return True
 
 
 def _must_refresh_cluster_status(
