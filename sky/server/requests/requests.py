@@ -1610,25 +1610,31 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     also serializes with full-row read-modify-write writers
     (update_request / update_request_async).
     """
-    set_clauses = ['status = ?', f'{COL_FINISHED_AT} = ?']
-    params: list[Any] = [status.value, time.time()]
+    serialized_result = None
     if result is not None:
         assert name is not None, request_id
         serializer = return_value_serializers.get_serializer(name)
-        set_clauses.append('return_value = ?')
-        # A serializer failure must degrade to a null return value rather
-        # than raise: an exception here escapes the executor wrapper after
-        # its try/except and leaves the row stuck in RUNNING forever (the
-        # same hazard `_encoded_return_value` guards against).
+        # A serializer failure must not raise: an exception here escapes the
+        # executor wrapper after its try/except and leaves the row stuck in
+        # RUNNING forever (the same hazard `_encoded_return_value` guards
+        # against). Surface it as a request failure instead of a silent
+        # success with a null return value.
         try:
-            serialized = serializer(
+            serialized_result = serializer(
                 _encoded_return_value(name, request_id, result))
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning(f'Serializer for request {request_id} ({name}) '
-                           f'failed; storing None: '
-                           f'{common_utils.format_exception(e)}')
-            serialized = 'null'
-        params.append(serialized)
+            logger.error(
+                f'Failed to serialize return value for request '
+                f'{request_id} ({name}); marking the request failed.',
+                exc_info=True)
+            status = RequestStatus.FAILED
+            if error is None:
+                error = e
+    set_clauses = ['status = ?', f'{COL_FINISHED_AT} = ?']
+    params: list[Any] = [status.value, time.time()]
+    if serialized_result is not None:
+        set_clauses.append('return_value = ?')
+        params.append(serialized_result)
     if error is not None:
         set_clauses.append('error = ?')
         params.append(orjson.dumps(_build_error_dict(error)).decode('utf-8'))

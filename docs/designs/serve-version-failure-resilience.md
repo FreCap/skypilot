@@ -58,6 +58,31 @@ is not quarantined. Provenance and status still report the highest committed
 version, the applied version, the quarantined version, its reason, and its
 timestamp. A quarantined version never becomes launch authority.
 
+### Never-ready runtime quarantine and recovery
+
+The existing replica status model already distinguishes a narrow class of
+post-launch failures that cannot recover: a candidate that has never been
+ready and either exceeds its initial readiness delay or reports a user
+application failure. `ReplicaStatusProperty.unrecoverable_failure()` is the
+typed authority for this classification. Generic launch, provider capacity,
+spot availability, cleanup, and probe failures do not qualify.
+
+When an applied rolling-update candidate has this evidence and an older
+version remains active, the autoscaler publishes the exact failed version and
+bounded replica-status evidence to the controller. The controller first
+quarantines that exact committed version under its service-incarnation and
+controller-owner fence. Only after the write is durable does the controller
+child terminate. The existing parent supervisor respawns a clean controller,
+so rollback never attempts to reverse partially mutated manager, autoscaler,
+routing, or launch-fence objects in process.
+
+Recovery normally elects the newest non-quarantined commit. If the newest
+quarantine is above that commit, however, an intermediate commit may never
+have become active. In that case recovery prefers the newest
+non-quarantined version still published in `active_versions`. A commit newer
+than the quarantine supersedes it normally. This makes the fallback a
+demonstrably serving runtime rather than an arbitrary historical version.
+
 ### Fail-open old-version capacity
 
 The prior applied version is the only fail-open target. Quarantine converts the
@@ -66,11 +91,13 @@ so the healthy applied runtime may continue its ordinary autoscaling policy.
 This is safe under queue pressure because:
 
 - no stale version is chosen dynamically or reconstructed from replica rows;
-- only the already applied runtime and its committed policy may launch;
+- only a version already published to the load balancer may become the
+  fallback runtime;
 - its existing `max_replicas`, exact-card, ownership, and capacity fences
   remain active;
-- the quarantined candidate has no manager, autoscaler, or routing mutation to
-  roll back;
+- a preflight quarantine has no runtime mutation to roll back, while a
+  never-ready runtime quarantine reconstructs cleanly in a new controller
+  process;
 - a new version can replace it without editing or deleting history.
 
 This covers a capped queue without making queue saturation itself an authority
@@ -113,9 +140,14 @@ scale-up decision carries a separate latest-version launch-capacity ceiling.
 That ceiling is the latest version's already committed capacity plus the
 current configured rollout wave. The replica manager checks the full aggregate
 and exact-card generation fence, but stops launching when the separate ceiling
-is reached. Subsequent ticks inside the wave cooldown retain the same ceiling;
-the next elapsed wave advances it. Whole multi-GPU backends may round one wave
-up by at most one backend width.
+is reached. Subsequent ticks inside the wave cooldown retain the same ceiling
+and can spend any authority left unused by lock contention or failed
+placement. Zero-authority ticks return before taking the global shared-capacity
+lock. The manager accounts the planned width of rows it actually appends, not
+concurrent load-balancer snapshot changes. The next elapsed wave advances the
+ceiling. Whole multi-GPU backends may round one wave up by at most one backend
+width. Degraded unknown-capacity replacements share this same wave budget with
+ordinary rollout launches.
 
 Configured waves therefore continue to limit replacement launches even when
 restart adoption already holds a much larger aggregate target. They do not
@@ -160,12 +192,12 @@ it may parse persisted data and construct candidate objects, but may not mutate
 manager state, autoscaler state, replicas, routing publication, or applied
 version.
 
-Post-preflight provision and setup failures also remain retryable. Replica rows
-do not yet persist a typed failure reason or immutable failure fingerprint, so
-classifying those failures solely from a terminal replica status could
-quarantine a healthy version during a transient provider or cluster outage.
-Durable typed launch-failure evidence is a prerequisite for extending
-quarantine into that phase.
+Post-preflight provision and setup failures remain retryable unless the
+persisted status property satisfies the existing never-ready unrecoverable
+classifier. A generic terminal status is insufficient: provider, spot,
+capacity, cleanup, and ordinary probe failures must not quarantine a healthy
+version during a transient infrastructure outage. The runtime classifier is
+therefore intentionally narrower than all failed replica statuses.
 
 The controller writes quarantine before clearing the pending version signal.
 If that database write fails, it keeps the pending fence and retries, preserving
@@ -199,6 +231,11 @@ Unit regressions cover:
 - a transient apply failure is not quarantined and still retries;
 - a newer commit supersedes a quarantined version;
 - controller recovery selects the newest non-quarantined committed version;
+- recovery below a runtime quarantine prefers the newest version still active
+  in load-balancer routing over an unproven intermediate commit;
+- typed never-ready runtime failure quarantines the exact applied candidate
+  under the controller ownership fence, while transient provisioning failure
+  remains retryable;
 - version history and update status surface quarantine metadata;
 - restart adoption uses total ready demand-owned capacity across old and latest
   versions while excluding reserved fill, retirement rows, and overlapping

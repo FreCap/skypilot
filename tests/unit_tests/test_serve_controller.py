@@ -1152,6 +1152,48 @@ class TestServiceUpdateReconciler:
         assert not status['update_apply_pending']
         assert status['quarantined_version'] == 2
 
+    def test_never_ready_runtime_failure_is_durably_quarantined(self):
+        ctrl = _make_update_controller()
+        ctrl._committed_version = 2  # pylint: disable=protected-access
+        ctrl._applied_version = 2  # pylint: disable=protected-access
+        failure = autoscalers.UnrecoverableRolloutFailure(
+            version=2, reason='Version 2 never became ready.')
+
+        with mock.patch.object(controller.time, 'time', return_value=123.0), \
+             mock.patch.object(controller.serve_state,
+                               'quarantine_version',
+                               return_value=True) as quarantine:
+            assert ctrl._quarantine_unrecoverable_rollout(  # pylint: disable=protected-access
+                failure)
+
+        quarantine.assert_called_once_with(
+            'svc',
+            2,
+            failure.reason,
+            quarantined_at=123.0,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(123, '10.0.0.1'))
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['committed_version'] == 2
+        assert status['applied_version'] == 2
+        assert status['quarantined_version'] == 2
+        assert status['update_apply_failures'] == 1
+        assert status['update_apply_error'] == failure.reason
+
+    def test_stale_runtime_failure_cannot_quarantine_newer_applied_version(
+            self):
+        ctrl = _make_update_controller()
+        ctrl._applied_version = 3  # pylint: disable=protected-access
+        failure = autoscalers.UnrecoverableRolloutFailure(
+            version=2, reason='Version 2 never became ready.')
+
+        with mock.patch.object(controller.serve_state,
+                               'quarantine_version') as quarantine:
+            assert not ctrl._quarantine_unrecoverable_rollout(  # pylint: disable=protected-access
+                failure)
+
+        quarantine.assert_not_called()
+
     def test_failed_quarantine_write_preserves_pending_fence(self):
         ctrl = _make_update_controller()
         ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access

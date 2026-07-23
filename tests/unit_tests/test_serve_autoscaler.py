@@ -287,6 +287,11 @@ class TestRolloutBlockedNotifications(unittest.TestCase):
             decisions = autoscaler.generate_scaling_decisions([info], [1])
 
         self.assertEqual(decisions, [])
+        failure = autoscaler.unrecoverable_rollout_failure
+        self.assertIsNotNone(failure)
+        assert failure is not None
+        self.assertEqual(failure.version, 2)
+        self.assertIn('2:FAILED_PROVISION', failure.reason)
         record_notification.assert_called_once()
         category, message = record_notification.call_args.args
         self.assertEqual(
@@ -304,6 +309,7 @@ class TestRolloutBlockedNotifications(unittest.TestCase):
             decisions = autoscaler.generate_scaling_decisions([info], [1])
 
         record_notification.assert_called_once()
+        self.assertIsNone(autoscaler.unrecoverable_rollout_failure)
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0].operator,
                          autoscalers.AutoscalerDecisionOperator.SCALE_UP)

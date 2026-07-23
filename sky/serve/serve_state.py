@@ -3733,6 +3733,65 @@ def get_latest_applicable_version_spec(
     return result[0], spec
 
 
+def get_recovery_version_spec(
+        service_name: str) -> tuple[int, 'service_spec.SkyServiceSpec'] | None:
+    """Return the safest committed version for controller reconstruction.
+
+    Normally this is the newest non-quarantined commit. If a newer version was
+    quarantined after runtime mutation, however, an unproven intermediate
+    commit may sit between it and the version still published to the load
+    balancer. Recovery must prefer the newest active, non-quarantined version
+    in that case. A commit newer than the quarantine still supersedes it.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        applicable = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.version,
+                version_specs_table.c.spec).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.yaml_content.isnot(None),
+                        version_specs_table.c.quarantined_at.is_(None))).
+            order_by(version_specs_table.c.version.desc()).limit(1)).fetchone()
+        quarantined_version = session.execute(
+            sqlalchemy.select(sqlalchemy.func.max(
+                version_specs_table.c.version)).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.quarantined_at.isnot(
+                            None)))).scalar_one_or_none()
+        if (quarantined_version is not None and
+            (applicable is None or applicable.version < quarantined_version)):
+            active_versions_json = session.execute(
+                sqlalchemy.select(services_table.c.active_versions).where(
+                    services_table.c.name ==
+                    service_name)).scalar_one_or_none()
+            active_versions = (json.loads(active_versions_json)
+                               if active_versions_json else [])
+            if active_versions:
+                active = session.execute(
+                    sqlalchemy.select(version_specs_table.c.version,
+                                      version_specs_table.c.spec).
+                    where(
+                        sqlalchemy.and_(
+                            version_specs_table.c.service_name == service_name,
+                            version_specs_table.c.version.in_(active_versions),
+                            version_specs_table.c.yaml_content.isnot(None),
+                            version_specs_table.c.quarantined_at.is_(
+                                None))).order_by(
+                                    version_specs_table.c.version.desc()).limit(
+                                        1)).fetchone()
+                if active is not None:
+                    applicable = active
+    if applicable is None:
+        return None
+    spec = pickle.loads(applicable.spec)
+    if spec is None:
+        return None
+    return applicable.version, spec
+
+
 def get_ha_recovery_script(service_name: str) -> str | None:
     """Gets the HA recovery script for a service."""
     engine = _db_manager.get_engine()

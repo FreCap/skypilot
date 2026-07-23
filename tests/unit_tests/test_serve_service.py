@@ -749,7 +749,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
                            'get_service_from_name',
                            return_value=record), \
          mock.patch.object(service.serve_state,
-                           'get_latest_applicable_version_spec',
+                           'get_recovery_version_spec',
                            return_value=(3, persisted)), \
          mock.patch.object(service.serve_state,
                            'get_yaml_content',

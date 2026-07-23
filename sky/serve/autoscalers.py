@@ -72,6 +72,14 @@ class LogicalScaleDownTarget:
     accelerator_shapes: tuple[tuple[str, int], ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class UnrecoverableRolloutFailure:
+    """Typed evidence that a candidate version never became serviceable."""
+
+    version: int
+    reason: str
+
+
 @dataclasses.dataclass
 class AutoscalerDecision:
     """Autoscaling decisions.
@@ -257,6 +265,13 @@ class Autoscaler:
         # latest_version, so we can fail early if the initial version got
         # unrecoverable failure.
         self.latest_version_ever_ready: int = self.latest_version - 1
+        # Set only for a never-ready candidate whose persisted replica state
+        # satisfies ReplicaStatusProperty.unrecoverable_failure(). The
+        # controller durably quarantines this exact version before respawning
+        # onto the proven active runtime. Generic provisioning/capacity
+        # failures deliberately never populate this signal.
+        self._unrecoverable_rollout_failure: (UnrecoverableRolloutFailure |
+                                              None) = None
         self.update_mode = serve_utils.DEFAULT_UPDATE_MODE
         # [boltz fork] Reserved-capacity fill (opt-in): snapshot state fed
         # by the controller's poller thread via collect_reserved_capacity.
@@ -313,6 +328,12 @@ class Autoscaler:
         if self.num_overprovision is None:
             return self.target_num_replicas
         return self.target_num_replicas + self.num_overprovision
+
+    @property
+    def unrecoverable_rollout_failure(
+            self) -> UnrecoverableRolloutFailure | None:
+        """Return this tick's typed never-ready rollout failure, if any."""
+        return self._unrecoverable_rollout_failure
 
     def _calculate_target_num_replicas(self) -> int:
         """Calculate target number of replicas."""
@@ -1500,6 +1521,7 @@ class Autoscaler:
         """
 
         # Handle latest version unrecoverable failure first.
+        self._unrecoverable_rollout_failure = None
         latest_replicas: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
             if info.version == self.latest_version:
@@ -1511,15 +1533,33 @@ class Autoscaler:
             if version < self.latest_version
         ]
         if self.latest_version_ever_ready < self.latest_version:
-            for info in latest_replicas:
-                if info.status_property.unrecoverable_failure():
-                    if previous_versions:
-                        self._notify_rollout_blocked(max(previous_versions))
-                    # Stop scaling if one of replica of the latest version
-                    # failed, it is likely that a fatal error happens to the
-                    # user application and may lead to a infinte termination
-                    # and restart.
-                    return []
+            unrecoverable = [
+                info for info in latest_replicas
+                if info.status_property.unrecoverable_failure()
+            ]
+            if unrecoverable:
+                if previous_versions:
+                    self._notify_rollout_blocked(max(previous_versions))
+                    evidence = ', '.join(
+                        f'{info.replica_id}:{info.status.value}' for info in
+                        sorted(unrecoverable,
+                               key=lambda replica: replica.replica_id)[:20])
+                    if len(unrecoverable) > 20:
+                        evidence += f', and {len(unrecoverable) - 20} more'
+                    self._unrecoverable_rollout_failure = (
+                        UnrecoverableRolloutFailure(
+                            version=self.latest_version,
+                            reason=(
+                                f'Version {self.latest_version} never became '
+                                'ready and has unrecoverable replica evidence: '
+                                f'{evidence}.')))
+                # Stop scaling if one replica of the latest version has a
+                # typed never-ready failure. With a previous active version,
+                # the controller consumes the signal above by quarantining
+                # this exact candidate and respawning onto the proven runtime.
+                # Without a fallback, preserve the historical fail-closed
+                # behavior rather than retrying a broken initial version.
+                return []
             if (previous_versions and latest_replicas and
                     all(info.is_terminal for info in latest_replicas) and
                     any(info.status in
@@ -3527,6 +3567,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.max_scale_down_rate_percentage: int = int(
             getattr(spec, 'max_scale_down_rate_percentage', 100))
         self._last_scale_up_wave_at: float | None = None
+        # The timestamp opens a rollout window; this ceiling retains the
+        # unspent part of that window when placement cannot make progress on
+        # its first reconciliation tick. It is latest-version committed
+        # logical capacity plus the authorized wave width.
+        self._logical_scale_up_wave_ceiling: int | None = None
         # Logical downscale hysteresis is elapsed-time based. A nominal
         # decision tick can stretch substantially while probing a large fleet,
         # so a tick counter cannot implement a duration contract. This state is
@@ -3659,6 +3704,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # demand target.
         self._logical_actuation_wave_budget: int | None = None
         self._logical_actuation_wave_started: bool = False
+        self._logical_actuation_wave_is_new: bool = False
         self._logical_card_transition_pending: bool = False
         self._logical_actuation_target_by_accelerator: dict[str, int] = {}
         self._logical_actuation_desired_by_accelerator: dict[str, int] = {}
@@ -4468,7 +4514,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> int | None:
-        """Return this tick's slot budget, zero in cooldown, or no limit."""
+        """Return new or retained slot authority for this reconciliation."""
+        self._logical_actuation_wave_is_new = False
         if (self.replica_unit != 'logical' or
                 self.max_scale_up_rate_percentage is None):
             return None
@@ -4478,7 +4525,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (self._last_scale_up_wave_at is not None and
                 now - self._last_scale_up_wave_at
                 < self.scale_up_rate_period_seconds):
-            return 0
+            if self._logical_scale_up_wave_ceiling is None:
+                # Dynamic handoff deliberately carries the timer but not its
+                # version-specific ceiling. Preserve a fail-closed cooldown
+                # for the remainder of that window.
+                return 0
+            committed = self._latest_committed_logical_capacity(replica_infos)
+            return max(0, self._logical_scale_up_wave_ceiling - committed)
         committed = self._latest_committed_logical_capacity(replica_infos)
         rate_percentage = self.max_scale_up_rate_percentage
         min_replicas = self.scale_up_rate_min_replicas
@@ -4489,7 +4542,19 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             min_replicas = self.adaptive_scale_up['scale_up_rate_min_replicas']
         assert rate_percentage is not None
         assert min_replicas is not None
+        self._logical_actuation_wave_is_new = True
         return max(min_replicas, math.ceil(committed * rate_percentage / 100.0))
+
+    def _record_logical_scale_up_wave(self, committed: int,
+                                      launch_budget: int | None) -> None:
+        """Open a new wave without burning retained cooldown authority."""
+        if (launch_budget is None or launch_budget <= 0 or
+                self._logical_actuation_wave_started):
+            return
+        if self._logical_actuation_wave_is_new:
+            self._last_scale_up_wave_at = time.time()
+            self._logical_scale_up_wave_ceiling = committed + launch_budget
+        self._logical_actuation_wave_started = True
 
     def _adopt_scale_up_target(
         self,
@@ -4507,7 +4572,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (self.max_scale_up_rate_percentage is not None and
                 self.target_num_replicas > old_target and
                 self.target_num_replicas > committed):
-            self._last_scale_up_wave_at = time.time()
+            if self.replica_unit == 'logical':
+                launch_budget = self._logical_actuation_wave_budget
+                if launch_budget is None:
+                    launch_budget = self.target_num_replicas - committed
+                self._record_logical_scale_up_wave(committed, launch_budget)
+            else:
+                self._last_scale_up_wave_at = time.time()
         if self.target_num_replicas > old_target:
             self._pending_retention_floor = None
             self._pending_capacity_at_adoption = 0
@@ -5163,8 +5234,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (added_card_slots > 0 and
                 self.max_scale_up_rate_percentage is not None and
                 not self._logical_actuation_wave_started):
-            self._last_scale_up_wave_at = time.time()
-            self._logical_actuation_wave_started = True
+            committed = self._latest_committed_logical_capacity(replica_infos)
+            self._record_logical_scale_up_wave(
+                committed, self._logical_actuation_wave_budget)
         return (limited_target, attribution_complete and
                 sum(limited_target.values()) == final_target)
 
@@ -5493,6 +5565,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # marrying a blind target to fresh-mode kills. All three
         # consumers read this snapshot instead of re-evaluating.
         self._tick_fresh = self.has_fresh_demand_report()
+        self._logical_actuation_wave_is_new = False
         self._logical_actuation_wave_budget = self._logical_scale_up_budget(
             replica_infos)
         self._logical_actuation_wave_started = False
@@ -5631,6 +5704,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # wave, including any aggregate or per-card floor.
             self.target_num_replicas = 0
             self.target_num_replicas_by_accelerator = {}
+            # A retained ceiling belongs to the previous version's committed
+            # capacity. Keep the shared timer, but fail closed for the rest of
+            # that cooldown instead of granting the new version the old
+            # version's unspent authority.
+            self._logical_scale_up_wave_ceiling = None
         self._snap_target_on_next_recompute = True
         self._adopt_total_capacity_on_next_recompute = False
         self._last_logical_target_state = None
@@ -6038,7 +6116,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # transition delta in the first restart tick. Later launch
                 # waves still need to advance the cooldown when they are
                 # authorized, even though that complete map no longer changes.
-                self._last_scale_up_wave_at = time.time()
+                self._record_logical_scale_up_wave(committed, launch_budget)
             replace_unknown_replica_ids = tuple(
                 sorted(info.replica_id
                        for info in latest_nonterminal_replicas

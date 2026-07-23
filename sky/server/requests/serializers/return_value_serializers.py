@@ -47,9 +47,13 @@ def default_serializer(return_value: Any) -> str:
         return orjson.dumps(return_value).decode('utf-8')
     except TypeError:
         # orjson rejects some payloads stdlib json accepts, e.g. dict keys
-        # that are legacy (non-compact) unicode objects produced by the
-        # Postgres driver on Python < 3.12.
-        return json.dumps(return_value)
+        # that are str subclasses or legacy (non-compact) unicode objects
+        # produced by the Postgres driver on Python < 3.12.
+        serialized = json.dumps(return_value, allow_nan=False)
+        # Persist only what the strict decoder accepts (stdlib json can
+        # emit lone-surrogate escapes that orjson.loads rejects).
+        orjson.loads(serialized)
+        return serialized
 
 
 @register_serializer('kubernetes_node_info')
