@@ -1983,6 +1983,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db_async
     @asyncio_utils.shield
+    @db_utils.retry_on_sqlite_busy_async
     async def create_if_not_exists_async(self, request: Request) -> bool:
         assert _DB is not None
         request_columns = ', '.join(REQUEST_COLUMNS)
@@ -2124,6 +2125,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 await _add_or_update_request_no_lock_async(request)
 
     @init_db
+    @db_utils.retry_on_sqlite_busy
     def try_mark_running(self, request_id: str, pid: int | None) -> bool:
         assert _DB is not None
         # The per-request FileLock is required for composition with
@@ -2141,6 +2143,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 return cursor.rowcount == 1
 
     @init_db
+    @db_utils.retry_on_sqlite_busy
     def set_request_finished(self,
                              request_id: str,
                              status: RequestStatus,
@@ -2176,6 +2179,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db_async
     @asyncio_utils.shield
+    @db_utils.retry_on_sqlite_busy_async
     async def set_request_finished_async(self,
                                          request_id: str,
                                          status: RequestStatus,
