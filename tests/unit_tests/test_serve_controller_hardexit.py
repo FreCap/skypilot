@@ -13,6 +13,8 @@ controller. ``run()`` therefore force-terminates the subprocess once
 ``uvicorn.run()`` returns (in a ``finally`` so it also fires on an exception).
 """
 # pylint: disable=protected-access
+from unittest import mock
+
 import fastapi
 import pytest
 
@@ -70,3 +72,24 @@ def test_hard_exit_when_uvicorn_raises(monkeypatch):
 
     assert exits == [1], ('controller must hard-exit even when uvicorn.run() '
                           'exits via an exception (e.g. child-only SIGINT)')
+
+
+def test_reserved_socket_is_handed_to_uvicorn_server(monkeypatch):
+    ctrl, exits = _make_controller(monkeypatch)
+    controller_socket = mock.Mock()
+    config = mock.Mock()
+    server = mock.Mock()
+    monkeypatch.setattr(controller_mod.uvicorn, 'Config',
+                        mock.Mock(return_value=config))
+    monkeypatch.setattr(controller_mod.uvicorn, 'Server',
+                        mock.Mock(return_value=server))
+
+    with pytest.raises(SystemExit):
+        ctrl.run(controller_socket)
+
+    controller_mod.uvicorn.Config.assert_called_once_with(ctrl._app,
+                                                          host='127.0.0.1',
+                                                          port=20010)
+    controller_mod.uvicorn.Server.assert_called_once_with(config)
+    server.run.assert_called_once_with(sockets=[controller_socket])
+    assert exits == [1]

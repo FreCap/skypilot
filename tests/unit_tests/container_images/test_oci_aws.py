@@ -717,8 +717,6 @@ def test_ecr_role_acquisition_fences_actual_sts_boundary(
     session_with_defaults = mock.Mock(return_value=ambient_session)
     monkeypatch.setattr(aws.aws_adaptor, 'session_with_client_defaults',
                         session_with_defaults)
-    monkeypatch.setattr(aws.aws_adaptor, 'get_workspace_profile',
-                        lambda: 'worker-profile')
     sts = mock.Mock()
     sts_session = mock.Mock()
     sts_session.client.return_value = sts
@@ -747,7 +745,7 @@ def test_ecr_role_acquisition_fences_actual_sts_boundary(
     session_with_defaults.assert_called_once_with(connect_timeout=10,
                                                   read_timeout=60,
                                                   total_max_attempts=1,
-                                                  profile='worker-profile')
+                                                  profile=None)
 
 
 def test_assumed_client_bounds_sts_and_service_sdk_attempts(

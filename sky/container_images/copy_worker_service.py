@@ -196,6 +196,13 @@ def _source_reader(
     binding = config.get_source_binding(source.source_auth_binding_id)
     if binding is not None and binding.fingerprint != source.source_auth_fingerprint:
         raise ValueError('AUTH_BINDING_UNAVAILABLE')
+    private_peer_authority: str | None = None
+    if (binding is not None and
+            binding.kind == models.RegistryAccessBindingKind.AWS_ASSUME_ROLE):
+        private_peer_authority = models.reference_registry_authority(
+            source.source_ref, 'OCI source reference')
+        if _ECR_AUTHORITY.fullmatch(private_peer_authority) is None:
+            raise ValueError('AUTH_BINDING_UNAVAILABLE')
     cached: list[providers.SourceCredentials | None] = []
 
     def resolve() -> providers.SourceCredentials | None:
@@ -209,9 +216,8 @@ def _source_reader(
                 source.source_ref, 'OCI source reference')
             credentials = _docker_config_credentials(binding, authority)
         elif binding.kind == models.RegistryAccessBindingKind.AWS_ASSUME_ROLE:
-            authority = models.reference_registry_authority(
-                source.source_ref, 'OCI source reference')
-            match = _ECR_AUTHORITY.fullmatch(authority)
+            assert private_peer_authority is not None
+            match = _ECR_AUTHORITY.fullmatch(private_peer_authority)
             if match is None or binding.authority is None:
                 raise ValueError('AUTH_BINDING_UNAVAILABLE')
             credentials = aws.mint_ecr_source_credentials(
@@ -223,16 +229,18 @@ def _source_reader(
                     profile_tag=profile_name),
                 region=match.group('region'),
                 account=match.group('account'),
-                expected_authority=authority,
+                expected_authority=private_peer_authority,
                 provider_fence=provider_fence)
         else:
             raise ValueError('AUTH_BINDING_UNAVAILABLE')
         cached.append(credentials)
         return credentials
 
-    return providers.RegistryV2Source(source.source_ref,
-                                      resolve,
-                                      provider_fence=provider_fence)
+    return providers.RegistryV2Source(
+        source.source_ref,
+        resolve,
+        provider_fence=provider_fence,
+        private_peer_authority=(private_peer_authority))
 
 
 def _inspection_graph(source_reader: providers.RegistryV2Source,

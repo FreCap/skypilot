@@ -16,6 +16,7 @@ from sky import exceptions
 from sky import skypilot_config
 from sky.backends import backend_utils
 from sky.exceptions import ClusterNotUpError
+from sky.provision import docker_utils
 from sky.resources import Resources
 from sky.utils import common
 from sky.utils import common_utils
@@ -59,6 +60,70 @@ def test_path_size_megabytes_quotes_path(tmp_path):
     source.write_text('data', encoding='utf-8')
 
     assert backend_utils.path_size_megabytes(str(source)) == 0
+
+
+@pytest.mark.parametrize('credential_helper', ['ecr-login', None])
+def test_aws_template_preserves_docker_credential_helper(
+        tmp_path, credential_helper):
+    output_path = tmp_path / 'aws-ray.yaml'
+    login = docker_utils.DockerLoginConfig(
+        username='',
+        password='',
+        server='123456789012.dkr.ecr.us-east-1.amazonaws.com')
+    login.credential_helper = credential_helper
+    common_utils.fill_template(
+        'aws-ray.yml.j2', {
+            'cluster_name_on_cloud': 'cluster',
+            'num_nodes': 1,
+            'docker_image': 'registry/image@sha256:' + 'a' * 64,
+            'docker_container_name': 'sky_container',
+            'docker_run_options': [],
+            'docker_login_config': login,
+            'region': 'us-east-1',
+            'zones': 'us-east-1a',
+            'security_group': 'sg',
+            'security_group_managed_by_skypilot': 'true',
+            'vpc_name': None,
+            'subnet_names': None,
+            'use_internal_ips': False,
+            'max_efa_interfaces': 0,
+            'ssh_user': 'ubuntu',
+            'ssh_private_key': '/tmp/key',
+            'ssh_proxy_command': None,
+            'remote_identity': 'LOCAL_CREDENTIALS',
+            'instance_type': 'g5.xlarge',
+            'image_id': 'ami-1234',
+            'root_device_name': '/dev/sda1',
+            'disk_size': 256,
+            'disk_tier': 'gp3',
+            'disk_encrypted': True,
+            'disk_iops': None,
+            'disk_throughput': None,
+            'use_spot': False,
+            'specific_reservations': None,
+            'runcmd': None,
+            'user': 'sky',
+            'labels': {},
+            'sky_ray_yaml_remote_path': '/tmp/ray.yaml',
+            'sky_ray_yaml_local_path': '/tmp/ray-local.yaml',
+            'sky_remote_path': '~/.sky',
+            'sky_wheel_hash': 'hash',
+            'sky_local_path': '/tmp/sky.whl',
+            'credentials': {},
+            'initial_setup_commands': [],
+            'conda_installation_commands': '',
+            'uv_installation_commands': '',
+            'ray_skypilot_installation_commands': '',
+            'copy_skypilot_templates_commands': '',
+            'ssh_max_sessions_config': '',
+        }, str(output_path))
+
+    login_config = yaml_utils.read_yaml(
+        output_path)['docker']['docker_login_config']
+    if credential_helper is None:
+        assert 'credential_helper' not in login_config
+    else:
+        assert login_config['credential_helper'] == credential_helper
 
 
 # Set env var to test config file.

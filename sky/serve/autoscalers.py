@@ -6198,6 +6198,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return []
         target_by_card, use_card_targets = (
             self._actuation_target_by_accelerator(replica_infos))
+        canonical_by_name: dict[str, str] = {}
+        ready_latest_by_card: dict[str, int] = {}
         if use_card_targets:
             canonical_by_name = {
                 card.casefold(): card
@@ -6216,9 +6218,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                          if self.replica_unit == 'logical' else 1)
                 ready_latest_by_card[card] = (
                     ready_latest_by_card.get(card, 0) + width)
-            if any(
-                    ready_latest_by_card.get(card, 0) < target
-                    for card, target in target_by_card.items()):
+            exact_card_shortfall = any(
+                ready_latest_by_card.get(card, 0) < target
+                for card, target in target_by_card.items())
+            incremental_logical_rollout = (self.replica_unit == 'logical' and
+                                           self.update_mode
+                                           == serve_utils.UpdateMode.ROLLING)
+            if exact_card_shortfall and not incremental_logical_rollout:
                 logger.info(
                     'Concurrency rolling drain waiting for '
                     'latest-version exact-card coverage: ready=%s, '
@@ -6267,9 +6273,45 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             selected_nonready = _select_nonterminal_replicas_to_scale_down(
                 min(batch_limit, len(idle_nonready_old)), idle_nonready_old)
             remaining_limit = batch_limit - len(selected_nonready)
-            selected_ready = _select_nonterminal_replicas_to_scale_down(
-                min(remaining_limit, excess_ready_old, len(idle_ready_old)),
-                idle_ready_old)
+            ready_limit = min(remaining_limit, excess_ready_old,
+                              len(idle_ready_old))
+            if use_card_targets and ready_limit > 0:
+                old_ready_by_card: dict[str, int] = {}
+                for info in old_ready:
+                    raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+                    card = canonical_by_name.get(raw_card.casefold())
+                    if card is not None:
+                        old_ready_by_card[card] = (
+                            old_ready_by_card.get(card, 0) + 1)
+                old_or_target_cards = (set(old_ready_by_card) |
+                                       set(target_by_card))
+                excess_old_by_card = {
+                    card: max(
+                        0,
+                        old_ready_by_card.get(card, 0) - max(
+                            0,
+                            target_by_card.get(card, 0) -
+                            ready_latest_by_card.get(card, 0),
+                        ),
+                    ) for card in old_or_target_cards
+                }
+                ordered_idle_ids = (_select_nonterminal_replicas_to_scale_down(
+                    len(idle_ready_old), idle_ready_old))
+                idle_by_id = {info.replica_id: info for info in idle_ready_old}
+                selected_ready = []
+                for replica_id in ordered_idle_ids:
+                    info = idle_by_id[replica_id]
+                    raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+                    card = canonical_by_name.get(raw_card.casefold())
+                    if card is None or excess_old_by_card.get(card, 0) <= 0:
+                        continue
+                    selected_ready.append(replica_id)
+                    excess_old_by_card[card] -= 1
+                    if len(selected_ready) >= ready_limit:
+                        break
+            else:
+                selected_ready = _select_nonterminal_replicas_to_scale_down(
+                    ready_limit, idle_ready_old)
             selected = selected_nonready + selected_ready
             logger.info(
                 'Logical rolling drain: coverage_target=%s, '

@@ -758,14 +758,41 @@ def fail_publication_inspection(publication_id: str,
             values.update(
                 reservation_expires_at=clock + _FAILED_RESERVATION_SECONDS,
                 record_expires_at=clock + _FAILED_PUBLICATION_RETENTION_SECONDS)
-        changed = session.execute(table.update().where(
+        row = session.execute(table.update().where(
             table.c.id == publication_id,
             table.c.state == models.ImagePublicationState.INSPECTING.value,
             table.c.inspection_lease_token == lease_token,
             table.c.inspection_lease_expires_at.is_not(None),
             table.c.inspection_lease_expires_at
-            > clock).values(**values)).rowcount
-    return changed == 1
+            > clock).values(**values).returning(table)).mappings().first()
+        if row is not None and terminal:
+            operation_matches = [
+                schema.operations.c.result_id == publication_id
+            ]
+            if row['operation_id'] is not None:
+                operation_matches.append(
+                    schema.operations.c.id == row['operation_id'])
+            session.execute(schema.operations.update().where(
+                sqlalchemy.or_(*operation_matches),
+                schema.operations.c.state.in_([
+                    models.ImageOperationState.PENDING.value,
+                    models.ImageOperationState.RUNNING.value,
+                ])).values(
+                    state=models.ImageOperationState.FAILED.value,
+                    result_kind='publication',
+                    result_id=publication_id,
+                    result_json=json.dumps(
+                        {
+                            'publication_id': publication_id,
+                            'release': row['requested_release'],
+                            'state': models.ImagePublicationState.FAILED.value,
+                            'image_id': row['image_id'],
+                        },
+                        sort_keys=True),
+                    error_code=error_code,
+                    updated_at=clock,
+                    terminal_expires_at=(clock + _OPERATION_RETENTION_SECONDS)))
+    return row is not None
 
 
 def heartbeat_publication_inspection(publication_id: str,

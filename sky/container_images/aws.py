@@ -755,11 +755,14 @@ def assumed_client(
     }
     if binding.external_id is not None:
         assume_kwargs['ExternalId'] = binding.external_id
+    # Worker pods receive a dedicated workload identity (for example, IRSA).
+    # Do not inherit the API server's workspace AWS profile because its
+    # credentials-file entry is intentionally absent from the worker pod.
     ambient_session = aws_adaptor.session_with_client_defaults(
         connect_timeout=_AWS_CONNECT_TIMEOUT_SECONDS,
         read_timeout=_AWS_READ_TIMEOUT_SECONDS,
         total_max_attempts=_AWS_TOTAL_MAX_ATTEMPTS,
-        profile=aws_adaptor.get_workspace_profile())
+        profile=None)
     credentials = fenced_provider_call(ambient_session.get_credentials)
     if credentials is None:
         raise aws_adaptor.botocore_exceptions().NoCredentialsError()

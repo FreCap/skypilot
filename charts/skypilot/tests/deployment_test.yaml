@@ -1420,6 +1420,65 @@ tests:
           path: spec.template.spec.containers[0].env
           count: 11
 
+  - it: should allow custom GCP workload identity env when native credentials are disabled
+    set:
+      gcpCredentials.enabled: false
+      apiService.extraEnvs:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/secrets/gcp/gcp-cred.json
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_APPLICATION_CREDENTIALS
+            value: /var/secrets/gcp/gcp-cred.json
+
+  - it: should reject custom GCP workload identity env when native credentials are enabled
+    set:
+      gcpCredentials.enabled: true
+      apiService.extraEnvs:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/secrets/gcp/gcp-cred.json
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "GOOGLE_APPLICATION_CREDENTIALS" is duplicated or reserved by the chart'
+
+  - it: should allow a custom Nebius credential volume when native credentials are disabled
+    set:
+      nebiusCredentials.enabled: false
+      apiService.extraVolumes:
+        - name: nebius-credentials
+          secret:
+            secretName: custom-nebius-credentials
+      apiService.extraVolumeMounts:
+        - name: nebius-credentials
+          mountPath: /root/.nebius
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: nebius-credentials
+            secret:
+              secretName: custom-nebius-credentials
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: nebius-credentials
+            mountPath: /root/.nebius
+            readOnly: true
+
+  - it: should reject a custom Nebius credential volume when native credentials are enabled
+    set:
+      nebiusCredentials.enabled: true
+      apiService.extraVolumes:
+        - name: nebius-credentials
+          secret:
+            secretName: custom-nebius-credentials
+    asserts:
+      - failedTemplate:
+          errorMessage: 'volume name "nebius-credentials" is duplicated or reserved by the chart'
+
   - it: should reject duplicate database and API volume names
     set:
       databaseConnection.extraVolumes:

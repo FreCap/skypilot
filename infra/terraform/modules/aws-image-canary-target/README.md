@@ -12,13 +12,23 @@ module's account or region are rejected before the role can be created.
 
 Configure `ami_arns`, `subnet_arns`, and at least one exact
 `canary_instance_type` for EC2 qualification. The launch policy constrains all
-three, requires catalog and operation tags, and pins the mandatory
-instance-resource authorization to `ec2_instance_profile_arns` with
-`ec2:InstanceProfile`. Instance-only condition keys are not attached to the
-AMI, network, volume, or Spot-request authorizations. `iam:PassRole` permits
+three plus the runtime instance profile. AMI policy resources use EC2's
+accountless authorization form,
+`arn:<partition>:ec2:<region>::image/<ami-id>`, including for private AMIs.
+AWS evaluates the created resource classes separately. Instance and EBS-volume
+authorization requires catalog and operation request tags. The implicit primary
+network-interface context exposes neither those tags nor
+`ec2:InstanceType`, so its separate statement requires the exact configured
+subnet. The role has no independent `CreateNetworkInterface` action, and the
+complete launch must still satisfy the exact AMI, security-group, instance-type,
+instance-profile, and tagged-resource statements. Spot-request authorization
+requires the same catalog and operation tags.
+
+The mandatory instance-resource authorization pins
+`ec2_instance_profile_arns` with `ec2:InstanceProfile`. `iam:PassRole` permits
 only `ec2_runtime_role_arns`. EKS node identities are never passable. List their
-profiles separately in
-`eks_node_instance_profile_arns`, which grants only `iam:GetInstanceProfile`.
+profiles separately in `eks_node_instance_profile_arns`, which grants only
+`iam:GetInstanceProfile`.
 The `iam:PassedToService` condition is derived from the active AWS partition, so
 China targets use `ec2.amazonaws.com.cn` while standard and GovCloud targets
 use `ec2.amazonaws.com`.

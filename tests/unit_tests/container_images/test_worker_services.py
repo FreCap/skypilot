@@ -32,6 +32,7 @@ from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.provision import docker_utils
 
 _DIGEST = 'sha256:' + 'a' * 64
 _CONFIG_DIGEST = 'sha256:' + 'b' * 64
@@ -39,6 +40,84 @@ _ARTIFACT_ID = '00000000-0000-4000-8000-000000000001'
 _LOCATION_ID = '00000000-0000-4000-8000-000000000002'
 _SHARD_ID = '00000000-0000-4000-8000-000000000003'
 _REVISION_ID = '00000000-0000-4000-8000-000000000004'
+
+
+@pytest.mark.parametrize(
+    ('output', 'expected'),
+    (
+        ('boot log\nSKYPILOT_IMAGE_CANARY_SUCCESS:nonce\n', True),
+        (base64.b64encode(
+            b'boot log\nSKYPILOT_IMAGE_CANARY_SUCCESS:nonce\n').decode(), True),
+        ('boot log without marker', False),
+        ('not valid base64 \u2026', False),
+        (None, False),
+    ),
+)
+def test_ec2_console_marker_supports_sdk_response_shapes(
+        output: object, expected: bool) -> None:
+    assert canary_worker_service._console_has_marker(
+        output, 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce') is expected
+
+
+def _console_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    clock = [100.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: clock[0])
+    monkeypatch.setattr(
+        canary_worker_service.time, 'sleep',
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(canary_worker_service, '_EC2_CONSOLE_SETTLE_SECONDS',
+                        10)
+    monkeypatch.setattr(canary_worker_service, '_EC2_CONSOLE_POLL_SECONDS', 5)
+    return clock
+
+
+def test_ec2_console_marker_waits_for_delayed_terminal_buffer(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _console_clock(monkeypatch)
+    ec2 = mock.Mock()
+    marker = 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce'
+    ec2.get_console_output.side_effect = ({'Output': ''}, {'Output': marker})
+    heartbeat = SimpleNamespace(assert_owned=mock.Mock())
+
+    assert canary_worker_service._wait_for_console_marker(
+        ec2, 'i-canary', marker, 1000.0, heartbeat)
+
+    assert ec2.get_console_output.call_args_list == [
+        mock.call(InstanceId='i-canary', Latest=True),
+        mock.call(InstanceId='i-canary', Latest=True),
+    ]
+
+
+def test_ec2_console_marker_exhausts_bounded_settle_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = _console_clock(monkeypatch)
+    ec2 = mock.Mock()
+    ec2.get_console_output.return_value = {'Output': 'partial boot log'}
+    heartbeat = SimpleNamespace(assert_owned=mock.Mock())
+
+    assert not canary_worker_service._wait_for_console_marker(
+        ec2, 'i-canary', 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce', 1000.0,
+        heartbeat)
+
+    assert clock == [110.0]
+    assert ec2.get_console_output.call_count == 2
+
+
+def test_ec2_console_marker_preserves_original_canary_deadline(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _console_clock(monkeypatch)
+    ec2 = mock.Mock()
+    ec2.get_console_output.return_value = {'Output': ''}
+    heartbeat = SimpleNamespace(assert_owned=mock.Mock())
+
+    with pytest.raises(ValueError, match='CANARY_TIMEOUT'):
+        canary_worker_service._wait_for_console_marker(
+            ec2, 'i-canary', 'SKYPILOT_IMAGE_CANARY_SUCCESS:nonce', 105.0,
+            heartbeat)
+
+    ec2.get_console_output.assert_called_once_with(InstanceId='i-canary',
+                                                   Latest=True)
 
 
 def _canary_operation(
@@ -2020,16 +2099,22 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
     ec2.describe_instances.assert_called_once_with(InstanceIds=['i-primary'])
 
 
-@pytest.mark.parametrize(('architecture', 'image_id_case', 'expected_error'),
-                         (('x86_64', 'expected', None),
-                          ('arm64', 'expected', 'QUALIFICATION_FAILED'),
-                          (None, 'expected', 'QUALIFICATION_FAILED'),
-                          ('x86_64', 'other', 'QUALIFICATION_FAILED'),
-                          ('x86_64', None, 'QUALIFICATION_FAILED')))
+@pytest.mark.parametrize(
+    ('architecture', 'image_id_case', 'profile_case', 'expected_error'),
+    (('x86_64', 'expected', 'expected', None),
+     ('x86_64', 'expected', 'delayed', None),
+     ('x86_64', 'expected', 'terminal_missing_after_match', None),
+     ('x86_64', 'expected', 'missing', 'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
+     ('x86_64', 'expected', 'conflicting',
+      'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
+     ('arm64', 'expected', 'expected', 'QUALIFICATION_FAILED'),
+     (None, 'expected', 'expected', 'QUALIFICATION_FAILED'),
+     ('x86_64', 'other', 'expected', 'QUALIFICATION_FAILED'),
+     ('x86_64', None, 'expected', 'QUALIFICATION_FAILED')))
 @pytest.mark.parametrize('use_spot', [True, False, None])
 def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
-        architecture: str | None, image_id_case: str | None,
+        architecture: str | None, image_id_case: str | None, profile_case: str,
         expected_error: str | None, use_spot: bool | None) -> None:
     operation = _canary_operation()
     target = profile.target('aws-us-west-2')
@@ -2071,36 +2156,58 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         instance['ImageId'] = 'ami-other'
     if architecture is not None:
         instance['Architecture'] = architecture
+    if profile_case == 'missing':
+        instance.pop('IamInstanceProfile')
+    elif profile_case == 'conflicting':
+        instance['IamInstanceProfile'] = {
+            'Arn': 'arn:aws:iam::210987654321:instance-profile/Other',
+        }
     terminated_instance = {
         **instance,
         'State': {
             'Name': 'terminated'
         },
     }
+    poll_observations = [instance]
+    if profile_case == 'delayed':
+        delayed_instance = {
+            **instance,
+            'State': {
+                'Name': 'running'
+            },
+        }
+        delayed_instance.pop('IamInstanceProfile')
+        poll_observations.insert(0, delayed_instance)
+    elif profile_case == 'terminal_missing_after_match':
+        running_instance = {
+            **instance,
+            'State': {
+                'Name': 'running'
+            },
+        }
+        final_instance = {
+            **instance,
+            'State': {
+                'Name': 'terminated'
+            },
+        }
+        final_instance.pop('IamInstanceProfile')
+        poll_observations = [running_instance, final_instance]
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        if not instances:
+            return {'Reservations': []}
+        return {'Reservations': [{'Instances': list(instances)}]}
+
     ec2 = mock.Mock()
-    ec2.describe_instances.side_effect = ({
-        'Reservations': []
-    }, {
-        'Reservations': [{
-            'Instances': [tagged_instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [tagged_instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [tagged_instance]
-        }]
-    }, {
-        'Reservations': [{
-            'Instances': [terminated_instance]
-        }]
-    })
+    describe_responses = [response()]
+    for observation in poll_observations:
+        describe_responses.extend(
+            (response(tagged_instance), response(observation)))
+    describe_responses.extend(
+        (response(tagged_instance), response(tagged_instance),
+         response(terminated_instance)))
+    ec2.describe_instances.side_effect = describe_responses
     ec2.run_instances.side_effect = (
         TimeoutError('ambiguous EC2 launch response'), {
             'Instances': [{
@@ -2125,9 +2232,7 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             'SpotInstanceRequests': [cancelled_spot_request],
         })
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
-    ec2.get_console_output.return_value = {
-        'Output': base64.b64encode(marker.encode()).decode()
-    }
+    ec2.get_console_output.return_value = {'Output': marker}
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
@@ -2157,6 +2262,7 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
     monkeypatch.setattr(canary_worker_service.qualification,
                         'authorize_canary_launch',
                         lambda *_args, **_kwargs: 1000)
+    monkeypatch.setattr(canary_worker_service, '_POLL_SECONDS', 0)
     heartbeat = _OwnedHeartbeat()
 
     if expected_error is None:
@@ -2182,6 +2288,9 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
     assert mock.call(
         InstanceIds=['i-canary']) in (ec2.describe_instances.call_args_list)
     launch = ec2.run_instances.call_args.kwargs
+    assert docker_utils.credential_helper_config_cmd(
+        target.registry) in launch['UserData']
+    assert "trap 'shutdown -h now' EXIT" in launch['UserData']
     assert launch['InstanceInitiatedShutdownBehavior'] == 'terminate'
     if use_spot:
         assert launch['InstanceMarketOptions'] == {
@@ -4719,15 +4828,20 @@ def test_lifecycle_lease_loss_before_sts_blocks_credential_acquisition(
 
     monkeypatch.setattr(lifecycle_worker_service, '_LeaseHeartbeat',
                         LosingHeartbeat)
-    sts = mock.Mock()
-    monkeypatch.setattr(lifecycle_worker_service.aws.aws_adaptor, 'client',
-                        lambda _service, **_kwargs: sts)
+    ambient_session = mock.Mock()
+    session_with_defaults = mock.Mock(return_value=ambient_session)
+    monkeypatch.setattr(lifecycle_worker_service.aws.aws_adaptor,
+                        'session_with_client_defaults', session_with_defaults)
 
     with pytest.raises(worker_lease.LeaseLostError,
                        match='lease lost before STS'):
         lifecycle_worker_service.evict_location(location, mock.Mock())
 
-    sts.assume_role.assert_not_called()
+    session_with_defaults.assert_called_once_with(connect_timeout=10,
+                                                  read_timeout=60,
+                                                  total_max_attempts=1,
+                                                  profile=None)
+    ambient_session.get_credentials.assert_not_called()
 
 
 def test_copy_and_inventory_use_operational_revision_not_newer_candidate(
@@ -4900,6 +5014,56 @@ def _dockerconfig_binding() -> models.RegistryAccessBinding:
             'name': 'ghcr',
             'key': '.dockerconfigjson',
         })
+
+
+def test_aws_source_reader_confines_private_peer_to_exact_ecr_authority(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = '123456789012.dkr.ecr.us-east-1.amazonaws.com'
+    binding = models.RegistryAccessBinding(
+        id='ecr-source',
+        kind=models.RegistryAccessBindingKind.AWS_ASSUME_ROLE,
+        purposes=('source_read',),
+        authority='arn:aws:iam::123456789012:role/SkyPilotImageSource')
+    source = catalog_state.SourceRecord(
+        id='00000000-0000-4000-8000-000000000010',
+        workspace='research',
+        image_id='00000000-0000-4000-8000-000000000011',
+        source_ref=f'{authority}/example/runtime@{_DIGEST}',
+        source_root_digest=_DIGEST,
+        source_root_media_type='',
+        requested_platform='linux/amd64',
+        selected_child_digest='',
+        source_auth_binding_id=binding.id,
+        source_auth_fingerprint=binding.fingerprint,
+        created_at=10)
+    monkeypatch.setattr(copy_worker_service.config, 'get_source_binding',
+                        lambda _: binding)
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    credentials = mock.Mock()
+    mint = mock.Mock(return_value=credentials)
+    monkeypatch.setattr(copy_worker_service.aws, 'mint_ecr_source_credentials',
+                        mint)
+    reader = mock.sentinel.reader
+    constructor = mock.Mock(return_value=reader)
+    monkeypatch.setattr(copy_worker_service.providers, 'RegistryV2Source',
+                        constructor)
+    fence = mock.Mock()
+
+    assert copy_worker_service._source_reader(source, 'gpu-production',
+                                              fence) is reader
+
+    constructor.assert_called_once_with(source.source_ref,
+                                        mock.ANY,
+                                        provider_fence=fence,
+                                        private_peer_authority=authority)
+    resolver = constructor.call_args.args[1]
+    assert resolver() is credentials
+    mint.assert_called_once()
+    assert mint.call_args.kwargs['region'] == 'us-east-1'
+    assert mint.call_args.kwargs['account'] == '123456789012'
+    assert mint.call_args.kwargs['expected_authority'] == authority
+    assert mint.call_args.kwargs['provider_fence'] is fence
 
 
 def test_source_secret_allowlist_blocks_ambient_rbac(

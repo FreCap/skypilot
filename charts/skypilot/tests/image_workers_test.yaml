@@ -225,6 +225,21 @@ tests:
             name: SKYPILOT_STATE_DB_MIGRATION_MODE
             value: auto
 
+  - it: should render lifecycle retention as an integer environment value
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageLifecycleWorker.enabled: true
+      imageLifecycleWorker.serviceAccount.create: false
+      imageLifecycleWorker.serviceAccount.name: lifecycle-worker
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_IMAGE_RETENTION_SECONDS
+            value: "4838400"
+
   - it: should reject a shared database migration ownership override
     set:
       apiService.dbConnectionSecretName: external-db

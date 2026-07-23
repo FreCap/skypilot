@@ -14,6 +14,7 @@ Focused on the helpers added for HA leader-aware routing:
 """
 # pylint: disable=import-outside-toplevel,missing-class-docstring
 # pylint: disable=protected-access,unreachable
+import multiprocessing
 import socket
 import threading
 import time
@@ -52,6 +53,14 @@ def _free_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def _listen_on_transferred_socket(controller_socket, ready):
+    controller_socket.listen(1)
+    ready.set()
+    connection, _ = controller_socket.accept()
+    connection.close()
+    controller_socket.close()
 
 
 class TestWaitForControllerReady:
@@ -744,6 +753,8 @@ def test_recovery_spawns_controller_with_persisted_semantics(
         'yaml_content': yaml_content,
     }
     process = mock.MagicMock(pid=456)
+    controller_context = mock.MagicMock()
+    controller_context.__enter__.return_value = (process, 20001)
     with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
                            'get_service_from_name',
@@ -763,13 +774,9 @@ def test_recovery_spawns_controller_with_persisted_semantics(
          mock.patch.object(service.serve_state,
                            'update_service_controller_pid_if_owner',
                            return_value=True), \
-         mock.patch.object(service.filelock, 'FileLock'), \
          mock.patch.object(service,
-                           '_select_controller_port',
-                           return_value=20001), \
-         mock.patch.object(service,
-                           '_spawn_controller',
-                           return_value=process) as spawn, \
+                           '_spawn_controller_on_reserved_port',
+                           return_value=controller_context) as spawn, \
          mock.patch.object(service, '_wait_for_controller_ready'), \
          mock.patch.object(
              service.serve_state,
@@ -1213,19 +1220,99 @@ class TestCleanupStorageStaleBucket:
 
 
 # ---------------------------------------------------------------------------
-# External-only controller port selection.
+# External-only controller socket reservation.
 # ---------------------------------------------------------------------------
 
 
-def test_select_controller_port_is_always_local_and_ephemeral():
-    with mock.patch.object(service.common_utils,
-                           'find_free_port',
-                           return_value=54321) as find_free_port, \
-         mock.patch.object(service.serve_state,
-                           'get_services') as get_services:
-        assert service._select_controller_port('svc') == 54321
+def test_reserve_controller_socket_is_exclusive_but_not_ready():
+    reserved, port = service._reserve_controller_socket('127.0.0.1')
+    competitor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        assert port >= service.constants.CONTROLLER_PORT_START
+        with pytest.raises(OSError):
+            competitor.bind(('127.0.0.1', port))
+        with pytest.raises(OSError):
+            socket.create_connection(('127.0.0.1', port), timeout=0.1)
 
-    find_free_port.assert_called_once_with(
-        service.constants.CONTROLLER_PORT_START)
-    # The stable API proxy removes any need for a DB-wide port allocator.
-    get_services.assert_not_called()
+        reserved.listen(1)
+        connection = socket.create_connection(('127.0.0.1', port), timeout=0.5)
+        connection.close()
+    finally:
+        competitor.close()
+        reserved.close()
+
+
+@pytest.mark.parametrize(
+    'start_method',
+    [
+        method for method in ('fork', 'forkserver', 'spawn')
+        if method in multiprocessing.get_all_start_methods()
+    ],
+)
+def test_bound_controller_socket_transfers_to_child(start_method):
+    context = multiprocessing.get_context(start_method)
+    controller_socket, port = service._reserve_controller_socket('127.0.0.1')
+    ready = context.Event()
+    process = context.Process(target=_listen_on_transferred_socket,
+                              args=(controller_socket, ready))
+    try:
+        process.start()
+        controller_socket.close()
+        deadline = time.monotonic() + 30
+        while not ready.wait(timeout=0.1):
+            if process.exitcode is not None:
+                pytest.fail(
+                    f'controller socket child exited with {process.exitcode}')
+            if time.monotonic() >= deadline:
+                pytest.fail('controller socket child did not become ready')
+        connection = socket.create_connection(('127.0.0.1', port), timeout=1)
+        connection.close()
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    finally:
+        controller_socket.close()
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+
+
+@pytest.mark.parametrize('start_error', [None, RuntimeError('spawn failed')])
+def test_reserved_port_context_owns_parent_socket(start_error):
+    process = mock.Mock()
+    controller_socket = mock.Mock(spec=socket.socket)
+    spawn = mock.Mock(return_value=process, side_effect=start_error)
+    with mock.patch.object(service.filelock, 'FileLock'), \
+         mock.patch.object(service,
+                           '_reserve_controller_socket',
+                           return_value=(controller_socket, 20001)), \
+         mock.patch.object(service, '_spawn_controller', spawn):
+        if start_error is None:
+            with service._spawn_controller_on_reserved_port(
+                    'svc', mock.Mock(), 1, '127.0.0.1', 'incarnation-a',
+                    None) as result:
+                assert result == (process, 20001)
+                controller_socket.close.assert_not_called()
+        else:
+            with pytest.raises(RuntimeError, match='spawn failed'):
+                with service._spawn_controller_on_reserved_port(
+                        'svc', mock.Mock(), 1, '127.0.0.1', 'incarnation-a',
+                        None):
+                    pass
+
+    controller_socket.close.assert_called_once_with()
+
+
+def test_parent_reservation_prevents_port_reuse_until_context_exit():
+    process = mock.Mock()
+    with mock.patch.object(service, '_spawn_controller', return_value=process):
+        with service._spawn_controller_on_reserved_port(
+                'svc', mock.Mock(), 1, '127.0.0.1', 'incarnation-a',
+                None) as (_, reserved_port):
+            other_socket, other_port = service._reserve_controller_socket(
+                '127.0.0.1')
+            other_socket.close()
+            assert other_port != reserved_port
+
+    reused_socket, reused_port = service._reserve_controller_socket('127.0.0.1')
+    reused_socket.close()
+    assert reused_port == reserved_port

@@ -73,7 +73,7 @@ variable "eks_node_instance_profile_arns" {
 }
 
 variable "ami_arns" {
-  description = "Exact regional AMI ARNs allowed for EC2 canary launches."
+  description = "Exact accountless EC2 image authorization ARNs allowed for canary launches."
   type        = set(string)
 
   default = []
@@ -81,9 +81,9 @@ variable "ami_arns" {
   validation {
     condition = length(var.ami_arns) <= 64 && alltrue([
       for arn in var.ami_arns :
-      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+::image/ami-[0-9A-Fa-f]+$", arn))
+      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+::image/ami-[0-9a-f]+$", arn))
     ])
-    error_message = "ami_arns must contain at most 64 exact regional AMI ARNs without policy wildcards or variables."
+    error_message = "ami_arns must contain at most 64 exact accountless regional AMI authorization ARNs without policy wildcards or variables."
   }
 }
 

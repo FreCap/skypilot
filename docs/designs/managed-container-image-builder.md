@@ -4,7 +4,7 @@ Status: post-v0 seam and prototype gate, not a v0 public product
 
 Owner: image build service
 
-Last updated: 2026-07-20
+Last updated: 2026-07-23
 
 ## Decision
 
@@ -237,10 +237,137 @@ The repository prototype lives in `sky/container_images/builder_prototype.py`.
 It is absent from the public API, SDK, YAML schema, and Dashboard, and its
 maintainer CLI refuses to run unless
 `SKYPILOT_IMAGE_BUILDER_PROTOTYPE=1` is set. The CLI currently validates and
-content-addresses a context only. The coordinator, isolated PostgreSQL schema,
-S3-compatible uploader, fenced BuildKit executor, staging verification, and
-ordinary publication handoff are exercised through the internal harness and
-tests, not enabled as a production service.
+content-addresses a context.
+
+### Executable direct-evidence runner
+
+The maintainer CLI also has an explicitly selected `--execute-direct` evidence
+mode. It uses the same closed build specification, filtered context, dependency
+cache key, Dockerfile generator, and BuildKit semantics as the durable
+coordinator, but executes through a locally configured Docker Buildx worker and
+pushes directly to the specification's staging repository. It verifies the
+result through its digest-pinned registry reference before reporting success.
+
+This mode exists to measure real images before standing up the coordinator and
+worker service. It has the following intentionally narrow contract:
+
+- `SKYPILOT_IMAGE_BUILDER_PROTOTYPE=1` remains mandatory;
+- the build specification must select `distribution: direct` and no source
+  authorization binding;
+- registry authentication is an operator prerequisite, never a command-line
+  secret argument;
+- the explicit execution path creates and bootstraps one named local
+  `docker-container` Buildx worker when it does not already exist, so registry
+  cache export does not depend on the Docker daemon's image-store setting;
+- multiline setup steps are rendered as deterministic Dockerfile heredocs and
+  run with shell fail-fast behavior; changing those rendering semantics bumps
+  the cache policy version rather than reusing an incompatible cache tag;
+- direct evidence disables BuildKit's implicit provenance wrapper so identical
+  inputs produce the same image-manifest digest. Product provenance remains an
+  explicit, separately addressed and signed publication artifact rather than
+  nondeterministic metadata hidden in the runnable image digest;
+- output is one immutable digest-pinned OCI reference, not a named SkyPilot
+  release;
+- the runner has no cancellation recovery or durable state, so it must never
+  be used as the production publication path; and
+- a digest-keyed registry cache is created once and then treated as read-only,
+  which is compatible with immutable-tag ECR repositories.
+
+`--validate-only` remains the safe default operation. The CLI requires exactly
+one of `--validate-only` or `--execute-direct`, so validation cannot
+accidentally trigger a build. The executable result reports build duration,
+cache hits, context identity, dependency-cache identity, log path, staging tag,
+and digest-pinned reference without returning credentials.
+
+The first live evidence pair uses isolated one-replica Serve services derived
+from `boltz-l4-fleet` and `opendde-10c200s-v4`. Both use Linux AMD64 images in
+one AWS region. The executable runner may itself run on a disposable CPU worker
+in that registry region; a laptop-side multi-gigabyte pull is not representative
+builder evidence. A same-region baseline and built-image run measure
+replica `time_to_ready_seconds`; image publication time is reported separately
+and is never hidden inside deployment readiness. The target is at least 120
+seconds lower readiness for each service when its existing runtime setup has
+that much removable work. A smaller improvement is a measured gate failure,
+not rounded up to success.
+
+The coordinator, isolated PostgreSQL schema, S3-compatible uploader, fenced
+BuildKit executor, staging verification, and ordinary publication handoff
+remain exercised through the internal harness and tests. They are not enabled
+as a production service by the direct-evidence runner.
+
+### Live benchmark result, July 23, 2026
+
+The OpenDDE prototype built and published the declared Linux AMD64 setup layer,
+and a managed release resolved to its same-region, digest-pinned ECR target.
+The source manifest contained 3,626,317,722 compressed bytes. The built
+manifest retained the same ten base-layer digests and added two layers totaling
+85,565,515 compressed bytes, for 3,711,883,237 compressed bytes overall.
+
+The repaired AWS pull plan used `credential_helper: ecr-login` on a fresh node.
+It performed no `docker login`, ECR token command, or AWS CLI installation on
+the pull path. Pulling the cold managed image and starting its container took
+about 102.25 seconds. This proves the qualified credential-helper contract, but
+it is not a startup-latency win by itself.
+
+A same-server, same-region comparison then used Spot by default with dynamic
+on-demand fallback. Every `g6.xlarge` Spot zone was initially exhausted, so the
+availability measurement used the fallback while SkyServe continued seeking
+Spot. Comparing the same on-demand `g6.xlarge` shape removes that placement
+delay:
+
+| Phase | Source image | Built image | Difference |
+| --- | ---: | ---: | ---: |
+| provision start to cluster launched | 210.31 s | 233.90 s | built +23.59 s |
+| cluster launched to readiness | 140.78 s | 141.29 s | built +0.51 s |
+| provision start to readiness | 351.09 s | 375.19 s | built +24.10 s |
+
+The runtime setup in both cases still staged 7,835 objects totaling
+10,036,350,627 bytes (9.35 GiB). Moving the virtual environment and source
+checkout into an 85.6 MB compressed image layer therefore removed no material
+readiness time, while the slightly larger cold pull added time. The 120-second
+readiness target failed. End-to-end service timings were further distorted by
+global launch-budget and Spot-capacity waits, so they are retained only as
+diagnostics, not as builder performance evidence.
+
+This result keeps the builder behind its productization gate. The ordinary OCI
+builder and distribution contracts are still useful for reproducibility,
+credential isolation, immutable publication, and avoiding runtime package
+drift. Making this workload at least two minutes faster would require a
+separate node-cache or model-data locality mechanism, such as a qualified
+prewarmed snapshot or lazy data/runtime path. It would not be honest to hide
+that mechanism inside v0 setup-layer builds or to count first-request latency
+as deployment savings.
+
+The Boltz fleet image completed a separate runtime smoke test. Its source
+manifest contained 35 layers and 4,888,012,650 compressed bytes. The prototype
+retained every source layer and added one 212-byte marker layer, producing a
+36-layer, 4,888,012,862-byte manifest. A Spot-first service with dynamic
+on-demand fallback resolved that release and eventually admitted an on-demand
+`g6.2xlarge` after shared launch-budget and Spot-capacity waits. From the start
+of that admitted launch, the instance was up at 24.26 seconds, the managed
+container was up at 204.71 seconds, the cluster was launched at 251.15 seconds,
+and a Python HTTP process in the image passed readiness at 301.20 seconds. The
+provision configuration preserved `credential_helper: ecr-login`.
+
+This was intentionally a secret-free image/runtime smoke test, not a full
+Boltz model-readiness benchmark. The production run block requires four
+deployment secrets that were not present in the benchmark environment. The
+test proves digest resolution, private-registry authentication, cold pull, L4
+container startup, command execution, and readiness. It cannot claim that the
+model initialized or that inference succeeded. Because the build adds no
+meaningful payload beyond its marker, it also has no credible deployment-speed
+claim.
+
+Chart upgrades must merge the new chart defaults before applying the previous
+release's values. Provider-specific environment variables, volume names, and
+mount paths are reserved only when the corresponding native chart credential
+block is enabled and actually emits those fields. This preserves existing
+custom workload-identity integrations, including projected GCP credentials and
+Nebius credentials, while still rejecting real duplicate fields.
+The PostgreSQL migration Job sets server mode in both its process entrypoint
+and Pod environment before resolving any database engine. A Job that upgrades
+ephemeral SQLite while the central PostgreSQL revision remains unchanged is a
+deployment failure, never a successful rollout.
 
 ## Productization gate
 

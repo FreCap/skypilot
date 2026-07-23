@@ -48,6 +48,7 @@ _STATES = ('PENDING', 'UPLOADING', 'QUEUED', 'BUILDING', 'VERIFYING',
            'PUBLISHING', 'READY', 'FAILED')
 _BUILD_FRONTEND = 'dockerfile.v0'
 _BUILD_FRONTEND_VERSION = 'docker/dockerfile:1.7'
+_CACHE_POLICY_VERSION = 2
 _SECRET_BUILD_ARG = re.compile(
     r'(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY)')
 
@@ -232,6 +233,24 @@ class BuildOutput:
 
 
 @dataclasses.dataclass(frozen=True)
+class DirectBuildResult:
+    """Secret-free result from the non-durable direct evidence runner."""
+
+    mode: str
+    spec_hash: str
+    context_digest: str
+    dependency_cache_key: str
+    files: int
+    bytes: int
+    staging_ref: str
+    digest: str
+    reference: str
+    cache_hits: int
+    elapsed_seconds: float
+    log_path: str
+
+
+@dataclasses.dataclass(frozen=True)
 class BuildRecord:
     """Credential-free projection of one prototype coordinator row."""
 
@@ -388,7 +407,7 @@ def dependency_cache_key(spec: BuildSpec, manifest: ContextManifest) -> str:
             'build_args': list(spec.build_args),
             'source_mode': spec.source_mode,
             'source': source_payload,
-            'policy_version': 1,
+            'policy_version': _CACHE_POLICY_VERSION,
         }))
 
 
@@ -743,11 +762,172 @@ class BuildKitExecutor:
         for key, _ in spec.build_args:
             lines.append(f'ARG {key}')
         for index, step in enumerate(spec.setup):
-            lines.append('RUN --mount=type=bind,source=.skypilot/steps/'
-                         f'{index:03d},target=/inputs,readonly {step.run}')
+            command_lines = step.run.rstrip('\n').splitlines()
+            delimiter = (
+                f'SKYPILOT_SETUP_{index:03d}_'
+                f'{hashlib.sha256(step.run.encode()).hexdigest()[:16].upper()}')
+            while delimiter in command_lines:
+                delimiter += '_X'
+            lines.extend([
+                'RUN --mount=type=bind,source=.skypilot/steps/'
+                f"{index:03d},target=/inputs,readonly <<'{delimiter}'",
+                'set -e',
+                *command_lines,
+                delimiter,
+            ])
         if spec.source_mode == 'image':
             lines.append('COPY .skypilot/source/ /opt/skypilot/source/')
         return '\n'.join(lines) + '\n'
+
+
+class DockerBuildxExecutor:
+    """Runs the filtered prototype build through a configured Buildx worker."""
+
+    def __init__(self,
+                 docker: str = 'docker',
+                 builder: str = 'skypilot-image-builder-prototype',
+                 metadata_timeout_seconds: int = 300) -> None:
+        executable = shutil.which(docker)
+        if executable is None:
+            raise RuntimeError('The builder prototype requires Docker Buildx.')
+        if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', builder) is None:
+            raise ValueError('Buildx builder name is invalid.')
+        if metadata_timeout_seconds <= 0:
+            raise ValueError('Buildx metadata timeout must be positive.')
+        self._docker = executable
+        self._builder = builder
+        self._metadata_timeout_seconds = metadata_timeout_seconds
+
+    def execute(self, record: BuildRecord, spec: BuildSpec, root: Path,
+                manifest: ContextManifest,
+                heartbeat: Callable[[], bool]) -> BuildOutput:
+        """Builds and pushes one immutable staging tag."""
+        if record.state != 'BUILDING' or record.lease_token is None:
+            raise RuntimeError('Buildx requires a fenced BUILDING claim.')
+        self._ensure_builder()
+        entries = manifest.by_path()
+        staging_ref = f'{spec.staging_repository}:sky-build-{record.id}'
+        cache_ref = (
+            f'{spec.staging_repository}:sky-cache-'
+            f'{record.dependency_cache_key.removeprefix("sha256:")[:24]}')
+        cache_exists = self._reference_exists(cache_ref)
+        with tempfile.TemporaryDirectory(prefix='sky-image-builder-') as temp:
+            build_root = Path(temp)
+            context_root = build_root / 'context'
+            dockerfile_root = build_root / 'dockerfile'
+            context_root.mkdir()
+            dockerfile_root.mkdir()
+            BuildKitExecutor._stage_context(  # pylint: disable=protected-access
+                root, context_root, spec, entries)
+            dockerfile = BuildKitExecutor._dockerfile(  # pylint: disable=protected-access
+                spec)
+            dockerfile_path = dockerfile_root / 'Dockerfile'
+            dockerfile_path.write_text(dockerfile, encoding='utf-8')
+            metadata_path = build_root / 'metadata.json'
+            log_path = Path(
+                tempfile.gettempdir()) / f'sky-build-{record.id}.log'
+            command = [
+                self._docker, 'buildx', 'build', '--builder', self._builder,
+                '--file',
+                str(dockerfile_path), '--platform', spec.platform,
+                '--metadata-file',
+                str(metadata_path), '--progress=plain', '--provenance=false',
+                '--tag', staging_ref, '--push', '--cache-from',
+                f'type=registry,ref={cache_ref}'
+            ]
+            # A digest-keyed cache tag is written once and then remains
+            # read-only. This supports ECR repositories with immutable tags.
+            if not cache_exists:
+                command.extend(
+                    ('--cache-to', f'type=registry,ref={cache_ref},mode=max'))
+            for key, value in spec.build_args:
+                command.extend(('--build-arg', f'{key}={value}'))
+            command.append(str(context_root))
+            with log_path.open('wb') as logs:
+                process = subprocess.Popen(command,
+                                           stdout=logs,
+                                           stderr=subprocess.STDOUT)
+                try:
+                    while process.poll() is None:
+                        if not heartbeat():
+                            raise RuntimeError('BUILDER_LEASE_LOST')
+                        time.sleep(5)
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=10)
+            if process.returncode != 0:
+                raise RuntimeError(f'BUILDX_FAILED (log: {log_path})')
+            metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+            digest = models.validate_sha256_digest(
+                metadata.get('containerimage.digest'), 'Buildx output digest')
+            cache_hits = log_path.read_text(encoding='utf-8',
+                                            errors='replace').count(' CACHED')
+            return BuildOutput(staging_ref=staging_ref,
+                               digest=digest,
+                               cache_hits=cache_hits,
+                               log_path=str(log_path))
+
+    def verify(self, output: BuildOutput) -> None:
+        """Proves the exact output digest is readable from the registry."""
+        exact_ref = f'{output.staging_ref}@{output.digest}'
+        result = subprocess.run(
+            [self._docker, 'buildx', 'imagetools', 'inspect', exact_ref],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=self._metadata_timeout_seconds)
+        if result.returncode != 0:
+            raise RuntimeError('BUILDX_STAGING_VERIFICATION_FAILED')
+
+    def _ensure_builder(self) -> None:
+        inspect = subprocess.run(
+            [self._docker, 'buildx', 'inspect', self._builder],
+            check=False,
+            capture_output=True,
+            timeout=self._metadata_timeout_seconds)
+        if inspect.returncode != 0:
+            error = (inspect.stdout +
+                     inspect.stderr).decode(errors='replace').lower()
+            if 'no builder' not in error and 'not found' not in error:
+                raise RuntimeError('BUILDX_BUILDER_INSPECTION_FAILED')
+            created = subprocess.run([
+                self._docker, 'buildx', 'create', '--name', self._builder,
+                '--driver', 'docker-container'
+            ],
+                                     check=False,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     timeout=self._metadata_timeout_seconds)
+            if created.returncode != 0:
+                raise RuntimeError('BUILDX_BUILDER_CREATION_FAILED')
+        bootstrapped = subprocess.run(
+            [self._docker, 'buildx', 'inspect', '--bootstrap', self._builder],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=self._metadata_timeout_seconds)
+        if bootstrapped.returncode != 0:
+            raise RuntimeError('BUILDX_BUILDER_BOOTSTRAP_FAILED')
+
+    def _reference_exists(self, reference: str) -> bool:
+        result = subprocess.run(
+            [self._docker, 'buildx', 'imagetools', 'inspect', reference],
+            check=False,
+            capture_output=True,
+            timeout=self._metadata_timeout_seconds)
+        if result.returncode == 0:
+            return True
+        error = (result.stdout + result.stderr).decode(errors='replace').lower()
+        missing_markers = ('not found', 'manifest unknown', 'does not exist',
+                           'imagenotfoundexception')
+        if any(marker in error for marker in missing_markers):
+            return False
+        raise RuntimeError('BUILDX_CACHE_INSPECTION_FAILED')
 
 
 def _copy_context_file(root: Path, destination: Path, relative: str,
@@ -866,6 +1046,55 @@ class PrototypeCoordinator:
         return record
 
 
+def run_direct_build(*, spec: BuildSpec, root: Path,
+                     executor: DockerBuildxExecutor) -> DirectBuildResult:
+    """Runs one non-durable build for real-image prototype evidence."""
+    if spec.distribution != 'direct' or spec.source_auth is not None:
+        raise ValueError('Direct evidence builds require distribution direct '
+                         'and no source authorization binding.')
+    root = root.resolve(strict=True)
+    manifest = create_context_manifest(root, spec)
+    cache_key = dependency_cache_key(spec, manifest)
+    now = int(time.time())
+    record = BuildRecord(id=str(uuid.uuid4()),
+                         idempotency_key=f'direct-evidence-{uuid.uuid4()}',
+                         spec_hash=spec.spec_hash,
+                         context_digest=manifest.digest,
+                         dependency_cache_key=cache_key,
+                         state='BUILDING',
+                         staging_repository=spec.staging_repository,
+                         output_digest=None,
+                         publication_id=None,
+                         artifact_id=None,
+                         error_code=None,
+                         lease_token='local-direct-evidence',
+                         lease_expires_at=now + _LEASE_SECONDS,
+                         created_at=now,
+                         updated_at=now)
+    started_at = time.monotonic()
+    output = executor.execute(record,
+                              spec,
+                              root,
+                              manifest,
+                              heartbeat=lambda: True)
+    executor.verify(output)
+    elapsed_seconds = time.monotonic() - started_at
+    return DirectBuildResult(
+        mode='execute-direct',
+        spec_hash=spec.spec_hash,
+        context_digest=manifest.digest,
+        dependency_cache_key=cache_key,
+        files=len(manifest.entries),
+        bytes=manifest.total_bytes,
+        staging_ref=output.staging_ref,
+        digest=output.digest,
+        reference=f'{spec.staging_repository}@{output.digest}',
+        cache_hits=output.cache_hits,
+        elapsed_seconds=elapsed_seconds,
+        log_path=output.log_path,
+    )
+
+
 def _load_spec(path: Path) -> BuildSpec:
     raw = yaml.safe_load(path.read_text(encoding='utf-8'))
     return BuildSpec.from_dict(raw)
@@ -881,13 +1110,21 @@ def main() -> None:
         description='Disabled managed container image builder prototype')
     parser.add_argument('spec', type=Path)
     parser.add_argument('--context', type=Path, default=Path('.'))
-    parser.add_argument('--validate-only', action='store_true')
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument('--validate-only', action='store_true')
+    action.add_argument('--execute-direct', action='store_true')
+    parser.add_argument('--docker', default='docker')
+    parser.add_argument('--builder', default='skypilot-image-builder-prototype')
     args = parser.parse_args()
-    if not args.validate_only:
-        raise RuntimeError(
-            'The prototype CLI currently requires --validate-only. Build '
-            'execution remains an internal evidence harness.')
     spec = _load_spec(args.spec)
+    if args.execute_direct:
+        executor = DockerBuildxExecutor(docker=args.docker,
+                                        builder=args.builder)
+        direct_result = run_direct_build(spec=spec,
+                                         root=args.context,
+                                         executor=executor)
+        print(json.dumps(dataclasses.asdict(direct_result), sort_keys=True))
+        return
     manifest = create_context_manifest(args.context, spec)
     cache_key = dependency_cache_key(spec, manifest)
     result = {
