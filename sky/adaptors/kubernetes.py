@@ -230,6 +230,10 @@ class _BoundedCoreApiResult(typing.NamedTuple):
     control_error: BaseException | None
 
 
+# The bounded credential path is entirely synchronous and contains no
+# cancellation checkpoint. Its BaseException boundaries deliberately contain
+# plugin/control failures until credentials are scrubbed or tracebacks detached.
+# The narrow ASYNC103/104 suppressions below preserve that security contract.
 class _ExecCredentialProcessState:
     """Owns cleanup if an unexpected failure escapes process collection."""
 
@@ -243,7 +247,7 @@ class _ExecCredentialProcessState:
         if process is not None:
             try:
                 _terminate_exec_credential_process_group(process)
-            except BaseException:  # pylint: disable=broad-exception-caught
+            except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
                 # Cleanup cannot replace the safe result.
                 pass
             for pipe_name in ('stdout', 'stderr'):
@@ -251,13 +255,13 @@ class _ExecCredentialProcessState:
                     pipe = getattr(process, pipe_name, None)
                     if pipe is not None:
                         pipe.close()
-                except BaseException:  # pylint: disable=broad-exception-caught
+                except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
                     # Cleanup is deliberately best effort.
                     pass
         for reader in self.readers:
             try:
                 reader.join(timeout=_EXEC_CREDENTIAL_TERMINATION_SECONDS)
-            except BaseException:  # pylint: disable=broad-exception-caught
+            except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
                 # A thread may have failed before start().
                 pass
         for output in self.outputs:
@@ -283,9 +287,9 @@ def _capture_provider_fence(
     """Runs a fence without returning an exception's originating traceback."""
     try:
         provider_fence()
-    except BaseException as error:  # pylint: disable=broad-exception-caught
+    except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # A drain/deadline error must retain its type.
-        return _detach_control_error(error)
+        return _detach_control_error(error)  # noqa: ASYNC104
     return None
 
 
@@ -312,7 +316,7 @@ def _read_bounded_exec_credential_output(pipe: Any, output: bytearray,
             if not chunk:
                 return
             output.extend(chunk)
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # A close caused by timeout/overflow may set this too. The caller gives
         # those earlier classifications priority, but an otherwise unexpected
         # read error must never be mistaken for clean EOF or reach
@@ -617,10 +621,10 @@ def _run_bounded_exec_credential_isolated(
             timeout_seconds=timeout_seconds,
             provider_fence=provider_fence,
             process_state=process_state)
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # Never expose the sensitive inner frame.
         process_state.terminate_and_scrub()
-        return _exec_credential_failure(
+        return _exec_credential_failure(  # noqa: ASYNC104
             'exec: credential command failed inside isolation boundary')
     process_state.release()
     return result
@@ -678,7 +682,7 @@ def _scrub_bounded_api_client_credentials(client_api: Any | None) -> None:
                     headers.pop(name, None)
         if hasattr(client_api, 'cookie'):
             client_api.cookie = None
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # Scrubbing must not replace the fixed failure or control result.
         pass
 
@@ -713,9 +717,9 @@ def _bounded_core_api_isolated_impl(
             in_cluster_core = kubernetes.client.CoreV1Api(api_client=client_api)
             in_cluster_refresh_deadline = (
                 time.monotonic() + _IN_CLUSTER_CREDENTIAL_REFRESH_SECONDS)
-        except BaseException:  # pylint: disable=broad-exception-caught
+        except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             _close_bounded_api_client(client_api)
-            return _bounded_core_api_failure(
+            return _bounded_core_api_failure(  # noqa: ASYNC104
                 'Failed to load bounded in-cluster Kubernetes credentials.')
         control_error = _capture_provider_fence(provider_fence)
         if control_error is not None:
@@ -788,10 +792,10 @@ def _bounded_core_api_isolated_impl(
         configuration.refresh_api_key_hook = None
         core = kubernetes.client.CoreV1Api(
             api_client=kubernetes.client.ApiClient(configuration=configuration))
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         _close_bounded_core(core)
         _scrub_bounded_kubeconfig_state(status, user, configuration)
-        return _bounded_core_api_failure(
+        return _bounded_core_api_failure(  # noqa: ASYNC104
             'Failed to install bounded Kubernetes credentials.')
     if status is not None:
         status.clear()
@@ -818,7 +822,7 @@ def _bounded_core_api_isolated(
             context,
             exec_credential_timeout_seconds=exec_credential_timeout_seconds,
             provider_fence=provider_fence)
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # Never expose the sensitive inner frame.
         result = _bounded_core_api_failure(
             'Failed to build Kubernetes client inside isolation boundary.')
@@ -892,15 +896,15 @@ class ProviderFencedCoreApi:
             return
         try:
             client_api = getattr(client, 'api_client', None)
-        except BaseException:  # pylint: disable=broad-exception-caught
+        except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             if logger is not None:
                 logger.debug('Error closing provider-fenced Kubernetes client.')
-            return
+            return  # noqa: ASYNC104
         _scrub_bounded_api_client_credentials(client_api)
         try:
             if client_api is not None:
                 client_api.close()
-        except BaseException:  # pylint: disable=broad-exception-caught
+        except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             if logger is not None:
                 logger.debug('Error closing provider-fenced Kubernetes client.')
 
@@ -970,7 +974,7 @@ class ProviderFencedCoreApi:
         refresh_error: BaseException | None = None
         try:
             self._refresh(provider_fence)
-        except BaseException as error:  # pylint: disable=broad-exception-caught
+        except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             refresh_error = _detach_control_error(error)
         if refresh_error is not None:
             self._invalidate()
@@ -997,7 +1001,7 @@ class ProviderFencedCoreApi:
                     f'Provider attribute {method_name!r} is not callable.')
             if on_start is not None:
                 on_start()
-        except BaseException as error:  # pylint: disable=broad-exception-caught
+        except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             start_error = _detach_control_error(error)
         if start_error is not None:
             method = None
@@ -1020,7 +1024,7 @@ class ProviderFencedCoreApi:
         result: Any = None
         try:
             result = method(*args, **kwargs)
-        except BaseException as error:  # pylint: disable=broad-exception-caught
+        except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             method_error = _detach_control_error(error)
         if method_error is not None:
             control_error = _capture_provider_fence(provider_fence)

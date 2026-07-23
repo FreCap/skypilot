@@ -71,16 +71,18 @@ def _wait_for_canary_poll(drain_event: threading.Event | None) -> None:
         raise _CanaryDrainRequested()
 
 
+# This synchronous fence has no cancellation checkpoint. It deliberately
+# detaches every control failure before the caller re-raises it after cleanup.
 def _capture_provider_fence_error(
         provider_fence: Callable[[], None]) -> BaseException | None:
     """Returns a control error detached from any losing provider failure."""
     try:
         provider_fence()
-    except BaseException as error:  # pylint: disable=broad-exception-caught
+    except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         error = error.with_traceback(None)
         error.__cause__ = None
         error.__context__ = None
-        return error
+        return error  # noqa: ASYNC104
     return None
 
 
