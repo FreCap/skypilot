@@ -467,13 +467,37 @@ def test_unverified_canary_teardown_remains_reclaimable(
          mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
     monkeypatch.setattr(
         canary_worker_service, '_run_ec2_canary',
-        mock.Mock(side_effect=ValueError('CANARY_TEARDOWN_FAILED')))
+        mock.Mock(side_effect=canary_worker_service._CanaryTeardownFailed()))
     fail = mock.Mock()
     monkeypatch.setattr(canary_worker_service.qualification,
                         'fail_owned_canary', fail)
 
     assert not canary_worker_service.run_canary(operation)
     fail.assert_not_called()
+
+
+def test_provider_teardown_code_collision_terminalizes_as_failure(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    operation = _canary_operation()
+    monkeypatch.setattr(canary_worker_service, '_LeaseHeartbeat',
+                        _OwnedHeartbeat)
+    monkeypatch.setattr(
+        canary_worker_service, '_load_contract', lambda _:
+        ({
+            'backend': 'aws_vm'
+        }, mock.sentinel.revision, mock.sentinel.profile, mock.sentinel.target,
+         mock.sentinel.binding, _DIGEST, mock.sentinel.ref))
+    provider_error = ValueError('CANARY_TEARDOWN_FAILED')
+    monkeypatch.setattr(canary_worker_service, '_run_ec2_canary',
+                        mock.Mock(side_effect=provider_error))
+    fail = mock.Mock(return_value=True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'fail_owned_canary', fail)
+
+    assert not canary_worker_service.run_canary(operation)
+    fail.assert_called_once_with(operation,
+                                 'CANARY_FAILED',
+                                 teardown_verified=True)
 
 
 def test_unstarted_canary_drain_does_not_load_or_terminalize(
@@ -1163,6 +1187,8 @@ def test_eks_cleanup_precedence_handles_provider_state_after_scrub(
     else:
         assert marker not in rendered
         _assert_canary_traceback_value_free(error, marker)
+    if winner == 'teardown':
+        assert isinstance(error, canary_worker_service._CanaryTeardownFailed)
     assert fenced._client is None
     assert core._client is None
     assert configuration.api_key == {}
@@ -1236,6 +1262,7 @@ def test_ec2_teardown_failure_drops_losing_provider_state(
     rendered = json.dumps(exceptions.serialize_exception(error),
                           default=str,
                           sort_keys=True)
+    assert isinstance(error, canary_worker_service._CanaryTeardownFailed)
     assert error.__cause__ is None
     assert error.__context__ is None
     assert marker not in rendered

@@ -372,7 +372,7 @@ def _preflight_error(operation: catalog_state.OperationRecord,
 def _detached_cleanup_winner(error: Exception) -> Exception | None:
     """Returns a cleanup/control winner detached from losing provider state."""
     if isinstance(error, _CanaryTeardownFailed):
-        return ValueError('CANARY_TEARDOWN_FAILED')
+        return _CanaryTeardownFailed()
     if isinstance(error, (_CanaryDrainRequested, _CanaryCleanupDeadlineExceeded,
                           worker_lease.LeaseLostError)):
         error = error.with_traceback(None)
@@ -1504,14 +1504,15 @@ def run_canary(operation: catalog_state.OperationRecord,
                 return False
             except worker_lease.LeaseLostError:
                 return False
+            except _CanaryTeardownFailed:
+                # Preserve the deterministic child for successor teardown.
+                # Terminalizing here would discard its only durable owner.
+                return False
             except ValueError as error:
                 code = str(error)
-                if code not in _CANARY_ERROR_CODES:
+                if (code not in _CANARY_ERROR_CODES or
+                        code == 'CANARY_TEARDOWN_FAILED'):
                     code = 'CANARY_FAILED'
-                if code == 'CANARY_TEARDOWN_FAILED':
-                    # Preserve the deterministic child for successor teardown.
-                    # Terminalizing here would discard its only durable owner.
-                    return False
                 if drain_event is not None and drain_event.is_set():
                     qualification.release_drained_canary(operation,
                                                          teardown_verified=True)
