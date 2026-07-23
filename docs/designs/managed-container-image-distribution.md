@@ -3564,3 +3564,21 @@ ordinary login configurations. A fresh cold launch is required after deploying
 that repair. The remaining image pull, instance bootstrap, and workload-data
 staging must be measured separately; this result does not justify moving a
 lazy OCI snapshotter or a separate model-data distribution plane into v0.
+
+The repair was subsequently deployed from
+`8481a272ee1afea77d9c9d21804a33ab63df9efe`. A fresh direct pull preserved
+`credential_helper: ecr-login`, performed no Docker login or ECR token command,
+and brought the managed container up after about 102.25 seconds of cold image
+pull. A paired Serve comparison used Spot by default with dynamic on-demand
+fallback because all `g6.xlarge` Spot zones were initially exhausted. On the
+same on-demand `g6.xlarge` fallback shape, source-image provision-to-readiness
+was 351.09 seconds and built-image provision-to-readiness was 375.19 seconds.
+The built image was about 24.10 seconds slower. Post-cluster readiness was
+effectively identical, 140.78 versus 141.29 seconds, because both paths still
+staged 10,036,350,627 bytes (9.35 GiB) of workload data.
+
+The credential-helper and concurrent-controller repairs are accepted, but the
+builder's 120-second deployment-speed gate failed. V0 remains an ordinary OCI
+distribution plane. A node-cache, snapshot, lazy snapshotter, or model-data
+locality feature requires a separate design and runtime capability gate rather
+than expansion of this PR.

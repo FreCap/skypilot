@@ -295,6 +295,49 @@ BuildKit executor, staging verification, and ordinary publication handoff
 remain exercised through the internal harness and tests. They are not enabled
 as a production service by the direct-evidence runner.
 
+### Live benchmark result, July 23, 2026
+
+The OpenDDE prototype built and published the declared Linux AMD64 setup layer,
+and a managed release resolved to its same-region, digest-pinned ECR target.
+The source manifest contained 3,626,317,722 compressed bytes. The built
+manifest retained the same ten base-layer digests and added two layers totaling
+85,565,515 compressed bytes, for 3,711,883,237 compressed bytes overall.
+
+The repaired AWS pull plan used `credential_helper: ecr-login` on a fresh node.
+It performed no `docker login`, ECR token command, or AWS CLI installation on
+the pull path. Pulling the cold managed image and starting its container took
+about 102.25 seconds. This proves the qualified credential-helper contract, but
+it is not a startup-latency win by itself.
+
+A same-server, same-region comparison then used Spot by default with dynamic
+on-demand fallback. Every `g6.xlarge` Spot zone was initially exhausted, so the
+availability measurement used the fallback while SkyServe continued seeking
+Spot. Comparing the same on-demand `g6.xlarge` shape removes that placement
+delay:
+
+| Phase | Source image | Built image | Difference |
+| --- | ---: | ---: | ---: |
+| provision start to cluster launched | 210.31 s | 233.90 s | built +23.59 s |
+| cluster launched to readiness | 140.78 s | 141.29 s | built +0.51 s |
+| provision start to readiness | 351.09 s | 375.19 s | built +24.10 s |
+
+The runtime setup in both cases still staged 7,835 objects totaling
+10,036,350,627 bytes (9.35 GiB). Moving the virtual environment and source
+checkout into an 85.6 MB compressed image layer therefore removed no material
+readiness time, while the slightly larger cold pull added time. The 120-second
+readiness target failed. End-to-end service timings were further distorted by
+global launch-budget and Spot-capacity waits, so they are retained only as
+diagnostics, not as builder performance evidence.
+
+This result keeps the builder behind its productization gate. The ordinary OCI
+builder and distribution contracts are still useful for reproducibility,
+credential isolation, immutable publication, and avoiding runtime package
+drift. Making this workload at least two minutes faster would require a
+separate node-cache or model-data locality mechanism, such as a qualified
+prewarmed snapshot or lazy data/runtime path. It would not be honest to hide
+that mechanism inside v0 setup-layer builds or to count first-request latency
+as deployment savings.
+
 Chart upgrades must merge the new chart defaults before applying the previous
 release's values. Provider-specific environment variables, volume names, and
 mount paths are reserved only when the corresponding native chart credential

@@ -55,6 +55,21 @@ The command returns JSON containing `reference`, `elapsed_seconds`,
 `cache_hits`, and the identities of the specification, context, and dependency
 cache. Run an identical build a second time to prove the registry cache hit.
 
+For live Serve evidence, use Spot as the primary market and enable
+`dynamic_ondemand_fallback` so a capacity shortage does not turn image timing
+into an unbounded placement wait. Record controller registration, launch-budget
+wait, Spot acquisition, node provisioning, image pull, runtime setup, and
+readiness separately.
+
+The July 23 OpenDDE comparison did not meet the 120-second readiness target.
+On the same on-demand `g6.xlarge` fallback shape, the source image reached
+readiness 351.09 seconds after provisioning began and the built image took
+375.19 seconds. Both spent about 141 seconds between cluster launch and
+readiness because both still staged 9.35 GiB of workload data. The result
+validates the builder and managed pull path, but it does not justify a
+faster-deployment claim or broadening this prototype into a data-locality
+system.
+
 This evidence mode is not a release publisher. It has no durable coordinator,
 does not create a SkyPilot release, and must not be used as the production
 publication path.
