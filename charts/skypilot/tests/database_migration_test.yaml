@@ -29,6 +29,11 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: IS_SKYPILOT_SERVER
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_STATE_DB_MIGRATION_MODE
             value: upgrade
       - contains:
@@ -206,6 +211,16 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: 'environment variable "SKYPILOT_DB_CONNECTION_URI" is duplicated or reserved by the chart'
+
+  - it: should reject an override of central server database selection
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: IS_SKYPILOT_SERVER
+          value: "false"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "IS_SKYPILOT_SERVER" is duplicated or reserved by the chart'
 
   - it: should reject duplicate shared volume names
     set:

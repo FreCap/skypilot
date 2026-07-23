@@ -86,9 +86,11 @@ def test_database_migration_entrypoint_forces_upgrade_mode(
     monkeypatch.setattr(serve_state, 'get_database_engine', initialize_serve)
     monkeypatch.setattr(state_storage, 'initialize_and_get_db', initialize_jobs)
     monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
+    monkeypatch.delenv(constants.ENV_VAR_IS_SKYPILOT_SERVER, raising=False)
 
     database_migrations.main()
 
+    assert os.environ[constants.ENV_VAR_IS_SKYPILOT_SERVER] == 'true'
     assert os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] == 'upgrade'
     initialize.assert_called_once_with()
     initialize_serve.assert_called_once_with()
