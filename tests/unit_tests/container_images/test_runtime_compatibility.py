@@ -822,10 +822,13 @@ def test_unsupported_runtime_rejects_managed_only_selectors_before_catalog(
     published.assert_not_called()
 
 
-def test_live_demand_replays_its_retired_immutable_profile_snapshot(
+def test_live_demand_replays_after_attestation_refresh_on_retired_snapshot(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
-    revision = dataclasses.replace(_active_revision(profile, observed_at=9),
+    # The automatic canary replaced the proof after this demand was admitted
+    # at t=10.  The later observed_at must not make the durable replay look as
+    # though its proof came from the future.
+    revision = dataclasses.replace(_active_revision(profile, observed_at=11),
                                    state=models.ImageProfileState.RETIRED)
     policy = models.WorkspaceImagePolicy(
         mode=models.WorkspaceImageMode.MANAGED_PREFERRED,

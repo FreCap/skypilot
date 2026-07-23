@@ -289,13 +289,18 @@ def _matches_current_demand(
                 for key, value in expected_placement.items()))
 
 
-def _runtime_binding_fresh(active: topology_state.ProfileRevisionRecord,
-                           profile: models.ManagedRegistryProfile,
-                           target: models.ManagedRegistryTarget,
-                           placement: models.Placement,
-                           binding: models.RegistryAccessBinding,
-                           *,
-                           now: int | None = None) -> bool:
+def _runtime_binding_matches(active: topology_state.ProfileRevisionRecord,
+                             profile: models.ManagedRegistryProfile,
+                             target: models.ManagedRegistryTarget,
+                             placement: models.Placement,
+                             binding: models.RegistryAccessBinding) -> bool:
+    """Checks structural runtime identity without re-admitting a demand.
+
+    Freshness for a new demand is checked against PostgreSQL time inside the
+    locked demand transaction.  An existing demand is the durable admission
+    record, so a later automatic-canary refresh must not revoke its replay by
+    replacing the attestation with an ``observed_at`` after ``created_at``.
+    """
     runtime_id = placement.region
     key = models.profile_attestation_key('runtime', target.name,
                                          placement.backend, binding.fingerprint,
@@ -319,7 +324,7 @@ def _runtime_binding_fresh(active: topology_state.ProfileRevisionRecord,
         placement.backend,
         runtime_id,
         evidence,
-        as_of=now,
+        as_of=None,
         qualified_cluster=qualified_cluster)
 
 
@@ -445,11 +450,8 @@ def _resolve_metadata(
          kubernetes_node_selector) = _runtime_binding(profile, target,
                                                       placement)
         prepared = _pin_host_image(resources, placement, expected_host_image)
-        qualification_time = (current_demand.created_at
-                              if current_demand is not None else None)
-        if not _runtime_binding_fresh(
-                active, profile, target, placement, binding,
-                now=qualification_time):
+        if not _runtime_binding_matches(active, profile, target, placement,
+                                        binding):
             raise ValueError('QUALIFICATION_STALE')
     except ValueError:
         if (_direct_fallback_allowed(policy, image) and current_demand is None):

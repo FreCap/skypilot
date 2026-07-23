@@ -629,6 +629,39 @@ def test_replica_index_migration_fails_closed_without_reconstructable_state(
     assert revision == '025'
 
 
+def test_replica_index_migration_rejects_same_name_with_wrong_columns(tmp_path):
+    engine = create_engine(f'sqlite:///{tmp_path / "wrong-index.db"}')
+    metadata = sqlalchemy.MetaData()
+    replicas = sqlalchemy.Table(
+        'replicas',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+    )
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db',
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    sqlalchemy.Index('replicas_service_version_idx', replicas.c.service_name,
+                     replicas.c.replica_id)
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(version_table.insert().values(version_num='025'))
+
+    with pytest.raises(RuntimeError, match='unexpected columns'):
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SERVE_DB_NAME,
+                                             '026')
+
+    with engine.connect() as connection:
+        revision = connection.execute(
+            sqlalchemy.select(version_table.c.version_num)).scalar_one()
+    assert revision == '025'
+
+
 def test_elected_version_migration_backfills_latest_committed_version(
         tmp_path, monkeypatch):
     engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')

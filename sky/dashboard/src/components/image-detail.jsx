@@ -26,9 +26,24 @@ import {
   RetryImageDialog,
 } from '@/components/image-action-dialogs';
 import {
+  getImageArtifactCollection,
   getImageArtifactDetail,
   getImageCapabilities,
 } from '@/data/connectors/images';
+
+const ARTIFACT_COLLECTIONS = [
+  'releases',
+  'sources',
+  'locations',
+  'publications',
+  'demands',
+];
+
+function initialCollectionCursorStacks() {
+  return Object.fromEntries(
+    ARTIFACT_COLLECTIONS.map((collection) => [collection, [null]])
+  );
+}
 
 function timestamp(value) {
   return value ? new Date(value * 1000).toLocaleString() : 'Never';
@@ -79,6 +94,60 @@ function Definition({ label, children }) {
   );
 }
 
+function CollectionPager({
+  collection,
+  page,
+  nextCursor,
+  loading,
+  error,
+  notice,
+  onPrevious,
+  onNext,
+}) {
+  const label = collection.replace('_', ' ');
+  if (page === 1 && !nextCursor && !loading && !error && !notice) return null;
+  return (
+    <div className="mt-4 border-t border-gray-200 pt-3">
+      {notice && (
+        <div className="mb-3 rounded-md border border-blue-200 bg-blue-50 p-2 text-sm text-blue-800">
+          {notice}
+        </div>
+      )}
+      {error && (
+        <div
+          role="alert"
+          className="mb-3 rounded-md border border-red-200 bg-red-50 p-2 text-sm text-red-800"
+        >
+          {error}
+        </div>
+      )}
+      <div className="flex items-center justify-between">
+        <span className="text-sm text-gray-500">Page {page}</span>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label={`Previous ${label} page`}
+            disabled={page === 1 || loading}
+            onClick={onPrevious}
+          >
+            Previous
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label={`Next ${label} page`}
+            disabled={!nextCursor || loading}
+            onClick={onNext}
+          >
+            Next
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function ImageDetail() {
   const router = useRouter();
   const imageId =
@@ -94,12 +163,24 @@ export function ImageDetail() {
   const [activeTab, setActiveTab] = useState('overview');
   const [prepareOpen, setPrepareOpen] = useState(false);
   const [retry, setRetry] = useState(null);
+  const [collectionCursorStacks, setCollectionCursorStacks] = useState(
+    initialCollectionCursorStacks
+  );
+  const [collectionLoading, setCollectionLoading] = useState({});
+  const [collectionErrors, setCollectionErrors] = useState({});
+  const [collectionNotices, setCollectionNotices] = useState({});
   const generation = useRef(0);
   const requestController = useRef(null);
+  const collectionControllers = useRef({});
 
   const load = useCallback(async () => {
     if (!imageId) return undefined;
     requestController.current?.abort();
+    Object.values(collectionControllers.current).forEach((controller) =>
+      controller.abort()
+    );
+    collectionControllers.current = {};
+    setCollectionLoading({});
     const controller = new AbortController();
     requestController.current = controller;
     const currentGeneration = ++generation.current;
@@ -122,6 +203,9 @@ export function ImageDetail() {
       setWorkspace(nextCapabilities.workspace);
       setCapabilities(nextCapabilities);
       setDetail(nextDetail);
+      setCollectionCursorStacks(initialCollectionCursorStacks());
+      setCollectionErrors({});
+      setCollectionNotices({});
     } catch (requestError) {
       if (
         requestError.name !== 'AbortError' &&
@@ -151,8 +235,125 @@ export function ImageDetail() {
       generation.current += 1;
       requestController.current?.abort();
       requestController.current = null;
+      Object.values(collectionControllers.current).forEach((controller) =>
+        controller.abort()
+      );
+      collectionControllers.current = {};
     };
   }, [load]);
+
+  const pageArtifactCollection = useCallback(
+    async (collection, direction) => {
+      if (!imageId || !workspace || !detail) return;
+      const currentStack = collectionCursorStacks[collection] || [null];
+      let nextStack;
+      if (direction === 'next') {
+        const nextCursor = detail.next_cursors?.[collection];
+        if (!nextCursor) return;
+        nextStack = [...currentStack, nextCursor];
+      } else {
+        if (currentStack.length === 1) return;
+        nextStack = currentStack.slice(0, -1);
+      }
+
+      collectionControllers.current[collection]?.abort();
+      const controller = new AbortController();
+      collectionControllers.current[collection] = controller;
+      const currentGeneration = generation.current;
+      setCollectionLoading((current) => ({
+        ...current,
+        [collection]: true,
+      }));
+      setCollectionErrors((current) => {
+        const next = { ...current };
+        delete next[collection];
+        return next;
+      });
+      setCollectionNotices((current) => {
+        const next = { ...current };
+        delete next[collection];
+        return next;
+      });
+
+      try {
+        let page;
+        try {
+          page = await getImageArtifactCollection(
+            imageId,
+            collection,
+            {
+              workspace,
+              limit: 100,
+              cursor: nextStack[nextStack.length - 1],
+            },
+            controller.signal
+          );
+        } catch (requestError) {
+          if (
+            requestError.code !== 'STALE_IMAGE_CURSOR' ||
+            nextStack[nextStack.length - 1] === null
+          ) {
+            throw requestError;
+          }
+          nextStack = [null];
+          page = await getImageArtifactCollection(
+            imageId,
+            collection,
+            { workspace, limit: 100, cursor: null },
+            controller.signal
+          );
+          setCollectionNotices((current) => ({
+            ...current,
+            [collection]: `The ${collection} collection changed while paging. Reloaded the first page.`,
+          }));
+        }
+
+        if (
+          generation.current !== currentGeneration ||
+          collectionControllers.current[collection] !== controller
+        )
+          return;
+        setDetail((current) => {
+          if (!current || current.artifact.id !== detail.artifact.id)
+            return current;
+          const nextCursors = {
+            ...(current.next_cursors || {}),
+            [collection]: page.next_cursor || null,
+          };
+          return {
+            ...current,
+            [collection]: page.items,
+            next_cursors: nextCursors,
+            truncated: Object.values(nextCursors).some(Boolean),
+          };
+        });
+        setCollectionCursorStacks((current) => ({
+          ...current,
+          [collection]: nextStack,
+        }));
+      } catch (requestError) {
+        if (
+          requestError.name !== 'AbortError' &&
+          generation.current === currentGeneration &&
+          collectionControllers.current[collection] === controller
+        ) {
+          setCollectionErrors((current) => ({
+            ...current,
+            [collection]: requestError.code || requestError.message,
+          }));
+        }
+      } finally {
+        if (collectionControllers.current[collection] === controller) {
+          delete collectionControllers.current[collection];
+          setCollectionLoading((current) => ({
+            ...current,
+            [collection]: false,
+          }));
+        }
+      }
+    },
+    [detail, imageId, workspace, collectionCursorStacks]
+  );
 
   const hasNonterminal = useMemo(
     () =>
@@ -168,12 +369,19 @@ export function ImageDetail() {
       ),
     [detail]
   );
+  const viewingFirstCollectionPages = useMemo(
+    () =>
+      ARTIFACT_COLLECTIONS.every(
+        (collection) => collectionCursorStacks[collection].length === 1
+      ),
+    [collectionCursorStacks]
+  );
 
   useEffect(() => {
-    if (!hasNonterminal) return undefined;
+    if (!hasNonterminal || !viewingFirstCollectionPages) return undefined;
     const timer = setInterval(load, 5000);
     return () => clearInterval(timer);
-  }, [hasNonterminal, load]);
+  }, [hasNonterminal, load, viewingFirstCollectionPages]);
 
   if (loading && !detail) {
     return (
@@ -283,19 +491,19 @@ export function ImageDetail() {
 
       <div className="grid gap-3 md:grid-cols-4">
         <div className="rounded-lg border border-gray-200 bg-white p-4">
-          <div className="text-xs text-gray-500">Releases</div>
+          <div className="text-xs text-gray-500">Releases on page</div>
           <div className="mt-1 text-2xl font-semibold">
             {detail.releases.length}
           </div>
         </div>
         <div className="rounded-lg border border-gray-200 bg-white p-4">
-          <div className="text-xs text-gray-500">Registry locations</div>
+          <div className="text-xs text-gray-500">Locations on page</div>
           <div className="mt-1 text-2xl font-semibold">
             {detail.locations.length}
           </div>
         </div>
         <div className="rounded-lg border border-gray-200 bg-white p-4">
-          <div className="text-xs text-gray-500">Active demands</div>
+          <div className="text-xs text-gray-500">Active demands on page</div>
           <div className="mt-1 text-2xl font-semibold">
             {
               detail.demands.filter((item) =>
@@ -311,13 +519,6 @@ export function ImageDetail() {
           </div>
         </div>
       </div>
-
-      {detail.truncated && (
-        <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-          One detail collection exceeded 100 rows. Use the paginated API for the
-          complete history.
-        </div>
-      )}
 
       <Tabs>
         <TabsList aria-label="Artifact detail sections">
@@ -379,6 +580,18 @@ export function ImageDetail() {
                   <p className="text-sm text-gray-500">No READY release.</p>
                 )}
               </div>
+              <CollectionPager
+                collection="releases"
+                page={collectionCursorStacks.releases.length}
+                nextCursor={detail.next_cursors?.releases}
+                loading={Boolean(collectionLoading.releases)}
+                error={collectionErrors.releases}
+                notice={collectionNotices.releases}
+                onPrevious={() =>
+                  pageArtifactCollection('releases', 'previous')
+                }
+                onNext={() => pageArtifactCollection('releases', 'next')}
+              />
             </section>
             <section className="rounded-lg border border-gray-200 bg-white p-5 lg:col-span-2">
               <h2 className="font-semibold text-gray-900">Retained sources</h2>
@@ -398,6 +611,16 @@ export function ImageDetail() {
                   </div>
                 ))}
               </div>
+              <CollectionPager
+                collection="sources"
+                page={collectionCursorStacks.sources.length}
+                nextCursor={detail.next_cursors?.sources}
+                loading={Boolean(collectionLoading.sources)}
+                error={collectionErrors.sources}
+                notice={collectionNotices.sources}
+                onPrevious={() => pageArtifactCollection('sources', 'previous')}
+                onNext={() => pageArtifactCollection('sources', 'next')}
+              />
             </section>
           </div>
         </TabsContent>
@@ -473,6 +696,20 @@ export function ImageDetail() {
                 ))}
               </TableBody>
             </Table>
+            <div className="px-5 pb-4">
+              <CollectionPager
+                collection="locations"
+                page={collectionCursorStacks.locations.length}
+                nextCursor={detail.next_cursors?.locations}
+                loading={Boolean(collectionLoading.locations)}
+                error={collectionErrors.locations}
+                notice={collectionNotices.locations}
+                onPrevious={() =>
+                  pageArtifactCollection('locations', 'previous')
+                }
+                onNext={() => pageArtifactCollection('locations', 'next')}
+              />
+            </div>
           </section>
         </TabsContent>
 
@@ -528,6 +765,20 @@ export function ImageDetail() {
                 ))}
               </TableBody>
             </Table>
+            <div className="px-5 pb-4">
+              <CollectionPager
+                collection="publications"
+                page={collectionCursorStacks.publications.length}
+                nextCursor={detail.next_cursors?.publications}
+                loading={Boolean(collectionLoading.publications)}
+                error={collectionErrors.publications}
+                notice={collectionNotices.publications}
+                onPrevious={() =>
+                  pageArtifactCollection('publications', 'previous')
+                }
+                onNext={() => pageArtifactCollection('publications', 'next')}
+              />
+            </div>
           </section>
         </TabsContent>
 
@@ -571,6 +822,18 @@ export function ImageDetail() {
                 ))}
               </TableBody>
             </Table>
+            <div className="px-5 pb-4">
+              <CollectionPager
+                collection="demands"
+                page={collectionCursorStacks.demands.length}
+                nextCursor={detail.next_cursors?.demands}
+                loading={Boolean(collectionLoading.demands)}
+                error={collectionErrors.demands}
+                notice={collectionNotices.demands}
+                onPrevious={() => pageArtifactCollection('demands', 'previous')}
+                onNext={() => pageArtifactCollection('demands', 'next')}
+              />
+            </div>
           </section>
         </TabsContent>
       </Tabs>

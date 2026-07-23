@@ -2830,29 +2830,40 @@ def test_new_demand_uses_locked_database_qualification_time_and_replay_skips_age
     assert validation_times == [last_qualified_at]
     assert demand.created_at == last_qualified_at
 
-    replay = _warming_demand(active,
+    target = next(item for item in (profile.canonical,) + profile.targets
+                  if item.target_fingerprint == regional.target_fingerprint)
+    refreshed_at = last_qualified_at + 1
+    refreshed_active = _refresh_runtime_attestation(active,
+                                                    profile,
+                                                    target,
+                                                    backend='aws_vm',
+                                                    runtime_id=target.region,
+                                                    now=refreshed_at)
+    replay = _warming_demand(refreshed_active,
                              publication_record,
                              regional,
                              profile,
                              owner='clock-boundary:v1',
                              controller_epoch='service:clock-boundary:v1',
                              controller_sequence=1,
-                             now=last_qualified_at + 1)
+                             now=last_qualified_at + 2)
     assert replay.id == demand.id
     assert replay.created_at == last_qualified_at
     assert validation_times == [last_qualified_at]
 
     stale_owner = 'clock-boundary:v2'
+    stale_now = (refreshed_at +
+                 profile.qualification.runtime_attestation_max_age_seconds + 1)
     with pytest.raises(ValueError, match='QUALIFICATION_STALE'):
-        _warming_demand(active,
+        _warming_demand(refreshed_active,
                         publication_record,
                         regional,
                         profile,
                         owner=stale_owner,
                         controller_epoch='service:clock-boundary:v2',
                         controller_sequence=2,
-                        now=last_qualified_at + 1)
-    assert validation_times == [last_qualified_at, last_qualified_at + 1]
+                        now=stale_now)
+    assert validation_times == [last_qualified_at, stale_now]
     with image_database.connect() as connection:
         demand_rows = connection.execute(
             sqlalchemy.select(schema.demands.c.id).where(

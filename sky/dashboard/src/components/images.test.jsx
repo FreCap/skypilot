@@ -164,6 +164,74 @@ describe('Images dashboard', () => {
     ]);
   });
 
+  it('pages the failed publication recovery feed independently', async () => {
+    getImageCapabilities.mockResolvedValue(capabilities({ publish: true }));
+    getImagePublications
+      .mockResolvedValueOnce({
+        items: [
+          {
+            id: 'publication-1',
+            requested_release: 'failed-release-1',
+            source_ref: 'registry/source-1',
+            error_code: 'SOURCE_FAILED',
+          },
+        ],
+        next_cursor: 'failed-next',
+      })
+      .mockResolvedValueOnce({
+        items: [
+          {
+            id: 'publication-2',
+            requested_release: 'failed-release-2',
+            source_ref: 'registry/source-2',
+            error_code: 'SOURCE_FAILED',
+          },
+        ],
+        next_cursor: null,
+      });
+
+    render(<Images />);
+
+    expect(await screen.findByText('failed-release-1')).toBeVisible();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'Next failed publications page',
+      })
+    );
+    expect(await screen.findByText('failed-release-2')).toBeVisible();
+    expect(screen.queryByText('failed-release-1')).toBeNull();
+    expect(
+      getImagePublications.mock.calls.map(([query]) => query.cursor)
+    ).toEqual([null, 'failed-next']);
+    expect(getImageCatalog).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers a stale failed-publication cursor without resetting catalog paging', async () => {
+    getImageCapabilities.mockResolvedValue(capabilities({ publish: true }));
+    getImagePublications
+      .mockResolvedValueOnce({ items: [], next_cursor: 'failed-next' })
+      .mockRejectedValueOnce({ code: 'STALE_IMAGE_CURSOR' })
+      .mockResolvedValueOnce(emptyPage);
+
+    render(<Images />);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'Next failed publications page',
+      })
+    );
+
+    expect(
+      await screen.findByText(
+        'The failed publication feed changed while paging. Reloaded the first page.'
+      )
+    ).toBeVisible();
+    await waitFor(() => expect(getImagePublications).toHaveBeenCalledTimes(3));
+    expect(
+      getImagePublications.mock.calls.map(([query]) => query.cursor)
+    ).toEqual([null, 'failed-next', null]);
+    expect(getImageCatalog).toHaveBeenCalledTimes(1);
+  });
+
   it('suppresses a late capability response after workspace navigation', async () => {
     const oldRequest = deferred();
     const newRequest = deferred();

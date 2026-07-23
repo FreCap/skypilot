@@ -1,5 +1,6 @@
 import { apiClient } from '@/data/connectors/client';
 import {
+  getImageArtifactCollection,
   getImageArtifactDetail,
   getImageCatalog,
   ImageApiError,
@@ -113,6 +114,40 @@ describe('managed image connectors', () => {
     );
     expect(detail.artifact).toEqual({ id: 'image-1' });
     expect(detail.locations).toEqual([{ id: 'locations' }]);
+    expect(detail.next_cursors).toEqual({
+      releases: null,
+      sources: null,
+      publications: null,
+      locations: 'next',
+      demands: null,
+    });
     expect(detail.truncated).toBe(true);
+  });
+
+  it('pages one artifact collection without loading the other collections', async () => {
+    apiClient.get.mockResolvedValue(
+      response({ items: [{ id: 'location-101' }], next_cursor: 'next-2' })
+    );
+
+    const page = await getImageArtifactCollection('image/1', 'locations', {
+      workspace: 'research',
+      limit: 100,
+      cursor: 'opaque + cursor',
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/images/artifacts/image%2F1/locations?workspace=research&limit=100&cursor=opaque+%2B+cursor',
+      { signal: undefined }
+    );
+    expect(page.items).toEqual([{ id: 'location-101' }]);
+  });
+
+  it('rejects an unknown artifact collection before issuing a request', () => {
+    expect(() =>
+      getImageArtifactCollection('image-1', 'credentials', {
+        workspace: 'research',
+      })
+    ).toThrow('Unknown image artifact collection');
+    expect(apiClient.get).not.toHaveBeenCalled();
   });
 });

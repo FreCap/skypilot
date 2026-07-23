@@ -8,12 +8,12 @@ Create Date: 2026-07-23
 # pylint: disable=invalid-name
 from collections.abc import Sequence
 import pickle
+from typing import Any
 
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from sky.serve import serve_state
 from sky.utils.db import db_utils
 
 revision: str = '026'
@@ -24,6 +24,23 @@ depends_on: str | Sequence[str] | None = None
 _INDEX_NAME = 'replicas_service_version_idx'
 _STATUS_INDEX_NAME = 'replicas_service_status_idx'
 _BACKFILL_BATCH_SIZE = 500
+
+
+def _legacy_replica_row_values(replica_info: Any) -> dict[str, Any]:
+    """Convert one legacy pickle using this migration's frozen projection."""
+    replica_state = replica_info.to_storage_dict()
+    sky_down_status = replica_info.status_property.sky_down_status
+    return {
+        'replica_state_version': 1,
+        'status': replica_info.status.value,
+        'sky_down_status':
+            (sky_down_status.value if sky_down_status is not None else None),
+        'version': replica_info.version,
+        'cluster_name': replica_info.cluster_name,
+        'created_at': getattr(replica_info, 'created_at', None),
+        'is_spot': replica_info.is_spot,
+        'replica_state': replica_state,
+    }
 
 
 def _replicas_table() -> sa.Table:
@@ -110,14 +127,11 @@ def _ensure_replica_json_state(bind: sa.engine.Connection) -> None:
                     'Replica JSON convergence found an incomplete row '
                     'without legacy replica_info state.')
             replica_info = pickle.loads(replica_info_bytes)
-            row_values = serve_state._replica_row_values(  # pylint: disable=protected-access
-                service_name, replica_id, replica_info)
+            row_values = _legacy_replica_row_values(replica_info)
             values.append({
                 '_service_name': service_name,
                 '_replica_id': replica_id,
-                **{
-                    key: value for key, value in row_values.items() if key not in ('service_name', 'replica_id', 'replica_info')
-                },
+                **row_values,
             })
         bind.execute(update, values)
 
@@ -131,10 +145,39 @@ def _ensure_replica_json_state(bind: sa.engine.Connection) -> None:
 
 def _ensure_index(bind: sa.engine.Connection, name: str,
                   columns: list[str]) -> None:
+    if bind.dialect.name == 'postgresql':
+        is_valid = bind.execute(
+            sa.text("""
+                SELECT pg_index.indisvalid
+                FROM pg_index
+                JOIN pg_class AS index_class
+                  ON index_class.oid = pg_index.indexrelid
+                JOIN pg_class AS table_class
+                  ON table_class.oid = pg_index.indrelid
+                JOIN pg_namespace
+                  ON pg_namespace.oid = table_class.relnamespace
+                WHERE pg_namespace.nspname = current_schema()
+                  AND table_class.relname = 'replicas'
+                  AND index_class.relname = :name
+                """), {
+                'name': name
+            }).scalar_one_or_none()
+        if is_valid is False:
+            schema = bind.execute(
+                sa.text('SELECT current_schema()')).scalar_one()
+            preparer = bind.dialect.identifier_preparer
+            bind.exec_driver_sql(
+                'DROP INDEX CONCURRENTLY IF EXISTS '
+                f'{preparer.quote(schema)}.{preparer.quote(name)}')
+
     existing = {
-        index['name'] for index in sa.inspect(bind).get_indexes('replicas')
+        index['name']: index
+        for index in sa.inspect(bind).get_indexes('replicas')
     }
     if name in existing:
+        if list(existing[name].get('column_names') or []) != columns:
+            raise RuntimeError(
+                f'Existing replica index {name!r} has unexpected columns.')
         return
     op.create_index(name,
                     'replicas',

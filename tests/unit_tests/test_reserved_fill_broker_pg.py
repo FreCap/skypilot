@@ -582,6 +582,46 @@ class TestMigrationChainPG:
         finally:
             engine.dispose()
 
+    def test_revision_026_rebuilds_invalid_concurrent_index_residue(
+            self, pg_server):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '025')
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        'DROP INDEX IF EXISTS replicas_service_version_idx'))
+                connection.execute(
+                    sqlalchemy.text('CREATE INDEX replicas_service_version_idx '
+                                    'ON replicas (service_name, version)'))
+                connection.execute(
+                    sqlalchemy.text(
+                        'UPDATE pg_index SET indisvalid = FALSE '
+                        "WHERE indexrelid = 'replicas_service_version_idx'"
+                        '::regclass'))
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '026')
+
+            with engine.connect() as connection:
+                is_valid = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT indisvalid FROM pg_index '
+                        "WHERE indexrelid = 'replicas_service_version_idx'"
+                        '::regclass')).scalar_one()
+                revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert is_valid is True
+            assert revision == '026'
+        finally:
+            engine.dispose()
+
     @pytest.mark.parametrize('preview_workspace_016', [False, True])
     def test_revision_022_reconciles_conflicting_revision_016_layouts(
             self, pg_server, preview_workspace_016):

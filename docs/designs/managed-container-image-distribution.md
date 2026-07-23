@@ -896,10 +896,15 @@ failure. They never persist a WARMING fallback as managed locality.
 An owner epoch with a live demand reloads that demand's exact immutable profile
 snapshot and target even after the revision becomes RETIRED. It evaluates the
 immutable authorization recorded when the demand was created and accepts only
-an exact placement replay. Current proof age is a new-admission condition, not a
-reason to invalidate that already-authorized deployment. A retired revision
-cannot admit a new owner or select a new target, so a profile rollout cannot
-strand an in-flight deployment or reopen old capacity.
+an exact placement replay. Resolution rechecks the structural runtime identity,
+target, binding fingerprint, principal, host image, and exact EKS tuple, but it
+does not re-evaluate proof age from the mutable profile attestation map. This is
+important both after proof expiry and after a successful automatic canary
+replaces the attestation with a later `observed_at`: neither event can revoke an
+already-authorized deployment. Current proof age is exclusively a new-admission
+condition inside the locked demand transaction. A retired revision cannot admit
+a new owner or select a new target, so a profile rollout cannot strand an
+in-flight deployment or reopen old capacity.
 
 Eviction treats every WARMING or READY demand as the fence and locks its shard,
 location, and demand state in the canonical order. Retention is evaluated per
@@ -1286,7 +1291,12 @@ SQLite as well as central PostgreSQL; skipping only the index would leave those
 legacy replicas unreadable by the current model. Empty projection-only preview
 tables gain the complete current column set. A nonempty row missing both
 authoritative JSON and the legacy pickle fails closed because its replica state
-cannot be reconstructed without inventing control-plane state. Real-PostgreSQL tests construct
+cannot be reconstructed without inventing control-plane state. The migration
+owns a frozen legacy-pickle projection instead of importing the live Serve
+write helper. On PostgreSQL it detects an INVALID same-name concurrent-index
+residue, drops it concurrently, and rebuilds it; a valid same-name index with
+unexpected columns fails closed instead of being mistaken for the required
+lookup. Real-PostgreSQL tests construct
 upstream-022 and managed-preview 022/023/024 layouts independently, upgrade each
 through 026, and prove the full model projection is readable. A SQLite
 regression starts with a legacy three-column replica table stamped at revision
@@ -2168,7 +2178,14 @@ Each catalog page loads at most ten active-publication, source, and location
 samples per artifact through three fixed lateral-limit statements and matching
 artifact indexes. `publications_truncated`, `sources_truncated`, and
 `locations_truncated` mark partial summaries; the UI labels them as partial and
-uses the paginated artifact endpoints for complete detail.
+uses the paginated artifact endpoints for complete detail. Every artifact
+collection has independent bounded Previous and Next controls backed by its own
+opaque cursor stack; navigating one collection does not eagerly materialize or
+refetch the others. The Dashboard also pages the workspace failed-publication
+feed independently, so an unbound failure remains discoverable and retryable
+beyond the first page. Stale collection or publication cursors reset only their
+own view to its first page with an explicit notice. Summary cards say that their
+counts cover the visible page rather than presenting a bounded page as a total.
 
 Catalog and detail reads remain available to workspace readers, but source and
 publication projections reveal credential-binding names and fingerprints only
@@ -2374,8 +2391,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   worker housekeeping use only monotonic process time;
 - locked new-demand tests proving that runtime-proof validation and
   `demand.created_at` use the same database epoch, stale proof rejection rolls
-  back both demand and watermark, and an exact existing replay survives later
-  proof expiry without changing its original creation time;
+  back both demand and watermark, and an exact existing replay survives both
+  later proof expiry and replacement by a newer successful attestation without
+  changing its original creation time;
 - source-reader tests for private and multicast literals, DNS rebinding to
   private or multicast peers before TLS bytes,
   off-authority bearer realms, private and chained redirects, disabled token
@@ -2434,6 +2452,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   child caps, explicit truncation flags, and publication/source/location index
   plans, plus many-target readiness fixtures proving one statement, a 100-group
   cap, queue lower-bound flags, and no per-group query growth;
+- Dashboard pagination tests proving independent artifact-collection and failed-
+  publication cursor stacks, bounded page replacement rather than eager history
+  accumulation, local stale-cursor recovery, and continued retry access beyond
+  the first failed-publication page;
 - profile-history pagination beyond one page plus PostgreSQL plan evidence that
   the newest-first workspace query uses its exact keyset index, and capability
   tests proving it requests only the bounded configured ACTIVE profile set;

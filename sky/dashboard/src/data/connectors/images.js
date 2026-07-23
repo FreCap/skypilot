@@ -73,18 +73,49 @@ export const getImageOperation = (operationId, workspace, signal) =>
     signal
   );
 
+const ARTIFACT_COLLECTIONS = new Set([
+  'releases',
+  'sources',
+  'publications',
+  'locations',
+  'demands',
+]);
+
+export function getImageArtifactCollection(
+  imageId,
+  collection,
+  options = {},
+  signal
+) {
+  if (!ARTIFACT_COLLECTIONS.has(collection)) {
+    throw new Error(`Unknown image artifact collection: ${collection}`);
+  }
+  return get(
+    `/images/artifacts/${encodeURIComponent(imageId)}/${collection}`,
+    options,
+    signal
+  );
+}
+
 export async function getImageArtifactDetail(imageId, workspace, signal) {
   const encoded = encodeURIComponent(imageId);
   const query = { workspace, limit: 100 };
   const [artifact, releases, sources, publications, locations, demands] =
     await Promise.all([
       get(`/images/artifacts/${encoded}`, { workspace }, signal),
-      get(`/images/artifacts/${encoded}/releases`, query, signal),
-      get(`/images/artifacts/${encoded}/sources`, query, signal),
-      get(`/images/artifacts/${encoded}/publications`, query, signal),
-      get(`/images/artifacts/${encoded}/locations`, query, signal),
-      get(`/images/artifacts/${encoded}/demands`, query, signal),
+      getImageArtifactCollection(imageId, 'releases', query, signal),
+      getImageArtifactCollection(imageId, 'sources', query, signal),
+      getImageArtifactCollection(imageId, 'publications', query, signal),
+      getImageArtifactCollection(imageId, 'locations', query, signal),
+      getImageArtifactCollection(imageId, 'demands', query, signal),
     ]);
+  const nextCursors = {
+    releases: releases.next_cursor || null,
+    sources: sources.next_cursor || null,
+    publications: publications.next_cursor || null,
+    locations: locations.next_cursor || null,
+    demands: demands.next_cursor || null,
+  };
   return {
     artifact: artifact.artifact,
     releases: releases.items,
@@ -92,13 +123,8 @@ export async function getImageArtifactDetail(imageId, workspace, signal) {
     publications: publications.items,
     locations: locations.items,
     demands: demands.items,
-    truncated: Boolean(
-      releases.next_cursor ||
-        sources.next_cursor ||
-        publications.next_cursor ||
-        locations.next_cursor ||
-        demands.next_cursor
-    ),
+    next_cursors: nextCursors,
+    truncated: Object.values(nextCursors).some(Boolean),
   };
 }
 

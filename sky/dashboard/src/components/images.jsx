@@ -112,7 +112,13 @@ export function Images() {
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState(null);
   const [cursorNotice, setCursorNotice] = useState(null);
-  const [failedPublications, setFailedPublications] = useState([]);
+  const [failedPublicationCursorStack, setFailedPublicationCursorStack] =
+    useState([null]);
+  const [failedPublicationPage, setFailedPublicationPage] = useState(null);
+  const [failedPublicationLoading, setFailedPublicationLoading] =
+    useState(false);
+  const [failedPublicationError, setFailedPublicationError] = useState(null);
+  const [failedPublicationNotice, setFailedPublicationNotice] = useState(null);
   const [readiness, setReadiness] = useState(null);
   const [readinessLoading, setReadinessLoading] = useState(false);
   const [readinessError, setReadinessError] = useState(null);
@@ -120,10 +126,14 @@ export function Images() {
   const [retryPublication, setRetryPublication] = useState(null);
   const capabilityGeneration = useRef(0);
   const catalogGeneration = useRef(0);
+  const failedPublicationGeneration = useRef(0);
   const readinessGeneration = useRef(0);
   const catalogController = useRef(null);
+  const failedPublicationController = useRef(null);
   const readinessController = useRef(null);
   const cursor = cursorStack[cursorStack.length - 1];
+  const failedPublicationCursor =
+    failedPublicationCursorStack[failedPublicationCursorStack.length - 1];
 
   useEffect(() => {
     getWorkspaces()
@@ -141,7 +151,11 @@ export function Images() {
         shallow: true,
       });
       setCursorStack([null]);
+      setFailedPublicationCursorStack([null]);
       setCatalog(null);
+      setFailedPublicationPage(null);
+      setCursorNotice(null);
+      setFailedPublicationNotice(null);
       setReadiness(null);
     },
     [router]
@@ -183,31 +197,17 @@ export function Images() {
     setCatalogLoading(true);
     setCatalogError(null);
     try {
-      const [page, publications] = await Promise.all([
-        getImageCatalog(
-          {
-            workspace: capabilities.workspace,
-            limit: 30,
-            cursor,
-            ...filters,
-          },
-          controller.signal
-        ),
-        capabilities.publish
-          ? getImagePublications(
-              {
-                workspace: capabilities.workspace,
-                state: 'FAILED',
-                limit: 10,
-              },
-              controller.signal
-            )
-          : Promise.resolve({ items: [] }),
-      ]);
+      const page = await getImageCatalog(
+        {
+          workspace: capabilities.workspace,
+          limit: 30,
+          cursor,
+          ...filters,
+        },
+        controller.signal
+      );
       if (catalogGeneration.current !== generation) return;
       setCatalog(page);
-      setFailedPublications(publications.items);
-      setCursorNotice(null);
     } catch (error) {
       if (
         error.name === 'AbortError' ||
@@ -238,6 +238,63 @@ export function Images() {
       catalogController.current = null;
     };
   }, [loadCatalog]);
+
+  const loadFailedPublications = useCallback(async () => {
+    if (!capabilities?.publish) {
+      setFailedPublicationPage(null);
+      setFailedPublicationError(null);
+      setFailedPublicationNotice(null);
+      return;
+    }
+    failedPublicationController.current?.abort();
+    const generation = ++failedPublicationGeneration.current;
+    const controller = new AbortController();
+    failedPublicationController.current = controller;
+    setFailedPublicationLoading(true);
+    setFailedPublicationError(null);
+    try {
+      const page = await getImagePublications(
+        {
+          workspace: capabilities.workspace,
+          state: 'FAILED',
+          limit: 10,
+          cursor: failedPublicationCursor,
+        },
+        controller.signal
+      );
+      if (failedPublicationGeneration.current !== generation) return;
+      setFailedPublicationPage(page);
+    } catch (error) {
+      if (
+        error.name === 'AbortError' ||
+        failedPublicationGeneration.current !== generation
+      )
+        return;
+      if (error.code === 'STALE_IMAGE_CURSOR' && failedPublicationCursor) {
+        setFailedPublicationCursorStack([null]);
+        setFailedPublicationNotice(
+          'The failed publication feed changed while paging. Reloaded the first page.'
+        );
+      } else {
+        setFailedPublicationError(error.code || error.message);
+      }
+    } finally {
+      if (failedPublicationGeneration.current === generation)
+        setFailedPublicationLoading(false);
+      if (failedPublicationController.current === controller) {
+        failedPublicationController.current = null;
+      }
+    }
+  }, [capabilities, failedPublicationCursor]);
+
+  useEffect(() => {
+    loadFailedPublications();
+    return () => {
+      failedPublicationGeneration.current += 1;
+      failedPublicationController.current?.abort();
+      failedPublicationController.current = null;
+    };
+  }, [loadFailedPublications]);
 
   const loadReadiness = useCallback(async () => {
     if (!capabilities?.admin) return;
@@ -288,6 +345,16 @@ export function Images() {
         }))
       ) || [],
     [capabilities]
+  );
+  const failedPublications = failedPublicationPage?.items || [];
+  const showFailedPublicationFeed = Boolean(
+    capabilities?.publish &&
+      (failedPublications.length ||
+        failedPublicationPage?.next_cursor ||
+        failedPublicationCursorStack.length > 1 ||
+        failedPublicationLoading ||
+        failedPublicationError ||
+        failedPublicationNotice)
   );
 
   const setTab = (tab) => {
@@ -523,6 +590,7 @@ export function Images() {
                     setDraftFilters(EMPTY_FILTERS);
                     setFilters(EMPTY_FILTERS);
                     setCursorStack([null]);
+                    setCursorNotice(null);
                   }}
                 >
                   Clear
@@ -532,6 +600,7 @@ export function Images() {
                   onClick={() => {
                     setFilters(draftFilters);
                     setCursorStack([null]);
+                    setCursorNotice(null);
                   }}
                 >
                   <Search className="mr-2 h-4 w-4" /> Filter
@@ -553,7 +622,7 @@ export function Images() {
               </div>
             )}
 
-            {failedPublications.length > 0 && capabilities?.publish && (
+            {showFailedPublicationFeed && (
               <section className="rounded-lg border border-red-200 bg-red-50 p-4">
                 <h2 className="font-semibold text-red-900">
                   Failed publication reservations
@@ -561,6 +630,19 @@ export function Images() {
                 <p className="text-sm text-red-700">
                   Failures before inspection may not have an artifact row yet.
                 </p>
+                {failedPublicationNotice && (
+                  <div className="mt-3 rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
+                    {failedPublicationNotice}
+                  </div>
+                )}
+                {failedPublicationError && (
+                  <div
+                    role="alert"
+                    className="mt-3 rounded-md border border-red-300 bg-white p-3 text-sm text-red-800"
+                  >
+                    {failedPublicationError}
+                  </div>
+                )}
                 <div className="mt-3 space-y-2">
                   {failedPublications.map((publication) => (
                     <div
@@ -587,6 +669,53 @@ export function Images() {
                       </Button>
                     </div>
                   ))}
+                  {failedPublicationLoading && !failedPublicationPage && (
+                    <div className="py-3 text-sm text-red-700">
+                      Loading failed publications…
+                    </div>
+                  )}
+                </div>
+                <div className="mt-3 flex items-center justify-between border-t border-red-200 pt-3">
+                  <span className="text-sm text-red-700">
+                    Page {failedPublicationCursorStack.length}
+                  </span>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-label="Previous failed publications page"
+                      disabled={
+                        failedPublicationCursorStack.length === 1 ||
+                        failedPublicationLoading
+                      }
+                      onClick={() => {
+                        setFailedPublicationNotice(null);
+                        setFailedPublicationCursorStack((stack) =>
+                          stack.slice(0, -1)
+                        );
+                      }}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-label="Next failed publications page"
+                      disabled={
+                        !failedPublicationPage?.next_cursor ||
+                        failedPublicationLoading
+                      }
+                      onClick={() => {
+                        setFailedPublicationNotice(null);
+                        setFailedPublicationCursorStack((stack) => [
+                          ...stack,
+                          failedPublicationPage.next_cursor,
+                        ]);
+                      }}
+                    >
+                      Next
+                    </Button>
+                  </div>
                 </div>
               </section>
             )}
@@ -728,9 +857,10 @@ export function Images() {
                     variant="outline"
                     size="sm"
                     disabled={cursorStack.length === 1 || catalogLoading}
-                    onClick={() =>
-                      setCursorStack((stack) => stack.slice(0, -1))
-                    }
+                    onClick={() => {
+                      setCursorNotice(null);
+                      setCursorStack((stack) => stack.slice(0, -1));
+                    }}
                   >
                     Previous
                   </Button>
@@ -738,9 +868,13 @@ export function Images() {
                     variant="outline"
                     size="sm"
                     disabled={!catalog?.next_cursor || catalogLoading}
-                    onClick={() =>
-                      setCursorStack((stack) => [...stack, catalog.next_cursor])
-                    }
+                    onClick={() => {
+                      setCursorNotice(null);
+                      setCursorStack((stack) => [
+                        ...stack,
+                        catalog.next_cursor,
+                      ]);
+                    }}
                   >
                     Next
                   </Button>
@@ -768,11 +902,17 @@ export function Images() {
           open={publishOpen}
           onOpenChange={(open) => {
             setPublishOpen(open);
-            if (!open) loadCatalog();
+            if (!open) {
+              loadCatalog();
+              loadFailedPublications();
+            }
           }}
           workspace={capabilities.workspace}
           capabilities={capabilities}
-          onChanged={loadCatalog}
+          onChanged={() => {
+            loadCatalog();
+            loadFailedPublications();
+          }}
         />
       )}
       <RetryImageDialog
@@ -781,12 +921,16 @@ export function Images() {
           if (!open) {
             setRetryPublication(null);
             loadCatalog();
+            loadFailedPublications();
           }
         }}
         workspace={capabilities?.workspace}
         kind="publication"
         recordId={retryPublication}
-        onChanged={loadCatalog}
+        onChanged={() => {
+          loadCatalog();
+          loadFailedPublications();
+        }}
       />
     </div>
   );

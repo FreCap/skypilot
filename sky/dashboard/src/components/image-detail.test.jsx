@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { ImageDetail } from '@/components/image-detail';
 import {
+  getImageArtifactCollection,
   getImageArtifactDetail,
   getImageCapabilities,
 } from '@/data/connectors/images';
@@ -15,6 +16,7 @@ jest.mock('next/router', () => ({
 }));
 
 jest.mock('@/data/connectors/images', () => ({
+  getImageArtifactCollection: jest.fn(),
   getImageArtifactDetail: jest.fn(),
   getImageCapabilities: jest.fn(),
 }));
@@ -28,6 +30,10 @@ describe('Image artifact detail', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockRouter.query = { image: 'image-1', workspace: 'research' };
+    getImageArtifactCollection.mockResolvedValue({
+      items: [],
+      next_cursor: null,
+    });
   });
 
   it('shows the API 62 callout on an old-server deep link', async () => {
@@ -41,7 +47,92 @@ describe('Image artifact detail', () => {
     expect(getImageArtifactDetail).not.toHaveBeenCalled();
   });
 
-  it('keeps bounded detail truncation visible to the operator', async () => {
+  it('pages one bounded detail collection inside the Dashboard', async () => {
+    getImageCapabilities.mockResolvedValue({
+      workspace: 'research',
+      publish: false,
+    });
+    getImageArtifactDetail.mockResolvedValue({
+      artifact: {
+        id: 'image-1',
+        workspace: 'research',
+        runtime_digest: `sha256:${'a'.repeat(64)}`,
+        platform: 'linux/amd64',
+        producer_kind: 'external_oci',
+        config_digest: `sha256:${'b'.repeat(64)}`,
+        manifest_size_bytes: 100,
+        declared_size_bytes: 1000,
+        created_at: 100,
+        updated_at: 101,
+      },
+      releases: [],
+      sources: [],
+      publications: [],
+      locations: [
+        {
+          id: 'location-1',
+          distribution: 'gpu-production',
+          target_id: 'west',
+          target_ref: `registry/west@sha256:${'a'.repeat(64)}`,
+          state: 'READY',
+          canonical: false,
+          error_code: null,
+          last_verified_at: 100,
+          attempt_count: 1,
+        },
+      ],
+      demands: [],
+      next_cursors: {
+        releases: null,
+        sources: null,
+        publications: null,
+        locations: 'locations-next',
+        demands: null,
+      },
+      truncated: true,
+    });
+    getImageArtifactCollection.mockResolvedValue({
+      items: [
+        {
+          id: 'location-101',
+          distribution: 'gpu-production',
+          target_id: 'east',
+          target_ref: `registry/east@sha256:${'b'.repeat(64)}`,
+          state: 'READY',
+          canonical: false,
+          error_code: null,
+          last_verified_at: 101,
+          attempt_count: 1,
+        },
+      ],
+      next_cursor: null,
+    });
+
+    render(<ImageDetail />);
+
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Next locations page' })
+    );
+    expect(await screen.findByText('east')).toBeVisible();
+    expect(screen.queryByText('west')).toBeNull();
+    expect(getImageArtifactCollection).toHaveBeenCalledWith(
+      'image-1',
+      'locations',
+      {
+        workspace: 'research',
+        limit: 100,
+        cursor: 'locations-next',
+      },
+      expect.anything()
+    );
+    expect(
+      screen.getByRole('button', { name: 'Previous locations page' })
+    ).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'Prepare target' })).toBeNull();
+  });
+
+  it('recovers only the stale detail collection at its first page', async () => {
     getImageCapabilities.mockResolvedValue({
       workspace: 'research',
       publish: false,
@@ -64,16 +155,31 @@ describe('Image artifact detail', () => {
       publications: [],
       locations: [],
       demands: [],
+      next_cursors: { locations: 'stale-locations' },
       truncated: true,
     });
+    getImageArtifactCollection
+      .mockRejectedValueOnce({ code: 'STALE_IMAGE_CURSOR' })
+      .mockResolvedValueOnce({ items: [], next_cursor: null });
 
     render(<ImageDetail />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Next locations page' })
+    );
 
-    expect(await screen.findByText('Image artifact')).toBeVisible();
     expect(
-      screen.getByText(/One detail collection exceeded 100 rows/)
+      await screen.findByText(
+        'The locations collection changed while paging. Reloaded the first page.'
+      )
     ).toBeVisible();
-    expect(screen.queryByRole('button', { name: 'Prepare target' })).toBeNull();
+    expect(
+      getImageArtifactCollection.mock.calls.map(
+        ([, , options]) => options.cursor
+      )
+    ).toEqual(['stale-locations', null]);
+    expect(
+      screen.getByRole('button', { name: 'Previous locations page' })
+    ).toBeDisabled();
   });
 
   it('makes cached artifact mutations read-only after refresh failure', async () => {
