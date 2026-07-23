@@ -90,6 +90,32 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function detailSummaryArgs(serviceName) {
+  return [
+    {
+      serviceNames: [serviceName],
+      summaryOnly: true,
+      includeTargetReplicas: true,
+      historyHours: 24,
+    },
+  ];
+}
+
+function detailFullArgs(serviceName) {
+  return [{ serviceNames: [serviceName] }];
+}
+
+function detailHistoryArgs(serviceName) {
+  return [
+    {
+      serviceNames: [serviceName],
+      summaryOnly: true,
+      includeTargetReplicas: false,
+      historyHours: 24,
+    },
+  ];
+}
+
 describe('useServiceDetails stale-response fencing', () => {
   beforeEach(() => {
     jest.resetAllMocks();
@@ -136,8 +162,13 @@ describe('useServiceDetails stale-response fencing', () => {
     });
 
     expect(secondRefresh).toBe(firstRefresh);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledWith(getServices);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(3);
+    expect(dashboardCache.invalidate.mock.calls).toEqual([
+      [getServices, detailSummaryArgs('svc')],
+      [getServices, detailFullArgs('svc')],
+      [getServices, detailHistoryArgs('svc')],
+    ]);
     expect(dashboardCache.get).toHaveBeenCalledTimes(4);
 
     await act(async () => {
@@ -197,7 +228,8 @@ describe('useServiceDetails stale-response fencing', () => {
     });
 
     expect(duplicateRefresh).toBe(failedRefresh);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(3);
 
     await act(async () => {
       failedSummary.reject(new Error('summary unavailable'));
@@ -221,7 +253,8 @@ describe('useServiceDetails stale-response fencing', () => {
     });
 
     expect(recoveredRefresh).not.toBe(failedRefresh);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(6);
     expect(dashboardCache.get).toHaveBeenCalledTimes(6);
 
     await act(async () => {
@@ -257,10 +290,23 @@ describe('useServiceDetails stale-response fencing', () => {
     });
 
     await waitFor(() =>
-      expect(dashboardCache.invalidateFunction).toHaveBeenCalledWith(
-        getServices
+      expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
+        1,
+        getServices,
+        detailSummaryArgs('svc')
       )
     );
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
+      2,
+      getServices,
+      detailFullArgs('svc')
+    );
+    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
+      3,
+      getServices,
+      detailHistoryArgs('svc')
+    );
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
 
     await act(async () => {
@@ -449,7 +495,8 @@ describe('useServiceDetails stale-response fencing', () => {
         refreshPromise = result.current.refreshData();
       });
 
-      expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(1);
+      expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(3);
       expect(dashboardCache.get).toHaveBeenCalledTimes(4);
 
       await act(async () => {
@@ -573,7 +620,8 @@ describe('useServiceDetails stale-response fencing', () => {
     });
 
     expect(newRefreshPromise).not.toBe(oldRefreshPromise);
-    expect(dashboardCache.invalidateFunction).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(6);
 
     await act(async () => {
       newSummary.resolve({
@@ -607,6 +655,47 @@ describe('useServiceDetails stale-response fencing', () => {
 
     expect(result.current.serviceData.status).toBe('svc-a-new-full');
     expect(result.current.serviceData.replicas).toEqual(['a2']);
+  });
+
+  it('scopes manual refresh invalidation to the current service detail keys', async () => {
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'initial-full', replicas: [] }],
+      })
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'refreshed-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'refreshed-full', replicas: ['r1'] }],
+      });
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('initial-full')
+    );
+
+    await act(async () => {
+      await result.current.refreshData();
+    });
+
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate.mock.calls).toEqual([
+      [getServices, detailSummaryArgs('svc')],
+      [getServices, detailFullArgs('svc')],
+      [getServices, detailHistoryArgs('svc')],
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+    expect(result.current.serviceData.status).toBe('refreshed-full');
   });
 });
 
