@@ -772,7 +772,8 @@ class Autoscaler:
         configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
         if (not isinstance(demand_target, dict) or
                 not isinstance(configured_shapes, dict) or
-                not configured_shapes):
+                not configured_shapes or
+                not getattr(self, '_compatibility_demand_complete', False)):
             return None
 
         canonical_by_name = {
@@ -784,6 +785,11 @@ class Autoscaler:
             if card is None:
                 return None
             demand_by_card[card] = max(0, int(raw_target))
+        if sum(demand_by_card.values()) != self.get_final_target_num_replicas():
+            # Generic overprovision and stale/partial maps do not have a safe
+            # exact-card attribution. The aggregate path still enforces the
+            # fill ceiling without guessing where that demand belongs.
+            return None
 
         current_by_card: dict[str, int] = {}
         replica_cards: dict[int, str] = {}

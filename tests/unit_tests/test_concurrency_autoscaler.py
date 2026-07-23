@@ -1668,20 +1668,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual(target, {'A100': 10})
 
-    def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
-        autoscaler = _make_autoscaler(max_replicas=20,
-                                      reserved_capacity_fill=True)
-        autoscaler.set_configured_accelerator_shapes({
-            'L4': 1,
-            'A100': 1,
-            'A100-80GB': 1,
-        })
-        autoscaler.target_num_replicas = 3
-        autoscaler.target_num_replicas_by_accelerator = {
-            'L4': 2,
-            'A100': 1,
-            'A100-80GB': 0,
-        }
+    @staticmethod
+    def _reserved_fill_shelter_inputs(autoscaler, grant=None):
         now = time.time()
         reserved_keys = [{
             'cloud': 'Kubernetes',
@@ -1694,7 +1682,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             'image_id': None,
             'disk_tier': None,
         } for card in ('A100', 'A100-80GB')]
-        autoscaler.collect_reserved_capacity(0, reserved_keys, now)
+        autoscaler.collect_reserved_capacity(0, reserved_keys, now, grant=grant)
 
         paid = [_replica(replica_id, card='L4') for replica_id in (1, 2)]
         reserved = [
@@ -1716,13 +1704,29 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             info.created_at = now - 10
             info.reserved_fill = True
             info.get_spot_location.return_value = location_by_card[card]
-
         ordinary = [
             autoscalers.AutoscalerDecision(_SCALE_DOWN, replica_id)
             for replica_id in (4, 5, 6, 7, 8)
         ]
-        decisions = autoscaler._apply_reserved_capacity_fill([*paid, *reserved],
-                                                             ordinary)
+        return [*paid, *reserved], ordinary
+
+    def test_reserved_fill_shelter_ignores_demand_on_other_cards(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 2,
+            'A100': 1,
+            'A100-80GB': 0,
+        }
+        autoscaler._compatibility_demand_complete = True
+        replicas, ordinary = self._reserved_fill_shelter_inputs(autoscaler)
+        decisions = autoscaler._apply_reserved_capacity_fill(replicas, ordinary)
 
         # Fill owns all six A100-family holdings. Only one of them overlaps
         # A100 demand; L4 demand cannot consume the other five units of
@@ -1744,52 +1748,49 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             'A100': 1,
             'A100-80GB': 0,
         }
-        now = time.time()
-        reserved_keys = [{
-            'cloud': 'Kubernetes',
-            'region': 'research-ctx',
-            'zone': None,
-            'accelerators': {
-                card: 1
-            },
-            'use_spot': False,
-            'image_id': None,
-            'disk_tier': None,
-        } for card in ('A100', 'A100-80GB')]
-        autoscaler.collect_reserved_capacity(0, reserved_keys, now, grant=4)
-
-        paid = [_replica(replica_id, card='L4') for replica_id in (1, 2)]
-        reserved = [
-            *[_replica(replica_id, card='A100') for replica_id in (3, 4, 5)],
-            *[
-                _replica(replica_id, card='A100-80GB')
-                for replica_id in (6, 7, 8)
-            ],
-        ]
-        location_by_card = {
-            card: spot_placer.Location.from_pickleable(key)
-            for card, key in zip(('A100', 'A100-80GB'), reserved_keys)
-        }
-        for info in paid:
-            info.created_at = now - 10
-            info.get_spot_location.return_value = None
-        for info in reserved:
-            card = next(iter(info.resources_override['accelerators']))
-            info.created_at = now - 10
-            info.reserved_fill = True
-            info.get_spot_location.return_value = location_by_card[card]
-
-        ordinary = [
-            autoscalers.AutoscalerDecision(_SCALE_DOWN, replica_id)
-            for replica_id in (4, 5, 6, 7, 8)
-        ]
-        decisions = autoscaler._apply_reserved_capacity_fill([*paid, *reserved],
-                                                             ordinary)
+        autoscaler._compatibility_demand_complete = True
+        replicas, ordinary = self._reserved_fill_shelter_inputs(autoscaler,
+                                                                grant=4)
+        decisions = autoscaler._apply_reserved_capacity_fill(replicas, ordinary)
 
         # The reduced grant retains the three existing A100s and one existing
         # A100-80GB. A100 demand overlaps one retained A100, so the shelter is
         # two A100s plus one A100-80GB. Exactly two A100-80GB victims drain.
         self.assertEqual(_scale_downs(decisions), [6, 7])
+
+    def test_incomplete_exact_card_target_uses_aggregate_fill_shelter(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {}
+        replicas, ordinary = self._reserved_fill_shelter_inputs(autoscaler,
+                                                                grant=4)
+
+        decisions = autoscaler._apply_reserved_capacity_fill(replicas, ordinary)
+
+        # The aggregate fallback shelters only fill_target - demand_target = 1
+        # victim, so the fleet converges to the broker's grant ceiling of 4.
+        self.assertEqual(_scale_downs(decisions), [4, 5, 6, 7])
+
+    def test_unattributed_overprovision_uses_aggregate_fill_shelter(self):
+        autoscaler = _make_autoscaler(max_replicas=20,
+                                      num_overprovision=1,
+                                      reserved_capacity_fill=True)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 2,
+            'A100': 1,
+        }
+        autoscaler._compatibility_demand_complete = True
+
+        self.assertEqual(autoscaler.get_final_target_num_replicas(), 4)
+        self.assertIsNone(autoscaler._exact_card_fill_shelter([], 5))
 
     def test_num_overprovision_keeps_exact_card_scale_up_shaped(self):
         autoscaler = _make_autoscaler(max_replicas=2, num_overprovision=1)
