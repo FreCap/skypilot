@@ -28,7 +28,10 @@ from sky.server import database_migrations
 _DEFAULT_LEASE_SECONDS = 15 * 60
 _POLL_SECONDS = 10
 _MAX_QUALIFIED_EKS_NODES = 1000
-_EC2_TEARDOWN_SECONDS = 5 * 60
+# The 60-observation Spot association proof has its own five-minute cadence.
+# Keep the absolute cleanup budget below the Helm 600-second shutdown grace
+# while leaving bounded headroom for client acquisition and provider calls.
+_EC2_TEARDOWN_SECONDS = 8 * 60
 _EC2_TEARDOWN_ATTEMPTS = 60
 _EC2_TEARDOWN_POLL_SECONDS = 5
 _SPOT_REQUEST_CANCELLABLE_STATES = frozenset({'active', 'disabled', 'open'})
@@ -463,28 +466,50 @@ def _tagged_instances(
         *,
         drain_event: threading.Event | None = None,
         cleanup_deadline: float | None = None) -> list[dict[str, Any]]:
-    kwargs = {
-        'Filters': [{
-            'Name': 'tag:SkyPilotCanaryOperation',
-            'Values': [operation_id],
-        }, {
-            'Name': 'instance-state-name',
-            'Values': [
-                'pending', 'running', 'stopping', 'stopped', 'shutting-down',
-                'terminated'
-            ],
-        }]
-    }
-    if cleanup_deadline is None:
-        response = _ordinary_provider_call(ec2, 'describe_instances',
-                                           drain_event, **kwargs)
-    else:
-        response = _cleanup_provider_call(ec2, 'describe_instances',
-                                          cleanup_deadline, **kwargs)
-    return [
-        instance for reservation in response.get('Reservations', [])
-        for instance in reservation.get('Instances', [])
-    ]
+    """Returns the complete operation-tagged EC2 instance inventory."""
+    instances: list[dict[str, Any]] = []
+    next_token: str | None = None
+    observed_tokens: set[str] = set()
+    while True:
+        kwargs: dict[str, Any] = {
+            'Filters': [{
+                'Name': 'tag:SkyPilotCanaryOperation',
+                'Values': [operation_id],
+            }, {
+                'Name': 'instance-state-name',
+                'Values': [
+                    'pending', 'running', 'stopping', 'stopped',
+                    'shutting-down', 'terminated'
+                ],
+            }],
+            'MaxResults': 1000,
+        }
+        if next_token is not None:
+            kwargs['NextToken'] = next_token
+        if cleanup_deadline is None:
+            response = _ordinary_provider_call(ec2, 'describe_instances',
+                                               drain_event, **kwargs)
+        else:
+            response = _cleanup_provider_call(ec2, 'describe_instances',
+                                              cleanup_deadline, **kwargs)
+        reservations = response.get('Reservations', [])
+        if (not isinstance(reservations, list) or not all(
+                isinstance(reservation, dict) for reservation in reservations)):
+            raise ValueError('QUALIFICATION_FAILED')
+        for reservation in reservations:
+            page = reservation.get('Instances', [])
+            if (not isinstance(page, list) or
+                    not all(isinstance(instance, dict) for instance in page)):
+                raise ValueError('QUALIFICATION_FAILED')
+            instances.extend(page)
+        raw_next_token = response.get('NextToken')
+        if raw_next_token is None:
+            return instances
+        if (not isinstance(raw_next_token, str) or not raw_next_token or
+                raw_next_token in observed_tokens):
+            raise ValueError('QUALIFICATION_FAILED')
+        observed_tokens.add(raw_next_token)
+        next_token = raw_next_token
 
 
 def _tagged_spot_requests(ec2: Any, operation_id: str, *,
@@ -733,6 +758,7 @@ def _terminate_ec2_instances(ec2: Any,
     termination_requested: set[str] = set()
     if cleanup_deadline is None:
         cleanup_deadline = time.monotonic() + _EC2_TEARDOWN_SECONDS
+    poll_epoch = time.monotonic()
     for attempt in range(_EC2_TEARDOWN_ATTEMPTS):
         if time.monotonic() >= cleanup_deadline:
             return False
@@ -919,9 +945,12 @@ def _terminate_ec2_instances(ec2: Any,
                     (not spot_request_expected or
                      (all_spot_requests_terminal and
                       spot_associations_settled) or not known_spot_request_ids))
-        time.sleep(
-            min(_EC2_TEARDOWN_POLL_SECONDS,
-                max(0.0, cleanup_deadline - time.monotonic())))
+        # Anchor the settling cadence to one absolute epoch. Provider latency
+        # consumes the interval instead of being added to every sleep, while
+        # the distinct cleanup deadline bounds all overhead.
+        next_poll_at = (poll_epoch + (attempt + 1) * _EC2_TEARDOWN_POLL_SECONDS)
+        now = time.monotonic()
+        time.sleep(max(0.0, min(next_poll_at, cleanup_deadline) - now))
     return False
 
 

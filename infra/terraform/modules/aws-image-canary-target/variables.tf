@@ -13,8 +13,15 @@ variable "canary_worker_role_arns" {
   type        = set(string)
 
   validation {
-    condition     = length(var.canary_worker_role_arns) > 0
-    error_message = "At least one canary worker role ARN is required."
+    condition = (
+      length(var.canary_worker_role_arns) > 0 &&
+      length(var.canary_worker_role_arns) <= 64 &&
+      alltrue([
+        for arn in var.canary_worker_role_arns :
+        can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", arn))
+      ])
+    )
+    error_message = "canary_worker_role_arns must contain 1-64 exact IAM role ARNs without policy wildcards or variables."
   }
 }
 
@@ -29,8 +36,11 @@ variable "ec2_runtime_role_arns" {
   default     = []
 
   validation {
-    condition     = length(var.ec2_runtime_role_arns) <= 64 && alltrue([for arn in var.ec2_runtime_role_arns : can(regex("^arn:[^:]+:iam::[0-9]{12}:role/.+$", arn))])
-    error_message = "ec2_runtime_role_arns must contain at most 64 IAM role ARNs."
+    condition = length(var.ec2_runtime_role_arns) <= 64 && alltrue([
+      for arn in var.ec2_runtime_role_arns :
+      can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", arn))
+    ])
+    error_message = "ec2_runtime_role_arns must contain at most 64 exact IAM role ARNs without policy wildcards or variables."
   }
 }
 
@@ -40,8 +50,11 @@ variable "ec2_instance_profile_arns" {
   default     = []
 
   validation {
-    condition     = length(var.ec2_instance_profile_arns) <= 64 && alltrue([for arn in var.ec2_instance_profile_arns : can(regex("^arn:[^:]+:iam::[0-9]{12}:instance-profile/.+$", arn))])
-    error_message = "ec2_instance_profile_arns must contain at most 64 IAM instance-profile ARNs."
+    condition = length(var.ec2_instance_profile_arns) <= 64 && alltrue([
+      for arn in var.ec2_instance_profile_arns :
+      can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_/-]+$", arn))
+    ])
+    error_message = "ec2_instance_profile_arns must contain at most 64 exact IAM instance-profile ARNs without policy wildcards or variables."
   }
 }
 
@@ -51,8 +64,11 @@ variable "eks_node_instance_profile_arns" {
   default     = []
 
   validation {
-    condition     = length(var.eks_node_instance_profile_arns) <= 64 && alltrue([for arn in var.eks_node_instance_profile_arns : can(regex("^arn:[^:]+:iam::[0-9]{12}:instance-profile/.+$", arn))])
-    error_message = "eks_node_instance_profile_arns must contain at most 64 IAM instance-profile ARNs."
+    condition = length(var.eks_node_instance_profile_arns) <= 64 && alltrue([
+      for arn in var.eks_node_instance_profile_arns :
+      can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_/-]+$", arn))
+    ])
+    error_message = "eks_node_instance_profile_arns must contain at most 64 exact IAM instance-profile ARNs without policy wildcards or variables."
   }
 }
 
@@ -61,6 +77,14 @@ variable "ami_arns" {
   type        = set(string)
 
   default = []
+
+  validation {
+    condition = length(var.ami_arns) <= 64 && alltrue([
+      for arn in var.ami_arns :
+      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+::image/ami-[0-9A-Fa-f]+$", arn))
+    ])
+    error_message = "ami_arns must contain at most 64 exact regional AMI ARNs without policy wildcards or variables."
+  }
 }
 
 variable "subnet_arns" {
@@ -68,12 +92,28 @@ variable "subnet_arns" {
   type        = set(string)
 
   default = []
+
+  validation {
+    condition = length(var.subnet_arns) <= 64 && alltrue([
+      for arn in var.subnet_arns :
+      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+:[0-9]{12}:subnet/subnet-[0-9A-Fa-f]+$", arn))
+    ])
+    error_message = "subnet_arns must contain at most 64 exact regional subnet ARNs without policy wildcards or variables."
+  }
 }
 
 variable "security_group_arns" {
   description = "Exact security groups allowed for EC2 canary launches."
   type        = set(string)
   default     = []
+
+  validation {
+    condition = length(var.security_group_arns) <= 64 && alltrue([
+      for arn in var.security_group_arns :
+      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+:[0-9]{12}:security-group/sg-[0-9A-Fa-f]+$", arn))
+    ])
+    error_message = "security_group_arns must contain at most 64 exact regional security-group ARNs without policy wildcards or variables."
+  }
 }
 
 variable "canary_instance_types" {
@@ -114,6 +154,14 @@ variable "eks_cluster_arns" {
   description = "Exact EKS clusters whose identity the canary worker may verify."
   type        = set(string)
   default     = []
+
+  validation {
+    condition = length(var.eks_cluster_arns) <= 64 && alltrue([
+      for arn in var.eks_cluster_arns :
+      can(regex("^arn:[a-z0-9-]+:eks:[a-z0-9-]+:[0-9]{12}:cluster/[A-Za-z0-9][A-Za-z0-9_-]*$", arn))
+    ])
+    error_message = "eks_cluster_arns must contain at most 64 exact regional EKS cluster ARNs without policy wildcards or variables."
+  }
 }
 
 variable "external_id" {
@@ -128,6 +176,14 @@ variable "permissions_boundary_arn" {
   type        = string
   default     = null
   nullable    = true
+
+  validation {
+    condition = var.permissions_boundary_arn == null || can(regex(
+      "^arn:[a-z0-9-]+:iam::[0-9]{12}:policy/[A-Za-z0-9+=,.@_/-]+$",
+      var.permissions_boundary_arn,
+    ))
+    error_message = "permissions_boundary_arn must be an exact IAM managed-policy ARN without policy wildcards or variables."
+  }
 }
 
 variable "tags" {

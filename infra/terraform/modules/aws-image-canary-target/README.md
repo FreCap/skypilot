@@ -6,6 +6,9 @@ groups, runtime roles, and instance profiles, and limits EKS identity checks to
 explicit cluster ARNs. Temporary instances must carry the exact SkyPilot
 catalog tag. Spot requests carry the same operation tags, and only matching
 catalog-tagged instances and requests can be terminated or cancelled.
+Every supplied ARN is a concrete resource identity. Policy wildcards, policy
+variables, cross-partition identities, and target resources outside the
+module's account or region are rejected before the role can be created.
 
 Configure `ami_arns`, `subnet_arns`, and at least one exact
 `canary_instance_type` for EC2 qualification. The launch policy constrains all
@@ -16,6 +19,9 @@ AMI, network, volume, or Spot-request authorizations. `iam:PassRole` permits
 only `ec2_runtime_role_arns`. EKS node identities are never passable. List their
 profiles separately in
 `eks_node_instance_profile_arns`, which grants only `iam:GetInstanceProfile`.
+The `iam:PassedToService` condition is derived from the active AWS partition, so
+China targets use `ec2.amazonaws.com.cn` while standard and GovCloud targets
+use `ec2.amazonaws.com`.
 The EC2 launchable and EKS inspect-only profile sets must be disjoint. An
 EKS-only deployment leaves every EC2 input empty and provides
 `eks_cluster_arns` plus its inspect-only node profiles; the resulting role has

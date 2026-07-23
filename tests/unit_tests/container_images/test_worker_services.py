@@ -2495,6 +2495,130 @@ def test_ec2_spot_cleanup_preserves_custody_until_request_is_terminal(
     ec2.terminate_instances.assert_not_called()
 
 
+def test_tagged_instance_discovery_reads_every_page(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = ({
+        'Reservations': [],
+        'NextToken': 'next-page',
+    }, {
+        'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-second-page',
+            }]
+        }],
+    })
+
+    instances = canary_worker_service._tagged_instances(ec2,
+                                                        'operation',
+                                                        cleanup_deadline=300.0)
+
+    assert [instance['InstanceId'] for instance in instances
+           ] == ['i-second-page']
+    filters = [{
+        'Name': 'tag:SkyPilotCanaryOperation',
+        'Values': ['operation'],
+    }, {
+        'Name': 'instance-state-name',
+        'Values': [
+            'pending', 'running', 'stopping', 'stopped', 'shutting-down',
+            'terminated'
+        ],
+    }]
+    assert ec2.describe_instances.call_args_list == [
+        mock.call(Filters=filters, MaxResults=1000),
+        mock.call(Filters=filters, MaxResults=1000, NextToken='next-page'),
+    ]
+
+
+def test_ec2_spot_cleanup_terminates_second_page_instance(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    running_instance = {
+        'InstanceId': 'i-second-page',
+        'SpotInstanceRequestId': 'sir-second-page',
+        'State': {
+            'Name': 'running',
+        },
+    }
+    terminated_instance = {
+        **running_instance,
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+
+    def describe_instances(**kwargs: object) -> dict[str, object]:
+        if 'InstanceIds' in kwargs:
+            return {
+                'Reservations': [{
+                    'Instances': [terminated_instance],
+                }]
+            }
+        if kwargs.get('NextToken') == 'next-page':
+            return {
+                'Reservations': [{
+                    'Instances': [running_instance],
+                }]
+            }
+        return {
+            'Reservations': [],
+            'NextToken': 'next-page',
+        }
+
+    ec2.describe_instances.side_effect = describe_instances
+    closed_request = {
+        'SpotInstanceRequestId': 'sir-second-page',
+        'State': 'closed',
+    }
+    ec2.describe_spot_instance_requests.return_value = {
+        'SpotInstanceRequests': [closed_request],
+    }
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 1)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert any(
+        call.kwargs.get('NextToken') == 'next-page'
+        for call in ec2.describe_instances.call_args_list)
+    ec2.terminate_instances.assert_called_once_with(
+        InstanceIds=['i-second-page'])
+
+
+@pytest.mark.parametrize(
+    ('next_token', 'expected_calls'),
+    [
+        ('', 1),
+        (7, 1),
+        ('same-page', 2),
+    ],
+    ids=['empty-token', 'non-string-token', 'cyclic-token'],
+)
+def test_tagged_instance_discovery_rejects_invalid_pagination(
+        monkeypatch: pytest.MonkeyPatch, next_token: object,
+        expected_calls: int) -> None:
+    current = [0.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {
+        'Reservations': [],
+        'NextToken': next_token,
+    }
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        canary_worker_service._tagged_instances(ec2,
+                                                'operation',
+                                                cleanup_deadline=300.0)
+
+    assert ec2.describe_instances.call_count == expected_calls
+
+
 def test_tagged_spot_request_discovery_reads_every_page(
         monkeypatch: pytest.MonkeyPatch) -> None:
     current = [0.0]
@@ -2879,6 +3003,48 @@ def test_ec2_teardown_stops_at_wall_clock_bound_after_slow_provider_call(
         initial_unidentified_child_observed=True)
 
     ec2.describe_instances.assert_called_once()
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_spot_production_settle_budget_includes_provider_latency(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # Model cleanup-client acquisition and preliminary discovery having already
+    # consumed 90 seconds of the absolute pod-shutdown budget.
+    current = [90.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    monkeypatch.setattr(
+        canary_worker_service.time, 'sleep',
+        lambda seconds: current.__setitem__(0, current[0] + seconds))
+    ec2 = mock.Mock()
+    closed_request = {
+        'SpotInstanceRequestId': 'sir-no-child',
+        'State': 'closed',
+    }
+
+    def describe_instances(**_kwargs: object) -> dict[str, object]:
+        current[0] += 0.05
+        return {'Reservations': []}
+
+    def describe_spot_requests(**_kwargs: object) -> dict[str, object]:
+        current[0] += 0.05
+        return {'SpotInstanceRequests': [closed_request]}
+
+    ec2.describe_instances.side_effect = describe_instances
+    ec2.describe_spot_instance_requests.side_effect = describe_spot_requests
+
+    assert canary_worker_service._terminate_ec2_instances(
+        ec2,
+        'operation', [],
+        settle_absence=True,
+        spot_request_expected=True,
+        cleanup_deadline=float(canary_worker_service._EC2_TEARDOWN_SECONDS))
+
+    assert ec2.describe_instances.call_count == (
+        canary_worker_service._EC2_TEARDOWN_ATTEMPTS)
+    assert ec2.describe_spot_instance_requests.call_count == (
+        2 * canary_worker_service._EC2_TEARDOWN_ATTEMPTS)
+    assert current[0] < canary_worker_service._EC2_TEARDOWN_SECONDS
     ec2.terminate_instances.assert_not_called()
 
 

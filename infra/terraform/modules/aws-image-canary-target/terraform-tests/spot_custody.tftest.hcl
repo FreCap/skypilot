@@ -83,6 +83,62 @@ run "ec2_target_rejects_a_missing_account_bootstrap" {
   expect_failures = [terraform_data.validate_contract]
 }
 
+run "policy_wildcards_are_rejected" {
+  command = plan
+
+  variables {
+    canary_worker_role_arns        = ["arn:aws:iam::123456789012:role/*"]
+    ec2_runtime_role_arns          = ["arn:aws:iam::123456789012:role/*"]
+    ec2_instance_profile_arns      = ["arn:aws:iam::123456789012:instance-profile/*"]
+    eks_node_instance_profile_arns = ["arn:aws:iam::123456789012:instance-profile/*"]
+    ami_arns                       = ["arn:aws:ec2:us-east-1::image/ami-*"]
+    subnet_arns                    = ["arn:aws:ec2:us-east-1:123456789012:subnet/subnet-*"]
+    security_group_arns            = ["arn:aws:ec2:us-east-1:123456789012:security-group/sg-*"]
+    eks_cluster_arns               = ["arn:aws:eks:us-east-1:123456789012:cluster/skypilot-*"]
+    permissions_boundary_arn       = "arn:aws:iam::123456789012:policy/*"
+  }
+
+  expect_failures = [
+    var.canary_worker_role_arns,
+    var.ec2_runtime_role_arns,
+    var.ec2_instance_profile_arns,
+    var.eks_node_instance_profile_arns,
+    var.ami_arns,
+    var.subnet_arns,
+    var.security_group_arns,
+    var.eks_cluster_arns,
+    var.permissions_boundary_arn,
+  ]
+}
+
+run "policy_variables_are_rejected" {
+  command = plan
+
+  variables {
+    ec2_runtime_role_arns = ["arn:aws:iam::123456789012:role/$${aws:username}"]
+  }
+
+  expect_failures = [var.ec2_runtime_role_arns]
+}
+
+run "target_scoped_arns_are_rejected_outside_the_target" {
+  command = plan
+
+  variables {
+    canary_worker_role_arns        = ["arn:aws-cn:iam::123456789012:role/skypilot-image-canary-worker"]
+    ec2_runtime_role_arns          = ["arn:aws:iam::210987654321:role/skypilot-runtime"]
+    ec2_instance_profile_arns      = ["arn:aws:iam::210987654321:instance-profile/skypilot-runtime"]
+    eks_node_instance_profile_arns = ["arn:aws:iam::210987654321:instance-profile/skypilot-eks-node"]
+    ami_arns                       = ["arn:aws:ec2:us-west-2::image/ami-00000000000000001"]
+    subnet_arns                    = ["arn:aws:ec2:us-west-2:210987654321:subnet/subnet-00000000000000001"]
+    security_group_arns            = ["arn:aws:ec2:us-west-2:210987654321:security-group/sg-00000000000000001"]
+    eks_cluster_arns               = ["arn:aws:eks:us-west-2:210987654321:cluster/skypilot-runtime"]
+    permissions_boundary_arn       = "arn:aws:iam::210987654321:policy/skypilot-boundary"
+  }
+
+  expect_failures = [terraform_data.validate_contract]
+}
+
 run "spot_requests_are_tagged_and_reclaimable" {
   command = plan
 

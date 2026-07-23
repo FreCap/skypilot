@@ -681,10 +681,11 @@ response remains reclaimable until the tagged Spot request is cancelled and
 terminal. A terminal request without a concrete request-to-instance association
 does not collapse the absence window: every request transition or newly visible
 child resets bounded settling, cleanup repeatedly exact-reads every known
-request and rediscovers tagged instances, and a late association is retained and
-terminated. Only a concrete association to an exactly terminated instance may
-finish early; otherwise the terminal no-instance outcome must remain stable for
-the complete window. On-demand ambiguity still requires the complete
+request and rediscovers every page of tagged instances, and a late association
+is retained and terminated. Malformed, empty, or cyclic pagination fails closed.
+Only a concrete association to an exactly terminated instance may finish early;
+otherwise the terminal no-instance outcome must remain stable for the complete
+60-observation cadence. On-demand ambiguity still requires the complete
 instance-absence window. EC2 cleanup follows every known child through
 `shutting-down` to `terminated`; EKS cleanup accounts for a timed-out create
 that becomes visible after the first delete. A persisted child also
@@ -746,7 +747,12 @@ the mandatory instance-resource `RunInstances` authorization uses `ArnEquals`
 on `ec2:InstanceProfile` with only the EC2 launchable profiles. Instance-only
 condition keys are not attached to the AMI, network, volume, or Spot-request
 authorizations. EKS node profiles receive `iam:GetInstanceProfile` only and the
-two profile sets are disjoint. The
+two profile sets are disjoint. Every role, profile, image, network, cluster,
+key, and permissions-boundary input is an exact ARN with no IAM wildcard or
+policy-variable syntax. Target resources are constrained to the active
+partition, account, and region as appropriate. `iam:PassedToService` is derived
+from the partition DNS suffix, including `ec2.amazonaws.com.cn` in `aws-cn`.
+The
 role may list Spot requests but may cancel only regional request resources
 carrying the exact catalog ownership tag. A separate `ec2:CreateTags` statement
 is limited by `ec2:CreateAction=RunInstances`; it is not combined with launch
@@ -2336,18 +2342,24 @@ token. The replacement worker can reclaim it immediately without waiting for the
 normal 15-minute lease. A failed release remains safe and falls back to ordinary
 lease-expiry recovery.
 
-EC2 teardown uses one absolute 300-second deadline. It establishes that deadline
-before acquiring a fresh cleanup-only EC2 client and never reuses the ordinary
-runtime client, whose fixed one-hour assumed credentials may expire at the
-allowed 3,600-second runtime limit. Ambient credential materialization, STS role
-assumption, and service-client creation all receive the same lease and cleanup
-deadline fence. Teardown checks that deadline immediately before and after every
-preliminary discovery, paginated Spot-request discovery, request cancellation,
-post-cancel exact request read, instance termination, and exact-state provider
-call. A cancellation-versus-fulfillment race therefore adds the returned
-instance ID to the retained set before teardown can succeed. A Spot cleanup is
-verified only when every discovered request is `cancelled`, `closed`, or
-`failed`, and every associated or operation-tagged instance is `terminated`.
+EC2 teardown uses one absolute 480-second deadline within the 600-second
+shutdown grace. Its terminal no-child proof remains 60 observations at a
+five-second absolute cadence, so provider-call latency consumes the current
+interval instead of accumulating after every fixed sleep. The remaining budget
+is bounded headroom for credential acquisition, complete paginated discovery,
+and provider calls. Teardown establishes that deadline before acquiring a fresh
+cleanup-only EC2 client and never reuses the ordinary runtime client, whose
+fixed one-hour assumed credentials may expire at the allowed 3,600-second
+runtime limit. Ambient credential materialization, STS role assumption, and
+service-client creation all receive the same lease and cleanup deadline fence.
+Teardown checks that deadline immediately before and after every preliminary
+discovery, every page of instance and Spot-request discovery, request
+cancellation, post-cancel exact request read, instance termination, and
+exact-state provider call. A cancellation-versus-fulfillment race therefore
+adds the returned instance ID to the retained set before teardown can succeed.
+A Spot cleanup is verified only when every discovered request is `cancelled`,
+`closed`, or `failed`, and every associated or operation-tagged instance is
+`terminated`.
 The shared deadline is passed into the provider wrapper. That wrapper
 proves the lease first, rechecks the deadline after any blocking heartbeat
 database round trip, and only then invokes the raw SDK call. A call that crosses
@@ -2440,9 +2452,10 @@ handler before rechecking drain, lease, or deadline state. If that control fence
 wins, the wrapper clears the losing provider error and response before raising
 the detached control exception, so it cannot acquire provider diagnostics as
 hidden context. The canary Deployment enforces a termination grace of at least
-600 seconds. The grace covers cancellation
-observation, that 300-second EC2 settling budget, bounded provider-call overhead,
-and margin. The process exits immediately when cleanup completes, so the
+600 seconds. The grace covers the 480-second absolute EC2 cleanup budget,
+including the 60-observation settling cadence and bounded provider-call
+overhead, plus process-exit margin. The process exits immediately when cleanup
+completes, so the
 configured ceiling does not add a fixed rollout delay. The same drain applies to
 disable and scale-down. For `helm upgrade --reuse-values`, legacy value maps that
 omit the three worker grace keys render copy/lifecycle/canary defaults of
@@ -2887,6 +2900,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   without an instance, a request-to-instance edge appears on a later exact
   read, a late request transition cannot reuse an earlier absence interval, and
   a true terminal no-child outcome consumes the complete settling window;
+  paginated instance discovery must terminate a running child found only on a
+  later page and reject malformed or cyclic cursors; the production 60-poll
+  absolute cadence must complete with nonzero provider latency inside its
+  distinct 480-second deadline;
 - deterministic stop-during-heartbeat tests for copy, lifecycle, and canary
   workers proving that shutdown begins no later maintenance, internal copy
   claim, manifest-ingestion item, lifecycle-maintenance item, publication fanout
@@ -2906,7 +2923,7 @@ drained and every image table is empty; it is never part of Helm rollback.
   proving EC2 settling passes one absolute deadline through the real fenced
   client, rechecks it after a heartbeat that crosses the deadline, treats an
   over-budget result as unverified, cannot start that or any later provider call
-  after its 300-second wall-clock budget, and acquires fresh cleanup credentials
+  after its 480-second wall-clock budget, and acquires fresh cleanup credentials
   under that deadline instead of reusing a one-hour runtime session;
   PostgreSQL tests proving a verified drain is immediately reclaimable while a
   stale token cannot release its successor; plus Helm rendering and schema tests
@@ -2978,8 +2995,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   restart, shard-ceiling, and inventory-drift tests;
 - source/destination/compute account separation, cross-identity attestation,
   negative STS trust, permissions-boundary, repository-policy size/principal,
-  KMS grant, protected destroy, empty import, desired-generation fencing, and
-  old-revision drain tests;
+  KMS grant, protected destroy, empty import, exact-ARN wildcard and
+  policy-variable rejection, target account/region/partition validation,
+  partition-derived China PassRole service names, desired-generation fencing,
+  and old-revision drain tests;
 - policy-only profile revision location reuse and physical-layout-change
   rejection after first release, including a constant-row custody marker plan,
   READY-versus-stage interleavings, and activation revalidation;
@@ -4061,3 +4080,21 @@ passable identities from EKS inspect-only profiles, pins every launch to the
 exact EC2 profile set, and synchronizes this canonical design. It also makes the
 partition-neutral account import and destruction protection explicit. The
 acceptance streak remains zero.
+
+Codex exact-head review round 14 at
+`cc024e434dd1662d2302d9505ead48b50ac38c6c` returned `RESHAPE`; the separate
+`claude-fable-5` max-effort request again returned HTTP 429 with zero tokens and
+provided no verdict. Codex verified all 26 GitHub checks, the 674-test feature
+matrix, PostgreSQL, managed-job, inherited Serve, Terraform, Helm, and static
+analysis, then reproduced four blockers in one transitive pass. First,
+`DescribeInstances` did not follow `NextToken`, so a paid child on a later page
+could be omitted while cleanup returned success. Second, the 300-second
+deadline left only five seconds for roughly 180 provider calls after its 59
+fixed sleeps, making the terminal no-child proof permanently fail under normal
+latency. Third, exact-ARN Terraform inputs accepted IAM wildcards and policy
+variables. Fourth, `iam:PassedToService` hardcoded the standard-partition EC2
+principal and broke China targets. This revision paginates and validates the
+complete instance inventory, uses a 480-second cleanup budget with an absolute
+60-observation cadence, validates every policy-bearing ARN and target scope,
+and derives the EC2 service principal from the active partition. The acceptance
+streak remains zero.

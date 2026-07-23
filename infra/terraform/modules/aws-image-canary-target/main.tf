@@ -18,6 +18,7 @@ locals {
     tolist(var.ec2_instance_profile_arns),
     tolist(var.eks_node_instance_profile_arns),
   ))
+  ec2_service_principal                 = "ec2.${data.aws_partition.current.dns_suffix}"
   expected_spot_service_linked_role_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/spot.amazonaws.com/AWSServiceRoleForEC2Spot"
   spot_service_linked_role_arn          = var.spot_service_linked_role_arn == null ? local.expected_spot_service_linked_role_arn : var.spot_service_linked_role_arn
   common_tags = merge(var.tags, {
@@ -61,6 +62,13 @@ resource "terraform_data" "validate_contract" {
     }
     precondition {
       condition = alltrue([
+        for arn in var.canary_worker_role_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:iam::")
+      ])
+      error_message = "Every canary worker role must belong to the target AWS partition."
+    }
+    precondition {
+      condition = alltrue([
         for arn in var.ec2_runtime_role_arns :
         startswith(arn, "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/")
       ])
@@ -72,6 +80,41 @@ resource "terraform_data" "validate_contract" {
         startswith(arn, "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/")
       ])
       error_message = "Every qualified instance profile must belong to the target AWS account and partition."
+    }
+    precondition {
+      condition = alltrue([
+        for arn in var.ami_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}::image/ami-")
+      ])
+      error_message = "Every qualified AMI must belong to the target AWS partition and module region."
+    }
+    precondition {
+      condition = alltrue([
+        for arn in var.subnet_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:subnet/subnet-")
+      ])
+      error_message = "Every qualified subnet must belong to the target AWS account, partition, and module region."
+    }
+    precondition {
+      condition = alltrue([
+        for arn in var.security_group_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:security-group/sg-")
+      ])
+      error_message = "Every qualified security group must belong to the target AWS account, partition, and module region."
+    }
+    precondition {
+      condition = alltrue([
+        for arn in var.eks_cluster_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:eks:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:cluster/")
+      ])
+      error_message = "Every qualified EKS cluster must belong to the target AWS account, partition, and module region."
+    }
+    precondition {
+      condition = (
+        var.permissions_boundary_arn == null ||
+        startswith(var.permissions_boundary_arn, "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/")
+      )
+      error_message = "The permissions boundary must belong to the target AWS account and partition."
     }
     precondition {
       condition     = !local.ec2_canary_enabled || var.spot_service_linked_role_arn != null
@@ -258,7 +301,7 @@ data "aws_iam_policy_document" "permissions" {
       condition {
         test     = "StringEquals"
         variable = "iam:PassedToService"
-        values   = ["ec2.amazonaws.com"]
+        values   = [local.ec2_service_principal]
       }
     }
   }
