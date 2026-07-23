@@ -131,14 +131,15 @@ async def test_unserializable_result_still_reaches_terminal_status(
         _make_request('req-unser', RequestStatus.RUNNING, pid=4242))
 
     # A set cannot be serialized by any JSON serializer; the request must
-    # still finish (with a null return value) instead of staying RUNNING.
+    # still reach a terminal status (FAILED, with the serialization error
+    # surfaced) instead of staying RUNNING forever.
     requests.set_request_succeeded('req-unser', {'bad': {1, 2}})
 
     record = requests.get_request('req-unser')
     assert record is not None
-    assert record.status == RequestStatus.SUCCEEDED
+    assert record.status == RequestStatus.FAILED
     assert record.finished_at is not None
-    assert record.get_return_value() is None
+    assert record.get_error() is not None
 
 
 @pytest.mark.asyncio
