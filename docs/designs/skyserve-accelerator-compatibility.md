@@ -36,6 +36,11 @@ Scheduling and scaling follow these rules:
    directly. If the paid price map is incomplete, startup preserves the
    explicit service resource order. Candidate-set growth therefore cannot
    prevent the controller from binding its health endpoint.
+10. Load-balancer sync reads the cached zero-cost identity set and the cached
+    reserved-capacity observations. Autoscaler decisions taken under the
+    logical-state lock also read only cached paid costs. Neither path may warm
+    paid-provider costs or make the controller health endpoint wait behind a
+    catalog-wide price scan.
 
 The priority rule deliberately means that a flexible priority-50 request remains ahead of a constrained priority-20 request. Within the same numeric priority, however, an `A100`-only request has no fallback and therefore gets the next A100 slot ahead of older flexible `L4/A100/H100` work. This preserves the existing strict-priority contract while protecting scarce-card access among peers.
 
@@ -88,7 +93,7 @@ not evidence that the behavior is active in production.
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
 | `1.1.721` | PR #877, reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Included in deployed `1.1.726`. Production then exposed a separate catalog-ordering edge case when a zero-cost-only A100 preceded paid L4. |
 | Unreleased | Reserved-only card paid fallback | Excludes cards whose every successfully priced location is zero-cost from flexible cold-paid ordering. Paid-capable and unpriced cards keep the all-or-nothing service-order fallback, while exact demand can still target a reserved-only card. | Required before the next `opendde-10c200s-v4` rollout so default-all demand selects paid L4 instead of waiting on the reserved-only A100 location. |
-| Unreleased | Bounded controller startup bootstrap | Configures exact-card order, seeds reserved-capacity identities, and adopts recovery claims from the placer's already-known cost cache instead of resolving paid-provider costs before Uvicorn binds. | Fix-forward for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures after exact instance-shape expansion increased the candidate set from 659 to more than 1,050. |
+| Unreleased | Bounded controller startup bootstrap | Configures exact-card order, seeds reserved-capacity identities, adopts recovery claims, serves load-balancer capacity metadata, and orders cold-paid cards under the logical-state lock from the placer's already-known cost cache instead of resolving paid-provider costs on controller-critical paths. | Fix-forward for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures after exact instance-shape expansion increased the candidate set from 659 to more than 1,050. |
 
 ### Controller startup liveness
 
@@ -106,14 +111,23 @@ configured card, the existing all-or-nothing ordering rule preserves the
 explicit service resource order. Claim recovery conservatively treats an
 uncached location as paid. Background placement and reserved-capacity polling
 retain their resolving cost semantics after the controller is healthy.
+Load-balancer sync consumes the cached zero-cost identities plus the poller's
+cached free-capacity observations, so routing refresh cannot trigger the same
+catalog-wide price warm-up after the health endpoint binds. Cold-paid card
+ordering runs while the autoscaler holds the logical-state lock used by load
+balancer demand reports, so it also uses only already-cached prices. An
+incomplete cache preserves service order and lets later background placement
+resolve the selected location without delaying health or sync requests.
 
 Regression coverage must include a large set of uncached paid candidates and
 prove that both pre-bind exact-card configuration and startup seeding use only
 cached values without calling resource feasibility or pricing code. Recovery
 claim adoption must satisfy the same no-resolution rule. Production rollout
-verification requires the exact deployed commit, healthy controller endpoints
-for the one-replica canary and the production fleet, successful load-balancer
-syncs, and continuity of pre-existing ready replicas.
+and load-balancer sync must satisfy the same no-resolution rule, including
+autoscaler cold-card ordering under the shared logical-state lock. Production
+rollout verification requires the exact deployed commit, healthy controller
+endpoints for the one-replica canary and the production fleet, successful
+load-balancer syncs, and continuity of pre-existing ready replicas.
 
 The dashboard's provisioning count is not itself a paid-capacity signal. For a
 launch audit, combine `cold_launch_authority_by_accelerator` with the durable

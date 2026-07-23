@@ -2330,7 +2330,11 @@ class SkyServeController:
         """Return fresh cached physical zero-cost supply by exact card."""
         placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
                          None)
-        getter = getattr(placer, 'zero_cost_locations', None)
+        # LB sync is latency-sensitive and consumes observations already
+        # refreshed by the background reserved-capacity poller. Do not warm
+        # every paid-provider cost from this request path merely to rediscover
+        # the Kubernetes locations classified during placer construction.
+        getter = getattr(placer, 'cached_zero_cost_locations', None)
         if not callable(getter):
             return {}
         locations = getter()

@@ -2501,6 +2501,28 @@ class TestAuthoritativeLbReportIngestion:
             report['prediction_time_history'],
         )
 
+    def test_free_reserved_slots_never_resolves_provider_costs(self):
+        ctrl = _make_controller()
+        location = types.SimpleNamespace(accelerators={'A100': 1})
+        placer = mock.Mock()
+        placer.cached_zero_cost_locations.return_value = [location]
+        placer.zero_cost_locations.side_effect = AssertionError(
+            'load-balancer sync must not resolve provider costs')
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            spot_placer=placer)
+
+        with mock.patch.object(controller.reserved_capacity,
+                               'zero_cost_pool_shapes',
+                               return_value={}), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'get_cached_free_gpus_by_pool',
+                                   return_value={}):
+            assert not ctrl._get_free_reserved_slots_by_accelerator(  # pylint: disable=protected-access
+            )
+
+        placer.cached_zero_cost_locations.assert_called_once_with()
+        placer.zero_cost_locations.assert_not_called()
+
     @pytest.mark.parametrize(
         ('history_error', 'history_accepted'),
         [(RuntimeError('database unavailable'), False),

@@ -169,7 +169,7 @@ def _order_cold_paid_cards(
     location_gpu_shape: typing.Callable[[spot_placer.Location], tuple[str,
                                                                       int]],
 ) -> list[str]:
-    """Order paid-capable cold cards without promoting reserved-only cards."""
+    """Order paid-capable cold cards from the placer's bounded cost cache."""
     if placer is None:
         return list(configured_cards)
     canonical_by_name = {card.casefold(): card for card in configured_cards}
@@ -186,7 +186,11 @@ def _order_cold_paid_cards(
         if card is None or gpu_count != configured_gpu_count(card):
             continue
         try:
-            hourly_cost = float(placer.cost_per_hour(location))
+            cached_cost = placer.cached_cost_per_hour(location)
+            if cached_cost is None:
+                unpriced_cards.add(card)
+                continue
+            hourly_cost = float(cached_cost)
         except Exception:  # pylint: disable=broad-except
             unpriced_cards.add(card)
             continue

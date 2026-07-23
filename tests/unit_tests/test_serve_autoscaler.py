@@ -1780,7 +1780,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         l4_location = types.SimpleNamespace(accelerators={'L4': 1})
         placer = mock.Mock()
         placer.known_locations.return_value = [a100_location, l4_location]
-        placer.cost_per_hour.side_effect = (
+        placer.cached_cost_per_hour.side_effect = (
             lambda location: 0.0 if location is a100_location else 1.0)
 
         flexible = self._autoscaler(max_replicas=1)
