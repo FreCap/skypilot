@@ -9,10 +9,17 @@ catalog-tagged instances and requests can be terminated or cancelled.
 
 Configure `ami_arns`, `subnet_arns`, and at least one exact
 `canary_instance_type` for EC2 qualification. The launch policy constrains all
-three, requires catalog and operation tags, and permits `iam:PassRole` only to
-EC2. An EKS-only deployment may leave the EC2 inputs empty and provide
-`eks_cluster_arns`; it still lists the node roles and instance profiles that can
-be inspected.
+three, requires catalog and operation tags, and pins the mandatory
+instance-resource authorization to `ec2_instance_profile_arns` with
+`ec2:InstanceProfile`. Instance-only condition keys are not attached to the
+AMI, network, volume, or Spot-request authorizations. `iam:PassRole` permits
+only `ec2_runtime_role_arns`. EKS node identities are never passable. List their
+profiles separately in
+`eks_node_instance_profile_arns`, which grants only `iam:GetInstanceProfile`.
+The EC2 launchable and EKS inspect-only profile sets must be disjoint. An
+EKS-only deployment leaves every EC2 input empty and provides
+`eks_cluster_arns` plus its inspect-only node profiles; the resulting role has
+no `RunInstances` or `PassRole` authority.
 
 Before configuring any EC2 target, apply `aws-image-canary-account` once per
 compute account. EC2 targets require that module's

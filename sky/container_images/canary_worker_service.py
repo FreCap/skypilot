@@ -555,9 +555,10 @@ def _remember_instance_ids(instances: list[dict[str, Any]],
     return unidentified_child_observed
 
 
-def _remember_instance_spot_request_ids(instances: list[dict[str, Any]],
-                                        known_request_ids: set[str]) -> bool:
-    """Retains request IDs exposed by Spot instances."""
+def _remember_instance_spot_request_ids(
+        instances: list[dict[str, Any]], known_request_ids: set[str],
+        request_ids_with_instances: set[str]) -> bool:
+    """Retains request IDs and concrete request-to-instance associations."""
     unidentified_child_observed = False
     for instance in instances:
         value = instance.get('SpotInstanceRequestId')
@@ -565,19 +566,25 @@ def _remember_instance_spot_request_ids(instances: list[dict[str, Any]],
             continue
         if isinstance(value, str) and value:
             known_request_ids.add(value)
+            instance_id = instance.get('InstanceId')
+            if isinstance(instance_id, str) and instance_id:
+                request_ids_with_instances.add(value)
         else:
             unidentified_child_observed = True
     return unidentified_child_observed
 
 
-def _remember_spot_request_children(requests: list[dict[str, Any]],
-                                    known_request_ids: set[str],
-                                    known_instance_ids: set[str]) -> bool:
+def _remember_spot_request_children(
+        requests: list[dict[str, Any]], known_request_ids: set[str],
+        known_instance_ids: set[str],
+        request_ids_with_instances: set[str]) -> bool:
     """Retains both halves of each request-to-instance custody edge."""
     unidentified_child_observed = False
     for request in requests:
         request_id = request.get('SpotInstanceRequestId')
-        if isinstance(request_id, str) and request_id:
+        valid_request_id = isinstance(request_id, str) and bool(request_id)
+        if valid_request_id:
+            assert isinstance(request_id, str)
             known_request_ids.add(request_id)
         else:
             unidentified_child_observed = True
@@ -586,17 +593,22 @@ def _remember_spot_request_children(requests: list[dict[str, Any]],
             continue
         if isinstance(instance_id, str) and instance_id:
             known_instance_ids.add(instance_id)
+            if valid_request_id:
+                assert isinstance(request_id, str)
+                request_ids_with_instances.add(request_id)
         else:
             unidentified_child_observed = True
     return unidentified_child_observed
 
 
 def _index_exact_spot_requests(
-        requests: list[dict[str, Any]], known_request_ids: set[str],
-        known_instance_ids: set[str]) -> tuple[dict[str, dict[str, Any]], bool]:
+    requests: list[dict[str, Any]], known_request_ids: set[str],
+    known_instance_ids: set[str], request_ids_with_instances: set[str]
+) -> tuple[dict[str, dict[str, Any]], bool]:
     """Indexes an exact request read and reports incomplete provider state."""
     unidentified_child_observed = _remember_spot_request_children(
-        requests, known_request_ids, known_instance_ids)
+        requests, known_request_ids, known_instance_ids,
+        request_ids_with_instances)
     requests_by_id: dict[str, dict[str, Any]] = {}
     for request in requests:
         request_id = request.get('SpotInstanceRequestId')
@@ -684,6 +696,8 @@ def _terminate_ec2_instances(ec2: Any,
                              settle_absence: bool,
                              spot_request_expected: bool = False,
                              initial_spot_request_ids: list[str] | None = None,
+                             initial_spot_request_ids_with_instances: list[str]
+                             | None = None,
                              initial_unidentified_child_observed: bool = False,
                              cleanup_deadline: float | None = None) -> bool:
     known_ids = {
@@ -697,11 +711,25 @@ def _terminate_ec2_instances(ec2: Any,
         request_id for request_id in (initial_spot_request_ids or [])
         if isinstance(request_id, str) and request_id
     }
+    spot_request_ids_with_instances = {
+        request_id
+        for request_id in (initial_spot_request_ids_with_instances or [])
+        if isinstance(request_id, str) and request_id
+    }
+    known_spot_request_ids.update(spot_request_ids_with_instances)
     unidentified_child_observed |= any(
         not isinstance(request_id, str) or not request_id
         for request_id in (initial_spot_request_ids or []))
+    unidentified_child_observed |= any(
+        not isinstance(request_id, str) or not request_id
+        for request_id in (initial_spot_request_ids_with_instances or []))
     spot_request_observed = bool(known_spot_request_ids)
     clean_observations_after_ambiguity = 0
+    unassociated_spot_request_observations = 0
+    previous_unassociated_spot_request_ids: frozenset[str] | None = None
+    previous_unassociated_spot_request_states: tuple[tuple[str, str | None],
+                                                     ...] | None = None
+    previous_known_instance_ids = frozenset(known_ids)
     termination_requested: set[str] = set()
     if cleanup_deadline is None:
         cleanup_deadline = time.monotonic() + _EC2_TEARDOWN_SECONDS
@@ -719,7 +747,8 @@ def _terminate_ec2_instances(ec2: Any,
         unidentified_in_observation = _remember_instance_ids(tagged, known_ids)
         if spot_request_expected:
             unidentified_in_observation |= (_remember_instance_spot_request_ids(
-                tagged, known_spot_request_ids))
+                tagged, known_spot_request_ids,
+                spot_request_ids_with_instances))
             try:
                 tagged_requests = _tagged_spot_requests(
                     ec2, operation_id, cleanup_deadline=cleanup_deadline)
@@ -730,7 +759,8 @@ def _terminate_ec2_instances(ec2: Any,
             if tagged_requests:
                 spot_request_observed = True
             unidentified_in_observation |= _remember_spot_request_children(
-                tagged_requests, known_spot_request_ids, known_ids)
+                tagged_requests, known_spot_request_ids, known_ids,
+                spot_request_ids_with_instances)
         exact_requests_by_id: dict[str, dict[str, Any]] = {}
         if known_spot_request_ids:
             try:
@@ -743,7 +773,8 @@ def _terminate_ec2_instances(ec2: Any,
                 return False
             exact_requests_by_id, incomplete_exact_inventory = (
                 _index_exact_spot_requests(exact_requests,
-                                           known_spot_request_ids, known_ids))
+                                           known_spot_request_ids, known_ids,
+                                           spot_request_ids_with_instances))
             unidentified_in_observation |= incomplete_exact_inventory
         (cancellable_spot_request_ids, terminal_spot_request_ids,
          unknown_spot_request_state
@@ -771,7 +802,8 @@ def _terminate_ec2_instances(ec2: Any,
                 return False
             exact_requests_by_id, incomplete_exact_inventory = (
                 _index_exact_spot_requests(post_cancel_requests,
-                                           known_spot_request_ids, known_ids))
+                                           known_spot_request_ids, known_ids,
+                                           spot_request_ids_with_instances))
             unidentified_in_observation |= incomplete_exact_inventory
             (_, terminal_spot_request_ids, unknown_spot_request_state
             ) = _spot_request_state_sets(exact_requests_by_id)
@@ -821,16 +853,57 @@ def _terminate_ec2_instances(ec2: Any,
             not spot_request_expected or
             (bool(known_spot_request_ids) and
              terminal_spot_request_ids == known_spot_request_ids))
+        all_spot_requests_have_instances = (bool(known_spot_request_ids) and
+                                            spot_request_ids_with_instances
+                                            == known_spot_request_ids)
+        unassociated_spot_request_ids = frozenset(
+            known_spot_request_ids - spot_request_ids_with_instances)
+        unassociated_spot_request_states: list[tuple[str, str | None]] = []
+        for request_id in sorted(unassociated_spot_request_ids):
+            request_state = exact_requests_by_id.get(request_id,
+                                                     {}).get('State')
+            unassociated_spot_request_states.append(
+                (request_id,
+                 request_state if isinstance(request_state, str) else None))
+        unassociated_spot_request_state_signature = tuple(
+            unassociated_spot_request_states)
+        if (spot_request_expected and settle_absence and
+                unassociated_spot_request_ids):
+            inventory_changed = (unassociated_spot_request_ids
+                                 != previous_unassociated_spot_request_ids or
+                                 unassociated_spot_request_state_signature
+                                 != previous_unassociated_spot_request_states or
+                                 frozenset(known_ids)
+                                 != previous_known_instance_ids)
+            if (unidentified_in_observation or not all_spot_requests_terminal or
+                (known_ids and not all_known_terminated)):
+                unassociated_spot_request_observations = 0
+            elif inventory_changed:
+                unassociated_spot_request_observations = 1
+            else:
+                unassociated_spot_request_observations += 1
+        else:
+            unassociated_spot_request_observations = 0
+        previous_unassociated_spot_request_ids = (unassociated_spot_request_ids)
+        previous_unassociated_spot_request_states = (
+            unassociated_spot_request_state_signature)
+        previous_known_instance_ids = frozenset(known_ids)
+        spot_associations_settled = (not spot_request_expected or
+                                     not settle_absence or
+                                     all_spot_requests_have_instances or
+                                     unassociated_spot_request_observations
+                                     >= _EC2_TEARDOWN_ATTEMPTS)
         instance_absence_settled = (not settle_absence or
                                     (spot_request_expected and
                                      spot_request_observed))
-        spot_request_absence_settled = (not spot_request_expected or
-                                        spot_request_observed)
+        spot_request_presence_settled = (not spot_request_expected or
+                                         spot_request_observed)
         teardown_complete = (ambiguity_resolved and
                              all_spot_requests_terminal and
                              (not known_ids or all_known_terminated) and
                              instance_absence_settled and
-                             spot_request_absence_settled)
+                             spot_associations_settled and
+                             spot_request_presence_settled)
         if teardown_complete:
             return True
         if (attempt == _EC2_TEARDOWN_ATTEMPTS - 1 or
@@ -843,8 +916,9 @@ def _terminate_ec2_instances(ec2: Any,
             # terminalized as an ordinary qualification failure.
             return (ambiguity_resolved and
                     (not known_ids or all_known_terminated) and
-                    (not spot_request_expected or all_spot_requests_terminal or
-                     not known_spot_request_ids))
+                    (not spot_request_expected or
+                     (all_spot_requests_terminal and
+                      spot_associations_settled) or not known_spot_request_ids))
         time.sleep(
             min(_EC2_TEARDOWN_POLL_SECONDS,
                 max(0.0, cleanup_deadline - time.monotonic())))
@@ -906,6 +980,7 @@ def _run_ec2_canary_inner(
     instances: list[dict[str, Any]] = []
     known_instance_ids: set[str] = set()
     known_spot_request_ids: set[str] = set()
+    spot_request_ids_with_instances: set[str] = set()
     unidentified_tagged_child_observed = False
     instance_id: str | None = None
     launch_attempted = False
@@ -946,8 +1021,9 @@ def _run_ec2_canary_inner(
             instances, known_instance_ids)
         if binding.canary_use_spot is True:
             unidentified_tagged_child_observed |= (
-                _remember_instance_spot_request_ids(instances,
-                                                    known_spot_request_ids))
+                _remember_instance_spot_request_ids(
+                    instances, known_spot_request_ids,
+                    spot_request_ids_with_instances))
         _raise_if_draining(drain_event)
         if len(instances) > 1:
             raise ValueError('CANARY_DUPLICATE_CHILD')
@@ -1053,8 +1129,9 @@ def _run_ec2_canary_inner(
             known_instance_ids.add(instance_id)
             if binding.canary_use_spot is True:
                 unidentified_tagged_child_observed |= (
-                    _remember_instance_spot_request_ids(instances,
-                                                        known_spot_request_ids))
+                    _remember_instance_spot_request_ids(
+                        instances, known_spot_request_ids,
+                        spot_request_ids_with_instances))
             launch_confirmed = True
         if instance_id is None:
             instance_id = _instance_id(instances[0])
@@ -1070,8 +1147,9 @@ def _run_ec2_canary_inner(
                 matching_instances, known_instance_ids)
             if binding.canary_use_spot is True:
                 unidentified_tagged_child_observed |= (
-                    _remember_instance_spot_request_ids(matching_instances,
-                                                        known_spot_request_ids))
+                    _remember_instance_spot_request_ids(
+                        matching_instances, known_spot_request_ids,
+                        spot_request_ids_with_instances))
             _raise_if_draining(drain_event)
             if len(matching_instances) > 1:
                 raise ValueError('CANARY_DUPLICATE_CHILD')
@@ -1086,8 +1164,9 @@ def _run_ec2_canary_inner(
             known_instance_ids.add(_instance_id(instance))
             if binding.canary_use_spot is True:
                 unidentified_tagged_child_observed |= (
-                    _remember_instance_spot_request_ids([instance],
-                                                        known_spot_request_ids))
+                    _remember_instance_spot_request_ids(
+                        [instance], known_spot_request_ids,
+                        spot_request_ids_with_instances))
             _raise_if_draining(drain_event)
             instance_image_id = instance.get('ImageId')
             if instance_image_id != dict(
@@ -1142,7 +1221,8 @@ def _run_ec2_canary_inner(
                         if binding.canary_use_spot is True:
                             unidentified_tagged_child_observed |= (
                                 _remember_instance_spot_request_ids(
-                                    live_instances, known_spot_request_ids))
+                                    live_instances, known_spot_request_ids,
+                                    spot_request_ids_with_instances))
                         teardown_verified = _terminate_ec2_instances(
                             cleanup_ec2,
                             operation.id,
@@ -1154,6 +1234,8 @@ def _run_ec2_canary_inner(
                                                    is True),
                             initial_spot_request_ids=sorted(
                                 known_spot_request_ids),
+                            initial_spot_request_ids_with_instances=sorted(
+                                spot_request_ids_with_instances),
                             initial_unidentified_child_observed=(
                                 unidentified_tagged_child_observed),
                             cleanup_deadline=cleanup_deadline)

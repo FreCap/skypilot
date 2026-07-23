@@ -2255,11 +2255,16 @@ def test_ec2_spot_ambiguous_launch_cancels_request_and_terminates_racing_child(
         empty_instances,  # Initial operation-tag discovery.
         empty_instances,  # Immediate cleanup discovery.
         empty_instances,  # First bounded cleanup observation.
+        empty_instances,  # The request-to-instance edge is not tagged yet.
         terminated_instance,  # Exact racing-instance termination proof.
     )
     open_request = {
         'SpotInstanceRequestId': 'sir-racing',
         'State': 'open',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-racing',
+        'State': 'cancelled',
     }
     cancelled_with_instance = {
         'SpotInstanceRequestId': 'sir-racing',
@@ -2270,6 +2275,10 @@ def test_ec2_spot_ambiguous_launch_cancels_request_and_terminates_racing_child(
         'SpotInstanceRequests': [open_request],
     }, {
         'SpotInstanceRequests': [open_request],
+    }, {
+        'SpotInstanceRequests': [cancelled_request],
+    }, {
+        'SpotInstanceRequests': [cancelled_with_instance],
     }, {
         'SpotInstanceRequests': [cancelled_with_instance],
     })
@@ -2312,6 +2321,157 @@ def test_ec2_spot_ambiguous_launch_cancels_request_and_terminates_racing_child(
     ec2.cancel_spot_instance_requests.assert_called_once_with(
         SpotInstanceRequestIds=['sir-racing'])
     ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-racing'])
+    assert ec2.describe_spot_instance_requests.call_count == 5
+
+
+def test_ec2_spot_terminal_request_without_child_consumes_full_settle_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    open_request = {
+        'SpotInstanceRequestId': 'sir-no-child',
+        'State': 'open',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-no-child',
+        'State': 'cancelled',
+    }
+    ec2.describe_spot_instance_requests.side_effect = (
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 3)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert ec2.describe_instances.call_count == 3
+    assert ec2.describe_spot_instance_requests.call_count == 7
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-no-child'])
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_spot_late_terminal_transition_preserves_custody(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    active_request = {
+        'SpotInstanceRequestId': 'sir-late-terminal',
+        'State': 'active',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-late-terminal',
+        'State': 'cancelled',
+    }
+    ec2.describe_spot_instance_requests.side_effect = (
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [active_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 3)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert ec2.describe_instances.call_count == 3
+    assert ec2.describe_spot_instance_requests.call_count == 8
+    assert ec2.cancel_spot_instance_requests.call_count == 2
+    ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_spot_terminal_transition_restarts_settle_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    ec2 = mock.Mock()
+    ec2.describe_instances.return_value = {'Reservations': []}
+    open_request = {
+        'SpotInstanceRequestId': 'sir-terminal-transition',
+        'State': 'open',
+    }
+    cancelled_request = {
+        'SpotInstanceRequestId': 'sir-terminal-transition',
+        'State': 'cancelled',
+    }
+    closed_request = {
+        'SpotInstanceRequestId': 'sir-terminal-transition',
+        'State': 'closed',
+    }
+    ec2.describe_spot_instance_requests.side_effect = (
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [open_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [cancelled_request],
+        },
+        {
+            'SpotInstanceRequests': [closed_request],
+        },
+        {
+            'SpotInstanceRequests': [closed_request],
+        },
+        {
+            'SpotInstanceRequests': [closed_request],
+        },
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 3)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2, 'operation', [], settle_absence=True, spot_request_expected=True)
+
+    assert ec2.describe_instances.call_count == 3
+    assert ec2.describe_spot_instance_requests.call_count == 7
+    ec2.cancel_spot_instance_requests.assert_called_once_with(
+        SpotInstanceRequestIds=['sir-terminal-transition'])
+    ec2.terminate_instances.assert_not_called()
 
 
 def test_ec2_spot_cleanup_preserves_custody_until_request_is_terminal(

@@ -14,6 +14,10 @@ locals {
     local.instance_resource_arns,
     [local.spot_request_resource_arn],
   )
+  qualified_instance_profile_arns = sort(concat(
+    tolist(var.ec2_instance_profile_arns),
+    tolist(var.eks_node_instance_profile_arns),
+  ))
   expected_spot_service_linked_role_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/spot.amazonaws.com/AWSServiceRoleForEC2Spot"
   spot_service_linked_role_arn          = var.spot_service_linked_role_arn == null ? local.expected_spot_service_linked_role_arn : var.spot_service_linked_role_arn
   common_tags = merge(var.tags, {
@@ -40,12 +44,46 @@ resource "terraform_data" "validate_contract" {
       error_message = "EC2 canaries require at least one exact security_group_arn and never use an implicit default security group."
     }
     precondition {
+      condition     = !local.ec2_canary_enabled || length(var.ec2_runtime_role_arns) > 0
+      error_message = "EC2 canaries require at least one exact ec2_runtime_role_arn."
+    }
+    precondition {
+      condition     = !local.ec2_canary_enabled || length(var.ec2_instance_profile_arns) > 0
+      error_message = "EC2 canaries require at least one exact ec2_instance_profile_arn."
+    }
+    precondition {
+      condition     = length(var.eks_cluster_arns) == 0 || length(var.eks_node_instance_profile_arns) > 0
+      error_message = "EKS canaries require at least one inspect-only eks_node_instance_profile_arn."
+    }
+    precondition {
+      condition     = length(setintersection(var.ec2_instance_profile_arns, var.eks_node_instance_profile_arns)) == 0
+      error_message = "EC2 launchable and EKS inspect-only instance profiles must be disjoint."
+    }
+    precondition {
+      condition = alltrue([
+        for arn in var.ec2_runtime_role_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/")
+      ])
+      error_message = "Every EC2 runtime role must belong to the target AWS account and partition."
+    }
+    precondition {
+      condition = alltrue([
+        for arn in local.qualified_instance_profile_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:instance-profile/")
+      ])
+      error_message = "Every qualified instance profile must belong to the target AWS account and partition."
+    }
+    precondition {
       condition     = !local.ec2_canary_enabled || var.spot_service_linked_role_arn != null
       error_message = "EC2 canary targets require spot_service_linked_role_arn from the account bootstrap module."
     }
     precondition {
       condition     = var.spot_service_linked_role_arn == null || var.spot_service_linked_role_arn == local.expected_spot_service_linked_role_arn
       error_message = "spot_service_linked_role_arn must belong to the target AWS account and identify its canonical EC2 Spot service-linked role."
+    }
+    precondition {
+      condition     = local.ec2_canary_enabled || length(var.spot_customer_managed_kms_key_arns) == 0
+      error_message = "Spot customer-managed KMS keys are valid only for an EC2 canary target."
     }
     precondition {
       condition = alltrue([
@@ -83,7 +121,7 @@ data "aws_iam_policy_document" "permissions" {
   dynamic "statement" {
     for_each = local.ec2_canary_enabled ? [1] : []
     content {
-      sid     = "LaunchOnlyThroughQualifiedNetworkAndImage"
+      sid     = "UseOnlyQualifiedNetworkAndImage"
       effect  = "Allow"
       actions = ["ec2:RunInstances"]
       resources = sort(concat(
@@ -91,11 +129,39 @@ data "aws_iam_policy_document" "permissions" {
         tolist(var.subnet_arns),
         tolist(var.security_group_arns),
       ))
+    }
+  }
+
+  dynamic "statement" {
+    for_each = local.ec2_canary_enabled ? [1] : []
+    content {
+      sid       = "CreateOnlyCatalogTaggedCanaryInstances"
+      effect    = "Allow"
+      actions   = ["ec2:RunInstances"]
+      resources = [local.instance_resource_arns[0]]
 
       condition {
         test     = "StringEquals"
         variable = "ec2:InstanceType"
         values   = sort(tolist(var.canary_instance_types))
+      }
+
+      condition {
+        test     = "ArnEquals"
+        variable = "ec2:InstanceProfile"
+        values   = sort(tolist(var.ec2_instance_profile_arns))
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "aws:RequestTag/SkyPilotCatalog"
+        values   = [var.catalog_authority]
+      }
+
+      condition {
+        test     = "StringLike"
+        variable = "aws:RequestTag/SkyPilotCanaryOperation"
+        values   = ["????????-????-????-????-????????????"]
       }
     }
   }
@@ -103,16 +169,14 @@ data "aws_iam_policy_document" "permissions" {
   dynamic "statement" {
     for_each = local.ec2_canary_enabled ? [1] : []
     content {
-      sid       = "CreateOnlyCatalogTaggedCanaryResources"
-      effect    = "Allow"
-      actions   = ["ec2:RunInstances"]
-      resources = local.launch_created_resource_arns
-
-      condition {
-        test     = "StringEquals"
-        variable = "ec2:InstanceType"
-        values   = sort(tolist(var.canary_instance_types))
-      }
+      sid     = "CreateOnlyCatalogTaggedCanarySupportResources"
+      effect  = "Allow"
+      actions = ["ec2:RunInstances"]
+      resources = [
+        local.instance_resource_arns[1],
+        local.instance_resource_arns[2],
+        local.spot_request_resource_arn,
+      ]
 
       condition {
         test     = "StringEquals"
@@ -189,7 +253,7 @@ data "aws_iam_policy_document" "permissions" {
       sid       = "PassOnlyQualifiedRuntimeRoles"
       effect    = "Allow"
       actions   = ["iam:PassRole"]
-      resources = sort(tolist(var.runtime_role_arns))
+      resources = sort(tolist(var.ec2_runtime_role_arns))
 
       condition {
         test     = "StringEquals"
@@ -203,7 +267,7 @@ data "aws_iam_policy_document" "permissions" {
     sid       = "InspectOnlyQualifiedInstanceProfiles"
     effect    = "Allow"
     actions   = ["iam:GetInstanceProfile"]
-    resources = sort(tolist(var.instance_profile_arns))
+    resources = local.qualified_instance_profile_arns
   }
 
   dynamic "statement" {

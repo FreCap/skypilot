@@ -678,11 +678,16 @@ and after cancellation, and requires both a terminal request state and exact
 instance termination. Since cancellation does not terminate an already launched
 instance, neither proof can substitute for the other. An ambiguous launch
 response remains reclaimable until the tagged Spot request is cancelled and
-terminal, or bounded provider settling proves repeated absence. On-demand
-ambiguity still requires the complete instance-absence window. EC2 cleanup
-follows every known child through `shutting-down` to `terminated`; EKS cleanup
-accounts for a timed-out create that becomes visible after the first delete. A
-persisted child also
+terminal. A terminal request without a concrete request-to-instance association
+does not collapse the absence window: every request transition or newly visible
+child resets bounded settling, cleanup repeatedly exact-reads every known
+request and rediscovers tagged instances, and a late association is retained and
+terminated. Only a concrete association to an exactly terminated instance may
+finish early; otherwise the terminal no-instance outcome must remain stable for
+the complete window. On-demand ambiguity still requires the complete
+instance-absence window. EC2 cleanup follows every known child through
+`shutting-down` to `terminated`; EKS cleanup accounts for a timed-out create
+that becomes visible after the first delete. A persisted child also
 remains reclaimable if its immutable contract cannot be reloaded, because no
 terminal transition may substitute for provider teardown; an incompatible
 worker rotates that expired queue row without clearing its child identity so a
@@ -735,11 +740,17 @@ catalog, operation, and profile tag specifications to the instance, every
 created EBS volume, every created network interface, and, for Spot, the request
 itself. The generated IAM role authorizes `RunInstances` against the exact AMI,
 subnet, security groups, and created resource classes with the required request
-tags. It may list Spot requests but may cancel only regional request resources
-carrying the exact catalog ownership tag. A separate
-`ec2:CreateTags` statement is limited by `ec2:CreateAction=RunInstances`; it is
-not combined with launch conditions. The role never relies on an implicit VPC
-default security group.
+tags. EC2 passable roles and instance profiles are separate inputs from EKS
+inspect-only node profiles. `iam:PassRole` names only EC2 runtime roles, and
+the mandatory instance-resource `RunInstances` authorization uses `ArnEquals`
+on `ec2:InstanceProfile` with only the EC2 launchable profiles. Instance-only
+condition keys are not attached to the AMI, network, volume, or Spot-request
+authorizations. EKS node profiles receive `iam:GetInstanceProfile` only and the
+two profile sets are disjoint. The
+role may list Spot requests but may cancel only regional request resources
+carrying the exact catalog ownership tag. A separate `ec2:CreateTags` statement
+is limited by `ec2:CreateAction=RunInstances`; it is not combined with launch
+conditions. The role never relies on an implicit VPC default security group.
 EC2 qualification canaries use one-time Spot capacity with terminate-on-
 interruption by default. `canary_use_spot: false` is the explicit escape hatch
 for an account or region that requires on-demand qualification. A failed Spot
@@ -764,12 +775,15 @@ planning any EC2 canary target. That account-scoped module owns
 and shares its output instead of racing to create an account-global role. This
 keeps a target ready for the public Spot default even when a staged profile
 revision explicitly selects on-demand. An existing role is imported into the
-account module. If a qualified AMI or snapshot is encrypted with a
-customer-managed KMS key, the regional target module receives that exact key
-ARN and grants the Spot service-linked role only the AWS-documented launch
-operations. AWS-managed EBS keys need no grant. Omitting a required
-customer-managed key makes qualification fail closed; the canary worker never
-receives direct KMS authority.
+account module with the active AWS partition. The account-global role is
+destruction-protected because every region and any other Spot workload shares
+it; deliberate decommission removes regional targets and grants first. If a
+qualified AMI or snapshot is encrypted with a customer-managed KMS key, the
+regional target module receives that exact key ARN and grants the Spot
+service-linked role only the AWS-documented launch operations. AWS-managed EBS
+keys need no grant. Omitting a required customer-managed key makes
+qualification fail closed; the canary worker never receives direct KMS
+authority.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -2761,8 +2775,10 @@ CLI or Dashboard locates such a publication for explicit retry.
    old pod remains before feature activation.
 4. Apply Terraform in one dedicated registry account. In each compute account,
    apply the account-global Spot bootstrap once, then every regional canary
-   target and any customer-managed AMI KMS grants. Import the qualification
-   manifest and stage the desired profile revision without activating it.
+   target and any customer-managed AMI KMS grants. Keep EC2 passable roles and
+   profiles separate from EKS inspect-only node profiles. Import the
+   qualification manifest and stage the desired profile revision without
+   activating it.
 5. Deploy one copy worker, one lifecycle worker, and one runtime-canary worker
    with separate identities.
 6. Let each worker attest only its own capability, run actual-principal EC2 and
@@ -2844,7 +2860,11 @@ drained and every image table is empty; it is never part of Helm rollback.
   `terraform test -test-directory=terraform-tests`;
 - clean-account Spot service-linked-role planning, existing-role import
   instructions, regional customer-managed AMI KMS grants, and least-privilege
-  Spot request tag, describe, and cancel policy tests;
+  Spot request tag, describe, and cancel policy tests; mixed EC2/EKS plans prove
+  only EC2 runtime roles are passable, the required instance-resource
+  permission pins `ec2:InstanceProfile`, instance-only conditions do not poison
+  other resource authorizations, EKS node profiles remain inspect-only, and an
+  EKS-only target has no EC2 launch or `PassRole` authority;
 - EC2 instance and EKS kubelet runtime pull-auth refresh tests, preinstalled
   helper/AMI enforcement, homogeneous EKS-node-role validation, multi-cluster
   attestation, no managed-path CLI install/login, plus
@@ -2863,6 +2883,10 @@ drained and every image table is empty; it is never part of Helm rollback.
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
+- lost-response Spot tests where cancellation first reports a terminal request
+  without an instance, a request-to-instance edge appears on a later exact
+  read, a late request transition cannot reuse an earlier absence interval, and
+  a true terminal no-child outcome consumes the complete settling window;
 - deterministic stop-during-heartbeat tests for copy, lifecycle, and canary
   workers proving that shutdown begins no later maintenance, internal copy
   claim, manifest-ingestion item, lifecycle-maintenance item, publication fanout
@@ -3993,13 +4017,16 @@ The revised three-state snapshot contract preserves old missing-field
 on-demand replay, while every new profile projects its boolean market policy
 and therefore requires an identity-changing revision. The acceptance streak
 remains zero.
-Before the repaired-head acceptance run, `origin/improvements` first advanced
-to `0758b9b32e5828a0befd6cde1fe09dce62e6f605` and then to
-`742315b8f847b2c414b2a25cf25c30863feb9c82`. Integrating both preserves the
-new managed-job cancellation attribution, transient-INIT recovery, and recovery
-signal-parent contracts. The second integration does not overlap this feature's
-26-file base-relative diff. All gates are rerun against the actual merge
-candidate.
+Before the repaired-head acceptance runs, `origin/improvements` advanced
+through `0758b9b32e5828a0befd6cde1fe09dce62e6f605` and
+`742315b8f847b2c414b2a25cf25c30863feb9c82`, preserving the managed-job
+cancellation attribution, transient-INIT recovery, and recovery signal-parent
+contracts. It then advanced to
+`cd52f3e099dad3e63741cc6d8317eceb342d16da`, whose inherited change uses slim
+Serve status snapshots for control writes. The exact round-13 candidate had
+that commit as both base and merge base, a 39-file base-relative diff, and a
+24-test inherited Serve status suite. No semantic overlap or conflict survived
+review. All gates are rerun against each actual merge candidate.
 
 Codex exact-head review round 12 at
 `795b0e561d3fc7f2af8b44bb7dd21f3671db5826` returned `RESHAPE`; the exact
@@ -4016,3 +4043,21 @@ and instance teardown across cancellation-versus-fulfillment, adds one
 account-scoped Spot bootstrap and regional conditional KMS grants, and keeps the
 legacy on-demand replay contract unchanged. The acceptance streak remains zero
 until both reviewers accept one immutable repaired head.
+
+Codex exact-head review round 13 at
+`7623fb052641734faa57ad7668dbbee5d16af437` returned `RESHAPE`; the separate
+`claude-fable-5` max-effort request again returned HTTP 429 with zero tokens and
+provided no verdict. Codex verified the exact 39-file candidate, all 26 GitHub
+checks, the 671-test feature matrix, PostgreSQL, managed-job, inherited Serve,
+Terraform, Helm, and static-analysis gates, then reproduced three blockers in
+one transitive pass. First, an immediate post-cancel read could report a
+terminal Spot request before eventual consistency exposed its running
+`InstanceId`, allowing false teardown success. Second, the target module
+combined EC2 runtime and EKS node roles under one `iam:PassRole` grant and did
+not pin `ec2:InstanceProfile`. Third, this integration history still described
+the prior base and 26-file candidate. This revision gives every terminal
+unassociated request its own restartable full settling window, splits EC2
+passable identities from EKS inspect-only profiles, pins every launch to the
+exact EC2 profile set, and synchronizes this canonical design. It also makes the
+partition-neutral account import and destruction protection explicit. The
+acceptance streak remains zero.

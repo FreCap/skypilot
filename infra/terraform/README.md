@@ -18,8 +18,10 @@ The normal installation flow is:
 4. Apply `aws-image-canary-account` once in every compute account. It creates
    the account-global EC2 Spot service-linked role used by every region.
 5. Apply `aws-image-canary-target` in every compute account and region that will
-   be qualified. Pass the account bootstrap output and any customer-managed AMI
-   KMS keys, then pass the exact target role ARNs to the worker identity module.
+   be qualified. Pass the account bootstrap output, any customer-managed AMI
+   KMS keys, exact EC2 passable roles and profiles, and separate EKS
+   inspect-only node profiles. Then pass the exact target role ARNs to the
+   worker identity module.
 6. Import the generated, secret-free qualification manifest and deploy the
    workers. Qualification and just-in-time regional copies run asynchronously.
 

@@ -23,23 +23,36 @@ variable "catalog_authority" {
   type        = string
 }
 
-variable "runtime_role_arns" {
-  description = "Exact EC2 or EKS node roles whose instance profiles may be inspected and passed."
+variable "ec2_runtime_role_arns" {
+  description = "Exact EC2 runtime roles that the canary authority may pass to RunInstances. Never include EKS node roles."
   type        = set(string)
+  default     = []
 
   validation {
-    condition     = length(var.runtime_role_arns) > 0
-    error_message = "At least one qualified runtime role ARN is required."
+    condition     = length(var.ec2_runtime_role_arns) <= 64 && alltrue([for arn in var.ec2_runtime_role_arns : can(regex("^arn:[^:]+:iam::[0-9]{12}:role/.+$", arn))])
+    error_message = "ec2_runtime_role_arns must contain at most 64 IAM role ARNs."
   }
 }
 
-variable "instance_profile_arns" {
-  description = "Exact instance profiles used by EC2 canaries or EKS nodes."
+variable "ec2_instance_profile_arns" {
+  description = "Exact EC2 instance profiles allowed on canary RunInstances requests and IAM inspection."
   type        = set(string)
+  default     = []
 
   validation {
-    condition     = length(var.instance_profile_arns) > 0
-    error_message = "At least one qualified instance profile ARN is required."
+    condition     = length(var.ec2_instance_profile_arns) <= 64 && alltrue([for arn in var.ec2_instance_profile_arns : can(regex("^arn:[^:]+:iam::[0-9]{12}:instance-profile/.+$", arn))])
+    error_message = "ec2_instance_profile_arns must contain at most 64 IAM instance-profile ARNs."
+  }
+}
+
+variable "eks_node_instance_profile_arns" {
+  description = "Exact EKS node instance profiles that the canary authority may inspect but never pass."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = length(var.eks_node_instance_profile_arns) <= 64 && alltrue([for arn in var.eks_node_instance_profile_arns : can(regex("^arn:[^:]+:iam::[0-9]{12}:instance-profile/.+$", arn))])
+    error_message = "eks_node_instance_profile_arns must contain at most 64 IAM instance-profile ARNs."
   }
 }
 
