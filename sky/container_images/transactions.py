@@ -7,6 +7,7 @@ publication and operation; watermark and demand.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from typing import Any
 import uuid
@@ -923,10 +924,15 @@ def reconcile_canonical_publications(location_id: str,
             profile_key=profile_key)
 
 
-def reconcile_pending_canonical_publications(limit: int = 100) -> int:
+def reconcile_pending_canonical_publications(
+        limit: int = 100,
+        *,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Reconciles a bounded fanout batch from either operational worker."""
     if not 1 <= limit <= 1000:
         raise ValueError('Publication fanout reconciliation limit is invalid.')
+    if should_stop is not None and should_stop():
+        return 0
     locations = schema.locations
     publications = schema.publications
     with orm.Session(catalog_state.engine()) as session:
@@ -944,9 +950,14 @@ def reconcile_pending_canonical_publications(limit: int = 100) -> int:
                     ])).distinct().order_by(
                         publications.c.canonical_location_id).limit(
                             limit)).scalars().all()
-    return sum(
-        reconcile_canonical_publications(location_id)
-        for location_id in location_ids)
+    if should_stop is not None and should_stop():
+        return 0
+    reconciled = 0
+    for location_id in location_ids:
+        if should_stop is not None and should_stop():
+            break
+        reconciled += reconcile_canonical_publications(location_id)
+    return reconciled
 
 
 def retry_publication(

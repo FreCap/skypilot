@@ -56,8 +56,13 @@ def _qualification_database_epoch(*, now: int | None = None) -> int:
         return catalog_state.database_epoch(session, now=now)
 
 
-def _ingest_qualification_manifests(directory: str) -> int:
+def _ingest_qualification_manifests(
+        directory: str,
+        *,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Ingests a bounded ConfigMap projection without provider I/O."""
+    if should_stop is not None and should_stop():
+        return 0
     root = pathlib.Path(directory)
     if not root.is_dir():
         logger.warning('Image qualification manifest directory is unavailable.')
@@ -68,6 +73,8 @@ def _ingest_qualification_manifests(directory: str) -> int:
         paths = paths[:_QUALIFICATION_MANIFEST_LIMIT]
     ingested = 0
     for path in paths:
+        if should_stop is not None and should_stop():
+            break
         try:
             payload = path.read_bytes()
             if len(payload) > 4 * 1024 * 1024:
@@ -79,6 +86,8 @@ def _ingest_qualification_manifests(directory: str) -> int:
             if not isinstance(profile, str):
                 raise ValueError('Qualification manifest profile is missing.')
             digest = hashlib.sha256(payload).hexdigest()
+            if should_stop is not None and should_stop():
+                break
             qualification.ingest_manifest(
                 profile_name=profile,
                 manifest=manifest,
@@ -803,17 +812,28 @@ def reconcile_qualification_copy(revision: topology_state.ProfileRevisionRecord,
     return True
 
 
-def reconcile_qualification_profiles(limiter: budgets.ProviderBudgetLimiter,
-                                     *,
-                                     limit: int = 8,
-                                     now: int | None = None) -> int:
+def reconcile_qualification_profiles(
+        limiter: budgets.ProviderBudgetLimiter,
+        *,
+        limit: int = 8,
+        now: int | None = None,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Runs a bounded fair page of independent copy-role attestations."""
     completed = 0
-    for revision in topology_state.list_qualifying_profiles(include_active=True,
-                                                            limit=limit):
+    if should_stop is not None and should_stop():
+        return completed
+    revisions = topology_state.list_qualifying_profiles(include_active=True,
+                                                        limit=limit)
+    if should_stop is not None and should_stop():
+        return completed
+    for revision in revisions:
+        if should_stop is not None and should_stop():
+            break
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
         for target in (profile.canonical,) + profile.targets:
+            if should_stop is not None and should_stop():
+                return completed
             try:
                 if reconcile_qualification_copy(revision,
                                                 target,
@@ -825,10 +845,20 @@ def reconcile_qualification_profiles(limiter: budgets.ProviderBudgetLimiter,
     return completed
 
 
-def _qualification_maintenance(limiter: budgets.ProviderBudgetLimiter) -> bool:
-    transactions.reconcile_pending_canonical_publications()
-    reconcile_qualification_profiles(limiter)
-    qualification.schedule_automatic_canaries()
+def _qualification_maintenance(
+        limiter: budgets.ProviderBudgetLimiter,
+        *,
+        should_stop: Callable[[], bool] | None = None) -> bool:
+    if should_stop is not None and should_stop():
+        return False
+    transactions.reconcile_pending_canonical_publications(
+        should_stop=should_stop)
+    if should_stop is not None and should_stop():
+        return False
+    reconcile_qualification_profiles(limiter, should_stop=should_stop)
+    if should_stop is not None and should_stop():
+        return False
+    qualification.schedule_automatic_canaries(should_stop=should_stop)
     return True
 
 
@@ -1049,7 +1079,9 @@ class CopyWorkerService:
                         if self._stop.is_set():
                             break
                         if manifest_directory is not None:
-                            _ingest_qualification_manifests(manifest_directory)
+                            _ingest_qualification_manifests(
+                                manifest_directory,
+                                should_stop=self._stop.is_set)
                     except (OSError, TypeError, ValueError):
                         logger.warning(
                             'Image worker configuration refresh failed.')
@@ -1069,7 +1101,9 @@ class CopyWorkerService:
                     if self._stop.is_set():
                         break
                     qualification_future = executor.submit(
-                        _qualification_maintenance, self._budget_limiter)
+                        _qualification_maintenance,
+                        self._budget_limiter,
+                        should_stop=self._stop.is_set)
                     futures.add(qualification_future)
                     last_qualification_refresh = schedule_now
                 while len(futures

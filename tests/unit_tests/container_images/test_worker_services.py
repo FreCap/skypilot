@@ -7,6 +7,7 @@ import base64
 import contextlib
 import dataclasses
 import json
+import pathlib
 import socket
 import threading
 from types import SimpleNamespace
@@ -271,6 +272,60 @@ def test_cluster_terminal_confirmation_uses_locked_reconciliation(
     assert lifecycle_worker_service._reconcile_terminal_consumers(current) == 0
     clear.assert_not_called()
     reconcile.assert_called_once_with(demand, 'orphan-cluster', now=current)
+
+
+def test_terminal_reconciliation_stops_between_independent_demands(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = 200_000
+    first = dataclasses.replace(_cluster_demand(created_at=current - 100_000),
+                                id='demand-one',
+                                consumer_kind='unknown',
+                                placement={'consumer': {}})
+    second = dataclasses.replace(first, id='demand-two')
+    stop = threading.Event()
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'list_consumer_reconciliation_candidates',
+                        lambda **_: [first, second])
+    monkeypatch.setattr(lifecycle_worker_service.global_user_state,
+                        'get_cluster_image_consumers', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', lambda _: {})
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', lambda _: {})
+    defer = mock.Mock(side_effect=lambda *_args, **_kwargs: stop.set())
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'defer_consumer_reconciliation', defer)
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(
+        current, should_stop=stop.is_set) == 0
+
+    defer.assert_called_once_with(first.id, now=current)
+
+
+def test_terminal_reconciliation_stops_between_bulk_queries(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = 200_000
+    demand = _cluster_demand(created_at=current - 100_000)
+    stop = threading.Event()
+    monkeypatch.setattr(lifecycle_worker_service.demand_state,
+                        'list_consumer_reconciliation_candidates',
+                        lambda **_: [demand])
+    monkeypatch.setattr(
+        lifecycle_worker_service.global_user_state,
+        'get_cluster_image_consumers',
+        mock.Mock(side_effect=lambda _names: (stop.set() or {})))
+    service_states = mock.Mock()
+    job_states = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.serve_state,
+                        'get_service_version_terminal_states', service_states)
+    monkeypatch.setattr(lifecycle_worker_service.managed_job_state,
+                        'get_job_task_terminal_states', job_states)
+
+    assert lifecycle_worker_service._reconcile_terminal_consumers(
+        current, should_stop=stop.is_set) == 0
+
+    service_states.assert_not_called()
+    job_states.assert_not_called()
 
 
 def test_lifecycle_policy_refresh_keeps_last_valid_retentions(
@@ -687,7 +742,10 @@ def test_ec2_drain_of_persisted_child_runs_uncancelled_teardown(
             drain_event=drain_event)
 
     ec2.run_instances.assert_not_called()
-    tagged_instances.assert_called_once_with(ec2, operation.id)
+    tagged_instances.assert_called_once()
+    assert tagged_instances.call_args.args == (ec2, operation.id)
+    assert isinstance(tagged_instances.call_args.kwargs['cleanup_deadline'],
+                      float)
     terminate.assert_called_once()
 
 
@@ -788,7 +846,7 @@ def test_eks_qualification_proves_every_selected_node_role(
         lambda _role, service, _region, **_kwargs: ec2
         if service == 'ec2' else iam)
     monkeypatch.setattr(canary_worker_service, '_instance_profile_role',
-                        lambda _iam, _name: qualified.node_role)
+                        lambda _iam, _name, **_kwargs: qualified.node_role)
     heartbeat = _OwnedHeartbeat()
     fenced_core = canary_worker_service._FencedClient(core, heartbeat)
 
@@ -834,7 +892,7 @@ def test_eks_qualification_rejects_heterogeneous_selected_node_roles(
         if service == 'ec2' else mock.Mock())
     monkeypatch.setattr(
         canary_worker_service, '_instance_profile_role',
-        lambda _iam, name: qualified.node_role
+        lambda _iam, name, **_kwargs: qualified.node_role
         if name == 'qualified' else 'arn:aws:iam::123:role/OtherNodeRole')
 
     with pytest.raises(ValueError,
@@ -844,6 +902,41 @@ def test_eks_qualification_rejects_heterogeneous_selected_node_roles(
         canary_worker_service._qualified_eks_nodes(fenced_core,
                                                    mock.sentinel.role, target,
                                                    qualified, heartbeat)
+
+
+def test_eks_qualification_rechecks_drain_after_node_response_parsing(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding = profile.bindings['aws-eks-pullers']
+    qualified = binding.qualified_clusters[0]
+    drain_event = threading.Event()
+
+    class DrainOnMetadata:
+
+        def __init__(self) -> None:
+            self.items = [_eks_node('node-a', 'i-a')]
+
+        @property
+        def metadata(self) -> object:
+            drain_event.set()
+            return SimpleNamespace(_continue=None)
+
+    core = mock.Mock()
+    core.list_node.return_value = DrainOnMetadata()
+    assumed_client = mock.Mock()
+    monkeypatch.setattr(canary_worker_service, '_assumed_client',
+                        assumed_client)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._qualified_eks_nodes(core,
+                                                   mock.sentinel.role,
+                                                   target,
+                                                   qualified,
+                                                   _OwnedHeartbeat(),
+                                                   drain_event=drain_event)
+
+    assumed_client.assert_not_called()
 
 
 def _artifact() -> catalog_state.ArtifactRecord:
@@ -1055,6 +1148,45 @@ def test_canary_provider_call_rejects_stale_owner_before_request() -> None:
         client.describe_instances()
 
     provider.describe_instances.assert_not_called()
+
+
+def test_canary_provider_call_rechecks_drain_after_ownership_renewal() -> None:
+    drain_event = threading.Event()
+    provider = mock.Mock()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = drain_event.set
+    client = canary_worker_service._FencedClient(provider, heartbeat)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._ordinary_provider_call(client,
+                                                      'describe_instances',
+                                                      drain_event)
+
+    provider.describe_instances.assert_not_called()
+
+
+def test_canary_client_acquisition_rechecks_drain_inside_provider_fence(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    drain_event = threading.Event()
+    raw_started = mock.Mock()
+
+    def acquire(_role: object, _service: str, _region: str, *,
+                provider_fence) -> object:
+        drain_event.set()
+        provider_fence()
+        raw_started()
+        return mock.sentinel.client
+
+    monkeypatch.setattr(canary_worker_service.aws, 'assumed_client', acquire)
+
+    with pytest.raises(canary_worker_service._CanaryDrainRequested):
+        canary_worker_service._assumed_client(mock.sentinel.role,
+                                              'ec2',
+                                              'us-west-2',
+                                              _OwnedHeartbeat(),
+                                              drain_event=drain_event)
+
+    raw_started.assert_not_called()
 
 
 @pytest.mark.parametrize('method_name',
@@ -1381,7 +1513,8 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             'SkyPilotCatalog': 'catalog',
             'SkyPilotProfile': profile.name,
         }
-    assert provider_fences == [heartbeat.assert_owned, heartbeat.assert_owned]
+    assert len(provider_fences) == 2
+    assert all(callable(fence) for fence in provider_fences)
 
 
 @pytest.mark.parametrize('invalid_instance_id', [None, 7],
@@ -1728,6 +1861,27 @@ def test_ec2_teardown_stops_at_wall_clock_bound_after_slow_provider_call(
 
     ec2.describe_instances.assert_called_once()
     ec2.terminate_instances.assert_not_called()
+
+
+def test_ec2_cleanup_rechecks_deadline_after_lease_heartbeat(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    current = [299.0]
+    monkeypatch.setattr(canary_worker_service.time, 'monotonic',
+                        lambda: current[0])
+    provider = mock.Mock()
+    heartbeat = mock.Mock(spec=['assert_owned'])
+    heartbeat.assert_owned.side_effect = lambda: current.__setitem__(0, 301.0)
+    ec2 = canary_worker_service._FencedClient(provider, heartbeat)
+
+    assert not canary_worker_service._terminate_ec2_instances(
+        ec2,
+        'operation', [],
+        settle_absence=True,
+        initial_unidentified_child_observed=True,
+        cleanup_deadline=300.0)
+
+    provider.describe_instances.assert_not_called()
+    provider.terminate_instances.assert_not_called()
 
 
 def test_ec2_teardown_starts_no_state_read_after_slow_termination(
@@ -2132,9 +2286,8 @@ def test_eks_canary_fences_clients_and_verifies_teardown(
 
     assert evidence['node_uid'] == 'node-a'
     assert evidence['teardown_verified'] is True
-    assert provider_fences == [
-        heartbeat.assert_owned, heartbeat.assert_owned, heartbeat.assert_owned
-    ]
+    assert len(provider_fences) == 3
+    assert all(callable(fence) for fence in provider_fences)
     core.delete_namespaced_pod.assert_called_once()
 
 
@@ -2630,9 +2783,180 @@ def test_copy_maintenance_also_recovers_pending_publication_fanout(
 
     assert copy_worker_service._qualification_maintenance(limiter)
 
-    reconcile_fanout.assert_called_once_with()
-    reconcile_profiles.assert_called_once_with(limiter)
-    schedule_canaries.assert_called_once_with()
+    reconcile_fanout.assert_called_once_with(should_stop=None)
+    reconcile_profiles.assert_called_once_with(limiter, should_stop=None)
+    schedule_canaries.assert_called_once_with(should_stop=None)
+
+
+def test_copy_qualification_page_stops_between_targets(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    stop = threading.Event()
+    revision = _revision(profile)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    reconcile = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: (stop.set() or True))
+    monkeypatch.setattr(copy_worker_service, 'reconcile_qualification_copy',
+                        reconcile)
+
+    assert copy_worker_service.reconcile_qualification_profiles(
+        mock.sentinel.limiter, should_stop=stop.is_set) == 1
+
+    reconcile.assert_called_once()
+    assert reconcile.call_args.args == (revision, profile.canonical)
+
+
+def test_automatic_canary_scheduler_stops_between_runtime_transactions(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.canonical
+    copy_key = models.profile_attestation_key('copy', target.name)
+    revision = dataclasses.replace(
+        _revision(profile),
+        attestations={copy_key: {
+            'status': 'READY',
+            'observed_at': 100,
+        }})
+    stop = threading.Event()
+    monkeypatch.setattr(copy_worker_service.qualification, '_database_epoch',
+                        lambda **_kwargs: 100)
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    request = mock.Mock(
+        side_effect=lambda **_kwargs: (stop.set() or mock.sentinel.operation))
+    monkeypatch.setattr(copy_worker_service.qualification, 'request_canary',
+                        request)
+
+    assert copy_worker_service.qualification.schedule_automatic_canaries(
+        should_stop=stop.is_set) == 1
+
+    request.assert_called_once()
+    assert request.call_args.kwargs['target_id'] == target.name
+
+
+def test_qualification_lifecycle_stops_after_provider_acquisition(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.canonical
+    backend, binding_id = target.runtime_pull[0]
+    binding = profile.bindings[binding_id]
+    runtime_id = lifecycle_worker_service.qualification.runtime_ids(
+        target, backend, binding)[0]
+    copy_key = models.profile_attestation_key('copy', target.name)
+    runtime_key = models.profile_attestation_key('runtime', target.name,
+                                                 backend, binding.fingerprint,
+                                                 runtime_id)
+    revision = dataclasses.replace(_revision(profile),
+                                   attestations={
+                                       copy_key: {
+                                           'status': 'READY',
+                                           'observed_at': 100,
+                                           'runtime_digest': _DIGEST,
+                                       },
+                                       runtime_key: {
+                                           'status': 'READY',
+                                           'observed_at': 100,
+                                           'runtime_digest': _DIGEST,
+                                       },
+                                   })
+    stop = threading.Event()
+    repository = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'get_target_shard', lambda *_args: mock.sentinel.shard)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'qualification_repository', lambda *_args:
+                        ('qualification', 'repository-arn'))
+    monkeypatch.setattr(lifecycle_worker_service, '_lifecycle_role',
+                        lambda *_args: mock.sentinel.role)
+    monkeypatch.setattr(
+        lifecycle_worker_service.aws.EcrRepository, 'from_role',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (stop.set() or repository)))
+
+    assert not lifecycle_worker_service.reconcile_qualification_lifecycle(
+        mock.sentinel.limiter, should_stop=stop.is_set)
+
+    repository.exact_delete.assert_not_called()
+
+
+def test_failed_reservation_reaper_stops_after_provider_acquisition(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    stop = threading.Event()
+    location = SimpleNamespace(shard_id='shard-id',
+                               target_fingerprint='fingerprint',
+                               runtime_digest=_DIGEST,
+                               id='location-id',
+                               updated_at=100)
+    shard = SimpleNamespace(target_fingerprint='fingerprint',
+                            region=profile.canonical.region,
+                            repository_name='canonical')
+    repository = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_failed_canonical_reap_candidates',
+                        lambda **_kwargs: [location])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state, 'get_shard',
+                        lambda _shard_id: shard)
+    monkeypatch.setattr(lifecycle_worker_service,
+                        '_profile_target_for_location', lambda *_args:
+                        (profile, profile.canonical))
+    monkeypatch.setattr(lifecycle_worker_service, '_lifecycle_role',
+                        lambda *_args: mock.sentinel.role)
+    monkeypatch.setattr(
+        lifecycle_worker_service.aws.EcrRepository, 'from_role',
+        mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (stop.set() or repository)))
+
+    assert not lifecycle_worker_service.reconcile_failed_canonical_reservations(
+        mock.sentinel.limiter, should_stop=stop.is_set)
+
+    repository.exact_manifest_exists.assert_not_called()
+
+
+def test_manifest_ingestion_stops_between_independent_files(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    for name in ('a.json', 'b.json'):
+        (tmp_path / name).write_text(json.dumps({'profile': name}),
+                                     encoding='utf-8')
+    stop = threading.Event()
+    ingest = mock.Mock(side_effect=lambda **_kwargs: stop.set())
+    monkeypatch.setattr(copy_worker_service.qualification, 'ingest_manifest',
+                        ingest)
+
+    assert copy_worker_service._ingest_qualification_manifests(
+        str(tmp_path), should_stop=stop.is_set) == 1
+
+    ingest.assert_called_once()
+    assert ingest.call_args.kwargs['profile_name'] == 'a.json'
+
+
+def test_publication_fanout_stops_between_location_transactions(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    stop = threading.Event()
+    session = mock.MagicMock()
+    session.execute.return_value.scalars.return_value.all.return_value = [
+        'location-one', 'location-two'
+    ]
+    session_context = mock.MagicMock()
+    session_context.__enter__.return_value = session
+    monkeypatch.setattr(transactions.catalog_state, 'engine',
+                        lambda: mock.sentinel.engine)
+    monkeypatch.setattr(transactions.orm, 'Session',
+                        mock.Mock(return_value=session_context))
+    reconcile = mock.Mock(side_effect=lambda _location_id: (stop.set() or 1))
+    monkeypatch.setattr(transactions, 'reconcile_canonical_publications',
+                        reconcile)
+
+    assert transactions.reconcile_pending_canonical_publications(
+        should_stop=stop.is_set) == 1
+
+    reconcile.assert_called_once_with('location-one')
 
 
 def test_publication_release_limit_keeps_typed_error(
@@ -3430,7 +3754,7 @@ def test_lifecycle_maintenance_starts_no_later_substep_after_stop(
         max_in_flight=1,
         retention_seconds=60)
     steps = [mock.Mock() for _ in range(4)]
-    steps[stop_after].side_effect = service.stop
+    steps[stop_after].side_effect = lambda *_args, **_kwargs: service.stop()
     monkeypatch.setattr(lifecycle_worker_service,
                         '_reconcile_publication_fanout', steps[0])
     monkeypatch.setattr(lifecycle_worker_service.catalog_state,

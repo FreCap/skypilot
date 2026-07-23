@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import json
 import secrets
@@ -631,27 +632,44 @@ def fail_owned_canary(operation: catalog_state.OperationRecord,
             now=now)
 
 
-def schedule_automatic_canaries(*,
-                                limit: int = 100,
-                                now: int | None = None) -> int:
+def schedule_automatic_canaries(
+        *,
+        limit: int = 100,
+        now: int | None = None,
+        should_stop: Callable[[], bool] | None = None) -> int:
     """Creates bounded idempotent runtime canaries only after copy readiness."""
+    if should_stop is not None and should_stop():
+        return 0
     current = _database_epoch(now=now)
     scheduled = 0
-    for revision in topology_state.list_qualifying_profiles(include_active=True,
-                                                            limit=limit):
+    if should_stop is not None and should_stop():
+        return scheduled
+    revisions = topology_state.list_qualifying_profiles(include_active=True,
+                                                        limit=limit)
+    if should_stop is not None and should_stop():
+        return scheduled
+    for revision in revisions:
+        if should_stop is not None and should_stop():
+            break
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
         if not profile.qualification.automatic_canaries:
             continue
         for target in (profile.canonical,) + profile.targets:
+            if should_stop is not None and should_stop():
+                return scheduled
             copy_key = models.profile_attestation_key('copy', target.name)
             if not _fresh(revision.attestations.get(copy_key),
                           now=current,
                           max_age_seconds=_AUTOMATIC_WINDOW_SECONDS):
                 continue
             for backend, binding_id in target.runtime_pull:
+                if should_stop is not None and should_stop():
+                    return scheduled
                 binding = profile.bindings[binding_id]
                 for runtime_id in runtime_ids(target, backend, binding):
+                    if should_stop is not None and should_stop():
+                        return scheduled
                     runtime_key = _runtime_attestation_key(
                         target, backend, binding, runtime_id)
                     if _fresh(revision.attestations.get(runtime_key),
@@ -668,6 +686,8 @@ def schedule_automatic_canaries(*,
                         'runtime_id': runtime_id,
                         'window': current // _AUTOMATIC_WINDOW_SECONDS,
                     })
+                    if should_stop is not None and should_stop():
+                        return scheduled
                     try:
                         request_canary(
                             workspace=revision.workspace,

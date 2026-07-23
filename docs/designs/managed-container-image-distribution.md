@@ -2209,42 +2209,60 @@ after heartbeat or configuration work and immediately before each maintenance
 call, queue claim, and executor submission. Copy checks before and after every
 independently blocking inventory, publication, and location claim; it cannot
 begin a later claim after an earlier claim observes shutdown. It also checks
-between configuration reload and qualification-manifest ingestion. Lifecycle
-checks between each independent maintenance substep. A stop observed at any
-boundary exits the claim loop without beginning more database or provider work.
-Work already submitted drains through the executor; lease fencing and durable
+between configuration reload and qualification-manifest ingestion, and the
+ingestor checks again before every independently persisted file. Lifecycle
+checks between each independent maintenance substep. Synchronously invoked
+bounded helpers receive the same stop predicate and check it before their first
+bulk state query and before every per-location or per-demand transaction. A stop
+observed at any boundary finishes only an already-open atomic transaction and
+exits without beginning more database or provider work. Submitted individual
+lease-owned operations drain through the executor; bounded qualification pages
+also stop between independent profile, target, reservation, and automatic
+runtime-canary scheduling items, and recheck stop between provider acquisition,
+provider proof, and the next database transaction. Lease fencing and durable
 state still own any ambiguous provider result.
 
 The canary worker additionally passes the same stop event into every submitted
 canary. A task that has not created a provider child exits without launching
 one. A task that may own a child observes the event between bounded provider
 calls and on every runtime poll, then enters its existing `finally` teardown.
-Cancellation never interrupts teardown itself. A persisted child claimed before
-shutdown therefore runs in cleanup-only mode and cannot be recreated. This
-reduces shutdown observation from the 3,600-second runtime maximum to one
-bounded provider call or the 10-second poll interval, followed by custody
-cleanup. Verified cleanup rechecks the process stop event before any success or
-failure terminalization. If shutdown arrived during teardown, that exact owner
-releases the still-RUNNING token instead, so successful cleanup cannot race into
-terminal qualification. Once an unstarted task or verified teardown has no live
-provider child, the exact owner advances its lease expiry to PostgreSQL's current
-time under the same token. The replacement worker can reclaim it immediately
-without waiting for the normal 15-minute lease. A failed release remains safe
-and falls back to ordinary lease-expiry recovery.
+Every ordinary provider client acquisition and SDK call uses a drain-aware lease
+fence: it proves the lease, then rechecks drain immediately before the raw call.
+Compound EC2 and EKS helpers repeat that fence before every page, authority
+acquisition, log read, node read, and role lookup. Cancellation never interrupts
+teardown itself. Teardown uses separate explicit cleanup calls that deliberately
+ignore drain while retaining lease and deadline fencing. A persisted child
+claimed before shutdown therefore runs in cleanup-only mode and cannot be
+recreated or continue ordinary qualification reads. This reduces shutdown
+observation from the 3,600-second runtime maximum to one bounded provider call
+or the 10-second poll interval, followed by custody cleanup. Verified cleanup
+rechecks the process stop event before any success or failure terminalization.
+If shutdown arrived during teardown, that exact owner releases the still-RUNNING
+token instead, so successful cleanup cannot race into terminal qualification.
+Once an unstarted task or verified teardown has no live provider child, the
+exact owner advances its lease expiry to PostgreSQL's current time under the same
+token. The replacement worker can reclaim it immediately without waiting for the
+normal 15-minute lease. A failed release remains safe and falls back to ordinary
+lease-expiry recovery.
 
 EC2 teardown uses one absolute 300-second deadline. It checks that deadline
-immediately before and after every tag discovery, termination, and exact-state
-provider call. A call that crosses the deadline makes cleanup unverified and no
-later provider call starts. The canary Deployment enforces a termination grace
-of at least 600 seconds. The grace covers cancellation observation, that
-300-second EC2 settling budget, bounded provider-call overhead, and margin. The
-process exits immediately when cleanup completes, so the configured ceiling does
-not add a fixed rollout delay. The same drain applies to disable and scale-down.
-For `helm upgrade --reuse-values`, legacy value maps that omit the three worker
-grace keys render copy/lifecycle/canary defaults of 30/30/600 seconds; an
-explicit canary value below 600 remains invalid. If the grace expires or bounded
-provider cleanup itself fails, the operation and concrete child identity remain
-RUNNING for lease-expiry recovery rather than being falsely terminalized.
+immediately before and after every preliminary discovery, tag discovery,
+termination, and exact-state provider call. The shared deadline is passed into
+the provider wrapper. That wrapper proves the lease first, rechecks the deadline
+after any blocking heartbeat database round trip, and only then invokes the raw
+SDK call. A call that crosses the deadline makes cleanup unverified and no later
+provider call starts. EKS cleanup applies the same call-start ordering to its own
+bounded delete/read settling deadline. The canary Deployment enforces a
+termination grace of at least 600 seconds. The grace covers cancellation
+observation, that 300-second EC2 settling budget, bounded provider-call overhead,
+and margin. The process exits immediately when cleanup completes, so the
+configured ceiling does not add a fixed rollout delay. The same drain applies to
+disable and scale-down. For `helm upgrade --reuse-values`, legacy value maps that
+omit the three worker grace keys render copy/lifecycle/canary defaults of
+30/30/600 seconds; an explicit canary value below 600 remains invalid. If the
+grace expires or bounded provider cleanup itself fails, the operation and
+concrete child identity remain RUNNING for lease-expiry recovery rather than
+being falsely terminalized.
 
 Restart recovery verifies actual registry state for immutable copy work and
 pre-delete claims. An expired
@@ -2666,13 +2684,17 @@ drained and every image table is empty; it is never part of Helm rollback.
   completion, publication fan-out, eviction, and attestation activation;
 - deterministic stop-during-heartbeat tests for copy, lifecycle, and canary
   workers proving that shutdown begins no later maintenance, internal copy
-  claim, manifest-ingestion, lifecycle-maintenance, or executor submission;
-  provider-level canary drain tests proving cancellation cannot create a new
-  child, always enters uncancelled teardown for an owned child, and cannot
-  terminalize success or failure when shutdown arrives during verified cleanup;
-  slow-provider tests proving EC2 settling checks its absolute deadline around
-  every provider call, treats an over-budget result as unverified, and cannot
-  start another call after its 300-second wall-clock budget;
+  claim, manifest-ingestion item, lifecycle-maintenance item, publication fanout
+  transaction, terminal-consumer query or transaction, qualification item, or
+  executor submission; provider-level canary drain tests proving cancellation
+  cannot create a new child, cannot begin an ordinary authority acquisition or
+  provider read after a lease heartbeat observes drain, always enters
+  uncancelled teardown for an owned child, and cannot terminalize success or
+  failure when shutdown arrives during verified cleanup; slow-provider tests
+  proving EC2 settling passes one absolute deadline through the real fenced
+  client, rechecks it after a heartbeat that crosses the deadline, treats an
+  over-budget result as unverified, and cannot start that or any later provider
+  call after its 300-second wall-clock budget;
   PostgreSQL tests proving a verified drain is immediately reclaimable while a
   stale token cannot release its successor; plus Helm rendering and schema tests
   enforcing the canary's 600-second minimum custody-cleanup grace and legacy
@@ -3610,3 +3632,18 @@ exceptions did not round-trip their canonical state. The adjacent audit also
 made STS retry and timeout bounds, configuration-to-ingestion shutdown, and
 lifecycle maintenance substep shutdown explicit. This revision closes those
 boundaries as one batch. The acceptance streak remains zero.
+
+Codex final-acceptance round 1 at
+`b1ebe1a9594cc7a696afcfaf5675ec1de2e43092` returned `RESHAPE`; the exact
+`claude-fable-5` max-effort plan-mode request reached its weekly limit before
+using any token, so no paired acceptance was recorded. Codex independently
+re-ran the 352-test feature matrix, 108 worker tests, real PostgreSQL drain proof,
+all 191 Helm tests, and the complete 26-check GitHub rollup, then reproduced
+three compound boundary defects. An EC2 cleanup heartbeat could cross the shared
+deadline before an unfenced raw AWS call, ordinary EKS and EC2 qualification
+could acquire a later authority or begin a later provider read after drain, and
+synchronous manifest, publication-fanout, and terminal-consumer loops could
+start later independent transactions after stop. This revision moves deadline
+and drain checks inside the provider fence and threads the stop predicate through
+every independently startable synchronous item. The acceptance streak remains
+zero.
