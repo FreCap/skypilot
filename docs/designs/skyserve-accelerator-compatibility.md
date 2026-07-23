@@ -78,7 +78,8 @@ not evidence that the behavior is active in production.
 | `1.1.702` | PR #862, separate demand from actuation | Attributed flexible unmet demand to the cheapest compatible cold card, then independently adopted ready, provisioning, and free reserved compatible supply for actuation. | Included in deployed `1.1.704`; this remains the active allocation contract. |
 | `1.1.703` | PR #863, response-time history | Added full HTTP completion history without changing placement. | Included in deployed `1.1.704`; later superseded by prediction-time history. |
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
-| Unreleased | Reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Required after production evidence showed an exact-card rolling replacement retrying a failed research-pool A100 launch on paid GCP A100 capacity. |
+| `1.1.721` | PR #877, reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Included in deployed `1.1.726`. Production then exposed a separate catalog-ordering edge case when a zero-cost-only A100 preceded paid L4. |
+| Unreleased | Reserved-only card paid fallback | Excludes cards whose every successfully priced location is zero-cost from flexible cold-paid ordering. Paid-capable and unpriced cards keep the all-or-nothing service-order fallback, while exact demand can still target a reserved-only card. | Required before the next `opendde-10c200s-v4` rollout so default-all demand selects paid L4 instead of waiting on the reserved-only A100 location. |
 
 The dashboard's provisioning count is not itself a paid-capacity signal. For a
 launch audit, combine `cold_launch_authority_by_accelerator` with the durable
@@ -321,11 +322,16 @@ advertising compatibility. An unordered `resources.any_of` service keeps
 legacy aggregate behavior rather than turning transient availability or hash
 iteration into a cold-card policy.
 
-Nominal cost ordering is all-or-nothing for a configured catalog. If any
-configured card lacks a finite positive paid price, because catalog lookup
-failed or only zero-cost locations are known, the controller and autoscaler
-preserve the explicit service order for the whole catalog. A partial price map
-must never promote a larger priced card ahead of an unpriced cheaper card.
+Nominal cost ordering is all-or-nothing across cards that may have paid
+capacity. If any such card lacks a finite positive paid price because catalog
+lookup failed or no location was enumerated, the controller and autoscaler
+preserve the explicit service order among those cards. A partial price map must
+never promote a larger priced card ahead of an unpriced cheaper card. A card
+whose every matched, successfully priced location is zero-cost is not a
+cold-paid candidate, so it is ordered after all paid-capable and unpriced
+cards. This does not remove the reserved-only card from compatibility or from
+reserved fill: exact demand may still target it, and free broker capacity may
+still materialize it through the independent zero-cost-only fill path.
 
 The controller recomputes after each supply transition. It may launch reserved and paid capacity in the same control cycle when demand exceeds already-ready, provisioning, and reserved capacity; the list above is allocation accounting, not a requirement to wait serially for one tier to finish.
 
@@ -1106,6 +1112,10 @@ resources, one with distinct per-card QPS targets and one with
 `target_concurrency_per_replica` in logical GPU-slot mode.
 
 1. Start with zero serving replicas and no free reserved capacity. Submit a default/missing-field request and confirm the cheapest compatible paid card is targeted.
+   Repeat with the first configured card available only at a zero-cost
+   reserved location and the second card available at a positive paid price.
+   Confirm default-all demand targets the paid card, while exact demand for the
+   reserved-only card keeps that exact target and waits for reserved fill.
 2. Expose a free reserved A100 slot (and no ready replica), submit the same request, and confirm the exact A100 resource override is selected before paid L4.
 3. Keep a reserved A100 replica and a paid L4 replica ready with spare concurrency. Submit only a flexible L4/A100 request and confirm reserved A100 dispatch. Then add an equal-priority A100-only request and confirm the matcher assigns A100-only to reserved A100 and flexible to paid L4.
 4. Fill all A100 slots with flexible requests, queue an older same-priority flexible request and then an A100-only request, release one A100 slot, and confirm A100-only runs next. Confirm existing work was not interrupted.
