@@ -69,9 +69,11 @@ if typing.TYPE_CHECKING:
     import sky
     from sky.serve import replica_managers
     from sky.serve import service_spec as service_spec_lib
+    WorkerHandle = backends.CloudVmRayResourceHandle | None
 else:
     psutil = adaptors_common.LazyImport('psutil')
     requests = adaptors_common.LazyImport('requests')
+    WorkerHandle = Any
 
 logger = sky_logging.init_logger(__name__)
 
@@ -2473,8 +2475,7 @@ def get_free_worker_resources(
     pool: str,
     replicas: list['replica_managers.ReplicaInfo'] | None = None,
     cluster_records: dict[str, dict[str, Any] | None] | None = None,
-    resolved_handles: dict[str, backends.CloudVmRayResourceHandle | None] |
-    None = None,
+    resolved_handles: dict[str, WorkerHandle] | None = None,
 ) -> dict[str, resources_lib.Resources | None] | None:
     """Get free resources for each worker in a pool.
 
@@ -2612,8 +2613,7 @@ def get_next_cluster_name(
 
         free_resources = None
         cluster_records = None
-        resolved_handles: dict[str, backends.CloudVmRayResourceHandle |
-                               None] | None = None
+        resolved_handles: dict[str, WorkerHandle] | None = None
         if resource_aware:
             cluster_records = _get_pool_cluster_records(replicas)
             resolved_handles = {}
