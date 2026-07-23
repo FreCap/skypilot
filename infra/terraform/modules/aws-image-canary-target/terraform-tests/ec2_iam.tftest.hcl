@@ -75,6 +75,14 @@ run "ec2_launch_authority_matches_each_resource_context" {
   }
 
   assert {
+    condition = length(one([
+      for statement in data.aws_iam_policy_document.permissions.statement : statement
+      if statement.sid == "LaunchOnlyThroughQualifiedNetworkAndImage"
+    ]).condition) == 0
+    error_message = "Exact existing resources must not require instance-only context keys."
+  }
+
+  assert {
     condition = toset(one([
       for statement in data.aws_iam_policy_document.permissions.statement : statement
       if statement.sid == "CreateOnlyCatalogTaggedCanaryInstances"

@@ -72,12 +72,6 @@ data "aws_iam_policy_document" "permissions" {
         tolist(var.subnet_arns),
         tolist(var.security_group_arns),
       ))
-
-      condition {
-        test     = "StringEquals"
-        variable = "ec2:InstanceType"
-        values   = sort(tolist(var.canary_instance_types))
-      }
     }
   }
 
