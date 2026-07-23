@@ -80,6 +80,14 @@ queue_from_kubernetes_pod = (
 cancel = managed_job_cancellation.cancel
 # Preserve module and pickle identity for the historical facade import.
 cancel.__module__ = __name__
+# usage_lib.entrypoint attributes each event from the *undecorated* function's
+# __module__ (see common_utils.make_decorator), which reads the wrapped
+# function at call time rather than the alias above. Update it too so cancel
+# usage events keep their historical 'sky.jobs.server.core.cancel' attribution
+# instead of silently becoming 'sky.jobs.server.cancellation.cancel'.
+_cancel_wrapped = getattr(cancel, '__wrapped__', None)
+if _cancel_wrapped is not None:
+    _cancel_wrapped.__module__ = __name__
 
 
 def _warn_file_mounts_rolling_update(dag: 'sky.Dag') -> None:

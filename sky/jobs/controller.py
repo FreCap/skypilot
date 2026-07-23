@@ -75,15 +75,15 @@ _background_tasks: set[asyncio.Task] = set()
 # must appear in `ray status`), so at large node counts a single transiently
 # lagging raylet or a probe-timing hiccup flags the whole cluster while the
 # job is in fact still running — and recovery tears down and relaunches the
-# entire cluster. Requiring consecutive confirmations (~30s at the 15s tick)
-# eliminates single-tick false positives; genuine failures where the head is
-# unreachable fetch no job status at all and still recover immediately.
+# entire cluster. Requiring consecutive INIT confirmations (~30s at the 15s
+# tick) protects running status and transient status-fetch gaps; confirmed
+# STOPPED/missing clusters and unrecoverable fetch failures recover immediately.
 _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
 _FILE_MOUNTS_BLOB_ID_UNSET = object()
 
 
 class _ClusterNotUpDebouncer:
-    """Debounce non-UP cluster observations for a still-running job.
+    """Debounce ambiguous INIT observations for a possibly running job.
 
     Only multi-node jobs debounce: single-node jobs skip the cluster status
     check entirely while their job is running, and when the job is dead
@@ -96,7 +96,7 @@ class _ClusterNotUpDebouncer:
         self._consecutive_not_up = 0
 
     def should_recover_now(self) -> bool:
-        """Record a not-UP observation with the job still alive.
+        """Record an ambiguous INIT observation.
 
         Returns True once enough consecutive observations accumulated for
         recovery to proceed.
@@ -114,6 +114,27 @@ class _ClusterNotUpDebouncer:
 
     def reset(self) -> None:
         self._consecutive_not_up = 0
+
+
+def _should_wait_for_cluster_not_up_confirmation(
+        cluster_status: status_lib.ClusterStatus | None,
+        job_status: job_lib.JobStatus | None,
+        transient_job_check_error_reason: str | None,
+        debouncer: _ClusterNotUpDebouncer) -> bool:
+    """Return whether a not-UP cluster verdict needs more confirmation.
+
+    ``INIT`` can be a transient health-probe false positive. That same
+    control-plane flap can also make the job-status fetch temporarily
+    unavailable, so both cases share the same confirmation gate.
+    """
+    if cluster_status != status_lib.ClusterStatus.INIT:
+        return False
+    if job_status is not None:
+        if job_status.is_terminal():
+            return False
+    elif transient_job_check_error_reason is None:
+        return False
+    return not debouncer.should_recover_now()
 
 
 def create_background_task(coro: typing.Coroutine) -> None:
@@ -879,13 +900,6 @@ class JobController:
                     f'status. Reason: {transient_job_check_error_reason}.\n'
                     'Check cluster status to determine if the job is '
                     'preempted or failed.')
-                if transient_job_check_retry is None:
-                    transient_job_check_retry = (
-                        time.monotonic() + managed_job_utils.
-                        JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS,
-                        common_utils.Backoff(initial_backoff=1,
-                                             max_backoff_factor=5),
-                    )
             else:
                 transient_job_check_retry = None
 
@@ -973,24 +987,30 @@ class JobController:
             external_failures: list[ExternalClusterFailure] | None = None
             cluster_event_reason = None
             if cluster_status != status_lib.ClusterStatus.UP:
+                # The status-fetch retry window only applies when the cluster
+                # itself is confirmed UP. A not-UP verdict switches to the
+                # cluster confirmation/recovery path and starts a fresh retry
+                # budget once the cluster reports UP again.
+                transient_job_check_retry = None
                 # The cluster is (partially) preempted or failed. It can be
                 # down, INIT or STOPPED, based on the interruption behavior of
                 # the cloud. Spot recovery is needed (will be done later in the
                 # code).
                 cluster_status_str = ('' if cluster_status is None else
                                       f' (status: {cluster_status.value})')
-                if (job_status is not None and not job_status.is_terminal() and
-                        not not_up_debouncer.should_recover_now()):
-                    # The job itself still reports running: the non-UP verdict
-                    # may be a transient probe false positive (the health
-                    # probe requires EVERY node in `ray status`). Confirm over
-                    # consecutive ticks before tearing the cluster down. A
-                    # genuinely dead head never reaches here (the job status
-                    # fetch fails and job_status is None).
+                if _should_wait_for_cluster_not_up_confirmation(
+                        cluster_status, job_status,
+                        transient_job_check_error_reason, not_up_debouncer):
+                    # INIT may be a transient probe false positive. Confirm
+                    # over consecutive ticks before tearing the cluster down,
+                    # even if the same control-plane flap temporarily hid the
+                    # job status as well.
+                    job_status_str = (job_status.value if job_status is not None
+                                      else 'job status temporarily unavailable')
                     logger.info(
-                        f'Cluster is not UP{cluster_status_str} but the job '
-                        f'still reports {job_status.value}; waiting for '
-                        'confirmation before recovery '
+                        f'Cluster is not UP{cluster_status_str} and '
+                        f'{job_status_str}; waiting for confirmation before '
+                        'recovery '
                         f'({not_up_debouncer.observations}/'
                         f'{not_up_debouncer.threshold} consecutive '
                         'observations).')
@@ -1144,6 +1164,13 @@ class JobController:
                     # job status. Try to recover the job (will not restart the
                     # cluster, if the cluster is healthy).
                     if transient_job_check_error_reason is not None:
+                        if transient_job_check_retry is None:
+                            transient_job_check_retry = (
+                                time.monotonic() + managed_job_utils.
+                                JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS,
+                                common_utils.Backoff(initial_backoff=1,
+                                                     max_backoff_factor=5),
+                            )
                         assert transient_job_check_retry is not None, (
                             transient_job_check_error_reason)
                         (transient_job_check_deadline,
