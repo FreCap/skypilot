@@ -1688,8 +1688,11 @@ lifecycle state from that one response. The observed AMI must equal the qualifie
 regional AMI. The console marker is read from that same child.
 An absent instance-profile ARN while that exact child is still pending or
 running is retried within the same bounded deadline because EC2 may expose the
-instance before its profile attachment. A conflicting nonempty ARN, or an
-absent ARN once the child is stopped or terminated, fails qualification.
+instance before its profile attachment. Once the exact expected ARN is
+observed, it is latched for that same child because EC2 may omit the attachment
+from a later stopped or terminated response. A conflicting nonempty ARN at any
+point, or terminal absence before an exact match was observed, fails
+qualification.
 Before the pull, EC2 canary user data configures the same exact value-free
 `credHelpers[registry] = ecr-login` route used by normal managed workload
 initialization. Merely finding the helper binary in the AMI is not runtime-pull
@@ -2653,7 +2656,8 @@ drained and every image table is empty; it is never part of Helm rollback.
   automatic refresh, concurrent daily-cost reservation, stale-binding tests,
   exact shared EC2 helper-route configuration, plaintext and strict-base64
   console marker responses, malformed console rejection, guest failure
-  self-termination, delayed EC2 instance-profile visibility,
+  self-termination, delayed EC2 instance-profile visibility, terminal EC2
+  profile omission after an exact match,
   expired-owner/successor interleavings at attach/fail/provider boundaries,
   pre-create client failure, stable EC2 `ClientToken` replay, provider-call
   pre/post lease fences, database authorization immediately before both EC2 and

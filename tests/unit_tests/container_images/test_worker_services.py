@@ -994,6 +994,7 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
     ('architecture', 'image_id_case', 'profile_case', 'expected_error'),
     (('x86_64', 'expected', 'expected', None),
      ('x86_64', 'expected', 'delayed', None),
+     ('x86_64', 'expected', 'terminal_missing_after_match', None),
      ('x86_64', 'expected', 'missing', 'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
      ('x86_64', 'expected', 'conflicting',
       'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
@@ -1066,6 +1067,21 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         }
         delayed_instance.pop('IamInstanceProfile')
         poll_observations.insert(0, delayed_instance)
+    elif profile_case == 'terminal_missing_after_match':
+        running_instance = {
+            **instance,
+            'State': {
+                'Name': 'running'
+            },
+        }
+        final_instance = {
+            **instance,
+            'State': {
+                'Name': 'terminated'
+            },
+        }
+        final_instance.pop('IamInstanceProfile')
+        poll_observations = [running_instance, final_instance]
 
     def response(*instances: dict[str, object]) -> dict[str, object]:
         if not instances:

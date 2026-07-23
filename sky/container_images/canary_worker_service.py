@@ -565,12 +565,17 @@ def _run_ec2_canary(operation: catalog_state.OperationRecord,
             if instance_architecture != 'x86_64':
                 raise ValueError('QUALIFICATION_FAILED')
             state = (instance.get('State') or {}).get('Name')
-            actual_profile_arn = (instance.get('IamInstanceProfile') or
-                                  {}).get('Arn')
-            if (actual_profile_arn is None and state in ('pending', 'running')):
-                time.sleep(_POLL_SECONDS)
-                continue
-            if actual_profile_arn != expected_profile_arn:
+            observed_profile_arn = (instance.get('IamInstanceProfile') or
+                                    {}).get('Arn')
+            if (observed_profile_arn is not None and
+                    observed_profile_arn != expected_profile_arn):
+                raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
+            if observed_profile_arn == expected_profile_arn:
+                actual_profile_arn = observed_profile_arn
+            elif actual_profile_arn is None:
+                if state in ('pending', 'running'):
+                    time.sleep(_POLL_SECONDS)
+                    continue
                 raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             if state in ('stopped', 'terminated'):
                 output = ec2.get_console_output(InstanceId=instance_id,
