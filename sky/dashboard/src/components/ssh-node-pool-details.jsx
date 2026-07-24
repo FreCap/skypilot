@@ -238,7 +238,10 @@ export function SSHNodePoolDetails({
 
         try {
           const response = await handleDeploySSHPool(poolName);
-          const requestId = response.request_id;
+          const requestId = response?.request_id;
+          if (!requestId) {
+            throw new Error('Missing request_id for SSH Node Pool deployment');
+          }
 
           setStreamingDialog((prev) => ({ ...prev, requestId }));
 

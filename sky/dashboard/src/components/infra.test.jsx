@@ -481,6 +481,29 @@ describe('SSHNodePoolDetails', () => {
     expect(screen.queryByText(/hidden debug line/)).not.toBeInTheDocument();
   });
 
+  it('fails cleanly when deployment does not return a request id', async () => {
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    const handleDeploySSHPool = jest.fn().mockResolvedValue({});
+
+    render(sshNodePoolDetails({ handleDeploySSHPool }));
+
+    await screen.findByText('Not Ready');
+    fireEvent.click(screen.getByRole('button', { name: 'Deploy' }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', {
+        name: 'Deploy',
+      })
+    );
+
+    expect(
+      await screen.findByText(/Deployment failed: Missing request_id/)
+    ).toBeVisible();
+    expect(streamSSHDeploymentLogs).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
   it('refreshes status once after a completed deployment', async () => {
     jest.useFakeTimers();
     const handleDeploySSHPool = jest
