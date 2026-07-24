@@ -2390,6 +2390,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'Service {self._service_name!r} incarnation changed while '
                 f'removing replica {replica_id}.')
 
+    def _remove_replicas(self, replica_ids: list[int]) -> None:
+        """Remove one replica wave under a single durable owner fence."""
+        if not replica_ids:
+            return
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            # Legacy/direct managers do not have the durable incarnation
+            # identity required by the batch-delete API.
+            for replica_id in replica_ids:
+                self._remove_replica(replica_id)
+            return
+        removed = serve_state.remove_replicas(self._service_name,
+                                              replica_ids,
+                                              service_hash,
+                                              expected_controller_owner=getattr(
+                                                  self, '_controller_owner',
+                                                  None))
+        if removed is False:
+            raise RuntimeError(
+                f'Service {self._service_name!r} incarnation changed while '
+                f'removing {len(replica_ids)} replicas.')
+
     def _failed_cleanup_retry_state(
             self) -> tuple[dict[int, int], dict[int, float]]:
         """Return retry maps, tolerating managers built before these fields.
@@ -3453,6 +3475,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     f'{location}: {claim_result.value}.')
                         return False
                     if (claim_result ==
+                            paid_capacity.ClaimResult.SERVICE_SATURATED):
+                        paid_capacity.exhaust_service(
+                            paid_location_launch_budget)
+                        logger.info('Deferring paid demand launch because the '
+                                    'service paid-capacity envelope is full.')
+                        return False
+                    if (claim_result ==
                             paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING):
                         paid_capacity.defer_for_priority(
                             paid_location_launch_budget, location)
@@ -3955,6 +3984,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{batch_version} scale-up batch because version '
                             f'{pending_version} is waiting to be applied.')
                 break
+            if paid_capacity.service_exhausted(paid_location_launch_budget):
+                logger.info('Stopping physical scale-up wave at the service '
+                            'paid-capacity envelope.')
+                break
             scale_up_kwargs: dict[str, Any] = {}
             if paid_location_launch_budget is not None:
                 scale_up_kwargs['paid_location_launch_budget'] = (
@@ -4224,6 +4257,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         deferred_cards: set[str] = set()
         launched_capacity = 0
         while True:
+            if paid_capacity.service_exhausted(paid_location_launch_budget):
+                logger.info('Stopping logical scale-up wave at the service '
+                            'paid-capacity envelope.')
+                break
             if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,
@@ -5908,6 +5945,42 @@ class SkyPilotReplicaManager(ReplicaManager):
             # concurrent row transition cannot mix two proofs.
             replica_infos = serve_state.get_replica_infos(self._service_name)
             infos_by_id = {info.replica_id: info for info in replica_infos}
+            # Failed logical launches commonly leave a large wave of durable
+            # replica rows whose clusters were never created. The old
+            # per-victim teardown path re-read both databases and deleted one
+            # row per transaction while holding the manager lock. Snapshot
+            # cluster existence once so eligible finished/never-started
+            # victims can use one fenced delete below. A live launch or any
+            # down worker retains the existing cancellation/cleanup path.
+            bulk_absent_replica_ids: set[int] = set()
+            if getattr(self, '_service_hash', None) is not None:
+                launch_pool = getattr(self, '_launch_thread_pool', {})
+                down_pool = getattr(self, '_down_thread_pool', {})
+                absence_candidates: list[ReplicaInfo] = []
+                seen_candidate_ids: set[int] = set()
+                for replica_id in replica_ids:
+                    if replica_id in seen_candidate_ids:
+                        continue
+                    seen_candidate_ids.add(replica_id)
+                    candidate = infos_by_id.get(replica_id)
+                    if (candidate is None or candidate.is_terminal or
+                            getattr(candidate.status_property, 'is_scale_down',
+                                    False) is True or
+                            candidate.status_property.first_ready_time
+                            is not None or replica_id in down_pool):
+                        continue
+                    launch_thread = launch_pool.get(replica_id)
+                    if (launch_thread is not None and launch_thread.is_alive()):
+                        continue
+                    absence_candidates.append(candidate)
+                existing_cluster_names = (
+                    serve_utils.get_existing_replica_cluster_names(
+                        absence_candidates))
+                bulk_absent_replica_ids = {
+                    info.replica_id
+                    for info in absence_candidates
+                    if info.cluster_name not in existing_cluster_names
+                }
             ready_capacity = 0
             committed_capacity = 0
             ready_by_accelerator = {card: 0 for card, _ in accelerator_shapes}
@@ -5955,6 +6028,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                         ready_width, card)
 
             accepted = 0
+            absent_finished_launch_ids: list[int] = []
             seen_ids: set[int] = set()
             for replica_id in replica_ids:
                 if replica_id in seen_ids:
@@ -5983,11 +6057,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 card_committed_after,
                                 target_capacity_by_accelerator)):
                         continue
-                    self._terminate_replica(replica_id,
-                                            sync_down_logs=False,
-                                            replica_drain_delay_seconds=0,
-                                            is_scale_down=True,
-                                            in_flight_drain_cap_seconds=0)
+                    if replica_id in bulk_absent_replica_ids:
+                        absent_finished_launch_ids.append(replica_id)
+                    else:
+                        self._terminate_replica(replica_id,
+                                                sync_down_logs=False,
+                                                replica_drain_delay_seconds=0,
+                                                is_scale_down=True,
+                                                in_flight_drain_cap_seconds=0)
                 else:
                     if (replica_id in snapshot.unknown_replica_ids or
                             snapshot.in_flight_by_replica_id.get(replica_id)
@@ -6023,6 +6100,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                     committed_by_accelerator[card] -= committed_width
                     ready_by_accelerator[card] -= ready_width
                 accepted += 1
+
+            if absent_finished_launch_ids:
+                self._remove_replicas(absent_finished_launch_ids)
+                for replica_id in absent_finished_launch_ids:
+                    # Delete local worker bookkeeping only after the durable
+                    # fenced delete succeeds. A failed transaction therefore
+                    # leaves the entire wave retryable on the next tick.
+                    for attr in ('_launch_thread_pool',
+                                 '_replica_to_request_id',
+                                 '_replica_to_launch_cancelled',
+                                 '_replica_to_logical_launch_fence'):
+                        mapping = getattr(self, attr, None)
+                        if mapping is not None and replica_id in mapping:
+                            mapping.pop(replica_id)
+                    self._clear_failed_cleanup_retry(replica_id)
+                logger.info(
+                    f'Removed {len(absent_finished_launch_ids)} replicas from '
+                    'the replica table in one batch (clusters were never '
+                    'created).')
 
             logger.info(
                 'Logical scale-down batch completed for version '

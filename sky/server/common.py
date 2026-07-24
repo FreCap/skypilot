@@ -911,6 +911,12 @@ def check_server_healthy_or_start_fn(deploy: bool = False,
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.ApiServerAuthenticationError(endpoint)
     except exceptions.ApiServerConnectionError as exc:
+        # API server descendants inherit this marker. They must wait for their
+        # parent server instead of starting a second server in the same runtime.
+        # During startup, a child can otherwise observe the parent as unhealthy
+        # and win the API port before the parent reaches its Uvicorn bind.
+        if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None:
+            raise
         endpoint = get_server_url()
         if not is_api_server_local():
             with ux_utils.print_exception_no_traceback():

@@ -5750,6 +5750,235 @@ class TestLogicalCapacityPlanning:
 
         assert [call.args[0] for call in terminate.call_args_list] == [1, 3]
 
+    def test_logical_scale_down_batches_absent_finished_launch_cleanup(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        victims = [
+            self._ready_backend(replica_id, 1) for replica_id in range(1, 16)
+        ]
+        for victim in victims:
+            victim.status_property.first_ready_time = None
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._replica_to_request_id[1] = 'request-1'
+        mgr._replica_to_launch_cancelled[1] = True
+        mgr._replica_to_logical_launch_fence[1] = (1, 4)
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+        mgr._terminate_replica = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=victims), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value=set()) as cluster_inventory, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=True) as remove_batch, \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id') as point_read, \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists') as cluster_exists, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replica') as remove_one:
+            mgr.scale_down_logically_batch(list(range(1, 16)), 0, 1, 4)
+
+        cluster_inventory.assert_called_once_with(victims)
+        remove_batch.assert_called_once_with(
+            'svc',
+            list(range(1, 16)),
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'))
+        mgr._terminate_replica.assert_not_called()
+        point_read.assert_not_called()
+        cluster_exists.assert_not_called()
+        remove_one.assert_not_called()
+        assert 1 not in mgr._launch_thread_pool
+        assert 1 not in mgr._replica_to_request_id
+        assert 1 not in mgr._replica_to_launch_cancelled
+        assert 1 not in mgr._replica_to_logical_launch_fence
+
+    def test_logical_scale_down_batch_preserves_live_cleanup_paths(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        victims = [
+            self._ready_backend(replica_id, 1) for replica_id in (1, 2, 3, 4)
+        ]
+        for victim in victims:
+            victim.status_property.first_ready_time = None
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        live_launch = mock.Mock()
+        live_launch.is_alive.return_value = True
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._launch_thread_pool[3] = live_launch
+        mgr._down_thread_pool[4] = mock.Mock()
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+        mgr._terminate_replica = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=victims), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value={victims[1].cluster_name}) as cluster_inventory, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=True) as remove_batch:
+            mgr.scale_down_logically_batch([1, 2, 3, 4], 0, 1, 4)
+
+        cluster_inventory.assert_called_once_with(victims[:2])
+        remove_batch.assert_called_once_with(
+            'svc', [1],
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'))
+        assert [call.args[0] for call in mgr._terminate_replica.call_args_list
+               ] == [2, 3, 4]
+        assert 1 not in mgr._launch_thread_pool
+        assert 3 in mgr._launch_thread_pool
+        assert 4 in mgr._down_thread_pool
+
+    def test_logical_scale_down_batch_keeps_tracking_on_fence_loss(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        victim = self._ready_backend(1, 1)
+        victim.status_property.first_ready_time = None
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._replica_to_request_id[1] = 'request-1'
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[victim]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value=set()), \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=False), \
+             pytest.raises(RuntimeError, match='incarnation changed'):
+            mgr.scale_down_logically_batch([1], 0, 1, 4)
+
+        assert 1 in mgr._launch_thread_pool
+        assert 1 in mgr._replica_to_request_id
+
+    def test_logical_scale_down_batch_excludes_served_replica(self):
+        # A replica that ever reached ready owns a real cloud cluster and must
+        # never enter the durable batch row-delete, even when the one-shot
+        # cluster inventory momentarily omits its cluster. The batch path only
+        # drops the row and the paid-capacity claim; it does not terminate the
+        # cluster. So a served victim must stay on the graceful drain path
+        # (`_defer_scale_down_until_idle`), guarded independently by the
+        # pre-pass `first_ready_time is not None` exclusion and by the
+        # main-loop `has_served` branch. Every other batch test resets
+        # `first_ready_time` to None, so neither guard is otherwise exercised.
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        never_served = self._ready_backend(1, 1)
+        never_served.status_property.first_ready_time = None
+        # Keep the default first_ready_time (1.0): this victim has served.
+        served = self._ready_backend(2, 1)
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._replica_to_request_id[1] = 'request-1'
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={2: 1},
+                in_flight_by_replica_id={2: 0},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+        mgr._terminate_replica = mock.Mock()
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[never_served, served]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value=set()) as cluster_inventory, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=True) as remove_batch:
+            mgr.scale_down_logically_batch([1, 2], 0, 1, 4)
+
+        # The served victim is filtered out before the cluster inventory read,
+        # so only the never-served victim is a batch-delete candidate.
+        cluster_inventory.assert_called_once_with([never_served])
+        # Only the never-served row is dropped in the fenced batch delete.
+        remove_batch.assert_called_once_with(
+            'svc', [1],
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'))
+        # The served victim takes the graceful drain path, never a hard delete.
+        assert [call.args[0] for call in defer.call_args_list] == [2]
+        mgr._terminate_replica.assert_not_called()
+        assert 1 not in mgr._launch_thread_pool
+        assert 1 not in mgr._replica_to_request_id
+
     def test_logical_scale_down_batch_matches_sequential_singletons(self):
 
         def _run(batch: bool):
@@ -7652,6 +7881,104 @@ class TestPaidLocationLaunchBudget:
         assert budget.remaining_by_location[cheap] == 0
         assert manager._next_replica_id == 2
         assert len(manager._launch_thread_pool) == 1
+
+    def test_authoritative_service_saturation_stops_paid_wave(self):
+        cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({cheap: 1.0, expensive: 2.0})
+        manager._service_hash = 'hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        budget = paid_capacity.LaunchBudget(remaining_by_location={
+            cheap: 4,
+            expensive: 4,
+        },
+                                            pool_key_by_location={
+                                                cheap: 'cheap',
+                                                expensive: 'expensive',
+                                            },
+                                            states_by_pool_key={},
+                                            globally_managed=True,
+                                            service_remaining=1)
+
+        with mock.patch.object(
+                paid_capacity,
+                'try_persist_claim',
+                return_value=paid_capacity.ClaimResult.
+                SERVICE_SATURATED) as claim, mock.patch(
+                    'sky.serve.replica_managers._should_use_spot',
+                    return_value=True), mock.patch(
+                        'sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), mock.patch(
+                            'sky.serve.replica_managers.thread_utils.SafeThread'
+                        ) as safe_thread:
+            launched = manager._scale_up_one_locked(
+                None,
+                set(), [],
+                paid_location_launch_budget=budget,
+                launch_priority=20)
+
+        assert not launched
+        assert claim.call_count == 1
+        assert budget.service_remaining == 0
+        assert paid_capacity.select_location(manager._spot_placer,
+                                             budget) is None
+        assert manager._next_replica_id == 1
+        assert not manager._launch_thread_pool
+        safe_thread.assert_called_once()
+
+    def test_service_envelope_stops_large_physical_wave(self):
+        cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({cheap: 1.0, expensive: 2.0})
+        manager._service_hash = 'hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        budget = paid_capacity.LaunchBudget(remaining_by_location={
+            cheap: 4,
+            expensive: 4,
+        },
+                                            pool_key_by_location={
+                                                cheap: 'cheap',
+                                                expensive: 'expensive',
+                                            },
+                                            states_by_pool_key={},
+                                            globally_managed=True,
+                                            service_remaining=2)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), mock.patch.object(
+                                   paid_capacity,
+                                   'build_launch_budget',
+                                   return_value=budget), mock.patch.object(
+                                       paid_capacity,
+                                       'try_persist_claim',
+                                       return_value=paid_capacity.ClaimResult.
+                                       ACQUIRED) as claim, mock.patch(
+                                           'sky.serve.replica_managers.'
+                                           '_should_use_spot',
+                                           return_value=True), mock.patch(
+                                               'sky.serve.replica_managers.'
+                                               '_get_resources_ports',
+                                               return_value='8080'), mock.patch(
+                                                   'sky.serve.'
+                                                   'replica_managers.'
+                                                   'thread_utils.SafeThread'):
+            manager._scale_up_batch_locked([{'use_spot': True}] * 20)
+
+        assert claim.call_count == 2
+        assert budget.service_remaining == 0
+        assert manager._next_replica_id == 3
+        assert len(manager._launch_thread_pool) == 2
 
     def test_priority_deferral_does_not_exhaust_or_spill_pool(self):
         cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')

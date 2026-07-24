@@ -2938,6 +2938,41 @@ def _valid_paid_capacity_claims_in_session(
     return valid, stale
 
 
+def _valid_paid_capacity_service_claims_in_session(
+    session: orm.Session,
+    service_name: str,
+    service_hash: str,
+) -> tuple[list[tuple[str, str, int]], list[tuple[str, str, int]]]:
+    """Return valid and stale claims for one locked service incarnation."""
+    rows = session.execute(
+        sqlalchemy.select(
+            paid_capacity_claims_table.c.replica_id,
+            paid_capacity_claims_table.c.pool_key,
+            replicas_table.c.status,
+            replicas_table.c.paid_capacity_pool_key,
+        ).select_from(
+            paid_capacity_claims_table.outerjoin(
+                replicas_table,
+                sqlalchemy.and_(
+                    replicas_table.c.service_name ==
+                    paid_capacity_claims_table.c.service_name,
+                    replicas_table.c.replica_id ==
+                    paid_capacity_claims_table.c.replica_id))).where(
+                        paid_capacity_claims_table.c.service_name ==
+                        service_name, paid_capacity_claims_table.c.service_hash
+                        == service_hash)).fetchall()
+    valid = []
+    stale = []
+    for replica_id, claim_pool, status, replica_pool in rows:
+        identity = (service_name, service_hash, replica_id)
+        if (status in _PAID_CAPACITY_UNRESOLVED_STATUSES and
+                replica_pool == claim_pool):
+            valid.append(identity)
+        else:
+            stale.append(identity)
+    return valid, stale
+
+
 def _delete_paid_capacity_claims_in_session(
         session: orm.Session, identities: list[tuple[str, str, int]]) -> None:
     if not identities:
@@ -3093,6 +3128,7 @@ def try_add_replica_with_paid_capacity_claim(
     priority: int,
     base_limit: int,
     max_limit: int,
+    service_limit: int | None = None,
     now: float | None,
     success_ttl_seconds: float,
     failure_cooldown_seconds: float = 10 * 60,
@@ -3149,6 +3185,15 @@ def try_add_replica_with_paid_capacity_claim(
 
         identity = (service_name, service_hash, replica_id)
         is_existing_claim = identity in valid_claims
+        if service_limit is not None and not is_existing_claim:
+            service_claims, stale_service_claims = (
+                _valid_paid_capacity_service_claims_in_session(
+                    session, service_name, service_hash))
+            _delete_paid_capacity_claims_in_session(session,
+                                                    stale_service_claims)
+            if len(service_claims) >= service_limit:
+                session.commit()
+                return 'service_saturated'
         if not is_existing_claim:
             session.execute(
                 sqlalchemy.delete(paid_capacity_waiters_table).where(

@@ -361,6 +361,102 @@ class TestPaidCapacityAuthorityPG:
             success_ttl_seconds=60)
         assert states[pool_key]['current_limit'] == 2
 
+    def test_service_envelope_serializes_distinct_pool_claims(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        barrier = threading.Barrier(12)
+        results = []
+        errors = []
+
+        def _claim(replica_id: int) -> None:
+            try:
+                barrier.wait(timeout=20)
+                results.append(
+                    serve_state.try_add_replica_with_paid_capacity_claim(
+                        'svc',
+                        'hash',
+                        replica_id,
+                        self._info('svc', replica_id),
+                        pool_key=f'pool-{replica_id}',
+                        priority=20,
+                        base_limit=4,
+                        max_limit=8,
+                        service_limit=3,
+                        now=100,
+                        success_ttl_seconds=60,
+                        waiter_ttl_seconds=30,
+                        expected_controller_owner=(11, '10.0.0.1')))
+            except Exception as e:  # pylint: disable=broad-except
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=_claim, args=(replica_id,))
+            for replica_id in range(1, 13)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), 'service admission thread hung'
+
+        assert not errors, errors
+        assert results.count('acquired') == 3
+        assert results.count('service_saturated') == 9
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim_count = session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.paid_capacity_claims_table).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc')).scalar_one()
+        assert claim_count == 3
+
+    def test_service_envelope_preserves_legacy_overage_and_prunes_stale(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        def _claim(replica_id: int, *, service_limit: int | None = None) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                self._info('svc', replica_id),
+                pool_key=f'pool-{replica_id}',
+                priority=20,
+                base_limit=4,
+                max_limit=8,
+                service_limit=service_limit,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'))
+
+        for replica_id in range(1, 5):
+            assert _claim(replica_id) == 'acquired'
+        assert _claim(5, service_limit=3) == 'service_saturated'
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id.in_([
+                        1, 2
+                    ])).values(status=serve_state.ReplicaStatus.READY.value))
+            session.commit()
+
+        assert _claim(5, service_limit=3) == 'acquired'
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim_ids = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.replica_id).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc').order_by(serve_state.paid_capacity_claims_table.
+                                        c.replica_id)).scalars().all()
+        assert claim_ids == [3, 4, 5]
+
     def test_saturation_wins_before_priority_deferral(self, broker_engine,
                                                       monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)

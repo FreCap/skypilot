@@ -6175,6 +6175,56 @@ def test_profile_staging_rejects_immutable_mismatch_before_mutation(
                                               profile=profile.name)) == 1
 
 
+@pytest.mark.parametrize('state', [
+    models.ImageProfileState.SUPERSEDED,
+    models.ImageProfileState.FAILED,
+    models.ImageProfileState.RETIRED,
+])
+def test_profile_staging_rejects_non_operational_revision_replay(
+        image_database, profile: models.ManagedRegistryProfile,
+        state: models.ImageProfileState) -> None:
+    """Re-staging a settled revision must reject cleanly, not wedge the op.
+
+    A candidate row whose immutable payload matches but whose state is no
+    longer operational (superseded/failed/retired/disabled) must raise a
+    caller-catchable ValueError. Without the guard the stage falls through to
+    the INSERT, which violates uq_container_image_profile_revision and raises
+    a bare IntegrityError that ``qualification.ingest_manifest`` cannot catch,
+    leaving the operation retrying the same idempotency key forever.
+    """
+    staged = _stage_candidate_profile(profile, now=10)
+    with image_database.begin() as connection:
+        connection.execute(schema.profile_revisions.update().where(
+            schema.profile_revisions.c.id == staged.id).values(
+                state=state.value))
+    statements: list[str] = []
+
+    def record_statements(_connection, _cursor, statement, _parameters,
+                          _context, _executemany) -> None:
+        statements.append(statement)
+
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            record_statements)
+    try:
+        with pytest.raises(ValueError, match='no longer operational'):
+            _stage_candidate_profile(profile, now=20)
+    finally:
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                record_statements)
+
+    # The rejection must happen before any row mutation so the wave stays
+    # retryable and the unique constraint is never tripped.
+    assert not any(statement.lstrip().upper().startswith(('INSERT', 'UPDATE'))
+                   for statement in statements)
+    current = topology_state.get_profile_revision(staged.id)
+    assert current is not None
+    assert current.state == state
+    assert current.desired_generation == staged.desired_generation
+    assert len(
+        topology_state.list_profile_revisions('research',
+                                              profile=profile.name)) == 1
+
+
 def test_qualification_ingest_immutable_revision_conflict_terminalizes_operation(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:

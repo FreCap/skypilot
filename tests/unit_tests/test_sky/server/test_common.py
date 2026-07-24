@@ -16,6 +16,7 @@ from sky.server import common
 from sky.server import constants as server_constants
 from sky.server.common import ApiServerInfo
 from sky.server.common import ApiServerStatus
+from sky.skylet.constants import ENV_VAR_IS_SKYPILOT_SERVER
 
 
 def _create_test_cookie(name: str = 'test-cookie', value: str = 'test-value'):
@@ -132,6 +133,61 @@ def test_check_server_healthy_or_start_rechecks_status(
         from sky.server import versions
         versions.set_remote_api_version(None)
         versions.set_remote_version('unknown')
+
+
+def test_server_child_does_not_autostart_unavailable_api(monkeypatch):
+    monkeypatch.setenv(ENV_VAR_IS_SKYPILOT_SERVER, 'true')
+    connection_error = exceptions.ApiServerConnectionError(
+        common.DEFAULT_SERVER_URL)
+
+    with mock.patch.object(common,
+                           'check_server_healthy',
+                           side_effect=connection_error), \
+         mock.patch.object(common, 'get_server_url') as mock_get_server_url, \
+         mock.patch.object(common,
+                           'is_api_server_local') as mock_is_local, \
+         mock.patch.object(common.filelock, 'FileLock') as mock_filelock, \
+         mock.patch.object(common,
+                           '_start_api_server') as mock_start_server:
+        with pytest.raises(exceptions.ApiServerConnectionError) as exc_info:
+            common.check_server_healthy_or_start_fn()
+
+    assert exc_info.value is connection_error
+    mock_get_server_url.assert_not_called()
+    mock_is_local.assert_not_called()
+    mock_filelock.assert_not_called()
+    mock_start_server.assert_not_called()
+
+
+def test_local_client_still_autostarts_unavailable_api(monkeypatch):
+    monkeypatch.delenv(ENV_VAR_IS_SKYPILOT_SERVER, raising=False)
+    connection_error = exceptions.ApiServerConnectionError(
+        common.DEFAULT_SERVER_URL)
+    unhealthy = ApiServerInfo(status=ApiServerStatus.UNHEALTHY)
+
+    with mock.patch.object(common,
+                           'check_server_healthy',
+                           side_effect=connection_error), \
+         mock.patch.object(common,
+                           'get_server_url',
+                           return_value=common.DEFAULT_SERVER_URL), \
+         mock.patch.object(common,
+                           'is_api_server_local',
+                           return_value=True), \
+         mock.patch.object(common.filelock, 'FileLock') as mock_filelock, \
+         mock.patch.object(common.get_api_server_status_response,
+                           'cache_clear') as mock_cache_clear, \
+         mock.patch.object(common,
+                           'get_api_server_status',
+                           return_value=unhealthy), \
+         mock.patch.object(common,
+                           '_start_api_server') as mock_start_server:
+        common.check_server_healthy_or_start_fn()
+
+    mock_filelock.assert_called_once()
+    mock_cache_clear.assert_called_once()
+    mock_start_server.assert_called_once_with(False, '127.0.0.1', False, False,
+                                              None, False)
 
 
 @mock.patch('sky.server.common.get_api_server_status')

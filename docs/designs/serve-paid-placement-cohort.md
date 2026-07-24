@@ -7,15 +7,20 @@ _Last updated: 2026-07-24_
 ## Status
 
 The PostgreSQL global paid-capacity authority shipped in production as
-revision 027. A production incident review on 2026-07-24 found that its
-60-request cold cohort is too optimistic and that its failure evidence resets
-the cohort but does not durably stop new claims. The corrective implementation
-is in progress on `fix/serve-provisioning-admission-observability`.
+revision 027. PR #909 reduced its exact-pool bootstrap from 60 to four, added a
+sticky failure cooldown and one-probe recovery, bounded controller submission
+by API worker capacity, and corrected dashboard lifecycle semantics. It passed
+the full PR suite, including the required real-PostgreSQL lane, and shipped as
+image and chart 1.1.759 from merge `1f0bc56953ecc7d7366f7f6858234ea751c2cf98`.
 
-The corrective implementation and local deterministic validation are
-complete. The remaining release gates are real-PostgreSQL CI, the full visible
-PR suite, and a production rollout with before/after admission and placement
-event measurements.
+The first production cycle exposed a second-order amplification across exact
+pools: after the inherited 72-claim legacy cohort drained, one service acquired
+49 unresolved claims across 28 independent pools (four claims in seven new
+pools and one probe in 21 previously failed pools). The exact-pool invariants
+held, but their sum was still too large for one service. The follow-up
+correction adds an atomic 16-claim per-service envelope across pools. Its
+implementation, CI, and production verification are in progress on
+`fix/serve-paid-service-cohort`.
 
 ## Problem
 
@@ -47,6 +52,10 @@ Production evidence showed two additional gaps in the global implementation:
 2. Failure timestamps survive in PostgreSQL, but placement admission ignores
    them. Controller or API-server restart reconstructs a fresh process-local
    placer and retries exact pools that failed minutes earlier.
+3. Per-exact-pool limits compose additively. A large placement catalog can
+   submit a small cohort or probe in many pools at once; production observed
+   49 unresolved paid claims for one service even after every individual pool
+   obeyed the corrected four-or-one bound.
 
 SkyServe also has two independent concurrency layers. A replica becomes
 PROVISIONING when its local launch thread submits a long API request, while
@@ -69,13 +78,14 @@ After the cooldown, one shared probe is allowed; its success reopens the
 four-wide cohort and its failure restarts the cooldown. Stale positive evidence
 also returns the pool to the four-wide cohort.
 
-The bound is deliberately per exact instance-type pool, not per zone. If a
-zone offers seven distinct L4 instance types, its initial aggregate headroom
-can therefore reach 28 while each provider pool remains capped at four. This
-lets large fleets probe independent pools and regions concurrently without
-serializing all provisioning behind one provider response. Placement spread
-and unresolved claims per zone must be monitored separately from the
-exact-pool safety invariant.
+The exact-pool bound remains deliberately per instance type rather than per
+zone, but it is nested inside a second atomic per-service envelope. A service
+may hold at most 16 unresolved paid claims across every exact pool and
+accelerator shape. This preserves parallel discovery across independent pools
+without allowing a large catalog to multiply one service's provider-facing
+work without bound. Successful launches release claims immediately, so the
+envelope limits unresolved latency rather than total fleet size or steady-state
+throughput.
 
 In consolidation mode, the default global Serve submission bound must not
 exceed the API server's guaranteed long-worker parallelism. This prevents a
@@ -197,14 +207,18 @@ pre-upgrade progress without guessing a global claim identity.
 ### Central claims
 
 The central database contains one pool row per exact key and one claim row per
-service incarnation and replica ID. The pool row is the transaction
-serialization point.
+service incarnation and replica ID. The service row serializes the per-service
+envelope; the pool row serializes the exact-pool limit.
 
-Claim acquisition locks the pool row, expires stale positive evidence,
-reconciles orphan claims against current service incarnation and replica
-status, applies priority admission, and compares the active claim count with
-the current limit. `ACQUIRED` atomically persists both the replica and its
-claim. Every denied result writes no replica and starts no launch thread.
+Claim acquisition locks and validates the service owner before locking the
+pool row. It reconciles orphan claims for both scopes, rejects a new identity
+when the current service already holds 16 valid unresolved claims, expires
+stale positive evidence, applies priority admission, and compares the pool's
+active claim count with its current limit. `ACQUIRED` atomically persists both
+the replica and its claim. Every denied result writes no replica and starts no
+launch thread. The consistent service-then-pool lock order serializes
+concurrent claims into different pools without introducing a cross-service
+deadlock.
 
 Claims remain active while the matching durable replica is PENDING or
 PROVISIONING. Success, failure, terminal transition, deletion, service
@@ -222,6 +236,14 @@ The default bootstrap limit is four. Operators may override it with the
 positive-integer environment variable
 `SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW`. Invalid or non-positive values
 log a warning once per distinct value and fall back to four.
+
+The per-service envelope defaults to 16 and is independently configurable with
+`SKYPILOT_SERVE_PAID_SERVICE_LAUNCH_WINDOW`. Invalid or non-positive values
+fall back to 16. It applies only to the PostgreSQL shared-authority path; local
+SQLite preserves its existing compatibility behavior. An upgraded controller
+adopts but does not cancel excess claims created by an older binary. Their
+overage blocks new claims for that service until normal launch outcomes drain
+the count to the envelope.
 
 Every successful genuine provider launch releases its claim and increments the
 pool's success count. When the count reaches the current limit, the authority
@@ -330,8 +352,8 @@ column or migration.
 ### Submission concurrency
 
 `PENDING` and `PROVISIONING` claims remain part of paid-pool accounting, but
-the default Serve-wide admission bound has a second ceiling. In consolidation
-mode it is:
+the 16-claim service envelope is independent from the process submission
+ceiling. In consolidation mode the latter is:
 
 ```text
 min(
@@ -354,10 +376,12 @@ The per-service config snapshot intentionally omits the server's
 `serve.controller.consolidation_mode` setting, so reading that snapshot alone
 would silently leave production controllers uncapped.
 
-This is an admission ceiling, not proof that every admitted request is
-provider-active: unrelated long operations can occupy workers. The explicit
-Serve launch override remains authoritative for operators who intentionally
-want an API queue.
+The service envelope is authoritative at durable claim persistence, while the
+worker ceiling includes zero-cost and lifecycle operations that do not consume
+paid claims. Neither is proof that every submitted request is provider-active:
+unrelated long operations can occupy workers. The explicit Serve launch
+override remains authoritative for process concurrency, but it does not bypass
+the paid service envelope.
 
 Non-consolidated controllers keep their existing local worker accounting.
 
@@ -632,8 +656,9 @@ Least-loaded placement would spread even when a cheap pool has proven depth
 and would conflate economics with capacity admission.
 
 Serializing every launch, or adding random sleep to every worker, would reduce
-useful concurrency across independent exact pools and regions. A small atomic
-cold cohort bounds correlated failures while preserving that breadth.
+useful concurrency across independent exact pools and regions. The 16-claim
+service envelope preserves bounded breadth while the smaller exact-pool cohort
+bounds correlated failures.
 
 A region-wide negative cache would incorrectly poison healthy instance types,
 zones, accelerator shapes, or purchase modes because one exact pool failed.
@@ -643,12 +668,12 @@ Canceling API-queued siblings after the first failure has an unavoidable race
 with provider mutation. The small cohort plus durable close bounds the waste
 without killing work whose mutation boundary is uncertain.
 
-Deriving the limit from the global launch-thread budget couples one service's
-provider behavior to unrelated controller memory sizing. The paid authority
-may never exceed that external budget, but it owns a separate provider-pool
-limit. Conversely, leaving the Serve-wide bound above the API execution pool
+Deriving the durable claim limit from the global launch-thread budget couples
+one service's provider behavior to unrelated controller memory sizing. The
+paid authority owns fixed, observable service and provider-pool envelopes.
+Conversely, leaving the Serve-wide process bound above the API execution pool
 creates a hidden queue. The design therefore caps total submissions at worker
-capacity without deriving any individual provider-pool limit from it.
+capacity without deriving either durable claim envelope from it.
 
 ## Changed-Path-to-Test Matrix
 
@@ -658,6 +683,7 @@ capacity without deriving any individual provider-pool limit from it.
 | Failure cooldown defaults to ten minutes and rejects invalid overrides | Pure configuration tests |
 | Exact keys distinguish workspace, cloud, region, zone, instance type, accelerator shape, Spot mode, and node count | Pool-key equality tests |
 | Combined claims across services never exceed the pool limit | Concurrent PostgreSQL admission test |
+| One service never holds more than 16 valid unresolved paid claims across distinct pools; stale claims do not consume the envelope; legacy overage blocks without revocation | Concurrent PostgreSQL cross-pool admission and reconciliation tests |
 | Claim and replica persist atomically under service-owner fencing | Persistence and ownership-loss tests |
 | PENDING and PROVISIONING count; provider success, terminal rows, service replacement, and missing replicas do not | Reconciliation tests |
 | 4, 8, 16, 32, 64, 128, 256, 480 ramp; stale success resets to 4 | Pure policy and state-transition tests |
@@ -668,7 +694,7 @@ capacity without deriving any individual provider-pool limit from it.
 | Exact-card logical demand derives priority independently per accelerator | Autoscaler and replica-manager tests |
 | Instance-aware QPS batches preserve card-specific priority; valid profiles never promote excluded cards; stale evidence falls back to minimum | Autoscaler and controller actuation tests |
 | Restart adoption and recovery preserve the claim in both relational and serialized replica state without duplicating it | Recovery test |
-| Cheapest selection spills on claim 5 at bootstrap, not before | Replica-manager integration test |
+| Cheapest selection spills on claim 5 at bootstrap, but the physical wave stops when the service envelope is exhausted | Replica-manager integration test |
 | A stale selection snapshot loses cleanly at the atomic persist | Cross-controller race test |
 | Owning controllers adopt attributable legacy rows; an unrelated unkeyed row does not debit every pool | Mixed-version compatibility test |
 | Local SQLite retains the unset legacy per-service window of 4 and stays below its 999-bind batch limit | Non-PostgreSQL fallback and constrained SQLite batch tests |
@@ -696,8 +722,9 @@ READY replica is preempted.
 
 For a shape with several exact instance types in one zone, confirm each type
 has an independent four-claim bootstrap and graph both exact-pool and aggregate
-zone headroom. Verify that this same-region depth is intentional before
-enabling the policy for a fleet.
+zone headroom. Generate enough demand to span at least five exact pools and
+confirm the owning service never exceeds 16 unresolved paid claims in total.
+Release one claim and confirm exactly one new cross-pool claim can enter.
 
 Complete 4, 8, 16, 32, 64, 128, and 256 real launches and confirm the shared
 limit reaches 8, 16, 32, 64, 128, 256, and 480 respectively. Inject one typed
@@ -740,6 +767,12 @@ does not declare the new bound active merely because the old controller
 exited. Have an old binary clamp a `current_limit=1` marker and record a later
 success; confirm `last_failure_at` remains sticky and new code requires a fresh
 post-drain probe.
+
+Also begin with one service holding more than 16 claims spread across several
+pools. Confirm the upgraded controller preserves and re-drives the inherited
+work, admits no additional paid claim while the service is over its envelope,
+and resumes one-for-one admission only after outcomes reduce the count below
+16.
 
 Render history containing both legacy accelerator-breakdown JSON and new
 capacity-semantics-v2 samples. Confirm the exact-card committed/unready line
@@ -815,9 +848,22 @@ Corrective local evidence on 2026-07-24:
   production-topology gaps before validation: consolidation detection now
   accepts the controller-process and external-LB runtime signals, and
   autoscaler versus status-history lifecycle labels remain distinct.
+- PR #909 passed every visible check, including the mandatory PostgreSQL unit
+  lane, and merged as `1f0bc56953ecc7d7366f7f6858234ea751c2cf98`.
+- Image and chart 1.1.759 passed registry readback and rolled out through Helm
+  revision 314. The API deployment became healthy and reported the exact merge
+  commit.
+- The inherited 72-claim cohort drained without new admissions and produced
+  one aggregate `failures=72, exact_pools=3` warning. The next fresh cycle
+  proved the exact-pool cooldown/probe policy but exposed 49 aggregate claims
+  across 28 pools, motivating the service envelope above.
 
 ## Open Release Gates
 
-- Pass the real-PostgreSQL concurrency cases in CI.
-- Pass the full visible PR CI on the integrated head.
-- Publish, deploy with reused Helm values, and verify the live HA rollout.
+- Implement and validate the 16-claim service envelope, including a
+  real-PostgreSQL distinct-pool race.
+- Pass the full visible PR CI on the follow-up integrated head.
+- Publish and deploy the follow-up with reused Helm values.
+- Verify the live service drains its existing overage, never exceeds 16 fresh
+  paid claims, retains one-per-failed-pool probes, and keeps bounded aggregate
+  logs and semantics-v2 history.

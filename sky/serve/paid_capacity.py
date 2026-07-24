@@ -34,6 +34,8 @@ _LEGACY_LOCAL_LIMIT_DEFAULT = 4
 _MAX_LIMIT_DEFAULT = 480
 _BASE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW'
 _MAX_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_MAX_LAUNCH_WINDOW'
+_SERVICE_LIMIT_DEFAULT = 16
+_SERVICE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_SERVICE_LAUNCH_WINDOW'
 _SUCCESS_TTL_SECONDS_DEFAULT = 10 * 60
 _SUCCESS_TTL_SECONDS_ENV_VAR = (
     'SKYPILOT_SERVE_PAID_LOCATION_SUCCESS_TTL_SECONDS')
@@ -57,6 +59,7 @@ class ClaimResult(enum.Enum):
 
     ACQUIRED = 'acquired'
     SATURATED = 'saturated'
+    SERVICE_SATURATED = 'service_saturated'
     HIGHER_PRIORITY_WAITING = 'higher_priority_waiting'
     OWNERSHIP_LOST = 'ownership_lost'
     LEGACY_LOCAL = 'legacy_local'
@@ -80,6 +83,7 @@ class LaunchBudget:
     globally_managed: bool
     priority_deferred_pool_keys: set[str] = dataclasses.field(
         default_factory=set)
+    service_remaining: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -134,6 +138,12 @@ def max_limit() -> int:
     configured = _parse_positive_int(os.environ.get(_MAX_LIMIT_ENV_VAR),
                                      _MAX_LIMIT_DEFAULT, _MAX_LIMIT_ENV_VAR)
     return max(base_limit(), configured)
+
+
+def service_limit() -> int:
+    """Return one service's cross-pool unresolved paid-claim envelope."""
+    return _parse_positive_int(os.environ.get(_SERVICE_LIMIT_ENV_VAR),
+                               _SERVICE_LIMIT_DEFAULT, _SERVICE_LIMIT_ENV_VAR)
 
 
 def success_ttl_seconds() -> int:
@@ -332,7 +342,9 @@ def central_authority_available() -> bool:
     return (serve_state.get_database_engine().dialect.name == 'postgresql')
 
 
-def _log_admission_summary(states: dict[str, dict[str, Any]]) -> None:
+def _log_admission_summary(states: dict[str, dict[str,
+                                                  Any]], *, service_claims: int,
+                           service_claim_limit: int) -> None:
     """Log one bounded shared-admission summary on transition or interval."""
     if not states:
         return
@@ -343,8 +355,9 @@ def _log_admission_summary(states: dict[str, dict[str, Any]]) -> None:
         int(state.get('legacy_overage', 0)) > 0 for state in states.values())
     saturated_pools = sum(
         int(state.get('remaining', 0)) == 0 for state in states.values())
+    service_remaining = max(0, service_claim_limit - service_claims)
     signature = (len(states), tuple(sorted(state_counts.items())), overage_pools
-                 > 0)
+                 > 0, service_remaining == 0)
     observed_at = time.monotonic()
     global _admission_summary_log_signature
     global _admission_summary_logged_at
@@ -365,8 +378,20 @@ def _log_admission_summary(states: dict[str, dict[str, Any]]) -> None:
         f'admission_limit={sum(int(state.get("admission_limit", 0)) for state in states.values())}, '
         f'remaining={sum(int(state.get("remaining", 0)) for state in states.values())}, '
         f'saturated_pools={saturated_pools}, '
-        f'legacy_overage_claims={sum(int(state.get("legacy_overage", 0)) for state in states.values())}.'
-    )
+        f'legacy_overage_claims={sum(int(state.get("legacy_overage", 0)) for state in states.values())}, '
+        f'service_claims={service_claims}, '
+        f'service_limit={service_claim_limit}, '
+        f'service_remaining={service_remaining}.')
+
+
+def _service_claim_count(
+        existing_replica_infos: Iterable['replica_managers.ReplicaInfo']
+) -> int:
+    """Count this service's unresolved rows with an exact paid claim."""
+    return sum(
+        getattr(info.status, 'value', info.status) in _UNRESOLVED_STATUS_VALUES
+        and isinstance(getattr(info, 'paid_capacity_pool_key', None), str)
+        for info in existing_replica_infos)
 
 
 def build_launch_budget(
@@ -406,11 +431,17 @@ def build_launch_budget(
         location: int(states[key]['remaining'])
         for location, key in keys.items()
     }
-    _log_admission_summary(states)
+    service_claims = _service_claim_count(existing_replica_infos)
+    service_claim_limit = service_limit()
+    _log_admission_summary(states,
+                           service_claims=service_claims,
+                           service_claim_limit=service_claim_limit)
     return LaunchBudget(remaining_by_location=remaining,
                         pool_key_by_location=keys,
                         states_by_pool_key=states,
-                        globally_managed=True)
+                        globally_managed=True,
+                        service_remaining=max(
+                            0, service_claim_limit - service_claims))
 
 
 def select_location(
@@ -436,7 +467,8 @@ def select_location(
     active_paid = [location for location in active if location not in zero_cost]
     available_paid = {
         location for location in active_paid
-        if budget.remaining_by_location.get(location, 0) > 0
+        if budget.remaining_by_location.get(location, 0) > 0 and
+        (budget.service_remaining is None or budget.service_remaining > 0)
     }
     if skip_zero_cost_preference and active_paid and not available_paid:
         return None
@@ -481,6 +513,8 @@ def debit(budget: LaunchBudget | None,
         remaining = budget.remaining_by_location[candidate]
         if remaining > 0:
             budget.remaining_by_location[candidate] = remaining - 1
+    if budget.service_remaining is not None and budget.service_remaining > 0:
+        budget.service_remaining -= 1
 
 
 def exhaust(budget: LaunchBudget | None,
@@ -494,6 +528,17 @@ def exhaust(budget: LaunchBudget | None,
             (key is not None and
              budget.pool_key_by_location.get(candidate) == key)):
             budget.remaining_by_location[candidate] = 0
+
+
+def exhaust_service(budget: LaunchBudget | None) -> None:
+    """Stop a wave after the authoritative per-service envelope is full."""
+    if budget is not None and budget.service_remaining is not None:
+        budget.service_remaining = 0
+
+
+def service_exhausted(budget: LaunchBudget | None) -> bool:
+    """Whether this wave has no remaining cross-pool service admission."""
+    return budget is not None and budget.service_remaining == 0
 
 
 def try_persist_claim(
@@ -521,6 +566,7 @@ def try_persist_claim(
                      min(constants.LB_REQUEST_PRIORITY_MAX, priority)),
         base_limit=base_limit(),
         max_limit=max_limit(),
+        service_limit=service_limit(),
         now=None,
         success_ttl_seconds=success_ttl_seconds(),
         failure_cooldown_seconds=failure_cooldown_seconds(),

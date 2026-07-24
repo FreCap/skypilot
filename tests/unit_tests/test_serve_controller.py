@@ -199,6 +199,8 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
+    ctrl._lb_role_lock = None  # pylint: disable=protected-access
+    ctrl._lb_demand_lock = None  # pylint: disable=protected-access
     ctrl._routing_spec = None  # pylint: disable=protected-access
     ctrl._applied_version = 1  # pylint: disable=protected-access
     ctrl._routing_state_lock = threading.RLock()  # pylint: disable=protected-access
@@ -2260,6 +2262,26 @@ class TestUnknownAsyncOccupancy:
         ctrl._replica_manager.update_lb_in_flight.assert_called_once_with(
             {'http://replica': 3}, ['http://replica'], [], [], 'legacy')
 
+    def test_malformed_demand_does_not_publish_partial_drain_state(self):
+        ctrl = _make_controller()
+        ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler = _StatefulDemandAutoscaler()  # pylint: disable=protected-access
+        request = {
+            'lb_session_id': 'lb-a',
+            'request_aggregator': {},
+            # A reporter-controlled list cannot be translated as the
+            # protocol's url-keyed gauge.
+            'in_flight': [],
+            'routing_urls': [],
+        }
+
+        with pytest.raises(AttributeError):
+            ctrl._apply_load_balancer_report(  # pylint: disable=protected-access
+                request, [], {}, (True, True, True), {})
+
+        ctrl._replica_manager.update_lb_in_flight.assert_not_called()
+
 
 class _StatefulDemandAutoscaler:
     """Small stateful collector exposing every LB-controlled demand field."""
@@ -3207,16 +3229,17 @@ class TestAuthoritativeLbReportIngestion:
             del replica_infos, observed_slots
             observed['ingest_logical_versions'] = set(logical_versions)
 
-        def _capture_ingest(request_data, replica_infos,
+        def _capture_ingest(request_data, effective_request_data, replica_infos,
                             async_occupancy_by_version, authority,
-                            observed_slots):
-            del request_data, replica_infos, authority, observed_slots
+                            observed_slots, ha_enabled):
+            del (request_data, effective_request_data, replica_infos, authority,
+                 observed_slots, ha_enabled)
             observed['ingest'] = dict(async_occupancy_by_version)
             return True
 
         ctrl._get_lb_replica_info = _capture_lb_replica_info  # pylint: disable=protected-access
         ctrl._confirm_logical_bridge_capacities = _capture_confirm  # pylint: disable=protected-access
-        ctrl._apply_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
+        ctrl._apply_prepared_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
 
         def _capture_capacity_hint(replica_infos,
                                    logical_versions,
@@ -3754,6 +3777,7 @@ class TestLbSyncBlockingReadsOffLoop:
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = [location]
         ctrl._replica_manager = types.SimpleNamespace(spot_placer=placer)  # pylint: disable=protected-access
+        ctrl._replica_manager.update_lb_in_flight = mock.Mock()  # pylint: disable=protected-access
         # Arm the ownership fence so _owns_current_service reads the DB.
         ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
         ctrl._controller_owner = (101, '10.0.0.1')  # pylint: disable=protected-access
@@ -3799,7 +3823,7 @@ class TestLbSyncBlockingReadsOffLoop:
                                return_value=(True, True, True)), \
              mock.patch.object(ctrl, '_get_lb_replica_info',
                                return_value=([], 0)), \
-             mock.patch.object(ctrl, '_apply_load_balancer_report',
+             mock.patch.object(ctrl, '_apply_prepared_load_balancer_report',
                                side_effect=_ingest), \
              mock.patch.object(ctrl, '_get_capacity_hint',
                                return_value={}):
@@ -3809,11 +3833,10 @@ class TestLbSyncBlockingReadsOffLoop:
     def test_db_reads_run_off_the_event_loop(self):
         response, read_threads, loop_thread = self._run_sync()
         assert response.status_code == 200
-        # 2 ownership-fence reads (entry + pre-side-effect) + replica rows +
-        # specs + one batched reserved-capacity observation read all happened
-        # -- and nothing more. Extra redundant reads here are a hot-path
-        # regression.
-        assert len(read_threads) == 5
+        # Four ownership fences (entry, serialized head, pre-tail, and final
+        # drain/disclosure) plus replica rows, specs, and one batched
+        # reserved-capacity observation read all happened -- and nothing more.
+        assert len(read_threads) == 7
         # ...and none of them on the event-loop thread.
         assert all(tid != loop_thread for tid in read_threads)
 
@@ -3832,17 +3855,273 @@ class TestLbSyncBlockingReadsOffLoop:
         assert body['service_version'] == 1
 
 
-class TestLbSyncOwnershipFences:
-    """The two remaining fences gate entry and the first side effect.
+class TestLbSyncThreePhase:
+    """Concurrency and cancellation boundaries for LB report ingestion."""
 
-    Consolidating the per-await fences into these two must not weaken the
-    incarnation fencing: a controller that lost its DB row may neither
-    mutate autoscaler/replica-manager state nor disclose routing.
+    @staticmethod
+    def _controller(runtime_tail):
+        ctrl = _make_controller()
+        ctrl._lb_ha_enabled = True  # pylint: disable=protected-access
+        ctrl._autoscaler = mock.Mock(
+            replica_unit='logical',  # pylint: disable=protected-access
+            latest_version=1)
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._owns_current_service = mock.Mock(return_value=True)  # pylint: disable=protected-access
+        ctrl._lb_report_authority = mock.Mock(  # pylint: disable=protected-access
+            return_value=(True, True, False))
+        ctrl._snapshot_replica_occupancy = mock.Mock(  # pylint: disable=protected-access
+            return_value=([], {}, None))
+        ctrl._get_lb_replica_info = mock.Mock(return_value=({}, 0))  # pylint: disable=protected-access
+        ctrl._get_replica_counts = mock.Mock(return_value={})  # pylint: disable=protected-access
+        ctrl._get_capacity_hint = mock.Mock(return_value={})  # pylint: disable=protected-access
+        ctrl._persist_request_history = mock.AsyncMock(return_value=True)  # pylint: disable=protected-access
+        ctrl._persist_response_time_history = mock.AsyncMock(  # pylint: disable=protected-access
+            return_value=True)
+        ctrl._persist_prediction_time_history = mock.AsyncMock(  # pylint: disable=protected-access
+            return_value=True)
+        ctrl._persist_autoscaler_history = mock.AsyncMock(  # pylint: disable=protected-access
+            return_value=True)
+        ctrl._prepare_load_balancer_report = mock.Mock(  # pylint: disable=protected-access
+            side_effect=lambda request, _: (True, request, True))
+        ctrl._apply_prepared_load_balancer_report = runtime_tail  # pylint: disable=protected-access
+        ctrl._load_balancer_disclosure_is_authorized = mock.Mock(  # pylint: disable=protected-access
+            return_value=True)
+        return ctrl
+
+    def test_runtime_tail_keeps_event_loop_and_role_lock_responsive(self):
+        tail_started = threading.Event()
+        release_tail = threading.Event()
+        fallback_released = threading.Event()
+        test_finished = threading.Event()
+        tail_threads = []
+
+        def blocking_tail(*_args):
+            tail_threads.append(threading.get_ident())
+            tail_started.set()
+            assert release_tail.wait(timeout=2)
+            return True
+
+        ctrl = self._controller(blocking_tail)
+
+        def release_if_event_loop_is_blocked():
+            if (tail_started.wait(timeout=1) and
+                    not test_finished.wait(timeout=0.5)):
+                fallback_released.set()
+                release_tail.set()
+
+        fallback = threading.Thread(target=release_if_event_loop_is_blocked)
+        fallback.start()
+
+        async def drive():
+            loop_thread = threading.get_ident()
+            sync = asyncio.create_task(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    {'lb_session_id': 'active'}))
+            started = await asyncio.wait_for(asyncio.to_thread(
+                tail_started.wait, 1),
+                                             timeout=2)
+            assert started
+            # This is the same scheduling property the constant-time health
+            # route relies on.
+            await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
+            assert not sync.done()
+            assert tail_threads == [tail_threads[0]]
+            assert tail_threads[0] != loop_thread
+            role_lock = ctrl._lb_role_lock  # pylint: disable=protected-access
+            if role_lock is None:
+                role_lock = asyncio.Lock()
+                ctrl._lb_role_lock = role_lock  # pylint: disable=protected-access
+
+            async def role_heartbeat():
+                async with role_lock:
+                    pass
+
+            await asyncio.wait_for(role_heartbeat(), timeout=0.1)
+            release_tail.set()
+            return await asyncio.wait_for(sync, timeout=2)
+
+        try:
+            response = asyncio.run(drive())
+        finally:
+            test_finished.set()
+            release_tail.set()
+            fallback.join(timeout=1)
+
+        assert response.status_code == 200
+        assert not fallback_released.is_set()
+        assert not fallback.is_alive()
+
+    def test_non_ha_cancellation_finishes_drain_publication_after_tail(self):
+        tail_started = threading.Event()
+        release_tail = threading.Event()
+        drain_published = threading.Event()
+
+        def blocking_tail(*_args):
+            tail_started.set()
+            assert release_tail.wait(timeout=2)
+            return True
+
+        ctrl = self._controller(blocking_tail)
+        ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+        ctrl._lb_report_authority.return_value = (True, True, True)  # pylint: disable=protected-access
+        ctrl._prepare_load_balancer_report.side_effect = (  # pylint: disable=protected-access
+            lambda request, _: (True, request, False))
+
+        def publish_drain(_request_data):
+            drain_published.set()
+            return True
+
+        ctrl._apply_authoritative_load_balancer_drain_report = publish_drain  # pylint: disable=protected-access
+
+        async def drive():
+            sync = asyncio.create_task(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    {'lb_session_id': 'legacy'}))
+            started = await asyncio.wait_for(asyncio.to_thread(
+                tail_started.wait, 1),
+                                             timeout=2)
+            assert started
+            sync.cancel()
+            await asyncio.sleep(0)
+            assert not sync.done()
+            assert not drain_published.is_set()
+            release_tail.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(sync, timeout=2)
+
+        try:
+            asyncio.run(drive())
+        finally:
+            release_tail.set()
+
+        assert drain_published.is_set()
+
+    def test_non_ha_cancellation_waits_for_drain_role_lock(self):
+        drain_published = threading.Event()
+
+        class BlockingRoleLock:
+            """Expose cancellation while final drain waits for role ordering."""
+
+            def __init__(self):
+                self.waiting = asyncio.Event()
+                self.allow = asyncio.Event()
+                self.release_calls = 0
+
+            async def acquire(self):
+                self.waiting.set()
+                await self.allow.wait()
+                return True
+
+            def release(self):
+                self.release_calls += 1
+
+        ctrl = self._controller(mock.Mock(return_value=True))
+        ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+        ctrl._lb_report_authority.return_value = (True, True, True)  # pylint: disable=protected-access
+        ctrl._prepare_load_balancer_report.side_effect = (  # pylint: disable=protected-access
+            lambda request, _: (True, request, False))
+
+        def publish_drain(_request_data):
+            drain_published.set()
+            return True
+
+        ctrl._apply_authoritative_load_balancer_drain_report = publish_drain  # pylint: disable=protected-access
+
+        async def drive():
+            role_lock = BlockingRoleLock()
+            ctrl._lb_role_lock = role_lock  # pylint: disable=protected-access
+            sync = asyncio.create_task(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    {'lb_session_id': 'legacy'}))
+            await asyncio.wait_for(role_lock.waiting.wait(), timeout=2)
+            sync.cancel()
+            await asyncio.sleep(0)
+            assert not sync.done()
+            assert not drain_published.is_set()
+            role_lock.allow.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(sync, timeout=2)
+            assert role_lock.release_calls == 1
+
+        asyncio.run(drive())
+        assert drain_published.is_set()
+
+    def test_repeated_cancellation_keeps_phase_lock_until_worker_finishes(self):
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def blocking_worker():
+            worker_started.set()
+            assert release_worker.wait(timeout=2)
+            return True
+
+        ctrl = _make_controller()
+
+        async def drive():
+            phase_lock = asyncio.Lock()
+            contender_entered = asyncio.Event()
+
+            async def guarded_worker():
+                async with phase_lock:
+                    loop = asyncio.get_running_loop()
+                    operation = loop.run_in_executor(None, blocking_worker)
+                    await ctrl._await_executor_operation(  # pylint: disable=protected-access
+                        operation, 'test worker')
+
+            async def contender():
+                async with phase_lock:
+                    contender_entered.set()
+
+            guarded = asyncio.create_task(guarded_worker())
+            started = await asyncio.wait_for(asyncio.to_thread(
+                worker_started.wait, 1),
+                                             timeout=2)
+            assert started
+            guarded.cancel()
+            await asyncio.sleep(0)
+            guarded.cancel()
+            waiting = asyncio.create_task(contender())
+            await asyncio.sleep(0.02)
+            assert not contender_entered.is_set()
+            assert not guarded.done()
+            release_worker.set()
+            with pytest.raises(asyncio.CancelledError):
+                await guarded
+            await asyncio.wait_for(waiting, timeout=1)
+            assert contender_entered.is_set()
+
+        try:
+            asyncio.run(drive())
+        finally:
+            release_worker.set()
+
+    def test_cancelled_executor_future_does_not_spin(self):
+        ctrl = _make_controller()
+
+        async def drive():
+            operation = asyncio.get_running_loop().create_future()
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    ctrl._await_executor_operation(  # pylint: disable=protected-access
+                        operation, 'cancelled test worker'),
+                    timeout=0.1)
+
+        asyncio.run(drive())
+
+
+class TestLbSyncOwnershipFences:
+    """Every async phase revalidates ownership before its side effects.
+
+    A controller that loses its DB row may neither enter the serialized
+    handoff head, mutate the contended runtime tail, publish drain state, nor
+    disclose routing.
     """
 
     def _make_fenced_controller(self):
         ctrl = _make_controller()
         ctrl._autoscaler = mock.Mock(replica_unit='physical')  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
         ctrl._controller_owner = (101, '10.0.0.1')  # pylint: disable=protected-access
         return ctrl
@@ -3853,7 +4132,13 @@ class TestLbSyncOwnershipFences:
         history_calls = []
 
         def _ingest(*args, **kwargs):
-            ingest_calls.append((args, kwargs))
+            ingest_calls.append(('runtime', args, kwargs))
+            return True
+
+        def _publish_drain(*args, **kwargs):
+            if not ctrl._owns_current_service():  # pylint: disable=protected-access
+                return False
+            ingest_calls.append(('drain', args, kwargs))
             return True
 
         def _record_history(data):
@@ -3871,8 +4156,12 @@ class TestLbSyncOwnershipFences:
                                return_value=(True, True, True)), \
              mock.patch.object(ctrl, '_get_lb_replica_info',
                                return_value=([], 0)), \
-             mock.patch.object(ctrl, '_apply_load_balancer_report',
+             mock.patch.object(ctrl, '_apply_prepared_load_balancer_report',
                                side_effect=_ingest), \
+             mock.patch.object(
+                 ctrl,
+                 '_apply_authoritative_load_balancer_drain_report',
+                 side_effect=_publish_drain), \
              mock.patch.object(ctrl, '_record_request_history',
                                side_effect=_record_history), \
              mock.patch.object(ctrl, '_get_capacity_hint',
@@ -3940,6 +4229,44 @@ class TestLbSyncOwnershipFences:
         assert response.body == b''
         assert history_calls == [request_data]
         assert not ingest_calls
+
+    def test_ownership_lost_after_head_blocks_runtime_tail(self):
+        ctrl = self._make_fenced_controller()
+        owned = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+        }
+        stolen = {
+            'hash': 'incarnation-b',
+            'controller_pid': 202,
+            'controller_ip': '10.0.0.2',
+        }
+
+        response, ingest_calls, _ = self._sync(
+            ctrl, owner_rows=[owned, owned, stolen])
+
+        assert response.status_code == 503
+        assert not ingest_calls
+
+    def test_ownership_lost_after_runtime_blocks_drain_and_disclosure(self):
+        ctrl = self._make_fenced_controller()
+        owned = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+        }
+        stolen = {
+            'hash': 'incarnation-b',
+            'controller_pid': 202,
+            'controller_ip': '10.0.0.2',
+        }
+
+        response, ingest_calls, _ = self._sync(
+            ctrl, owner_rows=[owned, owned, owned, stolen])
+
+        assert response.status_code == 503
+        assert [phase for phase, _, _ in ingest_calls] == ['runtime']
 
     def test_ownership_lost_during_bridge_confirmation_blocks_side_effects(
             self):
