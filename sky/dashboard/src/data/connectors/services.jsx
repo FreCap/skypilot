@@ -739,20 +739,37 @@ export function normalizeServicePlacement(payload) {
       enabled: placer.enabled === true,
       retrySeconds: finiteOrNull(placer.retry_seconds),
       observedAt: finiteOrNull(placer.observed_at),
+      statusSemantics: placer.status_semantics || null,
       truncated: placer.truncated === true,
       locations: Array.isArray(placer.locations)
         ? placer.locations.map((location) => ({
             cloud: location.cloud || 'Unknown',
             region: location.region || null,
             zone: location.zone || null,
+            instanceType: location.instance_type || null,
             accelerators: location.accelerators || null,
             useSpot: location.use_spot === true,
             storedStatus: location.stored_status || null,
             effectiveStatus: location.effective_status || null,
+            benchReason: location.bench_reason || null,
             probeEligible: location.probe_eligible === true,
             benchedAt: finiteOrNull(location.benched_at),
             nextProbeAt: finiteOrNull(location.next_probe_at),
             cachedHourlyCost: finiteOrNull(location.cached_hourly_cost),
+            paidAdmission: location.paid_admission
+              ? {
+                  state: location.paid_admission.state || null,
+                  poolRemaining: finiteOrNull(
+                    location.paid_admission.pool_remaining
+                  ),
+                  serviceRemaining: finiteOrNull(
+                    location.paid_admission.service_remaining
+                  ),
+                  cooldownUntil: finiteOrNull(
+                    location.paid_admission.cooldown_until
+                  ),
+                }
+              : null,
           }))
         : [],
     },

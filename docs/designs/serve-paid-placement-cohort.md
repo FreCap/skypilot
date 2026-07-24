@@ -215,22 +215,21 @@ flowchart LR
 
 ### Scope
 
-The global paid authority applies only to fresh demand launches selected by a
-spot placer at non-zero-cost locations. It does not constrain:
+The global paid authority applies to fresh demand launches and fresh
+cost-rebalance replacements at non-zero-cost locations. It does not constrain:
 
 - zero-cost reserved-capacity demand or fill;
 - recovery re-drives with an immutable persisted location;
-- cost-rebalance replacements with an already selected location; or
 - services without a spot placer.
 
 These exclusions apply to actuation, not only accounting. Exhausting the paid
 service envelope or one card's frontier suppresses only fresh paid placement.
 It never terminates zero-cost reserved demand or fill, and it never terminates
-a cost-rebalance replacement already pinned to its selected location. A
-physical wave stops only after a complete pass makes no progress through those
-unconstrained paths. Logical exact-card loops likewise continue evaluating and
-placing zero-cost capacity even when paid admission for the service or card is
-closed.
+a durable cost-rebalance replacement already persisted with its selected
+location and paid claim. A physical wave stops only after a complete pass makes
+no progress through those unconstrained paths. Logical exact-card loops
+likewise continue evaluating and placing zero-cost capacity even when paid
+admission for the service or card is closed.
 
 `service_exhausted()` is an advisory classification: it is true only when a
 finite fresh-paid service headroom is less than or equal to zero. A `None`
@@ -242,11 +241,13 @@ still proceeds through the normal broker, grant, and reconciliation-fence
 checks; the precheck preserves that opportunity but does not guarantee a
 launch.
 
-A recovery-pinned unresolved paid row still counts against exact-pool,
-service-envelope, and card-frontier capacity. It does not acquire a second
-claim. Its durable claim is immutable to the exact pool selected before the
-restart: a retry against that same pool is idempotent, while a retry naming a
-different pool fails before candidate-pool, waiter, or replica mutation.
+A recovery-pinned unresolved paid row, including a cost-rebalance replacement,
+still counts against exact-pool, service-envelope, and card-frontier capacity.
+It does not acquire a second claim. Its durable claim is immutable to the exact
+pool selected before the restart: a retry against that same pool is idempotent,
+while a retry naming a different pool fails before candidate-pool, waiter, or
+replica mutation. See `serve-restart-safe-cost-rebalance.md` for the
+replacement protocol.
 
 Fresh claim acquisition is blocked once a service enters a launch-blocking
 status. Adoption and launch-outcome persistence remain allowed for the same
@@ -538,7 +539,7 @@ compatible with the current exact-card batch:
 
 Here, “batch stops” applies only to fresh paid admission. It is not a
 control-flow break for the whole scaling pass. The physical placement loop
-continues zero-cost reserved demand, reserved fill, and already-pinned
+continues zero-cost reserved demand, reserved fill, and durable recovery-pinned
 cost-rebalance replacements, and terminates only after a complete pass makes no
 progress through any of those paths. Logical exact-card reconciliation
 similarly retains zero-cost candidates and may satisfy one or more card targets
@@ -547,7 +548,9 @@ is feedback-deferred. Within one physical batch, a frontier, priority, or
 service-envelope stop memoizes only the exact fresh-demand resources override
 that encountered it. Later equivalent paid decisions are skipped without
 repeating selection or central admission, while different card overrides,
-reserved-fill sentinels, and pinned-rebalance overrides are still examined.
+reserved-fill sentinels, and rebalance overrides are still examined. A fresh
+rebalance override is exact-location pinned but still acquires paid admission;
+only a recovery row that already owns a durable claim bypasses new admission.
 The wave-local stop sequence advances even when the relevant envelope or
 deferral marker existed before the batch, so a recovered full service or
 already-deferred card performs one no-progress selection rather than scanning
@@ -761,7 +764,8 @@ future slot. `HIGHER_PRIORITY_WAITING` is returned only when real headroom
 exists but belongs to a better waiter. A physical wave stops further fresh paid
 attempts against that deferred path so it neither repeats the database claim
 nor consumes a benched location's one TTL retry probe, but still completes
-zero-cost and pinned-replacement work before declaring no progress. Logical
+zero-cost and durable recovery-pinned replacement work before declaring no
+progress. Logical
 exact-card reconciliation independently continues other card targets and
 zero-cost placement for the deferred card.
 
@@ -956,7 +960,8 @@ expose counts and limits, not raw pool keys containing workspace identity.
 `SERVICE_SATURATED` exhausts paid admission for the service-wide wave.
 `FEEDBACK_PENDING` defers only the affected accelerator card, so independent
 cards may continue until the shared service envelope binds. Neither result
-terminates zero-cost reserved demand/fill or a pinned cost-rebalance launch.
+terminates zero-cost reserved demand/fill or a durable recovery-pinned
+cost-rebalance launch.
 The physical and logical orchestration loops distinguish “no fresh paid
 candidate” from “no placement progress.” The logical service-envelope
 precheck prunes only a proven paid-only override and continues other exact
@@ -1035,7 +1040,7 @@ capacity without deriving either durable claim envelope from it.
 | A saturated pool spills regardless of waiter order; with real headroom the higher-priority waiter gets the next claim; no existing claim is revoked; one deferred physical wave performs one central claim and selection attempt without paid spill | PostgreSQL priority arbitration and large-wave replica-manager tests |
 | The default exploration frontier is two; invalid overrides fall back; one service/card cannot open a third pool while its first two own unresolved claims, but a pool saturated solely by another service may be skipped | Pure selection, configuration, and real-PostgreSQL ownership tests |
 | Two overlapping claims for one service/card race on different candidates with one slot left; the service-row lock admits exactly one, the other returns `feedback_pending`, and neither a replica nor waiter leaks | Real-PostgreSQL concurrency test |
-| Service/frontier exhaustion suppresses only fresh paid admission: physical waves continue zero-cost reserved demand/fill and pinned cost-rebalance until a full pass makes no progress, and logical card loops continue zero-cost placement | Physical regressions with an envelope-blocked paid-only override ordered before later reserved-fill or pinned work, paid frontier and priority deferral followed by later real fill, paid frontier deferral followed by a later pinned replacement, exhausted-envelope zero-cost demand, initial service-envelope exhaustion and pre-existing frontier/priority stops across a 400-entry wave, plus logical exact-card zero-cost progress tests |
+| Service/frontier exhaustion suppresses only fresh paid admission: physical waves continue zero-cost reserved demand/fill and durable recovery-pinned cost-rebalance until a full pass makes no progress, while fresh cost replacements remain subject to paid admission and logical card loops continue zero-cost placement | Physical regressions with an envelope-blocked paid-only override ordered before later reserved fill, fresh rebalance admission-denial tests, durable replacement recovery tests, paid frontier and priority deferral followed by later real fill, exhausted-envelope zero-cost demand, initial service-envelope exhaustion and pre-existing frontier/priority stops across a 400-entry wave, plus logical exact-card zero-cost progress tests |
 | A frontier rejection reconciles every waiter/card under only the service lock before any pool lock; unknown or malformed owned keys count against every card and withdraw ineligible waiters across every affected frontier | Real-PostgreSQL waiter/frontier and malformed-key tests |
 | A frontier- or envelope-filling acquisition commits first and cleans in a separate service-row-only transaction; cleanup failure still returns `ACQUIRED` and the stale waiter expires within the 45-second TTL | Real-PostgreSQL lock-order, failure-injection, and TTL tests |
 | A high-priority service waits on saturated A, then fills its frontier on B/C; its waiter on A is withdrawn after commit so a lower-priority service can acquire released A headroom without waiting for TTL | Real-PostgreSQL waiter/frontier interaction test |
@@ -1090,11 +1095,13 @@ claims in total. Release one claim and confirm exactly one new claim can enter
 only when its card frontier also has space.
 
 While that paid envelope is full, expose zero-cost reserved demand and a
-reserved-fill grant, then request an already-pinned cost-rebalance replacement.
-Confirm a physical wave continues all three paths and stops only after a full
-pass makes no placement progress. Repeat through logical exact-card
-reconciliation and confirm paid deferral for one or every card does not prevent
-available zero-cost capacity from satisfying its compatible card target.
+reserved-fill grant, then restart a durable cost-rebalance replacement that
+already owns its exact-pool claim. Confirm a physical wave continues all three
+paths and stops only after a full pass makes no placement progress. Confirm a
+fresh rebalance candidate is instead deferred by the full envelope. Repeat
+through logical exact-card reconciliation and confirm paid deferral for one or
+every card does not prevent available zero-cost capacity from satisfying its
+compatible card target.
 
 Have a high-priority service wait on saturated pool A, then acquire B and C so
 its card frontier becomes full. Confirm the acquisition commits before
@@ -1201,9 +1208,9 @@ Monitor learned pool limit, effective admission limit, cooldown/probe state,
 active and service-owned claims, frontier width, feedback deferrals, oldest
 unresolved claim age, stale reconciliation, admission denials, priority
 deferrals, post-commit waiter-cleanup failures and TTL expiry, recovery
-pool-mismatch rejections, zero-cost and pinned-rebalance progress during paid
-deferral, success ramps, failure resets, placement spread, API request queue
-depth, provider capacity errors, and launch latency.
+pool-mismatch rejections, zero-cost and durable recovery-pinned rebalance
+progress during paid deferral, success ramps, failure resets, placement spread,
+API request queue depth, provider capacity errors, and launch latency.
 
 Rollback is an image rollback. Existing pool, claim, waiter, success, and
 failure rows remain schema-compatible with revision 027. Rolling back the
@@ -1291,7 +1298,8 @@ Pre-rebase frontier evidence on 2026-07-24:
 Post-rebase implementation-review evidence on 2026-07-24:
 
 - Review accepted three required corrections: paid deferral must preserve
-  zero-cost and pinned-rebalance progress; recovery claims must remain
+  zero-cost and durable recovery-pinned rebalance progress; recovery claims
+  must remain
   immutable to their exact pools; and service-row-only waiter reconciliation
   must cover every card, including conservative unknown/malformed ownership.
 - The accepted cleanup contract keeps `ACQUIRED` authoritative after the main
@@ -1373,9 +1381,10 @@ Frontier correction evidence on 2026-07-24:
 - The tree is rebased on PR #926 merge `8eab90191` (implementation
   `dbbe1ab3f`). Its logical paid-only precheck is retained, while the physical
   path uses exact-override memoization instead of a whole-wave break. Ordered
-  regressions prove an envelope-blocked paid exact card cannot suppress a
-  later reserved-fill or pinned-rebalance override, and a paid L4 card can be
-  skipped before a compatible zero-cost A100 card launches.
+  regressions prove an envelope-blocked paid exact card cannot suppress later
+  reserved fill or a durable replacement recovery, a fresh rebalance override
+  cannot bypass paid admission, and a paid L4 card can be skipped before a
+  compatible zero-cost A100 card launches.
 - The repository formatter passes YAPF, isort, mypy across 746 source files,
   pylint at 10.00/10, dashboard ESLint/Prettier, compilation, and
   `git diff --check`.
@@ -1446,9 +1455,9 @@ Frontier correction CI, publication, and production evidence on 2026-07-24:
   recovery requests above re-drove already-pinned rows and therefore do not
   exercise fresh frontier admission. Production has not yet supplied a natural
   wave that can demonstrate successive 4-to-8-to-16 deepening or simultaneous
-  paid deferral with zero-cost/pinned progress. Those paths are covered by
-  deterministic and real-PostgreSQL CI and remain explicit post-rollout
-  observational evidence.
+  paid deferral with zero-cost/durable-recovery progress. Those paths are
+  covered by deterministic and real-PostgreSQL CI and remain explicit
+  post-rollout observational evidence.
 
 ## Release Gate Results
 

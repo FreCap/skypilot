@@ -23,6 +23,7 @@ import pytest
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
+from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.serve import paid_capacity
@@ -599,11 +600,17 @@ class TestVersionSpecMemoizedPerProbeRound:
 
 
 def _capacity_error() -> exceptions.ResourcesUnavailableError:
-    return exceptions.ResourcesUnavailableError(
-        'no capacity',
-        failover_history=[
-            exceptions.ResourcesUnavailableError('zone exhausted')
-        ])
+    provider_error = RuntimeError('no provider capacity')
+    provider_error.response = {
+        'Error': {
+            'Code': 'InsufficientInstanceCapacity',
+            'Message': 'no provider capacity',
+        }
+    }
+    attempt = exceptions.ResourcesUnavailableError('zone exhausted')
+    attempt.__cause__ = provider_error
+    return exceptions.ResourcesUnavailableError('no capacity',
+                                                failover_history=[attempt])
 
 
 class TestLaunchClusterRetry:
@@ -626,9 +633,13 @@ class TestLaunchClusterRetry:
         """
         observed_workspaces = kwargs.pop('observed_workspaces', None)
         raised = None
+        task = mock.MagicMock()
+        resource = mock.MagicMock()
+        resource.cloud = clouds.AWS()
+        task.resources = {resource}
         with mock.patch(
                 'sky.serve.replica_managers.task_lib.Task.from_yaml_str',
-                return_value=mock.MagicMock()), \
+                return_value=task), \
              mock.patch('sky.serve.replica_managers.usage_lib'), \
              mock.patch('sky.serve.replica_managers.sdk') as mock_sdk, \
              mock.patch('sky.serve.replica_managers.terminate_cluster'
@@ -2352,6 +2363,9 @@ class TestLaunchOwnershipFence:
         infos[
             2].status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
         launch_threads[0].format_exc = 'no capacity'
+        launch_threads[0].exception = (
+            replica_managers._ReplicaLaunchCapacityError('no capacity',
+                                                         reason='capacity'))
         launch_threads[1].format_exc = None
 
         with mock.patch.object(mgr,
@@ -2370,7 +2384,8 @@ class TestLaunchOwnershipFence:
             mgr._refresh_thread_pool()
 
         placer.set_active.assert_not_called()
-        placer.set_preemptive.assert_called_once_with(location)
+        placer.set_preemptive.assert_called_once_with(location,
+                                                      reason='capacity')
         remove.assert_called_once_with(3)
         launch_threads[2].start.assert_not_called()
         assert len(mgr._launch_thread_pool) == 0
@@ -2407,6 +2422,8 @@ class TestLaunchOwnershipFence:
         mgr, infos = self._queued_manager([1, 2])
         failed_thread = mgr._launch_thread_pool[1]
         failed_thread.format_exc = 'no capacity'
+        failed_thread.exception = (replica_managers._ReplicaLaunchCapacityError(
+            'no capacity', reason='capacity'))
         infos[
             1].status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
         location = mock.Mock()
@@ -2417,8 +2434,8 @@ class TestLaunchOwnershipFence:
             info.get_spot_location.return_value = location
 
         events = []
-        placer.set_preemptive.side_effect = lambda _location: events.append(
-            'bench')
+        placer.set_preemptive.side_effect = lambda _location, **_kwargs: (
+            events.append('bench'))
 
         def _persist(*_args, **_kwargs):
             events.append('persist')
@@ -2451,7 +2468,8 @@ class TestLaunchOwnershipFence:
         if failure_stage == 'cleanup':
             expected.append('cleanup')
         assert events == expected
-        placer.set_preemptive.assert_called_once_with(location)
+        placer.set_preemptive.assert_called_once_with(location,
+                                                      reason='capacity')
         assert 2 in mgr._launch_thread_pool
         mgr._launch_thread_pool[2].start.assert_not_called()
 
@@ -2704,7 +2722,7 @@ class TestInfrastructureInterruptionRecovery:
                                           is_scale_down=True)
         if is_spot:
             manager._spot_placer.set_preemptive.assert_called_once_with(
-                location)
+                location, reason='preempted')
         else:
             manager._spot_placer.set_preemptive.assert_not_called()
 
@@ -2726,7 +2744,8 @@ class TestInfrastructureInterruptionRecovery:
              mock.patch.object(manager, '_terminate_replica'):
             assert manager._handle_preemption(info) is True
 
-        manager._spot_placer.set_preemptive.assert_called_once_with(spot)
+        manager._spot_placer.set_preemptive.assert_called_once_with(
+            spot, reason='preempted')
 
     def test_failed_research_probe_enters_interruption_prefilter(self):
         research = self._location()
@@ -8415,8 +8434,9 @@ class TestPaidLocationLaunchBudget:
         assert manager._next_replica_id == 3
         assert len(manager._launch_thread_pool) == 2
 
-    @pytest.mark.parametrize('exempt_kind', ['reserved_fill', 'pinned'])
-    def test_exhausted_paid_envelope_scans_later_exempt_override(
+    @pytest.mark.parametrize('exempt_kind',
+                             ['reserved_fill', 'fresh_rebalance'])
+    def test_exhausted_paid_envelope_scans_later_special_override(
             self, exempt_kind):
         zero = make_location('research', {'A100': 1},
                              use_spot=False,
@@ -8475,20 +8495,23 @@ class TestPaidLocationLaunchBudget:
                                     'thread_utils.SafeThread'):
             manager._scale_up_batch_locked([paid_only, exempt])
 
-        claim.assert_not_called()
-        manager._persist_replica.assert_called_once()
-        persisted = manager._persist_replica.call_args.args[1]
         if exempt_kind == 'reserved_fill':
+            claim.assert_not_called()
+            manager._persist_replica.assert_called_once()
+            persisted = manager._persist_replica.call_args.args[1]
             assert persisted.reserved_fill
             assert persisted.is_zero_cost
             assert replica_managers.spot_placer.locations_match_placement(
                 persisted.get_spot_location(), zero)
+            assert manager._next_replica_id == 2
+            assert len(manager._launch_thread_pool) == 1
         else:
-            assert persisted.cost_rebalance_for_replica_id == 7
-            assert replica_managers.spot_placer.locations_match_placement(
-                persisted.get_spot_location(), paid)
-        assert manager._next_replica_id == 2
-        assert len(manager._launch_thread_pool) == 1
+            # A fresh cost replacement is location-pinned but not yet
+            # admitted. It must not bypass a full paid service envelope.
+            claim.assert_not_called()
+            manager._persist_replica.assert_not_called()
+            assert manager._next_replica_id == 1
+            assert not manager._launch_thread_pool
 
     @pytest.mark.parametrize(
         'claim_result',
@@ -8564,7 +8587,7 @@ class TestPaidLocationLaunchBudget:
             assert budget.priority_deferred_pool_keys == {paid_key}
             assert not budget.feedback_deferred_frontiers
 
-    def test_feedback_deferral_scans_later_pinned_rebalance(self):
+    def test_feedback_deferral_rechecks_fresh_pinned_rebalance(self):
         paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
         manager = self._manager({paid: 1.0})
         manager._service_hash = 'hash'
@@ -8613,15 +8636,14 @@ class TestPaidLocationLaunchBudget:
                                                    'thread_utils.SafeThread'):
             manager._scale_up_batch_locked([{'use_spot': True}, pinned])
 
-        claim.assert_called_once()
-        manager._persist_replica.assert_called_once()
-        persisted = manager._persist_replica.call_args.args[1]
-        assert persisted.cost_rebalance_for_replica_id == 7
-        assert replica_managers.spot_placer.locations_match_placement(
-            persisted.get_spot_location(), paid)
+        # The first generic demand and the later fresh pinned replacement
+        # each require admission. The marker pins location; only a durable
+        # recovery row with an existing claim bypasses new admission.
+        assert claim.call_count == 2
+        manager._persist_replica.assert_not_called()
         assert budget.feedback_deferred_frontiers == {('l4',)}
-        assert manager._next_replica_id == 2
-        assert len(manager._launch_thread_pool) == 1
+        assert manager._next_replica_id == 1
+        assert not manager._launch_thread_pool
 
     def test_priority_deferral_does_not_exhaust_or_spill_pool(self):
         cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -9473,9 +9495,8 @@ class TestRefreshThreadPoolUnfencedLaunch:
     pre-check raises `_UnfencedExternalLbLaunchError`, but only this pass turns
     it into `user_app_failed` (so the autoscaler stops appending rows) and
     excludes it from `failed_spot_locations` / `failed_spot_availability` (so a
-    missing owner fence does not bench an otherwise-usable location). A generic
-    launch failure retains the historical local bench but must not reset shared
-    provider-capacity evidence.
+    missing owner fence does not bench an otherwise-usable location). Generic
+    launch failures are also not availability evidence.
     """
 
     def test_empty_refresh_does_not_touch_paid_capacity_authority(self):
@@ -9589,14 +9610,15 @@ class TestRefreshThreadPoolUnfencedLaunch:
         }
         assert terminated == [7]
 
-    def test_generic_failure_still_benches_location_and_stays_recoverable(self):
+    def test_generic_failure_does_not_bench_location(self):
         info, placer, terminated, persist_paid_outcomes, _ = self._run(
             RuntimeError('transient'))
-        # An ordinary launch failure keeps the historical behavior: the
-        # location is benched and the replica remains recoverable.
+        # An ordinary launch failure remains recoverable but says nothing
+        # about provider inventory.
         assert info.status_property.user_app_failed is False
-        placer.set_preemptive.assert_called_once_with(mock.ANY)
-        assert info.status_property.failed_spot_availability is True
+        placer.set_preemptive.assert_not_called()
+        placer.release_retry.assert_called_once_with(mock.ANY)
+        assert info.status_property.failed_spot_availability is False
         assert persist_paid_outcomes.call_args.kwargs['outcomes'] == {
             7: replica_managers.paid_capacity.LaunchOutcome.OTHER_FAILURE
         }
@@ -9604,15 +9626,32 @@ class TestRefreshThreadPoolUnfencedLaunch:
 
     def test_typed_capacity_failure_resets_shared_pool_evidence(self):
         info, placer, terminated, persist_paid_outcomes, warning = self._run(
-            replica_managers._ReplicaLaunchCapacityError('exhausted'))
+            replica_managers._ReplicaLaunchCapacityError('exhausted',
+                                                         reason='capacity'))
         assert info.status_property.user_app_failed is False
-        placer.set_preemptive.assert_called_once_with(mock.ANY)
+        placer.set_preemptive.assert_called_once_with(mock.ANY,
+                                                      reason='capacity')
         assert info.status_property.failed_spot_availability is True
         assert persist_paid_outcomes.call_args.kwargs['outcomes'] == {
             7: replica_managers.paid_capacity.LaunchOutcome.CAPACITY_FAILURE
         }
         warning.assert_called_once()
         message = warning.call_args.args[0]
-        assert 'failure wave: failures=1, exact_pools=unknown' in message
+        assert ('failure wave: capacity_failures=1, quota_failures=0, '
+                'exact_pools=unknown') in message
         assert 'boom traceback' not in message
+        assert terminated == [7]
+
+    def test_typed_quota_failure_uses_regional_bench(self):
+        info, placer, terminated, persist_paid_outcomes, warning = self._run(
+            replica_managers._ReplicaLaunchCapacityError('quota exhausted',
+                                                         reason='quota'))
+
+        placer.set_quota_limited.assert_called_once_with(mock.ANY)
+        placer.set_preemptive.assert_not_called()
+        assert info.status_property.failed_spot_availability is True
+        assert persist_paid_outcomes.call_args.kwargs['outcomes'] == {
+            7: replica_managers.paid_capacity.LaunchOutcome.QUOTA_FAILURE
+        }
+        warning.assert_called_once()
         assert terminated == [7]

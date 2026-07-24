@@ -37,6 +37,8 @@ _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
 # while restoring downscale liveness under trickle traffic. The veto does
 # not restart the already elapsed downscale delay.
 _MAX_CONSECUTIVE_DOWNSCALE_VETOES = 2
+_COST_REBALANCE_STATE_VERSION = 1
+_COST_REBALANCE_STATE_MAX_ENTRIES = 256
 
 
 class AutoscalerDecisionOperator(enum.Enum):
@@ -414,6 +416,7 @@ class Autoscaler:
         self._cost_rebalance_candidate_since: dict[tuple[int,
                                                          spot_placer.Location],
                                                    float] = {}
+        self._cost_rebalance_state_dirty = False
         self._cost_rebalance_replica_cost_cache: dict[int, float] = {}
         # Freshness fence for priority-only gauges. A stale LB report may keep
         # a conservative scale-up target, but it must not keep refreshing a
@@ -562,13 +565,82 @@ class Autoscaler:
             getattr(spec, 'cost_rebalance_max_parallel_replacements', 1))
         self.cost_rebalance_stabilization_seconds = float(
             getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
-        self._cost_rebalance_candidate_since.clear()
+        self._clear_cost_rebalance_candidates()
         self.warm_retention_target_by_accelerator = {}
         self.cold_launch_authority_by_accelerator = {}
 
     def set_spot_placer(self, placer: spot_placer.SpotPlacer | None) -> None:
         """Publish ReplicaManager's live placement/bench state for this tick."""
         self._cost_rebalance_spot_placer = placer
+
+    def _clear_cost_rebalance_candidates(self) -> None:
+        if self._cost_rebalance_candidate_since:
+            self._cost_rebalance_candidate_since.clear()
+            self._cost_rebalance_state_dirty = True
+
+    def dump_cost_rebalance_state(self) -> dict[str, Any]:
+        """Return bounded JSON-safe continuous-eligibility evidence."""
+        limit = min(_COST_REBALANCE_STATE_MAX_ENTRIES,
+                    max(16, 4 * self.cost_rebalance_max_parallel_replacements))
+        candidates = []
+        for (replica_id, location), first_seen_at in list(
+                self._cost_rebalance_candidate_since.items())[:limit]:
+            if not math.isfinite(first_seen_at):
+                continue
+            candidates.append({
+                'replica_id': replica_id,
+                'location': location.to_pickleable(),
+                'first_seen_at': first_seen_at,
+            })
+        return {
+            'version': _COST_REBALANCE_STATE_VERSION,
+            'service_version': self.latest_version,
+            'candidates': candidates,
+        }
+
+    def load_cost_rebalance_state(self, state: dict[str, Any] | None) -> None:
+        """Restore candidate timers without extending them across a restart."""
+        if (not isinstance(state, dict) or
+                state.get('version') != _COST_REBALANCE_STATE_VERSION or
+                state.get('service_version') != self.latest_version):
+            return
+        candidates = state.get('candidates')
+        if not isinstance(candidates, list):
+            return
+        limit = min(_COST_REBALANCE_STATE_MAX_ENTRIES,
+                    max(16, 4 * self.cost_rebalance_max_parallel_replacements))
+        now = time.time()
+        restored = {}
+        for raw in candidates[:limit]:
+            if not isinstance(raw, dict):
+                continue
+            replica_id = raw.get('replica_id')
+            first_seen_at = raw.get('first_seen_at')
+            if (not isinstance(replica_id, int) or
+                    isinstance(replica_id, bool) or replica_id < 0 or
+                    not isinstance(first_seen_at, (int, float)) or
+                    isinstance(first_seen_at, bool) or
+                    not math.isfinite(first_seen_at)):
+                continue
+            raw_location = raw.get('location')
+            if not isinstance(raw_location, dict):
+                continue
+            try:
+                location = spot_placer.Location.from_pickleable(raw_location)
+            except (AssertionError, KeyError, TypeError, ValueError):
+                continue
+            if location is None:
+                continue
+            restored[(replica_id, location)] = min(float(first_seen_at), now)
+        self._cost_rebalance_candidate_since = restored
+        self._cost_rebalance_state_dirty = False
+
+    @property
+    def cost_rebalance_state_dirty(self) -> bool:
+        return self._cost_rebalance_state_dirty
+
+    def mark_cost_rebalance_state_persisted(self) -> None:
+        self._cost_rebalance_state_dirty = False
 
     def collect_request_information(
             self, request_aggregator_info: dict[str, Any]) -> None:
@@ -1525,6 +1597,12 @@ class Autoscaler:
         placer = self._cost_rebalance_spot_placer
         if placer is None:
             return None
+        if (self.reserved_capacity_fill and
+            (getattr(incumbent, 'reserved_fill', False) or
+             getattr(incumbent, 'is_zero_cost', False))):
+            # The reserved-fill controller exclusively owns convergence to
+            # free capacity. Generic rebalance handles paid-to-paid movement.
+            return None
         incumbent_location = incumbent.get_spot_location()
         if incumbent_location is None:
             return None
@@ -1555,6 +1633,8 @@ class Autoscaler:
             # complete centralized catalog and cannot resolve providers.
             candidate_cost = placer.cost_per_hour(location)
             if not math.isfinite(candidate_cost) or candidate_cost < 0:
+                continue
+            if self.reserved_capacity_fill and candidate_cost == 0:
                 continue
             candidate_unit_cost = candidate_cost / candidate_capacity
             if candidate_unit_cost > maximum_unit_cost + 1e-12:
@@ -1616,14 +1696,14 @@ class Autoscaler:
 
         if (not self.cost_rebalance or
                 self._cost_rebalance_spot_placer is None):
-            self._cost_rebalance_candidate_since.clear()
+            self._clear_cost_rebalance_candidates()
             return decisions
         if ordinary_decisions:
-            self._cost_rebalance_candidate_since.clear()
+            self._clear_cost_rebalance_candidates()
             return decisions
         if any(not info.is_terminal and info.version != self.latest_version
                for info in replica_infos):
-            self._cost_rebalance_candidate_since.clear()
+            self._clear_cost_rebalance_candidates()
             return decisions
 
         slots = self.cost_rebalance_max_parallel_replacements - len(pairs)
@@ -1652,7 +1732,7 @@ class Autoscaler:
                 for current in planned_locations
             ) for location in active_locations
         }
-        now = time.monotonic()
+        now = time.time()
         current_candidate_keys: set[tuple[int, spot_placer.Location]] = set()
         for incumbent in candidates:
             location = self._best_cost_rebalance_candidate(
@@ -1661,8 +1741,11 @@ class Autoscaler:
                 continue
             key = (incumbent.replica_id, location)
             current_candidate_keys.add(key)
-            first_seen = self._cost_rebalance_candidate_since.setdefault(
-                key, now)
+            first_seen = self._cost_rebalance_candidate_since.get(key)
+            if first_seen is None:
+                self._cost_rebalance_candidate_since[key] = now
+                self._cost_rebalance_state_dirty = True
+                first_seen = now
             if (now - first_seen < self.cost_rebalance_stabilization_seconds):
                 continue
             if slots <= 0:
@@ -1687,6 +1770,7 @@ class Autoscaler:
         for key in list(self._cost_rebalance_candidate_since):
             if key not in current_candidate_keys:
                 del self._cost_rebalance_candidate_since[key]
+                self._cost_rebalance_state_dirty = True
         return decisions
 
     def _notify_rollout_blocked(self, previous_version: int) -> None:

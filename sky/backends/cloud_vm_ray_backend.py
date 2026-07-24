@@ -990,6 +990,30 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
     return None
 
 
+def classify_resources_unavailable_error(
+        cloud: 'clouds.Cloud',
+        error: exceptions.ResourcesUnavailableError) -> str | None:
+    """Classify a terminal failover history using typed provider evidence.
+
+    Every recorded attempt must be recognizable as capacity or quota.  A
+    mixed or unstructured history is intentionally left unclassified so
+    caller-local placement policy does not bench a healthy location for an
+    authentication, networking, throttling, or controller error.
+    """
+    failures: list[BaseException] = list(error.failover_history)
+    if not failures:
+        failures = [error]
+    reasons: list[str] = []
+    for failure in failures:
+        reason = _classify_capacity_error(cloud, failure)
+        if reason is None:
+            return None
+        reasons.append(reason)
+    if not reasons:
+        return None
+    return 'quota' if 'quota' in reasons else 'capacity'
+
+
 def _is_quota_error(error: BaseException) -> bool:
     """Whether an exception chain contains a recognized provider quota code."""
     return any(code in _PROVIDER_QUOTA_ERROR_CODES

@@ -127,6 +127,17 @@ services_table = sqlalchemy.Table(
     # from an in-progress handoff so a controller restart before PREPARING
     # cannot erase the scale-down floor copied into the next cutover.
     sqlalchemy.Column('lb_last_demand_snapshot', sqlalchemy.Text),
+    # Controller-owned placement policy state. Separate columns prevent the
+    # replica-manager failure refresher and autoscaler loop from clobbering
+    # each other's restart evidence.
+    sqlalchemy.Column(
+        'spot_placement_state',
+        sqlalchemy.JSON(none_as_null=True).with_variant(
+            postgresql.JSONB(none_as_null=True), 'postgresql')),
+    sqlalchemy.Column(
+        'cost_rebalance_state',
+        sqlalchemy.JSON(none_as_null=True).with_variant(
+            postgresql.JSONB(none_as_null=True), 'postgresql')),
 )
 
 replicas_table = sqlalchemy.Table(
@@ -2925,6 +2936,112 @@ def _lock_service_owner_in_session(
             owner[3] not in ServiceStatus.replica_launch_blocking_statuses())
 
 
+def get_service_placement_policy_states(
+        service_name: str) -> dict[str, dict[str, Any] | None] | None:
+    """Read restart-safe placer and economic-stabilization state."""
+    engine = _db_manager.get_engine()
+    try:
+        with orm.Session(engine) as session:
+            row = session.execute(
+                sqlalchemy.select(
+                    services_table.c.spot_placement_state,
+                    services_table.c.cost_rebalance_state,
+                ).where(services_table.c.name == service_name)).fetchone()
+    except sqlalchemy.exc.SQLAlchemyError as e:
+        if _placement_policy_columns_missing(e):
+            return None
+        raise
+    if row is None:
+        return None
+    return {
+        'spot_placement_state': row.spot_placement_state if isinstance(
+            row.spot_placement_state, dict) else None,
+        'cost_rebalance_state': row.cost_rebalance_state if isinstance(
+            row.cost_rebalance_state, dict) else None,
+    }
+
+
+def _set_service_placement_policy_state(
+    service_name: str,
+    service_hash: str,
+    controller_owner: tuple[int | None, str | None] | None,
+    *,
+    column: sqlalchemy.Column[Any],
+    state: dict[str, Any],
+    require_launch_allowed: bool,
+) -> bool:
+    """Persist one controller-owned policy state under the service fence."""
+    engine = _db_manager.get_engine()
+    try:
+        with orm.Session(engine) as session:
+            if not _lock_service_owner_in_session(
+                    session,
+                    service_name,
+                    service_hash,
+                    controller_owner,
+                    require_launch_allowed=require_launch_allowed):
+                session.rollback()
+                return False
+            session.execute(
+                sqlalchemy.update(services_table).where(
+                    services_table.c.name == service_name).values(
+                        {column: state}))
+            session.commit()
+    except sqlalchemy.exc.SQLAlchemyError as e:
+        if _placement_policy_columns_missing(e):
+            # Mixed rollout compatibility. Migration 029 is ordered before
+            # controller deployment; until it lands, retain process-local
+            # behavior instead of blocking every placer-backed launch.
+            return True
+        raise
+    return True
+
+
+def _placement_policy_columns_missing(
+        error: sqlalchemy.exc.SQLAlchemyError) -> bool:
+    """Whether an old schema lacks migration-029 policy columns."""
+    original = getattr(error, 'orig', None)
+    sqlstate = (getattr(original, 'sqlstate', None) or
+                getattr(original, 'pgcode', None))
+    message = str(error).casefold()
+    mentions_column = ('spot_placement_state' in message or
+                       'cost_rebalance_state' in message)
+    return mentions_column and (sqlstate == '42703' or 'no such column'
+                                in message or 'undefined column' in message)
+
+
+def set_service_spot_placement_state(
+    service_name: str,
+    service_hash: str,
+    controller_owner: tuple[int | None, str | None] | None,
+    state: dict[str, Any],
+) -> bool:
+    """Persist exact-location bench evidence, including during teardown."""
+    return _set_service_placement_policy_state(
+        service_name,
+        service_hash,
+        controller_owner,
+        column=services_table.c.spot_placement_state,
+        state=state,
+        require_launch_allowed=False)
+
+
+def set_service_cost_rebalance_state(
+    service_name: str,
+    service_hash: str,
+    controller_owner: tuple[int | None, str | None] | None,
+    state: dict[str, Any],
+) -> bool:
+    """Persist candidate stabilization before a replacement can launch."""
+    return _set_service_placement_policy_state(
+        service_name,
+        service_hash,
+        controller_owner,
+        column=services_table.c.cost_rebalance_state,
+        state=state,
+        require_launch_allowed=True)
+
+
 def _valid_paid_capacity_claims_in_session(
     session: orm.Session, pool_key: str
 ) -> tuple[list[tuple[str, str, int]], list[tuple[str, str, int]]]:
@@ -3594,7 +3711,8 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
             if pool is None:
                 raise RuntimeError('Paid-capacity pool disappeared.')
             capacity_failed = any(
-                outcome == paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+                outcome in (paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+                            paid_capacity.LaunchOutcome.QUOTA_FAILURE)
                 for outcome, _ in pool_outcomes)
             if capacity_failed:
                 session.execute(

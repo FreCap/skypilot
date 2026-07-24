@@ -216,18 +216,27 @@ function FilterSelect({ label, value, options, onChange }) {
 function locationTooltip(location) {
   const availability = locationAvailability(location);
   const availabilityLabel = {
-    [LOCATION_AVAILABILITY.AVAILABLE_SPOT]: 'Available spot',
-    [LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND]: 'Available on-demand',
-    [LOCATION_AVAILABILITY.UNAVAILABLE]: 'Unavailable',
+    [LOCATION_AVAILABILITY.AVAILABLE_SPOT]: 'Eligible spot',
+    [LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND]: 'Eligible on-demand',
+    [LOCATION_AVAILABILITY.UNAVAILABLE]: 'Ineligible',
   }[availability];
   const details = [
     `Zone: ${location.zone || '-'}`,
-    `Availability: ${availabilityLabel}`,
+    `Eligibility: ${availabilityLabel}`,
+    `Instance type: ${location.instanceType || '-'}`,
     `Card: ${formatAccelerators(location.accelerators)}`,
     `Price: ${formatHourlyPrice(location.cachedHourlyCost)}`,
     `Status: ${locationDisplayStatus(location)}`,
     `Stored: ${location.storedStatus || '-'} · Effective: ${location.effectiveStatus || '-'}`,
   ];
+  if (location.benchReason) {
+    details.push(`Bench reason: ${location.benchReason}`);
+  }
+  if (location.paidAdmission) {
+    details.push(
+      `Paid admission: ${location.paidAdmission.state || '-'} · pool remaining: ${location.paidAdmission.poolRemaining ?? '-'} · service remaining: ${location.paidAdmission.serviceRemaining ?? '-'}`
+    );
+  }
   if (location.nextProbeAt) {
     details.push(
       location.probeEligible
@@ -257,8 +266,13 @@ function LocationChip({ location }) {
       className={`inline-flex cursor-help items-center gap-1.5 rounded-md border px-2 py-1 text-xs ${tone}`}
     >
       <span className="font-medium">
-        {formatAccelerators(location.accelerators)}
+        {location.instanceType || formatAccelerators(location.accelerators)}
       </span>
+      {location.instanceType && (
+        <span className="opacity-80">
+          {formatAccelerators(location.accelerators)}
+        </span>
+      )}
       <span className="opacity-80">
         {formatHourlyPrice(location.cachedHourlyCost)}
       </span>
@@ -326,8 +340,9 @@ function PlacerStateCard({ state }) {
       <div className="border-b px-4 py-3">
         <h3 className="font-semibold">Service fallback locations</h3>
         <p className="mt-1 text-sm text-gray-500">
-          One row per provider and region. Hover a card for its zone, exact
-          availability, and next probe.
+          One row per provider and region. Eligible means the controller may
+          attempt a launch; it does not promise live provider inventory. Hover a
+          card for its exact instance, admission state, and next probe.
         </p>
       </div>
       {!state.available ? (
@@ -380,21 +395,21 @@ function PlacerStateCard({ state }) {
               onChange={(value) => setFilter('card', value)}
             />
             <FilterSelect
-              label="Availability"
+              label="Eligibility"
               value={filters.availability}
               options={[
-                { value: ALL_FILTER_VALUE, label: 'All availability' },
+                { value: ALL_FILTER_VALUE, label: 'All eligibility' },
                 {
                   value: LOCATION_AVAILABILITY.AVAILABLE_SPOT,
-                  label: 'Available spot',
+                  label: 'Eligible spot',
                 },
                 {
                   value: LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND,
-                  label: 'Available on-demand',
+                  label: 'Eligible on-demand',
                 },
                 {
                   value: LOCATION_AVAILABILITY.UNAVAILABLE,
-                  label: 'Unavailable',
+                  label: 'Ineligible',
                 },
               ]}
               onChange={(value) => setFilter('availability', value)}
@@ -441,8 +456,8 @@ function PlacerStateCard({ state }) {
                 <TableHeader>
                   <TableRow>
                     <TableHead className="w-52">Provider / region</TableHead>
-                    <TableHead>Available</TableHead>
-                    <TableHead>Unavailable</TableHead>
+                    <TableHead>Eligible</TableHead>
+                    <TableHead>Ineligible</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>

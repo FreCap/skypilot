@@ -8,11 +8,13 @@ import pytest
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
+from sky import clouds
 from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import service_spec
+from sky.serve import spot_placer
 from sky.utils import common_utils
 
 
@@ -147,10 +149,51 @@ service:
         with pytest.raises(ValueError, match=match):
             base.copy(cost_rebalance=config)
 
-    def test_programmatic_validation_requires_object(self):
+    def test_programmatic_true_uses_defaults(self):
         base = service_spec.SkyServiceSpec.from_yaml_str(self._YAML)
-        with pytest.raises(ValueError, match='must be an object'):
-            base.copy(cost_rebalance=True)
+        enabled = base.copy(cost_rebalance=True)
+        assert enabled.cost_rebalance
+        assert enabled.cost_rebalance_min_savings_fraction == pytest.approx(0.3)
+        assert enabled.cost_rebalance_max_parallel_replacements == 1
+        assert enabled.cost_rebalance_stabilization_seconds == 300
+
+    def test_placer_default_and_explicit_opt_out(self):
+        config = self._YAML.replace(
+            """    cost_rebalance:
+      min_savings_fraction: 0.3
+      max_parallel_replacements: 8
+      stabilization_seconds: 300
+""", '')
+        implicit = service_spec.SkyServiceSpec.from_yaml_str(config)
+        assert implicit.cost_rebalance
+        assert 'cost_rebalance' not in implicit.to_yaml_config(
+        )['replica_policy']
+
+        disabled = implicit.copy(cost_rebalance=False)
+        assert not disabled.cost_rebalance
+        assert disabled.to_yaml_config(
+        )['replica_policy']['cost_rebalance'] is False
+
+        explicit_null = service_spec.SkyServiceSpec.from_yaml_str(
+            config.replace(
+                '    spot_placer: dynamic_fallback\n',
+                '    spot_placer: dynamic_fallback\n'
+                '    cost_rebalance: null\n'))
+        assert explicit_null.cost_rebalance
+
+        legacy_state = dict(implicit.__dict__)
+        legacy_state.pop('_cost_rebalance')
+        restored = service_spec.SkyServiceSpec.__new__(
+            service_spec.SkyServiceSpec)
+        restored.__setstate__(legacy_state)
+        assert restored.cost_rebalance
+
+        without_placer = service_spec.SkyServiceSpec.from_yaml_str(
+            config.replace('    spot_placer: dynamic_fallback\n', ''))
+        assert not without_placer.cost_rebalance
+        assert not without_placer.copy(cost_rebalance=False).cost_rebalance
+        with pytest.raises(ValueError, match='requires spot_placer'):
+            without_placer.copy(cost_rebalance=True)
 
 
 class TestEconomicDecisions:
@@ -279,7 +322,7 @@ class TestEconomicDecisions:
 
     def test_stabilization_requires_continuous_eligibility(self, monkeypatch):
         now = [100.0]
-        monkeypatch.setattr(autoscalers.time, 'monotonic', lambda: now[0])
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
         scaler = _autoscaler(_spec(cost_rebalance_stabilization_seconds=300.0))
         placer, _, _, replicas = self._fleet()
         scaler.set_spot_placer(placer)
@@ -299,9 +342,64 @@ class TestEconomicDecisions:
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]) == 1
 
+    def test_stabilization_survives_restart(self, monkeypatch):
+        paid = spot_placer.Location(cloud=clouds.AWS(),
+                                    region='us-east-1',
+                                    zone='us-east-1a',
+                                    accelerators={'L4': 1},
+                                    use_spot=True,
+                                    instance_type='g6.xlarge')
+        cheap = spot_placer.Location(cloud=clouds.AWS(),
+                                     region='us-west-2',
+                                     zone='us-west-2a',
+                                     accelerators={'L4': 1},
+                                     use_spot=True,
+                                     instance_type='g6.xlarge')
+        placer = make_placer({paid: 1.0, cheap: 0.5})
+        replicas = [_Replica(1, paid, 1.0), _Replica(2, paid, 1.0)]
+        now = [100.0]
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
+        spec = _spec(cost_rebalance_stabilization_seconds=300.0)
+        scaler = _autoscaler(spec)
+        scaler.set_spot_placer(placer)
+        _report(scaler, replicas)
+        assert not _decisions(scaler, replicas)
+        state = scaler.dump_cost_rebalance_state()
+
+        now[0] = 399.0
+        restored = _autoscaler(spec)
+        restored.load_cost_rebalance_state(state)
+        restored.set_spot_placer(placer)
+        _report(restored, replicas)
+        assert not _decisions(restored, replicas)
+        now[0] = 400.0
+        assert len([
+            decision for decision in _decisions(restored, replicas) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]) == 1
+
+    def test_reserved_fill_keeps_zero_cost_candidates_broker_only(self):
+        scaler = _autoscaler(_spec(reserved_capacity_fill=True))
+        placer, _, _, replicas = self._fleet(candidate_cost=0.0)
+        scaler.set_spot_placer(placer)
+        _report(scaler, replicas)
+
+        assert not [
+            decision for decision in _decisions(scaler, replicas) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]
+
+        for location in placer.location2cost:
+            if placer.location2cost[location] == 0:
+                placer.location2cost[location] = 0.5
+        assert len([
+            decision for decision in _decisions(scaler, replicas) if
+            decision.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]) == 1
+
     def test_demand_decision_resets_stabilization(self, monkeypatch):
         now = [100.0]
-        monkeypatch.setattr(autoscalers.time, 'monotonic', lambda: now[0])
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
         scaler = _autoscaler(_spec(cost_rebalance_stabilization_seconds=300.0))
         placer, _, _, replicas = self._fleet()
         scaler.set_spot_placer(placer)
@@ -325,7 +423,7 @@ class TestEconomicDecisions:
     def test_full_slot_still_resets_discontinuous_eligibility(
             self, monkeypatch):
         now = [100.0]
-        monkeypatch.setattr(autoscalers.time, 'monotonic', lambda: now[0])
+        monkeypatch.setattr(autoscalers.time, 'time', lambda: now[0])
         scaler = _autoscaler(_spec(cost_rebalance_stabilization_seconds=300.0))
         placer, _, cheap, replicas = self._fleet()
         scaler.set_spot_placer(placer)
@@ -566,6 +664,113 @@ class TestPinnedReplacementLaunch:
         assert constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY not in info.resources_override
         assert info.resources_override['region'] == 'research'
         assert info.is_spot is False
+
+    def test_paid_replacement_acquires_exact_pool_claim(self):
+        paid = make_location('paid',
+                             accelerators={'L4': 1},
+                             use_spot=True,
+                             instance_type='g6.xlarge')
+        cheap = make_location('cheap',
+                              accelerators={'L4': 1},
+                              use_spot=True,
+                              instance_type='g6.xlarge')
+        placer = make_placer({paid: 1.0, cheap: 0.5})
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._service_hash = 'incarnation-a'
+        manager._controller_owner = (123, '10.0.0.1')
+        manager._resource_scope = None
+        manager._spot_placer = placer
+        manager.yaml_content = 'resources: {}'
+        manager.latest_version = 1
+        manager._launch_thread_pool = {}
+        manager._replica_to_request_id = {}
+        manager._replica_to_launch_cancelled = {}
+        manager._persist_replica = mock.Mock()
+        budget = replica_managers.paid_capacity.LaunchBudget(
+            remaining_by_location={cheap: 1},
+            pool_key_by_location={cheap: 'exact-pool'},
+            states_by_pool_key={},
+            globally_managed=True,
+            service_remaining=1)
+        override = cheap.to_dict()
+        override[constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY] = 7
+
+        with mock.patch.object(replica_managers, '_should_use_spot'), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.spot_placer.Location,
+                               'from_resources_override',
+                               return_value=cheap), \
+             mock.patch.object(replica_managers.thread_utils, 'SafeThread'), \
+             mock.patch.object(
+                 replica_managers.paid_capacity,
+                 'try_persist_claim',
+                 return_value=replica_managers.paid_capacity.ClaimResult.
+                 ACQUIRED) as persist_claim:
+            assert manager._launch_replica(8,
+                                           override,
+                                           existing_replica_infos=[],
+                                           paid_location_launch_budget=budget)
+
+        assert persist_claim.call_args.kwargs['location'] == cheap
+        claimed_info = persist_claim.call_args.kwargs['replica_info']
+        assert claimed_info.cost_rebalance_for_replica_id == 7
+        assert budget.remaining_by_location[cheap] == 0
+        assert budget.service_remaining == 0
+        manager._persist_replica.assert_not_called()
+
+    def test_recovered_paid_replacement_reuses_existing_claim(self):
+        paid = make_location('paid',
+                             accelerators={'L4': 1},
+                             use_spot=True,
+                             instance_type='g6.xlarge')
+        cheap = make_location('cheap',
+                              accelerators={'L4': 1},
+                              use_spot=True,
+                              instance_type='g6.xlarge')
+        placer = make_placer({paid: 1.0, cheap: 0.5})
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._resource_scope = None
+        manager._spot_placer = placer
+        manager._launch_thread_pool = {}
+        manager._replica_to_request_id = {}
+        manager._replica_to_launch_cancelled = {}
+        manager._persist_replica = mock.Mock()
+
+        with mock.patch.object(replica_managers, '_should_use_spot'), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.spot_placer.Location,
+                               'from_resources_override',
+                               return_value=cheap), \
+             mock.patch.object(replica_managers.thread_utils, 'SafeThread'), \
+             mock.patch.object(
+                 replica_managers.paid_capacity,
+                 'build_launch_budget') as build_budget, \
+             mock.patch.object(
+                 replica_managers.paid_capacity,
+                 'try_persist_claim') as persist_claim:
+            assert manager._launch_replica(
+                8,
+                cheap.to_dict(),
+                prior_cost_rebalance_for_replica_id=7,
+                prior_paid_capacity_pool_key='exact-pool',
+                recovering_existing_replica=True,
+                prior_version=1,
+                prior_yaml_content='resources: {}')
+
+        build_budget.assert_not_called()
+        persist_claim.assert_not_called()
+        info = manager._persist_replica.call_args.args[1]
+        assert info.cost_rebalance_for_replica_id == 7
+        assert info.paid_capacity_pool_key == 'exact-pool'
+        assert info.location == cheap.to_pickleable()
 
     def test_invalid_recovery_pin_retires_persisted_replacement(self):
         manager = replica_managers.SkyPilotReplicaManager.__new__(

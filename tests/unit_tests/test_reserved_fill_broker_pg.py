@@ -31,6 +31,7 @@ from alembic import command as alembic_command
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
+from sqlalchemy.dialects import postgresql
 from test_reserved_fill_broker import _broker_db  # noqa: F401
 from test_reserved_fill_broker import clock  # noqa: F401
 # The sqlite suite: its DB-touching test classes are re-collected below
@@ -2378,6 +2379,8 @@ class TestMigrationChainPG:
                     'lb_demand_handoff_snapshot',
                     'lb_demand_handoff_complete_at',
                     'lb_last_demand_snapshot',
+                    'spot_placement_state',
+                    'cost_rebalance_state',
                 }.issubset(service_columns)
                 version_columns = {
                     column['name']
@@ -2462,6 +2465,56 @@ class TestMigrationChainPG:
                             'SELECT version_num FROM '
                             'alembic_version_serve_state_db')).scalar_one()
                 assert revision == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    def test_revision_029_restart_state_survives_rollback_and_reupgrade(
+            self, pg_server):
+        """The additive evidence remains JSONB across image rollback."""
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        "INSERT INTO services "
+                        "(name, status, policy, requested_resources_str, "
+                        "load_balancing_policy, tls_encrypted, pool, hash, "
+                        "spot_placement_state, cost_rebalance_state) VALUES "
+                        "('restart-safe', 'READY', 'test', 'test', 'round_robin', "
+                        "0, 0, 'incarnation', "
+                        "CAST(:spot_state AS JSONB), "
+                        "CAST(:cost_state AS JSONB))"), {
+                            'spot_state': '{"version": 1, "benches": []}',
+                            'cost_state': '{"version": 1, "candidates": []}',
+                        })
+
+            config = migration_utils.get_alembic_config(
+                engine, migration_utils.SERVE_DB_NAME)
+            alembic_command.downgrade(config, '028')
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            inspector = sqlalchemy.inspect(engine)
+            service_columns = {
+                column['name']: column
+                for column in inspector.get_columns('services')
+            }
+            assert isinstance(service_columns['spot_placement_state']['type'],
+                              postgresql.JSONB)
+            assert isinstance(service_columns['cost_rebalance_state']['type'],
+                              postgresql.JSONB)
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT spot_placement_state, cost_rebalance_state '
+                        "FROM services WHERE name = 'restart-safe'")).one()
+            assert row[0] == {'version': 1, 'benches': []}
+            assert row[1] == {'version': 1, 'candidates': []}
         finally:
             engine.dispose()
 

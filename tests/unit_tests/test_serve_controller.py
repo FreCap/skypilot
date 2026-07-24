@@ -208,6 +208,43 @@ def _make_controller() -> controller.SkyServeController:
     return ctrl
 
 
+def test_cost_rebalance_state_persistence_is_owner_fenced():
+    ctrl = _make_controller()
+    ctrl._service_hash = 'incarnation-a'
+    ctrl._controller_owner = (123, '10.0.0.1')
+    scaler = mock.Mock()
+    scaler.cost_rebalance_state_dirty = True
+    scaler.dump_cost_rebalance_state.return_value = {
+        'version': 1,
+        'candidates': [],
+    }
+
+    with mock.patch.object(controller.serve_state,
+                           'set_service_cost_rebalance_state',
+                           return_value=True) as persist:
+        assert ctrl._persist_cost_rebalance_state(scaler)
+
+    persist.assert_called_once_with('svc', 'incarnation-a', (123, '10.0.0.1'),
+                                    scaler.dump_cost_rebalance_state())
+    scaler.mark_cost_rebalance_state_persisted.assert_called_once_with()
+
+
+def test_cost_rebalance_state_db_error_suppresses_only_economic_work():
+    ctrl = _make_controller()
+    ctrl._service_hash = 'incarnation-a'
+    ctrl._controller_owner = (123, '10.0.0.1')
+    scaler = mock.Mock()
+    scaler.cost_rebalance_state_dirty = True
+    scaler.dump_cost_rebalance_state.return_value = {'version': 1}
+
+    with mock.patch.object(controller.serve_state,
+                           'set_service_cost_rebalance_state',
+                           side_effect=RuntimeError('database unavailable')):
+        assert not ctrl._persist_cost_rebalance_state(scaler)
+
+    scaler.mark_cost_rebalance_state_persisted.assert_not_called()
+
+
 def test_recovery_rejects_physical_spec_after_durable_logical_activation():
     physical = mock.MagicMock()
     physical.uses_logical_replicas = False
