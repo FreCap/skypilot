@@ -42,6 +42,27 @@ _SHARD_ID = '00000000-0000-4000-8000-000000000003'
 _REVISION_ID = '00000000-0000-4000-8000-000000000004'
 
 
+def test_canary_credential_helper_can_remove_baked_docker_auth() -> None:
+    server = '123456789012.dkr.ecr.us-west-2.amazonaws.com'
+    ordinary = docker_utils.credential_helper_config_cmd(server)
+    canary = docker_utils.credential_helper_config_cmd(server,
+                                                       clear_cached_auth=True)
+
+    assert 'a=c.get("auths")' not in ordinary
+    assert 'a=c.get("auths")' in canary
+    assert 'a.pop(' in canary
+    assert server in canary
+
+
+@pytest.fixture(autouse=True)
+def _persist_canary_profile_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        canary_worker_service.qualification,
+        'record_canary_ec2_instance_profile',
+        lambda *_args, **_kwargs: True,
+    )
+
+
 @pytest.mark.parametrize(
     ('output', 'expected'),
     (
@@ -2101,10 +2122,13 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
 
 @pytest.mark.parametrize(
     ('architecture', 'image_id_case', 'profile_case', 'expected_error'),
-    (('x86_64', 'expected', 'expected', None),
+    (('x86_64', 'expected', 'launch_response', None),
+     ('x86_64', 'expected', 'expected', None),
      ('x86_64', 'expected', 'delayed', None),
      ('x86_64', 'expected', 'terminal_missing_after_match', None),
-     ('x86_64', 'expected', 'missing', 'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
+     ('x86_64', 'expected', 'missing', None),
+     ('x86_64', 'expected', 'missing_without_marker',
+      'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
      ('x86_64', 'expected', 'conflicting',
       'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
      ('arm64', 'expected', 'expected', 'QUALIFICATION_FAILED'),
@@ -2156,7 +2180,7 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         instance['ImageId'] = 'ami-other'
     if architecture is not None:
         instance['Architecture'] = architecture
-    if profile_case == 'missing':
+    if profile_case in ('missing', 'missing_without_marker'):
         instance.pop('IamInstanceProfile')
     elif profile_case == 'conflicting':
         instance['IamInstanceProfile'] = {
@@ -2208,11 +2232,14 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         (response(tagged_instance), response(tagged_instance),
          response(terminated_instance)))
     ec2.describe_instances.side_effect = describe_responses
+    launched_instance = {'InstanceId': 'i-canary'}
+    if profile_case == 'launch_response':
+        launched_instance['IamInstanceProfile'] = {
+            'Arn': models.ec2_instance_profile_arn(binding),
+        }
     ec2.run_instances.side_effect = (
         TimeoutError('ambiguous EC2 launch response'), {
-            'Instances': [{
-                'InstanceId': 'i-canary'
-            }]
+            'Instances': [launched_instance],
         })
     spot_request = {
         'SpotInstanceRequestId': 'sir-canary',
@@ -2233,6 +2260,10 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         })
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}'
     ec2.get_console_output.return_value = {'Output': marker}
+    if profile_case == 'missing_without_marker':
+        ec2.get_console_output.return_value = {'Output': ''}
+        monkeypatch.setattr(canary_worker_service,
+                            '_EC2_CONSOLE_SETTLE_SECONDS', 0)
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
@@ -2262,6 +2293,12 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
     monkeypatch.setattr(canary_worker_service.qualification,
                         'authorize_canary_launch',
                         lambda *_args, **_kwargs: 1000)
+    record_profile = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        canary_worker_service.qualification,
+        'record_canary_ec2_instance_profile',
+        record_profile,
+    )
     monkeypatch.setattr(canary_worker_service, '_POLL_SECONDS', 0)
     heartbeat = _OwnedHeartbeat()
 
@@ -2273,12 +2310,32 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         assert evidence['host_image_id'] == dict(
             binding.qualified_node_images)[target.region]
         assert evidence['instance_architecture'] == 'x86_64'
+        assert evidence['instance_profile_arn'] == (
+            models.ec2_instance_profile_arn(binding))
     else:
         with pytest.raises(ValueError, match=expected_error):
             canary_worker_service._run_ec2_canary(
                 operation, payload, _revision(profile), profile, target,
                 binding, _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
                 heartbeat)
+    if profile_case == 'missing':
+        record_profile.assert_called_once_with(
+            operation.id,
+            operation.lease_token,
+            f'ec2:{target.region}:{operation.id}',
+            models.ec2_instance_profile_arn(binding),
+        )
+    elif profile_case == 'missing_without_marker':
+        record_profile.assert_not_called()
+    elif profile_case == 'launch_response':
+        assert record_profile.call_args_list == [
+            mock.call(
+                operation.id,
+                operation.lease_token,
+                f'ec2:{target.region}:{operation.id}',
+                models.ec2_instance_profile_arn(binding),
+            )
+        ]
     assert ec2.run_instances.call_args.kwargs['ClientToken'] == (
         canary_worker_service._ec2_client_token(operation.id))
     assert len(ec2.run_instances.call_args.kwargs['ClientToken']) == 64
@@ -2289,7 +2346,14 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         InstanceIds=['i-canary']) in (ec2.describe_instances.call_args_list)
     launch = ec2.run_instances.call_args.kwargs
     assert docker_utils.credential_helper_config_cmd(
-        target.registry) in launch['UserData']
+        target.registry, clear_cached_auth=True) in launch['UserData']
+    assert 'AWS_SHARED_CREDENTIALS_FILE=/dev/null' in launch['UserData']
+    assert 'AWS_CONFIG_FILE=/dev/null' in launch['UserData']
+    assert '-u AWS_WEB_IDENTITY_TOKEN_FILE' in launch['UserData']
+    assert '-u AWS_CONTAINER_CREDENTIALS_FULL_URI' in launch['UserData']
+    assert 'AWS_EC2_METADATA_DISABLED=false' in launch['UserData']
+    assert 'AWS_ECR_DISABLE_CACHE=true' in launch['UserData']
+    assert 'AWS_SDK_LOAD_CONFIG=false' in launch['UserData']
     assert "trap 'shutdown -h now' EXIT" in launch['UserData']
     assert launch['InstanceInitiatedShutdownBehavior'] == 'terminate'
     if use_spot:
@@ -2326,6 +2390,111 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
     assert acquired_services == ['ec2', 'iam', 'ec2']
     assert len(provider_fences) == 3
     assert all(callable(fence) for fence in provider_fences)
+
+
+def test_ec2_canary_replay_restores_durable_profile_latch(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.target('aws-us-west-2')
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = dataclasses.replace(profile.bindings[binding_id],
+                                  canary_use_spot=False)
+    expected_profile_arn = models.ec2_instance_profile_arn(binding)
+    operation = _canary_operation()
+    child_id = f'ec2:{target.region}:{operation.id}'
+    operation = dataclasses.replace(
+        operation,
+        child_launch_id=child_id,
+        canary_child_evidence={
+            'backend': 'aws_vm',
+            'instance_profile_arn': expected_profile_arn,
+        },
+    )
+    payload = {
+        'backend': 'aws_vm',
+        'nonce': '1' * 32,
+        'runtime_id': target.region,
+        'timeout_seconds': 900,
+    }
+    expected_tags = [{
+        'Key': 'SkyPilotCanaryOperation',
+        'Value': operation.id,
+    }, {
+        'Key': 'SkyPilotCatalog',
+        'Value': 'catalog',
+    }, {
+        'Key': 'SkyPilotProfile',
+        'Value': profile.name,
+    }]
+    tagged = {'InstanceId': 'i-canary'}
+    terminal = {
+        'InstanceId': 'i-canary',
+        'Tags': expected_tags,
+        'ImageId': dict(binding.qualified_node_images)[target.region],
+        'Architecture': 'x86_64',
+        'State': {
+            'Name': 'terminated',
+        },
+    }
+
+    def response(*instances: dict[str, object]) -> dict[str, object]:
+        return {
+            'Reservations': ([{
+                'Instances': list(instances)
+            }] if instances else [])
+        }
+
+    ec2 = mock.Mock()
+    ec2.describe_instances.side_effect = (
+        response(tagged),
+        response(tagged),
+        response(terminal),
+        response(tagged),
+        response(tagged),
+        response(terminal),
+    )
+    ec2.get_console_output.return_value = {
+        'Output': f'SKYPILOT_IMAGE_CANARY_SUCCESS:{payload["nonce"]}',
+    }
+    iam = mock.Mock()
+    iam.get_instance_profile.return_value = {
+        'InstanceProfile': {
+            'Roles': [{
+                'Arn': binding.principals[0],
+            }],
+        },
+    }
+    clients = {'ec2': ec2, 'iam': iam}
+    monkeypatch.setattr(
+        canary_worker_service.aws, 'assumed_client',
+        lambda _role, service, _region, **_kwargs: clients[service])
+    monkeypatch.setattr(canary_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'attach_canary_child', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(canary_worker_service.qualification,
+                        'authorize_canary_launch',
+                        lambda *_args, **_kwargs: 1000)
+    record_profile = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        canary_worker_service.qualification,
+        'record_canary_ec2_instance_profile',
+        record_profile,
+    )
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_ATTEMPTS', 1)
+    monkeypatch.setattr(canary_worker_service, '_EC2_TEARDOWN_POLL_SECONDS', 0)
+
+    evidence = canary_worker_service._run_ec2_canary(
+        operation, payload, _revision(profile), profile, target,
+        binding, _DIGEST, f'{target.registry}/qualification@{_DIGEST}',
+        _OwnedHeartbeat())
+
+    assert evidence['instance_profile_arn'] == expected_profile_arn
+    assert evidence['teardown_verified'] is True
+    record_profile.assert_not_called()
+    ec2.run_instances.assert_not_called()
+    ec2.terminate_instances.assert_called_once_with(InstanceIds=['i-canary'])
 
 
 def test_ec2_spot_ambiguous_launch_cancels_request_and_terminates_racing_child(

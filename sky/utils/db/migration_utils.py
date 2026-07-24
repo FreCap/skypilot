@@ -40,7 +40,7 @@ def configured_migration_mode() -> MigrationMode:
 
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '024'  # managed images after shared auth sessions
+GLOBAL_USER_STATE_VERSION = '025'  # restart-safe managed-image canary evidence
 GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 

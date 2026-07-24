@@ -487,6 +487,68 @@ def test_expired_canary_owner_cannot_attach_or_terminalize_successor_work(
     assert qualification.fail_canary(successor, 'CANARY_FAILED', now=111)
 
 
+def test_canary_ec2_profile_evidence_is_immutable_and_lease_fenced(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    _request_ec2_canary(monkeypatch,
+                        profile,
+                        idempotency_key='canary-profile-evidence-key')
+    first = qualification.claim_canary(worker_id='worker-a',
+                                       lease_seconds=10,
+                                       now=100)
+    assert first is not None and first.lease_token is not None
+    target = profile.targets[0]
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    profile_arn = models.ec2_instance_profile_arn(profile.bindings[binding_id])
+    child_id = f'ec2:{target.region}:{first.id}'
+    assert qualification.attach_canary_child(first.id,
+                                             first.lease_token,
+                                             child_id,
+                                             now=101)
+    assert qualification.record_canary_ec2_instance_profile(first.id,
+                                                            first.lease_token,
+                                                            child_id,
+                                                            profile_arn,
+                                                            now=102)
+    assert qualification.record_canary_ec2_instance_profile(first.id,
+                                                            first.lease_token,
+                                                            child_id,
+                                                            profile_arn,
+                                                            now=103)
+    with pytest.raises(ValueError, match='immutable'):
+        qualification.record_canary_ec2_instance_profile(
+            first.id,
+            first.lease_token,
+            child_id,
+            'arn:aws:iam::123456789012:instance-profile/other',
+            now=104)
+
+    observed = catalog_state.get_operation(first.id, 'research')
+    assert observed is not None
+    assert qualification.canary_ec2_instance_profile_arn(
+        observed) == profile_arn
+    assert not qualification.record_canary_ec2_instance_profile(
+        first.id, 'stale-token', child_id, profile_arn, now=105)
+
+    successor = qualification.claim_canary(worker_id='worker-b',
+                                           lease_seconds=10,
+                                           now=110)
+    assert successor is not None and successor.lease_token is not None
+    assert successor.lease_token != first.lease_token
+    assert successor.child_launch_id == child_id
+    assert qualification.canary_ec2_instance_profile_arn(
+        successor) == profile_arn
+    assert not qualification.record_canary_ec2_instance_profile(
+        first.id, first.lease_token, child_id, profile_arn, now=111)
+    assert qualification.fail_canary(successor, 'CANARY_FAILED', now=111)
+
+    terminal = catalog_state.get_operation(first.id, 'research')
+    assert terminal is not None
+    assert terminal.canary_child_evidence is None
+
+
 def test_drained_canary_release_is_immediately_reclaimable_and_fenced(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -7257,6 +7319,9 @@ def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
                 "INSERT INTO clusters (name) VALUES ('legacy-cluster')")
         _migration_call(migration_engine, migration_024.upgrade)
         schema.metadata.create_all(runtime_engine)
+        with runtime_engine.begin() as connection:
+            connection.exec_driver_sql('ALTER TABLE container_image_operations '
+                                       'DROP COLUMN canary_child_evidence_json')
         assert _schema_shape(migration_engine,
                              migration_schema) == _schema_shape(
                                  runtime_engine, runtime_schema)
@@ -7317,6 +7382,76 @@ def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
             column['name'] for column in sqlalchemy.inspect(
                 migration_engine).get_columns('clusters')
         } == {'name'}
+    finally:
+        migration_engine.dispose()
+        runtime_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {runtime_schema} CASCADE')
+
+
+def test_migration_025_adds_rollback_compatible_canary_child_evidence(
+        postgres_engine) -> None:
+    migration_schema = f'image_evidence_migration_{uuid.uuid4().hex}'
+    runtime_schema = f'image_evidence_runtime_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+        connection.exec_driver_sql(f'CREATE SCHEMA {runtime_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    runtime_engine = _schema_engine(postgres_engine, runtime_schema)
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
+    migration_025 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '025_container_image_canary_child_evidence')
+    try:
+        with migration_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+        _migration_call(migration_engine, migration_024.upgrade)
+        _migration_call(migration_engine, migration_025.upgrade)
+        schema.metadata.create_all(runtime_engine)
+
+        assert _schema_shape(migration_engine,
+                             migration_schema) == _schema_shape(
+                                 runtime_engine, runtime_schema)
+        evidence_columns = {
+            column['name']: column for column in sqlalchemy.inspect(
+                migration_engine).get_columns('container_image_operations')
+        }
+        assert evidence_columns['canary_child_evidence_json']['nullable']
+
+        operation_id = str(uuid.uuid4())
+        evidence = json.dumps({
+            'backend': 'aws_vm',
+            'instance_profile_arn': 'arn:aws:iam::123456789012:instance-profile/skypilot-v1',
+        })
+        with migration_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text("""INSERT INTO container_image_operations
+                       (id, authority_id, scope, actor_hash, kind,
+                        idempotency_key, request_hash, state,
+                        canary_child_evidence_json, created_at, updated_at)
+                       VALUES (:id, :authority, 'research', :actor,
+                               'PROFILE_CANARY', 'migration-evidence-key',
+                               :request_hash, 'PENDING', :evidence, 1, 1)"""), {
+                    'id': operation_id,
+                    'authority': str(uuid.uuid4()),
+                    'actor': '1' * 64,
+                    'request_hash': '2' * 64,
+                    'evidence': evidence,
+                })
+        _migration_call(migration_engine, migration_025.downgrade)
+        with migration_engine.connect() as connection:
+            retained = connection.execute(
+                sqlalchemy.text(
+                    'SELECT canary_child_evidence_json '
+                    'FROM container_image_operations WHERE id = :id'), {
+                        'id': operation_id
+                    }).scalar_one()
+        assert retained == evidence
     finally:
         migration_engine.dispose()
         runtime_engine.dispose()
@@ -7400,7 +7535,7 @@ finally:
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
             ).scalar_one()
-        assert revision == '024'
+        assert revision == '025'
     finally:
         for process in processes:
             if process.poll() is None:
@@ -7543,7 +7678,7 @@ def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
             assert connection.execute(
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
-            ).scalar_one() == '024'
+            ).scalar_one() == '025'
         assert sqlalchemy.inspect(fresh_engine).has_table(
             'container_image_catalog')
     finally:

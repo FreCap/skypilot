@@ -350,6 +350,30 @@ def _attach_canary_child(operation: catalog_state.OperationRecord,
     _raise_if_draining(drain_event)
 
 
+def _record_ec2_instance_profile(
+        operation: catalog_state.OperationRecord,
+        child_id: str,
+        instance_profile_arn: str,
+        heartbeat: worker_lease.LeaseHeartbeat,
+        *,
+        drain_event: threading.Event | None = None) -> None:
+    """Persists provider-observed identity before more ordinary work."""
+    assert operation.lease_token is not None
+    heartbeat.assert_owned()
+    _raise_if_draining(drain_event)
+    recorded = qualification.record_canary_ec2_instance_profile(
+        operation.id,
+        operation.lease_token,
+        child_id,
+        instance_profile_arn,
+    )
+    if not recorded:
+        raise worker_lease.LeaseLostError(
+            'Canary operation lease or launch deadline was lost.')
+    heartbeat.assert_owned()
+    _raise_if_draining(drain_event)
+
+
 def _authorized_launch_deadline(
         operation: catalog_state.OperationRecord,
         child_id: str,
@@ -961,12 +985,39 @@ def _terminate_ec2_instances(ec2: Any,
 def _ec2_user_data(reference: str, registry: str, nonce: str,
                    timeout_seconds: int) -> str:
     marker = f'SKYPILOT_IMAGE_CANARY_SUCCESS:{nonce}'
+    disabled_credential_sources = (
+        'AWS_ACCESS_KEY_ID',
+        'AWS_SECRET_ACCESS_KEY',
+        'AWS_SESSION_TOKEN',
+        'AWS_SECURITY_TOKEN',
+        'AWS_PROFILE',
+        'AWS_DEFAULT_PROFILE',
+        'AWS_WEB_IDENTITY_TOKEN_FILE',
+        'AWS_ROLE_ARN',
+        'AWS_ROLE_SESSION_NAME',
+        'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+        'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+        'AWS_CONTAINER_AUTHORIZATION_TOKEN',
+        'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE',
+        'AWS_ECR_CACHE_DIR',
+    )
+    imds_only_environment = ' '.join(
+        [f'-u {name}' for name in disabled_credential_sources] + [
+            'AWS_CONFIG_FILE=/dev/null',
+            'AWS_SHARED_CREDENTIALS_FILE=/dev/null',
+            'AWS_SDK_LOAD_CONFIG=false',
+            'AWS_EC2_METADATA_DISABLED=false',
+            'AWS_ECR_DISABLE_CACHE=true',
+            'DOCKER_CONFIG=/root/.docker',
+        ])
     return '\n'.join((
         '#!/usr/bin/env bash',
         'set -euo pipefail',
         "trap 'shutdown -h now' EXIT",
-        docker_utils.credential_helper_config_cmd(registry),
-        f'timeout {timeout_seconds} docker pull {shlex.quote(reference)}',
+        docker_utils.credential_helper_config_cmd(registry,
+                                                  clear_cached_auth=True),
+        f'timeout {timeout_seconds} env {imds_only_environment} '
+        f'docker pull {shlex.quote(reference)}',
         f'docker image inspect {shlex.quote(reference)} >/dev/null',
         f'echo {shlex.quote(marker)} >/dev/console',
     ))
@@ -1125,6 +1176,12 @@ def _run_ec2_canary_inner(
                                                    child_id,
                                                    heartbeat,
                                                    drain_event=drain_event)
+        actual_profile_arn = (
+            qualification.canary_ec2_instance_profile_arn(operation))
+        if (actual_profile_arn is not None and
+            (not persisted_child or
+             actual_profile_arn != expected_profile_arn)):
+            raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
         iam = _assumed_client(role,
                               'iam',
                               target.region,
@@ -1222,6 +1279,18 @@ def _run_ec2_canary_inner(
                     _remember_instance_spot_request_ids(
                         instances, known_spot_request_ids,
                         spot_request_ids_with_instances))
+            launched_profile_arn = (instances[0].get('IamInstanceProfile') or
+                                    {}).get('Arn')
+            if (launched_profile_arn is not None and
+                    launched_profile_arn != expected_profile_arn):
+                raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
+            if launched_profile_arn == expected_profile_arn:
+                _record_ec2_instance_profile(operation,
+                                             child_id,
+                                             launched_profile_arn,
+                                             heartbeat,
+                                             drain_event=drain_event)
+                actual_profile_arn = launched_profile_arn
             launch_confirmed = True
         if instance_id is None:
             instance_id = _instance_id(instances[0])
@@ -1272,12 +1341,17 @@ def _run_ec2_canary_inner(
                     observed_profile_arn != expected_profile_arn):
                 raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             if observed_profile_arn == expected_profile_arn:
-                actual_profile_arn = observed_profile_arn
+                if actual_profile_arn is None:
+                    _record_ec2_instance_profile(operation,
+                                                 child_id,
+                                                 observed_profile_arn,
+                                                 heartbeat,
+                                                 drain_event=drain_event)
+                    actual_profile_arn = observed_profile_arn
             elif actual_profile_arn is None:
-                if state in ('pending', 'running'):
+                if state not in ('stopped', 'terminated'):
                     _wait_for_canary_poll(drain_event)
                     continue
-                raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
             if state in ('stopped', 'terminated'):
                 success = _wait_for_console_marker(ec2,
                                                    instance_id,
@@ -1285,6 +1359,13 @@ def _run_ec2_canary_inner(
                                                    deadline,
                                                    heartbeat,
                                                    drain_event=drain_event)
+                if success and actual_profile_arn is None:
+                    _record_ec2_instance_profile(operation,
+                                                 child_id,
+                                                 expected_profile_arn,
+                                                 heartbeat,
+                                                 drain_event=drain_event)
+                    actual_profile_arn = expected_profile_arn
                 break
             _wait_for_canary_poll(drain_event)
         else:
@@ -1343,6 +1424,8 @@ def _run_ec2_canary_inner(
             raise _CanaryTeardownFailed()
         _raise_if_draining(drain_event)
     if not success:
+        if actual_profile_arn is None:
+            raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
         raise ValueError('CANARY_PULL_FAILED')
     assert instance_id is not None
     assert instance_image_id is not None

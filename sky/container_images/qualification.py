@@ -282,6 +282,87 @@ def canary_payload(operation: catalog_state.OperationRecord) -> dict[str, Any]:
     return payload
 
 
+def _validate_canary_ec2_instance_profile_arn(instance_profile_arn: Any) -> str:
+    if (not isinstance(instance_profile_arn, str) or
+            not instance_profile_arn.startswith('arn:') or
+            len(instance_profile_arn) > 2048 or
+            any(character.isspace() for character in instance_profile_arn)):
+        raise ValueError('Canary child evidence is invalid.')
+    return instance_profile_arn
+
+
+def canary_ec2_instance_profile_arn(
+        operation: catalog_state.OperationRecord) -> str | None:
+    """Returns one strictly typed durable EC2 profile observation."""
+    evidence = operation.canary_child_evidence
+    if evidence is None:
+        return None
+    if (not isinstance(evidence, dict) or
+            set(evidence) != {'backend', 'instance_profile_arn'} or
+            evidence.get('backend') != 'aws_vm'):
+        raise ValueError('Canary child evidence is invalid.')
+    return _validate_canary_ec2_instance_profile_arn(
+        evidence.get('instance_profile_arn'))
+
+
+def record_canary_ec2_instance_profile(operation_id: str,
+                                       lease_token: str,
+                                       child_launch_id: str,
+                                       instance_profile_arn: str,
+                                       *,
+                                       now: int | None = None) -> bool:
+    """Lease-fences one immutable provider-observed profile ARN."""
+    instance_profile_arn = _validate_canary_ec2_instance_profile_arn(
+        instance_profile_arn)
+    evidence = {
+        'backend': 'aws_vm',
+        'instance_profile_arn': instance_profile_arn,
+    }
+    table = schema.operations
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = session.execute(
+            sqlalchemy.select(table).where(table.c.id == operation_id).
+            with_for_update()).mappings().first()
+        if row is None:
+            return False
+        current = catalog_state.database_epoch(session, now=now)
+        operation = catalog_state._operation(  # pylint: disable=protected-access
+            row)
+        payload = canary_payload(operation)
+        if payload['backend'] != 'aws_vm':
+            raise ValueError('Canary child evidence backend is invalid.')
+        live_owner = (operation.kind == 'PROFILE_CANARY' and
+                      operation.state == models.ImageOperationState.RUNNING and
+                      operation.lease_token == lease_token and
+                      operation.lease_expires_at is not None and
+                      operation.lease_expires_at > current and
+                      operation.teardown_deadline is not None and
+                      operation.teardown_deadline > current and
+                      operation.child_launch_id == child_launch_id)
+        if not live_owner:
+            return False
+        existing = canary_ec2_instance_profile_arn(operation)
+        if existing is not None:
+            if existing != instance_profile_arn:
+                raise ValueError('Canary child evidence is immutable.')
+            return True
+        clock = catalog_state.database_epoch_expression(now=now)
+        changed = session.execute(table.update().where(
+            table.c.id == operation_id, table.c.kind == 'PROFILE_CANARY',
+            table.c.state == models.ImageOperationState.RUNNING.value,
+            table.c.lease_token == lease_token,
+            table.c.lease_expires_at.is_not(None),
+            table.c.lease_expires_at > clock,
+            table.c.teardown_deadline.is_not(None), table.c.teardown_deadline
+            > clock, table.c.child_launch_id == child_launch_id,
+            table.c.canary_child_evidence_json.is_(None)).values(
+                canary_child_evidence_json=json.dumps(evidence,
+                                                      sort_keys=True,
+                                                      separators=(',', ':')),
+                updated_at=clock)).rowcount
+        return changed == 1
+
+
 def claim_canary(
         *,
         worker_id: str,

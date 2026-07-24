@@ -153,6 +153,7 @@ operations = sqlalchemy.Table(
             "updated_at WHEN kind = 'PROFILE_CANARY' AND state = 'RUNNING' "
             'THEN GREATEST(lease_expires_at, updated_at) ELSE NULL END',
             persisted=True)),
+    sqlalchemy.Column('canary_child_evidence_json', sqlalchemy.Text),
     sqlalchemy.UniqueConstraint(
         'authority_id',
         'scope',

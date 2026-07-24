@@ -1813,14 +1813,37 @@ observed AMI must equal the qualified regional AMI. The console marker is read
 from that same child.
 An absent instance-profile ARN while that exact child is still pending or
 running is retried within the same bounded deadline because EC2 may expose the
-instance before its profile attachment. Once the exact expected ARN is
-observed, it is latched for that same child because EC2 may omit the attachment
-from a later stopped or terminated response. A conflicting nonempty ARN at any
-point, or terminal absence before an exact match was observed, fails
+instance before its profile attachment. The exact expected ARN from the
+`RunInstances` response or a later ID-scoped read is lease-fenced into a
+dedicated nullable child-evidence field on the running operation before the
+worker performs more ordinary provider work. The field is separate from the
+closed canary request payload so a rolled-back worker can ignore the new column
+and continue to parse, reclaim, and clean up the operation. New-code terminal
+completion clears the internal evidence. A successor restores the latch for the
+same persisted child because EC2 may omit the attachment from a later stopped
+or terminated response. A conflicting nonempty ARN at any point fails
 qualification.
+
+A process can still die after AWS accepts the launch but before that first
+observation commits. For that narrow replay case, a terminal response with no
+profile ARN is accepted only after all of the following hold: the child ID and
+operation/catalog/profile tags match, the AMI and architecture match, a fresh
+IAM read maps the requested instance-profile name to the one configured role,
+and the exact nonce-bearing success marker proves the guest completed the
+private-registry pull through the requested profile's IMDS-only
+credential-helper path. The canary pull clears environment, shared-file,
+web-identity, and ECS credential sources, points shared config files at
+`/dev/null`, disables the ECR helper's filesystem token cache, and removes any
+preexisting Docker auth entry for the target registry. A credential or token
+baked into the AMI therefore cannot satisfy this recovery proof. The worker
+then records the expected profile ARN as recovered evidence. A marker-free
+terminal child without a durable profile latch fails with
+`QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED`; a conflicting ARN can never use this
+recovery path.
 Before the pull, EC2 canary user data configures the same exact value-free
 `credHelpers[registry] = ecr-login` route used by normal managed workload
-initialization. Merely finding the helper binary in the AMI is not runtime-pull
+initialization, then invokes the helper with every non-IMDS AWS credential
+source disabled. Merely finding the helper binary in the AMI is not runtime-pull
 evidence. The guest script uses an exit trap to invoke the instance's configured
 terminate-on-shutdown path after either success or failure, so a failed pull
 does not consume the entire canary deadline. Console marker inspection accepts
@@ -2975,6 +2998,11 @@ drained and every image table is empty; it is never part of Helm rollback.
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
+- EC2 canary profile-latch tests proving the launch response and later
+  ID-scoped observation are lease-fenced into the durable operation, a
+  successor accepts a terminal AWS record that omits the profile only with
+  either that exact latch or the nonce-bearing private-pull recovery proof, and
+  a mismatched ARN or marker-free terminal record still fails closed;
 - lost-response Spot tests where cancellation first reports a terminal request
   without an instance, a request-to-instance edge appears on a later exact
   read, a late request transition cannot reuse an earlier absence interval, and

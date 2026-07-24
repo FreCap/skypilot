@@ -73,11 +73,19 @@ def _extract_region_from_ecr_server(server: str) -> str:
     raise ValueError(f'Invalid ECR server format: {server}')
 
 
-def credential_helper_config_cmd(server: str) -> str:
+def credential_helper_config_cmd(server: str,
+                                 *,
+                                 clear_cached_auth: bool = False) -> str:
     """Atomically merges one value-free helper route into root's config."""
     if _ECR_SERVER_PATTERN.fullmatch(server) is None:
         raise ValueError(
             'Managed Docker credential helper registry is invalid.')
+    clear_auth_script = ''
+    if clear_cached_auth:
+        clear_auth_script = (
+            'a=c.get("auths"); '
+            'assert a is None or isinstance(a, dict); '
+            f'a.pop({server!r}, None) if a is not None else None; ')
     script = ('import json, os, tempfile; '
               'p="/root/.docker/config.json"; '
               'c=json.load(open(p)) if os.path.exists(p) else {}; '
@@ -85,6 +93,7 @@ def credential_helper_config_cmd(server: str) -> str:
               'h=c.setdefault("credHelpers", {}); '
               'assert isinstance(h, dict); '
               f'h[{server!r}]="ecr-login"; '
+              f'{clear_auth_script}'
               'f=tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(p), '
               'delete=False); '
               'json.dump(c, f, sort_keys=True, separators=(",", ":")); '

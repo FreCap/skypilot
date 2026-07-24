@@ -73,6 +73,7 @@ class OperationRecord:
     created_at: int
     updated_at: int
     terminal_expires_at: int | None
+    canary_child_evidence: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -183,6 +184,7 @@ def read_database_epoch(*, now: int | None = None) -> int:
 
 def _operation(row: sqlalchemy.engine.RowMapping) -> OperationRecord:
     result_json = row['result_json']
+    canary_child_evidence_json = row['canary_child_evidence_json']
     return OperationRecord(
         id=str(row['id']),
         authority_id=str(row['authority_id']),
@@ -203,6 +205,9 @@ def _operation(row: sqlalchemy.engine.RowMapping) -> OperationRecord:
         created_at=int(row['created_at']),
         updated_at=int(row['updated_at']),
         terminal_expires_at=row['terminal_expires_at'],
+        canary_child_evidence=(json.loads(canary_child_evidence_json)
+                               if canary_child_evidence_json is not None else
+                               None),
     )
 
 
@@ -432,6 +437,7 @@ def bind_operation_result(operation_id: str,
                 raise ValueError('Operation terminal state is invalid.')
             values.update(state=terminal_state.value,
                           error_code=error_code,
+                          canary_child_evidence_json=None,
                           terminal_expires_at=(current +
                                                _OPERATION_RETENTION_SECONDS))
         row = session.execute(schema.operations.update().where(
@@ -478,6 +484,7 @@ def complete_operation(session: orm.Session,
                              lease_token=None,
                              lease_expires_at=None,
                              child_launch_id=None,
+                             canary_child_evidence_json=None,
                              teardown_deadline=None,
                              updated_at=current,
                              terminal_expires_at=current +
@@ -513,6 +520,7 @@ def fail_operation(session: orm.Session,
                              lease_token=None,
                              lease_expires_at=None,
                              child_launch_id=None,
+                             canary_child_evidence_json=None,
                              teardown_deadline=None,
                              updated_at=current,
                              terminal_expires_at=current +
