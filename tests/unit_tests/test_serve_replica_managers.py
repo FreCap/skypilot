@@ -5913,6 +5913,72 @@ class TestLogicalCapacityPlanning:
         assert 1 in mgr._launch_thread_pool
         assert 1 in mgr._replica_to_request_id
 
+    def test_logical_scale_down_batch_excludes_served_replica(self):
+        # A replica that ever reached ready owns a real cloud cluster and must
+        # never enter the durable batch row-delete, even when the one-shot
+        # cluster inventory momentarily omits its cluster. The batch path only
+        # drops the row and the paid-capacity claim; it does not terminate the
+        # cluster. So a served victim must stay on the graceful drain path
+        # (`_defer_scale_down_until_idle`), guarded independently by the
+        # pre-pass `first_ready_time is not None` exclusion and by the
+        # main-loop `has_served` branch. Every other batch test resets
+        # `first_ready_time` to None, so neither guard is otherwise exercised.
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        never_served = self._ready_backend(1, 1)
+        never_served.status_property.first_ready_time = None
+        # Keep the default first_ready_time (1.0): this victim has served.
+        served = self._ready_backend(2, 1)
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._replica_to_request_id[1] = 'request-1'
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={2: 1},
+                in_flight_by_replica_id={2: 0},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+        mgr._terminate_replica = mock.Mock()
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[never_served, served]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value=set()) as cluster_inventory, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=True) as remove_batch:
+            mgr.scale_down_logically_batch([1, 2], 0, 1, 4)
+
+        # The served victim is filtered out before the cluster inventory read,
+        # so only the never-served victim is a batch-delete candidate.
+        cluster_inventory.assert_called_once_with([never_served])
+        # Only the never-served row is dropped in the fenced batch delete.
+        remove_batch.assert_called_once_with(
+            'svc', [1],
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'))
+        # The served victim takes the graceful drain path, never a hard delete.
+        assert [call.args[0] for call in defer.call_args_list] == [2]
+        mgr._terminate_replica.assert_not_called()
+        assert 1 not in mgr._launch_thread_pool
+        assert 1 not in mgr._replica_to_request_id
+
     def test_logical_scale_down_batch_matches_sequential_singletons(self):
 
         def _run(batch: bool):
