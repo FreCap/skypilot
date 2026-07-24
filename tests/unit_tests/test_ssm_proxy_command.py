@@ -9,6 +9,7 @@ controller then classifies healthy just-launched replicas as preempted
 import subprocess
 
 from sky.backends import backend_utils
+from sky.utils import cluster_utils
 from sky.utils import command_runner
 
 
@@ -96,6 +97,51 @@ def test_docker_hop_preserves_inner_openssh_percent_escape():
     assert '%%%%s\\n' in proxy_option
     assert 'Values=203.0.113.1' in proxy_option
     assert 'portNumber=22' in proxy_option
+
+
+def test_docker_ssh_config_preserves_inner_openssh_percent_escape(
+        tmp_path, monkeypatch):
+    raw = ("aws ssm start-session --target \"$(printf '')\" "
+           '--region us-east-2 --document-name AWS-StartSSHSession '
+           '--parameters portNumber=%p')
+    wrapped = _upgrade(raw)
+    ssh_config_path = tmp_path / 'ssh' / 'config'
+    ssh_cluster_path = str(tmp_path / 'sky' / 'ssh' / '{}')
+    monkeypatch.setattr(cluster_utils.SSHConfigHelper, 'ssh_conf_path',
+                        str(ssh_config_path))
+    monkeypatch.setattr(cluster_utils.SSHConfigHelper, 'ssh_cluster_path',
+                        ssh_cluster_path)
+    monkeypatch.setattr(cluster_utils.common_utils, 'is_wsl', lambda: False)
+
+    # Bypass the decorator's process-wide SSH config lock. All paths written by
+    # the underlying method are isolated under tmp_path.
+    cluster_utils.SSHConfigHelper.add_cluster.__wrapped__(
+        cluster_utils.SSHConfigHelper,
+        cluster_name='nested-test',
+        cluster_name_on_cloud='nested-test',
+        ips=['203.0.113.1'],
+        auth_config={
+            'ssh_user': 'ubuntu',
+            'ssh_private_key': str(tmp_path / 'key'),
+            'ssh_proxy_command': wrapped,
+        },
+        ports=[22],
+        docker_user='root')
+
+    generated = (tmp_path / 'sky' / 'ssh' / 'nested-test').read_text()
+    # Outer OpenSSH turns ``%%%%s`` into ``%%s`` before invoking the nested
+    # SSH command; inner OpenSSH then passes the intended ``%s`` to printf.
+    assert '%%%%s\\n' in generated
+    result = subprocess.run(
+        ['ssh', '-F', str(ssh_config_path), 'nested-test'],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5)
+    assert result.returncode == 255
+    assert backend_utils._SSM_TARGET_NOT_FOUND_MESSAGE.replace(  # pylint: disable=protected-access
+        '%h', '203.0.113.1') in result.stderr
+    assert 'unknown key %s' not in result.stderr
 
 
 def test_empty_target_fails_before_start_session():
