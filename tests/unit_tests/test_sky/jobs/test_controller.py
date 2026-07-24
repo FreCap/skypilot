@@ -13,6 +13,7 @@ import pathlib
 import threading
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
+from unittest.mock import ANY
 from unittest.mock import AsyncMock
 from unittest.mock import call
 from unittest.mock import MagicMock
@@ -320,6 +321,119 @@ class TestNormalJobRecovery:
         assert should_skip is False
         # Terminal status still triggers resume logic path
         assert is_resume is True
+
+
+class TestPoolStartingRestartRecovery:
+    """Restart recovery for pool jobs before their first worker assignment."""
+
+    @staticmethod
+    def _make_controller() -> JobController:
+        controller = JobController.__new__(JobController)
+        controller._job_id = 42
+        controller._pool = 'test-pool'
+        controller._backend = MagicMock()
+        controller._backend.run_timestamp = '2026-07-24-00-00-00-000000'
+        controller.starting = {42}
+        controller.starting_lock = asyncio.Lock()
+        controller.starting_signal = asyncio.Condition(controller.starting_lock)
+        return controller
+
+    @staticmethod
+    def _make_task():
+        task = MagicMock()
+        task.name = 'pooled-task'
+        task.run = 'echo hello'
+        task.metadata = {}
+        task.resources = []
+        task.envs = {constants.TASK_ID_ENV_VAR: 'managed-task-id'}
+        return task
+
+    @pytest.mark.asyncio
+    async def test_starting_without_assignment_reenters_pool_launch(self):
+        controller = self._make_controller()
+        task = self._make_task()
+        executor = MagicMock()
+        executor.launch = AsyncMock(return_value=123.0)
+        executor.on_resume = AsyncMock()
+        executor.monitor_task = AsyncMock(return_value=True)
+
+        pool_info = AsyncMock(side_effect=[(None, None), ('pool-worker-1', 7)])
+        task_status = AsyncMock(side_effect=[
+            managed_job_state.ManagedJobStatus.STARTING,
+            managed_job_state.ManagedJobStatus.RUNNING,
+        ])
+        set_started = AsyncMock()
+
+        with patch('sky.jobs.controller._add_k8s_annotations'), \
+             patch('sky.jobs.controller.usage_lib.messages.usage.'
+                   'update_task_id'), \
+             patch.object(controller,
+                          '_get_file_mounts_blob_id',
+                          new=AsyncMock(return_value=None)), \
+             patch('sky.jobs.state.get_latest_task_id_status_async',
+                   new=AsyncMock(return_value=(
+                       0, managed_job_state.ManagedJobStatus.STARTING))), \
+             patch('sky.jobs.state.get_pool_submit_info_async',
+                   new=pool_info), \
+             patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new=task_status), \
+             patch('sky.jobs.state.set_started_async', new=set_started), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   return_value=executor):
+            result = await controller._run_one_task(0, task)
+
+        assert result is True
+        executor.launch.assert_awaited_once_with()
+        assert pool_info.await_count == 2
+        set_started.assert_awaited_once_with(job_id=42,
+                                             task_id=0,
+                                             start_time=123.0,
+                                             callback_func=ANY)
+        executor.on_resume.assert_awaited_once_with('pool-worker-1')
+        assert executor.monitor_task.await_args.kwargs[
+            'cluster_name'] == 'pool-worker-1'
+        assert executor.monitor_task.await_args.kwargs[
+            'job_id_on_pool_cluster'] == 7
+        assert controller.starting == set()
+
+    @pytest.mark.asyncio
+    async def test_starting_with_assignment_does_not_launch_again(self):
+        controller = self._make_controller()
+        task = self._make_task()
+        executor = MagicMock()
+        executor.launch = AsyncMock()
+        executor.on_resume = AsyncMock()
+        executor.monitor_task = AsyncMock(return_value=True)
+
+        pool_info = AsyncMock(return_value=('pool-worker-1', 7))
+        set_started = AsyncMock()
+
+        with patch('sky.jobs.controller._add_k8s_annotations'), \
+             patch('sky.jobs.controller.usage_lib.messages.usage.'
+                   'update_task_id'), \
+             patch.object(controller,
+                          '_get_file_mounts_blob_id',
+                          new=AsyncMock(return_value=None)), \
+             patch('sky.jobs.state.get_latest_task_id_status_async',
+                   new=AsyncMock(return_value=(
+                       0, managed_job_state.ManagedJobStatus.STARTING))), \
+             patch('sky.jobs.state.get_pool_submit_info_async',
+                   new=pool_info), \
+             patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new=AsyncMock(return_value=(
+                       managed_job_state.ManagedJobStatus.STARTING))), \
+             patch('sky.jobs.state.set_started_async', new=set_started), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   return_value=executor):
+            result = await controller._run_one_task(0, task)
+
+        assert result is True
+        executor.launch.assert_not_awaited()
+        pool_info.assert_awaited_once_with(42)
+        set_started.assert_not_awaited()
+        executor.on_resume.assert_awaited_once_with('pool-worker-1')
+        assert executor.monitor_task.await_args.kwargs[
+            'force_transit_to_recovering'] is True
 
 
 class TestPipelineJobRecovery:

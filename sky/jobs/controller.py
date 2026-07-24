@@ -593,8 +593,11 @@ class JobController:
         logger.info('Started monitoring.')
 
         # Only do the initial cluster launch if not resuming from a controller
-        # failure. Otherwise, we will transit to recovering immediately.
+        # failure. A resumed pool task may still need this launch when the
+        # previous controller stopped before assigning a worker; that case is
+        # handled after reading its persisted pool submission info below.
         remote_job_submitted_at = time.time()
+        launched_task = False
         if not is_resume:
             launch_start = time.time()
 
@@ -602,6 +605,7 @@ class JobController:
             # loop. The scheduler functions used internally already have their
             # own file locks.
             remote_job_submitted_at = await self._strategy_executor.launch()
+            launched_task = True
 
             launch_time = time.time() - launch_start
             logger.info(f'Cluster launch completed in {launch_time:.2f}s')
@@ -627,9 +631,32 @@ class JobController:
                 logger.info(f'Job {self._job_id}, task {task_id} has '
                             'been quickly cancelled.')
                 raise asyncio.CancelledError()
+            if (is_resume and self._pool is not None and
+                    status == managed_job_state.ManagedJobStatus.STARTING):
+                # STARTING is persisted before pool scheduling. The controller
+                # can restart while a job is legitimately waiting for its
+                # first worker, leaving both pool submit fields unset. Re-enter
+                # the initial launch path instead of treating that durable
+                # pre-assignment state as controller corruption.
+                logger.info(
+                    f'Job {self._job_id}, task {task_id} was STARTING with no '
+                    'persisted pool worker assignment. Re-entering pool '
+                    'scheduling.')
+                launch_start = time.time()
+                remote_job_submitted_at = (await
+                                           self._strategy_executor.launch())
+                launched_task = True
+                launch_time = time.time() - launch_start
+                logger.info('Pool worker assignment completed after controller '
+                            f'restart in {launch_time:.2f}s')
+                assert remote_job_submitted_at is not None, (
+                    remote_job_submitted_at)
+                cluster_name, job_id_on_pool_cluster = (
+                    await
+                    managed_job_state.get_pool_submit_info_async(self._job_id))
         assert cluster_name is not None, (cluster_name, job_id_on_pool_cluster)
 
-        if not is_resume:
+        if launched_task:
             await managed_job_state.set_started_async(
                 job_id=self._job_id,
                 task_id=task_id,

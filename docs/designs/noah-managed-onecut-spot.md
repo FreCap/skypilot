@@ -219,6 +219,22 @@ failure while the job itself remains nonterminal continues to produce
 `FAILED_CONTROLLER`, because no authoritative workload outcome exists.
 Controller-death reconciliation follows the same rule.
 
+A pooled task may durably be `STARTING` before a worker has been assigned. In
+that state both `current_cluster_name` and `job_id_on_pool_cluster` are null.
+This is a valid pre-assignment checkpoint, not evidence of controller
+corruption. When a controller restarts from this exact state, it re-enters the
+initial pool scheduling path, persists the selected worker and worker-local job
+ID through the existing launch protocol, then transitions the task to
+`RUNNING`. It must not assert that a cluster already exists or mark the task
+`FAILED_CONTROLLER`.
+
+The retry is limited to `STARTING` tasks with no persisted worker assignment.
+Pool scheduling writes `current_cluster_name` while holding the pool scheduling
+lock before submitting the worker-local job, so a task with a persisted
+assignment follows the existing resume or recovery path instead of acquiring a
+second worker. Terminal and cancelling tasks retain their existing restart
+semantics.
+
 ### 5. Phase orchestration
 
 The launcher creates a unique run ID and immutable code bundle, applies the
@@ -309,6 +325,11 @@ global manifest contract.
   `full_resources` JSON payload and counts at most one active task per job;
 - a terminal task outcome survives a pool-worker cleanup failure, while the
   same failure on a nonterminal job still produces `FAILED_CONTROLLER`;
+- a pooled `STARTING` task with no persisted worker assignment re-enters
+  scheduling after controller restart and reaches monitoring without being
+  marked `FAILED_CONTROLLER`;
+- a pooled `STARTING` task with a persisted worker assignment does not launch a
+  second worker after controller restart;
 - existing pools without placement policy preserve their serialized form;
 
 ### Control-plane verification
