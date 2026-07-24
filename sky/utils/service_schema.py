@@ -204,6 +204,14 @@ def get_service_schema():
                         'type': 'number',
                         'minimum': 0,
                     },
+                    # Pools count physical workers, so the logical per-GPU
+                    # placer is intentionally excluded.
+                    'spot_placer': {
+                        'type': 'string',
+                        'case_insensitive_enum': [
+                            spot_placer.SPOT_HEDGE_PLACER
+                        ],
+                    },
                 },
             },
             'replica_policy': {

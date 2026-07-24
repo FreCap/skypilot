@@ -92,7 +92,6 @@ class SkyServiceSpec:
                 'max_scale_down_rate_percentage',
                 'base_ondemand_fallback_replicas',
                 'dynamic_ondemand_fallback',
-                'spot_placer',
                 'load_balancing_policy',
                 'ports',
                 'post_data',
@@ -906,6 +905,7 @@ class SkyServiceSpec:
         pool_max_workers = None
         pool_upscale_delay = None
         pool_downscale_delay = None
+        pool_spot_placer = None
         if pool_config is not None and isinstance(pool_config, dict):
             queue_length_threshold = pool_config.get('queue_length_threshold',
                                                      None)
@@ -914,6 +914,7 @@ class SkyServiceSpec:
             pool_upscale_delay = pool_config.get('upscale_delay_seconds', None)
             pool_downscale_delay = pool_config.get('downscale_delay_seconds',
                                                    None)
+            pool_spot_placer = pool_config.get('spot_placer', None)
             workers_config = pool_config.get('workers', workers_config)
             # Validate: one of workers or max_workers and min_workers must be
             # set.
@@ -982,6 +983,7 @@ class SkyServiceSpec:
             service_config['max_scale_down_rate_percentage'] = None
             service_config['reserved_capacity_fill'] = None
             service_config['cost_rebalance'] = None
+            service_config['spot_placer'] = pool_spot_placer
         else:
             service_config['min_replicas'] = policy_section['min_replicas']
             service_config['min_replicas_by_accelerator'] = policy_section.get(
@@ -1151,6 +1153,7 @@ class SkyServiceSpec:
                         self.graceful_drain_async_occupancy)
 
         if self.pool:
+            add_if_not_none('pool', 'spot_placer', self.spot_placer)
             if self.max_replicas is not None:
                 add_if_not_none('pool', 'max_workers', self.max_replicas)
                 add_if_not_none('pool', 'queue_length_threshold',

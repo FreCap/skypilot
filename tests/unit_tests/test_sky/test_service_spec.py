@@ -3,7 +3,9 @@ import pickle
 
 import pytest
 
+import sky
 from sky.serve import constants as serve_constants
+from sky.serve import serve_utils
 from sky.serve import service_spec
 
 
@@ -230,6 +232,68 @@ class TestPoolConfiguration:
 
         assert spec.min_replicas == 3
         assert spec.max_replicas == 3
+
+    def test_pool_spot_placer_round_trips(self):
+        config = {
+            'pool': {
+                'workers': 4,
+                'spot_placer': 'dynamic_fallback',
+            },
+        }
+
+        spec = service_spec.SkyServiceSpec.from_yaml_config(config)
+        rendered = spec.to_yaml_config()
+        restored = service_spec.SkyServiceSpec.from_yaml_config(rendered)
+
+        assert spec.spot_placer == 'dynamic_fallback'
+        assert not spec.uses_logical_replicas
+        assert not spec.cost_rebalance
+        assert rendered == config
+        assert restored.spot_placer == 'dynamic_fallback'
+
+    def test_pool_rejects_logical_gpu_spot_placer(self):
+        with pytest.raises(ValueError, match='Invalid service YAML'):
+            service_spec.SkyServiceSpec.from_yaml_config({
+                'pool': {
+                    'workers': 4,
+                    'spot_placer': 'dynamic_fallback_per_gpu',
+                },
+            })
+
+    def test_pool_spot_placer_allows_mixed_purchase_models(self):
+        spec = service_spec.SkyServiceSpec.from_yaml_config({
+            'pool': {
+                'workers': 4,
+                'spot_placer': 'dynamic_fallback',
+            },
+        })
+        task = sky.Task()
+        task.set_resources({
+            sky.Resources(
+                cloud=sky.AWS(),
+                region='us-east-1',
+                instance_type='r6a.xlarge',
+                use_spot=True,
+            ),
+            sky.Resources(
+                cloud=sky.AWS(),
+                region='us-east-1',
+                instance_type='r6a.xlarge',
+                use_spot=False,
+            ),
+        })
+        task.set_service(spec)
+
+        serve_utils.validate_service_task(task, pool=True)
+
+        task.set_service(
+            service_spec.SkyServiceSpec.from_yaml_config({
+                'pool': {
+                    'workers': 4,
+                },
+            }))
+        with pytest.raises(ValueError, match='either all use spot or none'):
+            serve_utils.validate_service_task(task, pool=True)
 
 
 class TestReadinessProbeConfiguration:

@@ -1938,6 +1938,7 @@ Syntax
 
   pool:
     :ref:`workers <yaml-spec-pool-workers>`: 3
+    :ref:`spot_placer <yaml-spec-pool-spot-placer>`: dynamic_fallback
 
   pool:
     :ref:`min_workers <yaml-spec-pool-min-workers>`: 1
@@ -1963,6 +1964,36 @@ If ``min_workers`` and ``max_workers`` are not specified, the pool maintains a f
 
   pool:
     workers: 3
+
+
+.. _yaml-spec-pool-spot-placer:
+
+``pool.spot_placer``
+~~~~~~~~~~~~~~~~~~~~
+
+Optional cost-aware placement policy for independently launched workers.
+The supported value is ``dynamic_fallback``. Configure Spot and on-demand
+candidates with ``resources.any_of``. SkyPilot prefers lower-cost active
+locations, temporarily benches an exact location after a capacity or quota
+failure, and falls through to another candidate for later worker launches.
+
+.. code-block:: yaml
+
+  pool:
+    workers: 3
+    spot_placer: dynamic_fallback
+
+  resources:
+    any_of:
+      - infra: aws/us-east-1
+        instance_type: r6a.xlarge
+        use_spot: true
+      - infra: aws/us-east-1
+        instance_type: r6a.xlarge
+        use_spot: false
+
+This is per-worker placement, not a Spot gang. ``resources.ordered`` and
+``dynamic_fallback_per_gpu`` are not supported for pools.
 
 
 .. _yaml-spec-pool-min-workers:

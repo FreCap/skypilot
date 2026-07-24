@@ -113,6 +113,48 @@ To create a pool, use :code:`sky jobs pool apply`:
 The pool will be created in the background. You can submit jobs to this pool immediately. If there aren't any workers ready to run the jobs yet, the jobs will wait in the PENDING state.
 Jobs will start automatically once some worker is provisioned and ready to run.
 
+Spot workers with on-demand fallback
+------------------------------------
+
+Pools can prefer Spot workers and fall through to on-demand workers when an
+exact Spot location reports a capacity or quota failure. Configure both
+purchase models with :code:`resources.any_of` and opt the pool into the
+:code:`dynamic_fallback` placement policy:
+
+.. code-block:: yaml
+
+  pool:
+    workers: 64
+    spot_placer: dynamic_fallback
+
+  resources:
+    any_of:
+      - infra: aws/us-east-1
+        instance_type: r6a.xlarge
+        use_spot: true
+      - infra: aws/us-east-1
+        instance_type: r6i.xlarge
+        use_spot: true
+      - infra: aws/us-east-1
+        instance_type: r6a.xlarge
+        use_spot: false
+      - infra: aws/us-east-1
+        instance_type: r6i.xlarge
+        use_spot: false
+
+The placer ranks exact locations by hourly cost. A failed location is
+temporarily benched, so later worker launches can select the next active
+candidate. Each worker is placed independently; the pool is not a Spot gang.
+Running workers are not replaced merely because a cheaper candidate later
+becomes available.
+
+.. note::
+
+  Pools do not support :code:`resources.ordered`. Use
+  :code:`resources.any_of` with :code:`pool.spot_placer` for this fallback
+  behavior. Pools count physical workers, so
+  :code:`dynamic_fallback_per_gpu` is not supported.
+
 Submit jobs to a pool
 ----------------------
 
@@ -477,4 +519,3 @@ To increase the limit:
 
   - **Multi-job per worker**: Support for running multiple jobs concurrently on the same worker.
   - **Fractional GPU support**: Allow jobs to request and share fractional GPU resources.
-
