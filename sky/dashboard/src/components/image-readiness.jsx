@@ -136,6 +136,70 @@ export function ImageReadiness({
     readiness?.queues_truncated ||
       readiness?.queues.some((queue) => queue.failed_count_at_least)
   );
+  const allQualificationTargets =
+    readiness?.profiles.flatMap((profile) =>
+      (profile.qualification_targets || []).map((target) => ({
+        ...target,
+        profile: profile.profile,
+      }))
+    ) || [];
+  const safeGenerationByTarget = new Map();
+  allQualificationTargets.forEach((target) => {
+    if (!target.repository_attested || target.repository_quarantined) return;
+    const key = JSON.stringify([
+      target.profile,
+      target.target,
+      target.target_fingerprint,
+    ]);
+    safeGenerationByTarget.set(
+      key,
+      Math.max(
+        safeGenerationByTarget.get(key) ?? -1,
+        target.repository_generation
+      )
+    );
+  });
+  const quarantinedTargets = allQualificationTargets
+    .filter((target) => target.repository_quarantined)
+    .map((target) => {
+      const replacementGeneration =
+        safeGenerationByTarget.get(
+          JSON.stringify([
+            target.profile,
+            target.target,
+            target.target_fingerprint,
+          ])
+        ) ?? -1;
+      return {
+        ...target,
+        replacement_generation:
+          replacementGeneration > target.repository_generation
+            ? replacementGeneration
+            : null,
+      };
+    });
+  const unresolvedQuarantinedTargets = quarantinedTargets.filter(
+    (target) => target.replacement_generation === null
+  );
+  const repositoryQuarantineCount =
+    readiness?.qualification_repository_quarantines?.length ||
+    quarantinedTargets.length;
+  const qualificationMutation = readiness?.qualification_mutation;
+  const qualificationMutationDetail =
+    qualificationMutation?.state === 'RESTORING'
+      ? 'Only the exact owner copy may restore the digest. Other copy, canary, staging and activation work remains fenced until restoration clears.'
+      : qualificationMutation?.state === 'QUARANTINED'
+        ? 'The old repository is permanently excluded. The same logical profile may stage a higher generation and ingest its fresh Terraform handoff.'
+        : 'Provider deletion and all copy, canary, staging and activation work remain fenced until readback completes.';
+  const handoffBlocked = Boolean(
+    qualificationMutation && qualificationMutation.state !== 'QUARANTINED'
+  );
+  // A completed quarantine cutover intentionally leaves the previous ACTIVE
+  // row pointing at its permanent tombstone while the fresh QUALIFYING row is
+  // canaried. The catalog mutation is the authoritative global fence; target
+  // tombstones remain visible remediation/history and are enforced again by
+  // the server for the exact selected revision.
+  const canaryBlocked = Boolean(qualificationMutation);
 
   if (loading && !readiness) {
     return (
@@ -166,6 +230,51 @@ export function ImageReadiness({
             : `This snapshot is ${age(now, readiness.generated_at)} old. Mutations are disabled until refresh succeeds.`}
         </div>
       )}
+      {qualificationMutation && (
+        <div
+          role="status"
+          className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"
+        >
+          Qualification mutation <strong>{qualificationMutation.state}</strong>{' '}
+          for {qualificationMutation.owner_target}.{' '}
+          {qualificationMutationDetail}
+        </div>
+      )}
+      {quarantinedTargets.length > 0 && (
+        <div
+          role="alert"
+          className="rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-900"
+        >
+          <div className="font-semibold">
+            {unresolvedQuarantinedTargets.length > 0
+              ? 'Qualification repository cutover required'
+              : 'Qualification repository quarantine retained'}
+          </div>
+          <div className="mt-1">
+            {unresolvedQuarantinedTargets.length > 0
+              ? 'An ambiguous delete permanently tombstoned a shared physical repository. Retain the old generation, provision a higher generation with Terraform, update the profile YAML, then ingest the new handoff.'
+              : 'The old physical repository remains permanently tombstoned while its fresh qualification generation completes canary and activation.'}
+          </div>
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            {quarantinedTargets.slice(0, 5).map((target) => (
+              <li key={`${target.profile}:${target.target}`}>
+                {target.profile} / {target.target}: generation{' '}
+                {target.repository_generation}
+                {target.replacement_generation !== null
+                  ? `, fresh generation ${target.replacement_generation} is qualifying`
+                  : target.required_generation !== null
+                    ? `, use generation ${target.required_generation} or higher`
+                    : ', generation space exhausted'}
+              </li>
+            ))}
+          </ul>
+          {quarantinedTargets.length > 5 && (
+            <div className="mt-2">
+              Plus {quarantinedTargets.length - 5} more affected targets.
+            </div>
+          )}
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-gray-900">
@@ -192,9 +301,13 @@ export function ImageReadiness({
             variant="outline"
             size="sm"
             onClick={() => setQualifyOpen(true)}
-            disabled={stale || loading}
+            disabled={stale || loading || handoffBlocked}
             title={
-              stale ? 'Refresh readiness before changing state' : undefined
+              stale
+                ? 'Refresh readiness before changing state'
+                : handoffBlocked
+                  ? 'Only a quarantined mutation accepts a fresh handoff'
+                  : undefined
             }
           >
             Ingest handoff
@@ -202,9 +315,13 @@ export function ImageReadiness({
           <Button
             size="sm"
             onClick={() => setCanaryOpen(true)}
-            disabled={stale || loading}
+            disabled={stale || loading || canaryBlocked}
             title={
-              stale ? 'Refresh readiness before changing state' : undefined
+              stale
+                ? 'Refresh readiness before changing state'
+                : canaryBlocked
+                  ? 'Resolve qualification mutation or repository quarantine first'
+                  : undefined
             }
           >
             <ShieldCheck className="mr-2 h-4 w-4" />
@@ -213,7 +330,7 @@ export function ImageReadiness({
         </div>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <SummaryCard
           label="Active profiles"
           value={activeProfiles.length}
@@ -243,6 +360,30 @@ export function ImageReadiness({
           warning={readiness.provider_budgets.some(
             (budget) => budget.blocked_until && budget.blocked_until > now
           )}
+        />
+        <SummaryCard
+          label="Repo quarantines"
+          value={`${repositoryQuarantineCount}${
+            readiness.qualification_repository_quarantines_truncated ? '+' : ''
+          }`}
+          detail={
+            unresolvedQuarantinedTargets.length > 0
+              ? `${unresolvedQuarantinedTargets.length} target${
+                  unresolvedQuarantinedTargets.length === 1 ? '' : 's'
+                } require${
+                  unresolvedQuarantinedTargets.length === 1 ? 's' : ''
+                } a new generation`
+              : quarantinedTargets.length > 0
+                ? `${quarantinedTargets.length} replaced target${
+                    quarantinedTargets.length === 1 ? '' : 's'
+                  } reference${
+                    quarantinedTargets.length === 1 ? 's' : ''
+                  } a retained tombstone`
+                : repositoryQuarantineCount > 0
+                  ? 'No selected target uses a tombstoned repository'
+                  : 'No physical repository tombstones'
+          }
+          warning={repositoryQuarantineCount > 0}
         />
       </div>
 
@@ -279,6 +420,7 @@ export function ImageReadiness({
               <TableHead>Revision</TableHead>
               <TableHead>Generation</TableHead>
               <TableHead>State</TableHead>
+              <TableHead>Qualification repo</TableHead>
               <TableHead>Evidence</TableHead>
               <TableHead>Updated</TableHead>
             </TableRow>
@@ -291,6 +433,36 @@ export function ImageReadiness({
                 <TableCell>{profile.desired_generation}</TableCell>
                 <TableCell>
                   <StatusBadge status={profile.state} />
+                </TableCell>
+                <TableCell>
+                  <div className="space-y-1">
+                    {(profile.qualification_targets || []).map((target) => (
+                      <div
+                        key={target.target}
+                        className={
+                          target.repository_quarantined
+                            ? 'text-xs font-medium text-red-700'
+                            : !target.repository_attested
+                              ? 'text-xs text-gray-400'
+                              : 'text-xs text-gray-600'
+                        }
+                      >
+                        {target.target}: g{target.repository_generation}{' '}
+                        {target.repository_quarantined
+                          ? target.required_generation === null
+                            ? '(quarantined, generation space exhausted)'
+                            : `(quarantined, use g${target.required_generation}+)`
+                          : target.repository_attested
+                            ? 'attested'
+                            : 'not attested'}
+                      </div>
+                    ))}
+                    {(profile.qualification_targets || []).length === 0 && (
+                      <span className="text-xs text-gray-400">
+                        Not attested
+                      </span>
+                    )}
+                  </div>
                 </TableCell>
                 <TableCell>
                   <div className="flex max-w-md flex-wrap gap-1">

@@ -247,15 +247,17 @@ def _target_from_config(name: str, value: dict[str, Any], *,
                         canonical: bool) -> models.ManagedRegistryTarget:
     if not isinstance(value, dict):
         raise ValueError(f'Registry target {name!r} must be an object.')
-    allowed = {
+    required = {
         'region', 'registry', 'repository_prefix', 'shard_count',
         'max_manifests_per_shard', 'max_declared_bytes_per_shard',
         'max_in_flight', 'write_authority', 'delete_authority',
         'qualification_delete_authority', 'runtime_pull'
     }
+    allowed = required | {'qualification_repository_generation'}
     if not canonical:
+        required.add('name')
         allowed.add('name')
-    if set(value) != allowed:
+    if not required <= set(value) or not set(value) <= allowed:
         raise ValueError(
             f'Registry target {name!r} must define the complete v0 contract.')
     delete_authority = value['delete_authority']
@@ -281,6 +283,8 @@ def _target_from_config(name: str, value: dict[str, Any], *,
         runtime_pull=tuple(
             sorted((str(backend), str(binding))
                    for backend, binding in runtime_pull.items())),
+        qualification_repository_generation=value.get(
+            'qualification_repository_generation', 0),
     )
 
 

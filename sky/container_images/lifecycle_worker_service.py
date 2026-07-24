@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import concurrent.futures
 import contextlib
+import functools
 import os
 import signal
 import threading
@@ -32,6 +33,8 @@ from sky.serve import serve_state
 from sky.server import database_migrations
 
 _DEFAULT_LEASE_SECONDS = 15 * 60
+_QUALIFICATION_DELETE_LEASE_SECONDS = 5 * 60
+_QUALIFICATION_DELETE_RETRY_SECONDS = 1
 _READBACK_ATTEMPTS = 3
 _CONSUMER_RECONCILIATION_SECONDS = 60
 _TERMINAL_CONFIRMATION_SECONDS = 60 * 60
@@ -49,6 +52,23 @@ class _QualificationDrainRequested(RuntimeError):
 def _raise_if_stopping(should_stop: Callable[[], bool] | None) -> None:
     if should_stop is not None and should_stop():
         raise _QualificationDrainRequested()
+
+
+def _qualification_delete_provider_fence(
+    should_stop: Callable[[], bool] | None,
+    heartbeat: worker_lease.LeaseHeartbeat,
+    ownership_check: Callable[[], bool],
+) -> None:
+    """Fences one destructive provider call on the exact durable epoch."""
+    _raise_if_stopping(should_stop)
+    try:
+        heartbeat.assert_owned()
+    except worker_lease.LeaseLostError:
+        raise _QualificationDrainRequested() from None
+    _raise_if_stopping(should_stop)
+    if not ownership_check():
+        raise _QualificationDrainRequested()
+    _raise_if_stopping(should_stop)
 
 
 def _ecr_hooks(
@@ -145,6 +165,183 @@ def _exact_presence_with_retry(
                 return None
             heartbeat.assert_owned()
     return None
+
+
+def _reconcile_qualification_delete_claim(
+    revision: topology_state.ProfileRevisionRecord,
+    profile: models.ManagedRegistryProfile,
+    target: models.ManagedRegistryTarget,
+    shard: topology_state.ShardRecord,
+    *,
+    repository_name: str,
+    repository_arn: str,
+    digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    delete_phase: str,
+    limiter: budgets.ProviderBudgetLimiter,
+    now: int | None,
+    should_stop: Callable[[], bool] | None,
+) -> tuple[bool, topology_state.ProfileRevisionRecord | None]:
+    """Runs one phase-aware qualification delete or readback claim."""
+    if should_stop is not None and should_stop():
+        return False, None
+    current_delete_phase = delete_phase
+    defer_delete_claim = False
+
+    def heartbeat_delete_claim() -> bool:
+        if defer_delete_claim:
+            return False
+        return qualification.heartbeat_qualification_lifecycle_delete(
+            revision,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=digest,
+            lifecycle_proof_id=lifecycle_proof_id,
+            mutation_lease_token=mutation_lease_token,
+            lease_seconds=_QUALIFICATION_DELETE_LEASE_SECONDS,
+            now=now)
+
+    mutation_heartbeat = worker_lease.LeaseHeartbeat(
+        heartbeat_delete_claim, max(1.0,
+                                    _QUALIFICATION_DELETE_LEASE_SECONDS / 3))
+
+    def delete_claim_owned() -> bool:
+        return qualification.qualification_lifecycle_delete_owned(
+            revision.id,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=digest,
+            lifecycle_proof_id=lifecycle_proof_id,
+            mutation_lease_token=mutation_lease_token,
+            expected_delete_phase=current_delete_phase,
+            now=now)
+
+    delete_provider_fence = functools.partial(
+        _qualification_delete_provider_fence, should_stop, mutation_heartbeat,
+        delete_claim_owned)
+
+    def before_provider_call() -> None:
+        nonlocal current_delete_phase
+        delete_provider_fence()
+        limiter.before_call(shard)
+        delete_provider_fence()
+        if (current_delete_phase ==
+                qualification.QUALIFICATION_DELETE_PHASE_PRE_INTENT):
+            if not qualification.begin_qualification_lifecycle_delete_request(
+                    revision,
+                    target,
+                    repository_arn=repository_arn,
+                    runtime_digest=digest,
+                    lifecycle_proof_id=lifecycle_proof_id,
+                    mutation_lease_token=mutation_lease_token,
+                    now=now):
+                raise _QualificationDrainRequested()
+            current_delete_phase = (
+                qualification.QUALIFICATION_DELETE_PHASE_IN_FLIGHT)
+            delete_provider_fence()
+
+    def quarantine_in_flight() -> None:
+        nonlocal current_delete_phase
+        if (current_delete_phase
+                != qualification.QUALIFICATION_DELETE_PHASE_IN_FLIGHT):
+            return
+        quarantined = qualification.quarantine_qualification_lifecycle_delete(
+            revision,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=digest,
+            lifecycle_proof_id=lifecycle_proof_id,
+            mutation_lease_token=mutation_lease_token,
+            now=now)
+        if quarantined is not None:
+            current_delete_phase = 'QUARANTINED'
+
+    def defer_pre_intent(*, provider_not_started: bool = False) -> bool:
+        nonlocal defer_delete_claim
+        defer_delete_claim = True
+        defer = (qualification.defer_qualification_lifecycle_delete_not_started
+                 if provider_not_started else
+                 qualification.defer_qualification_lifecycle_delete)
+        return defer(revision,
+                     target,
+                     repository_arn=repository_arn,
+                     runtime_digest=digest,
+                     lifecycle_proof_id=lifecycle_proof_id,
+                     mutation_lease_token=mutation_lease_token,
+                     retry_seconds=_QUALIFICATION_DELETE_RETRY_SECONDS,
+                     now=now)
+
+    binding = profile.bindings[target.qualification_delete_authority]
+    try:
+        with mutation_heartbeat:
+            repository = aws.EcrRepository.from_role(
+                _lifecycle_role(binding, profile),
+                target.region,
+                repository_name,
+                hooks=aws.EcrCallHooks(
+                    before_call=before_provider_call,
+                    on_throttle=lambda: limiter.record_throttle(shard)),
+                provider_fence=delete_provider_fence)
+            if (current_delete_phase ==
+                    qualification.QUALIFICATION_DELETE_PHASE_PRE_INTENT):
+                request_outcome = repository.delete_request_outcome(digest)
+                if request_outcome == aws.DeleteRequestOutcome.NOT_STARTED:
+                    return defer_pre_intent(provider_not_started=True), None
+                if request_outcome == aws.DeleteRequestOutcome.AMBIGUOUS:
+                    quarantine_in_flight()
+                    return False, None
+                if not (qualification.
+                        mark_qualification_lifecycle_delete_readback(
+                            revision,
+                            target,
+                            repository_arn=repository_arn,
+                            runtime_digest=digest,
+                            lifecycle_proof_id=lifecycle_proof_id,
+                            mutation_lease_token=mutation_lease_token,
+                            now=now)):
+                    return False, None
+                current_delete_phase = (
+                    qualification.QUALIFICATION_DELETE_PHASE_READBACK)
+            if (current_delete_phase
+                    != qualification.QUALIFICATION_DELETE_PHASE_READBACK):
+                return False, None
+            present = _exact_presence_with_retry(repository, digest,
+                                                 mutation_heartbeat)
+            if present is None:
+                return False, None
+            delete_provider_fence()
+            if present:
+                if not (qualification.
+                        retry_qualification_lifecycle_delete_from_readback(
+                            revision,
+                            target,
+                            repository_arn=repository_arn,
+                            runtime_digest=digest,
+                            lifecycle_proof_id=lifecycle_proof_id,
+                            mutation_lease_token=mutation_lease_token,
+                            now=now)):
+                    return False, None
+                current_delete_phase = (
+                    qualification.QUALIFICATION_DELETE_PHASE_PRE_INTENT)
+                return defer_pre_intent(), None
+            completed = qualification.complete_qualification_lifecycle_delete(
+                revision,
+                target,
+                repository_arn=repository_arn,
+                runtime_digest=digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                mutation_lease_token=mutation_lease_token,
+                now=now)
+            return completed is not None, completed
+    except (worker_lease.LeaseLostError, _QualificationDrainRequested):
+        quarantine_in_flight()
+        return False, None
+    except Exception:  # pylint: disable=broad-except
+        quarantine_in_flight()
+        logger.exception(
+            'Qualification lifecycle provider reconciliation failed.')
+        return False, None
 
 
 def evict_location(
@@ -461,11 +658,31 @@ def reconcile_qualification_lifecycle(
     if should_stop is not None and should_stop():
         return False
 
-    def provider_fence() -> None:
-        _raise_if_stopping(should_stop)
-
+    mutation = qualification.get_qualification_mutation()
+    if mutation is not None and mutation.get('state') == 'QUARANTINED':
+        # A provider request may still arrive after its worker disappeared.
+        # Automatic recovery must remain fail-closed until an operator cuts
+        # qualification over to a different physical repository identity.
+        return False
     revisions = topology_state.list_qualifying_profiles(include_active=True,
                                                         limit=limit)
+    recovery_owner_id: str | None = None
+    recovery_target: str | None = None
+    if mutation is not None and mutation.get('state') == 'DELETING':
+        owner_id = mutation.get('owner_profile_revision_id')
+        owner_target = mutation.get('owner_target')
+        if isinstance(owner_id, str) and isinstance(owner_target, str):
+            recovery_owner_id = owner_id
+            recovery_target = owner_target
+            owner = next((item for item in revisions if item.id == owner_id),
+                         None)
+            if owner is None:
+                owner = topology_state.get_profile_revision(owner_id)
+            if owner is not None:
+                revisions = [owner] + [
+                    item for item in revisions if item.id != owner_id
+                ]
+                revisions = revisions[:limit]
     if should_stop is not None and should_stop():
         return False
     for revision in revisions:
@@ -473,7 +690,12 @@ def reconcile_qualification_lifecycle(
             return False
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
-        for target in (profile.canonical,) + profile.targets:
+        targets = (profile.canonical,) + profile.targets
+        if revision.id == recovery_owner_id and recovery_target is not None:
+            targets = tuple(
+                sorted(targets,
+                       key=lambda target: target.name != recovery_target))
+        for target in targets:
             if should_stop is not None and should_stop():
                 return False
             copy_key = models.profile_attestation_key('copy', target.name)
@@ -484,41 +706,88 @@ def reconcile_qualification_lifecycle(
                     not isinstance(copy_evidence.get('runtime_digest'), str)):
                 continue
             copy_observed_at = copy_evidence['observed_at']
+            digest = models.validate_sha256_digest(
+                copy_evidence['runtime_digest'], 'Qualification canary digest')
+            repository_name, repository_arn = (
+                qualification.qualification_repository(revision, target))
+            if topology_state.qualification_repository_quarantined(
+                    repository_arn):
+                continue
             lifecycle_key = models.profile_attestation_key(
                 'lifecycle', target.name)
             lifecycle = revision.attestations.get(lifecycle_key)
-            if (isinstance(lifecycle, dict) and
-                    lifecycle.get('status') == 'READY' and
-                    lifecycle.get('runtime_digest')
-                    == copy_evidence['runtime_digest'] and
-                    isinstance(lifecycle.get('observed_at'), int) and
-                    lifecycle['observed_at'] >= copy_observed_at):
-                continue
-            runtime_ready = True
-            for backend, binding_id in target.runtime_pull:
-                if should_stop is not None and should_stop():
-                    return False
-                binding = profile.bindings[binding_id]
-                for runtime_id in qualification.runtime_ids(
-                        target, backend, binding):
+            lifecycle_complete = (
+                isinstance(lifecycle, dict) and
+                lifecycle.get('status') == 'READY' and
+                lifecycle.get('target_fingerprint') == target.target_fingerprint
+                and lifecycle.get('runtime_digest')
+                == copy_evidence['runtime_digest'] and
+                lifecycle.get('repository_arn') == repository_arn and
+                isinstance(lifecycle.get('observed_at'), int) and
+                lifecycle.get('exact_absence') is True)
+            if lifecycle_complete:
+                if not qualification.qualification_copy_available(
+                        revision, profile, target):
                     if should_stop is not None and should_stop():
                         return False
-                    runtime_key = models.profile_attestation_key(
-                        'runtime', target.name, backend, binding.fingerprint,
-                        runtime_id)
-                    runtime = revision.attestations.get(runtime_key)
-                    if (not isinstance(runtime, dict) or
-                            runtime.get('status') != 'READY' or
-                            runtime.get('runtime_digest')
-                            != copy_evidence['runtime_digest'] or
-                            not isinstance(runtime.get('observed_at'), int) or
-                            runtime['observed_at'] < copy_observed_at):
-                        runtime_ready = False
+                    revision, _ = (
+                        qualification.begin_qualification_lifecycle_restoration(
+                            revision,
+                            target,
+                            repository_arn=repository_arn,
+                            runtime_digest=digest,
+                            now=now))
+                continue
+            lifecycle_deleting = (
+                isinstance(lifecycle, dict) and
+                lifecycle.get('status') == 'DELETING' and
+                lifecycle.get('protocol_version') == 2 and
+                qualification.qualification_lifecycle_proof_id(lifecycle)
+                is not None and lifecycle.get('target_fingerprint')
+                == target.target_fingerprint and
+                lifecycle.get('repository_arn') == repository_arn and
+                lifecycle.get('runtime_digest') == digest)
+            if not lifecycle_deleting:
+                lifecycle_epoch = (
+                    qualification.qualification_copy_restoration_proof_id(
+                        revision, target, digest))
+                if lifecycle_epoch is None:
+                    revision, _ = qualification.arm_qualification_lifecycle(
+                        revision,
+                        target,
+                        repository_arn=repository_arn,
+                        runtime_digest=digest,
+                        now=now)
+                    # Copy must re-verify and acknowledge the new epoch before
+                    # admission or any lifecycle mutation can proceed.
+                    continue
+                if not qualification.qualification_copy_available(
+                        revision, profile, target):
+                    continue
+                runtime_ready = True
+                for backend, binding_id in target.runtime_pull:
+                    if should_stop is not None and should_stop():
+                        return False
+                    binding = profile.bindings[binding_id]
+                    for runtime_id in qualification.runtime_ids(
+                            target, backend, binding):
+                        if should_stop is not None and should_stop():
+                            return False
+                        runtime_key = models.profile_attestation_key(
+                            'runtime', target.name, backend,
+                            binding.fingerprint, runtime_id)
+                        runtime = revision.attestations.get(runtime_key)
+                        if (not isinstance(runtime, dict) or
+                                runtime.get('status') != 'READY' or
+                                runtime.get('runtime_digest') != digest or
+                                not isinstance(runtime.get('observed_at'), int)
+                                or runtime['observed_at'] < copy_observed_at):
+                            runtime_ready = False
+                            break
+                    if not runtime_ready:
                         break
                 if not runtime_ready:
-                    break
-            if not runtime_ready:
-                continue
+                    continue
             if should_stop is not None and should_stop():
                 return False
             shard = topology_state.get_target_shard(revision.workspace,
@@ -527,61 +796,45 @@ def reconcile_qualification_lifecycle(
                 return False
             if shard is None:
                 continue
-            repository_name, repository_arn = (
-                qualification.qualification_repository(revision, target))
-            binding = profile.bindings[target.qualification_delete_authority]
-            if should_stop is not None and should_stop():
+            revision, lifecycle_proof_id, mutation_lease_token = (
+                qualification.begin_qualification_lifecycle_delete(
+                    revision,
+                    target,
+                    repository_arn=repository_arn,
+                    runtime_digest=digest,
+                    lease_seconds=_QUALIFICATION_DELETE_LEASE_SECONDS,
+                    now=now))
+            if lifecycle_proof_id is None or mutation_lease_token is None:
+                continue
+            lifecycle = revision.attestations.get(lifecycle_key)
+            if not isinstance(lifecycle, dict):
                 return False
-            try:
-                repository = aws.EcrRepository.from_role(
-                    _lifecycle_role(binding, profile),
-                    target.region,
-                    repository_name,
-                    hooks=_ecr_hooks(limiter,
-                                     shard,
-                                     provider_fence=provider_fence),
-                    provider_fence=provider_fence)
-            except _QualificationDrainRequested:
+            delete_phase = lifecycle.get('delete_phase')
+            if delete_phase not in (
+                    qualification.QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+                    qualification.QUALIFICATION_DELETE_PHASE_READBACK):
+                # IN_FLIGHT recovery quarantines inside the claim transaction;
+                # no worker may automatically continue an unknown provider
+                # request.
                 return False
-            if should_stop is not None and should_stop():
+            reconciled, completed = _reconcile_qualification_delete_claim(
+                revision,
+                profile,
+                target,
+                shard,
+                repository_name=repository_name,
+                repository_arn=repository_arn,
+                digest=digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                mutation_lease_token=mutation_lease_token,
+                delete_phase=str(delete_phase),
+                limiter=limiter,
+                now=now,
+                should_stop=should_stop)
+            if not reconciled:
                 return False
-            digest = models.validate_sha256_digest(
-                copy_evidence['runtime_digest'], 'Qualification canary digest')
-            try:
-                request_outcome = repository.delete_request_outcome(digest)
-                _raise_if_stopping(should_stop)
-                if request_outcome != aws.DeleteRequestOutcome.CONCLUDED:
-                    raise aws.AmbiguousProviderOutcomeError(
-                        'ECR qualification deletion did not conclude.')
-                try:
-                    present = repository.exact_manifest_exists(digest)
-                except _QualificationDrainRequested:
-                    raise
-                except Exception as error:  # pylint: disable=broad-except
-                    raise aws.AmbiguousProviderOutcomeError(
-                        'ECR qualification deletion has no exact final '
-                        'presence proof.') from error
-                _raise_if_stopping(should_stop)
-                if present:
-                    continue
-            except _QualificationDrainRequested:
-                return False
-            if should_stop is not None and should_stop():
-                return False
-            revision = topology_state.record_profile_attestation(
-                profile_revision_id=revision.id,
-                kind=lifecycle_key,
-                evidence={
-                    'status': 'READY',
-                    'target': target.name,
-                    'target_fingerprint': target.target_fingerprint,
-                    'repository_arn': repository_arn,
-                    'runtime_digest': digest,
-                    'exact_absence': True,
-                },
-                expected_generation=revision.desired_generation,
-                expected_config_hash=revision.config_hash,
-                now=now)
+            if completed is not None:
+                revision = completed
         if should_stop is not None and should_stop():
             return False
         qualification.maybe_activate_profile(revision.id)

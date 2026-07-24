@@ -111,7 +111,7 @@ mock_provider "aws" {
 
 variables {
   catalog_authority                   = "00000000-0000-4000-8000-000000000001"
-  catalog_authority_base32            = "aaaaaaaaaaaaaaaaaaaaaaaaaa"
+  catalog_authority_base32            = "aaaaaaaaabaabaaaaaaaaaaaae"
   realm                               = "terraform-test"
   profile                             = "default"
   registry_account_id                 = "123456789012"

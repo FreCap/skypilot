@@ -28,6 +28,20 @@ const readiness = {
       revision: 2,
       desired_generation: 3,
       state: 'ACTIVE',
+      qualification_targets: [
+        {
+          target: 'aws-us-west-2',
+          target_fingerprint: 'target-fingerprint-west',
+          region: 'us-west-2',
+          repository_arn: 'arn:aws:ecr:us-west-2:123456789012:repository/q',
+          repository_generation: 1,
+          repository_attested: true,
+          repository_quarantined: false,
+          required_generation: null,
+          quarantine_reason: null,
+          quarantined_at: null,
+        },
+      ],
       attestations: {
         'runtime:aws-us-west-2:aws_vm': {
           status: 'READY',
@@ -90,6 +104,9 @@ const readiness = {
   workers_truncated: false,
   provider_budgets_truncated: false,
   queues_truncated: false,
+  qualification_mutation: null,
+  qualification_repository_quarantines: [],
+  qualification_repository_quarantines_truncated: false,
 };
 
 describe('Image readiness', () => {
@@ -200,6 +217,287 @@ describe('Image readiness', () => {
     expect(screen.getByText('10,000+ terminal failures')).toBeVisible();
     expect(screen.getByText('10,000+ failed')).toBeVisible();
     expect(screen.getByText('≥17m')).toBeVisible();
+  });
+
+  it('shows the exact generation remediation for repository quarantine', () => {
+    render(
+      <ImageReadiness
+        readiness={{
+          ...readiness,
+          generated_at: Math.floor(Date.now() / 1000),
+          qualification_repository_quarantines: [
+            {
+              repository_arn: 'arn:aws:ecr:us-west-2:123456789012:repository/q',
+              owner_profile_revision_id: 'profile-1',
+              owner_target: 'aws-us-west-2',
+              quarantine_reason: 'PROVIDER_OUTCOME_AMBIGUOUS',
+              quarantined_at: 9_999,
+            },
+          ],
+          qualification_mutation: {
+            state: 'QUARANTINED',
+            owner_target: 'aws-us-west-2',
+          },
+          profiles: [
+            {
+              ...readiness.profiles[0],
+              qualification_targets: [
+                {
+                  ...readiness.profiles[0].qualification_targets[0],
+                  repository_quarantined: true,
+                  required_generation: 2,
+                  quarantine_reason: 'PROVIDER_OUTCOME_AMBIGUOUS',
+                  quarantined_at: 9_999,
+                },
+              ],
+            },
+          ],
+        }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText('Qualification repository cutover required')
+    ).toBeVisible();
+    expect(screen.getByText(/use generation 2 or higher/)).toBeVisible();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.classList.contains('text-red-700') &&
+          element?.textContent === 'aws-us-west-2: g1 (quarantined, use g2+)'
+      )
+    ).toBeVisible();
+    expect(
+      screen.getByText('1 target requires a new generation')
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Ingest handoff' })
+    ).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Run canary' })).toBeDisabled();
+  });
+
+  it('allows canarying a fresh candidate after the old active repo cutover', () => {
+    render(
+      <ImageReadiness
+        readiness={{
+          ...readiness,
+          generated_at: Math.floor(Date.now() / 1000),
+          qualification_repository_quarantines: [
+            {
+              repository_arn: 'arn:aws:ecr:us-west-2:123456789012:repository/q',
+              owner_profile_revision_id: 'profile-active',
+              owner_target: 'aws-us-west-2',
+              quarantine_reason: 'PROVIDER_OUTCOME_AMBIGUOUS',
+              quarantined_at: 9_999,
+            },
+          ],
+          profiles: [
+            {
+              ...readiness.profiles[0],
+              id: 'profile-active',
+              state: 'ACTIVE',
+              qualification_targets: [
+                {
+                  ...readiness.profiles[0].qualification_targets[0],
+                  repository_quarantined: true,
+                  required_generation: 2,
+                },
+              ],
+            },
+            {
+              ...readiness.profiles[0],
+              id: 'profile-candidate',
+              revision: 3,
+              desired_generation: 4,
+              state: 'QUALIFYING',
+              qualification_targets: [
+                {
+                  ...readiness.profiles[0].qualification_targets[0],
+                  repository_arn:
+                    'arn:aws:ecr:us-west-2:123456789012:repository/q-g02',
+                  repository_generation: 2,
+                  repository_quarantined: false,
+                  required_generation: null,
+                },
+              ],
+            },
+          ],
+        }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Run canary' })).toBeEnabled();
+    expect(
+      screen.getByText('Qualification repository quarantine retained')
+    ).toBeVisible();
+    expect(screen.getByText(/fresh generation 2 is qualifying/)).toBeVisible();
+    expect(
+      screen.getByText('1 replaced target references a retained tombstone')
+    ).toBeVisible();
+    expect(screen.queryByText('1 target requires a new generation')).toBeNull();
+  });
+
+  it('does not treat a changed target fingerprint as a quarantine replacement', () => {
+    render(
+      <ImageReadiness
+        readiness={{
+          ...readiness,
+          generated_at: Math.floor(Date.now() / 1000),
+          profiles: [
+            {
+              ...readiness.profiles[0],
+              id: 'profile-active',
+              qualification_targets: [
+                {
+                  ...readiness.profiles[0].qualification_targets[0],
+                  repository_quarantined: true,
+                  required_generation: 2,
+                },
+              ],
+            },
+            {
+              ...readiness.profiles[0],
+              id: 'profile-candidate',
+              revision: 3,
+              state: 'QUALIFYING',
+              qualification_targets: [
+                {
+                  ...readiness.profiles[0].qualification_targets[0],
+                  target_fingerprint: 'changed-target-fingerprint',
+                  repository_arn:
+                    'arn:aws:ecr:us-west-2:123456789012:repository/q-g02',
+                  repository_generation: 2,
+                },
+              ],
+            },
+          ],
+        }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText('Qualification repository cutover required')
+    ).toBeVisible();
+    expect(screen.queryByText(/fresh generation 2 is qualifying/)).toBeNull();
+  });
+
+  it('reports exhausted qualification generation space', () => {
+    render(
+      <ImageReadiness
+        readiness={{
+          ...readiness,
+          generated_at: Math.floor(Date.now() / 1000),
+          profiles: [
+            {
+              ...readiness.profiles[0],
+              qualification_targets: [
+                {
+                  ...readiness.profiles[0].qualification_targets[0],
+                  repository_generation: 255,
+                  repository_quarantined: true,
+                  required_generation: null,
+                },
+              ],
+            },
+          ],
+        }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.classList.contains('text-red-700') &&
+          element?.textContent ===
+            'aws-us-west-2: g255 (quarantined, generation space exhausted)'
+      )
+    ).toBeVisible();
+  });
+
+  it('shows selected repository attestation independently per target', () => {
+    render(
+      <ImageReadiness
+        readiness={{
+          ...readiness,
+          profiles: [
+            {
+              ...readiness.profiles[0],
+              qualification_targets: [
+                readiness.profiles[0].qualification_targets[0],
+                {
+                  ...readiness.profiles[0].qualification_targets[0],
+                  target: 'aws-us-east-1',
+                  region: 'us-east-1',
+                  repository_generation: 2,
+                  repository_attested: false,
+                },
+              ],
+            },
+          ],
+        }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(screen.getByText('aws-us-west-2: g1 attested')).toBeVisible();
+    expect(screen.getByText('aws-us-east-1: g2 not attested')).toBeVisible();
+  });
+
+  it.each([
+    [
+      'DELETING',
+      /Provider deletion and all copy, canary, staging and activation work remain fenced/,
+    ],
+    ['RESTORING', /Only the exact owner copy may restore the digest/],
+    [
+      'QUARANTINED',
+      /same logical profile may stage a higher generation and ingest its fresh Terraform handoff/,
+    ],
+  ])('shows state-specific %s mutation recovery', (state, message) => {
+    render(
+      <ImageReadiness
+        readiness={{
+          ...readiness,
+          generated_at: Math.floor(Date.now() / 1000),
+          qualification_mutation: {
+            state,
+            owner_target: 'aws-us-west-2',
+          },
+        }}
+        capabilities={capabilities}
+        loading={false}
+        error={null}
+        onRefresh={jest.fn()}
+      />
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent(message);
+    expect(screen.getByRole('button', { name: 'Run canary' })).toBeDisabled();
+    const handoff = screen.getByRole('button', { name: 'Ingest handoff' });
+    if (state === 'QUARANTINED') {
+      expect(handoff).toBeEnabled();
+    } else {
+      expect(handoff).toBeDisabled();
+    }
   });
 
   it('marks aggregate counts and the table as partial when groups truncate', () => {

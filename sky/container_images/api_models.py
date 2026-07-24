@@ -11,6 +11,7 @@ import pydantic
 from sky.container_images import catalog_state
 from sky.container_images import demand_state
 from sky.container_images import models
+from sky.container_images import qualification
 from sky.container_images import topology_state
 
 
@@ -418,6 +419,19 @@ class DemandView(_ApiModel):
                    updated_at=record.updated_at)
 
 
+class QualificationTargetView(_ApiModel):
+    target: str
+    target_fingerprint: str
+    region: str
+    repository_arn: str | None
+    repository_generation: int
+    repository_attested: bool
+    repository_quarantined: bool
+    required_generation: int | None
+    quarantine_reason: str | None
+    quarantined_at: int | None
+
+
 class ProfileView(_ApiModel):
     id: str
     profile: str
@@ -451,6 +465,64 @@ class ProfileView(_ApiModel):
                    failed_code=record.failed_code,
                    created_at=record.created_at,
                    updated_at=record.updated_at)
+
+
+class ReadinessProfileView(ProfileView):
+    qualification_targets: list[QualificationTargetView] = pydantic.Field(
+        default_factory=list)
+
+    @classmethod
+    def from_readiness_record(
+        cls,
+        record: topology_state.ProfileRevisionRecord,
+        qualification_quarantines: dict[
+            str, topology_state.QualificationRepositoryQuarantineRecord],
+        catalog_authority: str,
+    ) -> ReadinessProfileView:
+        base = ProfileView.from_record(record)
+        profile = models.ManagedRegistryProfile.from_snapshot(
+            record.config_snapshot)
+        qualification_targets: list[QualificationTargetView] = []
+        for target in (profile.canonical,) + profile.targets:
+            evidence = record.attestations.get(
+                models.profile_attestation_key('terraform_target', target.name))
+            repository_arn = (evidence.get('repository_arn') if isinstance(
+                evidence, dict) else None)
+            if not isinstance(repository_arn, str):
+                repository_arn = None
+            try:
+                _, attested_repository_arn = (
+                    qualification.qualification_repository(
+                        record,
+                        target,
+                        catalog_authority=catalog_authority,
+                        profile=profile,
+                        configured_target=target))
+                repository_attested = (
+                    attested_repository_arn == repository_arn)
+            except ValueError:
+                repository_attested = False
+            quarantine = (qualification_quarantines.get(repository_arn)
+                          if repository_arn is not None else None)
+            generation = target.qualification_repository_generation
+            qualification_targets.append(
+                QualificationTargetView(
+                    target=target.name,
+                    target_fingerprint=target.target_fingerprint,
+                    region=target.region,
+                    repository_arn=repository_arn,
+                    repository_generation=generation,
+                    repository_attested=repository_attested,
+                    repository_quarantined=quarantine is not None,
+                    required_generation=(generation +
+                                         1 if quarantine is not None and
+                                         generation < 255 else None),
+                    quarantine_reason=(quarantine.quarantine_reason
+                                       if quarantine is not None else None),
+                    quarantined_at=(quarantine.quarantined_at
+                                    if quarantine is not None else None)))
+        return cls(**base.model_dump(),
+                   qualification_targets=qualification_targets)
 
 
 class WorkerView(_ApiModel):
@@ -550,13 +622,32 @@ class Page(_ApiModel):
     next_cursor: str | None = None
 
 
+class QualificationRepositoryQuarantineView(_ApiModel):
+    repository_arn: str
+    owner_profile_revision_id: str
+    owner_target: str
+    quarantine_reason: str
+    quarantined_at: int
+
+    @classmethod
+    def from_record(
+        cls,
+        record: topology_state.QualificationRepositoryQuarantineRecord,
+    ) -> QualificationRepositoryQuarantineView:
+        return cls(repository_arn=record.repository_arn,
+                   owner_profile_revision_id=record.owner_profile_revision_id,
+                   owner_target=record.owner_target,
+                   quarantine_reason=record.quarantine_reason,
+                   quarantined_at=record.quarantined_at)
+
+
 class ReadinessView(_ApiModel):
     version: Literal[1] = 1
     catalog_authority: str
     catalog_authority_base32: str
     workspace: str
     workspace_policy: dict[str, Any]
-    profiles: list[ProfileView]
+    profiles: list[ReadinessProfileView]
     profiles_truncated: bool
     shards: list[dict[str, Any]]
     shards_truncated: bool
@@ -566,4 +657,9 @@ class ReadinessView(_ApiModel):
     provider_budgets_truncated: bool
     queues: list[dict[str, Any]]
     queues_truncated: bool = False
+    qualification_mutation: dict[str, Any] | None = None
+    qualification_repository_quarantines: list[
+        QualificationRepositoryQuarantineView] = pydantic.Field(
+            default_factory=list)
+    qualification_repository_quarantines_truncated: bool = False
     generated_at: int

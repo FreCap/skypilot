@@ -761,11 +761,31 @@ def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
                                now: int) -> bool:
     copy_key = models.profile_attestation_key('copy', target.name)
     copy_evidence = revision.attestations.get(copy_key)
+    copy_available = qualification.qualification_copy_available(
+        revision, profile, target)
     copy_fresh = (
-        isinstance(copy_evidence, dict) and
+        copy_available and isinstance(copy_evidence, dict) and
         copy_evidence.get('status') == 'READY' and
         isinstance(copy_evidence.get('observed_at'), int) and
         0 <= now - copy_evidence['observed_at'] <= _CONFIG_REFRESH_SECONDS * 10)
+    if not copy_available:
+        if (isinstance(copy_evidence, dict) and
+                isinstance(copy_evidence.get('runtime_digest'), str)):
+            lifecycle_key = models.profile_attestation_key(
+                'lifecycle', target.name)
+            lifecycle = revision.attestations.get(lifecycle_key)
+            if not isinstance(lifecycle, dict):
+                # The initial unacknowledged copy gives lifecycle its digest.
+                # Wait for lifecycle to arm an epoch before re-verifying it.
+                return False
+            matching_lifecycle = (lifecycle.get('runtime_digest') ==
+                                  copy_evidence['runtime_digest'])
+            if matching_lifecycle:
+                return (qualification.qualification_copy_restoration_proof_id(
+                    revision, target, copy_evidence['runtime_digest'])
+                        is not None)
+            return False
+        return True
     if revision.state == models.ImageProfileState.QUALIFYING:
         return not copy_fresh
     for backend, binding_id in target.runtime_pull:
@@ -793,8 +813,16 @@ def reconcile_qualification_copy(
         should_stop: Callable[[], bool] | None = None) -> bool:
     """Attests live infrastructure and copies the fixed canary as copy role."""
     _raise_if_stopping(should_stop)
+    qualification_repository_arn: str | None = None
 
     def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+        if (qualification_repository_arn is not None and
+                not qualification.qualification_copy_provider_allowed(
+                    revision,
+                    target,
+                    repository_arn=qualification_repository_arn)):
+            raise _QualificationDrainRequested()
         _raise_if_stopping(should_stop)
 
     profile = models.ManagedRegistryProfile.from_snapshot(
@@ -807,6 +835,44 @@ def reconcile_qualification_copy(
         return False
     repository_name, repository_arn = qualification.qualification_repository(
         revision, target)
+    qualification_repository_arn = repository_arn
+    expected_uri = f'{target.registry}/{repository_name}'
+    target_key = models.profile_attestation_key('terraform_target', target.name)
+    terraform_target = revision.attestations.get(target_key)
+    if (not isinstance(terraform_target, dict) or
+            terraform_target.get('status') != 'READY' or
+            terraform_target.get('target_fingerprint')
+            != target.target_fingerprint or
+            terraform_target.get('repository_arn') != repository_arn):
+        raise LookupError(
+            'Terraform qualification target attestation is not committed yet.')
+    expected_policy_hash = models.validate_fingerprint(
+        terraform_target.get('qualification_policy_hash'),
+        'Qualification repository policy hash')
+    expected_ownership_tags_hash = models.validate_fingerprint(
+        terraform_target.get('qualification_ownership_tags_hash'),
+        'Qualification repository ownership tags hash')
+    _, terraform_shard = _expected_shard_attestation(revision, shard)
+    expected_encryption_type = terraform_shard.get('encryption_type')
+    expected_kms_key = terraform_shard.get('kms_key')
+    if (terraform_shard.get('target_fingerprint') != target.target_fingerprint
+            or expected_encryption_type not in ('AES256', 'KMS') or
+        (expected_encryption_type == 'AES256' and expected_kms_key is not None)
+            or (expected_encryption_type == 'KMS' and
+                not isinstance(expected_kms_key, str))):
+        raise LookupError(
+            'Terraform qualification encryption attestation is invalid.')
+    expected_metadata = {
+        'repository_arn': repository_arn,
+        'repository_uri': expected_uri,
+        'tag_mutability': 'IMMUTABLE',
+        'encryption_type': expected_encryption_type,
+        'kms_key': expected_kms_key,
+        'scanning_mode': 'MANUAL',
+        'policy_hash': expected_policy_hash,
+        'ownership_tags_hash': expected_ownership_tags_hash,
+    }
+    provider_fence()
     binding = profile.bindings[target.write_authority]
     _raise_if_stopping(should_stop)
     destination = aws.EcrRepository.from_role(
@@ -818,10 +884,7 @@ def reconcile_qualification_copy(
     _raise_if_stopping(should_stop)
     metadata = destination.repository_metadata()
     _raise_if_stopping(should_stop)
-    expected_uri = f'{target.registry}/{repository_name}'
-    if (metadata['repository_arn'] != repository_arn or
-            metadata['repository_uri'] != expected_uri or
-            metadata['tag_mutability'] != 'IMMUTABLE'):
+    if metadata != expected_metadata:
         raise ValueError('Qualification repository live identity drifted.')
     _raise_if_stopping(should_stop)
     revision = topology_state.record_profile_attestation(
@@ -836,6 +899,9 @@ def reconcile_qualification_copy(
             'tag_mutability': metadata['tag_mutability'],
             'encryption_type': metadata['encryption_type'],
             'kms_key': metadata['kms_key'],
+            'scanning_mode': metadata['scanning_mode'],
+            'policy_hash': metadata['policy_hash'],
+            'ownership_tags_hash': metadata['ownership_tags_hash'],
         },
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
@@ -862,6 +928,28 @@ def reconcile_qualification_copy(
     graph = _inspection_graph(reader, profile.qualification.canary_platform,
                               profile.limits.max_artifact_bytes)
     _raise_if_stopping(should_stop)
+    current_revision = topology_state.get_profile_revision(revision.id)
+    _raise_if_stopping(should_stop)
+    if current_revision is None:
+        return False
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    lifecycle = current_revision.attestations.get(lifecycle_key)
+    matching_lifecycle = (isinstance(lifecycle, dict) and
+                          lifecycle.get('runtime_digest')
+                          == graph.runtime_digest)
+    expected_lifecycle_proof_id = (
+        qualification.qualification_copy_restoration_proof_id(
+            current_revision, target, graph.runtime_digest))
+    if matching_lifecycle and expected_lifecycle_proof_id is None:
+        return False
+    copy_allowed, expected_mutation_proof_id = (
+        qualification.qualification_copy_barrier_snapshot(
+            current_revision,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=graph.runtime_digest))
+    if not copy_allowed:
+        return False
     outcome = destination.copy_graph(graph, reader.read_blob,
                                      _StopPredicateEvent(should_stop))
     _raise_if_stopping(should_stop)
@@ -874,23 +962,18 @@ def reconcile_qualification_copy(
         raise aws.DestinationContentMismatchError(
             'Qualification canary did not verify after copy.')
     _raise_if_stopping(should_stop)
-    topology_state.record_profile_attestation(
-        profile_revision_id=revision.id,
-        kind=models.profile_attestation_key('copy', target.name),
-        evidence={
-            'status': 'READY',
-            'target': target.name,
-            'target_fingerprint': target.target_fingerprint,
-            'repository_arn': repository_arn,
-            'runtime_digest': graph.runtime_digest,
-            'platform': graph.platform,
-            'copy_outcome': outcome.value,
-        },
-        expected_generation=revision.desired_generation,
-        expected_config_hash=revision.config_hash,
+    recorded = qualification.record_qualification_copy(
+        current_revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=graph.runtime_digest,
+        platform=graph.platform,
+        copy_outcome=outcome.value,
+        expected_lifecycle_proof_id=expected_lifecycle_proof_id,
+        expected_mutation_proof_id=expected_mutation_proof_id,
         now=now)
     _raise_if_stopping(should_stop)
-    return True
+    return recorded is not None
 
 
 def reconcile_qualification_profiles(
@@ -903,8 +986,30 @@ def reconcile_qualification_profiles(
     completed = 0
     if should_stop is not None and should_stop():
         return completed
+    mutation = qualification.get_qualification_mutation()
+    if mutation is not None and mutation.get('state') == 'QUARANTINED':
+        # No provider read is safe while an ambiguous old delete can still
+        # arrive at the shared physical qualification repository.
+        return completed
     revisions = topology_state.list_qualifying_profiles(include_active=True,
                                                         limit=limit)
+    recovery_owner_id: str | None = None
+    recovery_target: str | None = None
+    if mutation is not None and mutation.get('state') == 'RESTORING':
+        owner_id = mutation.get('owner_profile_revision_id')
+        owner_target = mutation.get('owner_target')
+        if isinstance(owner_id, str) and isinstance(owner_target, str):
+            recovery_owner_id = owner_id
+            recovery_target = owner_target
+            owner = next((item for item in revisions if item.id == owner_id),
+                         None)
+            if owner is None:
+                owner = topology_state.get_profile_revision(owner_id)
+            if owner is not None:
+                revisions = [owner] + [
+                    item for item in revisions if item.id != owner_id
+                ]
+                revisions = revisions[:limit]
     if should_stop is not None and should_stop():
         return completed
     for revision in revisions:
@@ -912,7 +1017,12 @@ def reconcile_qualification_profiles(
             break
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
-        for target in (profile.canonical,) + profile.targets:
+        targets = (profile.canonical,) + profile.targets
+        if revision.id == recovery_owner_id and recovery_target is not None:
+            targets = tuple(
+                sorted(targets,
+                       key=lambda target: target.name != recovery_target))
+        for target in targets:
             if should_stop is not None and should_stop():
                 return completed
             try:

@@ -594,6 +594,7 @@ class ManagedRegistryTarget:
     delete_authority: str | None
     qualification_delete_authority: str
     runtime_pull: tuple[tuple[str, str], ...]
+    qualification_repository_generation: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -633,6 +634,12 @@ class ManagedRegistryTarget:
             validate_control_plane_identifier(
                 self.qualification_delete_authority,
                 'Qualification delete authority'))
+        if (not isinstance(self.qualification_repository_generation, int) or
+                isinstance(self.qualification_repository_generation, bool) or
+                not 0 <= self.qualification_repository_generation <= 255):
+            raise ValueError(
+                'Qualification repository generation must be an integer from '
+                '0 through 255.')
 
     def runtime_binding(self, backend: str) -> str | None:
         return dict(self.runtime_pull).get(backend)
@@ -764,6 +771,9 @@ class ManagedRegistryProfile:
                     field.name: normalize(getattr(value, field.name))
                     for field in dataclasses.fields(value)
                 }
+                if (isinstance(value, ManagedRegistryTarget) and
+                        value.qualification_repository_generation == 0):
+                    normalized.pop('qualification_repository_generation')
                 if (isinstance(value, RegistryAccessBinding) and
                         value.canary_use_spot is None):
                     normalized.pop('canary_use_spot')
@@ -1224,6 +1234,50 @@ def profile_attestation_key(capability: str, *identity: str) -> str:
         json.dumps(identity, sort_keys=False,
                    separators=(',', ':')).encode()).hexdigest()
     return f'{capability}:{digest}'
+
+
+def qualification_copy_proof_matches(attestations: dict[str, Any],
+                                     profile: ManagedRegistryProfile,
+                                     target: ManagedRegistryTarget) -> bool:
+    """Validates one target's exact protocol-2 copy restoration handshake."""
+    copy_evidence = attestations.get(
+        profile_attestation_key('copy', target.name))
+    lifecycle = attestations.get(
+        profile_attestation_key('lifecycle', target.name))
+    if (not isinstance(copy_evidence, dict) or
+            copy_evidence.get('status') != 'READY' or
+            copy_evidence.get('target_fingerprint') != target.target_fingerprint
+            or copy_evidence.get('platform')
+            != profile.qualification.canary_platform or
+            not isinstance(copy_evidence.get('repository_arn'), str) or
+            not isinstance(copy_evidence.get('runtime_digest'), str) or
+            not isinstance(copy_evidence.get('observed_at'), int) or
+            not isinstance(lifecycle, dict) or
+            lifecycle.get('target_fingerprint') != target.target_fingerprint or
+            lifecycle.get('repository_arn') != copy_evidence['repository_arn']
+            or lifecycle.get('runtime_digest')
+            != copy_evidence['runtime_digest'] or
+            lifecycle.get('protocol_version') != 2 or
+            not isinstance(lifecycle.get('observed_at'), int)):
+        return False
+    status = lifecycle.get('status')
+    if status == 'ARMED':
+        if lifecycle.get('exact_absence') is not None:
+            return False
+    elif status == 'READY':
+        if lifecycle.get('exact_absence') is not True:
+            return False
+    else:
+        return False
+    proof_id = lifecycle.get('lifecycle_proof_id')
+    if not isinstance(proof_id, str):
+        return False
+    try:
+        parsed = uuid.UUID(proof_id)
+    except ValueError:
+        return False
+    return (str(parsed) == proof_id and
+            copy_evidence.get('restores_lifecycle_proof_id') == proof_id)
 
 
 def reference_registry_authority(reference: str, subject: str) -> str:

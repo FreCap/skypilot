@@ -13,6 +13,7 @@ import pydantic
 import pytest
 
 from sky.container_images import api_models
+from sky.container_images import aws
 from sky.container_images import catalog_state
 from sky.container_images import client
 from sky.container_images import models
@@ -637,6 +638,17 @@ def test_readiness_uses_operational_profiles_and_drops_partial_boundary(
                             profile=f'profile-{index:04d}')
         for index in range(999)
     ]
+    repository_arn = ('arn:aws:ecr:us-east-1:123456789012:repository/'
+                      'skypilot/images/qualification/g01/us-east-1')
+    terraform_target_key = models.profile_attestation_key(
+        'terraform_target', profile.canonical.name)
+    records[0] = dataclasses.replace(records[0],
+                                     attestations={
+                                         terraform_target_key: {
+                                             'status': 'READY',
+                                             'repository_arn': repository_arn,
+                                         }
+                                     })
     records.extend((
         dataclasses.replace(base,
                             id=str(uuid.uuid4()),
@@ -661,6 +673,24 @@ def test_readiness_uses_operational_profiles_and_drops_partial_boundary(
                         lambda **_kwargs: [])
     monkeypatch.setattr(server.topology_state, 'list_provider_budgets',
                         lambda **_kwargs: [])
+    monkeypatch.setattr(server.topology_state,
+                        'list_qualification_repository_quarantines',
+                        lambda **_kwargs: [])
+    monkeypatch.setattr(
+        server.topology_state, 'qualification_repository_quarantines_for_arns',
+        lambda _arns: [
+            topology_state.QualificationRepositoryQuarantineRecord(
+                repository_arn=repository_arn,
+                owner_profile_revision_id=records[0].id,
+                owner_target=profile.canonical.name,
+                owner_target_fingerprint=profile.canonical.target_fingerprint,
+                runtime_digest='sha256:' + 'a' * 64,
+                lifecycle_proof_id=str(uuid.uuid4()),
+                quarantine_reason='PROVIDER_OUTCOME_AMBIGUOUS',
+                quarantined_at=100)
+        ] if repository_arn in _arns else [])
+    monkeypatch.setattr(server.qualification, 'get_qualification_mutation',
+                        lambda: None)
     monkeypatch.setattr(server.topology_state, 'readiness_queue_stats',
                         lambda _shards: ([], False))
     monkeypatch.setattr(server.catalog_state, 'get_catalog_authority_id',
@@ -671,7 +701,80 @@ def test_readiness_uses_operational_profiles_and_drops_partial_boundary(
     assert view.profiles_truncated
     assert len(view.profiles) == 999
     assert all(item.profile != 'profile-boundary' for item in view.profiles)
+    projected = next(item for item in view.profiles if item.id == records[0].id)
+    assert projected.qualification_targets[0].repository_quarantined
+    assert projected.qualification_targets[0].required_generation == 1
     operational.assert_called_once_with('research', limit=1001)
+
+
+def test_readiness_profile_projection_parses_snapshot_once_without_target_lookup(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    authority = str(uuid.uuid4())
+    attestations: dict[str, Any] = {}
+    targets = (profile.canonical,) + profile.targets
+    assert len(targets) > 1
+    for target in targets:
+        repository_name = aws.qualification_repository_name(authority, target)
+        repository_arn = (
+            f'arn:{profile.partition}:ecr:{target.region}:'
+            f'{profile.registry_account}:repository/{repository_name}')
+        attestations[models.profile_attestation_key(
+            'terraform_target', target.name)] = {
+                'status': 'READY',
+                'target_fingerprint': target.target_fingerprint,
+                'registry': target.registry,
+                'repository_name': repository_name,
+                'repository_arn': repository_arn,
+                'qualification_repository_generation':
+                    target.qualification_repository_generation,
+            }
+    record = dataclasses.replace(_profile_record(profile),
+                                 attestations=attestations)
+    original_from_snapshot = models.ManagedRegistryProfile.from_snapshot
+    parse_snapshot = mock.Mock(wraps=original_from_snapshot)
+    monkeypatch.setattr(models.ManagedRegistryProfile, 'from_snapshot',
+                        parse_snapshot)
+
+    def fail_target_lookup(_profile: models.ManagedRegistryProfile,
+                           _target_name: str) -> models.ManagedRegistryTarget:
+        raise AssertionError('Readiness projection must not rescan targets.')
+
+    monkeypatch.setattr(models.ManagedRegistryProfile, 'target',
+                        fail_target_lookup)
+
+    projected = api_models.ReadinessProfileView.from_readiness_record(
+        record, {}, catalog_authority=authority)
+
+    assert parse_snapshot.call_count == 1
+    assert len(projected.qualification_targets) == len(targets)
+    assert all(target.repository_attested
+               for target in projected.qualification_targets)
+
+
+def test_readiness_v1_accepts_profile_without_new_qualification_projection(
+        profile: models.ManagedRegistryProfile) -> None:
+    legacy_profile = api_models.ProfileView.from_record(
+        _profile_record(profile)).model_dump(mode='json')
+    view = api_models.ReadinessView.model_validate({
+        'version': 1,
+        'catalog_authority': str(uuid.uuid4()),
+        'catalog_authority_base32': 'aaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'workspace': 'research',
+        'workspace_policy': {},
+        'profiles': [legacy_profile],
+        'profiles_truncated': False,
+        'shards': [],
+        'shards_truncated': False,
+        'workers': [],
+        'workers_truncated': False,
+        'provider_budgets': [],
+        'provider_budgets_truncated': False,
+        'queues': [],
+        'generated_at': 1,
+    })
+
+    assert view.profiles[0].qualification_targets == []
 
 
 def test_closed_error_mapping_never_reflects_provider_text() -> None:

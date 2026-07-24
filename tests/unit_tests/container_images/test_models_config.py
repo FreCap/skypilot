@@ -147,6 +147,60 @@ def test_profile_snapshot_is_complete_deterministic_and_revalidated(
         models.ManagedRegistryProfile.from_snapshot(forged)
 
 
+def test_qualification_repository_generation_is_additive_and_custody_neutral(
+        registry_config: dict[str, Any],
+        profile: models.ManagedRegistryProfile) -> None:
+    legacy_snapshot = profile.to_snapshot()
+    assert 'qualification_repository_generation' not in (
+        legacy_snapshot['canonical'])
+    assert all('qualification_repository_generation' not in target
+               for target in legacy_snapshot['targets'])
+    assert profile.config_hash == hashlib.sha256(
+        json.dumps(legacy_snapshot, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+
+    generated_config = copy.deepcopy(registry_config)
+    generated_profile_config = generated_config['profiles']['gpu-production']
+    generated_profile_config['canonical'][
+        'qualification_repository_generation'] = 1
+    generated_profile_config['targets'][0][
+        'qualification_repository_generation'] = 2
+    bindings = config.parse_access_bindings(generated_config['access_bindings'])
+    generated = config.parse_profiles(generated_config['profiles'],
+                                      bindings)['gpu-production']
+
+    assert generated.canonical.qualification_repository_generation == 1
+    assert generated.targets[0].qualification_repository_generation == 2
+    assert generated.config_hash != profile.config_hash
+    assert generated.physical_manifest_hash == profile.physical_manifest_hash
+    assert (generated.canonical.target_fingerprint ==
+            profile.canonical.target_fingerprint)
+    assert (generated.targets[0].target_fingerprint ==
+            profile.targets[0].target_fingerprint)
+    assert (models.ManagedRegistryProfile.from_snapshot(
+        generated.to_snapshot()) == generated)
+
+    registry_schema = schemas.get_config_schema(
+    )['properties']['container_registries']
+    jsonschema.validate(generated_config, registry_schema)
+
+
+@pytest.mark.parametrize('invalid_generation', [True, -1, 1.5, 256])
+def test_qualification_repository_generation_is_bounded_integer(
+        registry_config: dict[str, Any], invalid_generation: Any) -> None:
+    invalid = copy.deepcopy(registry_config)
+    invalid['profiles']['gpu-production']['canonical'][
+        'qualification_repository_generation'] = invalid_generation
+    bindings = config.parse_access_bindings(invalid['access_bindings'])
+    with pytest.raises(ValueError, match='repository generation'):
+        config.parse_profiles(invalid['profiles'], bindings)
+
+    registry_schema = schemas.get_config_schema(
+    )['properties']['container_registries']
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(invalid, registry_schema)
+
+
 def test_profile_requires_exact_runtime_and_canary_bindings(
         registry_config: dict[str, Any]) -> None:
     bindings = config.parse_access_bindings(registry_config['access_bindings'])

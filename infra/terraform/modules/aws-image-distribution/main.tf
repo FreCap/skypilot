@@ -10,6 +10,16 @@ data "aws_servicequotas_service_quota" "ecr_images_per_repository" {
 
 locals {
   applied_images_per_repository_quota = var.applied_images_per_repository_quota != null ? var.applied_images_per_repository_quota : data.aws_servicequotas_service_quota.ecr_images_per_repository[0].value
+  base32_alphabet                     = "abcdefghijklmnopqrstuvwxyz234567"
+  catalog_authority_padded_integer    = try(parseint(replace(var.catalog_authority, "-", ""), 16) * 4, 0)
+  derived_catalog_authority_base32 = join("", [
+    for index in range(26) :
+    substr(
+      local.base32_alphabet,
+      floor(local.catalog_authority_padded_integer / pow(32, 25 - index)) % 32,
+      1,
+    )
+  ])
   workspace_hashes = {
     for workspace in var.workspaces :
     workspace => substr(sha256("v1:${var.catalog_authority}:${lower(trimspace(workspace))}"), 0, 32)
@@ -44,7 +54,20 @@ locals {
   ])
   shards = { for shard in flatten(local.shard_specs) : shard.key => shard }
 
-  qualification_repository_name = "${var.repository_prefix}/r${var.catalog_authority_base32}/qualification/${var.region}"
+  qualification_repository_base = "${var.repository_prefix}/r${var.catalog_authority_base32}/qualification"
+  qualification_repository_name = "${local.qualification_repository_base}/${var.region}"
+  qualification_generation_specs = {
+    for generation in var.qualification_repository_generations :
+    format("g%02x", generation) => {
+      generation      = generation
+      repository_name = "${local.qualification_repository_base}/${format("g%02x", generation)}/${var.region}"
+    }
+    if generation != 0
+  }
+  active_qualification_repository_key = format(
+    "g%02x",
+    var.active_qualification_repository_generation,
+  )
 }
 
 resource "terraform_data" "validation" {
@@ -61,6 +84,10 @@ resource "terraform_data" "validation" {
     precondition {
       condition     = data.aws_region.current.region == var.region
       error_message = "The AWS provider region does not match var.region."
+    }
+    precondition {
+      condition     = var.catalog_authority_base32 == local.derived_catalog_authority_base32
+      error_message = "catalog_authority_base32 must be the lowercase, unpadded base32 encoding of catalog_authority."
     }
     precondition {
       condition = alltrue([
@@ -93,6 +120,29 @@ resource "terraform_data" "validation" {
     precondition {
       condition     = alltrue([for shard in values(local.shards) : length(shard.repository_name) <= 256])
       error_message = "A fixed repository name exceeds the ECR length limit."
+    }
+    precondition {
+      condition = (
+        contains(var.qualification_repository_generations, 0) &&
+        contains(
+          var.qualification_repository_generations,
+          var.active_qualification_repository_generation,
+        ) &&
+        var.active_qualification_repository_generation == max(
+          tolist(var.qualification_repository_generations)...
+        )
+      )
+      error_message = "qualification_repository_generations must retain generation 0, and active_qualification_repository_generation must be the highest retained generation."
+    }
+    precondition {
+      condition = (
+        length(local.qualification_repository_name) <= 256 &&
+        alltrue([
+          for spec in values(local.qualification_generation_specs) :
+          length(spec.repository_name) <= 256
+        ])
+      )
+      error_message = "A qualification repository name exceeds the ECR length limit."
     }
     precondition {
       condition     = var.encryption_type == "KMS" ? var.kms_key_arn != null : var.kms_key_arn == null
@@ -181,24 +231,65 @@ resource "aws_ecr_repository" "qualification" {
   depends_on = [terraform_data.validation]
 }
 
+resource "aws_ecr_repository" "qualification_generation" {
+  for_each = local.qualification_generation_specs
+
+  name                 = each.value.repository_name
+  image_tag_mutability = "IMMUTABLE"
+  force_delete         = false
+
+  encryption_configuration {
+    encryption_type = var.encryption_type
+    kms_key         = var.encryption_type == "KMS" ? var.kms_key_arn : null
+  }
+
+  image_scanning_configuration {
+    scan_on_push = false
+  }
+
+  tags = merge(local.common_tags, {
+    "SkyPilotQualification"           = "true"
+    "SkyPilotQualificationGeneration" = tostring(each.value.generation)
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [terraform_data.validation]
+}
+
 locals {
+  qualification_repositories = merge(
+    { g00 = aws_ecr_repository.qualification },
+    aws_ecr_repository.qualification_generation,
+  )
+  active_qualification_repository = try(
+    local.qualification_repositories[local.active_qualification_repository_key],
+    aws_ecr_repository.qualification,
+  )
+  active_qualification_repository_arns = [
+    local.active_qualification_repository.arn
+  ]
   lifecycle_read_actions = [
     "ecr:BatchGetImage",
     "ecr:DescribeImages",
     "ecr:ListImages",
   ]
   lifecycle_delete_actions = ["ecr:BatchDeleteImage"]
-  all_managed_repository_arns = concat(
+  managed_repository_arns = concat(
     [for repository in aws_ecr_repository.shard : repository.arn],
-    [aws_ecr_repository.qualification.arn],
+    local.active_qualification_repository_arns,
   )
   lifecycle_delete_repository_arns = concat(
     [
       for key, repository in aws_ecr_repository.shard : repository.arn
       if !local.shards[key].canonical
     ],
-    [aws_ecr_repository.qualification.arn],
+    local.active_qualification_repository_arns,
   )
+  iam_managed_policy_max_characters = 6144
+  iam_inline_policy_max_characters  = 10240
 }
 
 data "aws_iam_policy_document" "copy_role_boundary" {
@@ -206,7 +297,7 @@ data "aws_iam_policy_document" "copy_role_boundary" {
     sid       = "CopyExactManagedRepositories"
     effect    = "Allow"
     actions   = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:DescribeImages", "ecr:DescribeRepositories", "ecr:GetRepositoryPolicy", "ecr:ListTagsForResource", "ecr:ListImages", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"]
-    resources = concat([for repository in aws_ecr_repository.shard : repository.arn], [aws_ecr_repository.qualification.arn])
+    resources = local.managed_repository_arns
   }
 
   statement {
@@ -229,7 +320,7 @@ data "aws_iam_policy_document" "lifecycle_role_boundary" {
     sid       = "LifecycleReadAllManagedRepositories"
     effect    = "Allow"
     actions   = local.lifecycle_read_actions
-    resources = local.all_managed_repository_arns
+    resources = local.managed_repository_arns
   }
 
   statement {
@@ -245,6 +336,13 @@ resource "aws_iam_policy" "copy_role_boundary" {
   description = "Maximum ECR and quota-read permissions for the SkyPilot image copy role."
   policy      = data.aws_iam_policy_document.copy_role_boundary.json
   tags        = local.common_tags
+
+  lifecycle {
+    precondition {
+      condition     = length(data.aws_iam_policy_document.copy_role_boundary.minified_json) <= local.iam_managed_policy_max_characters
+      error_message = "The rendered copy role boundary exceeds the AWS customer-managed policy size limit."
+    }
+  }
 }
 
 resource "aws_iam_policy" "lifecycle_role_boundary" {
@@ -252,6 +350,13 @@ resource "aws_iam_policy" "lifecycle_role_boundary" {
   description = "Maximum ECR read and custody-scoped delete permissions for the SkyPilot image lifecycle role."
   policy      = data.aws_iam_policy_document.lifecycle_role_boundary.json
   tags        = local.common_tags
+
+  lifecycle {
+    precondition {
+      condition     = length(data.aws_iam_policy_document.lifecycle_role_boundary.minified_json) <= local.iam_managed_policy_max_characters
+      error_message = "The rendered lifecycle role boundary exceeds the AWS customer-managed policy size limit."
+    }
+  }
 }
 
 data "aws_iam_policy_document" "copy_trust" {
@@ -362,7 +467,7 @@ data "aws_iam_policy_document" "copy_permissions" {
     sid       = "CopyExactManagedContent"
     effect    = "Allow"
     actions   = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:DescribeImages", "ecr:DescribeRepositories", "ecr:GetRepositoryPolicy", "ecr:ListTagsForResource", "ecr:ListImages", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"]
-    resources = concat([for repository in aws_ecr_repository.shard : repository.arn], [aws_ecr_repository.qualification.arn])
+    resources = local.managed_repository_arns
   }
 
   statement {
@@ -385,7 +490,7 @@ data "aws_iam_policy_document" "lifecycle_permissions" {
     sid       = "ReadAllManagedContent"
     effect    = "Allow"
     actions   = local.lifecycle_read_actions
-    resources = local.all_managed_repository_arns
+    resources = local.managed_repository_arns
   }
 
   statement {
@@ -400,12 +505,26 @@ resource "aws_iam_role_policy" "copy_target" {
   name   = "copy-managed-image-content"
   role   = aws_iam_role.copy_target.id
   policy = data.aws_iam_policy_document.copy_permissions.json
+
+  lifecycle {
+    precondition {
+      condition     = length(data.aws_iam_policy_document.copy_permissions.minified_json) <= local.iam_inline_policy_max_characters
+      error_message = "The rendered copy role policy exceeds the AWS inline role policy size limit."
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "lifecycle_target" {
   name   = "lifecycle-managed-image-content"
   role   = aws_iam_role.lifecycle_target.id
   policy = data.aws_iam_policy_document.lifecycle_permissions.json
+
+  lifecycle {
+    precondition {
+      condition     = length(data.aws_iam_policy_document.lifecycle_permissions.minified_json) <= local.iam_inline_policy_max_characters
+      error_message = "The rendered lifecycle role policy exceeds the AWS inline role policy size limit."
+    }
+  }
 }
 
 data "aws_iam_policy_document" "shard" {
@@ -531,14 +650,62 @@ data "aws_iam_policy_document" "qualification" {
   }
 }
 
+data "aws_iam_policy_document" "qualification_inactive" {
+  statement {
+    sid    = "SkyPilotInactiveQualificationDataPlaneDeny"
+    effect = "Deny"
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage",
+      "ecr:DescribeImages",
+      "ecr:ListImages",
+      "ecr:InitiateLayerUpload",
+      "ecr:UploadLayerPart",
+      "ecr:CompleteLayerUpload",
+      "ecr:PutImage",
+      "ecr:BatchDeleteImage",
+    ]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+  }
+}
+
 resource "aws_ecr_repository_policy" "qualification" {
   repository = aws_ecr_repository.qualification.name
-  policy     = data.aws_iam_policy_document.qualification.json
+  policy = var.active_qualification_repository_generation == 0 ? (
+    data.aws_iam_policy_document.qualification.json
+  ) : data.aws_iam_policy_document.qualification_inactive.json
 
   lifecycle {
     precondition {
-      condition     = length(data.aws_iam_policy_document.qualification.json) <= var.max_repository_policy_bytes
+      condition = max(
+        length(data.aws_iam_policy_document.qualification.json),
+        length(data.aws_iam_policy_document.qualification_inactive.json),
+      ) <= var.max_repository_policy_bytes
       error_message = "The qualification repository policy exceeds the configured byte ceiling."
+    }
+  }
+}
+
+resource "aws_ecr_repository_policy" "qualification_generation" {
+  for_each = aws_ecr_repository.qualification_generation
+
+  repository = each.value.name
+  policy = local.qualification_generation_specs[each.key].generation == var.active_qualification_repository_generation ? (
+    data.aws_iam_policy_document.qualification.json
+  ) : data.aws_iam_policy_document.qualification_inactive.json
+
+  lifecycle {
+    precondition {
+      condition = max(
+        length(data.aws_iam_policy_document.qualification.json),
+        length(data.aws_iam_policy_document.qualification_inactive.json),
+      ) <= var.max_repository_policy_bytes
+      error_message = "A generated qualification repository policy exceeds the configured byte ceiling."
     }
   }
 }
@@ -561,7 +728,7 @@ locals {
       tag_immutability    = "IMMUTABLE"
       scanning_mode       = var.scan_on_push ? "SCAN_ON_PUSH" : "MANUAL"
       policy_hash         = sha256(jsonencode(jsondecode(data.aws_iam_policy_document.shard[key].json)))
-      ownership_tags_hash = sha256(jsonencode(aws_ecr_repository.shard[key].tags))
+      ownership_tags_hash = sha256(jsonencode(aws_ecr_repository.shard[key].tags_all))
       max_manifests       = shard.max_manifests
       max_declared_bytes  = shard.max_declared_bytes
       max_in_flight       = shard.max_in_flight

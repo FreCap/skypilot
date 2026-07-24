@@ -62,18 +62,20 @@ module "home_distribution" {
     aws = aws.home
   }
 
-  catalog_authority                   = var.catalog_authority
-  catalog_authority_base32            = var.catalog_authority_base32
-  realm                               = var.realm
-  profile                             = var.profile
-  registry_account_id                 = var.registry_account_id
-  region                              = var.home_region
-  workspaces                          = var.workspaces
-  copy_worker_base_role_arns          = [module.worker_identity.copy_role_arn]
-  lifecycle_worker_base_role_arns     = [module.worker_identity.lifecycle_role_arn]
-  copy_target_role_name               = local.home_copy_role_name
-  lifecycle_target_role_name          = local.home_lifecycle_role_name
-  applied_images_per_repository_quota = var.applied_images_per_repository_quota
+  catalog_authority                          = var.catalog_authority
+  catalog_authority_base32                   = var.catalog_authority_base32
+  realm                                      = var.realm
+  profile                                    = var.profile
+  registry_account_id                        = var.registry_account_id
+  region                                     = var.home_region
+  qualification_repository_generations       = var.qualification_repository_generations
+  active_qualification_repository_generation = var.active_qualification_repository_generation
+  workspaces                                 = var.workspaces
+  copy_worker_base_role_arns                 = [module.worker_identity.copy_role_arn]
+  lifecycle_worker_base_role_arns            = [module.worker_identity.lifecycle_role_arn]
+  copy_target_role_name                      = local.home_copy_role_name
+  lifecycle_target_role_name                 = local.home_lifecycle_role_name
+  applied_images_per_repository_quota        = var.applied_images_per_repository_quota
   targets = {
     canonical = {
       canonical                    = true
@@ -94,18 +96,20 @@ module "secondary_distribution" {
     aws = aws.secondary
   }
 
-  catalog_authority                   = var.catalog_authority
-  catalog_authority_base32            = var.catalog_authority_base32
-  realm                               = var.realm
-  profile                             = var.profile
-  registry_account_id                 = var.registry_account_id
-  region                              = var.secondary_region
-  workspaces                          = var.workspaces
-  copy_worker_base_role_arns          = [module.worker_identity.copy_role_arn]
-  lifecycle_worker_base_role_arns     = [module.worker_identity.lifecycle_role_arn]
-  copy_target_role_name               = local.secondary_copy_role_name
-  lifecycle_target_role_name          = local.secondary_lifecycle_role_name
-  applied_images_per_repository_quota = var.applied_images_per_repository_quota
+  catalog_authority                          = var.catalog_authority
+  catalog_authority_base32                   = var.catalog_authority_base32
+  realm                                      = var.realm
+  profile                                    = var.profile
+  registry_account_id                        = var.registry_account_id
+  region                                     = var.secondary_region
+  qualification_repository_generations       = var.qualification_repository_generations
+  active_qualification_repository_generation = var.active_qualification_repository_generation
+  workspaces                                 = var.workspaces
+  copy_worker_base_role_arns                 = [module.worker_identity.copy_role_arn]
+  lifecycle_worker_base_role_arns            = [module.worker_identity.lifecycle_role_arn]
+  copy_target_role_name                      = local.secondary_copy_role_name
+  lifecycle_target_role_name                 = local.secondary_lifecycle_role_name
+  applied_images_per_repository_quota        = var.applied_images_per_repository_quota
   targets = {
     "aws-${var.secondary_region}" = {
       canonical                    = false
@@ -144,4 +148,5 @@ locals {
       )
     }
   }
+  qualification_config_map_name = "skypilot-image-qualification-${substr(sha256(jsonencode(local.qualification_manifests)), 0, 16)}"
 }

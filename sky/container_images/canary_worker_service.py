@@ -455,8 +455,16 @@ def _load_contract(
             binding.fingerprint != payload['binding_fingerprint'] or
             target.runtime_binding(payload['backend']) != binding.id):
         raise ValueError('QUALIFICATION_FAILED')
+    if (operation.child_launch_id is None and
+            not qualification.qualification_copy_available(
+                revision, profile, target)):
+        raise ValueError('QUALIFICATION_FAILED')
     repository_name, _ = qualification.qualification_repository(
-        revision, target)
+        revision,
+        target,
+        catalog_authority=operation.authority_id,
+        profile=profile,
+        configured_target=target)
     copy_key = models.profile_attestation_key('copy', target.name)
     copy_evidence = revision.attestations.get(copy_key)
     if (not isinstance(copy_evidence, dict) or

@@ -296,7 +296,10 @@ metadata:
 spec:
   replicas: {{ .Values.imageLifecycleWorker.replicaCount }}
   strategy:
-    type: RollingUpdate
+    # Lifecycle owns destructive provider mutations. Recreate is the rollout
+    # barrier that drains pre-protocol workers before a new proof can restore
+    # recurring-canary admission.
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ $fullName }}

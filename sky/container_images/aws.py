@@ -19,6 +19,7 @@ import json
 import threading
 import time
 from typing import Any, cast
+import uuid
 
 from sqlalchemy import orm
 
@@ -325,6 +326,42 @@ class TerraformQualificationManifest:
                        separators=(',', ':')).encode()).hexdigest()
 
 
+def _catalog_authority_base32(catalog_authority: str) -> str:
+    authority = models.validate_catalog_id(catalog_authority,
+                                           'Qualification catalog authority')
+    return base64.b32encode(
+        uuid.UUID(authority).bytes).decode().lower().rstrip('=')
+
+
+def managed_shard_repository_name(catalog_authority: str, workspace: str,
+                                  target: models.ManagedRegistryTarget,
+                                  shard_index: int) -> str:
+    """Returns one exact authority/workspace/generation-scoped shard path."""
+    authority = models.validate_catalog_id(catalog_authority,
+                                           'Qualification catalog authority')
+    workspace = models.validate_workspace_name(workspace,
+                                               'Qualification workspace')
+    if (not isinstance(shard_index, int) or isinstance(shard_index, bool) or
+            not 0 <= shard_index <= 255):
+        raise ValueError('Qualification shard index is invalid.')
+    authority_base32 = _catalog_authority_base32(authority)
+    workspace_hash = hashlib.sha256(
+        f'v1:{authority}:{workspace.strip().lower()}'.encode()).hexdigest()[:32]
+    return (f'{target.repository_prefix}/r{authority_base32}/w{workspace_hash}/'
+            f'g00/s{shard_index:02x}')
+
+
+def qualification_repository_name(catalog_authority: str,
+                                  target: models.ManagedRegistryTarget) -> str:
+    """Returns the exact generation-scoped Terraform repository path."""
+    authority_base32 = _catalog_authority_base32(catalog_authority)
+    base = f'{target.repository_prefix}/r{authority_base32}/qualification'
+    generation = target.qualification_repository_generation
+    if generation == 0:
+        return f'{base}/{target.region}'
+    return f'{base}/g{generation:02x}/{target.region}'
+
+
 def ingest_terraform_qualification(
     payload: bytes,
     *,
@@ -378,7 +415,12 @@ def ingest_terraform_qualification(
         regional_quotas[region] = (images, headroom)
     for shard in manifest.shards:
         target = profile.target(shard.target)
-        expected_prefix = f'{target.repository_prefix}/'
+        expected_repository_name = managed_shard_repository_name(
+            manifest.catalog_authority, manifest.workspace, target,
+            shard.shard_index)
+        expected_repository_arn = (
+            f'arn:{profile.partition}:ecr:{target.region}:'
+            f'{profile.registry_account}:repository/{expected_repository_name}')
         applied_quota, reserved_headroom = regional_quotas[shard.region]
         if (shard.workspace != manifest.workspace or
                 shard.partition != profile.partition or
@@ -386,7 +428,8 @@ def ingest_terraform_qualification(
                 shard.region != target.region or
                 shard.registry != target.registry or
                 shard.shard_generation != 0 or
-                not shard.repository_name.startswith(expected_prefix) or
+                shard.repository_name != expected_repository_name or
+                shard.repository_arn != expected_repository_arn or
                 shard.max_manifests > target.max_manifests_per_shard or
                 shard.max_declared_bytes > target.max_declared_bytes_per_shard
                 or shard.max_in_flight > target.max_in_flight or
@@ -403,11 +446,18 @@ def ingest_terraform_qualification(
         required_facts = {
             'copy_role_arn', 'copy_policy_hash', 'lifecycle_role_arn',
             'lifecycle_policy_hash', 'copy_boundary_policy_hash',
-            'lifecycle_boundary_policy_hash', 'qualification_repo_arn'
+            'lifecycle_boundary_policy_hash', 'qualification_repo_arn',
+            'qualification_policy_hash', 'qualification_ownership_tags_hash'
         }
         if set(facts) != required_facts:
             raise ValueError(
                 'Qualification manifest role facts are incomplete.')
+        qualification_policy_hash = models.validate_fingerprint(
+            facts['qualification_policy_hash'],
+            'Qualification repository policy hash')
+        qualification_ownership_tags_hash = models.validate_fingerprint(
+            facts['qualification_ownership_tags_hash'],
+            'Qualification repository ownership tags hash')
         copy_binding = profile.bindings[target.write_authority]
         lifecycle_binding = profile.bindings[
             target.qualification_delete_authority]
@@ -424,10 +474,9 @@ def ingest_terraform_qualification(
             raise ValueError(
                 'Qualification repository ARN contradicts profile.')
         repository_name = arn_parts[5].removeprefix('repository/')
-        expected_prefix = f'{target.repository_prefix}/r'
-        expected_suffix = f'/qualification/{target.region}'
-        if (not repository_name.startswith(expected_prefix) or
-                not repository_name.endswith(expected_suffix)):
+        expected_repository_name = qualification_repository_name(
+            manifest.catalog_authority, target)
+        if repository_name != expected_repository_name:
             raise ValueError('Qualification repository name is invalid.')
         target_evidence.append((target.name, {
             'status': 'READY',
@@ -436,6 +485,10 @@ def ingest_terraform_qualification(
             'registry': target.registry,
             'repository_name': repository_name,
             'repository_arn': repository_arn,
+            'qualification_repository_generation':
+                target.qualification_repository_generation,
+            'qualification_policy_hash': qualification_policy_hash,
+            'qualification_ownership_tags_hash': qualification_ownership_tags_hash,
             'copy_role_arn': facts['copy_role_arn'],
             'copy_policy_hash': facts['copy_policy_hash'],
             'lifecycle_role_arn': facts['lifecycle_role_arn'],
@@ -572,7 +625,8 @@ def ingest_terraform_qualification(
             expected_generation=desired.desired_generation,
             expected_config_hash=profile.config_hash,
             now=now)
-    return desired
+    return topology_state.complete_qualification_quarantine_cutover(
+        profile_revision_id=desired.id, now=now)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -608,10 +662,21 @@ def _error_code_in_chain(error: BaseException) -> str | None:
     return None
 
 
+def _terraform_jsonencode(value: Any) -> str:
+    """Serializes a value exactly as Terraform's jsonencode function does."""
+    encoded = json.dumps(value,
+                         sort_keys=True,
+                         separators=(',', ':'),
+                         ensure_ascii=False)
+    # Terraform retains these legacy escapes for compatibility with RFC 7159.
+    return (encoded.replace('<', '\\u003c').replace('>', '\\u003e').replace(
+        '&', '\\u0026').replace('\u2028',
+                                '\\u2028').replace('\u2029', '\\u2029'))
+
+
 def _canonical_json_hash(value: Any) -> str:
     return hashlib.sha256(
-        json.dumps(value, sort_keys=True,
-                   separators=(',', ':')).encode()).hexdigest()
+        _terraform_jsonencode(value).encode('utf-8')).hexdigest()
 
 
 def applied_ecr_images_per_repository_quota(
@@ -882,10 +947,13 @@ class EcrRepository:
         client = _assumed_ecr_client(binding,
                                      region,
                                      provider_fence=provider_fence)
-        if provider_fence is not None:
-            client = _ProviderFencedEcrClient(client, provider_fence)
         if hooks is not None:
             client = _HookedEcrClient(client, hooks)
+        if provider_fence is not None:
+            # Keep the provider fence outermost. A pre-call fence or hook that
+            # rejects before the raw SDK invocation then leaves the inner
+            # started-call latch unchanged, which proves NOT_STARTED.
+            client = _ProviderFencedEcrClient(client, provider_fence)
         return cls(client, repository_name, provider_fence=provider_fence)
 
     def _batch_get_manifest(self, digest: str) -> tuple[bytes, str] | None:

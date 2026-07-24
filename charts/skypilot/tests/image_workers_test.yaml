@@ -90,6 +90,18 @@ tests:
           of: Deployment
         documentIndex: 2
       - equal:
+          path: spec.strategy.type
+          value: RollingUpdate
+        documentIndex: 0
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+        documentIndex: 1
+      - equal:
+          path: spec.strategy.type
+          value: RollingUpdate
+        documentIndex: 2
+      - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 30
         documentIndex: 0
@@ -239,6 +251,20 @@ tests:
           content:
             name: SKYPILOT_IMAGE_RETENTION_SECONDS
             value: "4838400"
+
+  - it: should allow the canary worker to be quiesced at zero replicas
+    set:
+      apiService.dbConnectionSecretName: external-db
+      imageCanaryWorker.enabled: true
+      imageCanaryWorker.replicaCount: 0
+      imageCanaryWorker.serviceAccount.create: false
+      imageCanaryWorker.serviceAccount.name: canary-worker
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.replicas
+          value: 0
 
   - it: should reject a shared database migration ownership override
     set:

@@ -1,10 +1,17 @@
 registry_account_id      = "123456789012"
 catalog_authority        = "00000000-0000-4000-8000-000000000000"
-catalog_authority_base32 = "aaaaaaaaabaaaaaaaaaaaaaaaa"
+catalog_authority_base32 = "aaaaaaaaabaabaaaaaaaaaaaaa"
 profile_revision         = 1
 profile_config_hash      = "replace-with-the-profile-config-sha256"
 physical_manifest_hash   = "replace-with-the-physical-manifest-sha256"
 qualification_generated_at = 1784505600
+
+# Initial deployments use generation 0. For quarantine recovery, retain every
+# prior value, append a fresh generation, and select the new highest value as
+# active, for example [0, 1] with active generation 1. Never select an older
+# quarantined generation again.
+qualification_repository_generations       = [0]
+active_qualification_repository_generation = 0
 
 eks_oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE"
 eks_oidc_issuer_url   = "https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE"
