@@ -213,6 +213,7 @@ class TestGetEngine:
             call_args = mock_create.call_args
             assert call_args[0][0] == 'postgresql://user:pass@localhost/db'
             assert call_args[1]['poolclass'] == sqlalchemy.NullPool
+            assert call_args[1]['connect_args'] == {'connect_timeout': 15}
             assert engine == mock_engine
 
     def test_postgres_sync_engine_creation_with_queuepool(self, monkeypatch):
@@ -236,6 +237,7 @@ class TestGetEngine:
             assert call_args[1]['max_overflow'] == 0  # max(0, 5-10)
             assert call_args[1]['pool_pre_ping'] is True
             assert call_args[1]['pool_recycle'] == 1800
+            assert call_args[1]['connect_args'] == {'connect_timeout': 15}
             assert engine == mock_engine
 
     def test_postgres_sync_engine_queuepool_max_overflow_calculation(
@@ -314,7 +316,8 @@ class TestGetEngine:
             async_creator = mock_create.call_args.kwargs['async_creator']
             assert await async_creator() is connection
 
-        mock_connect.assert_awaited_once_with(libpq_uri, timeout=15)
+        mock_connect.assert_awaited_once_with(
+            libpq_uri, timeout=db_utils._POSTGRES_CONNECT_TIMEOUT_SECONDS)
 
     def test_postgres_engine_caching(self, monkeypatch):
         """Test Postgres sync engines are cached and reused."""

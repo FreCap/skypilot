@@ -53,6 +53,10 @@ _DB_TIMEOUT_S = 60
 _SQLITE_BUSY_MAX_ATTEMPTS = 5
 _SQLITE_BUSY_INITIAL_BACKOFF_S = 0.02
 _SQLITE_BUSY_BACKOFF_MULTIPLIER = 3
+# Keep control-plane operations bounded when PostgreSQL or its network path is
+# unavailable. libpq otherwise has no connection deadline, so one transient
+# routing failure can indefinitely stall a Serve controller's reconciliation.
+_POSTGRES_CONNECT_TIMEOUT_SECONDS = 15
 
 
 def is_sqlite_busy_error(e: BaseException) -> bool:
@@ -630,7 +634,8 @@ def _make_asyncpg_creator(dsn: str) -> Callable[[], Any]:
     import asyncpg
 
     async def _connect() -> Any:
-        return await asyncpg.connect(dsn, timeout=15)
+        return await asyncpg.connect(dsn,
+                                     timeout=_POSTGRES_CONNECT_TIMEOUT_SECONDS)
 
     return _connect
 
@@ -689,19 +694,24 @@ def get_engine(
                             poolclass=sqlalchemy.NullPool,
                             async_creator=_make_asyncpg_creator(conn_string)))
                 elif _max_connections == 0:
-                    _postgres_engine_cache[cache_key] = (
-                        sqlalchemy.create_engine(conn_string,
-                                                 poolclass=sqlalchemy.NullPool))
+                    _postgres_engine_cache[cache_key] = (sqlalchemy.create_engine(
+                        conn_string,
+                        poolclass=sqlalchemy.NullPool,
+                        connect_args={
+                            'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS
+                        }))
                 else:
                     # Sync engines can safely use QueuePool for connection reuse
-                    _postgres_engine_cache[cache_key] = (
-                        sqlalchemy.create_engine(
-                            conn_string,
-                            poolclass=sqlalchemy.pool.QueuePool,
-                            pool_size=_max_connections,
-                            max_overflow=max(0, 5 - _max_connections),
-                            pool_pre_ping=True,
-                            pool_recycle=1800))
+                    _postgres_engine_cache[cache_key] = (sqlalchemy.create_engine(
+                        conn_string,
+                        poolclass=sqlalchemy.pool.QueuePool,
+                        pool_size=_max_connections,
+                        max_overflow=max(0, 5 - _max_connections),
+                        pool_pre_ping=True,
+                        pool_recycle=1800,
+                        connect_args={
+                            'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS
+                        }))
             engine = _postgres_engine_cache[cache_key]
     else:
         if db_name is None:
