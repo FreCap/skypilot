@@ -3260,7 +3260,9 @@ class SkyServeController:
                         'does not yet define a safe logical capacity contract.')
                 if needs_catalog:
                     built_catalog = spot_placer.SpotPlacer.build_catalog(
-                        validation_service, update_task)
+                        validation_service,
+                        update_task,
+                        workspace=self._replica_manager.workspace)
                     assert built_catalog is not None
                     placement_catalog = built_catalog.to_dict()
             except (ValueError, RuntimeError) as e:
@@ -3559,7 +3561,10 @@ class SkyServeController:
                     'logical replica semantics were activated.')
             candidate_spot_placer = (
                 replica_managers.validate_service_update_preflight(
-                    self._service_name, version, service))
+                    self._service_name,
+                    version,
+                    service,
+                    workspace=self._replica_manager.workspace))
         except (AssertionError, RuntimeError, TypeError, ValueError) as e:
             raise DeterministicServiceUpdateError(
                 f'Version {version} failed deterministic launch preflight: '

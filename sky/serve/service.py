@@ -1362,6 +1362,7 @@ def _prepare_placement_catalog(
     service_spec: 'service_spec_lib.SkyServiceSpec',
     task: task_lib.Task,
     *,
+    workspace: str,
     is_recovery: bool,
     recovery_version: int | None,
 ) -> dict[str, Any] | None:
@@ -1378,7 +1379,9 @@ def _prepare_placement_catalog(
         if placement_catalog is not None:
             return placement_catalog
 
-    built_catalog = spot_placer.SpotPlacer.build_catalog(service_spec, task)
+    built_catalog = spot_placer.SpotPlacer.build_catalog(service_spec,
+                                                         task,
+                                                         workspace=workspace)
     assert built_catalog is not None
     candidate_catalog = built_catalog.to_dict()
     if not is_recovery:
@@ -1568,6 +1571,7 @@ def _start(service_name: str,
         service_name,
         service_spec,
         task,
+        workspace=workspace,
         is_recovery=is_recovery,
         recovery_version=recovery_version)
 

@@ -410,10 +410,14 @@ class PlacementCatalog:
         task: 'task_lib.Task',
         *,
         expand_accelerator_counts: bool = False,
+        workspace: str | None = None,
     ) -> 'PlacementCatalog':
-        locations = (_get_possible_location_from_task(
-            task, expand_accelerator_counts=True) if expand_accelerator_counts
-                     else _get_possible_location_from_task(task))
+        location_kwargs: dict[str, Any] = {}
+        if expand_accelerator_counts:
+            location_kwargs['expand_accelerator_counts'] = True
+        if workspace is not None:
+            location_kwargs['workspace'] = workspace
+        locations = _get_possible_location_from_task(task, **location_kwargs)
         if len(locations) > _PLACEMENT_CATALOG_MAX_LOCATIONS:
             raise ValueError(
                 'Spot placement catalog contains too many locations: '
@@ -585,9 +589,17 @@ def _get_possible_location_from_task(
     task: 'task_lib.Task',
     *,
     expand_accelerator_counts: bool = False,
+    workspace: str | None = None,
 ) -> list[Location]:
     _validate_placement_resource_configs(task)
     resources_list = list(task.resources)
+    if workspace is None:
+        workspace = skypilot_config.get_active_workspace()
+    allowed_cloud_names = {
+        cloud_name.lower()
+        for cloud_name in sky_check.get_workspace_allowed_clouds(
+            workspace, capability=sky_cloud.CloudCapability.COMPUTE)
+    }
 
     # Group entries by (accelerators, use_spot) shape: locations are
     # enumerated per shape so each candidate location knows exactly what
@@ -600,6 +612,11 @@ def _get_possible_location_from_task(
         r = shape_entry
         if r.cloud is not None:
             cloud_str = str(r.cloud)
+            if cloud_str.lower() not in allowed_cloud_names:
+                logger.info(f'Skipping {cloud_str} spot-placement candidates: '
+                            f'the cloud is not allowed in workspace '
+                            f'{workspace!r}.')
+                continue
             if r.region is None:
                 _ = location_requirements[cloud_str]
             elif r.zone is None:
@@ -614,9 +631,17 @@ def _get_possible_location_from_task(
             clouds_list.append(cloud_obj)
         if not clouds_list:
             # No location requirement on this entry: all enabled clouds.
-            clouds_list = sky_check.get_cached_enabled_clouds_or_refresh(
-                capability=sky_cloud.CloudCapability.COMPUTE,
-                raise_if_no_cloud_access=False)
+            with skypilot_config.local_active_workspace_ctx(workspace):
+                clouds_list = sky_check.get_cached_enabled_clouds_or_refresh(
+                    capability=sky_cloud.CloudCapability.COMPUTE,
+                    raise_if_no_cloud_access=False)
+            # The enabled-cloud cache and workspace policy are updated
+            # separately. Intersect them here so a stale cache snapshot cannot
+            # reintroduce a cloud that this workspace has disabled.
+            clouds_list = [
+                cloud for cloud in clouds_list
+                if str(cloud).lower() in allowed_cloud_names
+            ]
             for cloud in clouds_list:
                 _ = location_requirements[str(cloud)]
 
@@ -627,63 +652,70 @@ def _get_possible_location_from_task(
         # Kubernetes entry, whose feasibility check then rejects
         # custom_disk_tier and silently drops the context).
         for cloud in clouds_list:
-            # Strip only location-specific attributes. The provider
-            # feasibility boundary requires explicit instance types to remain
-            # launchable, which includes being bound to the cloud currently
-            # enumerated.
-            shape_resources = r.copy(cloud=cloud, region=None, zone=None)
-            resource_shapes = [shape_resources]
-            if expand_accelerator_counts:
-                resource_shapes = _expand_accelerator_counts_for_cloud(
-                    shape_resources, cloud, accelerator_counts_cache)
-            for candidate_shape in resource_shapes:
-                feasible_resources: resources_utils.FeasibleResources = (
-                    cloud.get_feasible_launchable_resources(
-                        candidate_shape, num_nodes=task.num_nodes))
-                for feasible in feasible_resources.resources_list:
-                    # We set override_optimize_by_zone=True to force the
-                    # provisioner to use zone-level provisioning. This is to
-                    # get accurate location information.
-                    launchables: list[resources_lib.Resources] = (
-                        resources_utils.make_launchables_for_valid_region_zones(
-                            feasible, override_optimize_by_zone=True))
-                    for launchable in launchables:
-                        cloud_str = str(launchable.cloud)
-                        region = launchable.region
-                        zone = launchable.zone
-                        assert region is not None, 'Region must be specified'
-                        if (cloud_str not in location_requirements and
-                                location_requirements):
-                            continue
-                        # .get() avoids creating extra entries in
-                        # location_requirements that would then be treated as
-                        # user requirements for the following regions.
-                        cloud_reqs = location_requirements.get(cloud_str, {})
-                        if region not in cloud_reqs and cloud_reqs:
-                            continue
-                        region_reqs = cloud_reqs.get(region, set())
-                        if zone not in region_reqs and region_reqs:
-                            continue
-                        loc = Location.from_resources(launchable)
-                        # Pin the shape from the catalog-expanded entry, not
-                        # the launchable (make_launchables may resolve counts
-                        # differently).
-                        loc.accelerators = candidate_shape.accelerators
-                        loc.use_spot = candidate_shape.use_spot
-                        loc.image_id, loc.container_image = (
-                            _location_image_fields_from_resources(
-                                candidate_shape))
-                        loc.disk_tier = (candidate_shape.disk_tier.value
-                                         if candidate_shape.disk_tier
-                                         is not None else None)
-                        loc.ephemeral_storage = (
-                            candidate_shape.ephemeral_storage)
-                        # Feasibility resolves the provider shape. Preserve it
-                        # even though accelerator count is restored from the
-                        # catalog-expanded entry above.
-                        loc.instance_type = launchable.instance_type
-                        possible_locations.add(loc)
-
+            # Kubernetes, SSH, and Slurm derive their allowed contexts from
+            # the active workspace while resolving feasibility and regions.
+            # Keep the whole provider enumeration under the durable service
+            # workspace; wrapping only the enabled-cloud cache is insufficient
+            # for explicitly named cloud entries.
+            with skypilot_config.local_active_workspace_ctx(workspace):
+                # Strip only location-specific attributes. Provider
+                # feasibility still requires explicit instance types to be
+                # bound to the cloud currently being enumerated.
+                shape_resources = r.copy(cloud=cloud, region=None, zone=None)
+                resource_shapes = [shape_resources]
+                if expand_accelerator_counts:
+                    resource_shapes = _expand_accelerator_counts_for_cloud(
+                        shape_resources, cloud, accelerator_counts_cache)
+                for candidate_shape in resource_shapes:
+                    feasible_resources: resources_utils.FeasibleResources = (
+                        cloud.get_feasible_launchable_resources(
+                            candidate_shape, num_nodes=task.num_nodes))
+                    for feasible in feasible_resources.resources_list:
+                        # We set override_optimize_by_zone=True to force the
+                        # provisioner to use zone-level provisioning. This is
+                        # to get accurate location information.
+                        launchables: list[resources_lib.Resources] = (
+                            resources_utils.
+                            make_launchables_for_valid_region_zones(
+                                feasible, override_optimize_by_zone=True))
+                        for launchable in launchables:
+                            cloud_str = str(launchable.cloud)
+                            region = launchable.region
+                            zone = launchable.zone
+                            assert region is not None, (
+                                'Region must be specified')
+                            if (cloud_str not in location_requirements and
+                                    location_requirements):
+                                continue
+                            # .get() avoids creating extra entries in
+                            # location_requirements that would then be treated
+                            # as user requirements for following regions.
+                            cloud_reqs = location_requirements.get(
+                                cloud_str, {})
+                            if region not in cloud_reqs and cloud_reqs:
+                                continue
+                            region_reqs = cloud_reqs.get(region, set())
+                            if zone not in region_reqs and region_reqs:
+                                continue
+                            loc = Location.from_resources(launchable)
+                            # Pin the shape from the catalog-expanded entry,
+                            # not the launchable (make_launchables may resolve
+                            # counts differently).
+                            loc.accelerators = candidate_shape.accelerators
+                            loc.use_spot = candidate_shape.use_spot
+                            loc.image_id, loc.container_image = (
+                                _location_image_fields_from_resources(
+                                    candidate_shape))
+                            loc.disk_tier = (candidate_shape.disk_tier.value
+                                             if candidate_shape.disk_tier
+                                             is not None else None)
+                            loc.ephemeral_storage = (
+                                candidate_shape.ephemeral_storage)
+                            # Feasibility resolves the provider shape. Preserve
+                            # it even though accelerator count is restored from
+                            # the catalog-expanded entry above.
+                            loc.instance_type = launchable.instance_type
+                            possible_locations.add(loc)
     return list(possible_locations)
 
 
@@ -698,19 +730,24 @@ class SpotPlacer:
         self,
         task: 'task_lib.Task',
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
+        workspace: str | None = None,
     ) -> None:
         if placement_catalog is None:
             catalog_value = PlacementCatalog.from_task(
-                task, expand_accelerator_counts=self._expand_accelerator_counts)
+                task,
+                expand_accelerator_counts=self._expand_accelerator_counts,
+                workspace=workspace)
         elif isinstance(placement_catalog, PlacementCatalog):
             catalog_value = placement_catalog
         else:
             catalog_value = PlacementCatalog.from_dict(placement_catalog)
-        possible_locations = [location for location, _ in catalog_value.entries]
-        logger.info(f'{len(possible_locations)} possible location candidates '
-                    'loaded from the centralized placement catalog.')
-        logger.debug(f'All possible locations: {possible_locations}')
         self.placement_catalog = catalog_value
+        # Keep the durable service workspace so every launch-facing view can
+        # re-evaluate current policy. Workspace policy may be narrowed while a
+        # service is scaled to zero; constructor-only filtering would leave the
+        # long-lived controller with stale candidates.
+        self._workspace = workspace
+        possible_locations = [location for location, _ in catalog_value.entries]
         self.location2status: dict[Location, LocationStatus] = {
             location: LocationStatus.ACTIVE for location in possible_locations
         }
@@ -726,6 +763,15 @@ class SpotPlacer:
         # Complete by construction. Runtime paths must never resolve provider
         # feasibility or pricing because a location cost is missing.
         self.location2cost = catalog_value.costs()
+        eligible_locations = self.known_locations()
+        excluded_count = len(possible_locations) - len(eligible_locations)
+        if excluded_count:
+            logger.info(f'Excluded {excluded_count} placement candidate(s) '
+                        f'not allowed in workspace {workspace!r}.')
+        logger.info(
+            f'{len(eligible_locations)} eligible location candidates loaded '
+            'from the centralized placement catalog.')
+        logger.debug(f'All eligible locations: {eligible_locations}')
         # Already checked there is only one resource in the task.
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes
@@ -1031,10 +1077,70 @@ class SpotPlacer:
                 return LocationStatus.ACTIVE
         return status
 
+    def _workspace_eligible_locations(self) -> set[Location]:
+        """Return locations allowed by the workspace's current policy.
+
+        This is deliberately config-only: selection is a hot controller path,
+        so it must not probe credentials or provider control planes. It does
+        re-read the in-process config on each launch-facing view because
+        workspace cloud, capability, and context policy can change after a
+        scale-to-zero service's placer was constructed.
+        """
+        workspace = getattr(self, '_workspace', None)
+        if workspace is None:
+            return set(self.location2status)
+        allowed_cloud_names = {
+            cloud_name.lower()
+            for cloud_name in sky_check.get_workspace_allowed_clouds(
+                workspace, capability=sky_cloud.CloudCapability.COMPUTE)
+        }
+        cloud_configs = {
+            cloud_name: skypilot_config.get_workspace_cloud(
+                cloud_name,
+                workspace) for cloud_name in _LIVE_ACCELERATOR_CATALOG_CLOUDS
+        }
+
+        eligible = set()
+        for location in self.location2status:
+            cloud_name = str(location.cloud).lower()
+            if cloud_name not in allowed_cloud_names:
+                continue
+            region = location.region
+            cloud_config = cloud_configs.get(cloud_name)
+            if cloud_config is None or region is None:
+                eligible.add(location)
+                continue
+            if cloud_name == 'kubernetes':
+                allowed_contexts = cloud_config.get('allowed_contexts', None)
+                if (isinstance(allowed_contexts, list) and
+                        region not in allowed_contexts):
+                    continue
+            elif cloud_name == 'ssh':
+                allowed_node_pools = cloud_config.get('allowed_node_pools',
+                                                      None)
+                node_pool = region.removeprefix('ssh-')
+                if (isinstance(allowed_node_pools, list) and
+                        node_pool not in allowed_node_pools):
+                    continue
+            elif cloud_name == 'slurm':
+                allowed_clusters = cloud_config.get('allowed_clusters', None)
+                if (isinstance(allowed_clusters, list) and
+                        region not in allowed_clusters):
+                    continue
+            eligible.add(location)
+        return eligible
+
+    def refresh_workspace_policy(self) -> None:
+        """Reload centrally managed config before final launch admission."""
+        if getattr(self, '_workspace', None) is not None:
+            skypilot_config.safe_reload_config()
+
     def _location_with_status(self, status: LocationStatus) -> list[Location]:
+        eligible_locations = self._workspace_eligible_locations()
         return [
             location for location in self.location2status
-            if self._effective_status(location) == status
+            if location in eligible_locations and
+            self._effective_status(location) == status
         ]
 
     def _consume_retry_if_benched(self, location: Location) -> None:
@@ -1083,7 +1189,11 @@ class SpotPlacer:
         cost_per_hour(), but launch selection must still use active_locations()
         or select_next_location().
         """
-        return list(self.location2status)
+        eligible_locations = self._workspace_eligible_locations()
+        return [
+            location for location in self.location2status
+            if location in eligible_locations
+        ]
 
     def placement_snapshot(
         self,
@@ -1098,7 +1208,9 @@ class SpotPlacer:
                              f'{_PLACEMENT_SNAPSHOT_MAX_LOCATIONS}.')
         now = time.time()
         retry_seconds = _preemption_retry_seconds()
-        locations = sorted(self.location2status,
+        eligible_locations = self._workspace_eligible_locations()
+        locations = sorted((location for location in self.location2status
+                            if location in eligible_locations),
                            key=lambda location: location.sort_key())
         entries = []
         for location in locations[:limit]:
@@ -1154,6 +1266,7 @@ class SpotPlacer:
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         return (resolved is not None and
+                resolved in self._workspace_eligible_locations() and
                 self._effective_status(resolved) == LocationStatus.ACTIVE)
 
     def is_launch_admissible(self, location: Location, *,
@@ -1168,7 +1281,8 @@ class SpotPlacer:
         """
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
-        if resolved is None:
+        if (resolved is None or
+                resolved not in self._workspace_eligible_locations()):
             return False
         if self._effective_status(resolved) == LocationStatus.ACTIVE:
             return True
@@ -1182,7 +1296,8 @@ class SpotPlacer:
         """Return the centralized catalog cost without provider resolution."""
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
-        if resolved is None:
+        if (resolved is None or
+                resolved not in self._workspace_eligible_locations()):
             return float('inf')
         return self.location2cost.get(resolved, float('inf'))
 
@@ -1197,9 +1312,11 @@ class SpotPlacer:
         watch -- it comes back via the TTL retry, and free slots observed
         on it should already be feeding the fill target.
         """
+        eligible_locations = self._workspace_eligible_locations()
         return [
             location for location in self.location2status
-            if self.location2cost.get(location) == 0
+            if location in eligible_locations and
+            self.location2cost.get(location) == 0
         ]
 
     def select_next_zero_cost_location(
@@ -1239,6 +1356,7 @@ class SpotPlacer:
         cls,
         spec: 'service_spec.SkyServiceSpec',
         task: 'task_lib.Task',
+        workspace: str | None = None,
     ) -> PlacementCatalog | None:
         """Build the one complete catalog for an immutable service version."""
         if spec.spot_placer is None:
@@ -1246,7 +1364,8 @@ class SpotPlacer:
         placer_cls = SPOT_PLACERS[spec.spot_placer]
         return PlacementCatalog.from_task(
             task,
-            expand_accelerator_counts=placer_cls._expand_accelerator_counts)  # pylint: disable=protected-access
+            expand_accelerator_counts=placer_cls._expand_accelerator_counts,  # pylint: disable=protected-access
+            workspace=workspace)
 
     @classmethod
     def from_task(
@@ -1254,11 +1373,12 @@ class SpotPlacer:
         spec: 'service_spec.SkyServiceSpec',
         task: 'task_lib.Task',
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
+        workspace: str | None = None,
     ) -> Optional['SpotPlacer']:
         if spec.spot_placer is None:
             return None
         return SPOT_PLACERS[spec.spot_placer](
-            task, placement_catalog=placement_catalog)
+            task, placement_catalog=placement_catalog, workspace=workspace)
 
 
 class DynamicFallbackSpotPlacer(SpotPlacer,
@@ -1270,8 +1390,11 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         self,
         task: 'task_lib.Task',
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
+        workspace: str | None = None,
     ) -> None:
-        super().__init__(task, placement_catalog=placement_catalog)
+        super().__init__(task,
+                         placement_catalog=placement_catalog,
+                         workspace=workspace)
         # INVARIANT: the bench TTL must exceed the worst-case launch
         # FAILURE latency of every managed location, or a full location
         # ping-pongs (its bench expires exactly as a sibling's launch

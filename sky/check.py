@@ -130,6 +130,31 @@ def _get_workspace_allowed_clouds(workspace: str) -> list[str]:
     return config_allowed_cloud_names
 
 
+def get_workspace_allowed_clouds(
+    workspace: str | None = None,
+    capability: sky_cloud.CloudCapability | None = None,
+) -> list[str]:
+    """Return clouds permitted by config for one workspace and capability.
+
+    Unlike ``get_cached_enabled_clouds_or_refresh()``, this is a policy-only
+    lookup: it does not probe credentials or provider control planes.  Runtime
+    consumers can therefore reject candidates disabled by ``allowed_clouds`` or
+    the workspace's ``disabled``/``capabilities`` policy without adding
+    provider work to a hot or boot-critical path. If ``capability`` is omitted,
+    this preserves the capability-agnostic allowed-cloud contract.
+    """
+    if workspace is None:
+        workspace = skypilot_config.get_active_workspace()
+    allowed_clouds = _get_workspace_allowed_clouds(workspace)
+    if capability is None:
+        return allowed_clouds
+    return [
+        cloud for cloud in allowed_clouds
+        if (configured_capabilities := _get_workspace_cloud_capabilities(
+            workspace, cloud)) is None or capability in configured_capabilities
+    ]
+
+
 def _get_workspace_cloud_capabilities(
         workspace: str, cloud: str) -> list[sky_cloud.CloudCapability] | None:
     """Get the capabilities for a cloud in a workspace.
@@ -143,11 +168,11 @@ def _get_workspace_cloud_capabilities(
     cloud_config = skypilot_config.get_workspace_cloud(cloud,
                                                        workspace=workspace)
     cloud_capabilities = cloud_config.get('capabilities', None)
-    if not cloud_capabilities:
+    if cloud_capabilities is None:
         # get the capabilities from the global config
         cloud_capabilities = skypilot_config.get_nested(
             (cloud.lower(), 'capabilities'), default_value=None)
-    if cloud_capabilities:
+    if cloud_capabilities is not None:
         return [
             sky_cloud.CloudCapability(capability.lower())
             for capability in cloud_capabilities
@@ -275,7 +300,7 @@ def check_capabilities(
             else:
                 specified_capabilities = _get_workspace_cloud_capabilities(
                     current_workspace_name, cloud)
-                if specified_capabilities:
+                if specified_capabilities is not None:
                     # filter the capabilities to only the ones passed
                     # in as argument to this function
                     workspace_cloud_capabilities[cloud] = [

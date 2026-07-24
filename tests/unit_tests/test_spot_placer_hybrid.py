@@ -115,6 +115,303 @@ run: echo hi
         assert placer._min_cost_location([paid, reserved]) == reserved
         resources.copy.assert_not_called()
 
+    def test_explicit_workspace_disallowed_cloud_is_not_enumerated(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.clouds import kubernetes as kubernetes_cloud
+        from sky.utils import resources_utils
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  any_of:
+    - infra: k8s/research-ctx
+      accelerators: A100:1
+      use_spot: false
+    - infra: aws/us-east-1
+      accelerators: L4:1
+      use_spot: true
+run: echo hi
+""")
+        get_allowed_clouds = mock.MagicMock(return_value=['AWS'])
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_workspace_allowed_clouds', get_allowed_clouds)
+        kubernetes_feasibility = mock.MagicMock(side_effect=AssertionError(
+            'workspace-disallowed Kubernetes must not be enumerated'))
+        monkeypatch.setattr(kubernetes_cloud.Kubernetes,
+                            'get_feasible_launchable_resources',
+                            kubernetes_feasibility)
+
+        def _aws_feasible(self, resources, num_nodes=1):
+            del num_nodes
+            launchable = resources.copy(cloud=self, instance_type='g6.xlarge')
+            return resources_utils.FeasibleResources([launchable], [], None)
+
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _aws_feasible)
+        monkeypatch.setattr(
+            spot_placer.resources_utils,
+            'make_launchables_for_valid_region_zones', lambda resources, **_:
+            [resources.copy(region='us-east-1', zone='us-east-1a')])
+
+        locations = spot_placer._get_possible_location_from_task(
+            task, workspace='research')
+
+        assert locations
+        assert {str(location.cloud) for location in locations} == {'AWS'}
+        get_allowed_clouds.assert_called_once_with(
+            'research',
+            capability=spot_placer.sky_cloud.CloudCapability.COMPUTE)
+        kubernetes_feasibility.assert_not_called()
+
+    def test_implicit_candidates_intersect_stale_enabled_cloud_cache(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.clouds import kubernetes as kubernetes_cloud
+        from sky.utils import resources_utils
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  accelerators: L4:1
+  use_spot: true
+run: echo hi
+""")
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_workspace_allowed_clouds',
+                            lambda workspace, **_: ['AWS'])
+
+        def _cached_enabled_clouds(**_):
+            assert (spot_placer.skypilot_config.get_active_workspace() ==
+                    'research')
+            # Simulate the non-atomic window after policy changed but before
+            # the enabled-cloud cache was refreshed.
+            return [kubernetes_cloud.Kubernetes(), aws_cloud.AWS()]
+
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_cached_enabled_clouds_or_refresh',
+                            _cached_enabled_clouds)
+        kubernetes_feasibility = mock.MagicMock(side_effect=AssertionError(
+            'a stale enabled-cloud cache must not reintroduce Kubernetes'))
+        monkeypatch.setattr(kubernetes_cloud.Kubernetes,
+                            'get_feasible_launchable_resources',
+                            kubernetes_feasibility)
+
+        def _aws_feasible(self, resources, num_nodes=1):
+            del num_nodes
+            launchable = resources.copy(cloud=self, instance_type='g6.xlarge')
+            return resources_utils.FeasibleResources([launchable], [], None)
+
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _aws_feasible)
+        monkeypatch.setattr(
+            spot_placer.resources_utils,
+            'make_launchables_for_valid_region_zones', lambda resources, **_:
+            [resources.copy(region='us-east-1', zone='us-east-1a')])
+
+        locations = spot_placer._get_possible_location_from_task(
+            task, workspace='research')
+
+        assert locations
+        assert {str(location.cloud) for location in locations} == {'AWS'}
+        kubernetes_feasibility.assert_not_called()
+
+    def test_explicit_provider_enumeration_uses_service_workspace(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import kubernetes as kubernetes_cloud
+        from sky.utils import resources_utils
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  infra: k8s/research-ctx
+  accelerators: A100-80GB:1
+  use_spot: false
+run: echo hi
+""")
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_workspace_allowed_clouds',
+                            lambda workspace, **_: ['Kubernetes'])
+
+        def _kubernetes_feasible(self, resources, num_nodes=1):
+            del num_nodes
+            assert (spot_placer.skypilot_config.get_active_workspace() ==
+                    'research')
+            launchable = resources.copy(cloud=self)
+            return resources_utils.FeasibleResources([launchable], [], None)
+
+        monkeypatch.setattr(kubernetes_cloud.Kubernetes,
+                            'get_feasible_launchable_resources',
+                            _kubernetes_feasible)
+
+        def _make_launchables(resources, **_):
+            assert (spot_placer.skypilot_config.get_active_workspace() ==
+                    'research')
+            return [resources.copy(region='research-ctx', zone=None)]
+
+        monkeypatch.setattr(spot_placer.resources_utils,
+                            'make_launchables_for_valid_region_zones',
+                            _make_launchables)
+
+        locations = spot_placer._get_possible_location_from_task(
+            task, workspace='research')
+
+        assert len(locations) == 1
+        assert str(locations[0].cloud) == 'Kubernetes'
+        assert locations[0].region == 'research-ctx'
+
+    def test_persisted_catalog_is_projected_onto_workspace_policy(
+            self, monkeypatch):
+        reserved = make_location('research-ctx',
+                                 accelerators={'A100': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        catalog = spot_placer.PlacementCatalog(((reserved, 0.0), (paid, 0.2)))
+        resources = mock.MagicMock()
+        task = mock.MagicMock(resources=[resources], num_nodes=1)
+        allowed_clouds = ['AWS']
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_workspace_allowed_clouds',
+                            lambda workspace, **_: list(allowed_clouds))
+        monkeypatch.setattr(spot_placer.skypilot_config, 'get_workspace_cloud',
+                            lambda cloud, workspace: {})
+
+        placer = spot_placer.DynamicFallbackSpotPlacer(
+            task, placement_catalog=catalog, workspace='default')
+
+        # The immutable version catalog remains intact, but every runtime
+        # placement/reserved-fill view contains eligible locations only.
+        assert placer.placement_catalog == catalog
+        assert set(placer.location2status) == {reserved, paid}
+        assert placer.location2cost[reserved] == 0.0
+        assert placer.known_locations() == [paid]
+        assert placer.zero_cost_locations() == []
+        assert placer.select_next_zero_cost_location() is None
+        assert placer.select_next_location() == paid
+        assert placer.cost_per_hour(reserved) == float('inf')
+        assert placer.cost_per_hour(paid) == 0.2
+
+        # A later broadening can restore the durable entry without rebuilding
+        # the catalog or restarting the controller.
+        allowed_clouds.append('Kubernetes')
+        assert set(placer.known_locations()) == {reserved, paid}
+        assert placer.zero_cost_locations() == [reserved]
+        assert placer.select_next_location() == reserved
+
+    def test_live_placer_rechecks_narrowed_workspace_policy(self, monkeypatch):
+        reserved_a = make_location('research-a',
+                                   accelerators={'A100': 1},
+                                   cloud_name='Kubernetes',
+                                   use_spot=False)
+        reserved_b = make_location('research-b',
+                                   accelerators={'A100': 1},
+                                   cloud_name='Kubernetes',
+                                   use_spot=False)
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        catalog = spot_placer.PlacementCatalog(
+            ((reserved_a, 0.0), (reserved_b, 0.0), (paid, 0.2)))
+        resources = mock.MagicMock()
+        task = mock.MagicMock(resources=[resources], num_nodes=1)
+        policy = {
+            'clouds': ['Kubernetes', 'AWS'],
+            'contexts': ['research-a', 'research-b'],
+        }
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_workspace_allowed_clouds',
+                            lambda workspace, **_: list(policy['clouds']))
+
+        def _workspace_cloud(cloud, workspace):
+            assert workspace == 'research'
+            if cloud == 'kubernetes':
+                return {'allowed_contexts': list(policy['contexts'])}
+            return {}
+
+        monkeypatch.setattr(spot_placer.skypilot_config, 'get_workspace_cloud',
+                            _workspace_cloud)
+        placer = spot_placer.DynamicFallbackSpotPlacer(
+            task, placement_catalog=catalog, workspace='research')
+
+        with mock.patch.object(spot_placer.skypilot_config,
+                               'safe_reload_config') as reload_config:
+            placer.refresh_workspace_policy()
+        reload_config.assert_called_once_with()
+        assert set(placer.known_locations()) == {reserved_a, reserved_b, paid}
+
+        # Simulate a scale-to-zero service whose workspace drops one context
+        # after the controller has already loaded the durable catalog.
+        policy['contexts'] = ['research-b']
+        assert set(placer.known_locations()) == {reserved_b, paid}
+        assert placer.zero_cost_locations() == [reserved_b]
+        assert placer.cost_per_hour(reserved_a) == float('inf')
+        assert not placer.is_active_location(reserved_a)
+        assert not placer.is_launch_admissible(reserved_a, selected_at=100.0)
+        snapshot_locations = placer.placement_snapshot()['locations']
+        assert {entry['region'] for entry in snapshot_locations
+               } == {'research-b', 'us-east-1'}
+        assert placer.select_next_location() == reserved_b
+
+        # Disabling Kubernetes must take effect in the same long-lived placer,
+        # without waiting for a controller restart or rebuilding the catalog.
+        policy['clouds'] = ['AWS']
+        assert placer.zero_cost_locations() == []
+        assert placer.select_next_location() == paid
+
+        # A later policy broadening makes the immutable candidates eligible
+        # again; their retry state and catalog prices were retained.
+        policy['clouds'] = ['Kubernetes', 'AWS']
+        policy['contexts'] = ['research-a', 'research-b']
+        assert set(placer.zero_cost_locations()) == {reserved_a, reserved_b}
+        assert placer.cost_per_hour(reserved_a) == 0.0
+
+    @pytest.mark.parametrize(
+        ('cloud_name', 'region', 'config'),
+        [
+            ('Kubernetes', 'research-a', {
+                'allowed_contexts': ['research-b']
+            }),
+            ('SSH', 'ssh-pool-a', {
+                'allowed_node_pools': ['pool-b']
+            }),
+            ('Slurm', 'cluster-a', {
+                'allowed_clusters': ['cluster-b']
+            }),
+        ],
+    )
+    def test_runtime_context_policy_excludes_stale_candidate(
+            self, monkeypatch, cloud_name, region, config):
+        location = make_location(region,
+                                 accelerators={'A100': 1},
+                                 cloud_name=cloud_name,
+                                 use_spot=False)
+        catalog = spot_placer.PlacementCatalog(((location, 0.0),))
+        task = mock.MagicMock(resources=[mock.MagicMock()], num_nodes=1)
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_workspace_allowed_clouds',
+                            lambda workspace, **_: [cloud_name])
+        monkeypatch.setattr(
+            spot_placer.skypilot_config, 'get_workspace_cloud',
+            lambda cloud, workspace: config
+            if cloud == cloud_name.lower() else {})
+
+        placer = spot_placer.DynamicFallbackSpotPlacer(
+            task, placement_catalog=catalog, workspace='research')
+
+        assert placer.known_locations() == []
+        assert placer.active_locations() == []
+        assert placer.zero_cost_locations() == []
+        assert placer.cost_per_hour(location) == float('inf')
+        assert placer.select_next_location() is None
+
 
 @pytest.fixture
 def hybrid_placer():
