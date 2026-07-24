@@ -3075,7 +3075,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         unknown-capacity replacement tied to the exact outage observation.
 
         paid_location_launch_budget: advisory shared allowance for fresh paid
-        placement. Recovery and pinned replacements bypass fresh selection.
+        placement. Recovery bypasses new admission; fresh cost-rebalance
+        replacements bypass selection but still require exact-pool admission.
 
         launch_priority: highest queued demand priority represented by this
         fresh launch. It gates new global claims only and never preempts an
@@ -3233,6 +3234,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             # conflict with the spot placer's selection.
             if resources_override is None:
                 resources_override = {}
+            else:
+                # Location pinning below is persisted on ReplicaInfo, but the
+                # autoscaler's batch decision is caller-owned and may be
+                # reused by later entries in the same wave.
+                resources_override = dict(resources_override)
             allowed_locations = self._locations_for_accelerator_override(
                 resources_override)
             allowed_location_kwargs: dict[str, Any] = (
@@ -3540,6 +3546,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                         location=location,
                         budget=paid_location_launch_budget,
                         priority=launch_priority)
+                    if claim_result not in (
+                            paid_capacity.ClaimResult.ACQUIRED,
+                            paid_capacity.ClaimResult.LEGACY_LOCAL):
+                        # Selection consumes an expired bench's one-probe
+                        # reservation. An admission rejection never reached
+                        # the provider, so release that reservation instead of
+                        # silently extending the durable capacity cooldown.
+                        assert self._spot_placer is not None
+                        self._spot_placer.release_retry(location)
+                        self._persist_spot_placement_state_if_dirty()
+                    if (claim_result ==
+                            paid_capacity.ClaimResult.FEEDBACK_PENDING):
+                        paid_capacity.defer_for_feedback(
+                            paid_location_launch_budget, location)
+                        logger.info('Deferring paid demand launch at '
+                                    f'{location}: {claim_result.value}.')
+                        return False
                     if claim_result == paid_capacity.ClaimResult.SATURATED:
                         paid_capacity.exhaust(paid_location_launch_budget,
                                               location)
@@ -4048,6 +4071,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 existing_replica_infos=existing_replica_infos,
                 globally_managed=(getattr(self, '_service_hash', None)
                                   is not None)))
+        deferred_paid_overrides: list[dict[str, Any] | None] = []
         for resources_override in resources_overrides:
             pending_version = getattr(self, '_pending_version', None)
             if (pending_version is not None and
@@ -4056,29 +4080,41 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{batch_version} scale-up batch because version '
                             f'{pending_version} is waiting to be applied.')
                 break
-            if paid_capacity.service_exhausted(paid_location_launch_budget):
-                logger.info('Stopping physical scale-up wave at the service '
-                            'paid-capacity envelope.')
-                break
+            if any(resources_override == deferred
+                   for deferred in deferred_paid_overrides):
+                continue
             scale_up_kwargs: dict[str, Any] = {}
             if paid_location_launch_budget is not None:
                 scale_up_kwargs['paid_location_launch_budget'] = (
                     paid_location_launch_budget)
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 scale_up_kwargs['launch_priority'] = launch_priority
-            deferred_pool_keys_before = (
-                set(paid_location_launch_budget.priority_deferred_pool_keys)
-                if paid_location_launch_budget is not None else set())
-            self._scale_up_one_locked(resources_override, used_replica_ids,
-                                      existing_replica_infos,
-                                      zero_cost_demand_budget,
-                                      **scale_up_kwargs)
-            if (paid_location_launch_budget is not None and
-                    paid_location_launch_budget.priority_deferred_pool_keys
-                    != deferred_pool_keys_before):
-                logger.info('Stopping physical scale-up wave after priority '
-                            'deferral at its cheapest paid pool.')
-                break
+            stop_sequence_before = (paid_location_launch_budget.stop_sequence
+                                    if paid_location_launch_budget is not None
+                                    else 0)
+            service_remaining_before = (
+                paid_location_launch_budget.service_remaining
+                if paid_location_launch_budget is not None else None)
+            override_before = (None if resources_override is None else
+                               dict(resources_override))
+            launched = self._scale_up_one_locked(resources_override,
+                                                 used_replica_ids,
+                                                 existing_replica_infos,
+                                                 zero_cost_demand_budget,
+                                                 **scale_up_kwargs)
+            if paid_location_launch_budget is None:
+                continue
+            paid_selection_stopped = (paid_location_launch_budget.stop_sequence
+                                      != stop_sequence_before)
+            service_exhausted = (service_remaining_before is not None and
+                                 service_remaining_before > 0 and
+                                 paid_location_launch_budget.service_remaining
+                                 == 0)
+            if ((not launched and paid_selection_stopped) or service_exhausted):
+                # Only suppress later equivalent fresh-paid decisions. A
+                # complete pass must still examine different accelerator
+                # cards plus reserved-fill and pinned-rebalance overrides.
+                deferred_paid_overrides.append(override_before)
 
     @with_lock
     def scale_up_to_logical_capacity(
@@ -4329,10 +4365,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         deferred_cards: set[str] = set()
         launched_capacity = 0
         while True:
-            if paid_capacity.service_exhausted(paid_location_launch_budget):
-                logger.info('Stopping logical scale-up wave at the service '
-                            'paid-capacity envelope.')
-                break
             if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,
@@ -4360,6 +4392,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     break
             elif committed >= target_capacity:
                 break
+            resources_override = None
+            if selected_card is not None:
+                resources_override = {
+                    'accelerators': {
+                        selected_card: shapes[selected_card]
+                    }
+                }
+            if self._paid_service_envelope_blocks_launch(
+                    paid_location_launch_budget, resources_override):
+                if selected_card is not None:
+                    deferred_cards.add(selected_card)
+                    continue
+                break
             before = len(existing_replica_infos)
             launch_kwargs: dict[str, Any] = {}
             if paid_location_launch_budget is not None:
@@ -4381,13 +4426,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_kwargs['unknown_capacity_replacement'] = True
                 launch_kwargs[
                     'logical_reconcile_fence_requires_exact_generation'] = True
-            resources_override = None
-            if selected_card is not None:
-                resources_override = {
-                    'accelerators': {
-                        selected_card: shapes[selected_card]
-                    }
-                }
             launched = self._scale_up_one_locked(
                 resources_override,
                 used_replica_ids,
@@ -4488,6 +4526,29 @@ class SkyPilotReplicaManager(ReplicaManager):
             resource_override=None,
             service_spec=getattr(self, '_version_specs', {}).get(
                 self.latest_version)))
+
+    def _paid_service_envelope_blocks_launch(
+            self, budget: paid_capacity.LaunchBudget | None,
+            resources_override: dict[str, Any] | None) -> bool:
+        """Whether this launch can only use an exhausted paid envelope."""
+        if not paid_capacity.service_exhausted(budget):
+            return False
+        override = resources_override or {}
+        if (serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY in override or
+                serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY
+                in override or override.get('use_spot') is False):
+            return False
+        if self._spot_placer is None:
+            return True
+        allowed_locations = self._locations_for_accelerator_override(override)
+        if allowed_locations is not None and not allowed_locations:
+            # Preserve the normal exact-shape validation error.
+            return False
+        active_locations = set(self._spot_placer.active_locations())
+        return not any(
+            location in active_locations and
+            (allowed_locations is None or location in allowed_locations)
+            for location in self._spot_placer.zero_cost_locations())
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: str | None) -> None:

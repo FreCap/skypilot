@@ -7,6 +7,7 @@ Concepts:
   interact with a cluster.
 """
 import asyncio
+import contextlib
 import enum
 import json
 import os
@@ -670,6 +671,27 @@ _db_manager = db_utils.DatabaseManager(
 initialize_and_get_db = _db_manager.get_engine
 
 
+@contextlib.contextmanager
+def _session_scope(session: 'orm.Session | None' = None):
+    """Yield the caller's session, or open (and close) a fresh one.
+
+    Reusing an already-open session keeps a single logical operation on a
+    single pooled connection. A helper that opens its own session while the
+    caller still holds one needs a second concurrent connection; on the
+    synchronous PostgreSQL engine every ``state``/``spot``/``serve`` module
+    shares one process-local ``QueuePool``, so with ``max_overflow=0`` and a
+    small ``pool_size`` (down to 1 for the API server main process) the second
+    checkout self-deadlocks until ``pool_timeout`` and raises. Threading the
+    session through nested helpers avoids that starvation without relaxing the
+    strict per-process connection budget.
+    """
+    if session is not None:
+        yield session
+    else:
+        with orm.Session(_db_manager.get_engine()) as owned_session:
+            yield owned_session
+
+
 @metrics_lib.time_me
 def add_or_update_user(
         user: models.User,
@@ -834,10 +856,10 @@ def add_or_update_user(
 
 
 @metrics_lib.time_me
-def get_user(user_id: str) -> models.User | None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(user_table).filter_by(id=user_id).first()
+def get_user(user_id: str,
+             session: 'orm.Session | None' = None) -> models.User | None:
+    with _session_scope(session) as active_session:
+        row = active_session.query(user_table).filter_by(id=user_id).first()
     if row is None:
         return None
     return models.User(
@@ -1419,8 +1441,12 @@ def add_cluster_event(cluster_name: str,
         cluster_hash = cluster_row.cluster_hash
         last_status = cluster_row.status
         if nop_if_duplicate:
+            # Reuse this session: add_cluster_event already holds a pooled
+            # connection here, and a nested checkout self-deadlocks a
+            # single-connection sync pool.
             last_event = get_last_cluster_event(cluster_hash,
-                                                event_type=event_type)
+                                                event_type=event_type,
+                                                session=session)
             if duplicate_regex is not None and last_event is not None:
                 if re.search(duplicate_regex, last_event):
                     return
@@ -1455,10 +1481,10 @@ def add_cluster_event(cluster_name: str,
 
 
 def get_last_cluster_event(cluster_hash: str,
-                           event_type: ClusterEventType) -> str | None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(cluster_event_table).filter_by(
+                           event_type: ClusterEventType,
+                           session: 'orm.Session | None' = None) -> str | None:
+    with _session_scope(session) as active_session:
+        row = active_session.query(cluster_event_table).filter_by(
             cluster_hash=cluster_hash, type=event_type.value).order_by(
                 cluster_event_table.c.transitioned_at.desc()).first()
     if row is None:
@@ -1958,7 +1984,12 @@ def remove_cluster(cluster_name: str,
                 # retire. Deleting the cluster row is safe; the independent
                 # two-observation reconciler will later release its fence.
                 terminal_demand_id = None
-        usage_intervals = _get_cluster_usage_intervals(cluster_hash)
+        # Reuse this session: remove_cluster already holds a pooled connection
+        # (advisory + row locks) here, so the usage-interval read/write must
+        # not open nested sessions that self-deadlock a single-connection sync
+        # pool. The write joins this transaction and commits with it below.
+        usage_intervals = _get_cluster_usage_intervals(cluster_hash,
+                                                       session=session)
 
         # usage_intervals is not None and not empty
         if usage_intervals:
@@ -1966,7 +1997,9 @@ def remove_cluster(cluster_name: str,
             start_time = usage_intervals.pop()[0]
             end_time = int(time.time())
             usage_intervals.append((start_time, end_time))
-            _set_cluster_usage_intervals(cluster_hash, usage_intervals)
+            _set_cluster_usage_intervals(cluster_hash,
+                                         usage_intervals,
+                                         session=session)
 
         if provision_log_path:
             assert cluster_hash is not None, cluster_name
@@ -2345,13 +2378,15 @@ def set_cluster_skylet_ssh_tunnel_metadata(
 
 @metrics_lib.time_me
 def _get_cluster_usage_intervals(
-        cluster_hash: str | None) -> list[tuple[int, int | None]] | None:
-    engine = _db_manager.get_engine()
+    cluster_hash: str | None,
+    session: 'orm.Session | None' = None
+) -> list[tuple[int, int | None]] | None:
     if cluster_hash is None:
         return None
-    with orm.Session(engine) as session:
-        row = session.query(cluster_history_table.c.usage_intervals).filter_by(
-            cluster_hash=cluster_hash).first()
+    with _session_scope(session) as active_session:
+        row = active_session.query(
+            cluster_history_table.c.usage_intervals).filter_by(
+                cluster_hash=cluster_hash).first()
     if row is None or row.usage_intervals is None:
         return None
     return pickle.loads(row.usage_intervals)
@@ -2394,24 +2429,27 @@ def _get_cluster_last_activity_time(
 
 
 @metrics_lib.time_me
-def _set_cluster_usage_intervals(
-        cluster_hash: str, usage_intervals: list[tuple[int,
-                                                       int | None]]) -> None:
-    engine = _db_manager.get_engine()
-
+def _set_cluster_usage_intervals(cluster_hash: str,
+                                 usage_intervals: list[tuple[int, int | None]],
+                                 session: 'orm.Session | None' = None) -> None:
     # Calculate last_activity_time from usage_intervals
     last_activity_time = _get_cluster_last_activity_time(usage_intervals)
     usage_updated_at = int(time.time())
 
-    with orm.Session(engine) as session:
-        count = session.query(cluster_history_table).filter_by(
+    # When the caller supplies a session this write joins that transaction and
+    # the caller owns the commit; committing here would end the caller's
+    # transaction early (e.g. release remove_cluster's advisory/row locks).
+    owns_session = session is None
+    with _session_scope(session) as active_session:
+        count = active_session.query(cluster_history_table).filter_by(
             cluster_hash=cluster_hash).update({
                 cluster_history_table.c.usage_intervals:
                     pickle.dumps(usage_intervals),
                 cluster_history_table.c.last_activity_time: last_activity_time,
                 cluster_history_table.c.usage_updated_at: usage_updated_at,
             })
-        session.commit()
+        if owns_session:
+            active_session.commit()
     assert count <= 1, count
     if count == 0:
         raise ValueError(f'Cluster hash {cluster_hash} not found.')
@@ -2687,7 +2725,10 @@ def get_clusters_from_names(
                 }
                 if include_user_info:
                     user_hash = _get_user_hash_or_current_user(row.user_hash)
-                    user = get_user(user_hash)
+                    # Reuse this session: get_clusters_from_names holds a pooled
+                    # connection across this loop, and a nested checkout
+                    # self-deadlocks a single-connection sync pool.
+                    user = get_user(user_hash, session=session)
                     record['user_hash'] = user_hash
                     record['user_name'] = (user.name
                                            if user is not None else None)
@@ -4328,13 +4369,21 @@ def mark_operator_notifications_read(user_id: str,
 
 
 def get_max_db_connections() -> int | None:
-    """Get the maximum number of connections for the engine."""
+    """Get PostgreSQL connection capacity available to ordinary clients."""
     engine = _db_manager.get_engine()
     if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
         return None
     with sqlalchemy.orm.Session(engine) as session:
-        max_connections = session.execute(
-            sqlalchemy.text('SHOW max_connections')).scalar()
-        if max_connections is None:
+        settings = session.execute(
+            sqlalchemy.text(
+                "SELECT current_setting('max_connections'), "
+                "current_setting('superuser_reserved_connections'), "
+                "current_setting('reserved_connections', true)")).one()
+        max_connections, superuser_reserved, reserved = settings
+        if max_connections is None or superuser_reserved is None:
             return None
-        return int(max_connections)
+        # ``reserved_connections`` was added in PostgreSQL 16. The
+        # missing_ok=true lookup returns NULL on older supported versions.
+        return max(
+            0,
+            int(max_connections) - int(superuser_reserved) - int(reserved or 0))

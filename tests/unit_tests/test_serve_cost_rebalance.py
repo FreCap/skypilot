@@ -722,6 +722,56 @@ class TestPinnedReplacementLaunch:
         assert budget.service_remaining == 0
         manager._persist_replica.assert_not_called()
 
+    def test_recovered_paid_replacement_reuses_existing_claim(self):
+        paid = make_location('paid',
+                             accelerators={'L4': 1},
+                             use_spot=True,
+                             instance_type='g6.xlarge')
+        cheap = make_location('cheap',
+                              accelerators={'L4': 1},
+                              use_spot=True,
+                              instance_type='g6.xlarge')
+        placer = make_placer({paid: 1.0, cheap: 0.5})
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._resource_scope = None
+        manager._spot_placer = placer
+        manager._launch_thread_pool = {}
+        manager._replica_to_request_id = {}
+        manager._replica_to_launch_cancelled = {}
+        manager._persist_replica = mock.Mock()
+
+        with mock.patch.object(replica_managers, '_should_use_spot'), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.spot_placer.Location,
+                               'from_resources_override',
+                               return_value=cheap), \
+             mock.patch.object(replica_managers.thread_utils, 'SafeThread'), \
+             mock.patch.object(
+                 replica_managers.paid_capacity,
+                 'build_launch_budget') as build_budget, \
+             mock.patch.object(
+                 replica_managers.paid_capacity,
+                 'try_persist_claim') as persist_claim:
+            assert manager._launch_replica(
+                8,
+                cheap.to_dict(),
+                prior_cost_rebalance_for_replica_id=7,
+                prior_paid_capacity_pool_key='exact-pool',
+                recovering_existing_replica=True,
+                prior_version=1,
+                prior_yaml_content='resources: {}')
+
+        build_budget.assert_not_called()
+        persist_claim.assert_not_called()
+        info = manager._persist_replica.call_args.args[1]
+        assert info.cost_rebalance_for_replica_id == 7
+        assert info.paid_capacity_pool_key == 'exact-pool'
+        assert info.location == cheap.to_pickleable()
+
     def test_invalid_recovery_pin_retires_persisted_replacement(self):
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)

@@ -32,10 +32,13 @@ serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 _BASE_LIMIT_DEFAULT = 4
 _LEGACY_LOCAL_LIMIT_DEFAULT = 4
 _MAX_LIMIT_DEFAULT = 480
+_EXPLORATION_FRONTIER_DEFAULT = 2
 _BASE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW'
 _MAX_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_MAX_LAUNCH_WINDOW'
 _SERVICE_LIMIT_DEFAULT = 16
 _SERVICE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_SERVICE_LAUNCH_WINDOW'
+_EXPLORATION_FRONTIER_ENV_VAR = (
+    'SKYPILOT_SERVE_PAID_LOCATION_EXPLORATION_FRONTIER')
 _SUCCESS_TTL_SECONDS_DEFAULT = 10 * 60
 _SUCCESS_TTL_SECONDS_ENV_VAR = (
     'SKYPILOT_SERVE_PAID_LOCATION_SUCCESS_TTL_SECONDS')
@@ -52,6 +55,7 @@ _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
 _admission_summary_logged_at = 0.0
+FrontierKey = tuple[str, ...]
 
 
 class ClaimResult(enum.Enum):
@@ -60,6 +64,7 @@ class ClaimResult(enum.Enum):
     ACQUIRED = 'acquired'
     SATURATED = 'saturated'
     SERVICE_SATURATED = 'service_saturated'
+    FEEDBACK_PENDING = 'feedback_pending'
     HIGHER_PRIORITY_WAITING = 'higher_priority_waiting'
     OWNERSHIP_LOST = 'ownership_lost'
     LEGACY_LOCAL = 'legacy_local'
@@ -85,6 +90,21 @@ class LaunchBudget:
     priority_deferred_pool_keys: set[str] = dataclasses.field(
         default_factory=set)
     service_remaining: int | None = None
+    frontier_limit: int | None = None
+    frontier_key_by_location: dict[spot_placer.Location,
+                                   FrontierKey] = (dataclasses.field(
+                                       default_factory=dict))
+    owned_pool_keys_by_frontier: dict[FrontierKey,
+                                      set[str]] = (dataclasses.field(
+                                          default_factory=dict))
+    unknown_owned_pool_keys: set[str] = dataclasses.field(default_factory=set)
+    oldest_claimed_at_by_frontier: dict[FrontierKey,
+                                        float] = (dataclasses.field(
+                                            default_factory=dict))
+    oldest_unknown_claimed_at: float | None = None
+    feedback_deferred_frontiers: set[FrontierKey] = dataclasses.field(
+        default_factory=set)
+    stop_sequence: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,6 +165,13 @@ def service_limit() -> int:
     """Return one service's cross-pool unresolved paid-claim envelope."""
     return _parse_positive_int(os.environ.get(_SERVICE_LIMIT_ENV_VAR),
                                _SERVICE_LIMIT_DEFAULT, _SERVICE_LIMIT_ENV_VAR)
+
+
+def exploration_frontier() -> int:
+    """Return the number of paid pools one service/card may explore."""
+    return _parse_positive_int(os.environ.get(_EXPLORATION_FRONTIER_ENV_VAR),
+                               _EXPLORATION_FRONTIER_DEFAULT,
+                               _EXPLORATION_FRONTIER_ENV_VAR)
 
 
 def success_ttl_seconds() -> int:
@@ -316,6 +343,37 @@ def pool_key(location: spot_placer.Location, *, workspace: str,
     return json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
 
+def frontier_key(location: spot_placer.Location) -> FrontierKey:
+    """Return one model-only exploration identity for a paid location."""
+    accelerators = location.accelerators
+    if not accelerators:
+        return ()
+    return tuple(
+        sorted((str(name).casefold() for name in accelerators),
+               key=str.casefold))
+
+
+def frontier_key_from_pool_key(key: str) -> FrontierKey | None:
+    """Recover a card frontier identity from one versioned exact pool key."""
+    try:
+        payload = json.loads(key)
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(payload, dict) or
+            payload.get('version') != _POOL_KEY_VERSION):
+        return None
+    accelerators = payload.get('accelerators')
+    if not isinstance(accelerators, list):
+        return None
+    names = []
+    for accelerator in accelerators:
+        if (not isinstance(accelerator, list) or len(accelerator) != 2 or
+                not isinstance(accelerator[0], str)):
+            return None
+        names.append(accelerator[0].casefold())
+    return tuple(sorted(names, key=str.casefold))
+
+
 def _legacy_local_remaining(
     placer: spot_placer.SpotPlacer,
     paid_locations: Iterable[spot_placer.Location],
@@ -435,6 +493,36 @@ def build_launch_budget(
     }
     service_claims = _service_claim_count(existing_replica_infos)
     service_claim_limit = service_limit()
+    frontier_keys = {
+        location: frontier_key(location) for location in paid_locations
+    }
+    owned_by_frontier: dict[FrontierKey,
+                            set[str]] = collections.defaultdict(set)
+    oldest_by_frontier: dict[FrontierKey, float] = {}
+    unknown_owned_pool_keys = set()
+    oldest_unknown_claimed_at = None
+    for info in existing_replica_infos:
+        if (getattr(info.status, 'value', info.status)
+                not in _UNRESOLVED_STATUS_VALUES):
+            continue
+        key = getattr(info, 'paid_capacity_pool_key', None)
+        if not isinstance(key, str):
+            continue
+        claimed_at = getattr(info, 'created_at', None)
+        parsed_frontier = frontier_key_from_pool_key(key)
+        if parsed_frontier is None:
+            unknown_owned_pool_keys.add(key)
+            if isinstance(claimed_at, (int, float)):
+                oldest_unknown_claimed_at = min(
+                    float(claimed_at),
+                    oldest_unknown_claimed_at if oldest_unknown_claimed_at
+                    is not None else float(claimed_at))
+            continue
+        owned_by_frontier[parsed_frontier].add(key)
+        if isinstance(claimed_at, (int, float)):
+            oldest_by_frontier[parsed_frontier] = min(
+                float(claimed_at),
+                oldest_by_frontier.get(parsed_frontier, float(claimed_at)))
     _log_admission_summary(states,
                            service_claims=service_claims,
                            service_claim_limit=service_claim_limit)
@@ -443,7 +531,44 @@ def build_launch_budget(
                         states_by_pool_key=states,
                         globally_managed=True,
                         service_remaining=max(
-                            0, service_claim_limit - service_claims))
+                            0, service_claim_limit - service_claims),
+                        frontier_limit=exploration_frontier(),
+                        frontier_key_by_location=frontier_keys,
+                        owned_pool_keys_by_frontier=dict(owned_by_frontier),
+                        unknown_owned_pool_keys=unknown_owned_pool_keys,
+                        oldest_claimed_at_by_frontier=oldest_by_frontier,
+                        oldest_unknown_claimed_at=oldest_unknown_claimed_at)
+
+
+def _owned_pool_keys(budget: LaunchBudget, key: FrontierKey) -> set[str]:
+    return (budget.owned_pool_keys_by_frontier.get(key, set()) |
+            budget.unknown_owned_pool_keys)
+
+
+def _defer_frontier(budget: LaunchBudget, key: FrontierKey) -> None:
+    """Mark and log one card that cannot open another paid pool this wave."""
+    if key in budget.feedback_deferred_frontiers:
+        return
+    budget.feedback_deferred_frontiers.add(key)
+    oldest_candidates = [
+        value for value in (budget.oldest_claimed_at_by_frontier.get(key),
+                            budget.oldest_unknown_claimed_at)
+        if value is not None
+    ]
+    age_text = 'unknown'
+    if oldest_candidates:
+        age_text = str(max(0, int(time.time() - min(oldest_candidates))))
+    card = ','.join(key) if key else 'cpu'
+    logger.info(
+        'Paid-capacity exploration frontier awaiting feedback: '
+        f'card={card}, owned_pools={len(_owned_pool_keys(budget, key))}, '
+        f'limit={budget.frontier_limit}, '
+        f'oldest_unresolved_claim_age_seconds={age_text}.')
+
+
+def _record_selection_stop(budget: LaunchBudget) -> None:
+    """Record one paid path that made no progress in this wave."""
+    budget.stop_sequence += 1
 
 
 def select_location(
@@ -464,7 +589,10 @@ def select_location(
             selection_kwargs['skip_zero_cost_preference'] = True
         if allowed_locations is not None:
             selection_kwargs['allowed_locations'] = set()
-        return placer.select_next_location(**selection_kwargs)
+        selected = placer.select_next_location(**selection_kwargs)
+        if selected is None:
+            _record_selection_stop(budget)
+        return selected
     zero_cost = set(placer.zero_cost_locations())
     active_paid = [location for location in active if location not in zero_cost]
     available_paid = {
@@ -472,20 +600,50 @@ def select_location(
         if budget.remaining_by_location.get(location, 0) > 0 and
         (budget.service_remaining is None or budget.service_remaining > 0)
     }
-    if skip_zero_cost_preference and active_paid and not available_paid:
+    eligible_paid = available_paid
+    if budget.frontier_limit is not None:
+        eligible_paid = set()
+        blocked_frontiers = set()
+        for location in available_paid:
+            key = budget.frontier_key_by_location.get(location,
+                                                      frontier_key(location))
+            if key in budget.feedback_deferred_frontiers:
+                continue
+            pool = budget.pool_key_by_location.get(location)
+            owned = _owned_pool_keys(budget, key)
+            if pool in owned or len(owned) < budget.frontier_limit:
+                eligible_paid.add(location)
+            else:
+                blocked_frontiers.add(key)
+        if not eligible_paid:
+            for location in active_paid:
+                key = budget.frontier_key_by_location.get(
+                    location, frontier_key(location))
+                if (len(_owned_pool_keys(budget, key))
+                        >= budget.frontier_limit):
+                    blocked_frontiers.add(key)
+            for key in blocked_frontiers:
+                _defer_frontier(budget, key)
+    if skip_zero_cost_preference and active_paid and not eligible_paid:
+        _record_selection_stop(budget)
         return None
-    candidates = available_paid | {
+    candidates = eligible_paid | {
         location for location in active if location in zero_cost
     }
     if not candidates:
+        _record_selection_stop(budget)
         return None
     selected = placer.select_next_location(
         skip_zero_cost_preference=skip_zero_cost_preference,
         allowed_locations=candidates)
-    if selected is None or selected in zero_cost:
+    if selected is None:
+        _record_selection_stop(budget)
+        return None
+    if selected in zero_cost:
         return selected
     selected_key = budget.pool_key_by_location.get(selected)
     if selected_key in budget.priority_deferred_pool_keys:
+        _record_selection_stop(budget)
         return None
     return selected
 
@@ -522,6 +680,17 @@ def defer_for_priority(budget: LaunchBudget | None,
     key = budget.pool_key_by_location.get(location)
     if key is not None:
         budget.priority_deferred_pool_keys.add(key)
+        _record_selection_stop(budget)
+
+
+def defer_for_feedback(budget: LaunchBudget | None,
+                       location: spot_placer.Location | None) -> None:
+    """Stop this wave from opening another pool for one accelerator card."""
+    if budget is None or location is None:
+        return
+    key = budget.frontier_key_by_location.get(location, frontier_key(location))
+    _defer_frontier(budget, key)
+    _record_selection_stop(budget)
 
 
 def debit(budget: LaunchBudget | None,
@@ -541,6 +710,10 @@ def debit(budget: LaunchBudget | None,
             budget.remaining_by_location[candidate] = remaining - 1
     if budget.service_remaining is not None and budget.service_remaining > 0:
         budget.service_remaining -= 1
+    if budget.frontier_limit is not None and key is not None:
+        frontier = budget.frontier_key_by_location.get(location,
+                                                       frontier_key(location))
+        budget.owned_pool_keys_by_frontier.setdefault(frontier, set()).add(key)
 
 
 def exhaust(budget: LaunchBudget | None,
@@ -560,11 +733,13 @@ def exhaust_service(budget: LaunchBudget | None) -> None:
     """Stop a wave after the authoritative per-service envelope is full."""
     if budget is not None and budget.service_remaining is not None:
         budget.service_remaining = 0
+        _record_selection_stop(budget)
 
 
 def service_exhausted(budget: LaunchBudget | None) -> bool:
-    """Whether this wave has no remaining cross-pool service admission."""
-    return budget is not None and budget.service_remaining == 0
+    """Whether fresh paid placement has no service-envelope headroom."""
+    return (budget is not None and budget.service_remaining is not None and
+            budget.service_remaining <= 0)
 
 
 def try_persist_claim(
@@ -597,6 +772,10 @@ def try_persist_claim(
         success_ttl_seconds=success_ttl_seconds(),
         failure_cooldown_seconds=failure_cooldown_seconds(),
         waiter_ttl_seconds=waiter_ttl_seconds(),
+        frontier_key=budget.frontier_key_by_location.get(
+            location, frontier_key(location)),
+        frontier_limit=(budget.frontier_limit if budget.frontier_limit
+                        is not None else exploration_frontier()),
         expected_controller_owner=controller_owner)
     return ClaimResult(result)
 

@@ -60,6 +60,22 @@ def test_pool_key_normalizes_equivalent_accelerator_counts():
                                       floating, workspace='w1', num_nodes=1)
 
 
+def test_frontier_key_groups_card_model_across_counts_and_instance_types():
+    narrow = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    wide = make_location('us-west-2', {'l4': 8}, cloud_name='GCP')
+    narrow.instance_type = 'g6.xlarge'
+    wide.instance_type = 'g2-standard-96'
+
+    narrow_pool = paid_capacity.pool_key(narrow, workspace='w', num_nodes=1)
+    wide_pool = paid_capacity.pool_key(wide, workspace='w', num_nodes=1)
+
+    assert narrow_pool != wide_pool
+    assert paid_capacity.frontier_key(narrow) == ('l4',)
+    assert paid_capacity.frontier_key(wide) == ('l4',)
+    assert paid_capacity.frontier_key_from_pool_key(narrow_pool) == ('l4',)
+    assert paid_capacity.frontier_key_from_pool_key(wide_pool) == ('l4',)
+
+
 def test_default_limits_and_invalid_failure_cooldown(monkeypatch):
     monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
     monkeypatch.delenv(paid_capacity._MAX_LIMIT_ENV_VAR, raising=False)
@@ -76,6 +92,22 @@ def test_default_limits_and_invalid_failure_cooldown(monkeypatch):
     paid_capacity._parse_positive_int.cache_clear()
     assert paid_capacity.service_limit() == 16
     assert paid_capacity.failure_cooldown_seconds() == 600
+
+
+def test_exploration_frontier_default_override_and_invalid_fallback(
+        monkeypatch):
+    monkeypatch.delenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR,
+                       raising=False)
+    assert paid_capacity.exploration_frontier() == 2
+
+    monkeypatch.setenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR, '3')
+    assert paid_capacity.exploration_frontier() == 3
+
+    monkeypatch.setenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR, '0')
+    assert paid_capacity.exploration_frontier() == 2
+
+    monkeypatch.setenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR, 'invalid')
+    assert paid_capacity.exploration_frontier() == 2
 
 
 def test_default_adaptive_limit_ramps_four_to_480():
@@ -395,6 +427,47 @@ def test_global_budget_caps_paid_selection_across_exact_pools(monkeypatch):
     assert paid_capacity.select_location(placer, budget) is None
 
 
+def test_global_snapshot_counts_catalog_hidden_and_unknown_owned_pools():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    hidden = make_location('ap-south-1', {'L4': 8}, cloud_name='AWS')
+    placer = make_placer({first: 1.0, second: 2.0, third: 3.0})
+    active_keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in (first, second, third)
+    }
+    hidden_info = _pending_info(1, hidden)
+    hidden_info.paid_capacity_pool_key = paid_capacity.pool_key(hidden,
+                                                                workspace='w',
+                                                                num_nodes=1)
+    unknown_info = _pending_info(2, hidden)
+    unknown_info.paid_capacity_pool_key = 'opaque-pre-versioned-pool'
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value={
+                                   key: {
+                                       'remaining': 4
+                                   } for key in active_keys.values()
+                               }):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            existing_replica_infos=[hidden_info, unknown_info],
+            globally_managed=True)
+
+    assert budget.owned_pool_keys_by_frontier == {
+        ('l4',): {hidden_info.paid_capacity_pool_key}
+    }
+    assert budget.unknown_owned_pool_keys == {'opaque-pre-versioned-pool'}
+    assert paid_capacity.select_location(placer, budget) is None
+    assert budget.feedback_deferred_frontiers == {('l4',)}
+
+
 def test_debit_and_authoritative_saturation_exhaust_service_budget():
     location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     budget = paid_capacity.LaunchBudget(remaining_by_location={location: 4},
@@ -403,10 +476,16 @@ def test_debit_and_authoritative_saturation_exhaust_service_budget():
                                         globally_managed=True,
                                         service_remaining=2)
 
+    assert not paid_capacity.service_exhausted(None)
+    assert not paid_capacity.service_exhausted(budget)
     paid_capacity.debit(budget, location)
     assert budget.service_remaining == 1
+    assert not paid_capacity.service_exhausted(budget)
     paid_capacity.exhaust_service(budget)
     assert budget.service_remaining == 0
+    assert paid_capacity.service_exhausted(budget)
+    budget.service_remaining = None
+    assert not paid_capacity.service_exhausted(budget)
 
 
 def test_legacy_local_snapshot_only_debits_unresolved_rows(monkeypatch):
@@ -476,15 +555,17 @@ def test_local_window_debits_ambiguous_legacy_row_from_cheapest_type(
 def test_claim_clamps_priority_and_returns_typed_result():
     location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     location.instance_type = 'g6.xlarge'
-    budget = paid_capacity.LaunchBudget(remaining_by_location={location: 1},
-                                        pool_key_by_location={
-                                            location: paid_capacity.pool_key(
-                                                location,
-                                                workspace='w',
-                                                num_nodes=1)
-                                        },
-                                        states_by_pool_key={},
-                                        globally_managed=True)
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location={location: 1},
+        pool_key_by_location={
+            location: paid_capacity.pool_key(location,
+                                             workspace='w',
+                                             num_nodes=1)
+        },
+        states_by_pool_key={},
+        globally_managed=True,
+        frontier_limit=3,
+        frontier_key_by_location={location: ('l4',)})
     info = _pending_info(1, location)
     with mock.patch.object(paid_capacity.serve_state,
                            'try_add_replica_with_paid_capacity_claim',
@@ -503,6 +584,8 @@ def test_claim_clamps_priority_and_returns_typed_result():
     assert claim.call_args.kwargs['priority'] == (
         constants.LB_REQUEST_PRIORITY_MAX)
     assert claim.call_args.kwargs['service_limit'] == 16
+    assert claim.call_args.kwargs['frontier_key'] == ('l4',)
+    assert claim.call_args.kwargs['frontier_limit'] == 3
 
 
 def test_saturated_pool_exhaustion_spills_to_next_pool():
@@ -520,6 +603,116 @@ def test_saturated_pool_exhaustion_spills_to_next_pool():
     assert paid_capacity.select_location(placer, budget) == cheap
     paid_capacity.exhaust(budget, cheap)
     assert paid_capacity.select_location(placer, budget) == expensive
+
+
+def test_cold_large_wave_opens_only_two_l4_pools_before_feedback():
+    locations = [
+        make_location(region, {'L4': 1}, cloud_name='AWS')
+        for region in ('us-east-1', 'us-west-2', 'eu-west-1')
+    ]
+    placer = make_placer({
+        location: float(index)
+        for index, location in enumerate(locations, start=1)
+    })
+    pool_keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location={location: 4 for location in locations},
+        pool_key_by_location=pool_keys,
+        states_by_pool_key={},
+        globally_managed=True,
+        frontier_limit=2,
+        frontier_key_by_location={location: ('l4',) for location in locations})
+
+    selected = []
+    for _ in range(400):
+        location = paid_capacity.select_location(placer, budget)
+        if location is None:
+            break
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+
+    assert selected == [locations[0]] * 4 + [locations[1]] * 4
+    assert budget.remaining_by_location[locations[2]] == 4
+    assert budget.owned_pool_keys_by_frontier == {
+        ('l4',): {pool_keys[locations[0]], pool_keys[locations[1]]}
+    }
+    assert budget.feedback_deferred_frontiers == {('l4',)}
+
+
+def test_full_l4_frontier_does_not_block_independent_a100():
+    l4_primary = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    l4_hedge = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    l4_third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    a100 = make_location('ap-south-1', {'A100': 1}, cloud_name='AWS')
+    locations = (l4_primary, l4_hedge, l4_third, a100)
+    placer = make_placer({
+        location: float(index)
+        for index, location in enumerate(locations, start=1)
+    })
+    pool_keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location={
+            l4_primary: 0,
+            l4_hedge: 0,
+            l4_third: 4,
+            a100: 4,
+        },
+        pool_key_by_location=pool_keys,
+        states_by_pool_key={},
+        globally_managed=True,
+        frontier_limit=2,
+        frontier_key_by_location={
+            l4_primary: ('l4',),
+            l4_hedge: ('l4',),
+            l4_third: ('l4',),
+            a100: ('a100',),
+        },
+        owned_pool_keys_by_frontier={
+            ('l4',): {pool_keys[l4_primary], pool_keys[l4_hedge]}
+        })
+
+    assert paid_capacity.select_location(
+        placer, budget, allowed_locations={l4_primary, l4_hedge,
+                                           l4_third}) is None
+    assert budget.feedback_deferred_frontiers == {('l4',)}
+    assert paid_capacity.select_location(placer,
+                                         budget,
+                                         allowed_locations={a100}) == a100
+
+
+def test_feedback_deferral_logs_once_and_records_frontier_state():
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location={location: 4},
+        pool_key_by_location={location: 'candidate'},
+        states_by_pool_key={},
+        globally_managed=True,
+        frontier_limit=2,
+        frontier_key_by_location={location: ('l4',)},
+        owned_pool_keys_by_frontier={('l4',): {'primary', 'hedge'}},
+        oldest_claimed_at_by_frontier={('l4',): 900})
+
+    with mock.patch.object(paid_capacity.time, 'time',
+                           return_value=1000), mock.patch.object(
+                               paid_capacity.logger, 'info') as info:
+        paid_capacity.defer_for_feedback(budget, location)
+        paid_capacity.defer_for_feedback(budget, location)
+
+    assert budget.feedback_deferred_frontiers == {('l4',)}
+    info.assert_called_once()
+    message = info.call_args.args[0]
+    assert 'card=l4' in message
+    assert 'owned_pools=2' in message
+    assert 'limit=2' in message
+    assert 'oldest_unresolved_claim_age_seconds=100' in message
+    assert 'primary' not in message
+    assert 'hedge' not in message
 
 
 def test_priority_deferral_stops_same_pool_without_paid_spill():

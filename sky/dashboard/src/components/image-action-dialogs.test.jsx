@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 import {
   CanaryProfileDialog,
@@ -43,14 +49,24 @@ const capabilities = {
   ],
 };
 
-function renderPublish(onOpenChange = jest.fn()) {
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function renderPublish(onOpenChange = jest.fn(), onChanged = jest.fn()) {
   return render(
     <PublishImageDialog
       open
       onOpenChange={onOpenChange}
       workspace="research"
       capabilities={capabilities}
-      onChanged={jest.fn()}
+      onChanged={onChanged}
     />
   );
 }
@@ -70,6 +86,10 @@ describe('managed image action dialogs', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     newIdempotencyKey.mockReturnValue('stable-key');
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   it('offers bounded remediation for an unavailable registry shard', () => {
@@ -148,6 +168,160 @@ describe('managed image action dialogs', () => {
     expect(screen.queryByRole('button', { name: /cancel/i })).toBeNull();
     fireEvent.click(detach);
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it('keeps one poll owner while a slow operation request is pending', async () => {
+    jest.useFakeTimers();
+    const pendingPoll = deferred();
+    publishImage.mockResolvedValue({
+      operation: { id: 'op-slow', state: 'PENDING', error_code: null },
+    });
+    getImageOperation.mockReturnValue(pendingPoll.promise);
+
+    const view = renderPublish();
+    fillValidPublishForm();
+    fireEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(6000);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingPoll.resolve({
+        id: 'op-slow',
+        state: 'RUNNING',
+        error_code: null,
+      });
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(0);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+  });
+
+  it('preserves the two-second cadence after a fast nonterminal poll', async () => {
+    jest.useFakeTimers();
+    const firstPoll = deferred();
+    const secondPoll = deferred();
+    publishImage.mockResolvedValue({
+      operation: { id: 'op-fast', state: 'PENDING', error_code: null },
+    });
+    getImageOperation
+      .mockReturnValueOnce(firstPoll.promise)
+      .mockReturnValue(secondPoll.promise);
+
+    const view = renderPublish();
+    fillValidPublishForm();
+    fireEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstPoll.resolve({
+        id: 'op-fast',
+        state: 'RUNNING',
+        error_code: null,
+      });
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1999);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+  });
+
+  it('stops after terminal completion and notifies exactly once', async () => {
+    jest.useFakeTimers();
+    const terminalPoll = deferred();
+    const onChanged = jest.fn();
+    publishImage.mockResolvedValue({
+      operation: { id: 'op-terminal', state: 'PENDING', error_code: null },
+    });
+    getImageOperation.mockReturnValue(terminalPoll.promise);
+
+    const view = renderPublish(jest.fn(), onChanged);
+    fillValidPublishForm();
+    fireEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const terminalOperation = {
+      id: 'op-terminal',
+      state: 'SUCCEEDED',
+      error_code: null,
+    };
+    await act(async () => {
+      terminalPoll.resolve(terminalOperation);
+    });
+    expect(onChanged).toHaveBeenCalledTimes(1);
+    expect(onChanged).toHaveBeenCalledWith(terminalOperation);
+
+    await act(async () => {
+      jest.advanceTimersByTime(10_000);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+    expect(onChanged).toHaveBeenCalledTimes(1);
+    view.unmount();
+  });
+
+  it('retries failures on cadence and aborts the owner on detach', async () => {
+    jest.useFakeTimers();
+    const failedPoll = deferred();
+    const retryPoll = deferred();
+    const failure = new Error('temporary polling failure');
+    failure.code = 'POLL_RETRY';
+    publishImage.mockResolvedValue({
+      operation: { id: 'op-retry', state: 'PENDING', error_code: null },
+    });
+    getImageOperation
+      .mockReturnValueOnce(failedPoll.promise)
+      .mockReturnValue(retryPoll.promise);
+
+    const view = renderPublish();
+    fillValidPublishForm();
+    fireEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const signal = getImageOperation.mock.calls[0][2];
+
+    await act(async () => {
+      failedPoll.reject(failure);
+    });
+    expect(screen.getByText('POLL_RETRY')).toBeVisible();
+    await act(async () => {
+      jest.advanceTimersByTime(1999);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      jest.advanceTimersByTime(10_000);
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(2);
   });
 
   it('requires explicit cost acknowledgement for an actual-principal canary', async () => {
