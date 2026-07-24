@@ -115,6 +115,7 @@ class TestGetEngine:
         """Clear engine caches before each test."""
         # Clear the module-level caches
         db_utils._postgres_engine_cache.clear()
+        db_utils._postgres_lock_engine_cache.clear()
         db_utils._sqlite_engine_cache.clear()
         # Reset max_connections to default
         db_utils.set_max_connections(0)
@@ -260,6 +261,44 @@ class TestGetEngine:
             assert call_args[1]['pool_size'] == 1
             assert call_args[1]['max_overflow'] == 0
             assert call_args[1]['pool_timeout'] == 15
+
+    def test_postgres_lock_connections_use_separate_nullpool(self):
+        """Session locks must not consume an ordinary QueuePool checkout."""
+        ordinary_engine = mock.MagicMock()
+        ordinary_engine.dialect.name = (
+            db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+        ordinary_engine.url = sqlalchemy.engine.make_url(
+            'postgresql://user:pass@localhost/db')
+        lock_engine = mock.MagicMock()
+        lock_connection = mock.MagicMock()
+        lock_engine.raw_connection.return_value = lock_connection
+
+        with mock.patch('sqlalchemy.create_engine',
+                        return_value=lock_engine) as mock_create:
+            connection_one = db_utils.get_postgres_lock_connection(
+                ordinary_engine)
+            connection_two = db_utils.get_postgres_lock_connection(
+                ordinary_engine)
+
+        assert connection_one is lock_connection
+        assert connection_two is lock_connection
+        mock_create.assert_called_once_with(
+            ordinary_engine.url,
+            poolclass=sqlalchemy.NullPool,
+            connect_args={
+                'connect_timeout': 15,
+                'application_name': 'skypilot-advisory-lock',
+            })
+        assert lock_engine.raw_connection.call_count == 2
+        ordinary_engine.raw_connection.assert_not_called()
+
+    def test_postgres_lock_connection_rejects_sqlite(self):
+        engine = mock.MagicMock()
+        engine.dialect.name = db_utils.SQLAlchemyDialect.SQLITE.value
+
+        with pytest.raises(ValueError,
+                           match='lock connections require PostgreSQL'):
+            db_utils.get_postgres_lock_connection(engine)
 
     def test_max_connections_must_be_non_negative(self):
         with pytest.raises(ValueError,

@@ -50,9 +50,12 @@ _MAX_MEM_PERCENT_FOR_BLOCKING = 0.6
 _MIN_LONG_WORKERS = 1
 # Minimal number of idle short workers to ensure responsiveness.
 _MIN_IDLE_SHORT_WORKERS = 1
-# Keep the historical per-process burst ceiling while allocating it from the
-# database-wide connection budget instead of manufacturing QueuePool overflow.
-_MAX_DB_CONNECTIONS_PER_WORKER = 5
+# Each executor process handles one request at a time, so one reusable ORM
+# connection is sufficient now that nested ORM sessions have been removed.
+# Keeping the ordinary pool at one slot per process leaves database capacity
+# for dedicated advisory-lock sessions, async traffic, controllers, and other
+# deployment traffic.
+_MAX_DB_CONNECTIONS_PER_WORKER = 1
 
 # Default number of burstable workers for local API server. A heuristic number
 # that is large enough for most local cases.
@@ -206,8 +209,10 @@ def compute_server_config(
         else:
             # QueuePool is lazy, so this is the strict per-process ceiling
             # rather than an eager reservation. Integer division guarantees
-            # that the sum of every process-local pool cannot exceed the
-            # PostgreSQL capacity available to ordinary connections.
+            # that the sum of every process-local ORM pool cannot exceed the
+            # PostgreSQL capacity available to ordinary connections. Dedicated
+            # advisory-lock sessions and async NullPool connections are
+            # intentionally outside this reusable-pool budget.
             num_db_connections_per_worker = min(
                 _MAX_DB_CONNECTIONS_PER_WORKER,
                 max_db_connections // max_parallel_all_workers)
