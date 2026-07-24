@@ -46,6 +46,12 @@ from sky.utils import ux_utils
 logger = sky_logging.init_logger(__name__)
 
 
+class _PreparedLoadBalancerReport(NamedTuple):
+    authority: tuple[bool, bool, bool]
+    effective_request_data: dict[str, Any]
+    ha_enabled: bool
+
+
 def _make_auth_dependency(*,
                           sync: bool = False,
                           required: bool = False) -> Callable:
@@ -299,6 +305,7 @@ class SkyServeController:
         # current loop.
         self._lb_sync_lock: asyncio.Lock | None = None
         self._lb_role_lock: asyncio.Lock | None = None
+        self._lb_demand_lock: asyncio.Lock | None = None
         durable_lb_state = (serve_state.get_lb_cutover_state(service_name)
                             if service_hash is not None else None)
         self._lb_ha_enabled = (
@@ -899,21 +906,42 @@ class SkyServeController:
         observed_slots: dict[int, int],
     ) -> bool:
         """Synchronously mutate runtime state from one prepared LB report."""
-        (reporter_is_live, demand_authoritative,
-         drain_authoritative) = authority
+        accepted, effective_request_data, ha_enabled = (
+            self._prepare_load_balancer_report(request_data, authority))
+        if not accepted:
+            return False
+        applied = self._apply_prepared_load_balancer_report(
+            request_data, effective_request_data, replica_infos,
+            async_occupancy_by_version, authority, observed_slots, ha_enabled)
+        if not applied:
+            return False
+        return self._apply_load_balancer_drain_report(request_data, authority,
+                                                      ha_enabled)
+
+    def _prepare_load_balancer_report(
+        self,
+        request_data: dict[str, Any],
+        authority: tuple[bool, bool, bool],
+    ) -> tuple[bool, dict[str, Any], bool]:
+        """Linearize HA demand-handoff state before runtime ingestion.
+
+        The HA role channel snapshots ``_lb_last_demand_snapshot`` while
+        beginning a cutover and mutates ``_lb_demand_handoff`` while
+        recovering or rolling one back.  The async sync handler serializes
+        this short head phase with those rare demand transitions, then
+        releases the demand lock before the potentially contended
+        autoscaler/replica-manager phase.
+        """
+        (reporter_is_live, demand_authoritative, _) = authority
         ha_enabled = getattr(self, '_lb_ha_enabled', False)
         if not reporter_is_live:
             logger.warning('Ignoring non-authoritative load balancer demand '
                            'and drain report for service '
                            f'{self._service_name!r}.')
-            return False
-        if not demand_authoritative and not drain_authoritative:
-            # Either genuine Pod may refresh routing during the two-Ready
-            # maxSurge window, but neither may mutate last-writer-wins state.
-            return True
+            return False, request_data, ha_enabled
 
+        effective_request_data = request_data
         if demand_authoritative:
-            effective_request_data = request_data
             if ha_enabled:
                 state = serve_state.get_lb_cutover_state(self._service_name)
                 if (state is not None and
@@ -959,105 +987,132 @@ class SkyServeController:
                             self._service_name, service_hash, owner,
                             lifecycle_epoch, state.active_slot,
                             state.generation, demand_snapshot)
-            # Parse reporter-controlled demand only after its dedicated gate.
-            # Besides preventing state mutation, this keeps a stale/wrong Pod
-            # from making the controller reject a useful routing response with
-            # a malformed demand-only field.
-            request_aggregator: dict[str, Any] = effective_request_data.get(
-                'request_aggregator', {})
-            timestamps: list[int] = request_aggregator.get('timestamps', [])
-            compatibility_profiles = request_aggregator.get(
-                'compatibility_profiles', [])
-            queued_compatibility_profiles = effective_request_data.get(
-                'queued_requests_by_compatibility', [])
-            rejected_compatibility_profiles = effective_request_data.get(
-                'rejected_requests_by_compatibility', [])
-            logger.info(f'Received {len(timestamps)} inflight requests.')
-            translated_in_flight = self._translate_in_flight(
-                effective_request_data.get('in_flight'))
-            unknown_replica_ids = self._unknown_async_replica_ids(
-                replica_infos,
-                async_occupancy_by_version,
-                effective_request_data.get('occupancy_sampled_urls', []),
-                effective_request_data.get('unknown_in_flight_urls', []),
-                force_all_live_unknown=(not drain_authoritative and
-                                        not ha_enabled))
-            self._reconcile_generation = getattr(self, '_reconcile_generation',
-                                                 0) + 1
-            reconcile_generation = self._reconcile_generation
-            # Validate the reporter epoch and ingest its exact-card gauges
-            # under the same lock used to publish a new catalog/version.  The
-            # report is therefore either wholly old-epoch (and cleared by the
-            # subsequent catalog transition) or wholly new-epoch; it cannot be
-            # admitted on one side of an update and interpreted on the other.
-            with self._routing_state_lock:
-                compatibility_demand_complete = (
-                    self._compatibility_demand_report_is_complete(request_data))
-                self._autoscaler.collect_request_information({
-                    'timestamps': timestamps,
-                    'compatibility_profiles': compatibility_profiles,
-                    'queued_requests_by_compatibility': queued_compatibility_profiles,
-                    'rejected_requests_by_compatibility': rejected_compatibility_profiles,
-                    'compatibility_demand_complete': compatibility_demand_complete,
-                    'in_flight_by_replica_id': translated_in_flight,
-                    'unknown_in_flight_replica_ids': list(unknown_replica_ids),
-                    'observed_slots_by_replica_id': observed_slots,
-                    # During maxSurge overlap, no LB can prove service-wide
-                    # async occupancy. Keep those backends drain-busy, but do
-                    # not age the degraded-capacity replacement timer: the old
-                    # Pod may simply be finishing a long stream. Replacement
-                    # becomes eligible only from a sole-live authoritative
-                    # reporter's real probe miss.
-                    'unknown_capacity_replica_ids':
-                        list(unknown_replica_ids if (
-                            drain_authoritative or ha_enabled) else ()),
-                    'reconcile_generation': reconcile_generation,
-                    'queue_depth': effective_request_data.get('queue_depth'),
-                    'queue_depth_by_priority':
-                        effective_request_data.get('queue_depth_by_priority'),
-                    'rejected_in_window':
-                        effective_request_data.get('rejected_in_window'),
-                    'rejected_in_recent_window':
-                        effective_request_data.get('rejected_in_recent_window'),
-                    'rejected_in_window_by_priority':
-                        effective_request_data.get(
-                            'rejected_in_window_by_priority'),
-                    'rejected_in_recent_window_by_priority':
-                        effective_request_data.get(
-                            'rejected_in_recent_window_by_priority'),
-                    # Measured request durations. The same snapshot the
-                    # controller persists for history also lets the
-                    # autoscaler supersede its configured duration estimate.
-                    'prediction_time_history':
-                        request_data.get('prediction_time_history'),
-                    'unique_job_arrivals_60s':
-                        effective_request_data.get('unique_job_arrivals_60s'),
-                    'unique_job_arrivals_300s':
-                        effective_request_data.get('unique_job_arrivals_300s'),
-                    'headerless_arrivals_60s':
-                        effective_request_data.get('headerless_arrivals_60s'),
-                    'headerless_arrivals_300s':
-                        effective_request_data.get('headerless_arrivals_300s'),
-                    'offered_arrival_tracking_saturated':
-                        effective_request_data.get(
-                            'offered_arrival_tracking_saturated'),
-                    'pressure_report_is_floored': effective_request_data.get(
-                        'pressure_report_is_floored'),
-                })
-                if (translated_in_flight is not None and getattr(
-                        self._autoscaler, 'replica_unit', None) == 'logical'):
-                    self._replica_manager.update_logical_reconcile_snapshot(
-                        version=self._autoscaler.latest_version,
-                        generation=reconcile_generation,
-                        observed_slots_by_replica_id=observed_slots,
-                        in_flight_by_replica_id=translated_in_flight,
-                        unknown_replica_ids=unknown_replica_ids)
+        return True, effective_request_data, ha_enabled
 
+    def _apply_prepared_load_balancer_report(
+        self,
+        request_data: dict[str, Any],
+        effective_request_data: dict[str, Any],
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: dict[int, bool | None],
+        authority: tuple[bool, bool, bool],
+        observed_slots: dict[int, int],
+        ha_enabled: bool,
+    ) -> bool:
+        """Apply prepared demand and drain state without touching HA handoff."""
+        (_, demand_authoritative, drain_authoritative) = authority
+        if not demand_authoritative:
+            # Either genuine Pod may refresh routing during the two-Ready
+            # maxSurge window, but it may not mutate demand state.
+            return True
+
+        # Parse reporter-controlled demand only after its dedicated gate.
+        # Besides preventing state mutation, this keeps a stale/wrong Pod from
+        # making the controller reject a useful routing response with a
+        # malformed demand-only field.
+        request_aggregator: dict[str, Any] = effective_request_data.get(
+            'request_aggregator', {})
+        timestamps: list[int] = request_aggregator.get('timestamps', [])
+        compatibility_profiles = request_aggregator.get(
+            'compatibility_profiles', [])
+        queued_compatibility_profiles = effective_request_data.get(
+            'queued_requests_by_compatibility', [])
+        rejected_compatibility_profiles = effective_request_data.get(
+            'rejected_requests_by_compatibility', [])
+        logger.info(f'Received {len(timestamps)} inflight requests.')
+        translated_in_flight = self._translate_in_flight(
+            effective_request_data.get('in_flight'))
+        unknown_replica_ids = self._unknown_async_replica_ids(
+            replica_infos,
+            async_occupancy_by_version,
+            effective_request_data.get('occupancy_sampled_urls', []),
+            effective_request_data.get('unknown_in_flight_urls', []),
+            force_all_live_unknown=(not drain_authoritative and not ha_enabled))
+        self._reconcile_generation = getattr(self, '_reconcile_generation',
+                                             0) + 1
+        reconcile_generation = self._reconcile_generation
+        # Validate the reporter epoch and ingest its exact-card gauges under
+        # the same lock used to publish a new catalog/version. The report is
+        # therefore either wholly old-epoch or wholly new-epoch.
+        with self._routing_state_lock:
+            compatibility_demand_complete = (
+                self._compatibility_demand_report_is_complete(request_data))
+            self._autoscaler.collect_request_information({
+                'timestamps': timestamps,
+                'compatibility_profiles': compatibility_profiles,
+                'queued_requests_by_compatibility': queued_compatibility_profiles,
+                'rejected_requests_by_compatibility': rejected_compatibility_profiles,
+                'compatibility_demand_complete': compatibility_demand_complete,
+                'in_flight_by_replica_id': translated_in_flight,
+                'unknown_in_flight_replica_ids': list(unknown_replica_ids),
+                'observed_slots_by_replica_id': observed_slots,
+                # During maxSurge overlap, no LB can prove service-wide
+                # async occupancy. Keep those backends drain-busy, but do
+                # not age the degraded-capacity replacement timer: the old
+                # Pod may simply be finishing a long stream. Replacement
+                # becomes eligible only from a sole-live authoritative
+                # reporter's real probe miss.
+                'unknown_capacity_replica_ids': list(unknown_replica_ids if (
+                    drain_authoritative or ha_enabled) else ()),
+                'reconcile_generation': reconcile_generation,
+                'queue_depth': effective_request_data.get('queue_depth'),
+                'queue_depth_by_priority':
+                    effective_request_data.get('queue_depth_by_priority'),
+                'rejected_in_window':
+                    effective_request_data.get('rejected_in_window'),
+                'rejected_in_recent_window':
+                    effective_request_data.get('rejected_in_recent_window'),
+                'rejected_in_window_by_priority': effective_request_data.get(
+                    'rejected_in_window_by_priority'),
+                'rejected_in_recent_window_by_priority':
+                    effective_request_data.get(
+                        'rejected_in_recent_window_by_priority'),
+                # Measured request durations. The same snapshot the
+                # controller persists for history also lets the
+                # autoscaler supersede its configured duration estimate.
+                'prediction_time_history':
+                    request_data.get('prediction_time_history'),
+                'unique_job_arrivals_60s':
+                    effective_request_data.get('unique_job_arrivals_60s'),
+                'unique_job_arrivals_300s':
+                    effective_request_data.get('unique_job_arrivals_300s'),
+                'headerless_arrivals_60s':
+                    effective_request_data.get('headerless_arrivals_60s'),
+                'headerless_arrivals_300s':
+                    effective_request_data.get('headerless_arrivals_300s'),
+                'offered_arrival_tracking_saturated':
+                    effective_request_data.get(
+                        'offered_arrival_tracking_saturated'),
+                'pressure_report_is_floored':
+                    effective_request_data.get('pressure_report_is_floored'),
+            })
+            if (translated_in_flight is not None and getattr(
+                    self._autoscaler, 'replica_unit', None) == 'logical'):
+                self._replica_manager.update_logical_reconcile_snapshot(
+                    version=self._autoscaler.latest_version,
+                    generation=reconcile_generation,
+                    observed_slots_by_replica_id=observed_slots,
+                    in_flight_by_replica_id=translated_in_flight,
+                    unknown_replica_ids=unknown_replica_ids)
+        return True
+
+    def _apply_load_balancer_drain_report(
+        self,
+        request_data: dict[str, Any],
+        authority: tuple[bool, bool, bool],
+        ha_enabled: bool,
+    ) -> bool:
+        """Publish a validated report's drain view under fresh authority."""
+        (reporter_is_live, demand_authoritative,
+         drain_authoritative) = authority
+        if not reporter_is_live:
+            return False
+        if not demand_authoritative and not drain_authoritative:
+            # A merely live overlap Pod may refresh routing, but it must not
+            # overwrite a previously trusted drain snapshot.
+            return True
         if ha_enabled and not drain_authoritative:
-            # The fast role channel aggregates ACTIVE and DRAINING sessions.
-            # A slot sync must never overwrite that service-wide view. During
-            # legacy-selected migration/rollback, the sole legacy Pod remains
-            # the stream authority until the stable selector actually moves.
+            # The role channel owns the service-wide ACTIVE+DRAINING view.
             return True
         if drain_authoritative:
             drain_in_flight, drain_routing_urls = self._lb_drain_report_view(
@@ -1066,9 +1121,8 @@ class SkyServeController:
             draining_urls = request_data.get('draining_urls')
         else:
             # This is the legitimate sole Ready Pod, but another live Pod may
-            # still own streams. Replace any formerly trusted clean snapshot
-            # with a controller-generated blocking view; never copy an
-            # overlap reporter's drain fields into the replica manager.
+            # still own streams. Invalidate an older clean proof without
+            # trusting this overlap reporter's process-local drain fields.
             drain_in_flight, drain_routing_urls = {}, None
             unknown_urls, draining_urls = [], []
         self._replica_manager.update_lb_in_flight(
@@ -1120,8 +1174,7 @@ class SkyServeController:
             # so it may finish before the final ownership fence even if this
             # controller loses the service mid-write. Autoscaler history reads
             # the previously applied authoritative demand snapshot; the next
-            # frequent sync captures the report below without adding an await
-            # after the runtime-mutation fence.
+            # frequent sync persists the report prepared below.
             observed_slots: dict[int, int] = {}
             if authority[1]:
                 observed_slots = self._translate_observed_slots(
@@ -1144,18 +1197,114 @@ class SkyServeController:
                  self._persist_autoscaler_history(replica_counts,
                                                   history_capacity_hint),
              )
+            # HA cutover promotion snapshots the last active demand report.
+            # Serialize only demand-handoff mutations; ordinary role
+            # heartbeats do not take this lock and must remain responsive even
+            # when PostgreSQL/Kubernetes fencing for a sync is slow.
+            demand_lock = getattr(self, '_lb_demand_lock', None)
+            if demand_lock is None:
+                demand_lock = asyncio.Lock()
+                self._lb_demand_lock = demand_lock
+            async with demand_lock:
+                head_operation = loop.run_in_executor(
+                    None, self._prepare_authoritative_load_balancer_report,
+                    request_data)
+                prepared = await self._await_executor_operation(
+                    head_operation, 'Load balancer report preparation')
+                if prepared is None:
+                    return fastapi.Response(status_code=503)
+
+            if prepared.authority[1] and not authority[1]:
+                # Authority can legitimately move while the earlier replica
+                # and history snapshots are prepared. Preserve the newly
+                # authoritative report's capacity observation; durable bridge
+                # confirmation remains best-effort and conservative on error.
+                observed_slots = self._translate_observed_slots(
+                    request_data.get('total_slots_by_url'))
+                if logical_versions is not None:
+                    await self._confirm_logical_bridge_capacities(
+                        replica_infos, logical_versions, observed_slots)
+
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
-            # All awaits, including durable bridge confirmation, are above
-            # this final ownership fence. Runtime mutation and confidential
-            # routing disclosure below are one synchronous critical section.
-            self._apply_load_balancer_report(
+            deferred_sync_cancellation: asyncio.CancelledError | None = None
+
+            async def complete_sync_phase(operation: 'asyncio.Future[Any]',
+                                          description: str) -> Any:
+                """Keep a post-tail safety phase atomic across cancellation."""
+                nonlocal deferred_sync_cancellation
+                try:
+                    result, cancellation = (await
+                                            self._complete_executor_operation(
+                                                operation, description))
+                except Exception as e:  # pylint: disable=broad-except
+                    deferred_cancellation = deferred_sync_cancellation
+                    if deferred_cancellation is None:
+                        raise
+                    logger.warning(
+                        f'{description} failed after its request was '
+                        f'cancelled: {common_utils.format_exception(e)}')
+                    raise deferred_cancellation from e  # pylint: disable=raising-bad-type
+                if (cancellation is not None and
+                        deferred_sync_cancellation is None):
+                    deferred_sync_cancellation = cancellation
+                return result
+
+            def raise_deferred_sync_cancellation() -> None:
+                if deferred_sync_cancellation is not None:
+                    raise deferred_sync_cancellation
+
+            tail_operation = loop.run_in_executor(
+                None,
+                self._apply_prepared_load_balancer_report,
                 request_data,
+                prepared.effective_request_data,
                 replica_infos,
                 async_occupancy_by_version,
-                authority,
+                prepared.authority,
                 observed_slots,
+                prepared.ha_enabled,
             )
+            accepted = await complete_sync_phase(
+                tail_operation, 'Load balancer runtime report ingestion')
+            if not accepted:
+                raise_deferred_sync_cancellation()
+                return fastapi.Response(status_code=503)
+            if prepared.ha_enabled and not prepared.authority[2]:
+                # Steady HA slot reports never own drain state; the fast role
+                # channel publishes the ACTIVE+DRAINING aggregate. Revalidate
+                # disclosure off the role lock so normal heartbeats are not
+                # queued behind duplicate owner/Kubernetes reads.
+                drain_operation = loop.run_in_executor(
+                    None, self._load_balancer_disclosure_is_authorized,
+                    request_data.get('lb_session_id'))
+                drain_accepted = await complete_sync_phase(
+                    drain_operation, 'Load balancer disclosure validation')
+            else:
+                # Legacy-selected and non-HA reporters can own drain state.
+                # Order their publication after any role transition that ran
+                # while the runtime tail waited on manager locks.
+                role_lock = getattr(self, '_lb_role_lock', None)
+                if role_lock is None:
+                    role_lock = asyncio.Lock()
+                    self._lb_role_lock = role_lock
+                lock_operation = asyncio.create_task(role_lock.acquire())
+                acquired = await complete_sync_phase(
+                    lock_operation, 'Load balancer drain lock acquisition')
+                assert acquired
+                try:
+                    drain_operation = loop.run_in_executor(
+                        None,
+                        self._apply_authoritative_load_balancer_drain_report,
+                        request_data)
+                    drain_accepted = await complete_sync_phase(
+                        drain_operation,
+                        'Load balancer drain report publication')
+                finally:
+                    role_lock.release()
+            raise_deferred_sync_cancellation()
+            if not drain_accepted:
+                return fastapi.Response(status_code=503)
             self._replica_counts_snapshot = replica_counts
             capacity_hint = self._get_capacity_hint(
                 replica_infos, logical_versions, replica_counts=replica_counts)
@@ -1265,6 +1414,77 @@ class SkyServeController:
                 not isinstance(routing_version, bool) and
                 routing_version == self._applied_version and
                 self._lb_demand_report_is_complete(request_data))
+
+    def _prepare_authoritative_load_balancer_report(
+            self,
+            request_data: dict[str, Any]) -> _PreparedLoadBalancerReport | None:
+        """Refresh fences and prepare one demand-transition-serialized report."""
+        if not self._owns_current_service():
+            return None
+        authority = self._lb_report_authority(request_data.get('lb_session_id'))
+        if not authority[0]:
+            return None
+        accepted, effective_request_data, ha_enabled = (
+            self._prepare_load_balancer_report(request_data, authority))
+        if not accepted:
+            return None
+        return _PreparedLoadBalancerReport(authority, effective_request_data,
+                                           ha_enabled)
+
+    def _apply_authoritative_load_balancer_drain_report(
+            self, request_data: dict[str, Any]) -> bool:
+        """Re-fence and publish drain state immediately before disclosure."""
+        if not self._owns_current_service():
+            return False
+        authority = self._lb_report_authority(request_data.get('lb_session_id'))
+        if not authority[0]:
+            return False
+        return self._apply_load_balancer_drain_report(
+            request_data, authority, getattr(self, '_lb_ha_enabled', False))
+
+    def _load_balancer_disclosure_is_authorized(self,
+                                                session_id: str | None) -> bool:
+        """Revalidate ownership and live Pod membership before disclosure."""
+        return (self._owns_current_service() and
+                self._lb_report_authority(session_id)[0])
+
+    @staticmethod
+    async def _complete_executor_operation(
+            operation: 'asyncio.Future[Any]',
+            description: str) -> tuple[Any, asyncio.CancelledError | None]:
+        """Finish an executor mutation and report deferred cancellation."""
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                result = await asyncio.shield(operation)
+            except asyncio.CancelledError as e:  # noqa: ASYNC103
+                # Cancelling an asyncio wrapper cannot stop a running executor
+                # function. Even repeated cancellation must not release the
+                # corresponding lock while that worker mutates shared state.
+                if operation.cancelled():
+                    raise
+                cancellation = e
+            except Exception as e:  # pylint: disable=broad-except
+                deferred_cancellation = cancellation
+                if deferred_cancellation is None:
+                    raise
+                assert isinstance(deferred_cancellation, asyncio.CancelledError)
+                logger.warning(
+                    f'{description} failed after its request was cancelled: '
+                    f'{common_utils.format_exception(e)}')
+                raise deferred_cancellation from e  # pylint: disable=raising-bad-type
+            else:
+                return result, cancellation
+
+    @classmethod
+    async def _await_executor_operation(cls, operation: 'asyncio.Future[Any]',
+                                        description: str) -> Any:
+        """Keep an uncancellable executor mutation inside its async lock."""
+        result, cancellation = await cls._complete_executor_operation(
+            operation, description)
+        if cancellation is not None:
+            raise cancellation
+        return result
 
     def _restore_lb_demand_handoff(self, generation: int) -> None:
         handoff = self._lb_demand_handoff
@@ -1465,6 +1685,61 @@ class SkyServeController:
         if role_lock is None:
             role_lock = asyncio.Lock()
             self._lb_role_lock = role_lock
+        demand_lock = getattr(self, '_lb_demand_lock', None)
+        if demand_lock is None:
+            demand_lock = asyncio.Lock()
+            self._lb_demand_lock = demand_lock
+        demand_transition_cancellation: asyncio.CancelledError | None = None
+        demand_transition_invalidated_generation: int | None = None
+
+        async def run_demand_transition(phase: str, function: Callable, *args:
+                                        Any) -> Any:
+            nonlocal demand_transition_cancellation
+            operation = asyncio.create_task(
+                trace.run_in_executor(loop, phase, function, *args))
+            try:
+                result, cancellation = await self._complete_executor_operation(
+                    operation, f'Load balancer {phase}')
+            except Exception as e:  # pylint: disable=broad-except
+                deferred_cancellation = demand_transition_cancellation
+                if deferred_cancellation is None:
+                    raise
+                demand_transition_cancellation = None
+                logger.warning(
+                    'Load balancer transition failed after its request was '
+                    f'cancelled: {common_utils.format_exception(e)}')
+                raise deferred_cancellation from e  # pylint: disable=raising-bad-type
+            if cancellation is not None:
+                demand_transition_cancellation = cancellation
+            return result
+
+        def invalidate_demand_transition(
+                transition_state: lb_ha.LbCutoverState) -> None:
+            """Block clean drain proof until a post-transition role report."""
+            nonlocal demand_transition_invalidated_generation
+            if (demand_transition_invalidated_generation ==
+                    transition_state.generation):
+                return
+            self._replica_manager.update_lb_in_flight(
+                {}, None, [], [],
+                f'ha-transition-{transition_state.generation}')
+            demand_transition_invalidated_generation = (
+                transition_state.generation)
+
+        def finish_demand_transition(
+                transition_state: lb_ha.LbCutoverState) -> None:
+            """Publish a safe drain view before propagating cancellation."""
+            nonlocal demand_transition_cancellation
+            if demand_transition_cancellation is not None:
+                # The caller will not apply this role response, and an
+                # executor mutation may already have moved the selector.
+                # Invalidate any prior clean proof until a later role report
+                # publishes a view sampled after the transition.
+                invalidate_demand_transition(transition_state)
+                cancellation = demand_transition_cancellation
+                demand_transition_cancellation = None
+                raise cancellation
+
         lock_wait_started_at = time.monotonic()
         async with role_lock:
             trace.lock_acquired(lock_wait_started_at)
@@ -1532,22 +1807,29 @@ class SkyServeController:
                     if (slot is lb_ha.LbSlot.A and
                             session_id in ready_by_slot[lb_ha.LbSlot.A] and
                             bool(ready_by_slot[lb_ha.LbSlot.B]) and promotable):
-                        patched = await trace.run_in_executor(
-                            loop, 'kubernetes_selector_patch',
-                            lb_k8s.patch_lb_service_migration_to_slot,
-                            self._service_name, service_hash, expected_owner,
-                            lifecycle_epoch)
-                        if patched:
-                            # The old routing snapshot still says legacy, but
-                            # the successful resourceVersion-fenced patch is
-                            # enough to block drain decisions immediately.
-                            transition_legacy_selected = False
+                        async with demand_lock:
+                            invalidate_demand_transition(state)
+                            patched = await run_demand_transition(
+                                'kubernetes_selector_patch',
+                                lb_k8s.patch_lb_service_migration_to_slot,
+                                self._service_name, service_hash,
+                                expected_owner, lifecycle_epoch)
+                            if patched:
+                                # The old routing snapshot still says legacy,
+                                # but the resourceVersion-fenced patch is enough
+                                # to block drain decisions immediately.
+                                transition_legacy_selected = False
+                            finish_demand_transition(state)
                 elif (routing.active_slot is lb_ha.LbSlot.A and
                       routing.generation == 1):
-                    migrated = await trace.run_in_executor(
-                        loop, 'postgresql_cutover_write',
-                        serve_state.finish_lb_ha_migration, self._service_name,
-                        service_hash, expected_owner, lifecycle_epoch)
+                    async with demand_lock:
+                        invalidate_demand_transition(state)
+                        migrated = await run_demand_transition(
+                            'postgresql_cutover_write',
+                            serve_state.finish_lb_ha_migration,
+                            self._service_name, service_hash, expected_owner,
+                            lifecycle_epoch)
+                        finish_demand_transition(state)
                     if migrated:
                         state = await trace.run_in_executor(
                             loop, 'postgresql_cutover_state_read',
@@ -1570,13 +1852,17 @@ class SkyServeController:
                 if (not transition_legacy_selected and legacy_ready and
                         routing.active_slot is rollback_active_slot and
                         routing.generation == state.generation):
-                    patched = await trace.run_in_executor(
-                        loop, 'kubernetes_selector_patch',
-                        lb_k8s.patch_lb_service_rollback_to_legacy,
-                        self._service_name, service_hash, expected_owner,
-                        lifecycle_epoch, rollback_active_slot, state.generation)
-                    if patched:
-                        transition_legacy_selected = True
+                    async with demand_lock:
+                        invalidate_demand_transition(state)
+                        patched = await run_demand_transition(
+                            'kubernetes_selector_patch',
+                            lb_k8s.patch_lb_service_rollback_to_legacy,
+                            self._service_name, service_hash, expected_owner,
+                            lifecycle_epoch, rollback_active_slot,
+                            state.generation)
+                        if patched:
+                            transition_legacy_selected = True
+                        finish_demand_transition(state)
                 if transition_legacy_selected:
                     # Publish a blocking drain view before the database leaves
                     # HA mode. The legacy Pod may already be accepting new
@@ -1589,16 +1875,20 @@ class SkyServeController:
                         self._rollback_active_slot_is_drained, authority, state)
                     rolled_back = False
                     if slot_drained:
-                        rolled_back = await trace.run_in_executor(
-                            loop, 'postgresql_cutover_write',
-                            serve_state.finish_lb_ha_rollback,
-                            self._service_name, service_hash, expected_owner,
-                            lifecycle_epoch, rollback_active_slot,
-                            state.generation)
+                        async with demand_lock:
+                            invalidate_demand_transition(state)
+                            rolled_back = await run_demand_transition(
+                                'postgresql_cutover_write',
+                                serve_state.finish_lb_ha_rollback,
+                                self._service_name, service_hash,
+                                expected_owner, lifecycle_epoch,
+                                rollback_active_slot, state.generation)
+                            if rolled_back:
+                                self._lb_ha_enabled = False
+                                self._lb_session_ledger = None
+                                self._lb_last_demand_snapshot = None
+                            finish_demand_transition(state)
                     if rolled_back:
-                        self._lb_ha_enabled = False
-                        self._lb_session_ledger = None
-                        self._lb_last_demand_snapshot = None
                         # As above, the parent supervisor deletes obsolete HA
                         # slots outside this role lock. Return the committed
                         # role response immediately so remaining slots keep a
@@ -1637,17 +1927,20 @@ class SkyServeController:
                                        desired_revision not in active_revisions)
                 if (slot is target and target_ready and promotable and
                     (not selected_ready or planned_upgrade)):
-                    next_state = await trace.run_in_executor(
-                        loop, 'postgresql_cutover_write',
-                        serve_state.begin_lb_cutover, self._service_name,
-                        service_hash, expected_owner, lifecycle_epoch,
-                        stable_active_slot, state.generation, target,
-                        self._lb_last_demand_snapshot)
-                    if next_state is not None:
-                        self._lb_demand_handoff.begin(
-                            next_state.generation,
-                            self._lb_last_demand_snapshot)
-                        state = next_state
+                    async with demand_lock:
+                        invalidate_demand_transition(state)
+                        demand_snapshot = self._lb_last_demand_snapshot
+                        next_state = await run_demand_transition(
+                            'postgresql_cutover_write',
+                            serve_state.begin_lb_cutover, self._service_name,
+                            service_hash, expected_owner, lifecycle_epoch,
+                            stable_active_slot, state.generation, target,
+                            demand_snapshot)
+                        if next_state is not None:
+                            self._lb_demand_handoff.begin(
+                                next_state.generation, demand_snapshot)
+                            state = next_state
+                        finish_demand_transition(state)
 
             if state.phase is lb_ha.LbCutoverPhase.PREPARING:
                 assert state.pending_slot is not None
@@ -1657,11 +1950,27 @@ class SkyServeController:
                 # Crash recovery: the selector moved but the DB commit did not.
                 if (routing.active_slot is target and
                         routing.generation == state.generation):
-                    committed = await trace.run_in_executor(
-                        loop, 'postgresql_cutover_write',
-                        serve_state.commit_lb_cutover, self._service_name,
-                        service_hash, expected_owner, lifecycle_epoch,
-                        preparing_active_slot, target, state.generation)
+                    # This request discovered an already inconsistent
+                    # topology. Block drain proof before even queueing on a
+                    # concurrent sync/transition; cancellation while waiting
+                    # for the demand lock must remain fail closed.
+                    invalidate_demand_transition(state)
+                    async with demand_lock:
+                        committed = await run_demand_transition(
+                            'postgresql_cutover_write',
+                            serve_state.commit_lb_cutover, self._service_name,
+                            service_hash, expected_owner, lifecycle_epoch,
+                            preparing_active_slot, target, state.generation)
+                        finish_demand_transition(state)
+                    if not committed:
+                        # The selector already routes to the target. If the
+                        # fenced database CAS cannot record DRAINING, neither
+                        # the old PREPARING snapshot nor a role response can
+                        # safely describe all possible stream owners.
+                        invalidate_demand_transition(state)
+                        return role_response(
+                            lb_ha_obs.LbRoleOutcome.TRANSITION_INCONSISTENT,
+                            503)
                     if committed:
                         state = await trace.run_in_executor(
                             loop, 'postgresql_cutover_state_read',
@@ -1674,59 +1983,83 @@ class SkyServeController:
                     armed_generation = request_data.get('armed_generation')
                     if (slot is target and target_ready and promotable and
                             armed_generation == state.generation):
-                        patched = await trace.run_in_executor(
-                            loop, 'kubernetes_selector_patch',
-                            lb_k8s.patch_lb_service_active_slot,
-                            self._service_name, service_hash, expected_owner,
-                            lifecycle_epoch, preparing_active_slot,
-                            state.generation - 1, target, state.generation)
-                        if patched:
-                            committed = await trace.run_in_executor(
-                                loop, 'postgresql_cutover_write',
-                                serve_state.commit_lb_cutover,
+                        async with demand_lock:
+                            invalidate_demand_transition(state)
+                            patched = await run_demand_transition(
+                                'kubernetes_selector_patch',
+                                lb_k8s.patch_lb_service_active_slot,
                                 self._service_name, service_hash,
                                 expected_owner, lifecycle_epoch,
-                                preparing_active_slot, target, state.generation)
-                            if committed:
-                                state = await trace.run_in_executor(
-                                    loop, 'postgresql_cutover_state_read',
-                                    serve_state.get_lb_cutover_state,
-                                    self._service_name)
-                                assert state is not None
+                                preparing_active_slot, state.generation - 1,
+                                target, state.generation)
+                            committed = False
+                            if patched:
+                                committed = await run_demand_transition(
+                                    'postgresql_cutover_write',
+                                    serve_state.commit_lb_cutover,
+                                    self._service_name, service_hash,
+                                    expected_owner, lifecycle_epoch,
+                                    preparing_active_slot, target,
+                                    state.generation)
+                            finish_demand_transition(state)
+                        if patched and not committed:
+                            # Do not overwrite the fail-closed view with a
+                            # PREPARING aggregate that omits the now-selected
+                            # target.
+                            invalidate_demand_transition(state)
+                            return role_response(
+                                lb_ha_obs.LbRoleOutcome.TRANSITION_INCONSISTENT,
+                                503)
+                        if committed:
+                            state = await trace.run_in_executor(
+                                loop, 'postgresql_cutover_state_read',
+                                serve_state.get_lb_cutover_state,
+                                self._service_name)
+                            assert state is not None
                     elif not ready_by_slot[target]:
-                        advanced = await trace.run_in_executor(
-                            loop, 'kubernetes_selector_patch',
-                            lb_k8s.patch_lb_service_aborted_generation,
-                            self._service_name, service_hash, expected_owner,
-                            lifecycle_epoch, preparing_active_slot, target,
-                            state.generation)
-                        if advanced:
-                            aborted = await trace.run_in_executor(
-                                loop, 'postgresql_cutover_write',
-                                serve_state.abort_lb_cutover_preparation,
+                        async with demand_lock:
+                            invalidate_demand_transition(state)
+                            advanced = await run_demand_transition(
+                                'kubernetes_selector_patch',
+                                lb_k8s.patch_lb_service_aborted_generation,
                                 self._service_name, service_hash,
                                 expected_owner, lifecycle_epoch,
                                 preparing_active_slot, target, state.generation)
+                            aborted = False
+                            if advanced:
+                                aborted = await run_demand_transition(
+                                    'postgresql_cutover_write',
+                                    serve_state.abort_lb_cutover_preparation,
+                                    self._service_name, service_hash,
+                                    expected_owner, lifecycle_epoch,
+                                    preparing_active_slot, target,
+                                    state.generation)
                             if aborted:
                                 self._lb_demand_handoff.restore(
                                     None, None, None)
-                                state = await trace.run_in_executor(
-                                    loop, 'postgresql_cutover_state_read',
-                                    serve_state.get_lb_cutover_state,
-                                    self._service_name)
-                                assert state is not None
+                            finish_demand_transition(state)
+                        if aborted:
+                            state = await trace.run_in_executor(
+                                loop, 'postgresql_cutover_state_read',
+                                serve_state.get_lb_cutover_state,
+                                self._service_name)
+                            assert state is not None
                 elif (routing.active_slot is preparing_active_slot and
                       routing.generation == state.generation):
                     # Crash recovery after the Service generation was
                     # advanced but before the database abort committed.
-                    aborted = await trace.run_in_executor(
-                        loop, 'postgresql_cutover_write',
-                        serve_state.abort_lb_cutover_preparation,
-                        self._service_name, service_hash, expected_owner,
-                        lifecycle_epoch, preparing_active_slot, target,
-                        state.generation)
+                    async with demand_lock:
+                        invalidate_demand_transition(state)
+                        aborted = await run_demand_transition(
+                            'postgresql_cutover_write',
+                            serve_state.abort_lb_cutover_preparation,
+                            self._service_name, service_hash, expected_owner,
+                            lifecycle_epoch, preparing_active_slot, target,
+                            state.generation)
+                        if aborted:
+                            self._lb_demand_handoff.restore(None, None, None)
+                        finish_demand_transition(state)
                     if aborted:
-                        self._lb_demand_handoff.restore(None, None, None)
                         state = await trace.run_in_executor(
                             loop, 'postgresql_cutover_state_read',
                             serve_state.get_lb_cutover_state,

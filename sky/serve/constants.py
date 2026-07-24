@@ -229,7 +229,11 @@ TERMINATE_REPLICA_TIMEOUT_SECONDS = 600
 # interval.
 LB_CONTROLLER_SYNC_INTERVAL_SECONDS = 20
 LB_ROLE_HEARTBEAT_INTERVAL_SECONDS = 2
-LB_ROLE_HEARTBEAT_TIMEOUT_SECONDS = 5
+# The stable API proxy performs owner reads before and after the controller
+# request. Production p99 is about 5.6s even when the controller is healthy,
+# so a 5s client budget creates false heartbeat failures. Keep 2s of measured
+# headroom without weakening the independent 6s freshness gate below.
+LB_ROLE_HEARTBEAT_TIMEOUT_SECONDS = 8
 LB_ROLE_REPORT_MAX_AGE_SECONDS = 3 * LB_ROLE_HEARTBEAT_INTERVAL_SECONDS
 LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS = 15
 LB_DEMAND_HANDOFF_SECONDS = 60
