@@ -487,12 +487,36 @@ def reconcile_qualification_lifecycle(
             lifecycle_key = models.profile_attestation_key(
                 'lifecycle', target.name)
             lifecycle = revision.attestations.get(lifecycle_key)
-            if (isinstance(lifecycle, dict) and
-                    lifecycle.get('status') == 'READY' and
-                    lifecycle.get('runtime_digest')
-                    == copy_evidence['runtime_digest'] and
-                    isinstance(lifecycle.get('observed_at'), int) and
-                    lifecycle['observed_at'] >= copy_observed_at):
+            lifecycle_complete = (
+                isinstance(lifecycle, dict) and
+                lifecycle.get('status') == 'READY' and
+                lifecycle.get('target_fingerprint') == target.target_fingerprint
+                and lifecycle.get('runtime_digest')
+                == copy_evidence['runtime_digest'] and
+                isinstance(lifecycle.get('repository_arn'), str) and
+                isinstance(lifecycle.get('observed_at'), int) and
+                lifecycle.get('exact_absence') is True)
+            if lifecycle_complete:
+                assert isinstance(lifecycle, dict)
+                if qualification.qualification_lifecycle_proof_id(
+                        lifecycle) is None:
+                    if should_stop is not None and should_stop():
+                        return False
+                    revision = topology_state.record_profile_attestation(
+                        profile_revision_id=revision.id,
+                        kind=lifecycle_key,
+                        evidence={
+                            'status': 'READY',
+                            'target': target.name,
+                            'target_fingerprint': target.target_fingerprint,
+                            'repository_arn': lifecycle['repository_arn'],
+                            'runtime_digest': copy_evidence['runtime_digest'],
+                            'exact_absence': True,
+                            'lifecycle_proof_id': str(uuid.uuid4()),
+                        },
+                        expected_generation=revision.desired_generation,
+                        expected_config_hash=revision.config_hash,
+                        now=now)
                 continue
             runtime_ready = True
             for backend, binding_id in target.runtime_pull:
@@ -578,6 +602,7 @@ def reconcile_qualification_lifecycle(
                     'repository_arn': repository_arn,
                     'runtime_digest': digest,
                     'exact_absence': True,
+                    'lifecycle_proof_id': str(uuid.uuid4()),
                 },
                 expected_generation=revision.desired_generation,
                 expected_config_hash=revision.config_hash,

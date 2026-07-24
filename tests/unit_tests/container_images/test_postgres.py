@@ -431,6 +431,20 @@ def _request_ec2_canary(
 ) -> catalog_state.OperationRecord:
     _configure_profile(monkeypatch, profile)
     target = profile.targets[0]
+    revision = topology_state.get_active_profile('research', profile.name)
+    assert revision is not None
+    topology_state.record_profile_attestation(
+        profile_revision_id=revision.id,
+        kind=models.profile_attestation_key('copy', target.name),
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'runtime_digest': _DIGEST,
+            'platform': profile.qualification.canary_platform,
+        },
+        expected_generation=revision.desired_generation,
+        expected_config_hash=revision.config_hash)
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
     runtime_id = qualification.runtime_ids(target, 'aws_vm',
@@ -448,6 +462,124 @@ def _request_ec2_canary(
                 created_at=1,
                 updated_at=1).returning(schema.operations)).mappings().one()
     return catalog_state._operation(row)
+
+
+def test_canary_request_waits_for_exact_copy_restoration(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    revision = _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    target = profile.targets[0]
+    copy_key = models.profile_attestation_key('copy', target.name)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    lifecycle_proof_id = '00000000-0000-4000-8000-000000000099'
+    revision = topology_state.record_profile_attestation(
+        profile_revision_id=revision.id,
+        kind=copy_key,
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'runtime_digest': _DIGEST,
+            'platform': profile.qualification.canary_platform,
+        },
+        expected_generation=revision.desired_generation,
+        expected_config_hash=revision.config_hash,
+        now=20)
+    revision = topology_state.record_profile_attestation(
+        profile_revision_id=revision.id,
+        kind=lifecycle_key,
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'runtime_digest': _DIGEST,
+            'exact_absence': True,
+            'lifecycle_proof_id': lifecycle_proof_id,
+        },
+        expected_generation=revision.desired_generation,
+        expected_config_hash=revision.config_hash,
+        now=21)
+    lifecycle_observed_at = revision.attestations[lifecycle_key]['observed_at']
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    runtime_id = qualification.runtime_ids(target, 'aws_vm',
+                                           profile.bindings[binding_id])[0]
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        qualification.request_canary(workspace='research',
+                                     profile_name=profile.name,
+                                     target_id=target.name,
+                                     backend='aws_vm',
+                                     runtime_id=runtime_id,
+                                     actor_hash='1' * 64,
+                                     idempotency_key='deleted-copy-canary')
+    with image_database.connect() as connection:
+        assert not connection.execute(
+            sqlalchemy.select(schema.operations.c.id).where(
+                schema.operations.c.kind == 'PROFILE_CANARY')).all()
+
+    restored = topology_state.record_profile_attestation(
+        profile_revision_id=revision.id,
+        kind=copy_key,
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'runtime_digest': _DIGEST,
+            'platform': profile.qualification.canary_platform,
+            'restores_lifecycle_proof_id': lifecycle_proof_id,
+        },
+        expected_generation=revision.desired_generation,
+        expected_config_hash=revision.config_hash,
+        now=lifecycle_observed_at)
+
+    operation, requested_revision = qualification.request_canary(
+        workspace='research',
+        profile_name=profile.name,
+        target_id=target.name,
+        backend='aws_vm',
+        runtime_id=runtime_id,
+        actor_hash='1' * 64,
+        idempotency_key='restored-copy-canary')
+
+    assert qualification.qualification_copy_available(restored, profile, target)
+    assert operation.state == models.ImageOperationState.PENDING
+    assert requested_revision.id == revision.id
+
+
+def test_pending_canary_does_not_reserve_cost_after_copy_deletion(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    _activate_profile(image_database, profile)
+    operation = _request_ec2_canary(
+        monkeypatch, profile, idempotency_key='pending-copy-deletion-canary')
+    revision = topology_state.get_active_profile('research', profile.name)
+    assert revision is not None
+    target = profile.targets[0]
+    revision = topology_state.record_profile_attestation(
+        profile_revision_id=revision.id,
+        kind=models.profile_attestation_key('lifecycle', target.name),
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'runtime_digest': _DIGEST,
+            'exact_absence': True,
+        },
+        expected_generation=revision.desired_generation,
+        expected_config_hash=revision.config_hash)
+
+    assert qualification.claim_canary(worker_id='worker',
+                                      lease_seconds=60) is None
+
+    failed = catalog_state.get_operation(operation.id, 'research')
+    assert failed is not None
+    assert failed.state == models.ImageOperationState.FAILED
+    assert failed.error_code == 'QUALIFICATION_FAILED'
+    unchanged = topology_state.get_profile_revision(revision.id)
+    assert unchanged is not None
+    assert unchanged.canary_reserved_microusd == 0
 
 
 def test_expired_canary_owner_cannot_attach_or_terminalize_successor_work(
@@ -6455,6 +6587,9 @@ def test_copy_qualification_due_check_uses_database_clock_under_host_skew(
     attestations[models.profile_attestation_key('copy', target.name)] = {
         'status': 'READY',
         'observed_at': database_now,
+        'target_fingerprint': target.target_fingerprint,
+        'runtime_digest': _DIGEST,
+        'platform': profile.qualification.canary_platform,
     }
     qualifying = dataclasses.replace(revision,
                                      state=models.ImageProfileState.QUALIFYING,
@@ -6466,6 +6601,52 @@ def test_copy_qualification_due_check_uses_database_clock_under_host_skew(
 
     assert not copy_worker_service._qualification_copy_needed(
         qualifying, profile, target, due_now)
+
+
+def test_exact_absence_requires_same_second_copy_restoration_handshake(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    lifecycle_proof_id = '00000000-0000-4000-8000-000000000099'
+    copy_key = models.profile_attestation_key('copy', target.name)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    attestations = dict(active.attestations)
+    attestations[copy_key] = {
+        'status': 'READY',
+        'observed_at': 20,
+        'target_fingerprint': target.target_fingerprint,
+        'runtime_digest': _DIGEST,
+        'platform': profile.qualification.canary_platform,
+    }
+    attestations[lifecycle_key] = {
+        'status': 'READY',
+        'observed_at': 20,
+        'target_fingerprint': target.target_fingerprint,
+        'runtime_digest': _DIGEST,
+        'exact_absence': True,
+        'lifecycle_proof_id': lifecycle_proof_id,
+    }
+    deleted = dataclasses.replace(active, attestations=attestations)
+
+    assert not qualification.qualification_copy_available(
+        deleted, profile, target)
+    assert copy_worker_service._qualification_copy_needed(
+        deleted, profile, target, 20)
+
+    restoration = qualification.qualification_copy_restoration_evidence(
+        deleted, target, _DIGEST)
+    assert restoration == {
+        'restores_lifecycle_proof_id': lifecycle_proof_id,
+    }
+    attestations[copy_key] = {
+        **attestations[copy_key],
+        **restoration,
+    }
+    restored = dataclasses.replace(active, attestations=attestations)
+
+    assert qualification.qualification_copy_available(restored, profile, target)
+    assert not copy_worker_service._qualification_copy_needed(
+        restored, profile, target, 20)
 
 
 def _short_lived_qualifying_profile(
@@ -6539,6 +6720,9 @@ def test_automatic_canary_scheduler_uses_database_clock_under_host_skew(
     attestations[models.profile_attestation_key('copy', target.name)] = {
         'status': 'READY',
         'observed_at': database_now + proof_offset,
+        'target_fingerprint': target.target_fingerprint,
+        'runtime_digest': _DIGEST,
+        'platform': profile.qualification.canary_platform,
     }
     revision = dataclasses.replace(active, attestations=attestations)
     monkeypatch.setattr(topology_state, 'list_qualifying_profiles',

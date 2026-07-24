@@ -23,6 +23,8 @@ from sky.container_images import transactions
 _AUTOMATIC_ACTOR_HASH = hashlib.sha256(
     b'skypilot-managed-image-qualification-scheduler').hexdigest()
 _AUTOMATIC_WINDOW_SECONDS = 10 * 60
+_COPY_RESTORES_LIFECYCLE_KEY = 'restores_lifecycle_proof_id'
+_LIFECYCLE_PROOF_KEY = 'lifecycle_proof_id'
 
 
 def _database_epoch(*, now: int | None = None) -> int:
@@ -90,6 +92,67 @@ def _fresh(evidence: Any, *, now: int, max_age_seconds: int) -> bool:
     return (isinstance(evidence, dict) and evidence.get('status') == 'READY' and
             isinstance(evidence.get('observed_at'), int) and
             0 <= now - evidence['observed_at'] <= max_age_seconds)
+
+
+def qualification_lifecycle_proof_id(evidence: Any) -> str | None:
+    """Returns one canonical opaque lifecycle proof ID, if present."""
+    if not isinstance(evidence, dict):
+        return None
+    proof_id = evidence.get(_LIFECYCLE_PROOF_KEY)
+    if not isinstance(proof_id, str):
+        return None
+    try:
+        parsed = uuid.UUID(proof_id)
+    except ValueError:
+        return None
+    return proof_id if str(parsed) == proof_id else None
+
+
+def qualification_copy_available(revision: topology_state.ProfileRevisionRecord,
+                                 profile: models.ManagedRegistryProfile,
+                                 target: models.ManagedRegistryTarget) -> bool:
+    """Returns whether the fixed qualification digest is currently present."""
+    copy_key = models.profile_attestation_key('copy', target.name)
+    copy_evidence = revision.attestations.get(copy_key)
+    if (not isinstance(copy_evidence, dict) or
+            copy_evidence.get('status') != 'READY' or
+            copy_evidence.get('target_fingerprint') != target.target_fingerprint
+            or copy_evidence.get('platform')
+            != profile.qualification.canary_platform or
+            not isinstance(copy_evidence.get('runtime_digest'), str) or
+            not isinstance(copy_evidence.get('observed_at'), int)):
+        return False
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    lifecycle = revision.attestations.get(lifecycle_key)
+    if (not isinstance(lifecycle, dict) or lifecycle.get('status') != 'READY' or
+            lifecycle.get('runtime_digest') != copy_evidence['runtime_digest']):
+        return True
+    if (lifecycle.get('target_fingerprint') != target.target_fingerprint or
+            lifecycle.get('exact_absence') is not True or
+            not isinstance(lifecycle.get('observed_at'), int)):
+        return False
+    proof_id = qualification_lifecycle_proof_id(lifecycle)
+    return (proof_id is not None and
+            copy_evidence.get(_COPY_RESTORES_LIFECYCLE_KEY) == proof_id)
+
+
+def qualification_copy_restoration_evidence(
+        revision: topology_state.ProfileRevisionRecord,
+        target: models.ManagedRegistryTarget,
+        runtime_digest: str) -> dict[str, str]:
+    """Acknowledges the exact same-digest lifecycle proof a copy restores."""
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    lifecycle = revision.attestations.get(lifecycle_key)
+    if (not isinstance(lifecycle, dict) or lifecycle.get('status') != 'READY' or
+            lifecycle.get('target_fingerprint') != target.target_fingerprint or
+            lifecycle.get('runtime_digest') != runtime_digest or
+            lifecycle.get('exact_absence') is not True or
+            not isinstance(lifecycle.get('observed_at'), int)):
+        return {}
+    proof_id = qualification_lifecycle_proof_id(lifecycle)
+    if proof_id is None:
+        return {}
+    return {_COPY_RESTORES_LIFECYCLE_KEY: proof_id}
 
 
 def qualification_repository(
@@ -207,6 +270,8 @@ def request_canary(
     if (desired is None or desired.revision != profile.revision or
             desired.config_hash != profile.config_hash):
         raise ValueError('QUALIFICATION_FAILED')
+    if not qualification_copy_available(desired, profile, target):
+        raise ValueError('QUALIFICATION_FAILED')
     authority_id = catalog_state.get_catalog_authority_id()
     assert authority_id is not None
     request_hash = _hash({
@@ -280,6 +345,21 @@ def canary_payload(operation: catalog_state.OperationRecord) -> dict[str, Any]:
         {'desired_generation', 'worst_case_microusd', 'timeout_seconds'})):
         raise ValueError('Canary operation payload types are invalid.')
     return payload
+
+
+def _pending_canary_copy_available(payload: dict[str, Any]) -> bool:
+    revision = topology_state.get_profile_revision(
+        payload['profile_revision_id'])
+    if (revision is None or
+            revision.desired_generation != payload['desired_generation'] or
+            revision.config_hash != payload['config_hash']):
+        return False
+    profile = models.ManagedRegistryProfile.from_snapshot(
+        revision.config_snapshot)
+    target = profile.target(payload['target'])
+    if target.target_fingerprint != payload['target_fingerprint']:
+        return False
+    return qualification_copy_available(revision, profile, target)
 
 
 def _validate_canary_ec2_instance_profile_arn(instance_profile_arn: Any) -> str:
@@ -389,6 +469,8 @@ def claim_canary(
             try:
                 payload = canary_payload(operation)
                 if operation.state == models.ImageOperationState.PENDING:
+                    if not _pending_canary_copy_available(payload):
+                        raise ValueError('QUALIFICATION_FAILED')
                     _, claim_time = topology_state.reserve_canary_cost(
                         session,
                         profile_revision_id=payload['profile_revision_id'],
@@ -740,9 +822,10 @@ def schedule_automatic_canaries(
             if should_stop is not None and should_stop():
                 return scheduled
             copy_key = models.profile_attestation_key('copy', target.name)
-            if not _fresh(revision.attestations.get(copy_key),
-                          now=current,
-                          max_age_seconds=_AUTOMATIC_WINDOW_SECONDS):
+            if (not qualification_copy_available(revision, profile, target) or
+                    not _fresh(revision.attestations.get(copy_key),
+                               now=current,
+                               max_age_seconds=_AUTOMATIC_WINDOW_SECONDS)):
                 continue
             for backend, binding_id in target.runtime_pull:
                 if should_stop is not None and should_stop():

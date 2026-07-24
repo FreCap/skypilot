@@ -1778,7 +1778,26 @@ attestations, not one powerful worker assuming every identity:
 Every declared EC2 region/AMI/role tuple and EKS cluster/role tuple needs its own
 attestation; success for one tuple never qualifies another. Target qualification
 orders canary copy, actual runtime pulls, then lifecycle deletion and exact
-absence, so activation never races cleanup.
+absence, so activation never races cleanup. That deletion is a one-time
+lifecycle-authority proof, not a permanent desired state for the qualification
+artifact. Once exact absence is attested, the copy worker restores the same
+fixed digest for later manual and automatic canaries. A lifecycle attestation
+for that digest remains the completed deletion proof and must not delete the
+restored copy again. Every completed exact-absence attestation carries an
+opaque lifecycle proof ID. Copy availability uses an explicit restoration
+handshake, not wall-clock ordering: the restored copy attestation names the
+exact lifecycle proof ID it follows. A canary request or worker must reject a
+copy when the same-digest exact-absence proof is not acknowledged by that
+restoration field, while the copy worker treats that state as immediately due
+even when every runtime attestation remains fresh. A matching restoration field
+makes the digest eligible again. A rolling upgrade stamps an existing
+same-digest legacy exact-absence proof with a new proof ID without repeating
+provider deletion; any old worker that subsequently deletes and overwrites that
+proof removes the ID, closes admission again, and is safely superseded by
+another upgrade-and-restore cycle. This remains unambiguous when deletion and
+restoration occur in the same database-clock second, keeps repeat canaries
+nonblocking after bounded reconciliation, and does not weaken the initial copy,
+runtime, delete, and exact-absence activation gate.
 
 The runtime binding also declares the minimum launch tuple needed for an
 automatic canary. EC2 qualification pins one IAM role, instance-profile name,
@@ -3006,6 +3025,12 @@ drained and every image table is empty; it is never part of Helm rollback.
   a mismatched observed ARN, a path-qualified IAM lookup ARN that differs from
   the expected profile ARN, or a marker-free terminal record still fails
   closed;
+- qualification-copy lifecycle tests proving exact absence makes the copy
+  immediately due, an exact restoration handshake restores canary admission
+  even at the same database-clock second, the one-time lifecycle proof does not
+  delete that restored digest again, a legacy proof is upgraded without
+  provider deletion, and a request cannot create a billable canary intent
+  during the bounded post-deletion recopy window;
 - lost-response Spot tests where cancellation first reports a terminal request
   without an instance, a request-to-instance edge appears on a later exact
   read, a late request transition cannot reuse an earlier absence interval, and

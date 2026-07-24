@@ -761,11 +761,15 @@ def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
                                now: int) -> bool:
     copy_key = models.profile_attestation_key('copy', target.name)
     copy_evidence = revision.attestations.get(copy_key)
+    copy_available = qualification.qualification_copy_available(
+        revision, profile, target)
     copy_fresh = (
-        isinstance(copy_evidence, dict) and
+        copy_available and isinstance(copy_evidence, dict) and
         copy_evidence.get('status') == 'READY' and
         isinstance(copy_evidence.get('observed_at'), int) and
         0 <= now - copy_evidence['observed_at'] <= _CONFIG_REFRESH_SECONDS * 10)
+    if not copy_available:
+        return True
     if revision.state == models.ImageProfileState.QUALIFYING:
         return not copy_fresh
     for backend, binding_id in target.runtime_pull:
@@ -874,6 +878,13 @@ def reconcile_qualification_copy(
         raise aws.DestinationContentMismatchError(
             'Qualification canary did not verify after copy.')
     _raise_if_stopping(should_stop)
+    current_revision = topology_state.get_profile_revision(revision.id)
+    _raise_if_stopping(should_stop)
+    if current_revision is None:
+        return False
+    restoration_evidence = (
+        qualification.qualification_copy_restoration_evidence(
+            current_revision, target, graph.runtime_digest))
     topology_state.record_profile_attestation(
         profile_revision_id=revision.id,
         kind=models.profile_attestation_key('copy', target.name),
@@ -885,6 +896,7 @@ def reconcile_qualification_copy(
             'runtime_digest': graph.runtime_digest,
             'platform': graph.platform,
             'copy_outcome': outcome.value,
+            **restoration_evidence,
         },
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,

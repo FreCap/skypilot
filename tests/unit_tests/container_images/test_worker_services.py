@@ -167,6 +167,70 @@ def _canary_operation(
         terminal_expires_at=None)
 
 
+def test_canary_contract_rejects_deleted_copy_before_launch_but_allows_cleanup(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.targets[0]
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    binding = profile.bindings[binding_id]
+    runtime_id = canary_worker_service.qualification.runtime_ids(
+        target, 'aws_vm', binding)[0]
+    repository_name = f'{target.repository_prefix}/qualification'
+    revision = dataclasses.replace(
+        _revision(profile),
+        attestations={
+            models.profile_attestation_key('terraform_target', target.name): {
+                'status': 'READY',
+                'target_fingerprint': target.target_fingerprint,
+                'registry': target.registry,
+                'repository_name': repository_name,
+                'repository_arn': 'qualification-repository-arn',
+            },
+            models.profile_attestation_key('copy', target.name): {
+                'status': 'READY',
+                'observed_at': 100,
+                'target_fingerprint': target.target_fingerprint,
+                'runtime_digest': _DIGEST,
+                'platform': profile.qualification.canary_platform,
+            },
+            models.profile_attestation_key('lifecycle', target.name): {
+                'status': 'READY',
+                'observed_at': 101,
+                'target_fingerprint': target.target_fingerprint,
+                'runtime_digest': _DIGEST,
+                'exact_absence': True,
+            },
+        })
+    payload = {
+        'profile_revision_id': revision.id,
+        'desired_generation': revision.desired_generation,
+        'config_hash': revision.config_hash,
+        'target': target.name,
+        'target_fingerprint': target.target_fingerprint,
+        'backend': 'aws_vm',
+        'binding_id': binding.id,
+        'binding_fingerprint': binding.fingerprint,
+        'runtime_id': runtime_id,
+        'nonce': '1' * 32,
+        'worst_case_microusd': 10_000,
+        'timeout_seconds': 900,
+    }
+    operation = dataclasses.replace(_canary_operation(), result=payload)
+    monkeypatch.setattr(canary_worker_service.topology_state,
+                        'get_profile_revision', lambda _revision_id: revision)
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        canary_worker_service._load_contract(operation)
+
+    persisted = dataclasses.replace(
+        operation, child_launch_id=f'ec2:{target.region}:{operation.id}')
+    loaded = canary_worker_service._load_contract(persisted)
+
+    assert loaded[1].id == revision.id
+    assert loaded[5] == _DIGEST
+
+
 def _cluster_demand(
         *,
         created_at: int,
@@ -4440,10 +4504,15 @@ def test_automatic_canary_scheduler_stops_between_runtime_transactions(
     copy_key = models.profile_attestation_key('copy', target.name)
     revision = dataclasses.replace(
         _revision(profile),
-        attestations={copy_key: {
-            'status': 'READY',
-            'observed_at': 100,
-        }})
+        attestations={
+            copy_key: {
+                'status': 'READY',
+                'observed_at': 100,
+                'target_fingerprint': target.target_fingerprint,
+                'runtime_digest': _DIGEST,
+                'platform': profile.qualification.canary_platform,
+            }
+        })
     stop = threading.Event()
     monkeypatch.setattr(copy_worker_service.qualification, '_database_epoch',
                         lambda **_kwargs: 100)
@@ -4596,6 +4665,99 @@ def test_qualification_lifecycle_fences_delete_readback_boundary(
         raw_client.batch_get_image.assert_called_once()
         record.assert_called_once()
         activate.assert_called_once_with(revision.id)
+
+
+def test_qualification_lifecycle_does_not_redelete_restored_copy(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.canonical
+    lifecycle_proof_id = '00000000-0000-4000-8000-000000000099'
+    copy_key = models.profile_attestation_key('copy', target.name)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    revision = dataclasses.replace(
+        _revision(profile),
+        attestations={
+            copy_key: {
+                'status': 'READY',
+                'observed_at': 101,
+                'target_fingerprint': target.target_fingerprint,
+                'runtime_digest': _DIGEST,
+                'platform': profile.qualification.canary_platform,
+                'restores_lifecycle_proof_id': lifecycle_proof_id,
+            },
+            lifecycle_key: {
+                'status': 'READY',
+                'observed_at': 100,
+                'target_fingerprint': target.target_fingerprint,
+                'repository_arn': 'qualification-repository-arn',
+                'runtime_digest': _DIGEST,
+                'exact_absence': True,
+                'lifecycle_proof_id': lifecycle_proof_id,
+            },
+        })
+    from_role = mock.Mock()
+    activate = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        from_role)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'maybe_activate_profile', activate)
+
+    assert lifecycle_worker_service.reconcile_qualification_lifecycle(
+        mock.sentinel.limiter)
+
+    from_role.assert_not_called()
+    activate.assert_called_once_with(revision.id)
+
+
+def test_qualification_lifecycle_upgrades_legacy_proof_without_provider_io(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    target = profile.canonical
+    copy_key = models.profile_attestation_key('copy', target.name)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    revision = dataclasses.replace(
+        _revision(profile),
+        attestations={
+            copy_key: {
+                'status': 'READY',
+                'observed_at': 100,
+                'target_fingerprint': target.target_fingerprint,
+                'runtime_digest': _DIGEST,
+                'platform': profile.qualification.canary_platform,
+            },
+            lifecycle_key: {
+                'status': 'READY',
+                'observed_at': 100,
+                'target_fingerprint': target.target_fingerprint,
+                'repository_arn': 'qualification-repository-arn',
+                'runtime_digest': _DIGEST,
+                'exact_absence': True,
+            },
+        })
+    from_role = mock.Mock()
+    record = mock.Mock(return_value=revision)
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'record_profile_attestation', record)
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        from_role)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'maybe_activate_profile', mock.Mock())
+
+    assert lifecycle_worker_service.reconcile_qualification_lifecycle(
+        mock.sentinel.limiter)
+
+    from_role.assert_not_called()
+    record.assert_called_once()
+    evidence = record.call_args.kwargs['evidence']
+    assert evidence['exact_absence'] is True
+    assert (lifecycle_worker_service.qualification.
+            qualification_lifecycle_proof_id(evidence) is not None)
 
 
 def test_failed_reservation_reaper_stops_after_provider_acquisition(
