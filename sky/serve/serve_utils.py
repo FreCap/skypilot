@@ -2404,6 +2404,9 @@ def _get_service_status(
             ) for info in replica_infos
         ]
         if pool:
+            record['job_status_counts'] = (
+                managed_job_state.get_nonterminal_job_status_counts_by_pool(
+                    service_name))
             # Fetch all nonterminal job ids in the pool in a single query,
             # grouped by current_cluster_name. Avoids the N+1 pattern of
             # (1 + len(replicas)) per-pool queries against a job_info table

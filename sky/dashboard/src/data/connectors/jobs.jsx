@@ -480,6 +480,24 @@ export async function getPoolStatus({
       };
     }
 
+    const hasBackendJobCounts = poolData.every((pool) =>
+      Object.prototype.hasOwnProperty.call(pool, 'job_status_counts')
+    );
+    if (hasBackendJobCounts) {
+      return {
+        pools: poolData.map((pool) => ({
+          ...pool,
+          jobCounts:
+            pool.job_status_counts &&
+            typeof pool.job_status_counts === 'object' &&
+            !Array.isArray(pool.job_status_counts)
+              ? pool.job_status_counts
+              : {},
+        })),
+        controllerStopped: false,
+      };
+    }
+
     // Also fetch managed jobs to get job counts by pool
     let jobsData = { jobs: [] };
     try {
