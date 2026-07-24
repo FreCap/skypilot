@@ -4300,6 +4300,18 @@ capacity policies. Post-rollout verification kept `boltz-l4-fleet` `READY` at
 18 of 18 replicas, and its load-balancer health and liveness endpoints both
 returned HTTP 200.
 
+The normal improvements lane subsequently published release `1.1.755` at
+`c21d7e5e5011605c471568a9ad6598b219dec779`. Its image digest is
+`sha256:1d43416933904f694474a644be5bfaddc12dd3981dff0c0165ba3ed0e7768c67`,
+and its chart digest is
+`sha256:6187278300994576df2e71896646f0684145a53d437e3877296dd3e76c50624a`.
+Helm revision 241 preserved both complete named init-container objects,
+completed its migration Job, and converged the same four Deployments to one
+Ready replica each on that exact image digest with zero restarts. The API
+reports the exact release and commit; all three image workers remain fresh and
+idle, profile revision 2 remains `ACTIVE`, and the repaired qualification
+operation remains unchanged.
+
 The rollout deliberately scaled all three old worker Deployments to zero before
 the Helm upgrade. This prevented the legacy worker binary from overlapping a
 binary that understands `canary_use_spot`. Durable revision 1 omitted that
