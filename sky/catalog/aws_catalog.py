@@ -6,9 +6,12 @@ instance types and pricing information for AWS.
 import glob
 import hashlib
 import os
+import tempfile
 import threading
 import typing
 from typing import Optional
+
+import filelock
 
 from sky import exceptions
 from sky import sky_logging
@@ -95,31 +98,59 @@ def _get_az_mappings(aws_user_hash: str) -> Optional['pd.DataFrame']:
     filename = f'aws/az_mappings-{aws_user_hash}.csv'
     az_mapping_path = common.get_catalog_path(filename)
     az_mapping_md5_path = common.get_catalog_path(f'.meta/{filename}.md5')
-    if not os.path.exists(az_mapping_path):
-        az_mappings = None
-        if aws_user_hash != 'default':
-            # Fetch az mapping from AWS.
-            with rich_utils.safe_status(
-                    ux_utils.spinner_message('AWS: Fetching availability '
-                                             'zones mapping')):
-                az_mappings = fetch_aws.fetch_availability_zone_mappings()
-        else:
-            return None
-        # get_catalog_path() is now a pure path getter; create the
-        # parent dirs explicitly before writing.
+    vms_catalog_path = common.get_catalog_path('aws/vms.csv')
+
+    def _needs_refresh() -> bool:
+        if not os.path.exists(az_mapping_path):
+            return True
+        # Region enablement can change independently of the account identity.
+        # A newly downloaded VM catalog may therefore contain zone IDs that an
+        # indefinitely cached account mapping would silently drop below.
+        return (aws_user_hash != 'default' and
+                os.path.exists(vms_catalog_path) and
+                os.path.getmtime(vms_catalog_path)
+                > os.path.getmtime(az_mapping_path))
+
+    if aws_user_hash == 'default' and not os.path.exists(az_mapping_path):
+        return None
+
+    if _needs_refresh():
         os.makedirs(os.path.dirname(az_mapping_path), exist_ok=True)
         os.makedirs(os.path.dirname(az_mapping_md5_path), exist_ok=True)
-        az_mappings.to_csv(az_mapping_path, index=False)
-        # Write md5 of the az_mapping file to a file so we can check it for
-        # any changes when uploading to the controller
-        with open(az_mapping_path, encoding='utf-8') as f:
-            az_mapping_hash = hashlib.md5(f.read().encode(),
-                                          usedforsecurity=False).hexdigest()
-        with open(az_mapping_md5_path, 'w', encoding='utf-8') as f:
-            f.write(az_mapping_hash)
-    else:
-        az_mappings = pd.read_csv(az_mapping_path)
-    return az_mappings
+        with filelock.FileLock(az_mapping_path + '.lock'):
+            if _needs_refresh():
+                try:
+                    with rich_utils.safe_status(
+                            ux_utils.spinner_message(
+                                'AWS: Fetching availability zones mapping')):
+                        az_mappings = (
+                            fetch_aws.fetch_availability_zone_mappings())
+                except RuntimeError as e:
+                    if not os.path.exists(az_mapping_path):
+                        raise
+                    logger.warning('Failed to refresh AWS availability zone '
+                                   f'mapping; using the cached mapping: {e}')
+                else:
+                    # Publish atomically so concurrent readers never observe a
+                    # partially written mapping.
+                    with tempfile.NamedTemporaryFile(
+                            mode='w',
+                            dir=os.path.dirname(az_mapping_path),
+                            delete=False,
+                            encoding='utf-8') as f:
+                        az_mappings.to_csv(f, index=False)
+                        tmp_path = f.name
+                    os.replace(tmp_path, az_mapping_path)
+                    # Write md5 of the az_mapping file to a file so we can
+                    # check for changes when uploading to the controller.
+                    with open(az_mapping_path, encoding='utf-8') as f:
+                        az_mapping_hash = hashlib.md5(
+                            f.read().encode(),
+                            usedforsecurity=False).hexdigest()
+                    with open(az_mapping_md5_path, 'w', encoding='utf-8') as f:
+                        f.write(az_mapping_hash)
+
+    return pd.read_csv(az_mapping_path)
 
 
 @timeline.event
