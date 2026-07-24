@@ -36,6 +36,7 @@ from sky.serve import lb_k8s
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.skylet import constants as skylet_constants
 from sky.utils import auth_utils
 from sky.utils import common_utils
@@ -1356,6 +1357,50 @@ def _validate_recovery_target(service_name: str, record: dict[str, Any],
             f'{record.get("controller_job_id")!r}.')
 
 
+def _prepare_placement_catalog(
+    service_name: str,
+    service_spec: 'service_spec_lib.SkyServiceSpec',
+    task: task_lib.Task,
+    *,
+    is_recovery: bool,
+    recovery_version: int | None,
+) -> dict[str, Any] | None:
+    """Build a fresh catalog or load/backfill one legacy version."""
+    if service_spec.spot_placer is None:
+        return None
+    if is_recovery:
+        if recovery_version is None:
+            raise RuntimeError(
+                f'Cannot backfill the placement catalog for {service_name!r}: '
+                'the service has no committed immutable version.')
+        placement_catalog = serve_state.get_placement_catalog(
+            service_name, recovery_version)
+        if placement_catalog is not None:
+            return placement_catalog
+
+    built_catalog = spot_placer.SpotPlacer.build_catalog(service_spec, task)
+    assert built_catalog is not None
+    candidate_catalog = built_catalog.to_dict()
+    if not is_recovery:
+        return candidate_catalog
+
+    assert recovery_version is not None
+    if serve_state.set_placement_catalog_if_missing(service_name,
+                                                    recovery_version,
+                                                    candidate_catalog):
+        return candidate_catalog
+    # A concurrent recovery owner may have completed the same one-time legacy
+    # backfill. Its immutable row is authoritative.
+    placement_catalog = serve_state.get_placement_catalog(
+        service_name, recovery_version)
+    if placement_catalog is None:
+        raise RuntimeError(
+            f'Placement catalog backfill for {service_name!r} version '
+            f'{recovery_version} lost its compare-and-set but no winning '
+            'catalog is present.')
+    return placement_catalog
+
+
 def _start(service_name: str,
            tmp_task_yaml: str,
            job_id: int,
@@ -1519,6 +1564,13 @@ def _start(service_name: str,
     # admin-policy mutations that bypassed an earlier server-side validation.
     serve_utils.validate_logical_replica_task(task, service_spec)
 
+    placement_catalog = _prepare_placement_catalog(
+        service_name,
+        service_spec,
+        task,
+        is_recovery=is_recovery,
+        recovery_version=recovery_version)
+
     if not is_recovery:
         with filelock.FileLock(controller_utils.get_resources_lock_path()):
             if not controller_utils.can_start_new_process(task.service.pool):
@@ -1557,7 +1609,8 @@ def _start(service_name: str,
                     lifecycle_epoch=lifecycle_epoch,
                     resource_scope=resource_scope,
                     created_by=created_by,
-                    submitted_yaml_content=submitted_yaml_content)
+                    submitted_yaml_content=submitted_yaml_content,
+                    placement_catalog=placement_catalog)
             except (serve_state.OrphanedReplicaRecordsError,
                     serve_state.OrphanedStorageCleanupIntentsError,
                     serve_state.OrphanedVersionRecordsError):

@@ -231,53 +231,51 @@ class TestFromSpecSelection(unittest.TestCase):
 
 
 class TestColdPaidCardOrdering(unittest.TestCase):
-    """Cold-card ordering must not resolve provider costs under its lock."""
+    """Cold-card ordering reads only the complete centralized catalog."""
 
     def _order(self, costs):
         placer = mock.Mock()
         placer.known_locations.return_value = list(costs)
-        placer.cached_cost_per_hour.side_effect = costs.get
-        placer.cost_per_hour.side_effect = AssertionError(
-            'provider cost resolution is not allowed')
+        placer.cost_per_hour.side_effect = costs.get
         order = autoscalers._order_cold_paid_cards(['L4', 'A100'], placer,
                                                    lambda _: 1, lambda location:
                                                    (location, 1))
-        placer.cost_per_hour.assert_not_called()
+        self.assertEqual(placer.cost_per_hour.call_count, len(costs))
         return order
 
-    def test_uses_cached_costs_without_provider_resolution(self):
+    def test_uses_catalog_costs_without_provider_resolution(self):
         self.assertEqual(self._order({'L4': 2.0, 'A100': 0.0}), ['L4', 'A100'])
 
-    def test_cache_miss_preserves_service_order(self):
-        self.assertEqual(self._order({'L4': None, 'A100': 1.0}), ['L4', 'A100'])
+    def test_unpriced_catalog_entry_preserves_service_order(self):
+        self.assertEqual(self._order({
+            'L4': float('inf'),
+            'A100': 1.0
+        }), ['L4', 'A100'])
 
-    def test_cache_miss_on_other_location_of_paid_card_preserves_service_order(
-            self):
+    def test_unpriced_other_location_of_paid_card_preserves_service_order(self):
         a100_paid = object()
-        a100_uncached = object()
+        a100_unpriced = object()
         l4_paid = object()
         costs = {
             a100_paid: 4.0,
-            a100_uncached: None,
+            a100_unpriced: float('inf'),
             l4_paid: 2.0,
         }
         cards = {
             a100_paid: 'A100',
-            a100_uncached: 'A100',
+            a100_unpriced: 'A100',
             l4_paid: 'L4',
         }
         placer = mock.Mock()
         placer.known_locations.return_value = list(costs)
-        placer.cached_cost_per_hour.side_effect = costs.get
-        placer.cost_per_hour.side_effect = AssertionError(
-            'provider cost resolution is not allowed')
+        placer.cost_per_hour.side_effect = costs.get
 
         order = autoscalers._order_cold_paid_cards(['A100', 'L4'], placer,
                                                    lambda _: 1, lambda location:
                                                    (cards[location], 1))
 
         self.assertEqual(order, ['A100', 'L4'])
-        placer.cost_per_hour.assert_not_called()
+        self.assertEqual(placer.cost_per_hour.call_count, len(costs))
 
 
 class TestTargetMath(unittest.TestCase):
@@ -2374,7 +2372,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         l4_location = types.SimpleNamespace(accelerators={'L4': 1})
         placer = mock.Mock()
         placer.known_locations.return_value = [a100_location, l4_location]
-        placer.cached_cost_per_hour.side_effect = (
+        placer.cost_per_hour.side_effect = (
             lambda location: 0.0 if location is a100_location else 1.0)
 
         flexible = _make_autoscaler(max_replicas=1, replica_unit='logical')
@@ -2415,7 +2413,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         placer.known_locations.return_value = [
             a100_zero, a100_unpriced, l4_location
         ]
-        placer.cached_cost_per_hour.side_effect = (
+        placer.cost_per_hour.side_effect = (
             lambda location: 0.0 if location is a100_zero else float('inf')
             if location is a100_unpriced else 1.0)
         autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
@@ -2441,8 +2439,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         a100_location = types.SimpleNamespace(accelerators={'A100': 1})
         placer = mock.Mock()
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cached_cost_per_hour.side_effect = (
-            lambda location: float('inf') if location is l4_location else 2.0)
+        placer.cost_per_hour.side_effect = (lambda location: float('inf')
+                                            if location is l4_location else 2.0)
         autoscaler.set_spot_placer(placer)
         _report(autoscaler,
                 in_flight={},

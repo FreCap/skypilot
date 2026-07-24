@@ -52,6 +52,7 @@ from sky.utils import yaml_utils
 if typing.TYPE_CHECKING:
 
     from sky.serve import service_spec
+    SpotPlacerType = spot_placer.SpotPlacer
 
 logger = sky_logging.init_logger(__name__)
 
@@ -863,9 +864,29 @@ def _get_resources_ports(
                                                     pool=task.service.pool)
 
 
+def _load_spot_placer(
+    service_name: str,
+    version: int,
+    service_spec: 'service_spec.SkyServiceSpec',
+    task: 'task_lib.Task',
+) -> spot_placer.SpotPlacer | None:
+    """Load one version's durable catalog without provider resolution."""
+    if service_spec.spot_placer is None:
+        return None
+    catalog_data = serve_state.get_placement_catalog(service_name, version)
+    if catalog_data is None:
+        raise RuntimeError(
+            f'Placement catalog is missing for {service_name!r} version '
+            f'{version}. The service parent must backfill legacy versions '
+            'before starting the controller.')
+    return spot_placer.SpotPlacer.from_task(service_spec,
+                                            task,
+                                            placement_catalog=catalog_data)
+
+
 def validate_service_update_preflight(
-        service_name: str, version: int,
-        service_spec: 'service_spec.SkyServiceSpec') -> None:
+    service_name: str, version: int, service_spec: 'service_spec.SkyServiceSpec'
+) -> spot_placer.SpotPlacer | None:
     """Run immutable candidate calculations needed before replica launch."""
     yaml_content = serve_state.get_yaml_content(service_name, version)
     if yaml_content is None:
@@ -885,10 +906,12 @@ def validate_service_update_preflight(
     placer_name = getattr(service_spec, 'spot_placer', None)
     candidate_placer = None
     if uses_logical_replicas or isinstance(placer_name, str):
-        candidate_placer = spot_placer.SpotPlacer.from_task(service_spec, task)
+        candidate_placer = _load_spot_placer(service_name, version,
+                                             service_spec, task)
     if uses_logical_replicas:
         _validate_logical_capacity_sources(default_planned_capacity,
                                            candidate_placer, task.num_nodes)
+    return candidate_placer
 
 
 def _should_use_spot(
@@ -2081,7 +2104,7 @@ class ReplicaManager:
                 <= 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 
     @property
-    def spot_placer(self) -> Optional['spot_placer.SpotPlacer']:
+    def spot_placer(self) -> Optional['SpotPlacerType']:
         """The placer, if this manager kind carries one (else None).
 
         Public accessor for the controller's fill machinery, which needs
@@ -2177,8 +2200,13 @@ class ReplicaManager:
                                       target_capacity_by_accelerator,
                                       accelerator_shapes)
 
-    def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
-                       update_mode: serve_utils.UpdateMode) -> None:
+    def update_version(
+        self,
+        version: int,
+        spec: 'service_spec.SkyServiceSpec',
+        update_mode: serve_utils.UpdateMode,
+        new_spot_placer: 'SpotPlacerType | None' = None,
+    ) -> None:
         raise NotImplementedError
 
     def get_active_replica_urls(self) -> list[str]:
@@ -2437,8 +2465,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             task.resources)
         self._logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
             task.resources) if self._uses_logical_replicas else {})
-        self._spot_placer: spot_placer.SpotPlacer | None = (
-            spot_placer.SpotPlacer.from_task(spec, task))
+        self._spot_placer = _load_spot_placer(service_name, version, spec, task)
         if self._uses_logical_replicas:
             _validate_logical_capacity_sources(self._default_planned_capacity,
                                                self._spot_placer,
@@ -7394,8 +7421,13 @@ class SkyPilotReplicaManager(ReplicaManager):
     # clobbered by) a concurrent prober status write. See the with_lock
     # invariant note above ReplicaStatusProperty.
     @with_lock
-    def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
-                       update_mode: serve_utils.UpdateMode) -> None:
+    def update_version(
+        self,
+        version: int,
+        spec: 'service_spec.SkyServiceSpec',
+        update_mode: serve_utils.UpdateMode,
+        new_spot_placer: 'SpotPlacerType | None' = None,
+    ) -> None:
         if version <= self.latest_version:
             logger.error(f'Invalid version: {version}, '
                          f'latest version: {self.latest_version}')
@@ -7414,15 +7446,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         new_task = load_task_with_service_spec(new_yaml_content, spec)
         new_default_planned_capacity = _uniform_whole_gpu_capacity(
             new_task.resources)
+        if new_uses_logical_replicas and new_task.num_nodes != 1:
+            _validate_logical_capacity_sources(new_default_planned_capacity,
+                                               None, new_task.num_nodes)
         new_logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
             new_task.resources) if new_uses_logical_replicas else {})
         # A service update may change the placement policy or any_of shape
-        # set. Rebuild it before mutating manager version state so neither
-        # logical nor physical versions retain candidates from the prior spec.
+        # set. Use the preflight placer when provided; otherwise load the
+        # committed version's centralized catalog. Neither path rebuilds
+        # provider candidates in the controller child.
         new_placer_name = getattr(spec, 'spot_placer', None)
-        new_spot_placer = None
-        if new_uses_logical_replicas or isinstance(new_placer_name, str):
-            new_spot_placer = spot_placer.SpotPlacer.from_task(spec, new_task)
+        if ((new_uses_logical_replicas or isinstance(new_placer_name, str)) and
+                new_spot_placer is None):
+            new_spot_placer = _load_spot_placer(self._service_name, version,
+                                                spec, new_task)
         old_spot_placer = getattr(self, '_spot_placer', None)
         if new_spot_placer is not None and old_spot_placer is not None:
             new_spot_placer.inherit_preemption_state(old_spot_placer)

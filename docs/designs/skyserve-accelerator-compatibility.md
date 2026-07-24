@@ -94,7 +94,7 @@ not evidence that the behavior is active in production.
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
 | `1.1.721` | PR #877, reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Included in deployed `1.1.726`. Production then exposed a separate catalog-ordering edge case when a zero-cost-only A100 preceded paid L4. |
 | Unreleased | Reserved-only card paid fallback | Excludes cards whose every successfully priced location is zero-cost from flexible cold-paid ordering. Paid-capable and unpriced cards keep the all-or-nothing service-order fallback, while exact demand can still target a reserved-only card. | Required before the next `opendde-10c200s-v4` rollout so default-all demand selects paid L4 instead of waiting on the reserved-only A100 location. |
-| Unreleased | Bounded controller startup bootstrap | Configures exact-card order, seeds reserved-capacity identities, adopts recovery claims, serves load-balancer capacity metadata, and orders cold-paid cards under the logical-state lock from the placer's already-known cost cache instead of resolving paid-provider costs on controller-critical paths. | Fix-forward for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures after exact instance-shape expansion increased the candidate set from 659 to more than 1,050. |
+| Unreleased | Centralized placement catalog | Materializes every exact location and nominal cost once per immutable service version, persists the complete catalog in PostgreSQL, backfills legacy versions before controller-child spawn, and removes the old partial-cache accessors and fallback feasibility resolver. | Supersedes the bounded partial-cache fix for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures. The canonical subdesign is `docs/designs/serve-central-placement-catalog.md`. |
 
 ### Controller startup liveness
 
@@ -103,36 +103,29 @@ autoscaler tick so a recovered controller cannot mistake live fill capacity
 for surplus and terminate it. This startup seed is identity-only: it grants no
 free slots and records no fresh capacity snapshot.
 
-The placer classifies enumerated Kubernetes locations as zero-cost when it is
-constructed. Controller startup must use only this cached classification and
-already-cached paid prices. It must not resolve uncached paid-provider
-candidates, contact a provider API, or warm the full price cache before binding
-the controller health endpoint. When cached paid prices do not cover every
-configured card, the existing all-or-nothing ordering rule preserves the
-explicit service resource order. Claim recovery conservatively treats an
-uncached location as paid. Background placement and reserved-capacity polling
-retain their resolving cost semantics after the controller is healthy.
-Load-balancer sync consumes the cached zero-cost identities plus the poller's
-cached free-capacity observations. Its batched PostgreSQL observation read
-runs in the executor with the other sync-path database reads, so routing
-refresh cannot block the FastAPI event loop or trigger the same catalog-wide
-price warm-up after the health endpoint binds. Cold-paid card ordering runs
-while the autoscaler holds the logical-state lock used by load balancer demand
-reports, so it also uses only already-cached prices. Cost-rebalance candidate
-scoring follows the same rule and defers any candidate whose price is not yet
-cached. An incomplete cold-card cache for any inspected location preserves
-service order and lets later background placement resolve the selected
-location without delaying health or sync requests.
+The service parent constructs and commits a complete versioned placement
+catalog before it spawns the controller child. Legacy versions are backfilled
+with a compare-and-set write before child spawn. The child loads that
+PostgreSQL record and must never enumerate providers, resolve feasibility, or
+price a location because a catalog entry is absent. A missing catalog is a
+startup invariant failure, not permission to reconstruct one in the child.
 
-Regression coverage must include a large set of uncached paid candidates and
-prove that both pre-bind exact-card configuration and startup seeding use only
-cached values without calling resource feasibility or pricing code. Recovery
-claim adoption must satisfy the same no-resolution rule. Production rollout
-and load-balancer sync must satisfy the same no-resolution rule, including
-autoscaler cold-card ordering and cost-rebalance scoring under the shared
-logical-state lock. Production rollout verification requires the exact
-deployed commit, healthy controller endpoints for the one-replica canary and
-the production fleet, successful load-balancer syncs, and continuity of
+Controller startup, claim recovery, load-balancer sync, reserved-capacity
+polling, placement, cold-paid card ordering, and cost rebalancing all consume
+the same complete in-memory catalog. The poller's free-capacity observations
+remain transient runtime data and do not alter the immutable location/cost
+catalog. A location whose nominal price is unavailable carries infinity in
+memory and JSON `null` durably; the all-or-nothing ordering rule preserves
+explicit service order for any affected paid-capable card.
+
+Regression coverage must include a large candidate set and prove that child
+construction, pre-bind exact-card configuration, startup seeding, claim
+adoption, load-balancer sync, autoscaler ordering, and cost rebalance never
+call resource feasibility or pricing code. Recovery must reuse the persisted
+bytes; one legacy parent backfill may construct the catalog once. Production
+rollout verification requires the exact deployed commit, migration 028,
+non-null catalog data, healthy controller endpoints for the one-replica canary
+and production fleet, successful load-balancer syncs, and continuity of
 pre-existing ready replicas.
 
 The dashboard's provisioning count is not itself a paid-capacity signal. For a
@@ -363,7 +356,7 @@ card owns flexible demand in the dashboard or retained demand target. Cold
 placement does not fall through to a more expensive card merely because the
 cheapest card is temporarily unavailable.
 
-For placer-backed services, cheapest means the lowest nominal cached hourly
+For placer-backed services, cheapest means the lowest cataloged nominal hourly
 cost across every enumerated paid location, including a location currently
 benched after a capacity failure. Availability controls whether an exact-card
 launch can proceed, but it never changes the card target. If the cheapest card
@@ -377,15 +370,15 @@ legacy aggregate behavior rather than turning transient availability or hash
 iteration into a cold-card policy.
 
 Nominal cost ordering is all-or-nothing across cards that may have paid
-capacity. If any such card lacks a finite positive paid price because catalog
-lookup failed or no location was enumerated, the controller and autoscaler
-preserve the explicit service order among those cards. A partial price map must
-never promote a larger priced card ahead of an unpriced cheaper card. A card
-whose every matched, successfully priced location is zero-cost is not a
-cold-paid candidate, so it is ordered after all paid-capable and unpriced
-cards. This does not remove the reserved-only card from compatibility or from
-reserved fill: exact demand may still target it, and free broker capacity may
-still materialize it through the independent zero-cost-only fill path.
+capacity. If any such card has an unavailable catalog price or no cataloged
+location, the controller and autoscaler preserve the explicit service order
+among those cards. An unavailable price must never promote a larger priced
+card ahead of an unpriced cheaper card. A card whose every matched location is
+cataloged as zero-cost is not a cold-paid candidate, so it is ordered after all
+paid-capable and unpriced cards. This does not remove the reserved-only card
+from compatibility or from reserved fill: exact demand may still target it,
+and free broker capacity may still materialize it through the independent
+zero-cost-only fill path.
 
 The controller recomputes after each supply transition. It may launch reserved and paid capacity in the same control cycle when demand exceeds already-ready, provisioning, and reserved capacity; the list above is allocation accounting, not a requirement to wait serially for one tier to finish.
 

@@ -190,12 +190,8 @@ class TestPreemptionTtlRetry:
         # The first real selection still gets the one probe.
         assert placer.select_next_location() == cheap
 
-    def test_snapshot_uses_only_cached_prices(self, placer_and_locations,
-                                              monkeypatch):
+    def test_snapshot_uses_only_catalog_prices(self, placer_and_locations):
         placer, cheap, other, third = placer_and_locations
-        monkeypatch.setattr(
-            placer, '_get_cost_per_hour_cached',
-            lambda _: pytest.fail('snapshot must not look up catalog prices'))
 
         snapshot = placer.placement_snapshot()
 

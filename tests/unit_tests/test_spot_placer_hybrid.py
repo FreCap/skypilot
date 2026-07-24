@@ -18,6 +18,61 @@ from sky.container_images import models as container_image_models
 from sky.serve import spot_placer
 
 
+class TestCentralPlacementCatalog:
+    """One immutable complete catalog drives every runtime lookup."""
+
+    def test_round_trip_preserves_exact_locations_and_unavailable_price(self):
+        reserved = make_location('research-ctx',
+                                 accelerators={'A100': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        paid.image_id = {None: 'docker:registry.example/model:v1'}
+        entries = tuple(
+            sorted(((reserved, 0.0), (paid, float('inf'))),
+                   key=lambda item: item[0].sort_key()))
+        catalog = spot_placer.PlacementCatalog(entries)
+
+        serialized = catalog.to_dict()
+        assert any(
+            entry['hourly_cost'] is None for entry in serialized['entries'])
+        paid_entry = next(entry for entry in serialized['entries']
+                          if entry['location']['cloud'] == 'AWS')
+        assert paid_entry['location']['image_id'] == [{
+            'region': None,
+            'image': 'docker:registry.example/model:v1',
+        }]
+        restored = spot_placer.PlacementCatalog.from_dict(serialized)
+        assert restored.to_dict() == serialized
+
+    def test_runtime_lookup_never_resolves_a_complete_catalog(self):
+        reserved = make_location('research-ctx',
+                                 accelerators={'A100': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        catalog = spot_placer.PlacementCatalog(((reserved, 0.0), (paid, 0.2)))
+        resources = mock.MagicMock()
+        task = mock.MagicMock(resources=[resources], num_nodes=1)
+        with mock.patch.object(
+                spot_placer,
+                '_get_possible_location_from_task',
+                side_effect=AssertionError(
+                    'persisted catalog load must not enumerate providers')):
+            placer = spot_placer.SpotPlacer(task, placement_catalog=catalog)
+
+        assert placer.cost_per_hour(paid) == 0.2
+        assert placer.zero_cost_locations() == [reserved]
+        assert placer._min_cost_location([paid, reserved]) == reserved
+        resources.copy.assert_not_called()
+
+
 @pytest.fixture
 def hybrid_placer():
     k8s = make_location('research-ctx',

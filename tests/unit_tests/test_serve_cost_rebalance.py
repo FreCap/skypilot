@@ -199,19 +199,14 @@ class TestEconomicDecisions:
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]
 
-    def test_uncached_candidate_does_not_resolve_cost_under_decision_lock(self):
+    def test_unpriced_candidate_does_not_rebalance(self):
         scaler = _autoscaler()
         placer, _, cheap, replicas = self._fleet(candidate_cost=0.0)
-        del placer.location2cost[cheap]
+        placer.location2cost[cheap] = float('inf')
         scaler.set_spot_placer(placer)
         _report(scaler, replicas)
 
-        with mock.patch.object(
-                placer,
-                'cost_per_hour',
-                side_effect=AssertionError(
-                    'autoscaler decisions must not resolve provider costs')):
-            decisions = _decisions(scaler, replicas)
+        decisions = _decisions(scaler, replicas)
 
         assert not [
             decision for decision in decisions if decision.operator ==

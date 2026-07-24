@@ -167,6 +167,10 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('quarantined_at', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('quarantine_reason', sqlalchemy.Text,
                       server_default=None),
+    sqlalchemy.Column('placement_catalog',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      server_default=None),
 )
 
 # Durable cleanup inventory is intentionally separate from ``version_specs``.
@@ -769,7 +773,8 @@ def add_service(name: str,
                 lifecycle_epoch: int | None = None,
                 resource_scope: str | None = None,
                 created_by: str | None = None,
-                submitted_yaml_content: str | None = None) -> bool:
+                submitted_yaml_content: str | None = None,
+                placement_catalog: dict[str, Any] | None = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -913,6 +918,7 @@ def add_service(name: str,
                 spec=pickle.dumps(spec),
                 yaml_content=yaml_content,
                 submitted_yaml_content=submitted_yaml_content,
+                placement_catalog=placement_catalog,
                 created_at=time.time(),
                 created_by=created_by)
             if lifecycle_epoch is None:
@@ -926,7 +932,9 @@ def add_service(name: str,
                         'yaml_content':
                             version_insert_stmt.excluded.yaml_content,
                         'submitted_yaml_content':
-                            version_insert_stmt.excluded.submitted_yaml_content
+                            version_insert_stmt.excluded.submitted_yaml_content,
+                        'placement_catalog':
+                            version_insert_stmt.excluded.placement_catalog,
                     })
             session.execute(version_insert_stmt)
             if resource_scope is not None and storage_generation is not None:
@@ -3824,6 +3832,7 @@ def add_or_update_version(
     spec: 'service_spec.SkyServiceSpec',
     yaml_content: str,
     submitted_yaml_content: str | None = None,
+    placement_catalog: dict[str, Any] | None = None,
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
@@ -3875,9 +3884,11 @@ def add_or_update_version(
             raise ValueError('Unsupported database dialect')
 
         existing = session.execute(
-            sqlalchemy.select(version_specs_table.c.yaml_content).where(
-                version_specs_table.c.service_name == service_name,
-                version_specs_table.c.version == version)).fetchone()
+            sqlalchemy.select(
+                version_specs_table.c.yaml_content,
+                version_specs_table.c.placement_catalog).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version)).fetchone()
         identical_retry = existing is not None and existing[0] == yaml_content
         if existing is not None and existing[
                 0] is not None and not identical_retry:
@@ -3923,6 +3934,7 @@ def add_or_update_version(
                 spec=pickle.dumps(spec),
                 yaml_content=yaml_content,
                 submitted_yaml_content=submitted_yaml_content,
+                placement_catalog=placement_catalog,
                 created_at=time.time()))
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
@@ -3935,7 +3947,18 @@ def add_or_update_version(
                         spec=pickle.dumps(spec),
                         yaml_content=yaml_content,
                         submitted_yaml_content=submitted_yaml_content,
+                        placement_catalog=placement_catalog,
                         created_at=time.time()))
+        elif identical_retry and existing[1] is None and placement_catalog:
+            # A retry may be the first new binary to touch a version committed
+            # by an older controller. Backfill only the absent catalog; the
+            # immutable YAML and pickled spec bytes remain untouched.
+            session.execute(
+                sqlalchemy.update(version_specs_table).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version,
+                    version_specs_table.c.placement_catalog.is_(None)).values(
+                        placement_catalog=placement_catalog))
         if (not identical_retry and semantics_row is not None and
                 uses_logical_replicas):
             session.execute(
@@ -3981,6 +4004,40 @@ def get_spec(service_name: str,
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version))).fetchone()
     return pickle.loads(result[0]) if result else None
+
+
+def get_placement_catalog(service_name: str,
+                          version: int) -> dict[str, Any] | None:
+    """Return the immutable centralized catalog for one service version."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(version_specs_table.c.placement_catalog).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.version == version)).fetchone()
+    return result[0] if result is not None else None
+
+
+def set_placement_catalog_if_missing(service_name: str, version: int,
+                                     placement_catalog: dict[str, Any]) -> bool:
+    """Compare-and-set a legacy version's one-time catalog backfill.
+
+    Returns true only for the writer that filled the null column. A concurrent
+    loser must reread the catalog selected by the winner.
+    """
+    if not isinstance(placement_catalog, dict):
+        raise ValueError('Placement catalog must be a mapping.')
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.update(version_specs_table).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.version == version,
+                version_specs_table.c.yaml_content.isnot(None),
+                version_specs_table.c.placement_catalog.is_(None)).values(
+                    placement_catalog=placement_catalog))
+        session.commit()
+    return result.rowcount == 1
 
 
 def get_specs(

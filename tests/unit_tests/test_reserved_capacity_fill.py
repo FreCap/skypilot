@@ -648,7 +648,7 @@ class TestControllerSeeding(unittest.TestCase):
 
     def _placer(self):
         placer = mock.Mock()
-        placer.cached_zero_cost_locations.return_value = [
+        placer.zero_cost_locations.return_value = [
             spot_placer.Location.from_pickleable(_K8S_KEY)
         ]
         return placer
@@ -679,7 +679,7 @@ class TestControllerSeeding(unittest.TestCase):
         ctrl = self._make_controller(autoscaler, placer)
         ctrl._seed_fill_zero_cost_locations(autoscaler)
         self.assertEqual(autoscaler._fill_zero_cost_locations, [])
-        placer.cached_zero_cost_locations.assert_not_called()
+        placer.zero_cost_locations.assert_not_called()
 
     def test_no_placer_does_not_seed(self):
         autoscaler = _make_autoscaler()
@@ -692,8 +692,8 @@ class TestControllerSeeding(unittest.TestCase):
         # propagate out of the seed (it runs inside controller __init__).
         autoscaler = _make_autoscaler()
         placer = mock.Mock()
-        placer.cached_zero_cost_locations.side_effect = ValueError(
-            'cache unavailable')
+        placer.zero_cost_locations.side_effect = ValueError(
+            'catalog unavailable')
         ctrl = self._make_controller(autoscaler, placer)
         ctrl._seed_fill_zero_cost_locations(autoscaler)  # must not raise
         self.assertEqual(autoscaler._fill_zero_cost_locations, [])
@@ -1020,18 +1020,13 @@ class TestZeroCostSelection(unittest.TestCase):
             self.placer.set_preemptive(self.k8s)
             self.assertIn(self.k8s, self.placer.zero_cost_locations())
 
-    def test_cached_enumeration_never_prices_uncached_paid_candidates(self):
+    def test_catalog_enumeration_ignores_unknown_paid_candidates(self):
         self.placer.location2cost.pop(self.paid)
         self.placer.location2status.update({
             _make_location(f'paid-region-{index}', 'paid', use_spot=True):
                 spot_placer.LocationStatus.ACTIVE for index in range(1058)
         })
-        with mock.patch.object(
-                self.placer,
-                '_get_cost_per_hour_cached',
-                side_effect=AssertionError('must not resolve provider cost')):
-            self.assertEqual(self.placer.cached_zero_cost_locations(),
-                             [self.k8s])
+        self.assertEqual(self.placer.zero_cost_locations(), [self.k8s])
 
     def test_equal_cost_reuses_first_candidate(self):
         other = _make_location('research-ctx-2', 'free')
@@ -1613,24 +1608,24 @@ class TestDemandCapacityRefreshScheduling(unittest.TestCase):
 
 
 class TestCostFeasibilityDegradation(unittest.TestCase):
-    """Empty feasible list degrades to inf cost, never a boot crash."""
+    """Unavailable prices are represented completely in the catalog."""
 
-    def test_empty_feasible_list_is_infinite_not_raise(self):
-        placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-            spot_placer.DynamicFallbackSpotPlacer)
-        placer.location2cost = {}
-        placer.num_nodes = 1
-        placer.resources = mock.Mock()
-        empty = mock.Mock()
-        empty.resources_list = []
-        copied = mock.Mock()
-        copied.cloud.get_feasible_launchable_resources.return_value = empty
-        placer.resources.copy.return_value = copied
-        location = _make_location('research-ctx', 'free')
-        cost = placer._get_cost_per_hour_cached(location)
-        self.assertEqual(cost, float('inf'))
-        # Not memoized: a transient K8s API blip heals on the next call.
-        self.assertEqual(placer.location2cost, {})
+    def test_unavailable_price_is_materialized_as_infinity(self):
+        location = _make_location('paid-region', 'missing-price')
+        materialized = mock.Mock()
+        materialized.get_cost.side_effect = ValueError(
+            "No SpotPrice found for instance type 'gr6.8xlarge'.")
+        resources = mock.Mock()
+        resources.copy.return_value = materialized
+        task = types.SimpleNamespace(resources=[resources], num_nodes=1)
+
+        with mock.patch.object(spot_placer,
+                               '_get_possible_location_from_task',
+                               return_value=[location]):
+            catalog = spot_placer.PlacementCatalog.from_task(task)
+
+        self.assertEqual(catalog.costs(), {location: float('inf')})
+        materialized.get_cost.assert_called_once_with(seconds=3600)
 
     def test_kubernetes_zero_cost_seed_avoids_live_reclassification(self):
         location = spot_placer.Location.from_pickleable(_K8S_KEY)
@@ -1656,40 +1651,21 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
             free: spot_placer.LocationStatus.ACTIVE,
             missing_price: spot_placer.LocationStatus.ACTIVE,
         }
-        placer.location2cost = {free: 0.0}
-        placer.num_nodes = 1
-        placer.resources = mock.Mock()
-        feasible = mock.Mock()
-        resource = mock.Mock()
-        resource.get_cost.side_effect = ValueError(
-            "No SpotPrice found for instance type 'gr6.8xlarge'.")
-        feasible.resources_list = [resource]
-        copied = mock.Mock()
-        copied.cloud.get_feasible_launchable_resources.return_value = feasible
-        placer.resources.copy.return_value = copied
+        placer.location2cost = {free: 0.0, missing_price: float('inf')}
 
         self.assertEqual(placer.zero_cost_locations(), [free])
         self.assertEqual(placer.location2cost[missing_price], float('inf'))
 
     def test_missing_price_candidate_does_not_hide_priced_candidate(self):
-        placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-            spot_placer.DynamicFallbackSpotPlacer)
-        placer.location2cost = {}
-        placer.num_nodes = 1
-        placer.resources = mock.Mock()
-        missing = mock.Mock()
-        missing.get_cost.side_effect = ValueError('No SpotPrice found.')
-        priced = mock.Mock()
-        priced.get_cost.return_value = 0.42
-        feasible = mock.Mock()
-        feasible.resources_list = [missing, priced]
-        copied = mock.Mock()
-        copied.cloud.get_feasible_launchable_resources.return_value = feasible
-        placer.resources.copy.return_value = copied
-        location = _make_location('paid-region', 'mixed-prices')
+        missing = _make_location('paid-region', 'missing-price')
+        priced = _make_location('other-paid-region', 'priced')
+        placer = _make_placer({
+            missing: float('inf'),
+            priced: 0.42,
+        })
 
-        self.assertEqual(placer._get_cost_per_hour_cached(location), 0.42)
-        self.assertEqual(placer.location2cost[location], 0.42)
+        self.assertEqual(placer.cost_per_hour(missing), float('inf'))
+        self.assertEqual(placer.cost_per_hour(priced), 0.42)
 
 
 def _feed_broker(autoscaler,

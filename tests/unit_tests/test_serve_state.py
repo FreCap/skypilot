@@ -112,7 +112,8 @@ def _add_minimal_service(name: str,
                          pool=False,
                          spec=None,
                          created_by=None,
-                         submitted_yaml_content=None):
+                         submitted_yaml_content=None,
+                         placement_catalog=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -138,6 +139,7 @@ def _add_minimal_service(name: str,
         resource_scope=resource_scope,
         created_by=created_by,
         submitted_yaml_content=submitted_yaml_content,
+        placement_catalog=placement_catalog,
     )
 
 
@@ -859,6 +861,74 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
         'value: different')
     assert conflict_result is serve_state.VersionCommitResult.CONTENT_CONFLICT
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
+
+
+def test_version_placement_catalog_persists_and_backfills_once(_mock_serve_db):
+    initial_catalog = {'schema_version': 1, 'entries': []}
+    assert _add_minimal_service('svc-catalog',
+                                placement_catalog=initial_catalog) is True
+    assert serve_state.get_placement_catalog('svc-catalog',
+                                             1) == (initial_catalog)
+
+    assert serve_state.add_version('svc-catalog') == 2
+    update_catalog = {
+        'schema_version': 1,
+        'entries': [{
+            'location': {
+                'cloud': 'AWS',
+                'region': 'us-east-1',
+            },
+            'hourly_cost': 0.25,
+        }],
+    }
+    assert (serve_state.add_or_update_version('svc-catalog',
+                                              2,
+                                              types.SimpleNamespace(value='v2'),
+                                              'value: v2',
+                                              placement_catalog=update_catalog)
+            is serve_state.VersionCommitResult.COMMITTED)
+    assert serve_state.get_placement_catalog('svc-catalog', 2) == update_catalog
+
+    assert serve_state.add_version('svc-catalog') == 3
+    assert (serve_state.add_or_update_version(
+        'svc-catalog', 3, types.SimpleNamespace(value='legacy'),
+        'value: legacy') is serve_state.VersionCommitResult.COMMITTED)
+    winner = {'schema_version': 1, 'entries': [{'winner': True}]}
+    loser = {'schema_version': 1, 'entries': [{'winner': False}]}
+    assert serve_state.set_placement_catalog_if_missing('svc-catalog', 3,
+                                                        winner)
+    assert not serve_state.set_placement_catalog_if_missing(
+        'svc-catalog', 3, loser)
+    assert serve_state.get_placement_catalog('svc-catalog', 3) == winner
+
+
+def test_identical_version_retry_only_backfills_missing_catalog(_mock_serve_db):
+    assert _add_minimal_service('svc-catalog-retry') is True
+    catalog = {'schema_version': 1, 'entries': []}
+    assert (serve_state.add_or_update_version(
+        'svc-catalog-retry',
+        1,
+        types.SimpleNamespace(value='ignored'),
+        'yaml: v1',
+        placement_catalog=catalog)
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+    row = _read_version_row(_mock_serve_db, 'svc-catalog-retry', 1)
+    assert row['placement_catalog'] == catalog
+    original_spec = row['spec']
+    assert (serve_state.add_or_update_version(
+        'svc-catalog-retry',
+        1,
+        types.SimpleNamespace(value='different'),
+        'yaml: v1',
+        placement_catalog={
+            'schema_version': 1,
+            'entries': [{
+                'other': True
+            }]
+        }) is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+    final_row = _read_version_row(_mock_serve_db, 'svc-catalog-retry', 1)
+    assert final_row['placement_catalog'] == catalog
+    assert final_row['spec'] == original_spec
 
 
 def test_logical_replica_activation_is_durable_and_one_way(_mock_serve_db):

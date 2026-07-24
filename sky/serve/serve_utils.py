@@ -1646,11 +1646,10 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     'requires one-GPU Kubernetes fill shapes so broker slots '
                     'equal logical slots.')
 
-    # Try to create a spot placer from the task yaml. Check if the task yaml
-    # is valid for spot placer. Reserved-fill shape validation stays before
-    # construction so malformed counts fail at the Serve trust boundary,
-    # rather than leaking NaN/Inf into cloud feasibility code.
-    spot_placer.SpotPlacer.from_task(task.service, task)
+    # Validate the placer contract without enumerating providers. The final
+    # policy-mutated task gets one complete catalog immediately before its
+    # immutable service version is committed.
+    spot_placer.SpotPlacer.validate_task(task.service, task)
 
     replica_ingress_port = resolve_replica_ingress_port(task, pool)
     for requested_resources in task.resources:

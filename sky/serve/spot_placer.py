@@ -50,6 +50,8 @@ _LIVE_ACCELERATOR_CATALOG_CLOUDS = frozenset({'kubernetes', 'slurm', 'ssh'})
 _PREEMPTION_RETRY_SECONDS_DEFAULT = 600
 _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
 _PLACEMENT_SNAPSHOT_MAX_LOCATIONS = 500
+_PLACEMENT_CATALOG_SCHEMA_VERSION = 1
+_PLACEMENT_CATALOG_MAX_LOCATIONS = 100_000
 
 
 def _normalize_image_id(
@@ -344,6 +346,190 @@ class LocationStatus(enum.Enum):
     PREEMPTED = 'PREEMPTED'
 
 
+@dataclasses.dataclass(frozen=True)
+class PlacementCatalog:
+    """Complete immutable placement candidates and their nominal costs."""
+
+    entries: tuple[tuple[Location, float], ...]
+
+    @staticmethod
+    def _serialize_location(location: Location) -> dict[str, Any]:
+        """Return a JSON-safe location without lossy object-key coercion."""
+        serialized = location.to_pickleable()
+        image_id = serialized.get('image_id')
+        if image_id is not None:
+            # JSON object keys cannot preserve Python None. Region-independent
+            # image IDs deliberately use None as their key, so encode the map
+            # as records rather than letting json.dumps turn it into "null".
+            serialized['image_id'] = [{
+                'region': region,
+                'image': image,
+            } for region, image in sorted(image_id.items(),
+                                          key=lambda item: str(item[0]))]
+        return serialized
+
+    @staticmethod
+    def _deserialize_location(data: dict[str, Any]) -> Location:
+        """Restore the catalog's JSON-safe location representation."""
+        serialized = dict(data)
+        image_id = serialized.get('image_id')
+        if image_id is not None:
+            if not isinstance(image_id, list):
+                raise ValueError(
+                    'Placement catalog image_id must be a list or null.')
+            restored_image_id: dict[str | None, str] = {}
+            for image_entry in image_id:
+                if not isinstance(image_entry, dict):
+                    raise ValueError(
+                        'Placement catalog image_id entry must be a mapping.')
+                if set(image_entry) != {'region', 'image'}:
+                    raise ValueError(
+                        'Placement catalog image_id entry must contain only '
+                        'region and image.')
+                region = image_entry['region']
+                image = image_entry['image']
+                if region is not None and not isinstance(region, str):
+                    raise ValueError('Placement catalog image_id region must '
+                                     'be a string or null.')
+                if not isinstance(image, str):
+                    raise ValueError(
+                        'Placement catalog image_id image must be a string.')
+                if region in restored_image_id:
+                    raise ValueError(
+                        'Placement catalog image_id regions must be unique.')
+                restored_image_id[region] = image
+            serialized['image_id'] = restored_image_id
+        location = Location.from_pickleable(serialized)
+        if location is None:
+            raise ValueError('Placement catalog location cannot be null.')
+        return location
+
+    @classmethod
+    def from_task(
+        cls,
+        task: 'task_lib.Task',
+        *,
+        expand_accelerator_counts: bool = False,
+    ) -> 'PlacementCatalog':
+        locations = (_get_possible_location_from_task(
+            task, expand_accelerator_counts=True) if expand_accelerator_counts
+                     else _get_possible_location_from_task(task))
+        if len(locations) > _PLACEMENT_CATALOG_MAX_LOCATIONS:
+            raise ValueError(
+                'Spot placement catalog contains too many locations: '
+                f'{len(locations)} > {_PLACEMENT_CATALOG_MAX_LOCATIONS}.')
+        resources = list(task.resources)[0]
+        entries = []
+        for location in sorted(locations, key=lambda item: item.sort_key()):
+            if str(location.cloud).lower() == 'kubernetes':
+                cost = 0.0
+            else:
+                materialized = resources.copy(**location.to_dict())
+                try:
+                    cost = float(materialized.get_cost(seconds=3600))
+                    if not math.isfinite(cost) or cost < 0:
+                        raise ValueError(f'invalid hourly cost {cost!r}')
+                except (TypeError, ValueError) as e:
+                    # Catalog feasibility can identify an exact launchable
+                    # provider shape whose requested purchase model has no
+                    # price. Keep the location available but sort it last.
+                    logger.warning('No usable price for placement catalog '
+                                   f'location {location}: {e}')
+                    cost = float('inf')
+            entries.append((location, cost))
+        return cls(tuple(entries))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> 'PlacementCatalog':
+        """Deserialize and strictly validate a persisted catalog."""
+        if not isinstance(data, dict):
+            raise ValueError('Placement catalog must be a mapping.')
+        schema_version = data.get('schema_version')
+        if schema_version != _PLACEMENT_CATALOG_SCHEMA_VERSION:
+            raise ValueError('Unsupported placement catalog schema version: '
+                             f'{schema_version!r}.')
+        raw_entries = data.get('entries')
+        if not isinstance(raw_entries, list):
+            raise ValueError('Placement catalog entries must be a list.')
+        if len(raw_entries) > _PLACEMENT_CATALOG_MAX_LOCATIONS:
+            raise ValueError(
+                'Persisted placement catalog contains too many locations: '
+                f'{len(raw_entries)} > {_PLACEMENT_CATALOG_MAX_LOCATIONS}.')
+        entries: list[tuple[Location, float]] = []
+        seen: set[Location] = set()
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                raise ValueError('Placement catalog entry must be a mapping.')
+            raw_location = raw_entry.get('location')
+            if not isinstance(raw_location, dict):
+                raise ValueError(
+                    'Placement catalog location must be a mapping.')
+            location = cls._deserialize_location(raw_location)
+            if location in seen:
+                raise ValueError(
+                    f'Duplicate placement catalog location: {location}.')
+            seen.add(location)
+            raw_cost = raw_entry.get('hourly_cost')
+            if raw_cost is None:
+                cost = float('inf')
+            elif (isinstance(raw_cost, bool) or
+                  not isinstance(raw_cost, (int, float))):
+                raise ValueError('Placement catalog hourly cost must be a '
+                                 'non-negative finite number or null.')
+            else:
+                cost = float(raw_cost)
+                if not math.isfinite(cost) or cost < 0:
+                    raise ValueError('Placement catalog hourly cost must be a '
+                                     'non-negative finite number or null.')
+            entries.append((location, cost))
+        if entries != sorted(entries, key=lambda item: item[0].sort_key()):
+            raise ValueError(
+                'Placement catalog entries must be deterministically sorted.')
+        return cls(tuple(entries))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'schema_version': _PLACEMENT_CATALOG_SCHEMA_VERSION,
+            'entries': [{
+                'location': self._serialize_location(location),
+                'hourly_cost': cost if math.isfinite(cost) else None,
+            } for location, cost in self.entries],
+        }
+
+    def costs(self) -> dict[Location, float]:
+        """Return a mutable runtime map with one value for every location."""
+        return dict(self.entries)
+
+
+def _shape_free_config(resources: 'resources_lib.Resources') -> dict[str, Any]:
+    """Return the resource fields shared by every placement candidate."""
+    # Accelerators and spot-ness are per-location attributes (a heterogeneous
+    # any_of mixes e.g. cloud L4 spot with reserved-cluster A100 on-demand);
+    # everything else must be uniform across entries.
+    config = resources.copy(cloud=None, region=None, zone=None).to_yaml_config()
+    for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id',
+                'container_image', 'disk_tier', 'ephemeral_storage',
+                'instance_type'):
+        config.pop(key, None)
+    return config
+
+
+def _validate_placement_resource_configs(task: 'task_lib.Task') -> None:
+    """Validate placement shapes without enumerating provider catalogs."""
+    assert task.resources  # Guaranteed in task constructor.
+    resources_list = list(task.resources)
+    empty_location_resources_config = _shape_free_config(resources_list[0])
+    for resources in resources_list:
+        if _shape_free_config(resources) != empty_location_resources_config:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'Different resource configurations are not supported '
+                    'for spot placement. All resources must have the same '
+                    'configuration except for cloud/region/zone/'
+                    'accelerators/use_spot/image_id/container_image/disk_tier/'
+                    'ephemeral_storage/instance_type.')
+
+
 def _expand_accelerator_counts_for_cloud(
     resources: 'resources_lib.Resources',
     cloud: sky_clouds.Cloud,
@@ -400,37 +586,8 @@ def _get_possible_location_from_task(
     *,
     expand_accelerator_counts: bool = False,
 ) -> list[Location]:
-
-    def _shape_free_config(
-            resources: 'resources_lib.Resources') -> dict[str, Any]:
-        # Accelerators and spot-ness are per-location attributes (a
-        # heterogeneous any_of mixes e.g. cloud L4 spot with
-        # reserved-cluster A100 on-demand); everything else must be
-        # uniform across entries. Compare yaml configs with the
-        # per-location keys stripped instead of round-tripping through
-        # Resources.copy(use_spot=None), whose None handling is not a
-        # 'clear this field' contract.
-        config = resources.copy(cloud=None, region=None,
-                                zone=None).to_yaml_config()
-        for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id',
-                    'container_image', 'disk_tier', 'ephemeral_storage',
-                    'instance_type'):
-            config.pop(key, None)
-        return config
-
-    assert task.resources  # Guaranteed in task constructor
+    _validate_placement_resource_configs(task)
     resources_list = list(task.resources)
-    empty_location_resources_config = _shape_free_config(resources_list[0])
-
-    for r in resources_list:
-        if _shape_free_config(r) != empty_location_resources_config:
-            with ux_utils.print_exception_no_traceback():
-                raise ValueError(
-                    'Different resource configurations are not supported '
-                    'for spot placement. All resources must have the same '
-                    'configuration except for cloud/region/zone/'
-                    'accelerators/use_spot/image_id/container_image/disk_tier/'
-                    'ephemeral_storage/instance_type.')
 
     # Group entries by (accelerators, use_spot) shape: locations are
     # enumerated per shape so each candidate location knows exactly what
@@ -531,29 +688,31 @@ class SpotPlacer:
 
     _expand_accelerator_counts = False
 
-    def __init__(self, task: 'task_lib.Task') -> None:
-        if self._expand_accelerator_counts:
-            possible_locations = _get_possible_location_from_task(
-                task, expand_accelerator_counts=True)
+    def __init__(
+        self,
+        task: 'task_lib.Task',
+        placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
+    ) -> None:
+        if placement_catalog is None:
+            catalog_value = PlacementCatalog.from_task(
+                task, expand_accelerator_counts=self._expand_accelerator_counts)
+        elif isinstance(placement_catalog, PlacementCatalog):
+            catalog_value = placement_catalog
         else:
-            possible_locations = _get_possible_location_from_task(task)
+            catalog_value = PlacementCatalog.from_dict(placement_catalog)
+        possible_locations = [location for location, _ in catalog_value.entries]
         logger.info(f'{len(possible_locations)} possible location candidates '
-                    'are enabled for spot placement.')
+                    'loaded from the centralized placement catalog.')
         logger.debug(f'All possible locations: {possible_locations}')
+        self.placement_catalog = catalog_value
         self.location2status: dict[Location, LocationStatus] = {
             location: LocationStatus.ACTIVE for location in possible_locations
         }
         # When each PREEMPTED mark was set; drives the TTL retry.
         self.location2preempted_at: dict[Location, float] = {}
-        # Kubernetes is user-owned capacity and always has zero SkyPilot cost.
-        # Seed that classification from the enumerated location instead of
-        # re-running live feasibility against the cluster on every service
-        # scale tick during an API outage.
-        self.location2cost: dict[Location, float] = {
-            location: 0.0
-            for location in possible_locations
-            if str(location.cloud).lower() == 'kubernetes'
-        }
+        # Complete by construction. Runtime paths must never resolve provider
+        # feasibility or pricing because a location cost is missing.
+        self.location2cost = catalog_value.costs()
         # Already checked there is only one resource in the task.
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes
@@ -687,56 +846,10 @@ class SpotPlacer:
             if preempted_at is not None:
                 self.location2preempted_at[location] = preempted_at
 
-    def _get_cost_per_hour_cached(self, location: Location) -> float:
-        if location in self.location2cost:
-            return self.location2cost[location]
-        # TODO(tian): Is there a better way to do this? This is for filling
-        # instance type so the get_cost() can operate normally.
-        r: resources_lib.Resources = self.resources.copy(**location.to_dict())
-        assert r.cloud is not None
-        rs = r.cloud.get_feasible_launchable_resources(
-            r, num_nodes=self.num_nodes).resources_list
-        if not rs:
-            # Feasibility can be transiently empty: for Kubernetes
-            # locations the check is a LIVE API call (an unreachable
-            # context is swallowed into an empty region list), and a
-            # catalog regression can empty cloud entries too. min() over
-            # an empty list would raise -- through the constructor-time
-            # zero-cost seed that would crash-loop the controller at
-            # boot. Degrade to infinity: the location reads as
-            # not-zero-cost and maximally expensive this round, and the
-            # miss is NOT memoized so it heals on the next call.
-            logger.warning('No feasible resources for location '
-                           f'{location}; treating its cost as infinite '
-                           'for this round.')
-            return float('inf')
-        # For some clouds, there might have multiple instance types
-        # satisfying the resource request. In such case we choose the
-        # cheapest one, as the optimizer does. Reference:
-        # sky/optimizer.py::Optimizer::_print_candidates
-        costs: list[float] = []
-        for resource in rs:
-            try:
-                costs.append(resource.get_cost(seconds=3600))
-            except ValueError as e:
-                # A catalog can list a feasible instance type without a price
-                # for the requested purchase model (for example, an AWS type
-                # with no SpotPrice).  One incomplete paid candidate must not
-                # abort zero-cost classification or the autoscaler's launch
-                # tick.  Ignore it if another feasible resource is priced;
-                # otherwise treat this location as maximally expensive.
-                logger.warning('No usable price for feasible resource '
-                               f'{resource} at {location}: {e}')
-        if not costs:
-            cost = float('inf')
-            self.location2cost[location] = cost
-            return cost
-        cost = min(costs)
-        self.location2cost[location] = cost
-        return cost
-
     def _min_cost_location(self, locations: list[Location]) -> Location:
-        return min(locations, key=self._get_cost_per_hour_cached)
+        return min(
+            locations,
+            key=lambda location: self.location2cost.get(location, float('inf')))
 
     def _effective_status(self, location: Location) -> LocationStatus:
         """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
@@ -781,7 +894,7 @@ class SpotPlacer:
         """Return every configured location, regardless of retry status.
 
         Card-level cold placement order must remain stable while a location is
-        temporarily benched. Callers may inspect nominal cached costs through
+        temporarily benched. Callers may inspect nominal catalog costs through
         cost_per_hour(), but launch selection must still use active_locations()
         or select_next_location().
         """
@@ -866,40 +979,18 @@ class SpotPlacer:
         return preempted_at is not None and preempted_at <= selected_at
 
     def cost_per_hour(self, location: Location) -> float:
-        """Return the current cached catalog cost for a known location."""
+        """Return the centralized catalog cost without provider resolution."""
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if resolved is None:
             return float('inf')
-        return self._get_cost_per_hour_cached(resolved)
-
-    def cached_cost_per_hour(self, location: Location) -> float | None:
-        """Return a known cost without resolving resources or provider data.
-
-        Callers that run before the controller health endpoint binds must use
-        this bounded view. ``known_locations()`` returns the exact keys used by
-        ``location2cost``, so no legacy-shape resolution is needed here.
-        """
-        return self.location2cost.get(location)
+        return self.location2cost.get(resolved, float('inf'))
 
     def preemptive_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.PREEMPTED)
 
-    def cached_zero_cost_locations(self) -> list[Location]:
-        """Return zero-cost locations already known without provider calls.
-
-        Kubernetes locations are classified as zero-cost during placer
-        construction.  Controller boot uses this bounded view to seed the
-        autoscaler before its first tick without resolving every paid-cloud
-        candidate's feasibility and price.
-        """
-        return [
-            location for location in self.location2status
-            if self.location2cost.get(location) == 0
-        ]
-
     def zero_cost_locations(self) -> list[Location]:
-        """All zero-cost locations, regardless of bench status.
+        """All cataloged zero-cost locations, regardless of bench status.
 
         Enumeration surface for the reserved-capacity fill poller: a
         benched (PREEMPTED) zero-cost location still defines capacity to
@@ -908,7 +999,7 @@ class SpotPlacer:
         """
         return [
             location for location in self.location2status
-            if self._get_cost_per_hour_cached(location) == 0
+            if self.location2cost.get(location) == 0
         ]
 
     def select_next_zero_cost_location(
@@ -937,11 +1028,37 @@ class SpotPlacer:
         return res
 
     @classmethod
-    def from_task(cls, spec: 'service_spec.SkyServiceSpec',
-                  task: 'task_lib.Task') -> Optional['SpotPlacer']:
+    def validate_task(cls, spec: 'service_spec.SkyServiceSpec',
+                      task: 'task_lib.Task') -> None:
+        """Validate placer resource shape without provider enumeration."""
+        if spec.spot_placer is not None:
+            _validate_placement_resource_configs(task)
+
+    @classmethod
+    def build_catalog(
+        cls,
+        spec: 'service_spec.SkyServiceSpec',
+        task: 'task_lib.Task',
+    ) -> PlacementCatalog | None:
+        """Build the one complete catalog for an immutable service version."""
         if spec.spot_placer is None:
             return None
-        return SPOT_PLACERS[spec.spot_placer](task)
+        placer_cls = SPOT_PLACERS[spec.spot_placer]
+        return PlacementCatalog.from_task(
+            task,
+            expand_accelerator_counts=placer_cls._expand_accelerator_counts)  # pylint: disable=protected-access
+
+    @classmethod
+    def from_task(
+        cls,
+        spec: 'service_spec.SkyServiceSpec',
+        task: 'task_lib.Task',
+        placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
+    ) -> Optional['SpotPlacer']:
+        if spec.spot_placer is None:
+            return None
+        return SPOT_PLACERS[spec.spot_placer](
+            task, placement_catalog=placement_catalog)
 
 
 class DynamicFallbackSpotPlacer(SpotPlacer,
@@ -949,8 +1066,12 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
                                 default=True):
     """Dynamic Fallback Placer."""
 
-    def __init__(self, task: 'task_lib.Task') -> None:
-        super().__init__(task)
+    def __init__(
+        self,
+        task: 'task_lib.Task',
+        placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(task, placement_catalog=placement_catalog)
         # INVARIANT: the bench TTL must exceed the worst-case launch
         # FAILURE latency of every managed location, or a full location
         # ping-pongs (its bench expires exactly as a sibling's launch
@@ -1019,7 +1140,7 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         # placement preference, never availability).
         zero_cost = [
             location for location in active_locations
-            if self._get_cost_per_hour_cached(location) == 0
+            if self.location2cost.get(location) == 0
         ]
         if zero_cost and not skip_zero_cost_preference:
             active_locations = zero_cost
@@ -1069,6 +1190,7 @@ class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
     def _min_cost_location(self, locations: list[Location]) -> Location:
         # TODO(fran): Rank heterogeneous accelerators by measured workload
         # throughput per dollar once services can publish benchmark weights.
-        return min(locations,
-                   key=lambda location: self._get_cost_per_hour_cached(location)
-                   / self._accelerator_slots(location))
+        return min(
+            locations,
+            key=lambda location: self.location2cost.get(location, float(
+                'inf')) / self._accelerator_slots(location))

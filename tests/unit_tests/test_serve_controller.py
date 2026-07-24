@@ -432,8 +432,8 @@ class TestGetRoutingSpec:
         placer = mock.Mock()
         placer.active_locations.return_value = [a100_location]
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cached_cost_per_hour.side_effect = (
-            lambda location: 1.0 if location is l4_location else 2.0)
+        placer.cost_per_hour.side_effect = (lambda location: 1.0
+                                            if location is l4_location else 2.0)
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -460,8 +460,8 @@ class TestGetRoutingSpec:
         a100_location = types.SimpleNamespace(accelerators={'A100': 1})
         placer = mock.Mock()
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cached_cost_per_hour.side_effect = (
-            lambda location: float('inf') if location is l4_location else 2.0)
+        placer.cost_per_hour.side_effect = (lambda location: float('inf')
+                                            if location is l4_location else 2.0)
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -490,15 +490,12 @@ class TestGetRoutingSpec:
         a100_paid = types.SimpleNamespace(accelerators={'A100': 1})
         costs = {
             id(l4_paid): 2.0,
-            id(l4_uncached): None,
+            id(l4_uncached): float('inf'),
             id(a100_paid): 1.0,
         }
         placer = mock.Mock()
         placer.known_locations.return_value = [l4_paid, l4_uncached, a100_paid]
-        placer.cached_cost_per_hour.side_effect = (
-            lambda location: costs[id(location)])
-        placer.cost_per_hour.side_effect = AssertionError(
-            'pre-bind configuration must not resolve provider cost')
+        placer.cost_per_hour.side_effect = lambda location: costs[id(location)]
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -518,7 +515,7 @@ class TestGetRoutingSpec:
                 spec)
 
         assert configured == ['L4', 'A100']
-        placer.cost_per_hour.assert_not_called()
+        assert placer.cost_per_hour.call_count == 3
 
     def test_prebind_accelerator_configuration_never_resolves_provider_cost(
             self):
@@ -527,9 +524,7 @@ class TestGetRoutingSpec:
         a100_location = types.SimpleNamespace(accelerators={'A100': 1})
         placer = mock.Mock()
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cached_cost_per_hour.return_value = None
-        placer.cost_per_hour.side_effect = AssertionError(
-            'pre-bind configuration must not resolve provider cost')
+        placer.cost_per_hour.return_value = float('inf')
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -552,8 +547,7 @@ class TestGetRoutingSpec:
             routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
 
         assert routing_spec['configured_accelerators'] == ['L4', 'A100']
-        placer.cost_per_hour.assert_not_called()
-        assert placer.cached_cost_per_hour.call_count == 4
+        assert placer.cost_per_hour.call_count == 4
 
     def test_routing_spec_none_when_uninitialized(self):
         ctrl = _make_controller()
@@ -586,8 +580,11 @@ class TestGetRoutingSpec:
             _block_runtime_transition)
 
         new_autoscaler = mock.MagicMock()
-        with mock.patch.object(controller.replica_managers,
-                               'validate_service_update_preflight'), \
+        candidate_placer = mock.sentinel.candidate_placer
+        with mock.patch.object(
+                controller.replica_managers,
+                'validate_service_update_preflight',
+                return_value=candidate_placer), \
              mock.patch.object(controller.serve_state,
                                'get_service_from_name',
                                return_value={'version': 2}), \
@@ -624,6 +621,11 @@ class TestGetRoutingSpec:
         assert not updater.is_alive()
         ctrl._replica_manager.clear_pending_version.assert_called_once_with(  # pylint: disable=line-too-long
             2)
+        ctrl._replica_manager.update_version.assert_called_once_with(  # pylint: disable=line-too-long
+            2,
+            new_spec,
+            update_mode=mock.sentinel.mode,
+            new_spot_placer=candidate_placer)
         assert ctrl._applied_version == 2  # pylint: disable=protected-access
         assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
             'load_balancing_policy_name': 'instance_aware_least_load',
@@ -2543,9 +2545,7 @@ class TestAuthoritativeLbReportIngestion:
         ctrl = _make_controller()
         location = types.SimpleNamespace(accelerators={'A100': 1})
         placer = mock.Mock()
-        placer.cached_zero_cost_locations.return_value = [location]
-        placer.zero_cost_locations.side_effect = AssertionError(
-            'load-balancer sync must not resolve provider costs')
+        placer.zero_cost_locations.return_value = [location]
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             spot_placer=placer)
 
@@ -2558,8 +2558,7 @@ class TestAuthoritativeLbReportIngestion:
             assert not ctrl._get_free_reserved_slots_by_accelerator(  # pylint: disable=protected-access
             )
 
-        placer.cached_zero_cost_locations.assert_called_once_with()
-        placer.zero_cost_locations.assert_not_called()
+        placer.zero_cost_locations.assert_called_once_with()
 
     @pytest.mark.parametrize(
         ('history_error', 'history_accepted'),
@@ -3691,9 +3690,8 @@ class TestSeedFillZeroCostLocations:
     """The constructor-time seed is best-effort, never fatal."""
 
     def test_seed_failure_does_not_propagate(self):
-        # zero_cost_locations() can hit a LIVE K8s feasibility check; an
-        # unreachable context at boot must not crash-loop the controller
-        # through __init__ -- the first successful poll re-seeds.
+        # A malformed/corrupt catalog view must not crash-loop the controller;
+        # later reconciliation can still surface and repair the version.
         ctrl = _make_controller()
         placer = mock.Mock()
         placer.zero_cost_locations.side_effect = RuntimeError('api down')
@@ -3722,7 +3720,7 @@ class TestLbSyncBlockingReadsOffLoop:
                                          region='research-context',
                                          accelerators={'L4': 1})
         placer = mock.Mock()
-        placer.cached_zero_cost_locations.return_value = [location]
+        placer.zero_cost_locations.return_value = [location]
         ctrl._replica_manager = types.SimpleNamespace(spot_placer=placer)  # pylint: disable=protected-access
         # Arm the ownership fence so _owns_current_service reads the DB.
         ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access

@@ -741,6 +741,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
     persisted = mock.MagicMock()
     persisted.pool = True
     persisted.uses_logical_replicas = persisted_logical
+    persisted.spot_placer = 'dynamic_fallback_per_gpu'
     record = {
         'hash': 'incarnation-a',
         'controller_job_id': 1,
@@ -765,6 +766,15 @@ def test_recovery_spawns_controller_with_persisted_semantics(
          mock.patch.object(service.serve_state,
                            'get_yaml_content',
                            return_value=yaml_content), \
+         mock.patch.object(
+             service.serve_state,
+             'get_placement_catalog',
+             return_value={'schema_version': 1, 'entries': []}), \
+         mock.patch.object(
+             service.spot_placer.SpotPlacer,
+             'build_catalog',
+             side_effect=AssertionError(
+                 'persisted recovery must not rebuild the catalog')), \
          mock.patch.object(service.serve_utils,
                            'generate_remote_service_dir_name',
                            return_value='/tmp/legacy-service'), \
@@ -802,6 +812,34 @@ def test_recovery_spawns_controller_with_persisted_semantics(
 
     assert spawn.call_args.args[1] is persisted
     assert spawn.call_args.args[2] == 3
+
+
+def test_legacy_recovery_backfills_catalog_once():
+    task = mock.Mock()
+    service_spec = mock.Mock(spot_placer='dynamic_fallback')
+    catalog = mock.Mock()
+    catalog.to_dict.return_value = {
+        'schema_version': 1,
+        'entries': [],
+    }
+    with mock.patch.object(service.serve_state,
+                           'get_placement_catalog',
+                           return_value=None), \
+         mock.patch.object(service.spot_placer.SpotPlacer,
+                           'build_catalog',
+                           return_value=catalog) as build, \
+         mock.patch.object(service.serve_state,
+                           'set_placement_catalog_if_missing',
+                           return_value=True) as persist:
+        result = service._prepare_placement_catalog('svc',
+                                                    service_spec,
+                                                    task,
+                                                    is_recovery=True,
+                                                    recovery_version=3)
+
+    assert result == {'schema_version': 1, 'entries': []}
+    build.assert_called_once_with(service_spec, task)
+    persist.assert_called_once_with('svc', 3, result)
 
 
 class TestCleanupAuditLog:
@@ -1000,6 +1038,7 @@ class TestFailedStartupCleansOnlyScopedStorage:
         spec.autoscaling_policy_str.return_value = 'policy'
         spec.load_balancing_policy = 'round_robin'
         spec.tls_credential = None
+        spec.spot_placer = None
         return mock.MagicMock(service=spec)
 
     def _common_patches(self, task):

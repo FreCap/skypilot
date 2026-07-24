@@ -36,6 +36,7 @@ from sky.serve import reserved_capacity
 from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import context_utils
@@ -412,16 +413,13 @@ class SkyServeController:
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
-        """Seed known zero-cost identities without blocking controller boot.
+        """Seed centralized zero-cost identities without provider calls.
 
-        The placer classifies Kubernetes locations as zero-cost during its
-        construction.  Use only that already-resident cache here: resolving
-        every uncached paid-cloud candidate can exceed the controller startup
-        deadline for large exact-card catalogs.  The seed grants no free slots
-        and records no snapshot time; it only protects the known fill fleet
-        from the first autoscaler tick.  An already-populated set (e.g. loaded
-        from a dump) is never overwritten -- see
-        Autoscaler.seed_zero_cost_locations.
+        The complete version catalog was materialized before the controller
+        child started. The seed grants no free slots and records no snapshot
+        time; it only protects the known fill fleet from the first autoscaler
+        tick. An already-populated set (e.g. loaded from a dump) is never
+        overwritten -- see Autoscaler.seed_zero_cost_locations.
         """
         if not autoscaler.reserved_capacity_fill:
             return
@@ -431,10 +429,10 @@ class SkyServeController:
         try:
             autoscaler.seed_zero_cost_locations([
                 location.to_pickleable()
-                for location in placer.cached_zero_cost_locations()
+                for location in placer.zero_cost_locations()
             ])
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to seed cached zero-cost locations '
+            logger.warning('Failed to seed cataloged zero-cost locations '
                            '(best-effort; will rely on the first successful '
                            'poll instead): '
                            f'{common_utils.format_exception(e)}')
@@ -2331,14 +2329,12 @@ class SkyServeController:
         return counts
 
     def _get_free_reserved_slots_by_accelerator(self) -> dict[str, int]:
-        """Return fresh cached physical zero-cost supply by exact card."""
+        """Return fresh observed physical supply for cataloged free cards."""
         placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
                          None)
-        # LB sync is latency-sensitive and consumes observations already
-        # refreshed by the background reserved-capacity poller. Do not warm
-        # every paid-provider cost from this request path merely to rediscover
-        # the Kubernetes locations classified during placer construction.
-        getter = getattr(placer, 'cached_zero_cost_locations', None)
+        # LB sync is latency-sensitive and consumes both immutable catalog
+        # identities and observations refreshed by the background poller.
+        getter = getattr(placer, 'zero_cost_locations', None)
         if not callable(getter):
             return {}
         locations = getter()
@@ -2494,14 +2490,12 @@ class SkyServeController:
             configured.sort(key=lambda card: (qps_order.get(
                 card.casefold(), len(qps_order)), card.casefold()))
 
-        # A dynamic placer may already know the nominal per-machine price of
-        # every configured paid shape. Read only that cache here: this method
-        # runs before the controller health endpoint binds, so resolving an
-        # uncached provider candidate can make large catalogs miss the startup
-        # deadline. Include temporarily benched locations: transient
+        # The complete version catalog contains the nominal per-machine price
+        # of every configured shape. Include temporarily benched locations:
+        # transient
         # availability may delay an exact-card cold launch, but must never
         # promote a more expensive compatible card into its place. An
-        # incomplete cache preserves the deterministic service fallback.
+        # unavailable prices preserve the deterministic service fallback.
         if placer is not None:
             configured_by_name = {card.casefold(): card for card in configured}
             paid_costs: dict[str, float] = {}
@@ -2519,11 +2513,7 @@ class SkyServeController:
                 if card is None:
                     continue
                 try:
-                    cached_cost = placer.cached_cost_per_hour(location)
-                    if cached_cost is None:
-                        unpriced_cards.add(card)
-                        continue
-                    hourly_cost = float(cached_cost)
+                    hourly_cost = float(placer.cost_per_hour(location))
                 except Exception:  # pylint: disable=broad-except
                     unpriced_cards.add(card)
                     continue
@@ -2866,18 +2856,36 @@ class SkyServeController:
                            'preserve the per-GPU capacity target.'
             },
                                           status_code=400)
-        if (authoritative_retry_service is None and getattr(
-                validation_service, 'uses_logical_replicas', False) is True):
+        placement_catalog = serve_state.get_placement_catalog(
+            self._service_name, version)
+        needs_catalog = (getattr(validation_service, 'spot_placer', None)
+                         is not None and placement_catalog is None)
+        needs_logical_validation = (
+            authoritative_retry_service is None and
+            getattr(validation_service, 'uses_logical_replicas', False) is True)
+        if needs_catalog or needs_logical_validation:
             try:
-                update_task = task_lib.Task.from_yaml_str(yaml_content)
-                if update_task.num_nodes != 1:
+                if needs_catalog:
+                    update_task = (replica_managers.load_task_with_service_spec(
+                        yaml_content, validation_service))
+                else:
+                    update_task = task_lib.Task.from_yaml_str(yaml_content)
+                if (needs_logical_validation and update_task.num_nodes != 1):
                     raise ValueError(
                         'dynamic_fallback_per_gpu currently supports only '
                         'single-node services. Multi-node replica routing '
                         'does not yet define a safe logical capacity contract.')
+                if needs_catalog:
+                    built_catalog = spot_placer.SpotPlacer.build_catalog(
+                        validation_service, update_task)
+                    assert built_catalog is not None
+                    placement_catalog = built_catalog.to_dict()
             except (ValueError, RuntimeError) as e:
                 return responses.JSONResponse(content={'message': str(e)},
                                               status_code=400)
+        catalog_kwargs = ({
+            'placement_catalog': placement_catalog
+        } if placement_catalog is not None else {})
         result = serve_state.add_or_update_version(
             self._service_name,
             version,
@@ -2887,7 +2895,8 @@ class SkyServeController:
             expected_service_hash=(requested_service_hash or
                                    self._service_hash),
             expected_lifecycle_epoch=lifecycle_epoch,
-            expected_controller_owner=self._controller_owner)
+            expected_controller_owner=self._controller_owner,
+            **catalog_kwargs)
         if result is serve_state.VersionCommitResult.REJECTED:
             return responses.JSONResponse(content={
                 'message': 'Service lifecycle ownership changed or entered '
@@ -3165,8 +3174,9 @@ class SkyServeController:
                 raise ValueError(
                     'Refusing to apply a physical-backend version after '
                     'logical replica semantics were activated.')
-            replica_managers.validate_service_update_preflight(
-                self._service_name, version, service)
+            candidate_spot_placer = (
+                replica_managers.validate_service_update_preflight(
+                    self._service_name, version, service))
         except (AssertionError, RuntimeError, TypeError, ValueError) as e:
             raise DeterministicServiceUpdateError(
                 f'Version {version} failed deterministic launch preflight: '
@@ -3179,9 +3189,11 @@ class SkyServeController:
         # the lock and make the durable version live.
         self._replica_manager.notify_version_pending(version)
         try:
-            self._replica_manager.update_version(version,
-                                                 service,
-                                                 update_mode=update_mode)
+            self._replica_manager.update_version(
+                version,
+                service,
+                update_mode=update_mode,
+                new_spot_placer=(candidate_spot_placer))
         finally:
             self._replica_manager.clear_pending_version(version)
         new_autoscaler = autoscalers.Autoscaler.from_spec(

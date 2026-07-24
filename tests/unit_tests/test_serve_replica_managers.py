@@ -76,6 +76,10 @@ class TestSkyPilotReplicaManagerInitOrdering:
                  'sky.serve.replica_managers.load_task_with_service_spec',
                  return_value=mock.MagicMock()), \
              mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'get_placement_catalog',
+                 return_value={}), \
+             mock.patch(
                  'sky.serve.replica_managers.spot_placer.SpotPlacer.from_task',
                  return_value=None), \
              mock.patch.object(
@@ -186,6 +190,10 @@ run: echo hi
              mock.patch(
                  'sky.serve.replica_managers.task_lib.Task.from_yaml_str',
                  side_effect=AssertionError('must not reparse service')), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'get_placement_catalog',
+                 return_value={}), \
              mock.patch(
                  'sky.serve.replica_managers.spot_placer.SpotPlacer.from_task',
                  return_value=None), \
@@ -997,7 +1005,7 @@ class TestUpdateVersionHoldsManagerLock:
 class TestUpdateVersionBatchesPriorVersionYamls:
     """`update_version` should reuse old YAMLs per distinct version."""
 
-    def test_refreshes_spot_placer_from_new_task(self):
+    def test_reuses_preflight_spot_placer_for_new_task(self):
         mgr = _make_manager()
         old_placer = mock.Mock(name='old_placer')
         new_placer = mock.Mock(name='new_placer')
@@ -1026,10 +1034,12 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  return_value=new_placer) as build_placer:
             mgr.update_version(2,
                                spec,
-                               update_mode=serve_utils.UpdateMode.ROLLING)
+                               update_mode=serve_utils.UpdateMode.ROLLING,
+                               new_spot_placer=new_placer)
 
         parse_task.assert_called_once_with(new_yaml, spec)
-        build_placer.assert_called_once_with(spec, new_task)
+        build_placer.assert_not_called()
+        new_placer.inherit_preemption_state.assert_called_once_with(old_placer)
         assert mgr._spot_placer is new_placer
 
     def test_reuses_distinct_old_version_yamls(self):
@@ -1316,7 +1326,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         assert not persisted
         assert info.version == 1
 
-    def test_logical_update_rebuilds_shape_placer_from_new_version(self):
+    def test_logical_update_reuses_shape_placer_from_preflight(self):
         mgr = _make_manager()
         mgr.latest_version = 1
         mgr.yaml_content = 'old: yaml'
@@ -1326,7 +1336,10 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         new_placer = mock.Mock(name='new_placer')
         new_placer.active_locations.return_value = [new_location]
         new_task = types.SimpleNamespace(resources=[new_location], num_nodes=1)
-        spec = types.SimpleNamespace(uses_logical_replicas=True)
+        spec = types.SimpleNamespace(
+            uses_logical_replicas=True,
+            spot_placer='dynamic_fallback_per_gpu',
+        )
         yaml_content = ('resources: {}\n'
                         'file_mounts: {}\n'
                         'service: {readiness_probe: /}\n')
@@ -1345,9 +1358,11 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                                return_value=[]):
             mgr.update_version(2,
                                spec,
-                               update_mode=serve_utils.UpdateMode.ROLLING)
+                               update_mode=serve_utils.UpdateMode.ROLLING,
+                               new_spot_placer=new_placer)
 
-        build_placer.assert_called_once_with(spec, new_task)
+        build_placer.assert_not_called()
+        new_placer.inherit_preemption_state.assert_called_once_with(old_placer)
         assert mgr._spot_placer is new_placer
         assert mgr._default_planned_capacity == 4
         assert mgr.latest_version == 2

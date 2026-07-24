@@ -169,7 +169,7 @@ def _order_cold_paid_cards(
     location_gpu_shape: typing.Callable[[spot_placer.Location], tuple[str,
                                                                       int]],
 ) -> list[str]:
-    """Order paid-capable cold cards from the placer's bounded cost cache."""
+    """Order paid-capable cold cards from the centralized catalog."""
     if placer is None:
         return list(configured_cards)
     canonical_by_name = {card.casefold(): card for card in configured_cards}
@@ -186,11 +186,7 @@ def _order_cold_paid_cards(
         if card is None or gpu_count != configured_gpu_count(card):
             continue
         try:
-            cached_cost = placer.cached_cost_per_hour(location)
-            if cached_cost is None:
-                unpriced_cards.add(card)
-                continue
-            hourly_cost = float(cached_cost)
+            hourly_cost = float(placer.cost_per_hour(location))
         except Exception:  # pylint: disable=broad-except
             unpriced_cards.add(card)
             continue
@@ -212,9 +208,8 @@ def _order_cold_paid_cards(
     paid_or_unpriced_cards = [
         card for card in configured_cards if card not in reserved_only_cards
     ]
-    # A cached paid price for one location does not make the card complete:
-    # another uncached location for that card may resolve cheaper. Preserve
-    # service order until every inspected location has a conclusive price.
+    # An unavailable nominal price keeps service order deterministic instead
+    # of letting incomplete provider pricing promote a different card.
     if (not unpriced_cards and
             all(card in paid_costs for card in paid_or_unpriced_cards)):
         service_order = {
@@ -1556,13 +1551,9 @@ class Autoscaler:
             if candidate_capacity + 1e-9 < incumbent_capacity:
                 continue
             # This method can run while the concurrency autoscaler holds its
-            # logical-state lock. A cache miss is not worth blocking LB demand
-            # ingestion on provider feasibility and catalog lookups; the
-            # background placement path can populate the price for a later
-            # rebalance tick.
-            candidate_cost = placer.cached_cost_per_hour(location)
-            if candidate_cost is None:
-                continue
+            # logical-state lock. cost_per_hour() is a pure lookup over the
+            # complete centralized catalog and cannot resolve providers.
+            candidate_cost = placer.cost_per_hour(location)
             if not math.isfinite(candidate_cost) or candidate_cost < 0:
                 continue
             candidate_unit_cost = candidate_cost / candidate_capacity

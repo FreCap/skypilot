@@ -1,4 +1,4 @@
-"""State-transfer tests for rebuilding a Serve spot placer on update."""
+"""State-transfer tests for publishing a versioned Serve spot placer."""
 
 # pylint: disable=protected-access
 
@@ -54,12 +54,11 @@ def test_update_preserves_bench_for_unchanged_location(monkeypatch):
                         lambda *_args: mock.Mock())
     monkeypatch.setattr(replica_managers, '_uniform_whole_gpu_capacity',
                         lambda *_args: None)
-    monkeypatch.setattr(replica_managers.spot_placer.SpotPlacer, 'from_task',
-                        lambda *_args: new_placer)
 
     manager.update_version(2,
                            mock.Mock(spot_placer='dynamic_fallback'),
-                           update_mode=serve_utils.UpdateMode.ROLLING)
+                           update_mode=serve_utils.UpdateMode.ROLLING,
+                           new_spot_placer=new_placer)
 
     assert unchanged in new_placer.preemptive_locations()
     assert new_placer.location2preempted_at[unchanged] == benched_at

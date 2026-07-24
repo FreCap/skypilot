@@ -431,12 +431,10 @@ def adopt_existing_claims(
     """Adopt unresolved legacy rows before recovery re-drives their launches."""
     if service_hash is None or not central_authority_available():
         return True
-    # Recovery starts before the controller HTTP port binds. Use the placer's
-    # construction-time zero-cost classification instead of resolving every
-    # paid-cloud candidate while adopting legacy claims. Unresolved locations
-    # remain conservatively paid, which is the safe side of claim admission.
+    # Recovery starts before the controller HTTP port binds. The centralized
+    # version catalog is already complete, so this cannot resolve providers.
     zero_cost = set(
-        placer.cached_zero_cost_locations()) if placer is not None else set()
+        placer.zero_cost_locations()) if placer is not None else set()
     claims = []
     for info in replica_infos:
         if (getattr(info.status, 'value',
