@@ -702,7 +702,7 @@ export function GPUs() {
 
   const handleDeploySSHPool = async (poolName) => {
     try {
-      await deploySSHNodePool(poolName);
+      return await deploySSHNodePool(poolName);
     } catch (error) {
       console.error('Failed to deploy SSH Node Pool:', error);
       // Let the error bubble up to be handled by the dialog

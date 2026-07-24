@@ -15,17 +15,23 @@ import {
   getEnabledCloudsBatch,
   runSkyCheck,
 } from '@/data/connectors/workspaces';
-import { getSSHNodePools } from '@/data/connectors/ssh-node-pools';
+import {
+  deploySSHNodePool,
+  getSSHNodePools,
+} from '@/data/connectors/ssh-node-pools';
 import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 
+const router = {
+  isReady: true,
+  query: {},
+  asPath: '/infra',
+  push: jest.fn(),
+};
+let lastSshNodePoolDetailsProps = null;
+
 jest.mock('next/router', () => ({
-  useRouter: () => ({
-    isReady: true,
-    query: {},
-    asPath: '/infra',
-    push: jest.fn(),
-  }),
+  useRouter: () => router,
 }));
 
 jest.mock('@/hooks/useMobile', () => ({
@@ -129,7 +135,10 @@ jest.mock('@/components/ssh-node-pool-modal', () => ({
 }));
 
 jest.mock('@/components/ssh-node-pool-details', () => ({
-  SSHNodePoolDetails: ({ poolName }) => <div>{poolName}</div>,
+  SSHNodePoolDetails: (props) => {
+    lastSshNodePoolDetailsProps = props;
+    return <div>{props.poolName}</div>;
+  },
 }));
 
 jest.mock('@/components/ui/select', () => ({
@@ -212,6 +221,10 @@ describe('Infra page refresh lifecycle', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     installStableFetches();
+    router.query = {};
+    router.asPath = '/infra';
+    router.push.mockReset();
+    lastSshNodePoolDetailsProps = null;
     Object.defineProperty(window.document, 'visibilityState', {
       configurable: true,
       value: 'visible',
@@ -503,5 +516,24 @@ describe('Infra page refresh lifecycle', () => {
     });
 
     expect(getContextGPUData).not.toHaveBeenCalled();
+  });
+
+  it('passes a deploy handler that preserves the queued request id', async () => {
+    router.query = { context: 'ssh-gpu-pool' };
+    router.asPath = '/infra/ssh-gpu-pool';
+    deploySSHNodePool.mockResolvedValue({ request_id: 'deploy-123' });
+
+    render(<GPUs />);
+
+    await waitFor(() =>
+      expect(lastSshNodePoolDetailsProps?.poolName).toBe('gpu-pool')
+    );
+
+    const result =
+      await lastSshNodePoolDetailsProps.handleDeploySSHPool('gpu-pool');
+
+    expect(result).toEqual({ request_id: 'deploy-123' });
+    expect(deploySSHNodePool).toHaveBeenCalledTimes(1);
+    expect(deploySSHNodePool).toHaveBeenCalledWith('gpu-pool');
   });
 });
