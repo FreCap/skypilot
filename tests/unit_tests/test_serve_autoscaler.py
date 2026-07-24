@@ -1764,8 +1764,10 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         # to cold-launch an A100 for flexible demand.
         placer.active_locations.return_value = [a100_location]
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: 1.0
-                                            if location is l4_location else 2.0)
+        placer.cached_cost_per_hour.side_effect = (
+            lambda location: 1.0 if location is l4_location else 2.0)
+        placer.cost_per_hour.side_effect = AssertionError(
+            'controller-critical ordering must use cached costs')
         autoscaler.set_spot_placer(placer)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
         autoscaler._compatibility_demand_complete = True
@@ -1782,6 +1784,8 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         placer.known_locations.return_value = [a100_location, l4_location]
         placer.cached_cost_per_hour.side_effect = (
             lambda location: 0.0 if location is a100_location else 1.0)
+        placer.cost_per_hour.side_effect = AssertionError(
+            'controller-critical ordering must use cached costs')
 
         flexible = self._autoscaler(max_replicas=1)
         flexible.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
@@ -1810,8 +1814,10 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         a100_location = types.SimpleNamespace(accelerators={'A100': 1})
         placer = mock.Mock()
         placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: float('inf')
-                                            if location is l4_location else 2.0)
+        placer.cached_cost_per_hour.side_effect = (
+            lambda location: float('inf') if location is l4_location else 2.0)
+        placer.cost_per_hour.side_effect = AssertionError(
+            'controller-critical ordering must use cached costs')
         autoscaler.set_spot_placer(placer)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
         autoscaler._compatibility_demand_complete = True

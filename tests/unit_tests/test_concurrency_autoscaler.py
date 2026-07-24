@@ -251,6 +251,34 @@ class TestColdPaidCardOrdering(unittest.TestCase):
     def test_cache_miss_preserves_service_order(self):
         self.assertEqual(self._order({'L4': None, 'A100': 1.0}), ['L4', 'A100'])
 
+    def test_cache_miss_on_other_location_of_paid_card_preserves_service_order(
+            self):
+        a100_paid = object()
+        a100_uncached = object()
+        l4_paid = object()
+        costs = {
+            a100_paid: 4.0,
+            a100_uncached: None,
+            l4_paid: 2.0,
+        }
+        cards = {
+            a100_paid: 'A100',
+            a100_uncached: 'A100',
+            l4_paid: 'L4',
+        }
+        placer = mock.Mock()
+        placer.known_locations.return_value = list(costs)
+        placer.cached_cost_per_hour.side_effect = costs.get
+        placer.cost_per_hour.side_effect = AssertionError(
+            'provider cost resolution is not allowed')
+
+        order = autoscalers._order_cold_paid_cards(['A100', 'L4'], placer,
+                                                   lambda _: 1, lambda location:
+                                                   (cards[location], 1))
+
+        self.assertEqual(order, ['A100', 'L4'])
+        placer.cost_per_hour.assert_not_called()
+
 
 class TestTargetMath(unittest.TestCase):
     """target ~= pack(outstanding onto knob x gpu_count capacities)."""

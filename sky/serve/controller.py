@@ -1131,7 +1131,11 @@ class SkyServeController:
                 if logical_versions is not None:
                     await self._confirm_logical_bridge_capacities(
                         replica_infos, logical_versions, observed_slots)
-            replica_counts = self._get_replica_counts(replica_infos)
+            # Replica aggregation includes the cached reserved-capacity
+            # observation read. Keep that PostgreSQL read off the FastAPI
+            # event loop with the other load-balancer sync reads.
+            replica_counts = await loop.run_in_executor(
+                None, self._get_replica_counts, replica_infos)
             history_capacity_hint = self._get_capacity_hint(
                 replica_infos, logical_versions, replica_counts=replica_counts)
             (request_history_accepted, response_time_history_accepted,
@@ -2501,6 +2505,7 @@ class SkyServeController:
         if placer is not None:
             configured_by_name = {card.casefold(): card for card in configured}
             paid_costs: dict[str, float] = {}
+            unpriced_cards: set[str] = set()
             try:
                 known_locations = placer.known_locations()
             except Exception:  # pylint: disable=broad-except
@@ -2516,15 +2521,21 @@ class SkyServeController:
                 try:
                     cached_cost = placer.cached_cost_per_hour(location)
                     if cached_cost is None:
+                        unpriced_cards.add(card)
                         continue
                     hourly_cost = float(cached_cost)
                 except Exception:  # pylint: disable=broad-except
+                    unpriced_cards.add(card)
                     continue
-                if not math.isfinite(hourly_cost) or hourly_cost <= 0:
+                if not math.isfinite(hourly_cost) or hourly_cost < 0:
+                    unpriced_cards.add(card)
+                    continue
+                if hourly_cost == 0:
                     continue
                 paid_costs[card] = min(hourly_cost,
                                        paid_costs.get(card, float('inf')))
-            if all(card in paid_costs for card in configured):
+            if (not unpriced_cards and
+                    all(card in paid_costs for card in configured)):
                 fallback_order = {
                     card: index for index, card in enumerate(configured)
                 }

@@ -482,6 +482,44 @@ class TestGetRoutingSpec:
 
         assert configured == ['L4', 'A100']
 
+    def test_configured_catalog_preserves_order_when_one_location_is_uncached(
+            self):
+        ctrl = _make_controller()
+        l4_paid = types.SimpleNamespace(accelerators={'L4': 1})
+        l4_uncached = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_paid = types.SimpleNamespace(accelerators={'A100': 1})
+        costs = {
+            id(l4_paid): 2.0,
+            id(l4_uncached): None,
+            id(a100_paid): 1.0,
+        }
+        placer = mock.Mock()
+        placer.known_locations.return_value = [l4_paid, l4_uncached, a100_paid]
+        placer.cached_cost_per_hour.side_effect = (
+            lambda location: costs[id(location)])
+        placer.cost_per_hour.side_effect = AssertionError(
+            'pre-bind configuration must not resolve provider cost')
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            yaml_content='service: {}',
+            spot_placer=placer)
+        task = types.SimpleNamespace(resources=[
+            types.SimpleNamespace(accelerators={'L4': 1}),
+            types.SimpleNamespace(accelerators={'A100': 1}),
+        ])
+        spec = types.SimpleNamespace(min_replicas_by_accelerator={},
+                                     target_qps_per_replica={
+                                         'L4': 1.0,
+                                         'A100': 1.0,
+                                     })
+        with mock.patch.object(controller.replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task):
+            configured = ctrl._configured_accelerators(  # pylint: disable=protected-access
+                spec)
+
+        assert configured == ['L4', 'A100']
+        placer.cost_per_hour.assert_not_called()
+
     def test_prebind_accelerator_configuration_never_resolves_provider_cost(
             self):
         ctrl = _make_controller()
@@ -3670,16 +3708,22 @@ class TestSeedFillZeroCostLocations:
 class TestLbSyncBlockingReadsOffLoop:
     """`/lb/sync` DB reads must run in the executor, not on the event loop.
 
-    On a large replica table `get_replica_infos` / `get_specs` / the
-    ownership-fence reads are the handler's blocking calls; running them on
-    the FastAPI event loop stalls the controller liveness and ownership
-    probes served by the same loop (the same invariant that already keeps
+    On a large replica table, replica/spec/ownership reads and the cached
+    reserved-capacity observation read are blocking calls. Running them on the
+    FastAPI event loop stalls the controller liveness and ownership probes
+    served by the same loop (the same invariant that already keeps
     `_lb_report_authority` and `_get_lb_replica_info` in the executor).
     """
 
     def _run_sync(self):
         ctrl = _make_controller()
         ctrl._autoscaler = mock.Mock(replica_unit='physical')  # pylint: disable=protected-access
+        location = types.SimpleNamespace(cloud='Kubernetes',
+                                         region='research-context',
+                                         accelerators={'L4': 1})
+        placer = mock.Mock()
+        placer.cached_zero_cost_locations.return_value = [location]
+        ctrl._replica_manager = types.SimpleNamespace(spot_placer=placer)  # pylint: disable=protected-access
         # Arm the ownership fence so _owns_current_service reads the DB.
         ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
         ctrl._controller_owner = (101, '10.0.0.1')  # pylint: disable=protected-access
@@ -3717,6 +3761,10 @@ class TestLbSyncBlockingReadsOffLoop:
                                side_effect=_record([])), \
              mock.patch.object(controller.serve_state, 'get_specs',
                                side_effect=_record({})), \
+             mock.patch.object(
+                 controller.reserved_capacity,
+                 'get_cached_free_gpus_by_pool',
+                 side_effect=_record({})), \
              mock.patch.object(ctrl, '_lb_report_authority',
                                return_value=(True, True, True)), \
              mock.patch.object(ctrl, '_get_lb_replica_info',
@@ -3732,10 +3780,10 @@ class TestLbSyncBlockingReadsOffLoop:
         response, read_threads, loop_thread = self._run_sync()
         assert response.status_code == 200
         # 2 ownership-fence reads (entry + pre-side-effect) + replica rows +
-        # specs all happened -- and nothing more: the fences are the sync
-        # handler's per-request DB cost, so extra redundant reads here are a
-        # hot-path regression.
-        assert len(read_threads) == 4
+        # specs + one batched reserved-capacity observation read all happened
+        # -- and nothing more. Extra redundant reads here are a hot-path
+        # regression.
+        assert len(read_threads) == 5
         # ...and none of them on the event-loop thread.
         assert all(tid != loop_thread for tid in read_threads)
 

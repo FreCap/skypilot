@@ -212,7 +212,11 @@ def _order_cold_paid_cards(
     paid_or_unpriced_cards = [
         card for card in configured_cards if card not in reserved_only_cards
     ]
-    if all(card in paid_costs for card in paid_or_unpriced_cards):
+    # A cached paid price for one location does not make the card complete:
+    # another uncached location for that card may resolve cheaper. Preserve
+    # service order until every inspected location has a conclusive price.
+    if (not unpriced_cards and
+            all(card in paid_costs for card in paid_or_unpriced_cards)):
         service_order = {
             card: index for index, card in enumerate(configured_cards)
         }
@@ -416,6 +420,12 @@ class Autoscaler:
                                                          spot_placer.Location],
                                                    float] = {}
         self._cost_rebalance_replica_cost_cache: dict[int, float] = {}
+        # Shape-aware autoscalers resolve candidate prices before entering
+        # their demand-state critical sections and install the snapshot only
+        # for that decision tick. Unlocked autoscalers leave this as None and
+        # retain the existing resolving lookup at candidate-scoring time.
+        self._cost_rebalance_costs_for_tick: (dict[spot_placer.Location, float]
+                                              | None) = None
         # Freshness fence for priority-only gauges. A stale LB report may keep
         # a conservative scale-up target, but it must not keep refreshing a
         # high-priority paid-capacity waiter indefinitely.
@@ -570,6 +580,35 @@ class Autoscaler:
     def set_spot_placer(self, placer: spot_placer.SpotPlacer | None) -> None:
         """Publish ReplicaManager's live placement/bench state for this tick."""
         self._cost_rebalance_spot_placer = placer
+
+    def _resolve_cost_rebalance_cost_snapshot(
+        self,
+    ) -> tuple[spot_placer.SpotPlacer | None, dict[spot_placer.Location,
+                                                   float]]:
+        """Resolve active candidate prices before a decision-state lock."""
+        placer = self._cost_rebalance_spot_placer
+        if not self.cost_rebalance or placer is None:
+            return placer, {}
+        try:
+            active_locations = placer.active_locations()
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Failed to enumerate cost-rebalance candidates: '
+                           f'{error}')
+            return placer, {}
+        costs: dict[spot_placer.Location, float] = {}
+        failed = 0
+        for location in active_locations:
+            try:
+                costs[location] = float(placer.cost_per_hour(location))
+            except Exception:  # pylint: disable=broad-except
+                # One provider/catalog failure must not suppress ordinary
+                # demand scaling. Omit that candidate for this tick.
+                failed += 1
+        if failed:
+            logger.warning('Failed to resolve hourly cost for '
+                           f'{failed}/{len(active_locations)} active '
+                           'cost-rebalance candidates; deferring them.')
+        return placer, costs
 
     def collect_request_information(
             self, request_aggregator_info: dict[str, Any]) -> None:
@@ -1551,7 +1590,17 @@ class Autoscaler:
                 location)
             if candidate_capacity + 1e-9 < incumbent_capacity:
                 continue
-            candidate_cost = placer.cost_per_hour(location)
+            candidate_cost: float | None
+            if self._cost_rebalance_costs_for_tick is None:
+                candidate_cost = placer.cost_per_hour(location)
+            else:
+                # Locked autoscalers consume only the snapshot resolved before
+                # their decision-state lock was acquired, so LB demand
+                # ingestion never waits on provider feasibility or catalogs.
+                candidate_cost = self._cost_rebalance_costs_for_tick.get(
+                    location)
+            if candidate_cost is None:
+                continue
             if not math.isfinite(candidate_cost) or candidate_cost < 0:
                 continue
             candidate_unit_cost = candidate_cost / candidate_capacity
@@ -2902,13 +2951,19 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         active_versions: list[int],
     ) -> list[AutoscalerDecision]:
         shape_handles = self._resolve_gpu_shape_handles(replica_infos)
+        (snapshot_placer,
+         cost_rebalance_costs) = self._resolve_cost_rebalance_cost_snapshot()
         with self._instance_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._cost_rebalance_costs_for_tick = (
+                cost_rebalance_costs
+                if self._cost_rebalance_spot_placer is snapshot_placer else {})
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
             finally:
                 self._gpu_shape_handles_for_tick = None
+                self._cost_rebalance_costs_for_tick = None
 
     def _generate_scaling_decisions_locked(
         self,
@@ -5995,13 +6050,19 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         active_versions: list[int],
     ) -> list[AutoscalerDecision]:
         shape_handles = self._resolve_gpu_shape_handles(replica_infos)
+        (snapshot_placer,
+         cost_rebalance_costs) = self._resolve_cost_rebalance_cost_snapshot()
         with self._logical_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._cost_rebalance_costs_for_tick = (
+                cost_rebalance_costs
+                if self._cost_rebalance_spot_placer is snapshot_placer else {})
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
             finally:
                 self._gpu_shape_handles_for_tick = None
+                self._cost_rebalance_costs_for_tick = None
 
     def _generate_scaling_decisions_locked(
         self,
