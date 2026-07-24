@@ -473,19 +473,32 @@ def _load_contract(
     return payload, revision, profile, target, binding, digest, reference
 
 
-def _instance_profile_role(iam: Any,
-                           instance_profile: str,
-                           *,
-                           drain_event: threading.Event | None = None) -> str:
+def _instance_profile_identity(
+        iam: Any,
+        instance_profile: str,
+        *,
+        drain_event: threading.Event | None = None) -> tuple[str, str]:
     response = _ordinary_provider_call(iam,
                                        'get_instance_profile',
                                        drain_event,
                                        InstanceProfileName=instance_profile)
     profile = response.get('InstanceProfile', {})
+    profile_arn = profile.get('Arn')
     roles = profile.get('Roles', [])
-    if len(roles) != 1 or not isinstance(roles[0].get('Arn'), str):
-        raise ValueError('Qualified instance profile has an invalid role set.')
-    return str(roles[0]['Arn'])
+    if (not isinstance(profile_arn, str) or not profile_arn or
+            len(roles) != 1 or not isinstance(roles[0].get('Arn'), str)):
+        raise ValueError('Qualified instance profile has invalid identity.')
+    return profile_arn, str(roles[0]['Arn'])
+
+
+def _instance_profile_role(iam: Any,
+                           instance_profile: str,
+                           *,
+                           drain_event: threading.Event | None = None) -> str:
+    _, role_arn = _instance_profile_identity(iam,
+                                             instance_profile,
+                                             drain_event=drain_event)
+    return role_arn
 
 
 def _tagged_instances(
@@ -1187,9 +1200,8 @@ def _run_ec2_canary_inner(
                               target.region,
                               heartbeat,
                               drain_event=drain_event)
-        actual_role = _instance_profile_role(iam,
-                                             binding.instance_profile,
-                                             drain_event=drain_event)
+        iam_profile_arn, actual_role = _instance_profile_identity(
+            iam, binding.instance_profile, drain_event=drain_event)
         _raise_if_draining(drain_event)
         if actual_role != binding.principals[0]:
             raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
@@ -1360,6 +1372,8 @@ def _run_ec2_canary_inner(
                                                    heartbeat,
                                                    drain_event=drain_event)
                 if success and actual_profile_arn is None:
+                    if iam_profile_arn != expected_profile_arn:
+                        raise ValueError('QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED')
                     _record_ec2_instance_profile(operation,
                                                  child_id,
                                                  expected_profile_arn,

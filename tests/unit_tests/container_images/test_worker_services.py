@@ -1346,8 +1346,10 @@ def test_ec2_teardown_failure_drops_losing_provider_state(
     monkeypatch.setattr(
         canary_worker_service, '_authorized_launch_deadline',
         lambda *_args, **_kwargs: canary_worker_service.time.monotonic() + 30)
-    monkeypatch.setattr(canary_worker_service, '_instance_profile_role',
-                        lambda *_args, **_kwargs: binding.principals[0])
+    monkeypatch.setattr(
+        canary_worker_service, '_instance_profile_identity',
+        lambda *_args, **_kwargs:
+        (models.ec2_instance_profile_arn(binding), binding.principals[0]))
     monkeypatch.setattr(canary_worker_service, '_tagged_instances',
                         tagged_instances)
     monkeypatch.setattr(canary_worker_service, '_terminate_ec2_instances',
@@ -1989,6 +1991,7 @@ def test_expired_database_authorization_blocks_ec2_create_with_slow_host_clock(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': models.ec2_instance_profile_arn(binding),
             'Roles': [{
                 'Arn': binding.principals[0]
             }]
@@ -2129,6 +2132,8 @@ def test_exact_ec2_canary_read_rejects_id_and_tag_splices(
      ('x86_64', 'expected', 'missing', None),
      ('x86_64', 'expected', 'missing_without_marker',
       'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
+     ('x86_64', 'expected', 'iam_path_mismatch',
+      'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
      ('x86_64', 'expected', 'conflicting',
       'QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED'),
      ('arm64', 'expected', 'expected', 'QUALIFICATION_FAILED'),
@@ -2180,7 +2185,8 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         instance['ImageId'] = 'ami-other'
     if architecture is not None:
         instance['Architecture'] = architecture
-    if profile_case in ('missing', 'missing_without_marker'):
+    if profile_case in ('missing', 'missing_without_marker',
+                        'iam_path_mismatch'):
         instance.pop('IamInstanceProfile')
     elif profile_case == 'conflicting':
         instance['IamInstanceProfile'] = {
@@ -2265,8 +2271,13 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
         monkeypatch.setattr(canary_worker_service,
                             '_EC2_CONSOLE_SETTLE_SECONDS', 0)
     iam = mock.Mock()
+    iam_profile_arn = models.ec2_instance_profile_arn(binding)
+    if profile_case == 'iam_path_mismatch':
+        iam_profile_arn = iam_profile_arn.replace(
+            'instance-profile/', 'instance-profile/qualified-path/')
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': iam_profile_arn,
             'Roles': [{
                 'Arn': binding.principals[0]
             }]
@@ -2326,6 +2337,8 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             models.ec2_instance_profile_arn(binding),
         )
     elif profile_case == 'missing_without_marker':
+        record_profile.assert_not_called()
+    elif profile_case == 'iam_path_mismatch':
         record_profile.assert_not_called()
     elif profile_case == 'launch_response':
         assert record_profile.call_args_list == [
@@ -2460,6 +2473,7 @@ def test_ec2_canary_replay_restores_durable_profile_latch(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': expected_profile_arn,
             'Roles': [{
                 'Arn': binding.principals[0],
             }],
@@ -2563,6 +2577,7 @@ def test_ec2_spot_ambiguous_launch_cancels_request_and_terminates_racing_child(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': models.ec2_instance_profile_arn(binding),
             'Roles': [{
                 'Arn': binding.principals[0],
             }]
@@ -2986,6 +3001,7 @@ def test_ec2_canary_malformed_launch_identity_settles_and_terminates_late_child(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': models.ec2_instance_profile_arn(binding),
             'Roles': [{
                 'Arn': binding.principals[0],
             }]
@@ -3186,6 +3202,7 @@ def test_ec2_canary_terminal_child_plus_malformed_discovery_preserves_custody(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': models.ec2_instance_profile_arn(binding),
             'Roles': [{
                 'Arn': 'arn:aws:iam::123456789012:role/wrong-role',
             }]
@@ -3476,6 +3493,7 @@ def test_ec2_ambiguous_settling_consumes_full_window_before_terminalizing(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': models.ec2_instance_profile_arn(binding),
             'Roles': [{
                 'Arn': binding.principals[0],
             }]
@@ -3633,6 +3651,7 @@ def test_ec2_canary_rejects_mismatched_tagged_child_and_tears_down_all(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': models.ec2_instance_profile_arn(binding),
             'Roles': [{
                 'Arn': binding.principals[0]
             }]
@@ -3714,6 +3733,8 @@ def test_eks_canary_fences_clients_and_verifies_teardown(
     iam = mock.Mock()
     iam.get_instance_profile.return_value = {
         'InstanceProfile': {
+            'Arn': ('arn:aws:iam::210987654321:'
+                    'instance-profile/EksNodeProfile'),
             'Roles': [{
                 'Arn': qualified.node_role,
             }]
