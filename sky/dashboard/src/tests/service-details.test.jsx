@@ -297,6 +297,78 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
+  it('lets a manual refresh supersede a pending full-detail read once summary data is visible', async () => {
+    const initialSummary = deferred();
+    const initialFull = deferred();
+    const refreshedSummary = deferred();
+    const refreshedFull = deferred();
+
+    dashboardCache.get
+      .mockImplementationOnce(() => initialSummary.promise)
+      .mockImplementationOnce(() => initialFull.promise)
+      .mockImplementationOnce(() => refreshedSummary.promise)
+      .mockImplementationOnce(() => refreshedFull.promise);
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initialSummary.resolve({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      });
+      await Promise.resolve();
+    });
+    expect(result.current.serviceData.status).toBe('initial-summary');
+
+    let firstRefresh;
+    let duplicateRefresh;
+    act(() => {
+      firstRefresh = result.current.refreshData();
+      duplicateRefresh = result.current.refreshData();
+    });
+
+    expect(duplicateRefresh).toBe(firstRefresh);
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate.mock.calls).toEqual([
+      [getServices, detailSummaryArgs('svc')],
+      [getServices, detailFullArgs('svc')],
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      refreshedSummary.resolve({
+        services: [
+          { name: 'svc', status: 'refreshed-summary', summaryOnly: true },
+        ],
+      });
+      refreshedFull.resolve({
+        services: [{ name: 'svc', status: 'refreshed-full', replicas: ['r2'] }],
+      });
+      await firstRefresh;
+    });
+
+    expect(result.current.serviceData.status).toBe('refreshed-full');
+    expect(result.current.serviceData.replicas).toEqual(['r2']);
+
+    await act(async () => {
+      initialFull.resolve({
+        services: [
+          { name: 'svc', status: 'stale-initial-full', replicas: ['r1'] },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('refreshed-full');
+    expect(result.current.serviceData.replicas).toEqual(['r2']);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+  });
+
   it('drops stale results from a previous service after the route target changes', async () => {
     const firstSummary = deferred();
     const firstFull = deferred();
