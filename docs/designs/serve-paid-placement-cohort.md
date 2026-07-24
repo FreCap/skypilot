@@ -59,6 +59,19 @@ observation of success-driven deepening and zero-cost/pinned progress under a
 simultaneously closed paid frontier remains follow-up evidence rather than a
 deployment gate.
 
+This follow-up shortens the terminal provider-feedback path without changing
+admission bounds or durable state. A launch worker that receives a typed,
+terminal capacity or quota failure reports that result to the replica manager
+before starting controller-side cluster teardown only after provider failover
+cleanup completed successfully or the backend proved that no provider nodes
+were created. On the manager's next refresh, the existing atomic outcome
+transaction closes the exact pool and releases the claim before the existing
+idempotent replica teardown reconciles any control-plane leftovers. Retriable
+attempts, cleanup-uncertain failures, and untyped terminal failures retain
+synchronous cleanup. The implementation and exact-tree adversarial review are
+complete; pull-request CI, artifact publication, and production rollout
+evidence are pending.
+
 ## Problem
 
 SkyServe can persist a large missing-capacity wave before any provider launch
@@ -138,9 +151,12 @@ claim. Successful launches release service claims immediately and let later
 cohorts deepen a proven owned pool, so neither breadth control limits total
 fleet size, steady-state throughput, or the exact pool's learned ceiling.
 
-Only a durable launch outcome releases a claim; process-local bench or catalog
-state cannot erase frontier ownership. A typed failure closes exact-pool
-admission immediately, but its frontier slot advances only after every
+Only a durable launch outcome releases a claim; process-local bench, catalog
+state, and teardown completion cannot erase frontier ownership. For a typed
+terminal capacity or quota failure, worker completion makes the outcome
+eligible for the manager's next atomic refresh even if controller-side
+teardown is still pending. That transaction closes exact-pool admission and
+releases the failed claim. Its frontier slot advances only after every
 already-unresolved sibling in that pool receives a durable outcome.
 
 Saturation caused solely by another service does not consume this service's
@@ -593,14 +609,43 @@ PENDING and PROVISIONING claims intentionally have no age-based expiry:
 automatically releasing one while its provider mutation is ambiguous could
 over-launch outside the frontier. The policy fails closed if every frontier
 cohort hangs. Normal launch attempts are bounded to three, and spot capacity
-failures to one; their completed outcomes release claims. On controller/API
-restart, recovery adopts and re-drives every durable PENDING and PROVISIONING
-row with the same cluster, replica, exact-pool, and claim identity. The
-persisted resources override and paid pool key pin the re-drive; catalog
-refresh cannot select a replacement pool. A same-pool retry is idempotent, and
-the service-locked persistence guard rejects a cross-pool retry before
-candidate-pool, waiter, or replica mutation. A request that remains hung
-without process failure requires operator investigation and controller
+failures to one; their completed outcomes release claims. A terminal typed
+failure is reported before controller-side teardown only when the API backend
+completed provider failover cleanup successfully or proved that no nodes were
+created. Provider cleanup retries and verification are part of the typed-error
+boundary: cleanup uncertainty remains an untyped error such as
+`StopFailoverError`, retains the durable claim, and follows synchronous
+controller cleanup instead of this fast-feedback path. After the manager
+persists a typed outcome, its existing `_terminate_replica()` path performs
+idempotent control-plane cleanup and state reconciliation. Retriable attempts
+still terminate synchronously before retrying the same replica, and all
+untyped terminal failures still terminate synchronously before returning
+because they do not carry authoritative provider-availability evidence.
+
+The outcome transaction is also the lifecycle fence for crash and ownership
+races:
+
+- Before it commits, a controller crash or ownership handoff leaves the
+  PENDING or PROVISIONING row and claim intact. The successor re-drives that
+  same replica at the same exact pool; it cannot infer or publish the stale
+  worker's process-local typed result.
+- After it commits, the row durably records the failed launch and no longer
+  owns a paid claim. A crash before `_terminate_replica()` leaves cleanup
+  incomplete; recovery derives `FAILED_CLEANUP` and
+  `_reconcile_failed_cleanup()` re-drives teardown without launching a
+  replacement from that failed row.
+- Cancellation or scale-down that changes the replica lifecycle before the
+  outcome commit owns cleanup. A stale worker or stale controller may not
+  publish typed pool evidence after that transition. Ownership-fenced
+  persistence rejects an old controller atomically.
+
+On controller/API restart, recovery adopts and re-drives every durable PENDING
+and PROVISIONING row with the same cluster, replica, exact-pool, and claim
+identity. The persisted resources override and paid pool key pin the re-drive;
+catalog refresh cannot select a replacement pool. A same-pool retry is
+idempotent, and the service-locked persistence guard rejects a cross-pool retry
+before candidate-pool, waiter, or replica mutation. A request that remains
+hung without process failure requires operator investigation and controller
 restart; frontier-full logs include oldest-claim age so this condition is
 alertable. The rollout gate exercises restart with a full frontier and proves
 same-pool re-drive without opening another pool.
@@ -955,7 +1000,8 @@ expose counts and limits, not raw pool keys containing workspace identity.
 2. let the existing spot placer select the cheapest candidate;
 3. request an atomic claimed persist;
 4. enqueue a launch only on `ACQUIRED`; and
-5. report launch outcomes in one deterministic batch.
+5. report completed launch outcomes in one deterministic batch before
+   scheduling replica teardown.
 
 `SERVICE_SATURATED` exhausts paid admission for the service-wide wave.
 `FEEDBACK_PENDING` defers only the affected accelerator card, so independent
@@ -1015,6 +1061,22 @@ Canceling API-queued siblings after the first failure has an unavoidable race
 with provider mutation. The small cohort plus durable close bounds the waste
 without killing work whose mutation boundary is uncertain.
 
+Waiting for controller-side `down` before reporting a terminal typed outcome
+adds teardown latency to capacity discovery without strengthening safety once
+provider failover cleanup has completed successfully or no nodes were created.
+The backend converts cleanup uncertainty into an untyped failure, the durable
+claim remains authoritative until the manager transaction commits, and the
+manager's normal teardown remains the idempotent control-plane cleanup
+fallback.
+
+AWS and GCP do not publish a general notification that an arbitrary exact GPU
+pool has become available. An SQS, SNS, EventBridge, or Pub/Sub capacity queue
+would therefore need synthetic polling and would duplicate the PostgreSQL
+claim and outcome authority. The existing central PostgreSQL state remains the
+controller-wide coordination mechanism; provider-specific exact-capacity
+hints may reduce repeated backend calls but cannot release a claim or advance a
+service frontier.
+
 Deriving the durable claim limit from the global launch-thread budget couples
 one service's provider behavior to unrelated controller memory sizing. The
 paid authority owns fixed, observable service and provider-pool envelopes.
@@ -1058,6 +1120,8 @@ capacity without deriving either durable claim envelope from it.
 | Tuple-backed compatibility reports preserve per-card launch priority | QPS and concurrency autoscaler ingestion tests |
 | Exact instance types remain distinct; strict claim resolution rejects ambiguous legacy rows while operational rollout resolution uses the cheapest matching current type | Spot-placer compatibility tests |
 | Only a typed capacity failure resets shared evidence; generic failures can retain local bench behavior while reporting `OTHER_FAILURE` globally | Launch-thread and replica-manager outcome tests |
+| A terminal typed capacity or quota failure whose provider failover cleanup succeeded returns from the launch worker without waiting for controller-side teardown; retriable, cleanup-uncertain, and untyped failures keep synchronous cleanup; the manager persists the typed outcome before scheduling idempotent replica teardown | Launch-thread retry/cleanup and cleanup-failure tests plus an ordered replica-manager refresh test |
+| A crash or ownership handoff before outcome commit retains the exact-pinned claim for successor recovery; a crash after commit derives failed cleanup and re-drives teardown without relaunch; cancellation/scale-down and stale ownership cannot publish typed evidence after lifecycle ownership changes | Outcome-commit failpoint, cancellation, ownership-handoff, and failed-cleanup recovery tests |
 | Capacity failure wins a same-batch update and late pre-failure success cannot rebuild the ramp | Ordered outcome tests |
 | Admission summaries are transition/interval bounded, contain useful aggregate counts, and never expose workspace-bearing pool keys; provider-capacity tracebacks collapse to one wave warning | Pure logging-policy and replica-manager tests |
 | API startup publishes its actual guaranteed long-worker count; controller-process and external-LB runtime signals activate the cap even when the per-service config omits consolidation; default consolidated Serve admission does not exceed it; explicit override remains authoritative | CPU-bound, memory/reservation-bound, and production-topology server/controller tests |
@@ -1128,6 +1192,25 @@ the pre-existing four-wide cohort can still resolve, no new claim is accepted
 for ten minutes, exactly one cross-service probe is accepted afterward, a
 failed probe restarts the cooldown, and a successful probe reopens four slots.
 Confirm a different exact type in the same region remains eligible.
+
+For one terminal typed capacity failure, delay or block controller-side
+`down` after the provider launch request has completed. Confirm the manager
+persists the capacity outcome, closes the exact pool, and releases the failed
+claim within one refresh while teardown is still pending. Then unblock
+teardown and confirm idempotent cleanup completes. Repeat with a typed quota
+failure. Also confirm a retriable typed failure cleans up before its next
+in-place attempt and an untyped terminal failure still cleans up before the
+worker returns. Inject provider failover-cleanup failure and confirm it
+surfaces as an untyped cleanup-uncertain error, retains the paid claim until
+normal lifecycle resolution, and does not enter the fast-feedback path.
+
+Fail immediately before and immediately after the atomic outcome commit.
+Before commit, confirm successor recovery retains the claim and re-drives the
+same exact pool. After commit but before `_terminate_replica()`, confirm the
+successor classifies the row as failed cleanup and re-drives teardown without
+relaunching that row. Race cancellation, scale-down, and controller ownership
+handoff against a completed typed worker; confirm the lifecycle transition or
+current owner wins atomically and no stale typed pool evidence is published.
 
 In a consolidation deployment where the service-derived limit exceeds the API
 long-worker pool, generate a large demand wave. Confirm the default number of
@@ -1210,7 +1293,8 @@ unresolved claim age, stale reconciliation, admission denials, priority
 deferrals, post-commit waiter-cleanup failures and TTL expiry, recovery
 pool-mismatch rejections, zero-cost and durable recovery-pinned rebalance
 progress during paid deferral, success ramps, failure resets, placement spread,
-API request queue depth, provider capacity errors, and launch latency.
+API request queue depth, provider capacity errors, typed-outcome-to-pool-close
+latency, pending teardown duration, and launch latency.
 
 Rollback is an image rollback. Existing pool, claim, waiter, success, and
 failure rows remain schema-compatible with revision 027. Rolling back the
@@ -1459,6 +1543,22 @@ Frontier correction CI, publication, and production evidence on 2026-07-24:
   covered by deterministic and real-PostgreSQL CI and remain explicit
   post-rollout observational evidence.
 
+Pre-PR terminal-feedback evidence on 2026-07-24:
+
+- The full `test_serve_replica_managers.py` suite passed, including typed
+  capacity and quota terminal paths, retriable cleanup, cleanup uncertainty,
+  lifecycle cancellation, ownership-fenced outcome persistence, ordered
+  outcome-before-teardown, and failed-cleanup reconciliation.
+- Focused launch-thread and refresh tests passed sequentially after final
+  formatting.
+- YAPF and isort completed, mypy passed 747 source files, changed-file pylint
+  scored 10.00/10, dashboard lint/format passed, and `git diff --check` was
+  clean.
+- The exact updated design passed adversarial review after strengthening the
+  provider-cleanup prerequisite and pre/post-commit lifecycle contract. The
+  exact code and tests then passed a separate adversarial review with no
+  blocking findings.
+
 ## Release Gate Results
 
 - Complete: implement and validate the 16-claim service envelope, including a
@@ -1492,3 +1592,9 @@ Frontier correction CI, publication, and production evidence on 2026-07-24:
   deferral, exact-pool recovery re-drives, and semantics-v2 history. These
   runtime observations are not prerequisites to keep the already-validated
   correction active.
+- Complete: implement and locally validate terminal typed outcome reporting
+  before controller-side teardown; complete exact-tree design and code
+  adversarial review.
+- Pending: pass pull-request CI, publish the merged image and chart, deploy with
+  existing Helm values reused, and verify bounded outcome-to-pool-close latency
+  in production.

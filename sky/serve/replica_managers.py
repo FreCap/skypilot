@@ -582,17 +582,25 @@ def launch_cluster(
         # handled by the termination thread.
         if _check_is_cancelled():
             return
+
+        terminal = (retry_cnt >= max_retry or
+                    availability_retry_cnt >= availability_max_retry)
+        if terminal and capacity_error is not None:
+            # A typed availability error reaches this layer only after the
+            # backend's failover cleanup succeeded (or proved no nodes were
+            # created). Let the manager persist that feedback before its
+            # idempotent replica cleanup; waiting for another controller-side
+            # down here delays the next exact-pool decision.
+            raise _ReplicaLaunchCapacityError(
+                'Failed to launch the sky serve replica cluster '
+                f'{cluster_name} due to provider {availability_reason} '
+                f'after {retry_cnt} attempt(s).',
+                reason=typing.cast(str,
+                                   availability_reason)) from capacity_error
+
         terminate_cluster(cluster_name, log_file=log_file)
 
-        if (retry_cnt >= max_retry or
-                availability_retry_cnt >= availability_max_retry):
-            if capacity_error is not None:
-                raise _ReplicaLaunchCapacityError(
-                    'Failed to launch the sky serve replica cluster '
-                    f'{cluster_name} due to provider {availability_reason} '
-                    f'after {retry_cnt} attempt(s).',
-                    reason=typing.cast(str,
-                                       availability_reason)) from capacity_error
+        if terminal:
             raise RuntimeError('Failed to launch the sky serve replica cluster '
                                f'{cluster_name} after {retry_cnt} attempt(s).')
 
