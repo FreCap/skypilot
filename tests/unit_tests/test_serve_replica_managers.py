@@ -26,6 +26,7 @@ from spot_placer_test_utils import make_placer
 from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
+from sky.provision import common as provision_common
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import serve_utils
@@ -613,6 +614,20 @@ def _capacity_error() -> exceptions.ResourcesUnavailableError:
                                                 failover_history=[attempt])
 
 
+def _quota_error() -> exceptions.ResourcesUnavailableError:
+    provider_error = RuntimeError('provider quota exhausted')
+    provider_error.response = {
+        'Error': {
+            'Code': 'VcpuLimitExceeded',
+            'Message': 'provider quota exhausted',
+        }
+    }
+    attempt = exceptions.ResourcesUnavailableError('region quota exhausted')
+    attempt.__cause__ = provider_error
+    return exceptions.ResourcesUnavailableError('no quota',
+                                                failover_history=[attempt])
+
+
 class TestLaunchClusterRetry:
     """`launch_cluster` must fail fast ONLY on resource availability
     (capacity) failures when `availability_max_retry` caps them; other
@@ -737,7 +752,36 @@ class TestLaunchClusterRetry:
             tmp_path, [_capacity_error()] * 3, availability_max_retry=1)
         assert isinstance(raised, replica_managers._ReplicaLaunchCapacityError)
         assert mock_sdk.launch.call_count == 1
-        assert mock_terminate.call_count == 1
+        mock_terminate.assert_not_called()
+
+    def test_quota_failure_reports_before_controller_cleanup(self, tmp_path):
+        """A terminal typed quota failure follows the same fast path."""
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [_quota_error()] * 3, availability_max_retry=1)
+        assert isinstance(raised, replica_managers._ReplicaLaunchCapacityError)
+        assert raised.reason == 'quota'
+        assert mock_sdk.launch.call_count == 1
+        mock_terminate.assert_not_called()
+
+    def test_terminal_capacity_failure_yields_to_lifecycle_cancellation(
+            self, tmp_path):
+        """Scale-down/cancellation owns cleanup if it wins before feedback."""
+        cancelled = thread_utils.ThreadSafeDict()
+
+        def _cancel_then_fail(*_args, **_kwargs):
+            cancelled[1] = True
+            raise _capacity_error()
+
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path,
+            _cancel_then_fail,
+            availability_max_retry=1,
+            replica_to_launch_cancelled=cancelled)
+
+        assert raised is None
+        assert mock_sdk.launch.call_count == 1
+        mock_terminate.assert_not_called()
+        assert 1 not in cancelled
 
     def test_legacy_service_policy_does_not_block_recovered_launch(
             self, tmp_path):
@@ -800,17 +844,32 @@ run: echo hi
     def test_capacity_failures_default_to_max_retry(self, tmp_path):
         """Without availability_max_retry, capacity failures keep the
         default max_retry in-place attempts."""
-        mock_sdk, _, raised = self._run_launch_cluster(tmp_path,
-                                                       [_capacity_error()] * 3)
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [_capacity_error()] * 3)
         assert isinstance(raised, replica_managers._ReplicaLaunchCapacityError)
         assert mock_sdk.launch.call_count == 3
+        # Retriable attempts are cleaned synchronously; terminal typed
+        # feedback returns directly to the manager.
+        assert mock_terminate.call_count == 2
 
     def test_generic_failure_never_becomes_shared_capacity_evidence(
             self, tmp_path):
-        mock_sdk, _, raised = self._run_launch_cluster(
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
             tmp_path, [RuntimeError('transient')] * 3)
         assert type(raised) is RuntimeError
         assert mock_sdk.launch.call_count == 3
+        assert mock_terminate.call_count == 3
+
+    def test_cleanup_uncertainty_keeps_synchronous_controller_cleanup(
+            self, tmp_path):
+        """Provisioner cleanup uncertainty must never take the typed path."""
+        cleanup_error = provision_common.StopFailoverError(
+            'provider cleanup could not be verified')
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [cleanup_error] * 3)
+        assert type(raised) is RuntimeError
+        assert mock_sdk.launch.call_count == 3
+        assert mock_terminate.call_count == 3
 
     def test_exact_override_collapses_any_of_to_one_resource(self, tmp_path):
         task = mock.MagicMock()
@@ -9561,9 +9620,18 @@ class TestRefreshThreadPoolUnfencedLaunch:
 
         persisted = []
         terminated = []
+        events = []
 
         def _persist(updates):
             persisted.extend(updates)
+
+        def _persist_paid_outcomes(**_kwargs):
+            events.append('persist_outcome')
+            return None
+
+        def _terminate(rid, **_kwargs):
+            events.append('terminate')
+            terminated.append(rid)
 
         with mock.patch.object(
                 manager, '_reconcile_legacy_uncertain_logical_retirements'), \
@@ -9578,10 +9646,10 @@ class TestRefreshThreadPoolUnfencedLaunch:
              mock.patch.object(
                  replica_managers.paid_capacity,
                  'persist_completed_launches',
-                 return_value=None) as persist_paid_outcomes, \
+                 side_effect=_persist_paid_outcomes) as persist_paid_outcomes, \
              mock.patch.object(
                  manager, '_terminate_replica',
-                 side_effect=lambda rid, **_k: terminated.append(rid)), \
+                 side_effect=_terminate), \
              mock.patch.object(manager, '_reconcile_failed_cleanup'), \
              mock.patch(
                  'sky.serve.replica_managers.serve_state.get_replica_infos',
@@ -9593,10 +9661,11 @@ class TestRefreshThreadPoolUnfencedLaunch:
              mock.patch.object(replica_managers.logger, 'warning') as warning:
             manager._refresh_thread_pool()
 
-        return info, placer, terminated, persist_paid_outcomes, warning
+        return (info, placer, terminated, persist_paid_outcomes, warning,
+                events)
 
     def test_unfenced_failure_is_unrecoverable_and_not_benched(self):
-        info, placer, terminated, persist_paid_outcomes, _ = self._run(
+        info, placer, terminated, persist_paid_outcomes, _, events = self._run(
             replica_managers._UnfencedExternalLbLaunchError('no fence'))
         # Unrecoverable so the autoscaler stops recreating replica rows.
         assert info.status_property.user_app_failed is True
@@ -9609,9 +9678,10 @@ class TestRefreshThreadPoolUnfencedLaunch:
             7: replica_managers.paid_capacity.LaunchOutcome.OTHER_FAILURE
         }
         assert terminated == [7]
+        assert events == ['persist_outcome', 'terminate']
 
     def test_generic_failure_does_not_bench_location(self):
-        info, placer, terminated, persist_paid_outcomes, _ = self._run(
+        info, placer, terminated, persist_paid_outcomes, _, events = self._run(
             RuntimeError('transient'))
         # An ordinary launch failure remains recoverable but says nothing
         # about provider inventory.
@@ -9623,11 +9693,13 @@ class TestRefreshThreadPoolUnfencedLaunch:
             7: replica_managers.paid_capacity.LaunchOutcome.OTHER_FAILURE
         }
         assert terminated == [7]
+        assert events == ['persist_outcome', 'terminate']
 
     def test_typed_capacity_failure_resets_shared_pool_evidence(self):
-        info, placer, terminated, persist_paid_outcomes, warning = self._run(
-            replica_managers._ReplicaLaunchCapacityError('exhausted',
-                                                         reason='capacity'))
+        (info, placer, terminated, persist_paid_outcomes, warning,
+         events) = self._run(
+             replica_managers._ReplicaLaunchCapacityError('exhausted',
+                                                          reason='capacity'))
         assert info.status_property.user_app_failed is False
         placer.set_preemptive.assert_called_once_with(mock.ANY,
                                                       reason='capacity')
@@ -9641,11 +9713,13 @@ class TestRefreshThreadPoolUnfencedLaunch:
                 'exact_pools=unknown') in message
         assert 'boom traceback' not in message
         assert terminated == [7]
+        assert events == ['persist_outcome', 'terminate']
 
     def test_typed_quota_failure_uses_regional_bench(self):
-        info, placer, terminated, persist_paid_outcomes, warning = self._run(
-            replica_managers._ReplicaLaunchCapacityError('quota exhausted',
-                                                         reason='quota'))
+        (info, placer, terminated, persist_paid_outcomes, warning,
+         events) = self._run(
+             replica_managers._ReplicaLaunchCapacityError('quota exhausted',
+                                                          reason='quota'))
 
         placer.set_quota_limited.assert_called_once_with(mock.ANY)
         placer.set_preemptive.assert_not_called()
@@ -9655,3 +9729,4 @@ class TestRefreshThreadPoolUnfencedLaunch:
         }
         warning.assert_called_once()
         assert terminated == [7]
+        assert events == ['persist_outcome', 'terminate']
