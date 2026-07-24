@@ -97,3 +97,41 @@ def test_request_body_env_vars_client_user_hash_none_with_basic_auth(
 
     env_vars = payloads.request_body_env_vars()
     assert constants.CLIENT_USER_HASH_ENV_VAR not in env_vars
+
+
+def test_persisted_payload_strips_server_owned_kubernetes_autoscaler():
+    body = payloads.ServeUpBody(task='name: task',
+                                service_name='service',
+                                override_skypilot_config={
+                                    'active_workspace': 'workspace',
+                                    'kubernetes': {
+                                        'autoscaler': 'generic',
+                                        'ports': 'podip',
+                                        'context_configs': {
+                                            'research': {
+                                                'autoscaler': 'generic',
+                                                'provision_timeout': 15,
+                                            },
+                                            'other': {
+                                                'provision_timeout': 30,
+                                            },
+                                        },
+                                    },
+                                })
+
+    payloads.validate_task_request_body_for_persistence(body)
+
+    assert body.override_skypilot_config == {
+        'active_workspace': 'workspace',
+        'kubernetes': {
+            'ports': 'podip',
+            'context_configs': {
+                'research': {
+                    'provision_timeout': 15,
+                },
+                'other': {
+                    'provision_timeout': 30,
+                },
+            },
+        },
+    }

@@ -19,6 +19,35 @@ def test_nested_config(monkeypatch) -> None:
     }
 
 
+def test_expand_nested_key_patterns():
+    config = {
+        'kubernetes': {
+            'autoscaler': 'generic',
+            'context_configs': {
+                'first': {
+                    'autoscaler': 'gke',
+                },
+                'non_mapping': 'invalid',
+                'second': {
+                    'autoscaler': 'karpenter',
+                },
+            },
+        },
+    }
+    patterns = [
+        ('kubernetes', 'autoscaler'),
+        ('kubernetes', 'context_configs', '*', 'autoscaler'),
+        ('kubernetes', 'context_configs', '*', 'autoscaler'),
+        ('missing', '*'),
+    ]
+
+    assert config_utils.expand_nested_key_patterns(config, patterns) == [
+        ('kubernetes', 'autoscaler'),
+        ('kubernetes', 'context_configs', 'first', 'autoscaler'),
+        ('kubernetes', 'context_configs', 'second', 'autoscaler'),
+    ]
+
+
 def test_recursive_update_k8s_config():
     base_config = {
         'kubernetes': {

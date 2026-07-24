@@ -963,8 +963,10 @@ def override_skypilot_config(
     else:
         override_config_path = json.loads(override_config_path_serialized)
 
+    skipped_keys = config_utils.expand_nested_key_patterns(
+        override_configs, constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
     disallowed_diff_keys = []
-    for key in constants.SKIPPED_CLIENT_OVERRIDE_KEYS:
+    for key in skipped_keys:
         if key == ('db',):
             # since db key is popped out of server config, the key is expected
             # to be different between client and server.
@@ -982,12 +984,11 @@ def override_skypilot_config(
             'and will be ignored. Remove these keys to disable this warning. '
             'If you want to specify it, please modify it on server side or '
             'contact your administrator.')
-    config = original_config.get_nested(
-        keys=tuple(),
-        default_value=None,
-        override_configs=dict(override_configs),
-        allowed_override_keys=None,
-        disallowed_override_keys=constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    config = original_config.get_nested(keys=tuple(),
+                                        default_value=None,
+                                        override_configs=dict(override_configs),
+                                        allowed_override_keys=None,
+                                        disallowed_override_keys=skipped_keys)
     workspace = config.get_nested(
         keys=('active_workspace',),
         default_value=constants.SKYPILOT_DEFAULT_WORKSPACE)

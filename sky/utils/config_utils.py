@@ -99,6 +99,38 @@ class Config(dict[str, Any]):
         return cls(**config)
 
 
+def expand_nested_key_patterns(
+        config: dict[str, Any],
+        key_patterns: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    """Expands wildcard config-key patterns into concrete paths.
+
+    A ``*`` segment matches every key at that mapping level. Patterns only
+    expand to paths that exist in ``config``.
+    """
+    expanded: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def _expand(node: Any, pattern: tuple[str, ...],
+                prefix: tuple[str, ...]) -> None:
+        if not pattern:
+            if prefix not in seen:
+                expanded.append(prefix)
+                seen.add(prefix)
+            return
+        if not isinstance(node, dict):
+            return
+        segment = pattern[0]
+        keys = list(node) if segment == '*' else [segment]
+        for key in keys:
+            if key in node:
+                _expand(node[key], pattern[1:], prefix + (key,))
+
+    for key_pattern in key_patterns:
+        if key_pattern:
+            _expand(config, key_pattern, ())
+    return expanded
+
+
 def _check_allowed_and_disallowed_override_keys(
     key: str,
     allowed_override_keys: list[tuple[str, ...]] | None = None,

@@ -565,10 +565,9 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: list[tuple[str, ...]] = [
     ('slurm', 'cpu_partition'),
     ('active_workspace',),
 ]
-# When overriding the SkyPilot configs on the API server with the client one,
-# we skip the following keys because they are meant to be client-side configs.
-# Also, we skip the consolidation mode config as those should be only set on
-# the API server side.
+# When overriding the SkyPilot config on the API server with the client one,
+# skip server-owned or client-local keys. A '*' segment matches every child
+# key at that mapping level.
 SKIPPED_CLIENT_OVERRIDE_KEYS: list[tuple[str, ...]] = [
     ('api_server',),
     ('allowed_clouds',),
@@ -576,6 +575,11 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: list[tuple[str, ...]] = [
     ('container_registries',),
     ('db',),
     ('daemons',),
+    # The autoscaler determines the cluster's accelerator-label dialect.
+    # Letting a remote client override it can make pods unschedulable or target
+    # labels that do not exist on the server's Kubernetes infrastructure.
+    ('kubernetes', 'autoscaler'),
+    ('kubernetes', 'context_configs', '*', 'autoscaler'),
     # TODO(kevin,tian): Override the whole controller config once our test
     # infrastructure supports setting dynamic server side configs.
     # Tests that are affected:

@@ -44,6 +44,7 @@ from sky.usage import usage_lib
 from sky.utils import annotations
 from sky.utils import common as common_lib
 from sky.utils import common_utils
+from sky.utils import config_utils
 from sky.utils import infra_utils
 from sky.utils import registry
 from sky.utils import yaml_utils
@@ -73,7 +74,9 @@ def _without_server_owned_override_config(
     if not isinstance(override_configs, dict):
         raise ValueError('Invalid client SkyPilot configuration override.')
     sanitized = copy.deepcopy(override_configs)
-    for key_path in constants.SKIPPED_CLIENT_OVERRIDE_KEYS:
+    skipped_keys = config_utils.expand_nested_key_patterns(
+        sanitized, constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    for key_path in skipped_keys:
         parent: Any = sanitized
         for key in key_path[:-1]:
             if not isinstance(parent, dict):

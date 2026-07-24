@@ -11,6 +11,7 @@ import pytest
 import sky
 from sky import skypilot_config
 import sky.exceptions
+from sky.provision.kubernetes import utils as kubernetes_label_utils
 from sky.server.requests import payloads
 from sky.sky_logging import INFO
 from sky.skylet import constants
@@ -841,6 +842,78 @@ def test_override_skypilot_config_with_disallowed_keys(monkeypatch, tmp_path):
                 'be ignored. Remove these keys to disable this warning. If you '
                 'want to specify it, please modify it on server side or contact '
                 'your administrator.')
+
+
+def test_override_skypilot_config_keeps_server_kubernetes_autoscaler(
+        monkeypatch, tmp_path):
+    """A remote client cannot change the server's GPU label dialect."""
+    os.environ.pop(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, None)
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text(
+        textwrap.dedent("""\
+            kubernetes:
+                ports: loadbalancer
+                context_configs:
+                    managed:
+                        autoscaler: karpenter
+                    research:
+                        provision_timeout: 600
+            """))
+    monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH', config_path)
+    skypilot_config.safe_reload_config()
+
+    client_config = {
+        'kubernetes': {
+            'autoscaler': 'generic',
+            'ports': 'podip',
+            'context_configs': {
+                'managed': {
+                    'autoscaler': 'generic',
+                },
+                'research': {
+                    'autoscaler': 'generic',
+                    'provision_timeout': 15,
+                },
+            },
+        },
+    }
+    with mock.patch.object(skypilot_config, 'logger') as mock_logger:
+        with skypilot_config.override_skypilot_config(client_config):
+            assert skypilot_config.get_nested(('kubernetes', 'autoscaler'),
+                                              None) is None
+            assert skypilot_config.get_effective_region_config(
+                cloud='kubernetes', region='managed',
+                keys=('autoscaler',)) == 'karpenter'
+            assert skypilot_config.get_nested(('kubernetes', 'ports'),
+                                              None) == 'podip'
+            assert skypilot_config.get_effective_region_config(
+                cloud='kubernetes',
+                region='research',
+                keys=('provision_timeout',)) == 15
+            node_labels = {
+                'node-1': [('nvidia.com/gpu.product', 'NVIDIA-A100-SXM4-80GB'),
+                          ],
+            }
+            with mock.patch.object(
+                    kubernetes_label_utils,
+                    'detect_accelerator_resource',
+                    return_value=(True, {'nvidia.com/gpu'})), mock.patch.object(
+                        kubernetes_label_utils,
+                        'detect_gpu_label_formatter',
+                        return_value=(
+                            kubernetes_label_utils.GFDLabelFormatter(),
+                            node_labels)):
+                assert kubernetes_label_utils.get_accelerator_label_key_values(
+                    context='research', acc_type='A100-80GB', acc_count=1) == (
+                        'nvidia.com/gpu.product',
+                        ['NVIDIA-A100-SXM4-80GB'],
+                        None,
+                        None,
+                    )
+    warning = mock_logger.warning.call_args.args[0]
+    assert 'kubernetes.autoscaler' in warning
+    assert 'kubernetes.context_configs.managed.autoscaler' in warning
+    assert 'kubernetes.context_configs.research.autoscaler' in warning
 
 
 def test_hierarchical_server_config(monkeypatch, tmp_path):

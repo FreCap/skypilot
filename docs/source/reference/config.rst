@@ -1876,6 +1876,13 @@ Can be one of:
 
 If you want to use the autoscaler, set :ref:`provision_timeout <config-yaml-kubernetes-provision-timeout>` to at least 600.
 
+.. note::
+
+  On an API server, ``kubernetes.autoscaler`` is infrastructure configuration
+  owned by the server administrator. Values from a remote client's user or
+  project config are ignored, including values under
+  ``kubernetes.context_configs.<context>.autoscaler``.
+
 .. _config-yaml-kubernetes-pod-config:
 
 ``kubernetes.pod_config``
