@@ -29,8 +29,8 @@ PR #915 merged the first breadth guard as
 `c249e39368edfa98d7de240716ce88721d1da909`: an atomic, default 16-claim
 per-service envelope across every paid pool and accelerator shape. It passed
 the full suite, including the real-PostgreSQL lane. Image and chart 1.1.768
-were published, and production is on the subsequent 1.1.769 release containing
-that merge at Helm revision 254. The live controller adopted an inherited
+were published, and that correction was subsequently deployed in release
+1.1.769 at Helm revision 254. The live controller adopted an inherited
 27-claim overage and admitted nothing while over limit; after normal outcomes
 reduced the cohort to five, it acquired exactly the 11 remaining slots and
 stopped at 16 total.
@@ -41,16 +41,23 @@ envelope must not suppress a compatible zero-cost launch. The frontier
 correction is rebased on that merge. It retains the logical paid-only precheck
 and implements the physical requirement through a full pass with exact-override
 memoization, so a blocked paid entry cannot hide later reserved-fill or pinned
-work. Production 1.1.769 predates PR #926; its evidence below validates the paid
-envelope, not zero-cost progress while that envelope is full.
+work. The earlier production 1.1.769 evidence below predates PR #926 and
+validates the paid envelope, not zero-cost progress while that envelope is
+full. The current production 1.1.776 image contains both corrections.
 
 The current bounded-exploration correction layers a default two-pool frontier
 per exact accelerator card on top of that deployed service envelope while
-retaining the adaptive exact-pool depth authority. Its implementation,
-deterministic validation, and exact-tree adversarial reviews are complete. The
-remaining gates are visible PR CI with the required real-PostgreSQL lane,
-artifact publication, and a production rollout with before/after
-service-claim, placement-breadth, and controller-health evidence.
+retaining the adaptive exact-pool depth authority. PR #928 passed every visible
+check, including the required real-PostgreSQL lane, and merged as
+`1cea872fe2d83afa676e7a11d12f8c1dfb8dbca7`. Image and chart 1.1.776 were
+published and production is deployed on that chart at Helm revision 258. The
+post-rollout database snapshot satisfies the exact-pool, 16-claim service, and
+two-pool card bounds with no unattributable unresolved row; the API, service
+controller, and both load-balancer slots are healthy. A natural
+`boltz-l4-fleet` scale-up wave has not occurred since rollout, so live
+observation of success-driven deepening and zero-cost/pinned progress under a
+simultaneously closed paid frontier remains follow-up evidence rather than a
+deployment gate.
 
 ## Problem
 
@@ -1234,9 +1241,9 @@ Pre-PR implementation evidence on 2026-07-23, integrated onto
   also reviewed the final merge with the new incomplete-fill-shelter fallback
   and approved the combined compatibility-completeness semantics.
 
-After the combined envelope-and-frontier deployment this section is updated
-with the merge SHA, published image and chart version, Helm revision, migration
-state, API health, controller readiness, and fleet health.
+The combined envelope-and-frontier deployment evidence below records the merge
+SHA, published image and chart version, Helm revision, migration state, API
+health, controller readiness, fleet health, and bounded database state.
 
 Corrective local evidence on 2026-07-24:
 
@@ -1383,6 +1390,66 @@ Frontier correction evidence on 2026-07-24:
   service-row-only waiter cleanup, and the rule that cleanup failure cannot
   change committed `ACQUIRED`.
 
+Frontier correction CI, publication, and production evidence on 2026-07-24:
+
+- PR #928 merged implementation `ec3bc8b5552c6745d3720b8787d8721d5535be27`
+  as merge commit `1cea872fe2d83afa676e7a11d12f8c1dfb8dbca7`.
+  All 24 visible checks passed. The mandatory unit lane reported 9,922 passed,
+  one xfailed, and 62 subtests, explicitly enabled
+  `SKYPILOT_REQUIRE_SERVE_POSTGRES=1`, and started PostgreSQL 16 through
+  testcontainers; the 122 PostgreSQL cases therefore did not silently skip.
+- The exact implementation tree passed 34 paid-capacity, 326 replica-manager,
+  and 130 Serve-state tests locally. All 122 PostgreSQL cases collected
+  locally and skipped only because this host has no Docker daemon. YAPF,
+  isort, mypy across 746 source files, pylint at 10.00/10, dashboard
+  ESLint/Prettier, compilation, and `git diff --check` passed. Two independent
+  exact-tree reviews approved the final implementation and this design.
+- Release 1.1.776 resolves to the merge commit above. The published image is
+  `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.776`
+  at digest
+  `sha256:e823c3036dbcbbb23c75d4db3387a1cab220a2f9cb132ee05db52b2df94aee55`.
+  The published chart has version and appVersion 1.1.776, merge-SHA
+  annotations, that exact default image, and digest
+  `sha256:5687f9c9f6fcee45c0c5f81503ae0cf7e55d538dedecdc2c13298fea678f9779`.
+- The Helm upgrade reused the existing values and explicitly replaced the
+  persisted API image override. Kubernetes completed migration job
+  `skypilot-db-migration-257` on 1.1.776 and converged every workload, but the
+  operator's private-network proxy disappeared before Helm could write its
+  terminal release status, leaving revision 257 `pending-upgrade`. Restored
+  connectivity proved that revision's non-image values matched revision 256
+  and that every 1.1.776 resource was healthy. An in-place Helm rollback to
+  the identical revision-257 content finalized deployed revision 258 without
+  reverting to 1.1.771.
+- Helm revision 258 is deployed on chart/app 1.1.776. All 18 deployments and
+  18 active pods are ready with zero container restarts; all five retained
+  jobs succeeded. The API reports version 1.1.776 and the exact merge commit,
+  and external `/api/health` returns `healthy`.
+- `boltz-l4-fleet` is `READY`; its recovered controller process is alive, both
+  warm-standby load-balancer slots are ready on the release image digest, and
+  both `/_lb/health` probes return 200. Controller, API, worker, and
+  load-balancer logs after rollout contain no deadlock, traceback, unhandled
+  exception, database error, critical error, or panic. Retained failed replica
+  rows predate the rollout by creation time. Five recovery-pinned A100 launch
+  requests for those existing rows failed after restart because their
+  configured model-image tag was absent; these are typed provider/configuration
+  outcomes, not controller crashes, and no fresh fleet replica row was
+  admitted. The current fleet remains ready.
+- The post-rollout PostgreSQL audit found no unresolved replica without an
+  exact paid-pool key, no exact pool above its effective admission limit, no
+  service above 16 valid unresolved claims, no service/card above two exact
+  pools, and no malformed frontier ownership. The sampled maxima were two
+  valid claims per service and one exact pool per service/card. The live
+  runtime configuration reports the default 4, 8, 16, 32, 64, 128, 256, 480
+  depth ladder, service envelope 16, card frontier two, waiter TTL 45 seconds,
+  and failure cooldown 600 seconds.
+- No fresh `boltz-l4-fleet` replica row was admitted after the rollout; the
+  recovery requests above re-drove already-pinned rows and therefore do not
+  exercise fresh frontier admission. Production has not yet supplied a natural
+  wave that can demonstrate successive 4-to-8-to-16 deepening or simultaneous
+  paid deferral with zero-cost/pinned progress. Those paths are covered by
+  deterministic and real-PostgreSQL CI and remain explicit post-rollout
+  observational evidence.
+
 ## Release Gate Results
 
 - Complete: implement and validate the 16-claim service envelope, including a
@@ -1399,15 +1466,20 @@ Frontier correction evidence on 2026-07-24:
 - Complete: implement the two-pool per-card frontier, exact-override
   memoization, recovery immutability, and deadlock-free waiter reconciliation;
   pass deterministic local tests and exact-tree adversarial code/design review.
-- Pending: pass visible PR CI, including all 122 cases on real PostgreSQL.
-- Pending: publish the merged image and chart, then deploy with existing Helm
-  values reused.
-- Pending: wait for every older controller to exit and for inherited
+- Complete: pass visible PR CI, including all 122 cases on real PostgreSQL.
+- Complete: publish the merged image and chart, then deploy with existing Helm
+  values reused and an explicit replacement for the persisted image override.
+- Complete: wait for every older controller to exit and for inherited
   exact-pool, service-envelope, and service/card overages to drain to their
   declared bounds and unattributable legacy rows to drain to zero before
   marking the combined correction active.
-- Pending: verify the live service opens no more than two unresolved pools per
-  exact card before feedback, remains within the 16-claim service envelope,
-  deepens proven pools through the adaptive ladder, preserves zero-cost and
-  pinned progress, re-drives only durable exact pools, and retains healthy
-  controller/LB processes, bounded aggregate logs, and semantics-v2 history.
+- Complete: verify the active production state has no exact-pool,
+  service-envelope, or service/card overage and retains healthy controller/LB
+  processes with bounded aggregate logs.
+- Follow-up observation: on the next natural paid scale-up wave, record that
+  the service opens no more than two unresolved pools per exact card before
+  feedback and remains within 16 claims. Over later natural outcomes, record
+  success-driven adaptive deepening, zero-cost and pinned progress during paid
+  deferral, exact-pool recovery re-drives, and semantics-v2 history. These
+  runtime observations are not prerequisites to keep the already-validated
+  correction active.
