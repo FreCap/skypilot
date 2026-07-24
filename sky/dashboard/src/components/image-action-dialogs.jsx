@@ -52,6 +52,8 @@ export const IMAGE_REMEDIATIONS = {
   RELEASE_CONFLICT: 'Use a new release or the existing immutable artifact.',
 };
 
+const OPERATION_POLL_INTERVAL_MS = 2000;
+
 export function ImageError({ code }) {
   if (!code) return null;
   return (
@@ -73,6 +75,9 @@ function OperationProgress({ mutation, workspace, onTerminal }) {
   const [pollError, setPollError] = useState(null);
   const generation = useRef(0);
   const terminalNotification = useRef(null);
+  const operationId = operation?.id;
+  const operationTerminal =
+    operation && ['SUCCEEDED', 'FAILED'].includes(operation.state);
 
   useEffect(() => {
     if (!operation || !['SUCCEEDED', 'FAILED'].includes(operation.state))
@@ -84,34 +89,48 @@ function OperationProgress({ mutation, workspace, onTerminal }) {
   }, [operation, onTerminal]);
 
   useEffect(() => {
-    if (!operation || ['SUCCEEDED', 'FAILED'].includes(operation.state)) {
+    if (!operationId || operationTerminal) {
       return undefined;
     }
     const currentGeneration = ++generation.current;
     const controller = new AbortController();
+    let timer = null;
     const poll = async () => {
+      const startedAt = performance.now();
+      let terminal = false;
       try {
         const next = await getImageOperation(
-          operation.id,
+          operationId,
           workspace,
           controller.signal
         );
         if (generation.current !== currentGeneration) return;
         setOperation(next);
         setPollError(null);
+        terminal = ['SUCCEEDED', 'FAILED'].includes(next.state);
       } catch (error) {
-        if (error.name !== 'AbortError')
+        if (
+          generation.current === currentGeneration &&
+          error.name !== 'AbortError'
+        ) {
           setPollError(error.code || error.message);
+        }
+      } finally {
+        if (generation.current !== currentGeneration || terminal) return;
+        const elapsed = performance.now() - startedAt;
+        timer = setTimeout(
+          poll,
+          Math.max(0, OPERATION_POLL_INTERVAL_MS - elapsed)
+        );
       }
     };
-    const timer = setInterval(poll, 2000);
     poll();
     return () => {
       generation.current += 1;
       controller.abort();
-      clearInterval(timer);
+      clearTimeout(timer);
     };
-  }, [operation, workspace]);
+  }, [operationId, operationTerminal, workspace]);
 
   return (
     <div className="space-y-3 rounded-md border border-gray-200 bg-gray-50 p-4">
