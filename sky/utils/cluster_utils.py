@@ -533,6 +533,10 @@ class SSHConfigHelper:
                 if inner_proxy is not None:
                     inner_proxy = inner_proxy.replace('%h', ip)
                     inner_proxy = inner_proxy.replace('%p', str(inner_port))
+                    # The generated command is itself an outer OpenSSH
+                    # ProxyCommand. Preserve percent tokens for the inner SSH
+                    # expansion pass.
+                    inner_proxy = inner_proxy.replace('%', '%%')
                 return ' '.join(['ssh'] + command_runner.ssh_options_list(
                     key_path,
                     ssh_control_name=None,
