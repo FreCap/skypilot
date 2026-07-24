@@ -209,6 +209,16 @@ that payload as `json`, which has no equality operator. Missing, unresolved
 heterogeneous, or otherwise invalid resource payloads continue to fail closed
 and disable resource-aware packing for the affected scheduling decision.
 
+Pool-job cleanup is a best-effort resource finalizer after the task state has
+already become terminal. A transient worker connection failure while
+downloading logs or cancelling the worker-local job must not rewrite an
+authoritative `SUCCEEDED`, workload `FAILED`, or `CANCELLED` outcome to
+`FAILED_CONTROLLER`. The controller logs the cleanup failure, preserves the
+terminal task outcome, and still releases scheduler ownership. A cleanup
+failure while the job itself remains nonterminal continues to produce
+`FAILED_CONTROLLER`, because no authoritative workload outcome exists.
+Controller-death reconciliation follows the same rule.
+
 ### 5. Phase orchestration
 
 The launcher creates a unique run ID and immutable code bundle, applies the
@@ -227,8 +237,12 @@ artifacts intact for diagnosis. Re-running the launcher with the same run ID is
 idempotent because names and durable bucket commits are stable.
 
 The launcher always prints the pool name, run root, code bundle URI, and phase
-names. Automatic teardown is used for experiments. Production runs require an
-explicit teardown decision after the joint commit succeeds.
+names. Automatic teardown is used for experiments after the joint commit
+succeeds, and is also forced when the experiment's explicit deadline expires.
+An unexpected phase failure preserves the isolated pool and artifacts for
+diagnosis instead of implicitly cancelling every sibling job from the exit
+trap. Production runs require an explicit teardown decision after the joint
+commit succeeds.
 
 ## Alternatives considered
 
@@ -293,6 +307,8 @@ global manifest contract.
   cloud-bound launchable resources;
 - pool resource accounting executes on PostgreSQL without comparing the
   `full_resources` JSON payload and counts at most one active task per job;
+- a terminal task outcome survives a pool-worker cleanup failure, while the
+  same failure on a nonterminal job still produces `FAILED_CONTROLLER`;
 - existing pools without placement policy preserve their serialized form;
 
 ### Control-plane verification

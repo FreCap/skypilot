@@ -2499,13 +2499,26 @@ class ControllerManager:
                 except Exception as e:  # pylint: disable=broad-except
                     failure_reason = ('Failed to clean up: '
                                       f'{common_utils.format_exception(e)}')
-                    await managed_job_state.set_failed_async(
-                        job_id,
-                        task_id=None,
-                        failure_type=managed_job_state.ManagedJobStatus.
-                        FAILED_CONTROLLER,
-                        failure_reason=failure_reason,
-                        override_terminal=True)
+                    job_status = await managed_job_state.get_status_async(
+                        job_id=job_id)
+                    if job_status is not None and job_status.is_terminal():
+                        # The workload outcome is authoritative once it is
+                        # terminal. Pool cleanup only releases worker-local
+                        # resources and can fail transiently (for example,
+                        # while SSM is reconnecting). Do not turn a successful
+                        # workload into FAILED_CONTROLLER because best-effort
+                        # cleanup could not reach the worker.
+                        logger.warning(
+                            f'{failure_reason}. Preserving terminal job '
+                            f'status {job_status.value!r} for job {job_id}.')
+                    else:
+                        await managed_job_state.set_failed_async(
+                            job_id,
+                            task_id=None,
+                            failure_type=managed_job_state.ManagedJobStatus.
+                            FAILED_CONTROLLER,
+                            failure_reason=failure_reason,
+                            override_terminal=True)
 
                 if cancelling:
                     # Since it's set with cancelling
