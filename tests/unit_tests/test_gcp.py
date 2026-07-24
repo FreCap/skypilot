@@ -16,9 +16,11 @@ from sky.clouds import Zone
 from sky.clouds.gcp import GCP
 from sky.clouds.utils import gcp_utils
 from sky.provision import common
+from sky.provision import constants as provision_constants
 from sky.provision.gcp import api as gcp_api
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants as gcp_constants
+from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils
 from sky.provision.gcp import tpu_node
 from sky.utils import common_utils
@@ -272,6 +274,199 @@ def test_gcp_http_retry_rejects_empty_retry_budget():
         wrapped()
 
 
+@pytest.mark.parametrize(
+    ('node_type', 'handler'),
+    [(instance_utils.GCPNodeType.COMPUTE, instance_utils.GCPComputeInstance),
+     (instance_utils.GCPNodeType.MIG, instance_utils.GCPManagedInstanceGroup),
+     (instance_utils.GCPNodeType.TPU, instance_utils.GCPTPUVMInstance)])
+def test_run_instances_enforces_managed_label(monkeypatch, node_type, handler):
+    config = common.ProvisionConfig(
+        provider_config={
+            'project_id': 'project',
+            'availability_zone': 'us-central1-a',
+        },
+        authentication_config={},
+        docker_config={},
+        node_config={},
+        count=1,
+        tags={
+            'team': 'research',
+            provision_constants.TAG_SKYPILOT_MANAGED: 'false',
+        },
+        resume_stopped_nodes=False,
+        ports_to_open_on_launch=None,
+    )
+    monkeypatch.setattr(instance_utils, 'get_node_type',
+                        MagicMock(return_value=node_type))
+    filter_mock = MagicMock(side_effect=[
+        {},
+        {},
+        {},
+        {
+            'node-1': {
+                handler.STATUS_FIELD: handler.RUNNING_STATE,
+            }
+        },
+    ])
+    create_mock = MagicMock(return_value=(None, ['node-1']))
+    monkeypatch.setattr(handler, 'filter', filter_mock)
+    monkeypatch.setattr(handler, 'create_instances', create_mock)
+
+    result = gcp_instance._run_instances(  # pylint: disable=protected-access
+        'us-central1', 'cluster', config)
+
+    labels = create_mock.call_args.args[4]
+    assert labels == {
+        provision_constants.TAG_SKYPILOT_MANAGED:
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+        'team': 'research',
+    }
+    assert config.tags[provision_constants.TAG_SKYPILOT_MANAGED] == 'false'
+    assert result.created_instance_ids == ['node-1']
+
+
+def test_compute_instance_labels_new_persistent_disks(monkeypatch):
+    node_config = {
+        'machineType': 'n2-standard-4',
+        'disks': [
+            {
+                'type': 'PERSISTENT',
+                'initializeParams': {
+                    'sourceImage': 'projects/image-project/global/images/base',
+                    'labels': {
+                        'owner': 'research',
+                        provision_constants.TAG_SKYPILOT_MANAGED: 'false',
+                    },
+                },
+            },
+            {
+                # An omitted type defaults to a persistent disk.
+                'initializeParams': {},
+            },
+            {
+                'type': 'PERSISTENT',
+                'source': 'projects/project/zones/us-central1-a/disks/existing',
+            },
+            {
+                'type': 'PERSISTENT',
+                'source': 'projects/project/zones/us-central1-a/disks/existing-raw',
+                'initializeParams': {
+                    'labels': {
+                        'owner': 'research',
+                    },
+                },
+            },
+            {
+                'type': 'SCRATCH',
+                'initializeParams': {
+                    'diskType': 'local-ssd',
+                    'labels': {
+                        'owner': 'research',
+                    },
+                },
+            },
+        ],
+    }
+    captured_config = {}
+
+    def _capture_create(cls, names, project_id, zone, config, head_tag_needed):
+        del cls, names, project_id, zone, head_tag_needed
+        captured_config.update(config)
+        return None
+
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, '_create_instances',
+                        classmethod(_capture_create))
+
+    errors, _ = instance_utils.GCPComputeInstance.create_instances(
+        'cluster',
+        'project',
+        'us-central1-a',
+        node_config,
+        labels={},
+        count=1,
+        total_count=1,
+        include_head_node=True)
+
+    assert errors is None
+    disks = captured_config['disks']
+    assert disks[0]['initializeParams']['labels'] == {
+        'owner': 'research',
+        provision_constants.TAG_SKYPILOT_MANAGED:
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }
+    assert disks[1]['initializeParams']['labels'] == {
+        provision_constants.TAG_SKYPILOT_MANAGED:
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }
+    assert 'initializeParams' not in disks[2]
+    assert disks[3]['initializeParams']['labels'] == {'owner': 'research'}
+    assert disks[4]['initializeParams']['labels'] == {'owner': 'research'}
+    assert node_config['disks'][0]['initializeParams']['labels'][
+        provision_constants.TAG_SKYPILOT_MANAGED] == 'false'
+
+
+def test_mig_instance_template_labels_new_persistent_disks(monkeypatch):
+    template_config = {}
+    monkeypatch.setattr(instance_utils.mig_utils,
+                        'check_instance_template_exits',
+                        MagicMock(return_value=False))
+    monkeypatch.setattr(instance_utils.mig_utils,
+                        'check_managed_instance_group_exists',
+                        MagicMock(return_value=False))
+
+    def _capture_template(cluster_name, project_id, region, template_name,
+                          config):
+        del cluster_name, project_id, region, template_name
+        template_config.update(config)
+        return {'name': 'create-template'}
+
+    monkeypatch.setattr(instance_utils.mig_utils,
+                        'create_region_instance_template', _capture_template)
+    monkeypatch.setattr(instance_utils.mig_utils,
+                        'create_managed_instance_group',
+                        MagicMock(return_value={'name': 'create-mig'}))
+    monkeypatch.setattr(instance_utils.mig_utils,
+                        'resize_managed_instance_group',
+                        MagicMock(return_value={'name': 'resize-mig'}))
+    monkeypatch.setattr(instance_utils.mig_utils,
+                        'wait_for_managed_group_to_be_stable', MagicMock())
+    monkeypatch.setattr(instance_utils.GCPManagedInstanceGroup,
+                        'wait_for_operation', MagicMock())
+    monkeypatch.setattr(instance_utils.GCPManagedInstanceGroup,
+                        '_add_labels_and_find_head',
+                        MagicMock(return_value=['node-1']))
+    monkeypatch.setattr(instance_utils.GCPManagedInstanceGroup,
+                        'create_node_tag', MagicMock(return_value='node-1'))
+
+    errors, _ = instance_utils.GCPManagedInstanceGroup.create_instances(
+        'cluster',
+        'project',
+        'us-central1-a', {
+            'machineType': 'a3-highgpu-8g',
+            'disks': [{
+                'type': 'PERSISTENT',
+                'initializeParams': {
+                    'labels': {
+                        provision_constants.TAG_SKYPILOT_MANAGED: 'false',
+                    },
+                },
+            }],
+            gcp_constants.MANAGED_INSTANCE_GROUP_CONFIG: {
+                'run_duration': 3600,
+            },
+        },
+        labels={},
+        count=1,
+        total_count=1,
+        include_head_node=True)
+
+    assert errors is None
+    assert template_config['disks'][0]['initializeParams']['labels'] == {
+        provision_constants.TAG_SKYPILOT_MANAGED:
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }
+
+
 def test_tpu_timeout_cancels_every_unfinished_operation(monkeypatch):
     resource = MagicMock()
     operations_api = resource.projects().locations().operations()
@@ -505,6 +700,11 @@ def test_gcp_minimal_compute_permissions_skip_firewall_for_custom_subnet():
 
     for permission in gcp_constants.FIREWALL_PERMISSIONS:
         assert permission not in permissions
+
+
+def test_gcp_minimal_compute_permissions_include_disk_labeling():
+    assert 'compute.disks.setLabels' in (
+        gcp_utils.get_minimal_compute_permissions())
 
 
 def test_gcp_minimal_compute_permissions_include_firewall_for_empty_subnets():
@@ -742,6 +942,7 @@ class TestTPUNodeGateway:
             'yes | gcloud compute tpus create tpu-1 '
             '--project=project-1 --zone=us-central1-b '
             '--version=tpu-vm-base --accelerator-type=v3-8 '
+            '--labels=skypilot-managed=true '
             '--network=default',
             capture_output=True,
             shell=True,

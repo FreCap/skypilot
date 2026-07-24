@@ -92,14 +92,26 @@ def test_create_instances_projects_request_without_mutating_node_config():
                 'Key': 'owner',
                 'Value': 'sky',
             }, {
+                'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+                'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+            }, {
                 'Key': 'purpose',
                 'Value': 'test',
             }],
         }, {
             'ResourceType': 'volume',
             'Tags': [{
+                'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+                'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+            }, {
                 'Key': 'storage',
                 'Value': 'scratch',
+            }],
+        }, {
+            'ResourceType': 'network-interface',
+            'Tags': [{
+                'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+                'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
             }],
         }],
         'MinCount': 1,
@@ -112,6 +124,56 @@ def test_create_instances_projects_request_without_mutating_node_config():
             'InterfaceType': 'interface',
         }],
     }]
+
+
+def test_create_instances_tags_all_resources_and_reserves_managed_marker():
+    observed = []
+
+    class _FakeEC2:
+
+        def create_instances(self, **kwargs):
+            observed.append(kwargs)
+            return [object()]
+
+    node_config = {
+        'SubnetIds': ['subnet-a'],
+        'SecurityGroupIds': ['sg-1'],
+        'InstanceType': 'g6.4xlarge',
+        'InstanceMarketOptions': {
+            'MarketType': 'SPOT',
+        },
+        'TagSpecifications': [{
+            'ResourceType': resource_type,
+            'Tags': [{
+                'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+                'Value': 'false',
+            }, {
+                'Key': 'owner',
+                'Value': resource_type,
+            }],
+        } for resource_type in ('instance', 'volume', 'network-interface',
+                                'spot-instances-request')],
+    }
+    original_node_config = pickle.loads(pickle.dumps(node_config))
+
+    aws_instance._create_instances(  # pylint: disable=protected-access
+        _FakeEC2(), 'cluster', node_config, {
+            provision_constants.TAG_SKYPILOT_MANAGED: 'false',
+        }, 1, True, 0)
+
+    assert node_config == original_node_config
+    tag_specs = observed[0]['TagSpecifications']
+    assert [spec['ResourceType'] for spec in tag_specs] == [
+        'instance',
+        'volume',
+        'network-interface',
+        'spot-instances-request',
+    ]
+    for tag_spec in tag_specs:
+        tags = {tag['Key']: tag['Value'] for tag in tag_spec['Tags']}
+        assert tags[provision_constants.TAG_SKYPILOT_MANAGED] == (
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE)
+        assert tags['owner'] == tag_spec['ResourceType']
 
 
 def test_instance_request_helpers_keep_instance_facade():
@@ -203,6 +265,79 @@ def test_run_instances_passes_single_zone_signal(monkeypatch):
 
     assert observed == [True]
     assert record.created_instance_ids == ['i-created']
+
+
+def test_run_instances_tags_resumed_instance_with_reserved_marker(monkeypatch):
+
+    class _Instances:
+        """Minimal stopped-instance collection for the resume path."""
+
+        def __init__(self, instances):
+            self._instances = instances
+
+        def filter(self, **kwargs):
+            del kwargs
+            return self._instances
+
+    class _Client:
+        """Records EC2 resume and tag requests."""
+
+        def __init__(self):
+            self.meta = SimpleNamespace(region_name='us-east-1')
+            self.create_tag_calls = []
+            self.started_instance_ids = []
+
+        def start_instances(self, InstanceIds):
+            self.started_instance_ids.extend(InstanceIds)
+            return {}
+
+        def create_tags(self, **kwargs):
+            self.create_tag_calls.append(kwargs)
+
+    stopped = SimpleNamespace(
+        id='i-stopped',
+        state={'Name': 'stopped'},
+        tags=[{
+            'Key': provision_constants.TAG_RAY_CLUSTER_NAME,
+            'Value': 'cluster',
+        }],
+        placement={'AvailabilityZone': 'us-east-1a'},
+    )
+    client = _Client()
+    ec2 = SimpleNamespace(meta=SimpleNamespace(client=client),
+                          instances=_Instances([stopped]))
+    monkeypatch.setattr(aws_instance, '_default_ec2_resource', lambda _: ec2)
+    monkeypatch.setattr(aws_instance.aws, 'resource', lambda *_, **__: ec2)
+    config = provision_common.ProvisionConfig(
+        provider_config={
+            'use_internal_ips': False,
+        },
+        authentication_config={},
+        docker_config={},
+        node_config={
+            'InstanceType': 'g6.4xlarge',
+        },
+        count=1,
+        tags={
+            'owner': 'test',
+            provision_constants.TAG_SKYPILOT_MANAGED: 'false',
+        },
+        resume_stopped_nodes=True,
+        ports_to_open_on_launch=None)
+
+    record = aws_instance.run_instances('us-east-1', 'unused', 'cluster',
+                                        config)
+
+    assert record.resumed_instance_ids == ['i-stopped']
+    assert client.started_instance_ids == ['i-stopped']
+    resume_tags = {
+        tag['Key']: tag['Value'] for tag in client.create_tag_calls[0]['Tags']
+    }
+    assert resume_tags == {
+        'owner': 'test',
+        provision_constants.TAG_SKYPILOT_MANAGED:
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }
 
 
 def test_single_zone_spot_iic_stops_after_first_attempt(monkeypatch):

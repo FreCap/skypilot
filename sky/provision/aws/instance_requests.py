@@ -1,6 +1,7 @@
 """AWS instance request construction and capacity retry policy."""
 
 from collections.abc import Callable
+import copy
 import logging
 import time
 from typing import Any, TypeVar
@@ -67,35 +68,57 @@ def _format_tags(tags: dict[str, str]) -> list:
     return [{'Key': k, 'Value': v} for k, v in tags.items()]
 
 
-def _merge_tag_specs(tag_specs: list[dict[str, Any]],
-                     user_tag_specs: list[dict[str, Any]]) -> None:
-    """Merges user-provided node config tag specifications into a base
-    list of node provider tag specifications. The base list of
-    node provider tag specs is modified in-place.
+def _merge_tag_specs(
+        tag_specs: list[dict[str, Any]],
+        user_tag_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merges user-provided tag specifications without mutating either input.
 
-    This allows users to add tags and override values of existing
-    tags with their own, and only applies to the resource type
-    'instance'. All other resource types are appended to the list of
-    tag specs.
+    User tags override SkyPilot defaults except for the reserved managed
+    marker. Resource types not already emitted by SkyPilot are retained.
 
     Args:
         tag_specs (List[Dict[str, Any]]): base node provider tag specs
         user_tag_specs (List[Dict[str, Any]]): user's node config tag specs
-    """
 
-    for user_tag_spec in user_tag_specs:
-        if user_tag_spec['ResourceType'] == 'instance':
-            for user_tag in user_tag_spec['Tags']:
-                exists = False
-                for tag in tag_specs[0]['Tags']:
-                    if user_tag['Key'] == tag['Key']:
-                        exists = True
-                        tag['Value'] = user_tag['Value']
-                        break
-                if not exists:
-                    tag_specs[0]['Tags'] += [user_tag]
+    Returns:
+        A new merged list of tag specifications.
+    """
+    merged_tag_specs = copy.deepcopy(tag_specs)
+    specs_by_resource_type = {
+        tag_spec['ResourceType']: tag_spec for tag_spec in merged_tag_specs
+    }
+    for user_tag_spec in copy.deepcopy(user_tag_specs):
+        resource_type = user_tag_spec['ResourceType']
+        if resource_type not in specs_by_resource_type:
+            merged_tag_specs.append(user_tag_spec)
+            specs_by_resource_type[resource_type] = user_tag_spec
+            continue
+
+        tags_by_key = {
+            tag['Key']: tag
+            for tag in specs_by_resource_type[resource_type]['Tags']
+        }
+        for user_tag in user_tag_spec['Tags']:
+            key = user_tag['Key']
+            if key == constants.TAG_SKYPILOT_MANAGED:
+                continue
+            if key in tags_by_key:
+                tags_by_key[key]['Value'] = user_tag['Value']
+            else:
+                specs_by_resource_type[resource_type]['Tags'].append(user_tag)
+                tags_by_key[key] = user_tag
+
+    for tag_spec in merged_tag_specs:
+        tags_by_key = {tag['Key']: tag for tag in tag_spec['Tags']}
+        if constants.TAG_SKYPILOT_MANAGED in tags_by_key:
+            tags_by_key[constants.TAG_SKYPILOT_MANAGED][
+                'Value'] = constants.SKYPILOT_MANAGED_TAG_VALUE
         else:
-            tag_specs += [user_tag_spec]
+            tag_spec['Tags'].append({
+                'Key': constants.TAG_SKYPILOT_MANAGED,
+                'Value': constants.SKYPILOT_MANAGED_TAG_VALUE,
+            })
+    return merged_tag_specs
 
 
 def _is_single_zone_request(provider_config: dict[str, Any]) -> bool:
@@ -126,24 +149,46 @@ def create_instances(
         'Name': cluster_name,
         constants.TAG_RAY_CLUSTER_NAME: cluster_name,
         constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
-        **tags
+        **tags,
+        constants.TAG_SKYPILOT_MANAGED: constants.SKYPILOT_MANAGED_TAG_VALUE,
     }
-    conf = node_config.copy()
+    conf = copy.deepcopy(node_config)
 
-    tag_specs = [{
-        'ResourceType': 'instance',
-        'Tags': _format_tags(tags),
-    }]
-    user_tag_specs = conf.get('TagSpecifications', [])
-    _merge_tag_specs(tag_specs, user_tag_specs)
-
-    # SubnetIds is not a real config key: we must resolve to a
-    # single SubnetId before invoking the AWS API.
-    subnet_ids = conf.pop('SubnetIds')
     market_options = conf.get('InstanceMarketOptions', {})
     market_type = (market_options.get('MarketType') if isinstance(
         market_options, dict) else None)
     is_spot = (isinstance(market_type, str) and market_type.lower() == 'spot')
+
+    tag_specs = [{
+        'ResourceType': 'instance',
+        'Tags': _format_tags(tags),
+    }, {
+        'ResourceType': 'volume',
+        'Tags': [{
+            'Key': constants.TAG_SKYPILOT_MANAGED,
+            'Value': constants.SKYPILOT_MANAGED_TAG_VALUE,
+        }],
+    }, {
+        'ResourceType': 'network-interface',
+        'Tags': [{
+            'Key': constants.TAG_SKYPILOT_MANAGED,
+            'Value': constants.SKYPILOT_MANAGED_TAG_VALUE,
+        }],
+    }]
+    if is_spot:
+        tag_specs.append({
+            'ResourceType': 'spot-instances-request',
+            'Tags': [{
+                'Key': constants.TAG_SKYPILOT_MANAGED,
+                'Value': constants.SKYPILOT_MANAGED_TAG_VALUE,
+            }],
+        })
+    user_tag_specs = conf.get('TagSpecifications', [])
+    tag_specs = _merge_tag_specs(tag_specs, user_tag_specs)
+
+    # SubnetIds is not a real config key: we must resolve to a
+    # single SubnetId before invoking the AWS API.
+    subnet_ids = conf.pop('SubnetIds')
     is_known_single_zone_spot = is_spot and is_single_zone_request
 
     # update config with min/max node counts and tag specs

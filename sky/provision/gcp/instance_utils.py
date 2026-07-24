@@ -172,6 +172,26 @@ def selflink_to_name(selflink: str) -> str:
     return selflink.rsplit('/', 1)[-1]
 
 
+def _add_managed_label_to_new_persistent_disks(config: dict) -> None:
+    """Labels persistent disks initialized as part of an instance launch."""
+    for disk in config.get('disks', []):
+        disk_type = disk.get('type', constants.NETWORK_STORAGE_TYPE)
+        if disk_type != constants.NETWORK_STORAGE_TYPE:
+            continue
+        if disk.get('source'):
+            # An attached disk is user-provided, even if malformed raw config
+            # also supplies initialization parameters.
+            continue
+        initialize_params = disk.get('initializeParams')
+        if initialize_params is None:
+            # This attachment does not initialize a new disk.
+            continue
+        disk_labels = dict(initialize_params.get('labels', {}))
+        disk_labels[provision_constants.TAG_SKYPILOT_MANAGED] = (
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE)
+        initialize_params['labels'] = disk_labels
+
+
 def instance_to_handler(instance: str):
     instance_type = instance.split('-')[-1]
     if instance_type == 'compute':
@@ -723,6 +743,7 @@ class GCPComputeInstance(GCPInstance):
                     provision_constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name
                 }),
         })
+        _add_managed_label_to_new_persistent_disks(config)
 
         all_names = []
         if 'reservationAffinity' in config:
@@ -1072,6 +1093,7 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                     provision_constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
                 }),
         })
+        _add_managed_label_to_new_persistent_disks(config)
         cls._convert_selflinks_in_config(config)
 
         # Convert label values to string and lowercase per MIG API requirement.

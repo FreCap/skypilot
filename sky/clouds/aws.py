@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import typing
@@ -28,6 +29,7 @@ from sky.adaptors import common
 from sky.catalog import common as catalog_common
 from sky.clouds.utils import aws_utils
 from sky.clouds.utils import gpu_utils
+from sky.provision import constants as provision_constants
 from sky.skylet import constants
 from sky.utils import annotations
 from sky.utils import common_utils
@@ -48,6 +50,19 @@ if typing.TYPE_CHECKING:
     from sky.utils import volume as volume_lib
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _managed_tag_specifications(resource_types: Iterable[str]) -> str:
+    """Returns shell-quoted AWS CLI tag specifications for managed resources."""
+    tag_specifications = [{
+        'ResourceType': resource_type,
+        'Tags': [{
+            'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+            'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+        }],
+    } for resource_type in resource_types]
+    return shlex.quote(json.dumps(tag_specifications, separators=(',', ':')))
+
 
 # Image ID tags
 _DEFAULT_CPU_IMAGE_ID = 'skypilot:custom-cpu-ubuntu'
@@ -1592,9 +1607,11 @@ class AWS(clouds.Cloud):
                     f'instance, but got: {instance_ids}')
 
         instance_id = instance_ids[0]
+        tag_specifications = _managed_tag_specifications(('image', 'snapshot'))
         create_image_cmd = (
             f'aws ec2 create-image --region {region} --instance-id {instance_id} '
-            f'--name {image_name} --output text')
+            f'--name {image_name} '
+            f'--tag-specifications {tag_specifications} --output text')
         returncode, image_id, stderr = subprocess_utils.run_with_retries(
             create_image_cmd,
             retry_returncode=[255],
@@ -1638,10 +1655,13 @@ class AWS(clouds.Cloud):
         if source_region == target_region:
             return image_id
         image_name = f'skypilot-cloned-from-{source_region}-{image_id}'
+        tag_specifications = _managed_tag_specifications(('image', 'snapshot'))
         copy_image_cmd = (f'aws ec2 copy-image --name {image_name} '
                           f'--source-image-id {image_id} '
                           f'--source-region {source_region} '
-                          f'--region {target_region} --output text')
+                          f'--region {target_region} '
+                          f'--tag-specifications {tag_specifications} '
+                          f'--output text')
         returncode, target_image_id, stderr = subprocess_utils.run_with_retries(
             copy_image_cmd,
             retry_returncode=[255],

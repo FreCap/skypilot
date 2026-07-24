@@ -20,6 +20,7 @@ from sky import skypilot_config
 from sky.adaptors import gcp
 from sky.clouds.utils import gcp_utils
 from sky.clouds.utils import gpu_utils
+from sky.provision import constants as provision_constants
 from sky.provision.gcp import constants
 from sky.provision.gcp import volume_utils
 from sky.utils import annotations
@@ -1505,9 +1506,12 @@ class GCP(clouds.Cloud):
         image_name = f'skypilot-{cluster_name.display_name}-{int(time.time())}'
         create_image_cmd = (f'gcloud compute images create {image_name} '
                             f'--source-disk  {instance_name} '
-                            f'--source-disk-zone {zone}')
+                            f'--source-disk-zone {zone} '
+                            f'--labels='
+                            f'{provision_constants.TAG_SKYPILOT_MANAGED}='
+                            f'{provision_constants.SKYPILOT_MANAGED_TAG_VALUE}')
         logger.debug(create_image_cmd)
-        subprocess_utils.run_with_retries(
+        returncode, _, stderr = subprocess_utils.run_with_retries(
             create_image_cmd,
             retry_returncode=[255],
         )
