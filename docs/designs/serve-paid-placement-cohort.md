@@ -72,6 +72,17 @@ synchronous cleanup. The implementation and exact-tree adversarial review are
 complete; pull-request CI, artifact publication, and production rollout
 evidence are pending.
 
+Production verification of that follow-up exposed an evidence-preservation
+gap below the launch worker: the per-zone provisioning loop recorded a
+structured AWS `InsufficientInstanceCapacity` failure for its local cache and
+event history, then raised a new terminal `ResourcesUnavailableError` without
+the provider failure in its nested failover history. The Serve classifier
+therefore conservatively treated the terminal wrapper as untyped and did not
+refresh the durable paid-pool cooldown. The correction preserves every
+per-zone provider exception in the terminal wrapper. Mixed or unknown
+histories remain unclassified; only the already-recognized structured
+capacity/quota codes reach the durable outcome path.
+
 ## Problem
 
 SkyServe can persist a large missing-capacity wave before any provider launch

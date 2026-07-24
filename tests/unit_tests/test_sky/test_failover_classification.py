@@ -462,6 +462,68 @@ def test_retry_zones_quota_cooldown_does_not_apply_to_on_demand(
     assert not provisioner._blocked_resources
 
 
+def test_retry_zones_preserves_structured_provider_failure(
+        tmp_path, monkeypatch):
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._local_wheel_path = None
+    provisioner._wheel_hash = None
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = None
+    to_provision = _to_provision()
+    provider_error = _aggregate_error('InsufficientInstanceCapacity')
+    provider_error.requested_count = 1
+
+    monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-east-1a')]]))
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(backend.provision_lib, 'get_registered_provisioner',
+                        lambda *_: None)
+    monkeypatch.setattr(backend, '_get_cluster_config_template',
+                        lambda *_: '/tmp/template')
+    monkeypatch.setattr(
+        backend.backend_utils, 'write_cluster_config', lambda *_, **__: {
+            'ray': '/tmp/cluster.yaml',
+            'cluster_name_on_cloud': 'test-cluster',
+        })
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_: None)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        mock.Mock(side_effect=provider_error))
+    monkeypatch.setattr(backend.CloudVmRayBackend, 'post_teardown_cleanup',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.FailoverCloudErrorHandlerV2,
+                        'update_blocklist_on_error', lambda *_, **__: None)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.capacity_cache, 'mark_exhausted',
+                        lambda *_, **__: None)
+
+    with pytest.raises(exceptions.ResourcesUnavailableError) as exc_info:
+        _call_retry_zones(provisioner, to_provision)
+
+    assert exc_info.value.failover_history == [provider_error]
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), exc_info.value) == 'capacity'
+
+
 def test_quota_notification_has_generic_actionable_context(monkeypatch):
     record = mock.Mock(return_value=True)
     monkeypatch.setattr(backend.operator_notifications, 'record_notification',

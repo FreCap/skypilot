@@ -1703,6 +1703,12 @@ class RetryingVmProvisioner:
 
         insufficient_resources = None
         last_error_reason: str | None = None
+        # Preserve the structured provider failures that explain why every
+        # yielded zone was rejected.  The outer provisioning retry loop stores
+        # this ResourcesUnavailableError in its failover history; without the
+        # nested evidence, callers can only see the generic summary below and
+        # cannot safely distinguish capacity/quota from an unrelated failure.
+        provision_failures: list[Exception] = []
         for zones in self._yield_zones(to_provision, num_nodes, cluster_name,
                                        prev_cluster_status,
                                        prev_cluster_ever_up):
@@ -1792,6 +1798,7 @@ class RetryingVmProvisioner:
                     # Failed due to catalog issue, e.g. image not found, or
                     # GPUs are requested in a Kubernetes cluster but the cluster
                     # does not have nodes labeled with GPU types.
+                    provision_failures.append(e)
                     logger.info(f'{e}')
                     continue
                 except exceptions.InvalidCloudCredentials as e:
@@ -2034,6 +2041,7 @@ class RetryingVmProvisioner:
                         # resources for resume, do not tear down or fail over.
                         raise
                     except config_lib.KubernetesError as e:
+                        provision_failures.append(e)
                         if e.insufficent_resources:
                             insufficient_resources = e.insufficent_resources
                         last_error_reason = str(e)
@@ -2066,6 +2074,7 @@ class RetryingVmProvisioner:
                             error=e)
                         continue
                     except Exception as e:  # pylint: disable=broad-except
+                        provision_failures.append(e)
                         capacity_reason = _classify_capacity_error(
                             to_provision.cloud, e)
                         if _is_quota_error(e):
@@ -2278,7 +2287,9 @@ class RetryingVmProvisioner:
         # Do not failover to other locations if the cluster was ever up, since
         # the user can have some data on the cluster.
         raise exceptions.ResourcesUnavailableError(
-            message, no_failover=prev_cluster_ever_up)
+            message,
+            no_failover=prev_cluster_ever_up,
+            failover_history=provision_failures)
 
     # TODO(suquark): Deprecate this method
     # once the `provision_utils` is adopted for all the clouds.
