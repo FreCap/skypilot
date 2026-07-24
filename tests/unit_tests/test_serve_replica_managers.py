@@ -3508,6 +3508,68 @@ class TestLogicalCapacityPlanning:
                                              mgr._logical_reconcile_snapshot,
                                              ())
 
+    def test_paid_envelope_skips_to_zero_cost_exact_card(self):
+        paid_l4 = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        zero_a100 = make_location('research', {'A100': 8},
+                                  use_spot=False,
+                                  cloud_name='Kubernetes')
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._spot_placer = make_placer({paid_l4: 1.0, zero_a100: 0.0})
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 3, 9, (('L4', 1), ('A100', 8)),
+                                   (('L4', 1), ('A100', 8)))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        budget = paid_capacity.LaunchBudget(
+            remaining_by_location={paid_l4: 4},
+            pool_key_by_location={paid_l4: 'paid-l4'},
+            states_by_pool_key={},
+            globally_managed=True,
+            service_remaining=0)
+
+        def _launch_zero_cost(resources_override, _used_ids, existing,
+                              _zero_budget, **_kwargs):
+            assert resources_override == {'accelerators': {'A100': 8}}
+            info = mock.Mock(replica_id=1,
+                             is_terminal=False,
+                             is_ready=False,
+                             version=1,
+                             planned_capacity=8)
+            info.status_property.is_scale_down = False
+            info.get_spot_location.return_value = zero_a100
+            existing.append(info)
+            return True
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(paid_capacity,
+                               'build_launch_budget',
+                               return_value=budget), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_launch_zero_cost) as launch:
+            mgr.scale_up_to_logical_capacity(target_capacity=9,
+                                             version=1,
+                                             reconcile_generation=3,
+                                             target_capacity_by_accelerator={
+                                                 'L4': 1,
+                                                 'A100': 8,
+                                             },
+                                             accelerator_shapes={
+                                                 'L4': 1,
+                                                 'A100': 8,
+                                             })
+
+        launch.assert_called_once()
+
     def test_logical_scale_up_honors_each_exact_card_target(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
@@ -7979,6 +8041,84 @@ class TestPaidLocationLaunchBudget:
         assert budget.service_remaining == 0
         assert manager._next_replica_id == 3
         assert len(manager._launch_thread_pool) == 2
+
+    def test_paid_envelope_only_blocks_fresh_paid_launches(self):
+        paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({paid: 1.0})
+        budget = paid_capacity.LaunchBudget(remaining_by_location={paid: 4},
+                                            pool_key_by_location={paid: 'paid'},
+                                            states_by_pool_key={},
+                                            globally_managed=True,
+                                            service_remaining=0)
+
+        assert manager._paid_service_envelope_blocks_launch(
+            budget, {'use_spot': True})
+        assert not manager._paid_service_envelope_blocks_launch(
+            budget, {'use_spot': False})
+        assert not manager._paid_service_envelope_blocks_launch(
+            budget, {
+                replica_managers.serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True
+            })
+        assert not manager._paid_service_envelope_blocks_launch(
+            budget, {
+                replica_managers.serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY: 7
+            })
+
+    @pytest.mark.parametrize('reserved_fill', [False, True])
+    def test_paid_envelope_does_not_block_zero_cost_physical_launch(
+            self, reserved_fill):
+        zero = make_location('research', {'L4': 1},
+                             use_spot=False,
+                             cloud_name='Kubernetes')
+        paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({zero: 0.0, paid: 1.0})
+        manager._service_hash = 'hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._persist_replica = mock.Mock()
+        manager._uses_shared_zero_cost_demand_budget = mock.Mock(
+            return_value=False)
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        budget = paid_capacity.LaunchBudget(remaining_by_location={paid: 4},
+                                            pool_key_by_location={paid: 'paid'},
+                                            states_by_pool_key={},
+                                            globally_managed=True,
+                                            service_remaining=0)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(paid_capacity,
+                               'build_launch_budget',
+                               return_value=budget), \
+             mock.patch.object(
+                 paid_capacity, 'try_persist_claim') as claim, \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            resources_override = {'use_spot': True}
+            if reserved_fill:
+                resources_override = {
+                    replica_managers.serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True
+                }
+            manager._scale_up_batch_locked([resources_override])
+
+        claim.assert_not_called()
+        manager._persist_replica.assert_called_once()
+        persisted = manager._persist_replica.call_args.args[1]
+        assert persisted.reserved_fill is reserved_fill
+        assert persisted.is_zero_cost is True
+        persisted_location = persisted.get_spot_location()
+        assert persisted_location is not None
+        assert persisted_location.region == zero.region
+        assert persisted_location.use_spot is False
+        assert manager._next_replica_id == 2
+        assert len(manager._launch_thread_pool) == 1
 
     def test_priority_deferral_does_not_exhaust_or_spill_pool(self):
         cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
