@@ -18,10 +18,25 @@ variable "canary_worker_role_arns" {
       length(var.canary_worker_role_arns) <= 64 &&
       alltrue([
         for arn in var.canary_worker_role_arns :
-        can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", arn))
+        can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:role/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,64}$", arn))
       ])
     )
-    error_message = "canary_worker_role_arns must contain 1-64 exact IAM role ARNs without policy wildcards or variables."
+    error_message = "canary_worker_role_arns must contain 1-64 exact IAM role ARNs with AWS-valid paths and 1-64 character terminal names."
+  }
+}
+
+variable "applied_role_trust_policy_quota" {
+  description = "Applied IAM role trust-policy character quota in the target account."
+  type        = number
+  default     = 2048
+
+  validation {
+    condition = (
+      var.applied_role_trust_policy_quota >= 2048 &&
+      var.applied_role_trust_policy_quota <= 8192 &&
+      floor(var.applied_role_trust_policy_quota) == var.applied_role_trust_policy_quota
+    )
+    error_message = "applied_role_trust_policy_quota must be an integer between 2048 and 8192."
   }
 }
 
@@ -38,9 +53,9 @@ variable "ec2_runtime_role_arns" {
   validation {
     condition = length(var.ec2_runtime_role_arns) <= 64 && alltrue([
       for arn in var.ec2_runtime_role_arns :
-      can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", arn))
+      can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:role/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,64}$", arn))
     ])
-    error_message = "ec2_runtime_role_arns must contain at most 64 exact IAM role ARNs without policy wildcards or variables."
+    error_message = "ec2_runtime_role_arns must contain at most 64 exact IAM role ARNs with AWS-valid paths and 1-64 character terminal names."
   }
 }
 
@@ -52,9 +67,9 @@ variable "ec2_instance_profile_arns" {
   validation {
     condition = length(var.ec2_instance_profile_arns) <= 64 && alltrue([
       for arn in var.ec2_instance_profile_arns :
-      can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_/-]+$", arn))
+      can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:instance-profile/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,128}$", arn))
     ])
-    error_message = "ec2_instance_profile_arns must contain at most 64 exact IAM instance-profile ARNs without policy wildcards or variables."
+    error_message = "ec2_instance_profile_arns must contain at most 64 exact IAM instance-profile ARNs with AWS-valid paths and 1-128 character terminal names."
   }
 }
 
@@ -66,9 +81,9 @@ variable "eks_node_instance_profile_arns" {
   validation {
     condition = length(var.eks_node_instance_profile_arns) <= 64 && alltrue([
       for arn in var.eks_node_instance_profile_arns :
-      can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_/-]+$", arn))
+      can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:instance-profile/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,128}$", arn))
     ])
-    error_message = "eks_node_instance_profile_arns must contain at most 64 exact IAM instance-profile ARNs without policy wildcards or variables."
+    error_message = "eks_node_instance_profile_arns must contain at most 64 exact IAM instance-profile ARNs with AWS-valid paths and 1-128 character terminal names."
   }
 }
 
@@ -81,9 +96,9 @@ variable "ami_arns" {
   validation {
     condition = length(var.ami_arns) <= 64 && alltrue([
       for arn in var.ami_arns :
-      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+::image/ami-[0-9a-f]+$", arn))
+      can(regex("^arn:aws(-[a-z0-9]+)*:ec2:[a-z0-9]+(-[a-z0-9]+)+-[0-9]+::image/ami-([0-9a-f]{8}|[0-9a-f]{17})$", arn))
     ])
-    error_message = "ami_arns must contain at most 64 exact accountless regional AMI authorization ARNs without policy wildcards or variables."
+    error_message = "ami_arns must contain at most 64 exact accountless regional AMI authorization ARNs with 8- or 17-character lowercase hexadecimal IDs."
   }
 }
 
@@ -96,9 +111,9 @@ variable "subnet_arns" {
   validation {
     condition = length(var.subnet_arns) <= 64 && alltrue([
       for arn in var.subnet_arns :
-      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+:[0-9]{12}:subnet/subnet-[0-9A-Fa-f]+$", arn))
+      can(regex("^arn:aws(-[a-z0-9]+)*:ec2:[a-z0-9]+(-[a-z0-9]+)+-[0-9]+:[0-9]{12}:subnet/subnet-([0-9a-f]{8}|[0-9a-f]{17})$", arn))
     ])
-    error_message = "subnet_arns must contain at most 64 exact regional subnet ARNs without policy wildcards or variables."
+    error_message = "subnet_arns must contain at most 64 exact regional subnet ARNs with 8- or 17-character lowercase hexadecimal IDs."
   }
 }
 
@@ -110,9 +125,9 @@ variable "security_group_arns" {
   validation {
     condition = length(var.security_group_arns) <= 64 && alltrue([
       for arn in var.security_group_arns :
-      can(regex("^arn:[a-z0-9-]+:ec2:[a-z0-9-]+:[0-9]{12}:security-group/sg-[0-9A-Fa-f]+$", arn))
+      can(regex("^arn:aws(-[a-z0-9]+)*:ec2:[a-z0-9]+(-[a-z0-9]+)+-[0-9]+:[0-9]{12}:security-group/sg-([0-9a-f]{8}|[0-9a-f]{17})$", arn))
     ])
-    error_message = "security_group_arns must contain at most 64 exact regional security-group ARNs without policy wildcards or variables."
+    error_message = "security_group_arns must contain at most 64 exact regional security-group ARNs with 8- or 17-character lowercase hexadecimal IDs."
   }
 }
 
@@ -134,19 +149,19 @@ variable "spot_service_linked_role_arn" {
   nullable    = true
 
   validation {
-    condition     = var.spot_service_linked_role_arn == null || can(regex("^arn:[^:]+:iam::[0-9]{12}:role/aws-service-role/spot\\.amazonaws\\.com/AWSServiceRoleForEC2Spot$", var.spot_service_linked_role_arn))
+    condition     = var.spot_service_linked_role_arn == null || can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:role/aws-service-role/spot\\.amazonaws\\.com/AWSServiceRoleForEC2Spot$", var.spot_service_linked_role_arn))
     error_message = "spot_service_linked_role_arn must identify AWSServiceRoleForEC2Spot."
   }
 }
 
 variable "spot_customer_managed_kms_key_arns" {
-  description = "Customer-managed regional KMS keys encrypting qualified Spot AMIs or snapshots. The module grants the EC2 Spot service-linked role launch access."
+  description = "Customer-managed regional KMS keys encrypting qualified Spot AMIs or snapshots. Keys may be owned by another account in the same partition and region. The module grants the EC2 Spot service-linked role launch access."
   type        = set(string)
   default     = []
 
   validation {
-    condition     = length(var.spot_customer_managed_kms_key_arns) <= 64 && alltrue([for arn in var.spot_customer_managed_kms_key_arns : can(regex("^arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[0-9A-Za-z-]+$", arn))])
-    error_message = "spot_customer_managed_kms_key_arns must contain at most 64 KMS key ARNs."
+    condition     = length(var.spot_customer_managed_kms_key_arns) <= 64 && alltrue([for arn in var.spot_customer_managed_kms_key_arns : can(regex("^arn:aws(-[a-z0-9]+)*:kms:[a-z0-9]+(-[a-z0-9]+)+-[0-9]+:[0-9]{12}:key/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$", arn))])
+    error_message = "spot_customer_managed_kms_key_arns must contain at most 64 exact regional KMS key ARNs using a lowercase UUID or mrk- identifier."
   }
 }
 
@@ -158,17 +173,26 @@ variable "eks_cluster_arns" {
   validation {
     condition = length(var.eks_cluster_arns) <= 64 && alltrue([
       for arn in var.eks_cluster_arns :
-      can(regex("^arn:[a-z0-9-]+:eks:[a-z0-9-]+:[0-9]{12}:cluster/[A-Za-z0-9][A-Za-z0-9_-]*$", arn))
+      can(regex("^arn:aws(-[a-z0-9]+)*:eks:[a-z0-9]+(-[a-z0-9]+)+-[0-9]+:[0-9]{12}:cluster/[A-Za-z0-9][A-Za-z0-9_-]{0,99}$", arn))
     ])
-    error_message = "eks_cluster_arns must contain at most 64 exact regional EKS cluster ARNs without policy wildcards or variables."
+    error_message = "eks_cluster_arns must contain at most 64 exact regional EKS cluster ARNs with AWS-valid 1-100 character names."
   }
 }
 
 variable "external_id" {
-  description = "Optional external ID required when the worker assumes this role."
+  description = "Optional 2-1224 character AWS STS external ID required when the worker assumes this role."
   type        = string
   default     = null
   nullable    = true
+
+  validation {
+    condition = var.external_id == null ? true : (
+      length(var.external_id) >= 2 &&
+      length(var.external_id) <= 1224 &&
+      can(regex("^[A-Za-z0-9_+=,.@:/-]+$", var.external_id))
+    )
+    error_message = "external_id must be null or 2-1224 characters from the AWS STS allowed set: letters, digits, _+=,.@:/-."
+  }
 }
 
 variable "permissions_boundary_arn" {
@@ -178,11 +202,17 @@ variable "permissions_boundary_arn" {
   nullable    = true
 
   validation {
-    condition = var.permissions_boundary_arn == null || can(regex(
-      "^arn:[a-z0-9-]+:iam::[0-9]{12}:policy/[A-Za-z0-9+=,.@_/-]+$",
-      var.permissions_boundary_arn,
-    ))
-    error_message = "permissions_boundary_arn must be an exact IAM managed-policy ARN without policy wildcards or variables."
+    condition = var.permissions_boundary_arn == null || (
+      can(regex(
+        "^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:policy/([A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]{1,128}$",
+        var.permissions_boundary_arn,
+      )) &&
+      can(regex(
+        "^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:policy/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,128}$",
+        var.permissions_boundary_arn,
+      ))
+    )
+    error_message = "permissions_boundary_arn must be an exact IAM managed-policy ARN with an AWS-valid path and 1-128 character terminal name."
   }
 }
 

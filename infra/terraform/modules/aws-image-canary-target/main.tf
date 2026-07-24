@@ -134,9 +134,9 @@ resource "terraform_data" "validate_contract" {
     precondition {
       condition = alltrue([
         for arn in var.spot_customer_managed_kms_key_arns :
-        startswith(arn, "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/")
+        startswith(arn, "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:")
       ])
-      error_message = "Every Spot customer-managed KMS key must belong to the target AWS account and module region."
+      error_message = "Every Spot customer-managed KMS key must belong to the target AWS partition and module region."
     }
   }
 }
@@ -366,6 +366,13 @@ resource "aws_iam_role" "canary" {
   assume_role_policy   = data.aws_iam_policy_document.trust.json
   permissions_boundary = var.permissions_boundary_arn
   tags                 = local.common_tags
+
+  lifecycle {
+    precondition {
+      condition     = length(data.aws_iam_policy_document.trust.minified_json) <= var.applied_role_trust_policy_quota
+      error_message = "The rendered canary role trust policy exceeds applied_role_trust_policy_quota."
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "canary" {

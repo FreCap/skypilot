@@ -39,6 +39,15 @@ into this module's Terraform state and let Terraform converge them. There is no
 external-role escape hatch because an unattached policy or boundary would make
 the qualification fingerprints misleading.
 
+Each rendered, minified target-role trust policy must fit
+`applied_role_trust_policy_quota`. The variable defaults to AWS's 2,048
+character account quota and accepts an integer up to AWS's 8,192 character
+maximum. Set it above the default only after that quota increase is applied in
+the registry account.
+When `worker_assume_role_external_id` is set, Terraform enforces the AWS STS
+contract before rendering either trust policy: 2-1,224 characters containing
+only letters, digits, and `_+=,.@:/-`.
+
 Run the mocked custody-boundary tests with Terraform 1.7 or newer:
 
 ```bash

@@ -7,8 +7,11 @@ explicit cluster ARNs. Temporary instances must carry the exact SkyPilot
 catalog tag. Spot requests carry the same operation tags, and only matching
 catalog-tagged instances and requests can be terminated or cancelled.
 Every supplied ARN is a concrete resource identity. Policy wildcards, policy
-variables, cross-partition identities, and target resources outside the
-module's account or region are rejected before the role can be created.
+variables, cross-partition identities, and account or region mismatches for
+account-bound target resources are rejected before the role can be created.
+Customer-managed keys for shared encrypted AMIs are the exception: the key may
+belong to the AMI source account, but it must remain in the target partition and
+region.
 
 Configure `ami_arns`, `subnet_arns`, and at least one exact
 `canary_instance_type` for EC2 qualification. The launch policy constrains all
@@ -45,7 +48,20 @@ Spot prerequisite. If a qualified AMI or snapshot uses a customer-managed KMS
 key, list every regional key in
 `spot_customer_managed_kms_key_arns`; omitting one intentionally makes the Spot
 canary fail closed instead of weakening the key policy. AWS-managed EBS keys do
-not need a grant and must not be listed.
+not need a grant and must not be listed. For a key in another account, the
+Terraform caller must have cross-account `kms:CreateGrant`, `kms:ListGrants`,
+and `kms:RevokeGrant` authority through both the source key policy and its own
+IAM policy so provider refresh and teardown remain usable.
+
+The rendered, minified worker trust policy must fit
+`applied_role_trust_policy_quota`. The variable defaults to AWS's 2,048
+character account quota and accepts an integer up to AWS's 8,192 character
+maximum. Set it above the default only after that quota increase is applied in
+the target account. This check requires HashiCorp AWS provider 6.x, matching the
+module's provider constraint.
+When `external_id` is set, Terraform enforces the AWS STS contract before
+rendering the trust policy: 2-1,224 characters containing only letters, digits,
+and `_+=,.@:/-`.
 
 Use one target module instance per compute account and region. Add its
 `role_arn` to `aws-image-worker-identity.canary_target_role_arns`, and use

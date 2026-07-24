@@ -88,9 +88,13 @@ variable "targets" {
       target.max_manifests_per_shard >= 1 &&
       target.max_declared_bytes_per_shard >= 1 &&
       target.max_in_flight >= 1 && target.max_in_flight <= 1024 &&
-      length(target.runtime_pull_principal_arns) <= 100
+      length(target.runtime_pull_principal_arns) <= 100 &&
+      alltrue([
+        for arn in target.runtime_pull_principal_arns :
+        can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:role/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,64}$", arn))
+      ])
     ])
-    error_message = "Provide exactly one regional target with a valid name, bounded fixed shards, positive ceilings, and at most 100 pull principals."
+    error_message = "Provide exactly one regional target with a valid name, bounded fixed shards, positive ceilings, and at most 100 exact IAM role pull principals."
   }
 }
 
@@ -98,29 +102,79 @@ variable "copy_worker_base_role_arns" {
   description = "Worker base roles allowed to assume the regional copy target role."
   type        = set(string)
   default     = []
+
+  validation {
+    condition = length(var.copy_worker_base_role_arns) <= 64 && alltrue([
+      for arn in var.copy_worker_base_role_arns :
+      can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:role/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,64}$", arn))
+    ])
+    error_message = "copy_worker_base_role_arns must contain at most 64 exact IAM role ARNs with AWS-valid paths and 1-64 character terminal names."
+  }
 }
 
 variable "lifecycle_worker_base_role_arns" {
   description = "Worker base roles allowed to assume the regional lifecycle target role."
   type        = set(string)
   default     = []
+
+  validation {
+    condition = length(var.lifecycle_worker_base_role_arns) <= 64 && alltrue([
+      for arn in var.lifecycle_worker_base_role_arns :
+      can(regex("^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:role/([A-Za-z0-9+=,.@_/-]{1,510}/)?[A-Za-z0-9+=,.@_-]{1,64}$", arn))
+    ])
+    error_message = "lifecycle_worker_base_role_arns must contain at most 64 exact IAM role ARNs with AWS-valid paths and 1-64 character terminal names."
+  }
+}
+
+variable "applied_role_trust_policy_quota" {
+  description = "Applied IAM role trust-policy character quota in the registry account."
+  type        = number
+  default     = 2048
+
+  validation {
+    condition = (
+      var.applied_role_trust_policy_quota >= 2048 &&
+      var.applied_role_trust_policy_quota <= 8192 &&
+      floor(var.applied_role_trust_policy_quota) == var.applied_role_trust_policy_quota
+    )
+    error_message = "applied_role_trust_policy_quota must be an integer between 2048 and 8192."
+  }
 }
 
 variable "copy_target_role_name" {
   description = "Deterministic copy target role name for this region."
   type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9+=,.@_-]{1,64}$", var.copy_target_role_name))
+    error_message = "copy_target_role_name must be a valid 1-64 character IAM role name."
+  }
 }
 
 variable "lifecycle_target_role_name" {
   description = "Deterministic lifecycle target role name for this region."
   type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9+=,.@_-]{1,64}$", var.lifecycle_target_role_name))
+    error_message = "lifecycle_target_role_name must be a valid 1-64 character IAM role name."
+  }
 }
 
 variable "worker_assume_role_external_id" {
-  description = "Optional external ID required by registry target roles."
+  description = "Optional 2-1224 character AWS STS external ID required by registry target roles."
   type        = string
   default     = null
   nullable    = true
+
+  validation {
+    condition = var.worker_assume_role_external_id == null ? true : (
+      length(var.worker_assume_role_external_id) >= 2 &&
+      length(var.worker_assume_role_external_id) <= 1224 &&
+      can(regex("^[A-Za-z0-9_+=,.@:/-]+$", var.worker_assume_role_external_id))
+    )
+    error_message = "worker_assume_role_external_id must be null or 2-1224 characters from the AWS STS allowed set: letters, digits, _+=,.@:/-."
+  }
 }
 
 variable "encryption_type" {
@@ -139,6 +193,14 @@ variable "kms_key_arn" {
   type        = string
   default     = null
   nullable    = true
+
+  validation {
+    condition = var.kms_key_arn == null || can(regex(
+      "^arn:aws(-[a-z0-9]+)*:kms:[a-z0-9]+(-[a-z0-9]+)+-[0-9]+:[0-9]{12}:key/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$",
+      var.kms_key_arn,
+    ))
+    error_message = "kms_key_arn must be an exact regional KMS key ARN using a lowercase UUID or mrk- identifier."
+  }
 }
 
 variable "scan_on_push" {

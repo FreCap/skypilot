@@ -1,9 +1,51 @@
+data "aws_caller_identity" "current" {}
+
+data "aws_partition" "current" {}
+
 locals {
   oidc_issuer = trimprefix(var.oidc_issuer_url, "https://")
+  expected_oidc_provider_arn = format(
+    "arn:%s:iam::%s:oidc-provider/%s",
+    data.aws_partition.current.partition,
+    data.aws_caller_identity.current.account_id,
+    local.oidc_issuer,
+  )
+  target_role_arns = setunion(
+    var.copy_target_role_arns,
+    var.lifecycle_target_role_arns,
+    var.canary_target_role_arns,
+  )
   common_tags = merge(var.tags, {
     "ManagedBy"         = "Terraform"
     "SkyPilotComponent" = "container-image-distribution"
   })
+}
+
+resource "terraform_data" "validate_contract" {
+  lifecycle {
+    precondition {
+      condition     = var.oidc_provider_arn == local.expected_oidc_provider_arn
+      error_message = "oidc_provider_arn must exactly identify oidc_issuer_url in the active AWS account and partition."
+    }
+
+    precondition {
+      condition = alltrue([
+        for arn in local.target_role_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:iam::")
+      ])
+      error_message = "Every target role ARN must use the active AWS partition."
+    }
+
+    precondition {
+      condition = var.permissions_boundary_arn == null ? true : (
+        startswith(
+          var.permissions_boundary_arn,
+          "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/",
+        )
+      )
+      error_message = "permissions_boundary_arn must identify a managed policy in the active AWS account and partition."
+    }
+  }
 }
 
 data "aws_iam_policy_document" "copy_trust" {
@@ -86,6 +128,8 @@ resource "aws_iam_role" "copy" {
   assume_role_policy   = data.aws_iam_policy_document.copy_trust.json
   permissions_boundary = var.permissions_boundary_arn
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "copy" })
+
+  depends_on = [terraform_data.validate_contract]
 }
 
 resource "aws_iam_role" "lifecycle" {
@@ -93,6 +137,8 @@ resource "aws_iam_role" "lifecycle" {
   assume_role_policy   = data.aws_iam_policy_document.lifecycle_trust.json
   permissions_boundary = var.permissions_boundary_arn
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "lifecycle" })
+
+  depends_on = [terraform_data.validate_contract]
 }
 
 resource "aws_iam_role" "canary" {
@@ -100,6 +146,8 @@ resource "aws_iam_role" "canary" {
   assume_role_policy   = data.aws_iam_policy_document.canary_trust.json
   permissions_boundary = var.permissions_boundary_arn
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "canary" })
+
+  depends_on = [terraform_data.validate_contract]
 }
 
 data "aws_iam_policy_document" "copy_assume_targets" {
