@@ -199,8 +199,9 @@ is part of this exact-card design:
   rows from hiding physical occupancy.
 - At `max_replicas`, fill waits for normal autoscaling or lifecycle transitions
   to create headroom. It does not overlap replicas or evict paid capacity.
-  Generic `cost_rebalance` remains a separate, incompatible policy because its
-  ready-before-drain replacement contract intentionally uses temporary overlap.
+  Generic `cost_rebalance` remains a separate paid-to-paid policy. It never
+  selects zero-cost candidates or incumbents while fill is enabled; the broker
+  exclusively owns paid-to-free convergence.
 - Freshness damping, pending-row occupancy debit, broker grants, grant epochs,
   active-location checks, and zero-cost-only launch pinning remain mandatory.
   The aggregate demand target and capacity hint remain demand-only.

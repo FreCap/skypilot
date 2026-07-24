@@ -133,13 +133,14 @@ to discover additional shapes.
 Cost-aware replacement
 ----------------------
 
-With a multi-location ``dynamic_fallback`` policy, ``cost_rebalance`` can
-replace an existing replica when a capacity-equivalent location remains at
-least the configured fraction cheaper. SkyServe launches and health-checks the
-replacement first. It then removes the incumbent from load-balancer routing and
-terminates it only after the load balancer proves that no request is still in
-flight. Normal demand autoscaling remains bounded by ``max_replicas``;
-``max_parallel_replacements`` permits only temporary paired overlap.
+With a multi-location ``dynamic_fallback`` policy, cost rebalancing is enabled
+by default. It replaces an existing replica when a capacity-equivalent
+location remains at least the configured fraction cheaper. SkyServe launches
+and health-checks the replacement first. It then removes the incumbent from
+load-balancer routing and terminates it only after the load balancer proves
+that no request is still in flight. Normal demand autoscaling remains bounded
+by ``max_replicas``; ``max_parallel_replacements`` permits only temporary
+paired overlap. Set ``cost_rebalance: false`` to opt out.
 
 .. code-block:: yaml
 
@@ -156,8 +157,9 @@ flight. Normal demand autoscaling remains bounded by ``max_replicas``;
 
 The savings comparison uses hourly cost per configured serving-capacity unit,
 not raw per-GPU price. ``stabilization_seconds`` requires the candidate to stay
-eligible continuously before a replacement starts. This policy cannot be
-combined with ``reserved_capacity_fill``.
+eligible continuously before a replacement starts. With
+``reserved_capacity_fill``, generic rebalancing remains paid-to-paid;
+broker-granted fill remains the only path that launches zero-cost capacity.
 
 Example
 -------

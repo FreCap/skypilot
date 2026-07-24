@@ -687,6 +687,8 @@ class SpotPlacer:
     """Spot Placement specification."""
 
     _expand_accelerator_counts = False
+    _RETRY_STATE_VERSION = 1
+    _BENCH_REASONS = frozenset({'capacity', 'quota', 'preempted'})
 
     def __init__(
         self,
@@ -710,12 +712,28 @@ class SpotPlacer:
         }
         # When each PREEMPTED mark was set; drives the TTL retry.
         self.location2preempted_at: dict[Location, float] = {}
+        self.location2preempted_reason: dict[Location, str] = {}
+        # A separate durable timestamp reserves the one expired-bench probe
+        # without rewriting the underlying provider observation. Generic
+        # launch failures can release this reservation and leave the location
+        # immediately eligible; typed failures replace the observation.
+        self.location2retry_reserved_at: dict[Location, float] = {}
+        self._retry_state_dirty = False
         # Complete by construction. Runtime paths must never resolve provider
         # feasibility or pricing because a location cost is missing.
         self.location2cost = catalog_value.costs()
         # Already checked there is only one resource in the task.
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes
+
+    def _ensure_retry_state_fields(self) -> None:
+        """Initialize fields for lightweight or legacy reconstructed placers."""
+        if not hasattr(self, 'location2preempted_reason'):
+            self.location2preempted_reason = {}
+        if not hasattr(self, 'location2retry_reserved_at'):
+            self.location2retry_reserved_at = {}
+        if not hasattr(self, '_retry_state_dirty'):
+            self._retry_state_dirty = False
 
     def __init_subclass__(cls, name: str, default: bool = False):
         SPOT_PLACERS[name] = cls
@@ -729,7 +747,7 @@ class SpotPlacer:
             self,
             *,
             skip_zero_cost_preference: bool = False,
-            allowed_locations: set[Location] | None = None) -> Location:
+            allowed_locations: set[Location] | None = None) -> Location | None:
         """Select next location to place spot instance.
 
         skip_zero_cost_preference disables the fill-the-free-tier-first
@@ -795,6 +813,7 @@ class SpotPlacer:
                    location: Location,
                    *,
                    selected_at: float | None = None) -> None:
+        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if resolved is None:
@@ -809,25 +828,77 @@ class SpotPlacer:
             # is selected after the current bench timestamp, so its success
             # still reactivates the location immediately.
             return
+        changed = (self.location2status[resolved] != LocationStatus.ACTIVE or
+                   resolved in self.location2preempted_at or
+                   resolved in self.location2preempted_reason or
+                   resolved in self.location2retry_reserved_at)
         self.location2status[resolved] = LocationStatus.ACTIVE
         self.location2preempted_at.pop(resolved, None)
+        self.location2preempted_reason.pop(resolved, None)
+        self.location2retry_reserved_at.pop(resolved, None)
+        self._retry_state_dirty |= changed
 
-    def set_preemptive(self, location: Location) -> None:
+    def set_preemptive(self,
+                       location: Location,
+                       *,
+                       reason: str = 'capacity',
+                       observed_at: float | None = None) -> None:
+        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if resolved is None:
             logger.warning(f'set_preemptive: unknown location {location}; '
                            'ignoring (likely a pre-upgrade replica row).')
             return
+        if reason not in self._BENCH_REASONS:
+            raise ValueError(f'Unsupported placement bench reason: {reason!r}')
+        if observed_at is None:
+            observed_at = time.time()
+        if not math.isfinite(observed_at):
+            raise ValueError('Placement bench timestamp must be finite.')
         self.location2status[resolved] = LocationStatus.PREEMPTED
         # (Re)start the bench clock: a failed retry benches the location
         # for another full TTL window.
-        self.location2preempted_at[resolved] = time.time()
+        self.location2preempted_at[resolved] = observed_at
+        self.location2preempted_reason[resolved] = reason
+        self.location2retry_reserved_at.pop(resolved, None)
+        self._retry_state_dirty = True
+
+    def set_quota_limited(self,
+                          location: Location,
+                          *,
+                          observed_at: float | None = None) -> None:
+        """Bench every same-region candidate covered by quota evidence."""
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
+        if resolved is None:
+            logger.warning(f'set_quota_limited: unknown location {location}; '
+                           'ignoring (likely a pre-upgrade replica row).')
+            return
+        if observed_at is None:
+            observed_at = time.time()
+        for candidate in self.location2status:
+            if (not candidate.cloud.is_same_cloud(resolved.cloud) or
+                    candidate.region != resolved.region or
+                    candidate.use_spot != resolved.use_spot or
+                    candidate.accelerators != resolved.accelerators):
+                continue
+            self.set_preemptive(candidate,
+                                reason='quota',
+                                observed_at=observed_at)
 
     def clear_preemptive_locations(self) -> None:
+        self._ensure_retry_state_fields()
+        changed = bool(self.location2preempted_at or
+                       self.location2preempted_reason or
+                       self.location2retry_reserved_at)
         for location in self.location2status:
+            changed |= self.location2status[location] != LocationStatus.ACTIVE
             self.location2status[location] = LocationStatus.ACTIVE
         self.location2preempted_at.clear()
+        self.location2preempted_reason.clear()
+        self.location2retry_reserved_at.clear()
+        self._retry_state_dirty |= changed
 
     def inherit_preemption_state(self, old_placer: 'SpotPlacer') -> None:
         """Carry live benches for unchanged shapes into a rebuilt placer.
@@ -837,6 +908,8 @@ class SpotPlacer:
         model, image, disk tier, or ephemeral storage; a capacity failure for
         the old shape must not bench that new shape.
         """
+        self._ensure_retry_state_fields()
+        old_placer._ensure_retry_state_fields()  # pylint: disable=protected-access
         for location in self.location2status:
             if (old_placer.location2status.get(location)
                     != LocationStatus.PREEMPTED):
@@ -845,6 +918,92 @@ class SpotPlacer:
             preempted_at = old_placer.location2preempted_at.get(location)
             if preempted_at is not None:
                 self.location2preempted_at[location] = preempted_at
+            reason = old_placer.location2preempted_reason.get(location)
+            if reason is not None:
+                self.location2preempted_reason[location] = reason
+            retry_reserved_at = old_placer.location2retry_reserved_at.get(
+                location)
+            if retry_reserved_at is not None:
+                self.location2retry_reserved_at[location] = retry_reserved_at
+            self._retry_state_dirty = True
+
+    def dump_retry_state(self) -> dict[str, Any]:
+        """Return bounded JSON-safe placement retry state."""
+        self._ensure_retry_state_fields()
+        benches = []
+        for location in sorted(self.location2status,
+                               key=lambda candidate: candidate.sort_key()):
+            if self.location2status[location] != LocationStatus.PREEMPTED:
+                continue
+            observed_at = self.location2preempted_at.get(location)
+            if observed_at is None or not math.isfinite(observed_at):
+                continue
+            bench = {
+                'location': location.to_pickleable(),
+                'reason': self.location2preempted_reason.get(
+                    location, 'capacity'),
+                'observed_at': observed_at,
+            }
+            retry_reserved_at = self.location2retry_reserved_at.get(location)
+            if (retry_reserved_at is not None and
+                    math.isfinite(retry_reserved_at)):
+                bench['retry_reserved_at'] = retry_reserved_at
+            benches.append(bench)
+        return {'version': self._RETRY_STATE_VERSION, 'benches': benches}
+
+    def load_retry_state(self, state: dict[str, Any] | None) -> None:
+        """Restore exact durable benches without restarting their clocks."""
+        self._ensure_retry_state_fields()
+        if not isinstance(state, dict) or state.get(
+                'version') != self._RETRY_STATE_VERSION:
+            return
+        raw_benches = state.get('benches')
+        if not isinstance(raw_benches, list):
+            return
+        now = time.time()
+        for raw in raw_benches[:len(self.location2status)]:
+            if not isinstance(raw, dict):
+                continue
+            reason = raw.get('reason')
+            observed_at = raw.get('observed_at')
+            retry_reserved_at = raw.get('retry_reserved_at')
+            if (reason not in self._BENCH_REASONS or
+                    not isinstance(observed_at, (int, float)) or
+                    isinstance(observed_at, bool) or
+                    not math.isfinite(observed_at)):
+                continue
+            if (retry_reserved_at is not None and
+                (not isinstance(retry_reserved_at, (int, float)) or
+                 isinstance(retry_reserved_at, bool) or
+                 not math.isfinite(retry_reserved_at))):
+                continue
+            location_state = raw.get('location')
+            if not isinstance(location_state, dict):
+                continue
+            try:
+                location = Location.from_pickleable(location_state)
+            except (AssertionError, KeyError, TypeError, ValueError):
+                continue
+            if location is None:
+                continue
+            resolved = self.resolve_location(location)
+            if resolved is None:
+                continue
+            restored_at = min(float(observed_at), now)
+            self.location2status[resolved] = LocationStatus.PREEMPTED
+            self.location2preempted_at[resolved] = restored_at
+            self.location2preempted_reason[resolved] = reason
+            if retry_reserved_at is not None:
+                self.location2retry_reserved_at[resolved] = min(
+                    float(retry_reserved_at), now)
+        self._retry_state_dirty = False
+
+    @property
+    def retry_state_dirty(self) -> bool:
+        return getattr(self, '_retry_state_dirty', False)
+
+    def mark_retry_state_persisted(self) -> None:
+        self._retry_state_dirty = False
 
     def _min_cost_location(self, locations: list[Location]) -> Location:
         return min(
@@ -858,11 +1017,13 @@ class SpotPlacer:
         set_preemptive refreshes the timestamp (benched for another TTL);
         if it succeeds, set_active clears the mark entirely.
         """
+        self._ensure_retry_state_fields()
         status = self.location2status[location]
         if status == LocationStatus.PREEMPTED:
-            preempted_at = self.location2preempted_at.get(location)
-            if (preempted_at is not None and
-                    time.time() - preempted_at >= _preemption_retry_seconds()):
+            retry_from = self.location2retry_reserved_at.get(
+                location, self.location2preempted_at.get(location))
+            if (retry_from is not None and
+                    time.time() - retry_from >= _preemption_retry_seconds()):
                 return LocationStatus.ACTIVE
         return status
 
@@ -880,12 +1041,32 @@ class SpotPlacer:
         probe launch later fails. Otherwise a burst of scale-ups inside one
         window would all pile onto the benched location (it looks like the
         cheapest ACTIVE candidate) before the first failure re-benches it.
-        Refreshing the timestamp here caps it to one probe launch per TTL
-        window regardless of batch size; a successful launch clears the mark
-        via set_active.
+        Recording a separate reservation timestamp here caps it to one probe
+        launch per TTL window regardless of batch size while preserving the
+        underlying provider observation. A successful launch clears both via
+        set_active; a generic failure releases only the reservation.
         """
+        self._ensure_retry_state_fields()
         if self.location2status.get(location) == LocationStatus.PREEMPTED:
-            self.location2preempted_at[location] = time.time()
+            self.location2retry_reserved_at[location] = time.time()
+            self._retry_state_dirty = True
+
+    def reserve_retry(self, location: Location) -> None:
+        """Consume an expired exact-location retry selected by another layer."""
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
+        if resolved is not None:
+            self._consume_retry_if_benched(resolved)
+
+    def release_retry(self, location: Location) -> None:
+        """Release an expired-bench probe after a non-availability failure."""
+        self._ensure_retry_state_fields()
+        resolved = self.resolve_location(location,
+                                         allow_ambiguous_legacy_shape=True)
+        if (resolved is not None and
+                resolved in self.location2retry_reserved_at):
+            self.location2retry_reserved_at.pop(resolved, None)
+            self._retry_state_dirty = True
 
     def active_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.ACTIVE)
@@ -901,9 +1082,12 @@ class SpotPlacer:
         return list(self.location2status)
 
     def placement_snapshot(
-            self,
-            limit: int = _PLACEMENT_SNAPSHOT_MAX_LOCATIONS) -> dict[str, Any]:
+        self,
+        limit: int = _PLACEMENT_SNAPSHOT_MAX_LOCATIONS,
+        paid_admission_by_location: dict[Location, dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         """Serialize already-resident retry state without provider calls."""
+        self._ensure_retry_state_fields()
         if (not isinstance(limit, int) or isinstance(limit, bool) or
                 limit < 1 or limit > _PLACEMENT_SNAPSHOT_MAX_LOCATIONS):
             raise ValueError(f'limit must be an integer from 1 to '
@@ -916,11 +1100,14 @@ class SpotPlacer:
         for location in locations[:limit]:
             stored_status = self.location2status[location]
             benched_at = self.location2preempted_at.get(location)
+            retry_reserved_at = self.location2retry_reserved_at.get(location)
             next_probe_at = None
             effective_status = stored_status
             if (stored_status == LocationStatus.PREEMPTED and
                     benched_at is not None):
-                next_probe_at = benched_at + retry_seconds
+                retry_from = (benched_at if retry_reserved_at is None else
+                              retry_reserved_at)
+                next_probe_at = retry_from + retry_seconds
                 if now >= next_probe_at:
                     effective_status = LocationStatus.ACTIVE
             cached_cost = self.location2cost.get(location)
@@ -930,21 +1117,30 @@ class SpotPlacer:
                 'cloud': str(location.cloud),
                 'region': location.region,
                 'zone': location.zone,
+                'instance_type': location.instance_type,
                 'accelerators': location.accelerators,
                 'use_spot': location.use_spot,
                 'stored_status': stored_status.value,
                 'effective_status': effective_status.value,
+                'bench_reason': self.location2preempted_reason.get(location),
                 'probe_eligible': (stored_status == LocationStatus.PREEMPTED and
                                    effective_status == LocationStatus.ACTIVE),
                 'benched_at': benched_at,
+                'retry_reserved_at': retry_reserved_at,
                 'next_probe_at': next_probe_at,
                 'cached_hourly_cost': cached_cost,
+                'paid_admission':
+                    (None if paid_admission_by_location is None else
+                     paid_admission_by_location.get(location)),
             })
         return {
             'available': True,
             'enabled': True,
             'retry_seconds': retry_seconds,
             'observed_at': now,
+            'status_semantics':
+                ('Controller eligibility only; ACTIVE does not guarantee live '
+                 'provider capacity.'),
             'locations': entries,
             'truncated': len(locations) > limit,
         }
@@ -960,11 +1156,11 @@ class SpotPlacer:
                              selected_at: float | None) -> bool:
         """Whether a queued placement is still valid for launch admission.
 
-        Selecting an expired bench consumes its one retry by refreshing the
-        bench timestamp before the replica row is created. That specific row
-        remains admissible even though the location is no longer effectively
-        ACTIVE. A bench recorded after the row was selected is newer failure
-        evidence and fences the queued launch.
+        Selecting an expired bench consumes its one retry by recording a
+        separate reservation before the replica row is created. That specific
+        row remains admissible even though the location is no longer
+        effectively ACTIVE. A bench recorded after the row was selected is
+        newer failure evidence and fences the queued launch.
         """
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
@@ -1116,15 +1312,13 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
             self,
             *,
             skip_zero_cost_preference: bool = False,
-            allowed_locations: set[Location] | None = None) -> Location:
+            allowed_locations: set[Location] | None = None) -> Location | None:
         active_locations = [
             location for location in self.active_locations()
             if allowed_locations is None or location in allowed_locations
         ]
         if not active_locations:
-            raise RuntimeError(
-                'No active placement location satisfies the requested exact '
-                'accelerator override.')
+            return None
         # Zero-cost tier first: locations that cost nothing (reserved /
         # already-paid capacity, e.g. a Kubernetes pool) are filled
         # COMPLETELY before any paid location is considered, regardless
@@ -1159,17 +1353,6 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         logger.info(f'Active locations: {active_locations}\n'
                     f'Selected location: {res}\n')
         return res
-
-    def set_preemptive(self, location: Location) -> None:
-        super().set_preemptive(location)
-        # Reset only on TOTAL exhaustion (nothing selectable at all). The
-        # old <2 threshold defeated small mixed sets: benching a full
-        # zero-cost pool with a single paid fallback left active==1,
-        # which reset the bench and re-selected the full pool forever
-        # instead of spilling over. The TTL decay now guarantees benched
-        # locations come back on their own.
-        if not self.active_locations():
-            self.clear_preemptive_locations()
 
 
 class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,

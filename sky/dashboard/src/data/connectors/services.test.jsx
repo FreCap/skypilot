@@ -938,18 +938,27 @@ describe('service placement', () => {
       available: true,
       enabled: true,
       retry_seconds: 600,
+      status_semantics: 'Eligibility is not live inventory.',
       locations: [
         {
           cloud: 'AWS',
           region: 'us-east-1',
           zone: 'us-east-1a',
+          instance_type: 'g6.xlarge',
           accelerators: { L4: 1 },
           use_spot: true,
           stored_status: 'PREEMPTED',
           effective_status: 'ACTIVE',
+          bench_reason: 'quota',
           probe_eligible: true,
           benched_at: 1000,
           next_probe_at: 1600,
+          paid_admission: {
+            state: 'cooldown',
+            pool_remaining: 0,
+            service_remaining: 12,
+            cooldown_until: 1700,
+          },
         },
       ],
     },
@@ -997,11 +1006,22 @@ describe('service placement', () => {
     expect(placement.serviceName).toBe('svc');
     expect(placement.placerState.locations[0]).toMatchObject({
       cloud: 'AWS',
+      instanceType: 'g6.xlarge',
+      benchReason: 'quota',
       probeEligible: true,
       storedStatus: 'PREEMPTED',
       effectiveStatus: 'ACTIVE',
       nextProbeAt: 1600,
+      paidAdmission: {
+        state: 'cooldown',
+        poolRemaining: 0,
+        serviceRemaining: 12,
+        cooldownUntil: 1700,
+      },
     });
+    expect(placement.placerState.statusSemantics).toBe(
+      'Eligibility is not live inventory.'
+    );
     expect(placement.capacityHints.hints[0]).toMatchObject({
       kind: 'capacity',
       cloud: 'aws',

@@ -370,27 +370,37 @@ def get_service_schema():
                             },
                         ],
                     },
-                    # Opt-in economic replacement of serving replicas.  The
-                    # replacement is launched and proven ready before the
-                    # incumbent is removed from routing and drained.
+                    # Default-on economic replacement for placer-backed
+                    # services. False is the explicit opt-out; True or an
+                    # object enables the conservative defaults.
                     'cost_rebalance': {
-                        'type': 'object',
-                        'additionalProperties': False,
-                        'properties': {
-                            'min_savings_fraction': {
-                                'type': 'number',
-                                'exclusiveMinimum': 0,
-                                'maximum': 1,
+                        'oneOf': [
+                            {
+                                'type': 'null',
                             },
-                            'max_parallel_replacements': {
-                                'type': 'integer',
-                                'minimum': 1,
+                            {
+                                'type': 'boolean',
                             },
-                            'stabilization_seconds': {
-                                'type': 'number',
-                                'minimum': 0,
+                            {
+                                'type': 'object',
+                                'additionalProperties': False,
+                                'properties': {
+                                    'min_savings_fraction': {
+                                        'type': 'number',
+                                        'exclusiveMinimum': 0,
+                                        'maximum': 1,
+                                    },
+                                    'max_parallel_replacements': {
+                                        'type': 'integer',
+                                        'minimum': 1,
+                                    },
+                                    'stabilization_seconds': {
+                                        'type': 'number',
+                                        'minimum': 0,
+                                    },
+                                },
                             },
-                        },
+                        ],
                     },
                     'dynamic_ondemand_fallback': {
                         'type': 'boolean',

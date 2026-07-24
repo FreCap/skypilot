@@ -45,19 +45,27 @@ const placement = {
         cloud: 'AWS',
         region: 'us-east-1',
         zone: 'us-east-1a',
+        instanceType: 'g6.xlarge',
         accelerators: { L4: 1 },
         useSpot: true,
         storedStatus: 'PREEMPTED',
         effectiveStatus: 'ACTIVE',
+        benchReason: 'quota',
         probeEligible: true,
         benchedAt: 1000,
         nextProbeAt: 1600,
         cachedHourlyCost: 0.45,
+        paidAdmission: {
+          state: 'probe',
+          poolRemaining: 1,
+          serviceRemaining: 12,
+        },
       },
       {
         cloud: 'AWS',
         region: 'us-east-1',
         zone: 'us-east-1b',
+        instanceType: 'g6.2xlarge',
         accelerators: { A100: 1 },
         useSpot: false,
         storedStatus: 'ACTIVE',
@@ -71,6 +79,7 @@ const placement = {
         cloud: 'AWS',
         region: 'us-east-1',
         zone: 'us-east-1c',
+        instanceType: 'p5.48xlarge',
         accelerators: { H100: 1 },
         useSpot: true,
         storedStatus: 'PREEMPTED',
@@ -84,6 +93,7 @@ const placement = {
         cloud: 'GCP',
         region: 'us-central1',
         zone: 'us-central1-a',
+        instanceType: 'g2-standard-4',
         accelerators: { L4: 1 },
         useSpot: true,
         storedStatus: 'ACTIVE',
@@ -195,11 +205,11 @@ it('loads once on mount and only refreshes manually', async () => {
     expect(within(awsRow).getByText('$2.5000/hr')).toBeTruthy();
     expect(
       screen.getByLabelText(
-        /Availability: Available spot[\s\S]*Probe eligible since/
+        /Eligibility: Eligible spot[\s\S]*Probe eligible since/
       )
     ).toBeTruthy();
     expect(
-      screen.getByLabelText(/Availability: Unavailable[\s\S]*Next probe:/)
+      screen.getByLabelText(/Eligibility: Ineligible[\s\S]*Next probe:/)
     ).toBeTruthy();
     expect(screen.getByText('Zonal capacity')).toBeTruthy();
     // The provider is shown so a hint is attributable once more than one
@@ -244,14 +254,14 @@ it('filters the compact rows and clears all filters', async () => {
   fireEvent.change(screen.getByLabelText('Region filter'), {
     target: { value: 'all' },
   });
-  fireEvent.change(screen.getByLabelText('Availability filter'), {
+  fireEvent.change(screen.getByLabelText('Eligibility filter'), {
     target: { value: LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND },
   });
   expect(screen.getByText('$3.2500/hr')).toBeTruthy();
   expect(screen.queryByText('$0.4500/hr')).toBeNull();
   expect(screen.queryByText('$2.5000/hr')).toBeNull();
 
-  fireEvent.change(screen.getByLabelText('Availability filter'), {
+  fireEvent.change(screen.getByLabelText('Eligibility filter'), {
     target: { value: 'all' },
   });
   fireEvent.change(screen.getByLabelText('Card filter'), {
@@ -272,7 +282,7 @@ it('filters the compact rows and clears all filters', async () => {
 it('exposes next-probe detail on the unavailable card hover target', async () => {
   render(<ServicePlacement serviceName="svc" />);
   const unavailable = await screen.findByLabelText(
-    /Availability: Unavailable[\s\S]*Next probe:/
+    /Eligibility: Ineligible[\s\S]*Next probe:/
   );
 
   expect(unavailable).toHaveAttribute(

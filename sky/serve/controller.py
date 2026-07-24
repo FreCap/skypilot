@@ -31,6 +31,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
+from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import serve_history
@@ -350,6 +351,24 @@ class SkyServeController:
         self._autoscaler: autoscalers.Autoscaler = (
             autoscalers.Autoscaler.from_spec(service_name, service_spec,
                                              version))
+        self._autoscaler.set_spot_placer(self._replica_manager.spot_placer)
+        try:
+            placement_policy_states = (
+                serve_state.get_service_placement_policy_states(service_name))
+        except Exception as e:  # pylint: disable=broad-except
+            # This state is an economic optimization fence, not part of the
+            # serving data path. Starting with no elapsed stabilization is the
+            # conservative fallback: it cannot authorize an early replacement
+            # and lets a recovering controller become healthy while the next
+            # successful write re-establishes durable state.
+            logger.warning(
+                'Could not restore cost-rebalance stabilization; restarting '
+                'the candidate window: '
+                f'{common_utils.format_exception(e)}')
+            placement_policy_states = None
+        self._autoscaler.load_cost_rebalance_state(
+            None if placement_policy_states is
+            None else placement_policy_states['cost_rebalance_state'])
         self._configure_instance_aware_accelerators(service_spec)
         # [boltz fork] Reserved-capacity fill poller lifecycle: started
         # from run() when the service booted with the flag on, and
@@ -443,6 +462,30 @@ class SkyServeController:
                            '(best-effort; will rely on the first successful '
                            'poll instead): '
                            f'{common_utils.format_exception(e)}')
+
+    def _persist_cost_rebalance_state(
+            self, autoscaler: autoscalers.Autoscaler) -> bool:
+        """Persist stabilization before authorizing economic scale-up."""
+        if not autoscaler.cost_rebalance_state_dirty:
+            return True
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            autoscaler.mark_cost_rebalance_state_persisted()
+            return True
+        try:
+            persisted = serve_state.set_service_cost_rebalance_state(
+                self._service_name, service_hash,
+                getattr(self, '_controller_owner', None),
+                autoscaler.dump_cost_rebalance_state())
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                'Could not persist cost-rebalance stabilization; suppressing '
+                'new economic replacements for this tick: '
+                f'{common_utils.format_exception(e)}')
+            return False
+        if persisted:
+            autoscaler.mark_cost_rebalance_state_persisted()
+        return persisted
 
     def _get_lb_replica_info(
         self,
@@ -3683,6 +3726,18 @@ class SkyServeController:
                 # for better decoupling.
                 scaling_options = decision_autoscaler.generate_scaling_decisions(
                     replica_infos, active_versions)
+                if not self._persist_cost_rebalance_state(decision_autoscaler):
+                    logger.warning(
+                        'Suppressing new cost-rebalance replacements because '
+                        'the controller no longer owns durable stabilization '
+                        'state.')
+                    scaling_options = [
+                        option for option in scaling_options
+                        if not (option.operator == autoscalers.
+                                AutoscalerDecisionOperator.SCALE_UP and
+                                option.reason == autoscalers.
+                                AutoscalerDecisionReason.COST_REBALANCE)
+                    ]
                 rollout_failure = (
                     decision_autoscaler.unrecoverable_rollout_failure)
                 if isinstance(rollout_failure,
@@ -3920,7 +3975,7 @@ class SkyServeController:
         @self._app.get(
             serve_constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
             dependencies=[admin_auth_dependency, controller_owner_dependency])
-        async def get_placement_state() -> fastapi.Response:
+        def get_placement_state() -> fastapi.Response:
             placer = self._replica_manager.spot_placer
             if placer is None:
                 content = {
@@ -3930,7 +3985,30 @@ class SkyServeController:
                     'truncated': False,
                 }
             else:
-                content = placer.placement_snapshot()
+                replica_infos = serve_state.get_replica_infos(
+                    self._service_name)
+                try:
+                    budget = paid_capacity.build_launch_budget(
+                        placer,
+                        workspace=getattr(self._replica_manager, '_workspace',
+                                          constants.SKYPILOT_DEFAULT_WORKSPACE),
+                        existing_replica_infos=replica_infos,
+                        globally_managed=getattr(self, '_service_hash',
+                                                 None) is not None)
+                    paid_admission = (
+                        paid_capacity.admission_snapshot_by_location(budget))
+                except Exception as e:  # pylint: disable=broad-except
+                    # Admission shown here is explicitly advisory. Keep exact
+                    # location and bench diagnostics available during a
+                    # database outage; the launch path still requires its
+                    # transactional claim and therefore remains fail closed.
+                    logger.warning(
+                        'Could not build advisory paid-capacity placement '
+                        'state: '
+                        f'{common_utils.format_exception(e)}')
+                    paid_admission = None
+                content = placer.placement_snapshot(
+                    paid_admission_by_location=paid_admission)
             return responses.JSONResponse(content=content, status_code=200)
 
         @self._app.get(

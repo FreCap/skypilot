@@ -73,6 +73,46 @@ def test_classify_known_mixed_capacity_and_quota_as_quota():
                          'VcpuLimitExceeded')) == 'quota'
 
 
+def test_terminal_resources_unavailable_requires_all_structured_evidence():
+    capacity = exceptions.ResourcesUnavailableError(
+        'capacity',
+        failover_history=[
+            _aggregate_error('InsufficientInstanceCapacity'),
+            _aggregate_error('InsufficientInstanceCapacity'),
+        ])
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        capacity) == 'capacity'
+
+    quota = exceptions.ResourcesUnavailableError(
+        'quota',
+        failover_history=[
+            _aggregate_error('InsufficientInstanceCapacity'),
+            _aggregate_error('MaxSpotInstanceCountExceeded'),
+        ])
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        quota) == 'quota'
+
+    mixed = exceptions.ResourcesUnavailableError(
+        'not availability',
+        failover_history=[
+            _aggregate_error('InsufficientInstanceCapacity'),
+            _aggregate_error('RequestLimitExceeded'),
+        ])
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        mixed) is None
+
+
+def test_terminal_resources_unavailable_does_not_parse_error_text():
+    error = exceptions.ResourcesUnavailableError(
+        'InsufficientInstanceCapacity',
+        failover_history=[
+            RuntimeError('InsufficientInstanceCapacity'),
+            AssertionError('security group already exists'),
+        ])
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        error) is None
+
+
 def test_shared_hint_requires_full_demand_request_metadata():
     error = _aggregate_error('InsufficientInstanceCapacity')
     assert not backend._failure_requested_full_demand(error, 4)

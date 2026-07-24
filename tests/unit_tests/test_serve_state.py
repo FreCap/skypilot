@@ -162,6 +162,34 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
         session.commit()
 
 
+def test_placement_policy_state_is_separate_and_owner_fenced(_mock_serve_db):
+    owner = (123, '10.0.0.1')
+    _add_minimal_service('svc',
+                         controller_pid=owner[0],
+                         controller_ip=owner[1],
+                         service_hash='incarnation-a')
+
+    spot_state = {'version': 1, 'benches': [{'reason': 'capacity'}]}
+    rebalance_state = {'version': 1, 'candidates': [{'replica_id': 7}]}
+    assert serve_state.set_service_spot_placement_state('svc', 'incarnation-a',
+                                                        owner, spot_state)
+    assert not serve_state.set_service_cost_rebalance_state(
+        'svc', 'incarnation-a', (999, '10.0.0.9'), rebalance_state)
+    assert serve_state.set_service_cost_rebalance_state('svc', 'incarnation-a',
+                                                        owner, rebalance_state)
+
+    assert serve_state.get_service_placement_policy_states('svc') == {
+        'spot_placement_state': spot_state,
+        'cost_rebalance_state': rebalance_state,
+    }
+    assert not serve_state.set_service_spot_placement_state(
+        'svc', 'stale-incarnation', owner, {
+            'version': 1,
+            'benches': []
+        })
+    assert serve_state.get_service_placement_policy_states('missing') is None
+
+
 def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
                                                      monkeypatch):
     """Provisioning and termination occupancy are counted in one SQL query.

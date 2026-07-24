@@ -13,6 +13,7 @@ import pytest
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
+from sky import clouds
 from sky.serve import spot_placer
 
 
@@ -102,21 +103,21 @@ class TestPreemptionTtlRetry:
         assert cheap in placer.active_locations()
         assert cheap not in placer.preemptive_locations()
 
-    def test_total_exhaustion_reset(self, placer_and_locations, monkeypatch):
-        """The global reset fires only when NOTHING is selectable —
-        a single remaining active location must stay the fallback
-        (the old <2 threshold un-benched a full zero-cost pool and
-        re-selected it forever instead of spilling to the paid tier)."""
+    def test_total_exhaustion_waits_for_ttl(self, placer_and_locations,
+                                            monkeypatch):
+        """Total exhaustion stays closed until a durable retry is eligible."""
         placer, cheap, other, third = placer_and_locations
-        monkeypatch.setattr(spot_placer.time, 'time', lambda: 1000.0)
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
         placer.set_preemptive(cheap)
         placer.set_preemptive(other)
-        # One active location left: NO reset — it serves as fallback.
         assert placer.active_locations() == [third]
-        # Benching the last one leaves nothing selectable -> reset.
         placer.set_preemptive(third)
+        assert placer.active_locations() == []
+        assert placer.select_next_location() is None
+        assert len(placer.location2preempted_at) == 3
+        now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
         assert len(placer.active_locations()) == 3
-        assert not placer.location2preempted_at
 
     def test_selection_consumes_the_retry_budget(self, placer_and_locations,
                                                  monkeypatch):
@@ -126,9 +127,12 @@ class TestPreemptionTtlRetry:
         now = [1000.0]
         monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
         placer.set_preemptive(cheap)
+        observed_at = placer.location2preempted_at[cheap]
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
         # First selection picks the expired-benched cheapest location...
         assert placer.select_next_location() == cheap
+        assert placer.location2preempted_at[cheap] == observed_at
+        assert placer.location2retry_reserved_at[cheap] == now[0]
         # ...and consumes its retry: subsequent selections in the same
         # burst must go elsewhere until the next window.
         assert cheap not in placer.active_locations()
@@ -200,3 +204,98 @@ class TestPreemptionTtlRetry:
             for item in snapshot['locations']
         }
         assert prices == {'seoul': 1.0, 'oregon': 2.0, 'iowa': 3.0}
+
+    def test_retry_state_survives_restart_with_original_expiry(
+            self, monkeypatch):
+        location = spot_placer.Location(cloud=clouds.AWS(),
+                                        region='us-east-1',
+                                        zone='us-east-1a',
+                                        accelerators={'L4': 1},
+                                        use_spot=True,
+                                        instance_type='g6.xlarge')
+        original = make_placer({location: 1.0})
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
+        original.set_preemptive(location, reason='quota')
+        state = original.dump_retry_state()
+
+        now[0] = 1200.0
+        restored = make_placer({location: 1.0})
+        restored.load_retry_state(state)
+        assert restored.location2preempted_at[location] == 1000.0
+        assert restored.location2preempted_reason[location] == 'quota'
+        assert location not in restored.active_locations()
+
+        now[0] = 1601.0
+        assert location in restored.active_locations()
+
+    def test_probe_reservation_survives_restart_and_generic_failure_releases_it(
+            self, monkeypatch):
+        location = spot_placer.Location(cloud=clouds.AWS(),
+                                        region='us-east-1',
+                                        zone='us-east-1a',
+                                        accelerators={'L4': 1},
+                                        use_spot=True,
+                                        instance_type='g6.xlarge')
+        placer = make_placer({location: 1.0})
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
+        placer.set_preemptive(location, reason='capacity')
+        original_observed_at = placer.location2preempted_at[location]
+        now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
+        assert placer.select_next_location() == location
+
+        restored = make_placer({location: 1.0})
+        restored.load_retry_state(placer.dump_retry_state())
+        assert restored.location2preempted_at[location] == original_observed_at
+        assert restored.location2retry_reserved_at[location] == now[0]
+        assert location not in restored.active_locations()
+
+        restored.release_retry(location)
+        assert location in restored.active_locations()
+        assert location not in restored.location2retry_reserved_at
+        assert restored.location2preempted_at[location] == original_observed_at
+        assert restored.location2preempted_reason[location] == 'capacity'
+
+    def test_quota_benches_matching_regional_scope(self):
+        aws = clouds.AWS()
+        failed = spot_placer.Location(cloud=aws,
+                                      region='us-east-1',
+                                      zone='us-east-1a',
+                                      accelerators={'L4': 1},
+                                      use_spot=True,
+                                      instance_type='g6.xlarge')
+        sibling_type = spot_placer.Location(cloud=aws,
+                                            region='us-east-1',
+                                            zone='us-east-1b',
+                                            accelerators={'L4': 1},
+                                            use_spot=True,
+                                            instance_type='g6.2xlarge')
+        on_demand = spot_placer.Location(cloud=aws,
+                                         region='us-east-1',
+                                         zone='us-east-1b',
+                                         accelerators={'L4': 1},
+                                         use_spot=False,
+                                         instance_type='g6.xlarge')
+        other_region = spot_placer.Location(cloud=aws,
+                                            region='us-west-2',
+                                            zone='us-west-2a',
+                                            accelerators={'L4': 1},
+                                            use_spot=True,
+                                            instance_type='g6.xlarge')
+        placer = make_placer({
+            failed: 1.0,
+            sibling_type: 1.1,
+            on_demand: 3.0,
+            other_region: 1.2,
+        })
+
+        placer.set_quota_limited(failed, observed_at=1000.0)
+
+        assert {
+            location for location, status in placer.location2status.items()
+            if status == spot_placer.LocationStatus.PREEMPTED
+        } == {failed, sibling_type}
+        assert placer.location2preempted_reason[failed] == 'quota'
+        assert on_demand in placer.active_locations()
+        assert other_region in placer.active_locations()

@@ -1840,13 +1840,19 @@ The following optional fields require ``dynamic_fallback_per_gpu`` and
 ``service.replica_policy.cost_rebalance``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Optional cost-aware replacement policy. Requires ``spot_placer``.
+Cost-aware replacement policy for services with ``spot_placer``. It is enabled
+by default; set it to ``false`` to opt out. ``true`` uses the defaults, while
+an object customizes them.
 
 When a capacity-equivalent active location stays at least
 ``min_savings_fraction`` cheaper for ``stabilization_seconds``, SkyServe
 launches a replacement before gracefully draining the expensive incumbent.
 ``max_parallel_replacements`` bounds temporary replacement overlap and does not
 change the demand autoscaler's ``max_replicas`` limit.
+
+The replacement admission and stabilization state survive controller and API
+server restarts. Only structured provider capacity or quota failures suppress
+a candidate location; other launch errors do not classify it as unavailable.
 
 .. code-block:: yaml
 

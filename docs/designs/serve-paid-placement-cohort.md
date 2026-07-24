@@ -153,16 +153,16 @@ flowchart LR
 
 ### Scope
 
-The global paid authority applies only to fresh demand launches selected by a
-spot placer at non-zero-cost locations. It does not constrain:
+The global paid authority applies to fresh demand launches and fresh
+cost-rebalance replacements at non-zero-cost locations. It does not constrain:
 
 - zero-cost reserved-capacity demand or fill;
 - recovery re-drives with an immutable persisted location;
-- cost-rebalance replacements with an already selected location; or
 - services without a spot placer.
 
-A recovery-pinned unresolved paid row still counts against global capacity. It
-does not acquire a second claim.
+A recovery-pinned unresolved paid row, including a cost-rebalance replacement,
+still counts against global capacity. It does not acquire a second claim. See
+`serve-restart-safe-cost-rebalance.md` for the replacement protocol.
 
 Fresh claim acquisition is blocked once a service enters a launch-blocking
 status. Adoption and launch-outcome persistence remain allowed for the same

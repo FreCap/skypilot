@@ -276,6 +276,57 @@ def test_non_capacity_failure_preserves_provider_evidence():
     assert not update.failed
 
 
+def test_quota_failure_closes_paid_capacity_ramp():
+    update = paid_capacity.record_outcomes(
+        current_limit=240,
+        successes_since_resize=17,
+        last_success_at=100,
+        outcomes=[paid_capacity.LaunchOutcome.QUOTA_FAILURE],
+        bootstrap_limit=4,
+        ceiling_limit=480,
+        now=101,
+        ttl_seconds=600)
+
+    assert update.current_limit == 4
+    assert update.successes_since_resize == 0
+    assert update.failed
+
+
+def test_admission_snapshot_distinguishes_open_and_cooldown():
+    open_location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    cooldown_location = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    budget = paid_capacity.LaunchBudget(remaining_by_location={
+        open_location: 2,
+        cooldown_location: 0,
+    },
+                                        pool_key_by_location={
+                                            open_location: 'open',
+                                            cooldown_location: 'cooldown',
+                                        },
+                                        states_by_pool_key={
+                                            'open': {
+                                                'admission_state': 'active',
+                                            },
+                                            'cooldown': {
+                                                'admission_state': 'cooldown',
+                                                'cooldown_until': 1234.0,
+                                            },
+                                        },
+                                        globally_managed=True,
+                                        service_remaining=12)
+
+    snapshot = paid_capacity.admission_snapshot_by_location(budget)
+
+    assert snapshot[open_location] == {
+        'state': 'open',
+        'pool_remaining': 2,
+        'service_remaining': 12,
+        'cooldown_until': None,
+    }
+    assert snapshot[cooldown_location]['state'] == 'cooldown'
+    assert snapshot[cooldown_location]['cooldown_until'] == 1234.0
+
+
 def test_global_snapshot_uses_shared_headroom_by_exact_pool():
     cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')

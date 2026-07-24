@@ -70,6 +70,7 @@ class LaunchOutcome(enum.Enum):
 
     SUCCESS = 'success'
     CAPACITY_FAILURE = 'capacity_failure'
+    QUOTA_FAILURE = 'quota_failure'
     OTHER_FAILURE = 'other_failure'
 
 
@@ -250,7 +251,8 @@ def record_outcomes(
     completed = list(outcomes)
     if not completed:
         raise ValueError('At least one paid-capacity outcome is required.')
-    if LaunchOutcome.CAPACITY_FAILURE in completed:
+    if (LaunchOutcome.CAPACITY_FAILURE in completed or
+            LaunchOutcome.QUOTA_FAILURE in completed):
         return RampUpdate(current_limit=bootstrap_limit,
                           successes_since_resize=0,
                           expired=False,
@@ -486,6 +488,30 @@ def select_location(
     if selected_key in budget.priority_deferred_pool_keys:
         return None
     return selected
+
+
+def admission_snapshot_by_location(
+        budget: LaunchBudget) -> dict[spot_placer.Location, dict[str, Any]]:
+    """Return bounded, display-only admission state for active paid pools."""
+    snapshot = {}
+    for location, remaining in budget.remaining_by_location.items():
+        key = budget.pool_key_by_location.get(location)
+        state = budget.states_by_pool_key.get(key,
+                                              {}) if key is not None else {}
+        raw_state = str(state.get('admission_state', 'active'))
+        if raw_state == 'active':
+            admission_state = 'open' if remaining > 0 else 'saturated'
+        elif raw_state in ('cooldown', 'probe'):
+            admission_state = raw_state
+        else:
+            admission_state = 'open' if remaining > 0 else 'saturated'
+        snapshot[location] = {
+            'state': admission_state,
+            'pool_remaining': max(0, int(remaining)),
+            'service_remaining': budget.service_remaining,
+            'cooldown_until': state.get('cooldown_until'),
+        }
+    return snapshot
 
 
 def defer_for_priority(budget: LaunchBudget | None,

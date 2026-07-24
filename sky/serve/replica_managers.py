@@ -27,6 +27,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
 from sky.backends import backend_utils
+from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import constants as serve_constants
 from sky.serve import paid_capacity
@@ -289,7 +290,13 @@ class _ReplicaLaunchSupersededError(RuntimeError):
 
 
 class _ReplicaLaunchCapacityError(RuntimeError):
-    """A pinned provider launch failed with typed capacity exhaustion."""
+    """A pinned provider launch failed with typed availability evidence."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        if reason not in ('capacity', 'quota'):
+            raise ValueError(f'Invalid availability failure reason: {reason}')
+        self.reason = reason
 
 
 class _UnfencedExternalLbLaunchError(RuntimeError):
@@ -473,6 +480,7 @@ def launch_cluster(
     while True:
         retry_cnt += 1
         capacity_error: exceptions.ResourcesUnavailableError | None = None
+        availability_reason: str | None = None
         try:
             if _check_is_cancelled():
                 return
@@ -544,13 +552,14 @@ def launch_cluster(
                 raise _ReplicaLaunchOwnershipLostError(
                     f'Replica {replica_id} launch was cancelled after '
                     'controller ownership loss.') from e
-            if not any(
-                    isinstance(err, exceptions.ResourcesUnavailableError)
-                    for err in e.failover_history):
-                raise RuntimeError('Failed to launch the sky serve replica '
-                                   f'cluster {cluster_name}.') from e
-            capacity_error = e
-            availability_retry_cnt += 1
+            launch_cloud = next(iter(task.resources)).cloud
+            if launch_cloud is not None:
+                availability_reason = (
+                    cloud_vm_ray_backend.classify_resources_unavailable_error(
+                        launch_cloud, e))
+            if availability_reason is not None:
+                capacity_error = e
+                availability_retry_cnt += 1
             logger.info('Failed to launch the sky serve replica cluster with '
                         f'error: {common_utils.format_exception(e)})')
         except Exception as e:  # pylint: disable=broad-except
@@ -580,8 +589,10 @@ def launch_cluster(
             if capacity_error is not None:
                 raise _ReplicaLaunchCapacityError(
                     'Failed to launch the sky serve replica cluster '
-                    f'{cluster_name} due to provider capacity after '
-                    f'{retry_cnt} attempt(s).') from capacity_error
+                    f'{cluster_name} due to provider {availability_reason} '
+                    f'after {retry_cnt} attempt(s).',
+                    reason=typing.cast(str,
+                                       availability_reason)) from capacity_error
             raise RuntimeError('Failed to launch the sky serve replica cluster '
                                f'{cluster_name} after {retry_cnt} attempt(s).')
 
@@ -2226,6 +2237,36 @@ class SkyPilotReplicaManager(ReplicaManager):
             whether it is still responding to requests.
     """
 
+    def _restore_spot_placement_state(self) -> None:
+        """Restore durable exact-location benches once per manager process."""
+        if getattr(self, '_spot_placement_state_restored', False):
+            return
+        placer = getattr(self, '_spot_placer', None)
+        if placer is not None:
+            states = serve_state.get_service_placement_policy_states(
+                self._service_name)
+            placer.load_retry_state(None if states is
+                                    None else states['spot_placement_state'])
+        self._spot_placement_state_restored = True
+
+    def _persist_spot_placement_state_if_dirty(self) -> None:
+        """Fence and persist placer evidence before dependent replica rows."""
+        placer = getattr(self, '_spot_placer', None)
+        if placer is None or not placer.retry_state_dirty:
+            return
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            placer.mark_retry_state_persisted()
+            return
+        persisted = serve_state.set_service_spot_placement_state(
+            self._service_name, service_hash,
+            getattr(self, '_controller_owner', None), placer.dump_retry_state())
+        if not persisted:
+            raise RuntimeError(
+                f'Service {self._service_name!r} controller ownership changed '
+                'while persisting placement retry state.')
+        placer.mark_retry_state_persisted()
+
     def _db_fence_kwargs(self) -> dict[str, Any]:
         """Exact owner predicates, omitted for legacy/direct test managers."""
         kwargs: dict[str, Any] = {}
@@ -2488,6 +2529,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
             task.resources) if self._uses_logical_replicas else {})
         self._spot_placer = _load_spot_placer(service_name, version, spec, task)
+        self._spot_placement_state_restored = False
         if self._uses_logical_replicas:
             _validate_logical_capacity_sources(self._default_planned_capacity,
                                                self._spot_placer,
@@ -2658,6 +2700,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # past every persisted id so new replicas always get a fresh id. On a
         # first run there are no replicas, so this stays at 1 (no-op).
         all_replica_infos = serve_state.get_replica_infos(self._service_name)
+        self._restore_spot_placement_state()
         if not paid_capacity.adopt_existing_claims(
                 service_name=self._service_name,
                 service_hash=getattr(self, '_service_hash', None),
@@ -3147,6 +3190,34 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._clean_up_skipped_cost_rebalance_redrive(
                     replica_id, prior_cost_rebalance_for_replica_id)
                 return False
+            if not recovering_existing_replica:
+                if existing_replica_infos is None:
+                    existing_replica_infos = serve_state.get_replica_infos(
+                        self._service_name)
+                if paid_location_launch_budget is None:
+                    paid_location_launch_budget = (
+                        paid_capacity.build_launch_budget(
+                            self._spot_placer,
+                            workspace=getattr(
+                                self, '_workspace',
+                                constants.SKYPILOT_DEFAULT_WORKSPACE),
+                            existing_replica_infos=existing_replica_infos,
+                            globally_managed=(getattr(self, '_service_hash',
+                                                      None) is not None)))
+                if location in (
+                        paid_location_launch_budget.remaining_by_location):
+                    if (paid_location_launch_budget.
+                            remaining_by_location[location] <= 0 or
+                            paid_capacity.service_exhausted(
+                                paid_location_launch_budget)):
+                        logger.info(
+                            'Deferring cost-rebalance replacement because '
+                            f'paid admission is closed at {location}.')
+                        self._clean_up_skipped_cost_rebalance_redrive(
+                            replica_id, prior_cost_rebalance_for_replica_id)
+                        return False
+                    debit_paid_location_launch_budget = True
+                self._spot_placer.reserve_retry(location)
             resources_override = location.to_dict()
             use_spot = location.use_spot
             retry_until_up = False
@@ -3333,6 +3404,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # launches -- while availability_max_retry=1 (armed by
                 # this location below) never sees the error.
                 retry_until_up = False
+        self._persist_spot_placement_state_if_dirty()
         if logical_reconcile_fence is not None:
             if not self._logical_reconcile_fence_holds(
                     logical_reconcile_fence,
@@ -6240,7 +6312,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         if info.is_spot and self._spot_placer is not None:
             spot_location = info.get_spot_location()
             assert spot_location is not None
-            self._spot_placer.set_preemptive(spot_location)
+            self._spot_placer.set_preemptive(spot_location, reason='preempted')
+            self._persist_spot_placement_state_if_dirty()
         self._persist_replica(info.replica_id, info)
         self._terminate_replica(info.replica_id,
                                 sync_down_logs=False,
@@ -6526,7 +6599,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         pending_launches: list[tuple[int, thread_utils.SafeThread,
                                      ReplicaInfo]] = []
         successful_spot_locations: dict[spot_placer.Location, float] = {}
-        failed_spot_locations: set[spot_placer.Location] = set()
+        failed_spot_locations: dict[spot_placer.Location, str] = {}
+        generic_failed_spot_locations: set[spot_placer.Location] = set()
         # One query for every finished launch thread; walking the pool with
         # per-replica reads makes queued PENDING launches re-hit the DB every
         # tick until they are admitted.
@@ -6584,13 +6658,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if resolved_location is not None:
                     location = resolved_location
                 finished_spot_locations[replica_id] = location
-                if t.format_exc is not None:
-                    if (replica_id not in unfenced_launch_failures and
-                            replica_id not in superseded_launches):
-                        failed_spot_locations.add(location)
+                launch_error = getattr(t, 'exception', None)
+                if isinstance(launch_error, _ReplicaLaunchCapacityError):
+                    previous_reason = failed_spot_locations.get(location)
+                    failed_spot_locations[location] = (
+                        'quota' if launch_error.reason == 'quota' or
+                        previous_reason == 'quota' else 'capacity')
+                elif t.format_exc is not None:
+                    generic_failed_spot_locations.add(location)
                 else:
                     selected_at = getattr(info, 'created_at', None)
-                    if selected_at is not None:
+                    if t.format_exc is None and selected_at is not None:
                         successful_spot_locations[location] = max(
                             selected_at,
                             successful_spot_locations.get(
@@ -6604,11 +6682,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if location not in failed_spot_locations:
                     self._spot_placer.set_active(location,
                                                  selected_at=selected_at)
-            for location in failed_spot_locations:
-                self._spot_placer.set_preemptive(location)
+            for location, reason in failed_spot_locations.items():
+                if reason == 'quota':
+                    self._spot_placer.set_quota_limited(location)
+                else:
+                    self._spot_placer.set_preemptive(location,
+                                                     reason='capacity')
+            for location in (generic_failed_spot_locations -
+                             failed_spot_locations.keys()):
+                self._spot_placer.release_retry(location)
+            self._persist_spot_placement_state_if_dirty()
 
         completed_launches: list[tuple[int, ReplicaInfo, bool]] = []
         capacity_launch_failures: set[int] = set()
+        quota_launch_failures: set[int] = set()
         for replica_id, t in finished_launches:
             info = launch_infos.get(replica_id)
             assert info is not None, replica_id
@@ -6639,7 +6726,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 is_capacity_failure = isinstance(t.exception,
                                                  _ReplicaLaunchCapacityError)
                 if is_capacity_failure:
-                    capacity_launch_failures.add(replica_id)
+                    if t.exception.reason == 'quota':
+                        quota_launch_failures.add(replica_id)
+                    else:
+                        capacity_launch_failures.add(replica_id)
                 else:
                     logger.warning(f'Launch thread for replica {replica_id} '
                                    f'exited abnormally with exception '
@@ -6658,32 +6748,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.SUCCEEDED)
             if replica_id in finished_spot_locations:
-                # TODO(tian): Currently, we set the location to
-                # preemptive if the launch thread failed. This is
-                # because if the error is not related to the
-                # availability of the location, then all locations
-                # should failed for same reason. So it does not matter
-                # which location is preemptive or not, instead, all
-                # locations would fail. We should implement a log parser
-                # to detect if the error is actually related to the
-                # availability of the location later.
-                if (t.format_exc is not None and
-                        replica_id not in unfenced_launch_failures):
+                if replica_id in (capacity_launch_failures |
+                                  quota_launch_failures):
                     info.status_property.failed_spot_availability = True
             completed_launches.append((replica_id, info, error_in_sky_launch))
 
-        if capacity_launch_failures:
+        availability_launch_failures = (capacity_launch_failures |
+                                        quota_launch_failures)
+        if availability_launch_failures:
             affected_pool_keys = {
                 info.paid_capacity_pool_key
                 for replica_id, info, _ in completed_launches
-                if replica_id in capacity_launch_failures and
+                if replica_id in availability_launch_failures and
                 isinstance(info.paid_capacity_pool_key, str)
             }
             pool_count = len(affected_pool_keys)
             pool_count_text = str(pool_count) if pool_count else 'unknown'
             logger.warning(
-                'Provider-capacity launch failure wave: '
-                f'failures={len(capacity_launch_failures)}, '
+                'Provider-availability launch failure wave: '
+                f'capacity_failures={len(capacity_launch_failures)}, '
+                f'quota_failures={len(quota_launch_failures)}, '
                 f'exact_pools={pool_count_text}; '
                 'shared paid-capacity admission will close the affected '
                 'pools. Per-replica tracebacks remain in replica logs.')
@@ -6703,6 +6787,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     outcome = paid_capacity.LaunchOutcome.SUCCESS
                 elif replica_id in capacity_launch_failures:
                     outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+                elif replica_id in quota_launch_failures:
+                    outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
                 else:
                     outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
                 outcomes[replica_id] = outcome
@@ -7578,6 +7664,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         old_spot_placer = getattr(self, '_spot_placer', None)
         if new_spot_placer is not None and old_spot_placer is not None:
             new_spot_placer.inherit_preemption_state(old_spot_placer)
+        elif new_spot_placer is not None:
+            # A service may disable the placer for one version and later
+            # re-enable it without restarting the controller. Recover still-
+            # live exact benches from the service row instead of treating that
+            # update as a fresh availability epoch.
+            placement_states = (serve_state.get_service_placement_policy_states(
+                self._service_name))
+            new_spot_placer.load_retry_state(
+                None if placement_states is
+                None else placement_states['spot_placement_state'])
         if new_uses_logical_replicas:
             _validate_logical_capacity_sources(new_default_planned_capacity,
                                                new_spot_placer,
@@ -7605,6 +7701,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._logical_exact_accelerator_shapes = (
             new_logical_exact_accelerator_shapes)
         self._spot_placer = new_spot_placer
+        self._persist_spot_placement_state_if_dirty()
 
         # Reuse all replicas that have the same config as the new version
         # (except for the `service` field) by directly setting the version to be
