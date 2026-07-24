@@ -1429,8 +1429,11 @@ Frontier correction CI, publication, and production evidence on 2026-07-24:
   both `/_lb/health` probes return 200. Controller, API, worker, and
   load-balancer logs after rollout contain no deadlock, traceback, unhandled
   exception, database error, critical error, or panic. Retained failed replica
-  rows are historical: no fleet replica or failed row was created after the
-  rollout began.
+  rows predate the rollout by creation time. Five recovery-pinned A100 launch
+  requests for those existing rows failed after restart because their
+  configured model-image tag was absent; these are typed provider/configuration
+  outcomes, not controller crashes, and no fresh fleet replica row was
+  admitted. The current fleet remains ready.
 - The post-rollout PostgreSQL audit found no unresolved replica without an
   exact paid-pool key, no exact pool above its effective admission limit, no
   service above 16 valid unresolved claims, no service/card above two exact
@@ -1439,11 +1442,13 @@ Frontier correction CI, publication, and production evidence on 2026-07-24:
   runtime configuration reports the default 4, 8, 16, 32, 64, 128, 256, 480
   depth ladder, service envelope 16, card frontier two, waiter TTL 45 seconds,
   and failure cooldown 600 seconds.
-- No new `boltz-l4-fleet` replica was requested after the rollout, so
-  production has not yet supplied a natural wave that can demonstrate
-  successive 4-to-8-to-16 deepening or simultaneous paid deferral with
-  zero-cost/pinned progress. Those paths are covered by deterministic and
-  real-PostgreSQL CI and remain explicit post-rollout observational evidence.
+- No fresh `boltz-l4-fleet` replica row was admitted after the rollout; the
+  recovery requests above re-drove already-pinned rows and therefore do not
+  exercise fresh frontier admission. Production has not yet supplied a natural
+  wave that can demonstrate successive 4-to-8-to-16 deepening or simultaneous
+  paid deferral with zero-cost/pinned progress. Those paths are covered by
+  deterministic and real-PostgreSQL CI and remain explicit post-rollout
+  observational evidence.
 
 ## Release Gate Results
 
