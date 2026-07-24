@@ -9,6 +9,7 @@ controller then classifies healthy just-launched replicas as preempted
 import subprocess
 
 from sky.backends import backend_utils
+from sky.utils import command_runner
 
 
 def _upgrade(cmd):
@@ -74,6 +75,27 @@ def test_existing_guarded_form_repairs_openssh_percent_escape():
     broken = fixed.replace('%%s\\n', '%s\\n')
     assert broken != fixed
     assert _upgrade(broken) == fixed
+
+
+def test_docker_hop_preserves_inner_openssh_percent_escape():
+    wrapped = _upgrade(SSM_CMD)
+    runner = command_runner.SSHCommandRunner(node=('203.0.113.1', 22),
+                                             ssh_user='ubuntu',
+                                             ssh_private_key=None,
+                                             ssh_control_name=None,
+                                             ssh_proxy_command=wrapped,
+                                             docker_user='root')
+    command = runner.ssh_base_command(
+        ssh_mode=command_runner.SshMode.NON_INTERACTIVE,
+        port_forward=None,
+        connect_timeout=1)
+    proxy_option = next(
+        arg for arg in command if arg.startswith('ProxyCommand='))
+    # Outer OpenSSH turns ``%%%%s`` into ``%%s`` before invoking the nested
+    # SSH command; inner OpenSSH then passes the intended ``%s`` to printf.
+    assert '%%%%s\\n' in proxy_option
+    assert 'Values=203.0.113.1' in proxy_option
+    assert 'portNumber=22' in proxy_option
 
 
 def test_empty_target_fails_before_start_session():

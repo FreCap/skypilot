@@ -1052,6 +1052,12 @@ class SSHCommandRunner(CommandRunner):
                 inner_proxy_command = inner_proxy_command.replace('%h', ip)
                 inner_proxy_command = inner_proxy_command.replace(
                     '%p', str(inner_proxy_port))
+                # The command is nested inside the Docker hop's ProxyCommand,
+                # so it is parsed by OpenSSH twice.  Preserve percent escapes
+                # intended for the inner OpenSSH pass through the outer one.
+                # For example, the generated SSM guard's ``%%s`` printf
+                # literal must reach the inner command as ``%%s``, not ``%s``.
+                inner_proxy_command = inner_proxy_command.replace('%', '%%')
             self._docker_ssh_proxy_command = lambda ssh: ' '.join(
                 ssh + ssh_options_list(
                     ssh_private_key,
