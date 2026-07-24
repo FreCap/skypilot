@@ -2203,15 +2203,18 @@ no runtime-pull, copy, or lifecycle allow statement. The deny deliberately
 excludes `ecr:DescribeRepositories`, `ecr:GetRepositoryPolicy`,
 `ecr:ListTagsForResource`, and repository, policy, and tag management actions so
 Terraform can continue refreshing and reconciling the retained resource. The
-copy and lifecycle permissions boundaries and inline policies likewise contain
-shard ARNs plus only the active qualification-generation ARN. A stale identity
-policy, resource-based runtime grant, or independently retained role session
-therefore cannot use an inactive or tombstoned generation. Retaining up to 256
-generations does not grow role policies. Terraform fails locally when a
-rendered customer-managed boundary exceeds AWS's 6,144-character limit or an
-inline role policy exceeds 10,240 characters. A generation bump creates a
-repository, changes the previous generation to deny-only, and updates active
-role policies in place; it never replaces or deletes an earlier repository.
+module-managed copy and lifecycle permissions boundaries and the exact inline
+policies likewise contain shard ARNs plus only the active
+qualification-generation ARN. An optional organization-managed boundary may be
+attached instead, but it never replaces the exact inline or repository
+policies. A stale identity policy, resource-based runtime grant, or independently
+retained role session therefore cannot use an inactive or tombstoned generation.
+Retaining up to 256 generations does not grow role policies. Terraform fails
+locally when a rendered module-managed boundary exceeds AWS's 6,144-character
+limit or an inline role policy exceeds 10,240 characters. A generation bump
+creates a repository, changes the previous generation to deny-only, and updates
+active role policies in place; it never replaces or deletes an earlier
+repository.
 The handoff identifies the active repository with canonical hashes of its
 rendered allow policy and complete `tags_all` set, including provider-level
 default tags. The copy worker compares those hashes plus exact ARN, URI,
@@ -2439,7 +2442,16 @@ accounts may differ. Multiple destination registry accounts remain outside
 managed v0 until a later topology is reviewed.
 
 The module creates and owns the registry copy and lifecycle roles below,
-including their trust policies, inline policies, and permissions boundaries.
+including their trust and inline policies. By default it also owns one exact
+permissions boundary per role. An operator may instead supply one exact
+organization-managed customer policy in the registry account and partition as
+the boundary attached to both roles. AWS supports one permissions boundary per
+role, so this is an attachment replacement, not a second boundary. The exact
+inline and repository policies remain authoritative least-privilege layers. The
+module validates the managed-policy ARN shape plus active account and partition,
+then delegates detailed path/name syntax and existence to the provider's
+exact-ARN lookup so its input parser does not reject an otherwise resolvable IAM
+policy.
 Worker base roles and runtime pull principals are exact input ARNs. These
 identities are non-interchangeable:
 
@@ -2462,6 +2474,24 @@ identities are non-interchangeable:
   node role, with token plus repository-scoped pull only on workspace shards and
   the active qualification generation. Every inactive qualification repository
   explicitly denies their image data-plane requests.
+
+The null boundary input preserves the original resource graph, state addresses,
+attachments, output keys, and hashes. The module-managed boundary resources stay
+unconditional when an external boundary is selected because adding `count` or
+`for_each` would rewrite established state addresses and force migration. They
+become unattached compatibility resources in that path. Qualification never
+attests those dormant policies: Terraform reads the attached external policy by
+exact ARN through the AWS provider, obtains its current default-version
+document, normalizes the JSON, and places that document hash in both existing
+boundary fingerprint keys. Hashing only the ARN would miss a same-ARN policy
+version change, while hashing either dormant module policy would attest a
+control that AWS does not apply. A changed external document forces
+requalification. Selecting, removing, or changing the external boundary is
+therefore an additive profile-revision rollout, never an in-place mutation of an
+active revision's immutable handoff. The apply identity must be able to read
+that managed policy and its default version, and the operator must ensure the
+organization boundary allows the exact copy and lifecycle actions because a
+boundary can deny permissions that the inline and repository policies allow.
 
 A pod service account is not treated as the EKS image-pull principal. V0 supports
 only the EKS node role for Kubernetes. Fargate, custom kubelet credential
@@ -2536,10 +2566,11 @@ and verifies that provider's account and region against explicit inputs. It
 accepts the catalog authority, realm and profile, declared workspaces and
 repository prefix, exactly one regional target with fixed shard and capacity
 ceilings, exact runtime pull principals, exact worker base roles and target-role
-names, an optional AWS-valid STS external ID, encryption and scanning settings,
-repository-policy and quota ceilings, and the applied trust-policy quota. It
-reads the applied ECR images-per-repository quota when permitted; otherwise the
-operator supplies that verified value explicitly.
+names, an optional same-account and same-partition organization-managed
+permissions boundary, an optional AWS-valid STS external ID, encryption and
+scanning settings, repository-policy and quota ceilings, and the applied
+trust-policy quota. It reads the applied ECR images-per-repository quota when
+permitted; otherwise the operator supplies that verified value explicitly.
 
 The worker-identity module binds three exact Kubernetes service accounts to
 separate IRSA roles and exact same-partition target-role sets. The account module
@@ -3411,8 +3442,11 @@ never part of Helm rollback.
   original direct resources and rank beside GCP or generic Kubernetes;
 - AWS integration plus mocked canonical-read, canonical-delete-denial,
   regional-delete, identity-policy, repository-policy, and
-  permissions-boundary tests via
-  `terraform test -test-directory=terraform-tests`;
+  permissions-boundary tests, including null compatibility, exact external
+  attachment, attached-document fingerprinting, and negative account and
+  partition cases, via `terraform test -test-directory=terraform-tests`; a
+  stateful verbose-plan harness additionally proves the boundary switch updates
+  exactly two roles in place with zero creates or destroys;
 - clean-account Spot service-linked-role planning, existing-role import
   instructions, regional customer-managed AMI KMS grants, and least-privilege
   Spot request tag, describe, and cancel policy tests; mixed EC2/EKS plans prove

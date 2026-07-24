@@ -193,6 +193,21 @@ variable "lifecycle_target_role_name" {
   }
 }
 
+variable "permissions_boundary_arn" {
+  description = "Optional organization-managed boundary attached to both registry target roles instead of the module-managed boundaries."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.permissions_boundary_arn == null || can(regex(
+      "^arn:aws(-[a-z0-9]+)*:iam::[0-9]{12}:policy/.+$",
+      var.permissions_boundary_arn,
+    ))
+    error_message = "permissions_boundary_arn must be null or an exact IAM customer-managed policy ARN."
+  }
+}
+
 variable "worker_assume_role_external_id" {
   description = "Optional 2-1224 character AWS STS external ID required by registry target roles."
   type        = string

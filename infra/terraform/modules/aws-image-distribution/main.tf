@@ -104,6 +104,13 @@ resource "terraform_data" "validation" {
       error_message = "Every lifecycle worker base role must belong to the registry target's AWS partition."
     }
     precondition {
+      condition = var.permissions_boundary_arn == null ? true : startswith(
+        var.permissions_boundary_arn,
+        "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/",
+      )
+      error_message = "permissions_boundary_arn must identify a managed policy in the registry target's AWS account and partition."
+    }
+    precondition {
       condition = alltrue([
         for target in values(var.targets) :
         alltrue([
@@ -359,6 +366,26 @@ resource "aws_iam_policy" "lifecycle_role_boundary" {
   }
 }
 
+data "aws_iam_policy" "external_role_boundary" {
+  count = var.permissions_boundary_arn == null ? 0 : 1
+  arn   = var.permissions_boundary_arn
+}
+
+locals {
+  copy_target_permissions_boundary_arn = var.permissions_boundary_arn == null ? (
+    aws_iam_policy.copy_role_boundary.arn
+  ) : data.aws_iam_policy.external_role_boundary[0].arn
+  lifecycle_target_permissions_boundary_arn = var.permissions_boundary_arn == null ? (
+    aws_iam_policy.lifecycle_role_boundary.arn
+  ) : data.aws_iam_policy.external_role_boundary[0].arn
+  copy_boundary_policy_fingerprint_document = var.permissions_boundary_arn == null ? (
+    data.aws_iam_policy_document.copy_role_boundary.json
+  ) : jsonencode(jsondecode(data.aws_iam_policy.external_role_boundary[0].policy))
+  lifecycle_boundary_policy_fingerprint_document = var.permissions_boundary_arn == null ? (
+    data.aws_iam_policy_document.lifecycle_role_boundary.json
+  ) : jsonencode(jsondecode(data.aws_iam_policy.external_role_boundary[0].policy))
+}
+
 data "aws_iam_policy_document" "copy_trust" {
   statement {
     sid     = "ExactCopyWorkerPrincipals"
@@ -430,7 +457,7 @@ data "aws_iam_policy_document" "lifecycle_trust" {
 resource "aws_iam_role" "copy_target" {
   name                 = var.copy_target_role_name
   assume_role_policy   = data.aws_iam_policy_document.copy_trust.json
-  permissions_boundary = aws_iam_policy.copy_role_boundary.arn
+  permissions_boundary = local.copy_target_permissions_boundary_arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "copy" })
 
@@ -445,7 +472,7 @@ resource "aws_iam_role" "copy_target" {
 resource "aws_iam_role" "lifecycle_target" {
   name                 = var.lifecycle_target_role_name
   assume_role_policy   = data.aws_iam_policy_document.lifecycle_trust.json
-  permissions_boundary = aws_iam_policy.lifecycle_role_boundary.arn
+  permissions_boundary = local.lifecycle_target_permissions_boundary_arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "lifecycle" })
 

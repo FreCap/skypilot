@@ -3,8 +3,9 @@
 This region-scoped module creates the complete fixed ECR shard ring for a set of
 SkyPilot workspaces, retained qualification repository generations, separate
 copy and lifecycle target roles, repository policies, and a Terraform-managed
-permissions boundary. It never creates repositories or copies content at
-deployment time.
+permissions boundary for each role. An optional organization-managed boundary
+can replace both role attachments without changing the inline or repository
+policies. It never creates repositories or copies content at deployment time.
 
 Qualification generation `0` always remains at the legacy fixed repository
 path. To replace a damaged qualification repository without destroying it, add
@@ -49,18 +50,39 @@ copy worker independently re-reads live quota and repository state before a
 PENDING shard can become READY, so Terraform output is desired state rather than
 qualification evidence.
 
-Copy and lifecycle target roles have separate inline policies and separate
-Terraform-managed permissions boundaries. The copy role can inspect and publish
-only the declared repositories and read quota facts. The lifecycle role can
-inspect canonical and regional content plus the active qualification generation,
-but can delete only eligible regional content and that active qualification
-generation. Managed v0 always creates and owns both target roles, their trust
-policies, their inline policies, and their permissions boundaries. Operators
-adopting deterministic role names that already exist must import the exact
-roles, and any same-named boundary policies, into this module's Terraform state
-and let Terraform converge them. There is no external-role escape hatch because
-an unattached policy or boundary would make the qualification fingerprints
-misleading.
+Copy and lifecycle target roles have separate inline policies and, by default,
+separate Terraform-managed permissions boundaries. The copy role can inspect
+and publish only the declared repositories and read quota facts. The lifecycle
+role can inspect canonical and regional content plus the active qualification
+generation, but can delete only eligible regional content and that active
+qualification generation.
+
+Set `permissions_boundary_arn` only when the registry account requires one
+organization-managed boundary on both target roles. The ARN must identify an
+exact customer-managed IAM policy in the active registry account and partition.
+The module validates that ownership boundary but delegates detailed path and
+name validation plus existence to the provider's exact-ARN lookup. Terraform
+reads that policy's current default-version document, attaches the exact ARN to
+both roles, and writes the normalized document hash into the existing copy and
+lifecycle boundary fingerprint keys. The applying principal therefore needs
+permission to read the policy and its default version. A policy document change
+at the same ARN changes both fingerprints. Selecting, removing, or changing the
+external boundary must be rolled out with a new profile revision and fresh
+qualification rather than mutating an active revision's handoff. The external
+boundary must allow the required copy and lifecycle actions; it intersects, but
+never replaces, the module's exact inline and repository policies.
+
+The null default is state-address and output compatible with the original
+module. The two Terraform-managed boundary resources remain unconditional even
+when an external boundary is selected, so existing states do not acquire indexed
+resource addresses or destructive moves. In the external path those policies
+are compatibility resources, are not attached, and are not fingerprinted.
+Managed v0 always creates and owns both target roles, their trust policies, and
+their inline policies. Operators adopting deterministic role names that already
+exist must import the exact roles and same-named module boundary policies into
+this module's Terraform state and let Terraform converge them. There is no
+external-role escape hatch because an unattached role policy would make the
+qualification fingerprints misleading.
 
 Each rendered, minified target-role trust policy must fit
 `applied_role_trust_policy_quota`. The variable defaults to AWS's 2,048
@@ -80,5 +102,6 @@ retained generation fails specifically on `lifecycle.prevent_destroy`:
 
 ```bash
 terraform test -test-directory=terraform-tests
+bash terraform-tests/verify_external_boundary_in_place.sh
 bash terraform-tests/verify_prevent_destroy.sh
 ```
