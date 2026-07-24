@@ -1828,16 +1828,17 @@ A process can still die after AWS accepts the launch but before that first
 observation commits. For that narrow replay case, a terminal response with no
 profile ARN is accepted only after all of the following hold: the child ID and
 operation/catalog/profile tags match, the AMI and architecture match, a fresh
-IAM read maps the requested instance-profile name to the one configured role,
-and the exact nonce-bearing success marker proves the guest completed the
-private-registry pull through the requested profile's IMDS-only
-credential-helper path. The canary pull clears environment, shared-file,
-web-identity, and ECS credential sources, points shared config files at
-`/dev/null`, disables the ECR helper's filesystem token cache, and removes any
-preexisting Docker auth entry for the target registry. A credential or token
-baked into the AMI therefore cannot satisfy this recovery proof. The worker
-then records the expected profile ARN as recovered evidence. A marker-free
-terminal child without a durable profile latch fails with
+IAM read returns the exact expected instance-profile ARN, including its path,
+and maps that profile to the one configured role, and the exact nonce-bearing
+success marker proves the guest completed the private-registry pull through the
+requested profile's IMDS-only credential-helper path. The canary pull clears
+environment, shared-file, web-identity, and ECS credential sources, points
+shared config files at `/dev/null`, disables the ECR helper's filesystem token
+cache, and removes any preexisting Docker auth entry for the target registry. A
+credential or token baked into the AMI therefore cannot satisfy this recovery
+proof. The worker then records the expected profile ARN as recovered evidence.
+A path-qualified or otherwise different IAM ARN, or a marker-free terminal
+child without a durable profile latch, fails with
 `QUALIFIED_RUNTIME_PRINCIPAL_REQUIRED`; a conflicting ARN can never use this
 recovery path.
 Before the pull, EC2 canary user data configures the same exact value-free
@@ -3002,7 +3003,9 @@ drained and every image table is empty; it is never part of Helm rollback.
   ID-scoped observation are lease-fenced into the durable operation, a
   successor accepts a terminal AWS record that omits the profile only with
   either that exact latch or the nonce-bearing private-pull recovery proof, and
-  a mismatched ARN or marker-free terminal record still fails closed;
+  a mismatched observed ARN, a path-qualified IAM lookup ARN that differs from
+  the expected profile ARN, or a marker-free terminal record still fails
+  closed;
 - lost-response Spot tests where cancellation first reports a terminal request
   without an instance, a request-to-instance edge appears on a later exact
   read, a late request transition cannot reuse an earlier absence interval, and
