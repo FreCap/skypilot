@@ -17,6 +17,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import declarative
 
+from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
 from sky.serve import lb_ha
@@ -33,6 +34,7 @@ if typing.TYPE_CHECKING:
     from sky.serve import service_spec
 
 replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
+logger = sky_logging.init_logger(__name__)
 
 Base = declarative.declarative_base()
 _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
@@ -2963,8 +2965,8 @@ def _valid_paid_capacity_service_claims_in_session(
     session: orm.Session,
     service_name: str,
     service_hash: str,
-) -> tuple[list[tuple[str, str, int]], list[tuple[str, str, int]]]:
-    """Return valid and stale claims for one locked service incarnation."""
+) -> tuple[list[tuple[int, str]], list[tuple[str, str, int]]]:
+    """Return one locked service incarnation's valid and stale claims."""
     rows = session.execute(
         sqlalchemy.select(
             paid_capacity_claims_table.c.replica_id,
@@ -2984,13 +2986,12 @@ def _valid_paid_capacity_service_claims_in_session(
                         == service_hash)).fetchall()
     valid = []
     stale = []
-    for replica_id, claim_pool, status, replica_pool in rows:
-        identity = (service_name, service_hash, replica_id)
+    for replica_id, pool_key, status, row_pool in rows:
         if (status in _PAID_CAPACITY_UNRESOLVED_STATUSES and
-                replica_pool == claim_pool):
-            valid.append(identity)
+                row_pool == pool_key):
+            valid.append((replica_id, pool_key))
         else:
-            stale.append(identity)
+            stale.append((service_name, service_hash, replica_id))
     return valid, stale
 
 
@@ -3004,6 +3005,92 @@ def _delete_paid_capacity_claims_in_session(
                 paid_capacity_claims_table.c.service_name,
                 paid_capacity_claims_table.c.service_hash,
                 paid_capacity_claims_table.c.replica_id).in_(identities)))
+
+
+def _withdraw_ineligible_frontier_waiters_in_session(
+    session: orm.Session,
+    service_name: str,
+    service_hash: str,
+    service_claims: list[tuple[int, str]],
+    frontier_limit: int,
+) -> None:
+    """Remove waiters on every card whose exploration frontier is full."""
+    owned_by_frontier: dict[paid_capacity.FrontierKey,
+                            set[str]] = collections.defaultdict(set)
+    unknown_owned_pool_keys = set()
+    for _, pool_key in service_claims:
+        parsed = paid_capacity.frontier_key_from_pool_key(pool_key)
+        if parsed is None:
+            unknown_owned_pool_keys.add(pool_key)
+        else:
+            owned_by_frontier[parsed].add(pool_key)
+    waiter_pool_keys = session.execute(
+        sqlalchemy.select(paid_capacity_waiters_table.c.pool_key).where(
+            paid_capacity_waiters_table.c.service_name == service_name,
+            paid_capacity_waiters_table.c.service_hash ==
+            service_hash)).scalars().all()
+    withdraw = []
+    for pool_key in waiter_pool_keys:
+        parsed = paid_capacity.frontier_key_from_pool_key(pool_key)
+        if parsed is None:
+            owned_pool_keys = unknown_owned_pool_keys
+        else:
+            owned_pool_keys = (owned_by_frontier.get(parsed, set()) |
+                               unknown_owned_pool_keys)
+        if (pool_key not in owned_pool_keys and
+                len(owned_pool_keys) >= frontier_limit):
+            withdraw.append(pool_key)
+    if withdraw:
+        session.execute(
+            sqlalchemy.delete(paid_capacity_waiters_table).where(
+                paid_capacity_waiters_table.c.service_name == service_name,
+                paid_capacity_waiters_table.c.service_hash == service_hash,
+                paid_capacity_waiters_table.c.pool_key.in_(withdraw)))
+
+
+def _withdraw_all_paid_capacity_waiters_in_session(
+    session: orm.Session,
+    service_name: str,
+    service_hash: str,
+) -> None:
+    """Remove waiters when one service cannot acquire any new paid claim."""
+    session.execute(
+        sqlalchemy.delete(paid_capacity_waiters_table).where(
+            paid_capacity_waiters_table.c.service_name == service_name,
+            paid_capacity_waiters_table.c.service_hash == service_hash))
+
+
+def _reconcile_ineligible_paid_capacity_waiters(
+    service_name: str,
+    service_hash: str,
+    *,
+    service_limit: int | None,
+    frontier_limit: int | None,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+) -> bool:
+    """Withdraw newly ineligible waiters without holding any pool lock."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if not _lock_service_owner_in_session(session,
+                                              service_name,
+                                              service_hash,
+                                              expected_controller_owner,
+                                              require_launch_allowed=False):
+            session.rollback()
+            return False
+        service_claims, stale_claims = (
+            _valid_paid_capacity_service_claims_in_session(
+                session, service_name, service_hash))
+        _delete_paid_capacity_claims_in_session(session, stale_claims)
+        if service_limit is not None and len(service_claims) >= service_limit:
+            _withdraw_all_paid_capacity_waiters_in_session(
+                session, service_name, service_hash)
+        elif frontier_limit is not None:
+            _withdraw_ineligible_frontier_waiters_in_session(
+                session, service_name, service_hash, service_claims,
+                frontier_limit)
+        session.commit()
+    return True
 
 
 def _ensure_paid_capacity_pool_in_session(session: orm.Session,
@@ -3155,9 +3242,12 @@ def try_add_replica_with_paid_capacity_claim(
     failure_cooldown_seconds: float = 10 * 60,
     waiter_ttl_seconds: float,
     expected_controller_owner: tuple[int | None, str | None] | None,
+    frontier_key: paid_capacity.FrontierKey | None = None,
+    frontier_limit: int | None = None,
 ) -> str:
     """Atomically persist one replica and its global paid-capacity claim."""
     engine = _db_manager.get_engine()
+    reconcile_waiters = False
     with orm.Session(engine) as session:
         if not _lock_service_owner_in_session(session,
                                               service_name,
@@ -3166,6 +3256,62 @@ def try_add_replica_with_paid_capacity_claim(
                                               require_launch_allowed=True):
             session.rollback()
             return 'ownership_lost'
+        if service_limit is not None and service_limit <= 0:
+            raise ValueError('Paid-capacity service limit must be positive.')
+        if frontier_limit is not None and frontier_limit <= 0:
+            raise ValueError('Paid-capacity frontier must be positive.')
+        if (frontier_key is None) != (frontier_limit is None):
+            raise ValueError(
+                'Paid-capacity frontier key and limit must be set together.')
+
+        identity = (service_name, service_hash, replica_id)
+        service_claims, stale_service_claims = (
+            _valid_paid_capacity_service_claims_in_session(
+                session, service_name, service_hash))
+        _delete_paid_capacity_claims_in_session(session, stale_service_claims)
+        is_existing_service_claim = any(
+            claim_replica_id == replica_id
+            for claim_replica_id, _ in service_claims)
+        existing_service_pool_key = next(
+            (claim_pool_key
+             for claim_replica_id, claim_pool_key in service_claims
+             if claim_replica_id == replica_id), None)
+        if (existing_service_pool_key is not None and
+                existing_service_pool_key != pool_key):
+            raise ValueError(
+                'A paid-capacity replica claim cannot move between exact '
+                'provider pools during a recovery re-drive.')
+        frontier_owned_pool_keys: set[str] | None = None
+        if (service_limit is not None and
+                len(service_claims) >= service_limit and
+                not is_existing_service_claim):
+            # The service row is the only admission lock held here, so
+            # deleting waiters across pools cannot form a pool-lock cycle.
+            _withdraw_all_paid_capacity_waiters_in_session(
+                session, service_name, service_hash)
+            session.commit()
+            return 'service_saturated'
+
+        if frontier_key is not None:
+            assert frontier_limit is not None
+            candidate_frontier_key = (
+                paid_capacity.frontier_key_from_pool_key(pool_key))
+            if (candidate_frontier_key is not None and
+                    candidate_frontier_key != frontier_key):
+                raise ValueError(
+                    'Paid-capacity pool and frontier identities disagree.')
+            frontier_owned_pool_keys = {
+                claim_pool_key for _, claim_pool_key in service_claims
+                if (paid_capacity.frontier_key_from_pool_key(claim_pool_key) in
+                    (None, frontier_key))
+            }
+            if (pool_key not in frontier_owned_pool_keys and
+                    len(frontier_owned_pool_keys) >= frontier_limit):
+                _withdraw_ineligible_frontier_waiters_in_session(
+                    session, service_name, service_hash, service_claims,
+                    frontier_limit)
+                session.commit()
+                return 'feedback_pending'
         _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
                                               base_limit, now)
         pool = _paid_capacity_pool_row_for_update(session, pool_key)
@@ -3204,17 +3350,7 @@ def try_add_replica_with_paid_capacity_claim(
             session, pool_key)
         _delete_paid_capacity_claims_in_session(session, stale_claims)
 
-        identity = (service_name, service_hash, replica_id)
         is_existing_claim = identity in valid_claims
-        if service_limit is not None and not is_existing_claim:
-            service_claims, stale_service_claims = (
-                _valid_paid_capacity_service_claims_in_session(
-                    session, service_name, service_hash))
-            _delete_paid_capacity_claims_in_session(session,
-                                                    stale_service_claims)
-            if len(service_claims) >= service_limit:
-                session.commit()
-                return 'service_saturated'
         if not is_existing_claim:
             session.execute(
                 sqlalchemy.delete(paid_capacity_waiters_table).where(
@@ -3301,6 +3437,17 @@ def try_add_replica_with_paid_capacity_claim(
                     'pool_key': pool_key,
                     'priority': priority,
                 }))
+        service_claim_count_after = (len(service_claims) +
+                                     (0 if is_existing_service_claim else 1))
+        if (service_limit is not None and
+                service_claim_count_after >= service_limit):
+            reconcile_waiters = True
+        if frontier_owned_pool_keys is not None:
+            assert frontier_key is not None
+            assert frontier_limit is not None
+            frontier_owned_pool_keys.add(pool_key)
+            if len(frontier_owned_pool_keys) >= frontier_limit:
+                reconcile_waiters = True
         if not is_existing_claim:
             session.execute(
                 sqlalchemy.delete(paid_capacity_waiters_table).where(
@@ -3308,6 +3455,23 @@ def try_add_replica_with_paid_capacity_claim(
                     paid_capacity_waiters_table.c.service_name == service_name,
                     paid_capacity_waiters_table.c.service_hash == service_hash))
         session.commit()
+    if reconcile_waiters:
+        # Cross-pool waiter cleanup must not share a transaction with a pool
+        # row lock: crossed waiters for two services could otherwise deadlock.
+        # The claim is already durable, so cleanup is best effort and the
+        # waiter TTL remains the bounded fallback after a process crash.
+        try:
+            _reconcile_ineligible_paid_capacity_waiters(
+                service_name,
+                service_hash,
+                service_limit=service_limit,
+                frontier_limit=frontier_limit,
+                expected_controller_owner=expected_controller_owner)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                'Committed paid-capacity claim but failed to withdraw '
+                'ineligible waiters; they will expire by TTL. '
+                f'Details: {common_utils.format_exception(e)}')
     return 'acquired'
 
 
