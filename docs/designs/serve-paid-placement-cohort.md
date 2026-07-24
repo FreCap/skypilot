@@ -83,6 +83,31 @@ per-zone provider exception in the terminal wrapper. Mixed or unknown
 histories remain unclassified; only the already-recognized structured
 capacity/quota codes reach the durable outcome path.
 
+The normal cross-location path adds another terminal wrapper when optimizer
+exhaustion follows a per-location failure. Provider evidence may therefore be
+nested through more than one `ResourcesUnavailableError.failover_history`.
+Classification recursively traverses those histories to their leaves instead
+of inspecting only the immediate list. A `ResourcesUnavailableError` with a
+nonempty history is an internal node: its history children are the
+authoritative attempts, and its own summary and explicit cause are not an
+additional leaf. One with an empty history, or any other exception, is a leaf
+classified through its explicit cause chain.
+
+Each leaf still requires recognized, provider-scoped structured codes. GCP's
+uninformative `VM_MIN_COUNT_NOT_REACHED` summary is neutral only while
+classifying GCP; seeing it in an AWS result remains unknown. Any unstructured
+or unknown leaf, history container whose exact type is not the built-in
+`list`, malformed history entry, failover-history cycle, explicit-cause cycle,
+mixed graph that reaches a history-bearing wrapper through a leaf's cause
+chain, excessive depth, or overflow of the total history-and-cause node budget
+keeps the whole terminal result untyped; error text is never parsed. The
+implementation fixes the maximum depth and total node budget as constants,
+preflights each history fanout before enqueueing its children, and tests both
+deep and shallow-wide overflow. If every leaf is recognized, quota dominates
+a mixed known capacity/quota history and otherwise the result is capacity.
+This recursive contract applies equally to AWS and GCP and changes neither
+provider cleanup nor controller-side teardown ordering.
+
 ## Problem
 
 SkyServe can persist a large missing-capacity wave before any provider launch
@@ -1132,6 +1157,7 @@ capacity without deriving either durable claim envelope from it.
 | Exact instance types remain distinct; strict claim resolution rejects ambiguous legacy rows while operational rollout resolution uses the cheapest matching current type | Spot-placer compatibility tests |
 | Only a typed capacity failure resets shared evidence; generic failures can retain local bench behavior while reporting `OTHER_FAILURE` globally | Launch-thread and replica-manager outcome tests |
 | A terminal typed capacity or quota failure whose provider failover cleanup succeeded returns from the launch worker without waiting for controller-side teardown; retriable, cleanup-uncertain, and untyped failures keep synchronous cleanup; the manager persists the typed outcome before scheduling idempotent replica teardown | Launch-thread retry/cleanup and cleanup-failure tests plus an ordered replica-manager refresh test |
+| Terminal classification recursively preserves provider evidence through per-zone, per-location, and optimizer-exhaustion `ResourcesUnavailableError` histories; a nonempty wrapper history is authoritative over its cause; nested AWS/GCP capacity succeeds; quota dominates a fully known mixed history; and any unknown leaf, malformed entry, history/cause cycle, depth overflow, or total-node overflow remains untyped | Direct recursive-classifier depth/width/cycle tests plus an end-to-end `provision_with_retries()` optimizer-exhaustion regression |
 | A crash or ownership handoff before outcome commit retains the exact-pinned claim for successor recovery; a crash after commit derives failed cleanup and re-drives teardown without relaunch; cancellation/scale-down and stale ownership cannot publish typed evidence after lifecycle ownership changes | Outcome-commit failpoint, cancellation, ownership-handoff, and failed-cleanup recovery tests |
 | Capacity failure wins a same-batch update and late pre-failure success cannot rebuild the ramp | Ordered outcome tests |
 | Admission summaries are transition/interval bounded, contain useful aggregate counts, and never expose workspace-bearing pool keys; provider-capacity tracebacks collapse to one wave warning | Pure logging-policy and replica-manager tests |
@@ -1214,6 +1240,21 @@ in-place attempt and an untyped terminal failure still cleans up before the
 worker returns. Inject provider failover-cleanup failure and confirm it
 surfaces as an untyped cleanup-uncertain error, retains the paid claim until
 normal lifecycle resolution, and does not enter the fast-feedback path.
+
+Wrap structured AWS and GCP capacity and quota failures first in the
+per-location terminal error and then in the optimizer-exhaustion terminal
+error. Confirm the outer result classifies from every nested leaf, with quota
+dominating a fully recognized mixed capacity/quota history. Add an unrelated
+provider code, a provider-mismatched neutral code, an unstructured exception, a
+non-list or behavior-overriding list-subclass history container, a malformed
+history entry, a mixed history/cause graph, a cycle, an explicit-cause cycle, a
+history beyond the depth bound, and a shallow history beyond the total node
+budget; confirm each entire result remains untyped and that the shallow-wide
+case is rejected before its children are scanned or enqueued. Give an internal
+wrapper an unrelated explicit cause and confirm its nonempty history remains
+authoritative. Exercise the real
+`provision_with_retries()` exhaustion path so a test that stops at
+`_retry_zones()` cannot falsely satisfy this contract.
 
 Fail immediately before and immediately after the atomic outcome commit.
 Before commit, confirm successor recovery retains the claim and re-drives the
@@ -1606,6 +1647,8 @@ Pre-PR terminal-feedback evidence on 2026-07-24:
 - Complete: implement and locally validate terminal typed outcome reporting
   before controller-side teardown; complete exact-tree design and code
   adversarial review.
-- Pending: pass pull-request CI, publish the merged image and chart, deploy with
-  existing Helm values reused, and verify bounded outcome-to-pool-close latency
-  in production.
+- Pending: recursively preserve and classify structured provider evidence
+  through normal optimizer-exhaustion nesting; pass exact-tree adversarial
+  review and pull-request CI; publish the superseding image and chart; deploy
+  with existing Helm values reused; and verify bounded
+  outcome-to-pool-close latency in production.

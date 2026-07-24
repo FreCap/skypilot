@@ -906,6 +906,11 @@ _GCP_QUOTA_ERROR_CODES = frozenset({
     'RESOURCE_EXHAUSTED',
     'type.googleapis.com/google.rpc.QuotaFailure',
 })
+# Terminal optimizer exhaustion can nest per-location failover histories.
+# Bound defensive traversal so malformed or cyclic exception graphs remain
+# conservatively unclassified instead of consuming unbounded controller work.
+_MAX_TERMINAL_FAILOVER_HISTORY_DEPTH = 32
+_MAX_TERMINAL_FAILOVER_HISTORY_NODES = 1024
 
 
 def _record_capacity_metric(reason: str, action: str) -> None:
@@ -974,9 +979,11 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
     # GCP pairs the causal code with a `VM_MIN_COUNT_NOT_REACHED` summary that
     # says only that the request failed. Dropping it keeps the all-known check
     # meaningful without weakening it for a genuinely unknown code.
+    neutral_codes = (_NEUTRAL_PLACEMENT_ERROR_CODES if isinstance(
+        cloud, clouds.GCP) else frozenset())
     codes = [
         code for code in _provider_error_codes(error)
-        if code not in _NEUTRAL_PLACEMENT_ERROR_CODES
+        if code not in neutral_codes
     ]
     known_codes = capacity_codes | quota_codes
     if codes and all(code in known_codes for code in codes):
@@ -990,6 +997,82 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
     return None
 
 
+def _terminal_failover_leaves(
+    error: exceptions.ResourcesUnavailableError,
+) -> tuple[list[tuple[BaseException, int]], int] | None:
+    """Flatten nested terminal failover histories conservatively.
+
+    ``_retry_zones()`` records provider failures in one
+    ``ResourcesUnavailableError``. Cross-location optimizer exhaustion wraps
+    that error in another terminal history. Preserve path-local ancestry so a
+    shared leaf may appear in independent branches while a real history cycle,
+    malformed entry, or excessive graph remains unclassified.
+    """
+    pending: list[tuple[BaseException, frozenset[int],
+                        int]] = [(error, frozenset(), 0)]
+    leaves: list[tuple[BaseException, int]] = []
+    visited = 0
+    while pending:
+        failure, ancestors, depth = pending.pop()
+        visited += 1
+        if visited > _MAX_TERMINAL_FAILOVER_HISTORY_NODES:
+            return None
+        history = None
+        if isinstance(failure, exceptions.ResourcesUnavailableError):
+            history = failure.failover_history
+            # Require the built-in type: a list subclass can override
+            # iteration or length and hide an unknown child.
+            if type(history) is not list:
+                return None
+        if history:
+            identity = id(failure)
+            if (identity in ancestors or
+                    depth >= _MAX_TERMINAL_FAILOVER_HISTORY_DEPTH):
+                return None
+            # Account for already-queued nodes before scanning this fanout.
+            # ``len(list)`` is constant-time, so an adversarially wide history
+            # is rejected without allocating one pending tuple per child.
+            remaining_nodes = (_MAX_TERMINAL_FAILOVER_HISTORY_NODES - visited -
+                               len(pending))
+            if len(history) > remaining_nodes:
+                return None
+            next_ancestors = ancestors | {identity}
+            for nested in reversed(history):
+                if not isinstance(nested, BaseException):
+                    return None
+                pending.append((nested, next_ancestors, depth + 1))
+            continue
+        leaves.append((failure, depth))
+    return leaves, visited
+
+
+def _terminal_leaf_cause_nodes(failure: BaseException, *, history_depth: int,
+                               remaining_nodes: int) -> int | None:
+    """Validate one leaf's explicit cause chain within terminal bounds."""
+    seen = {id(failure)}
+    cause = failure.__cause__
+    cause_nodes = 0
+    depth = history_depth
+    while cause is not None:
+        identity = id(cause)
+        cause_nodes += 1
+        depth += 1
+        if (identity in seen or cause_nodes > remaining_nodes or
+                depth > _MAX_TERMINAL_FAILOVER_HISTORY_DEPTH):
+            return None
+        seen.add(identity)
+        # A history-bearing terminal wrapper is an internal attempt node, not
+        # a valid member of one leaf's explicit cause chain. Treat this
+        # malformed mixed graph conservatively instead of choosing one edge.
+        if isinstance(cause, exceptions.ResourcesUnavailableError):
+            if type(cause.failover_history) is not list:
+                return None
+            if cause.failover_history:
+                return None
+        cause = cause.__cause__
+    return cause_nodes
+
+
 def classify_resources_unavailable_error(
         cloud: 'clouds.Cloud',
         error: exceptions.ResourcesUnavailableError) -> str | None:
@@ -1000,11 +1083,19 @@ def classify_resources_unavailable_error(
     caller-local placement policy does not bench a healthy location for an
     authentication, networking, throttling, or controller error.
     """
-    failures: list[BaseException] = list(error.failover_history)
-    if not failures:
-        failures = [error]
+    traversal = _terminal_failover_leaves(error)
+    if traversal is None:
+        return None
+    failures, visited = traversal
     reasons: list[str] = []
-    for failure in failures:
+    for failure, history_depth in failures:
+        cause_nodes = _terminal_leaf_cause_nodes(
+            failure,
+            history_depth=history_depth,
+            remaining_nodes=_MAX_TERMINAL_FAILOVER_HISTORY_NODES - visited)
+        if cause_nodes is None:
+            return None
+        visited += cause_nodes
         reason = _classify_capacity_error(cloud, failure)
         if reason is None:
             return None

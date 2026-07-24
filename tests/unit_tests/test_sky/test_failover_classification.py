@@ -102,6 +102,156 @@ def test_terminal_resources_unavailable_requires_all_structured_evidence():
                                                         mixed) is None
 
 
+def _nested_terminal_error(
+        *failures: Exception) -> exceptions.ResourcesUnavailableError:
+    per_location = exceptions.ResourcesUnavailableError(
+        'location unavailable', failover_history=list(failures))
+    return exceptions.ResourcesUnavailableError('optimizer exhausted',
+                                                failover_history=[per_location])
+
+
+@pytest.mark.parametrize(
+    ('cloud', 'capacity_code', 'quota_code'),
+    [
+        (clouds.AWS(), 'InsufficientInstanceCapacity',
+         'MaxSpotInstanceCountExceeded'),
+        (clouds.GCP(), 'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+         'QUOTA_EXCEEDED'),
+    ],
+)
+def test_terminal_resources_unavailable_recurses_nested_histories(
+        cloud, capacity_code, quota_code):
+    capacity = _aggregate_error(capacity_code)
+    assert backend.classify_resources_unavailable_error(
+        cloud, _nested_terminal_error(capacity)) == 'capacity'
+
+    quota = _aggregate_error(quota_code)
+    assert backend.classify_resources_unavailable_error(
+        cloud, _nested_terminal_error(capacity, quota)) == 'quota'
+
+
+def test_terminal_resources_unavailable_nested_history_is_conservative(
+        monkeypatch):
+    capacity = _aggregate_error('InsufficientInstanceCapacity')
+    unknown = _aggregate_error('RequestLimitExceeded')
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), _nested_terminal_error(capacity, unknown)) is None
+
+    malformed = _nested_terminal_error(capacity)
+    malformed.failover_history.append(
+        'not an exception')  # type: ignore[arg-type]
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        malformed) is None
+
+    malformed_container = _nested_terminal_error(capacity)
+    malformed_container.failover_history = ()  # type: ignore[assignment]
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), malformed_container) is None
+
+    class _HiddenHistory(list):
+
+        def __len__(self):
+            return 0
+
+    hidden_history = exceptions.ResourcesUnavailableError('hidden history')
+    hidden_history.failover_history = _HiddenHistory(
+        [unknown])  # type: ignore[assignment]
+    hidden_history.__cause__ = capacity
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        hidden_history) is None
+
+    cause_leaf = RuntimeError('leaf')
+    malformed_cause = exceptions.ResourcesUnavailableError('malformed cause')
+    malformed_cause.failover_history = ()  # type: ignore[assignment]
+    cause_leaf.__cause__ = malformed_cause
+    malformed_cause.__cause__ = capacity
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), _nested_terminal_error(cause_leaf)) is None
+
+    mixed_cause_leaf = RuntimeError('leaf')
+    mixed_cause_leaf.__cause__ = exceptions.ResourcesUnavailableError(
+        'history-bearing cause', failover_history=[capacity])
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), _nested_terminal_error(mixed_cause_leaf)) is None
+
+    history_cycle = exceptions.ResourcesUnavailableError('cycle')
+    history_cycle.failover_history.append(history_cycle)
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        history_cycle) is None
+
+    cause_cycle = _FakeClientError('InsufficientInstanceCapacity')
+    cause_wrapper = RuntimeError('cause wrapper')
+    cause_cycle.__cause__ = cause_wrapper
+    cause_wrapper.__cause__ = cause_cycle
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), _nested_terminal_error(cause_cycle)) is None
+
+    too_deep: Exception = capacity
+    for _ in range(backend._MAX_TERMINAL_FAILOVER_HISTORY_DEPTH + 1):
+        too_deep = exceptions.ResourcesUnavailableError(
+            'nested', failover_history=[too_deep])
+    assert isinstance(too_deep, exceptions.ResourcesUnavailableError)
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        too_deep) is None
+
+    cause_too_deep: Exception = capacity
+    for _ in range(backend._MAX_TERMINAL_FAILOVER_HISTORY_DEPTH + 1):
+        cause_wrapper = RuntimeError('nested cause')
+        cause_wrapper.__cause__ = cause_too_deep
+        cause_too_deep = cause_wrapper
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), _nested_terminal_error(cause_too_deep)) is None
+
+    too_wide = exceptions.ResourcesUnavailableError(
+        'wide',
+        failover_history=[capacity] *
+        (backend._MAX_TERMINAL_FAILOVER_HISTORY_NODES + 1))
+    with monkeypatch.context() as patch:
+        patch.setitem(
+            backend._terminal_failover_leaves.__globals__,
+            'reversed',
+            mock.Mock(side_effect=AssertionError(
+                'oversized history must not be scanned')),
+        )
+        assert backend.classify_resources_unavailable_error(
+            clouds.AWS(), too_wide) is None
+
+    cause_budget_overflow = exceptions.ResourcesUnavailableError(
+        'wide',
+        failover_history=[
+            _aggregate_error('InsufficientInstanceCapacity')
+            for _ in range(backend._MAX_TERMINAL_FAILOVER_HISTORY_NODES // 2)
+        ],
+    )
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), cause_budget_overflow) is None
+
+
+def test_terminal_resources_unavailable_wrapper_history_is_authoritative():
+    capacity = _aggregate_error('InsufficientInstanceCapacity')
+    leaf_wrapper = exceptions.ResourcesUnavailableError('leaf')
+    leaf_wrapper.__cause__ = capacity
+    inner = exceptions.ResourcesUnavailableError(
+        'inner', failover_history=[leaf_wrapper])
+    outer = exceptions.ResourcesUnavailableError('outer',
+                                                 failover_history=[inner])
+    outer.__cause__ = _aggregate_error('RequestLimitExceeded')
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        outer) == 'capacity'
+
+
+def test_terminal_resources_unavailable_allows_shared_leaf():
+    capacity = _aggregate_error('InsufficientInstanceCapacity')
+    left = exceptions.ResourcesUnavailableError('left',
+                                                failover_history=[capacity])
+    right = exceptions.ResourcesUnavailableError('right',
+                                                 failover_history=[capacity])
+    outer = exceptions.ResourcesUnavailableError('outer',
+                                                 failover_history=[left, right])
+    assert backend.classify_resources_unavailable_error(clouds.AWS(),
+                                                        outer) == 'capacity'
+
+
 def test_terminal_resources_unavailable_does_not_parse_error_text():
     error = exceptions.ResourcesUnavailableError(
         'InsufficientInstanceCapacity',
@@ -233,6 +383,11 @@ def test_capacity_codes_do_not_cross_providers():
                                             gcp_code) == 'capacity'
     assert backend._classify_capacity_error(clouds.AWS(),
                                             aws_code) == 'capacity'
+    # GCP's uninformative summary code is not neutral for AWS.
+    assert backend._classify_capacity_error(
+        clouds.AWS(),
+        _aggregate_error('InsufficientInstanceCapacity',
+                         'VM_MIN_COUNT_NOT_REACHED')) is None
 
 
 def test_gcp_classification_reads_past_the_summary_code():
@@ -520,6 +675,66 @@ def test_retry_zones_preserves_structured_provider_failure(
         _call_retry_zones(provisioner, to_provision)
 
     assert exc_info.value.failover_history == [provider_error]
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), exc_info.value) == 'capacity'
+
+
+def test_provision_with_retries_preserves_nested_terminal_failure(
+        tmp_path, monkeypatch):
+    to_provision = _to_provision()
+    provider_error = _aggregate_error('InsufficientInstanceCapacity')
+    per_location_error = exceptions.ResourcesUnavailableError(
+        'location unavailable', failover_history=[provider_error])
+    provisioner = backend.RetryingVmProvisioner(
+        log_dir=str(tmp_path),
+        dag=mock.Mock(),
+        optimize_target=mock.Mock(),
+        requested_features=set(),
+        local_wheel_path=tmp_path / 'wheel',
+        wheel_hash='',
+        extra_launch_context={},
+    )
+    task = mock.Mock()
+    task.is_controller_task.return_value = False
+    task.num_nodes = 1
+    task.resources = {to_provision}
+    task.best_resources = to_provision
+    task.volume_mounts = None
+    config = backend.RetryingVmProvisioner.ToProvisionConfig(
+        cluster_name='test-cluster',
+        resources=to_provision,
+        num_nodes=1,
+        prev_cluster_status=None,
+        prev_handle=None,
+        prev_cluster_ever_up=False,
+        prev_config_hash=None,
+    )
+
+    monkeypatch.setattr(clouds.AWS, 'get_active_user_identity',
+                        lambda *_: ['acct'])
+    monkeypatch.setattr(provisioner, '_retry_zones',
+                        mock.Mock(side_effect=per_location_error))
+    monkeypatch.setattr(
+        backend.optimizer.Optimizer,
+        'optimize',
+        mock.Mock(side_effect=exceptions.ResourcesUnavailableError(
+            'optimizer exhausted')),
+    )
+    monkeypatch.setattr(backend, '_format_provision_failure_blocks',
+                        lambda *_: '')
+    monkeypatch.setattr(backend.rich_utils, 'force_update_status',
+                        lambda *_: None)
+
+    with pytest.raises(exceptions.ResourcesUnavailableError) as exc_info:
+        provisioner.provision_with_retries(
+            task,
+            config,
+            dryrun=False,
+            stream_logs=False,
+            skip_unnecessary_provisioning=False,
+        )
+
+    assert exc_info.value.failover_history == [per_location_error]
     assert backend.classify_resources_unavailable_error(
         clouds.AWS(), exc_info.value) == 'capacity'
 
