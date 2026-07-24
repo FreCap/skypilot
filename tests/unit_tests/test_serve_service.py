@@ -814,6 +814,122 @@ def test_recovery_spawns_controller_with_persisted_semantics(
     assert spawn.call_args.args[2] == 3
 
 
+def test_start_releases_port_lock_before_readiness_wait():
+    """Fresh `_start` runs the readiness wait outside the port-selection lock.
+
+    PR #897 moved `_wait_for_controller_ready` out from under the host-global
+    ``PORT_SELECTION_FILE_LOCK_PATH`` filelock (via
+    `_spawn_controller_on_reserved_port`) so a controller that crash-loops at
+    boot no longer holds that lock for the full readiness timeout on every
+    retry, starving other services' boot/recovery on the same API pod.
+    `_respawn_controller` has an explicit ordering regression test
+    (``test_respawn_releases_port_lock_before_readiness_wait``); this pins the
+    same invariant for the fresh-up `_start` path, which shares the same
+    context manager. Exercises the real
+    `_spawn_controller_on_reserved_port` so a regression that re-wraps the
+    readiness wait under the lock (``wait`` before ``lock_exit``) fails here.
+    """
+    events = []
+
+    class _EventLock:
+        """File-lock double that records its held interval."""
+
+        def __init__(self, *unused_args, **unused_kwargs):
+            pass
+
+        def __enter__(self):
+            events.append('lock_enter')
+            return self
+
+        def __exit__(self, *unused_args):
+            events.append('lock_exit')
+            return False
+
+    controller_socket = mock.Mock(spec=socket.socket)
+    controller_socket.close.side_effect = lambda: events.append('socket_close')
+    process = mock.MagicMock(pid=456)
+    process.is_alive.return_value = True
+
+    def _reserve(unused_host):
+        events.append('reserve')
+        return controller_socket, 20001
+
+    def _spawn(*unused_args, **unused_kwargs):
+        events.append('spawn')
+        return process
+
+    persisted = mock.MagicMock()
+    persisted.pool = True
+    persisted.uses_logical_replicas = True
+    persisted.spot_placer = 'dynamic_fallback_per_gpu'
+    record = {
+        'hash': 'incarnation-a',
+        'controller_job_id': 1,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.2',
+        'workspace': 'default',
+        'resource_scope': 'incarnation-a',
+        'pool': True,
+        'status': serve_state.ServiceStatus.READY,
+        'yaml_content': _CURRENT_PER_GPU_YAML,
+    }
+    with mock.patch.object(service.filelock, 'FileLock', _EventLock), \
+         mock.patch.object(service, '_reserve_controller_socket', _reserve), \
+         mock.patch.object(service, '_spawn_controller', _spawn), \
+         mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
+         mock.patch.object(service.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(service.serve_state,
+                           'get_recovery_version_spec',
+                           return_value=(3, persisted)), \
+         mock.patch.object(service.serve_state,
+                           'get_yaml_content',
+                           return_value=_CURRENT_PER_GPU_YAML), \
+         mock.patch.object(service.serve_state,
+                           'get_placement_catalog',
+                           return_value={'schema_version': 1, 'entries': []}), \
+         mock.patch.object(service.serve_state,
+                           'get_latest_version',
+                           return_value=3), \
+         mock.patch.object(service.serve_state,
+                           'update_service_controller_pid_if_owner',
+                           return_value=True), \
+         mock.patch.object(
+             service,
+             '_wait_for_controller_ready',
+             side_effect=lambda *a, **k: events.append('wait')), \
+         mock.patch.object(
+             service.serve_state,
+             'update_service_controller_pid_ip_and_port',
+             side_effect=lambda *a, **k: events.append('publish') or True), \
+         mock.patch.object(
+             service.serve_state,
+             'get_service_controller_owner',
+             return_value={
+                 'hash': 'incarnation-a',
+                 'controller_pid': service.os.getpid(),
+                 'controller_ip': None,
+                 'status': serve_state.ServiceStatus.SHUTTING_DOWN,
+             }), \
+         mock.patch.object(service.subprocess_utils,
+                           'kill_children_processes'), \
+         mock.patch.object(service, '_run_cleanup_and_finalize'):
+        service._start('svc',
+                       '/does/not/matter',
+                       1,
+                       'sky serve up',
+                       requested_incarnation='incarnation-a')
+
+    # The lock must be released (lock_exit) before the readiness wait, and the
+    # DB publish must follow the wait. The parent socket reservation is closed
+    # only after publication, once the child owns the transferred socket.
+    assert events == [
+        'lock_enter', 'reserve', 'spawn', 'lock_exit', 'wait', 'publish',
+        'socket_close'
+    ]
+
+
 def test_legacy_recovery_backfills_catalog_once():
     task = mock.Mock()
     service_spec = mock.Mock(spot_placer='dynamic_fallback')
