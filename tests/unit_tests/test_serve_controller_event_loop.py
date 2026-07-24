@@ -16,7 +16,8 @@ from sky.serve import controller
 
 def _register_controller_routes(monkeypatch,
                                 autoscaler,
-                                replica_manager=None) -> fastapi.FastAPI:
+                                replica_manager=None,
+                                controller_setup=None) -> fastapi.FastAPI:
     ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
     ctrl._app = fastapi.FastAPI()
     ctrl._service_name = 'test-service'
@@ -40,6 +41,8 @@ def _register_controller_routes(monkeypatch,
                         mock.Mock())
     monkeypatch.setattr(controller.uvicorn, 'run', mock.Mock())
     monkeypatch.setattr(controller.os, '_exit', mock.Mock())
+    if controller_setup is not None:
+        controller_setup(ctrl)
     ctrl.run()
     return ctrl._app
 
@@ -94,6 +97,104 @@ async def test_autoscaler_info_does_not_block_controller_event_loop(
             await asyncio.gather(info_task, return_exceptions=True)
         fallback_thread.join(timeout=1)
 
+    assert not fallback_thread.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_lb_sync_runtime_tail_does_not_block_health_route(monkeypatch):
+    tail_started = threading.Event()
+    allow_tail = threading.Event()
+    tail_finished = threading.Event()
+    fallback_released = threading.Event()
+    test_finished = threading.Event()
+    tail_threads = []
+
+    def blocking_runtime_tail(*_args):
+        tail_threads.append(threading.get_ident())
+        tail_started.set()
+        allow_tail.wait(timeout=2)
+        tail_finished.set()
+        return True
+
+    def configure_controller(ctrl):
+        ctrl._lb_sync_lock = None
+        ctrl._lb_role_lock = None
+        ctrl._lb_demand_lock = None
+        ctrl._routing_state_lock = threading.RLock()
+        ctrl._applied_version = 1
+        ctrl._owns_current_service = mock.Mock(return_value=True)
+        ctrl._lb_report_authority = mock.Mock(return_value=(True, False, False))
+        ctrl._snapshot_replica_occupancy = mock.Mock(return_value=([], {},
+                                                                   None))
+        ctrl._get_lb_replica_info = mock.Mock(return_value=({}, 0))
+        ctrl._get_replica_counts = mock.Mock(return_value={})
+        ctrl._get_capacity_hint = mock.Mock(return_value={})
+        ctrl._get_routing_spec = mock.Mock(return_value=None)
+        ctrl._persist_request_history = mock.AsyncMock(return_value=True)
+        ctrl._persist_response_time_history = mock.AsyncMock(return_value=True)
+        ctrl._persist_prediction_time_history = mock.AsyncMock(
+            return_value=True)
+        ctrl._persist_autoscaler_history = mock.AsyncMock(return_value=True)
+        ctrl._prepare_authoritative_load_balancer_report = mock.Mock(
+            return_value=controller._PreparedLoadBalancerReport((
+                True, False, False), {
+                    'lb_session_id': 'active',
+                }, True))
+        ctrl._apply_prepared_load_balancer_report = blocking_runtime_tail
+        ctrl._load_balancer_disclosure_is_authorized = mock.Mock(
+            return_value=True)
+
+    autoscaler = mock.Mock(replica_unit='logical', latest_version=1)
+    app = _register_controller_routes(monkeypatch,
+                                      autoscaler,
+                                      controller_setup=configure_controller)
+
+    # Release a regressed event-loop-blocking tail so the test fails instead
+    # of hanging forever.
+    def release_if_event_loop_is_blocked():
+        if (tail_started.wait(timeout=1) and
+                not test_finished.wait(timeout=0.5)):
+            fallback_released.set()
+            allow_tail.set()
+
+    fallback_thread = threading.Thread(target=release_if_event_loop_is_blocked)
+    fallback_thread.start()
+    transport = httpx.ASGITransport(app=app)
+    headers = {constants.CONTROLLER_OWNER_HEADER: 'owner-a'}
+    sync_task = None
+    loop_thread = threading.get_ident()
+    try:
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url='http://test') as client:
+            sync_task = asyncio.create_task(
+                client.post(constants.LB_CONTROLLER_SYNC_PATH,
+                            headers=headers,
+                            json={'lb_session_id': 'active'}))
+            started = await asyncio.wait_for(asyncio.to_thread(
+                tail_started.wait, 1),
+                                             timeout=2)
+            assert started
+
+            health_response = await asyncio.wait_for(client.get(
+                constants.CONTROLLER_HEALTH_ENDPOINT_PATH, headers=headers),
+                                                     timeout=0.25)
+            assert health_response.status_code == 200
+            assert not tail_finished.is_set()
+            assert not sync_task.done()
+            assert tail_threads and tail_threads[0] != loop_thread
+
+            allow_tail.set()
+            sync_response = await asyncio.wait_for(sync_task, timeout=2)
+            assert sync_response.status_code == 200
+    finally:
+        test_finished.set()
+        allow_tail.set()
+        if sync_task is not None:
+            await asyncio.gather(sync_task, return_exceptions=True)
+        fallback_thread.join(timeout=1)
+
+    assert tail_finished.is_set()
+    assert not fallback_released.is_set()
     assert not fallback_thread.is_alive()
 
 

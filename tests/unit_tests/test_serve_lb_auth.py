@@ -389,6 +389,7 @@ def test_role_heartbeat_client_url_matches_registered_proxy_route(monkeypatch):
     assert captured['url'] == f'http://api{expected_path}'
     assert captured['url'] == (controller_url +
                                constants.LB_CONTROLLER_ROLE_PATH)
+    assert captured['timeout'].total == 8
     assert lb._lb_role is lb_ha.LbRole.ACTIVE
 
 
