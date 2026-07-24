@@ -119,40 +119,8 @@ def qualification_copy_available(revision: topology_state.ProfileRevisionRecord,
                                  profile: models.ManagedRegistryProfile,
                                  target: models.ManagedRegistryTarget) -> bool:
     """Returns whether the fixed qualification digest is currently present."""
-    copy_key = models.profile_attestation_key('copy', target.name)
-    copy_evidence = revision.attestations.get(copy_key)
-    if (not isinstance(copy_evidence, dict) or
-            copy_evidence.get('status') != 'READY' or
-            copy_evidence.get('target_fingerprint') != target.target_fingerprint
-            or copy_evidence.get('platform')
-            != profile.qualification.canary_platform or
-            not isinstance(copy_evidence.get('repository_arn'), str) or
-            not isinstance(copy_evidence.get('runtime_digest'), str) or
-            not isinstance(copy_evidence.get('observed_at'), int)):
-        return False
-    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
-    lifecycle = revision.attestations.get(lifecycle_key)
-    if (not isinstance(lifecycle, dict) or
-            lifecycle.get('target_fingerprint') != target.target_fingerprint or
-            lifecycle.get('repository_arn') != copy_evidence['repository_arn']
-            or lifecycle.get('runtime_digest')
-            != copy_evidence['runtime_digest'] or
-            lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
-            != _LIFECYCLE_PROTOCOL_VERSION or
-            not isinstance(lifecycle.get('observed_at'), int)):
-        return False
-    status = lifecycle.get('status')
-    if status == 'ARMED':
-        if lifecycle.get('exact_absence') is not None:
-            return False
-    elif status == 'READY':
-        if lifecycle.get('exact_absence') is not True:
-            return False
-    else:
-        return False
-    proof_id = qualification_lifecycle_proof_id(lifecycle)
-    return (proof_id is not None and
-            copy_evidence.get(_COPY_RESTORES_LIFECYCLE_KEY) == proof_id)
+    return models.qualification_copy_proof_matches(revision.attestations,
+                                                   profile, target)
 
 
 def qualification_copy_restoration_proof_id(
@@ -403,6 +371,101 @@ def arm_qualification_lifecycle(
             expected_config_hash=revision.config_hash,
             now=now)
         return updated, True
+
+
+def begin_qualification_lifecycle_restoration(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    now: int | None = None,
+) -> tuple[topology_state.ProfileRevisionRecord, str | None]:
+    """Adopts exact legacy absence into the durable restoration barrier."""
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        if (current.state not in (models.ImageProfileState.QUALIFYING,
+                                  models.ImageProfileState.ACTIVE) or
+                current.desired_generation != revision.desired_generation or
+                current.config_hash != revision.config_hash):
+            raise topology_state.StaleProfileRevisionError(
+                'Lifecycle restoration no longer matches the desired revision.')
+        lifecycle = current.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current_time = catalog_state.database_epoch(session, now=now)
+        if (not isinstance(lifecycle, dict) or
+                lifecycle.get('status') != 'READY' or
+                lifecycle.get('target_fingerprint') != target.target_fingerprint
+                or lifecycle.get('repository_arn') != repository_arn or
+                lifecycle.get('runtime_digest') != runtime_digest or
+                lifecycle.get('exact_absence') is not True):
+            return current, None
+        profile = models.ManagedRegistryProfile.from_snapshot(
+            current.config_snapshot)
+        if qualification_copy_available(current, profile, target):
+            return current, None
+
+        proof_id = qualification_lifecycle_proof_id(lifecycle)
+        upgrade_legacy = proof_id is None
+        if upgrade_legacy:
+            # Reject malformed partial protocol-2 evidence. Only the exact
+            # pre-protocol shape may be adopted without repeating deletion.
+            if (lifecycle.get(_LIFECYCLE_PROTOCOL_KEY) is not None or
+                    lifecycle.get(_LIFECYCLE_PROOF_KEY) is not None):
+                return current, None
+            proof_id = str(uuid.uuid4())
+        elif (lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+              != _LIFECYCLE_PROTOCOL_VERSION):
+            return current, None
+        assert proof_id is not None
+
+        if mutation is not None:
+            if _qualification_mutation_matches(
+                    mutation,
+                    state=_QUALIFICATION_MUTATION_RESTORING,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=proof_id,
+                    mutation_lease_token=None):
+                return current, proof_id
+            return current, None
+
+        session.execute(schema.qualification_mutation.insert().values(
+            id=_QUALIFICATION_MUTATION_ID,
+            owner_profile_revision_id=revision.id,
+            owner_target=target.name,
+            owner_target_fingerprint=target.target_fingerprint,
+            repository_arn=repository_arn,
+            runtime_digest=runtime_digest,
+            lifecycle_proof_id=proof_id,
+            state=_QUALIFICATION_MUTATION_RESTORING,
+            mutation_lease_token=None,
+            mutation_lease_expires_at=None,
+            updated_at=current_time))
+        if not upgrade_legacy:
+            return current, proof_id
+        updated = topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='READY',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=proof_id,
+                exact_absence=True),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=current_time)
+        return updated, proof_id
 
 
 def qualification_repository(
@@ -1614,6 +1677,9 @@ def maybe_activate_profile(
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
     preflight_current = _database_epoch(now=now)
+    for target in (profile.canonical,) + profile.targets:
+        if not qualification_copy_available(revision, profile, target):
+            return None
     try:
         requirements = _attestation_requirements(profile, revision.attestations)
     except ValueError:

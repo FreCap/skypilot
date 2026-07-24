@@ -538,24 +538,17 @@ def reconcile_qualification_lifecycle(
                 isinstance(lifecycle.get('observed_at'), int) and
                 lifecycle.get('exact_absence') is True)
             if lifecycle_complete:
-                assert isinstance(lifecycle, dict)
-                if (qualification.qualification_copy_restoration_proof_id(
-                        revision, target, digest) is None):
+                if not qualification.qualification_copy_available(
+                        revision, profile, target):
                     if should_stop is not None and should_stop():
                         return False
-                    revision = topology_state.record_profile_attestation(
-                        profile_revision_id=revision.id,
-                        kind=lifecycle_key,
-                        evidence=qualification.qualification_lifecycle_evidence(
-                            status='READY',
-                            target=target,
+                    revision, _ = (
+                        qualification.begin_qualification_lifecycle_restoration(
+                            revision,
+                            target,
                             repository_arn=repository_arn,
                             runtime_digest=digest,
-                            lifecycle_proof_id=str(uuid.uuid4()),
-                            exact_absence=True),
-                        expected_generation=revision.desired_generation,
-                        expected_config_hash=revision.config_hash,
-                        now=now)
+                            now=now))
                 continue
             lifecycle_deleting = (
                 isinstance(lifecycle, dict) and

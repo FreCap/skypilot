@@ -1916,13 +1916,23 @@ ordinary catalog image copies do not use the qualification repository and
 remain usable.
 
 Legacy revision-local lifecycle proofs are evidence only and never substitute
-for the catalog barrier. After the first protocol-2 rollout is quiesced, the new
-workers revalidate the physical digest through the global flow before admitting
-new canaries or activating a revision. Helm renders the lifecycle worker
-Deployment with `Recreate`, which drains the old destructive worker before a new
-worker can create or advance the singleton mutation. Copy and canary Deployments
-remain `RollingUpdate`; the durable barrier and provider leases fence their
-cross-version work.
+for the catalog barrier. After the first protocol-2 rollout is quiesced, a
+legacy `READY` exact-absence proof is atomically adopted into a new protocol-2
+proof and the catalog-wide `RESTORING` row. This adoption requires the barrier
+to be idle, but it does not repeat a provider delete that the legacy proof
+already completed. It may safely close admission while an already-running
+canary finishes because restoration only adds and verifies the missing digest;
+unlike deletion, it does not require a zero-running precondition. The copy
+worker must restore and verify the exact digest against that proof and
+atomically clear the barrier.
+Activation independently requires every target's copy attestation to
+acknowledge its exact protocol-2 lifecycle proof; generic freshness alone is
+insufficient. The expected attestation hash and final shared barrier lock make
+that preflight relationship authoritative at activation commit. Helm renders
+the lifecycle worker Deployment with `Recreate`, which drains the old
+destructive worker before a new worker can create or advance the singleton
+mutation. Copy and canary Deployments remain `RollingUpdate`; the durable
+barrier and provider leases fence their cross-version work.
 
 The runtime binding also declares the minimum launch tuple needed for an
 automatic canary. EC2 qualification pins one IAM role, instance-profile name,
@@ -3067,9 +3077,10 @@ CLI or Dashboard locates such a publication for explicit retry.
    rollout to prove that no pre-protocol API or image-worker pod remains. Then
    use the same target chart to set `imageLifecycleWorker.enabled=true` while
    canary replicas remain zero. Wait for the lifecycle `Recreate` rollout,
-   global `DELETING`-to-`RESTORING` convergence, owner recopy, atomic barrier
-   removal, and physical digest verification. Finally, use the same target
-   chart with `imageCanaryWorker.enabled=true` and
+   global legacy-proof adoption directly into `RESTORING` or ordinary
+   `DELETING`-to-`RESTORING` convergence, owner recopy, atomic barrier removal,
+   and physical digest verification. Finally, use the same target chart with
+   `imageCanaryWorker.enabled=true` and
    `imageCanaryWorker.replicaCount=1`. Every revision preserves existing
    values, pins the exact image, waits for the migration Job and workloads, and
    rolls back on failure. This one-time quiescing prevents any pre-protocol
@@ -3229,6 +3240,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   commit atomically under the exclusive catalog lock; a stale owner, unrelated
   copy, mismatched target/repository/digest/proof, or lost CAS leaves the row
   present and every admission path closed even when bytes happen to exist;
+  legacy exact-absence evidence is upgraded in the same transaction that
+  inserts a `RESTORING` owner, including while an earlier canary drains, and
+  activation rejects a fresh copy/lifecycle pair whose restoration proof does
+  not match;
   eight older failing revisions cannot hide the direct `DELETING` lifecycle
   owner or `RESTORING` copy owner from worker recovery;
 - deterministic claim/delete interleavings proving claim takes the shared

@@ -1226,6 +1226,50 @@ def profile_attestation_key(capability: str, *identity: str) -> str:
     return f'{capability}:{digest}'
 
 
+def qualification_copy_proof_matches(attestations: dict[str, Any],
+                                     profile: ManagedRegistryProfile,
+                                     target: ManagedRegistryTarget) -> bool:
+    """Validates one target's exact protocol-2 copy restoration handshake."""
+    copy_evidence = attestations.get(
+        profile_attestation_key('copy', target.name))
+    lifecycle = attestations.get(
+        profile_attestation_key('lifecycle', target.name))
+    if (not isinstance(copy_evidence, dict) or
+            copy_evidence.get('status') != 'READY' or
+            copy_evidence.get('target_fingerprint') != target.target_fingerprint
+            or copy_evidence.get('platform')
+            != profile.qualification.canary_platform or
+            not isinstance(copy_evidence.get('repository_arn'), str) or
+            not isinstance(copy_evidence.get('runtime_digest'), str) or
+            not isinstance(copy_evidence.get('observed_at'), int) or
+            not isinstance(lifecycle, dict) or
+            lifecycle.get('target_fingerprint') != target.target_fingerprint or
+            lifecycle.get('repository_arn') != copy_evidence['repository_arn']
+            or lifecycle.get('runtime_digest')
+            != copy_evidence['runtime_digest'] or
+            lifecycle.get('protocol_version') != 2 or
+            not isinstance(lifecycle.get('observed_at'), int)):
+        return False
+    status = lifecycle.get('status')
+    if status == 'ARMED':
+        if lifecycle.get('exact_absence') is not None:
+            return False
+    elif status == 'READY':
+        if lifecycle.get('exact_absence') is not True:
+            return False
+    else:
+        return False
+    proof_id = lifecycle.get('lifecycle_proof_id')
+    if not isinstance(proof_id, str):
+        return False
+    try:
+        parsed = uuid.UUID(proof_id)
+    except ValueError:
+        return False
+    return (str(parsed) == proof_id and
+            copy_evidence.get('restores_lifecycle_proof_id') == proof_id)
+
+
 def reference_registry_authority(reference: str, subject: str) -> str:
     """Returns the canonical runtime registry authority for a reference.
 

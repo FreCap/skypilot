@@ -585,6 +585,139 @@ def test_canary_request_waits_for_exact_copy_restoration(
     assert requested_revision.id == revision.id
 
 
+def test_legacy_lifecycle_absence_enters_durable_restoration_barrier(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    copy_key = models.profile_attestation_key('copy', target.name)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    legacy = topology_state.record_profile_attestation(
+        profile_revision_id=active.id,
+        kind=copy_key,
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
+            'runtime_digest': _DIGEST,
+            'platform': profile.qualification.canary_platform,
+        },
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        now=20)
+    legacy = topology_state.record_profile_attestation(
+        profile_revision_id=active.id,
+        kind=lifecycle_key,
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
+            'runtime_digest': _DIGEST,
+            'exact_absence': True,
+        },
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        now=21)
+
+    restoring, proof_id = (
+        qualification.begin_qualification_lifecycle_restoration(
+            legacy,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            now=22))
+
+    assert proof_id is not None
+    lifecycle = restoring.attestations[lifecycle_key]
+    assert lifecycle['status'] == 'READY'
+    assert lifecycle['protocol_version'] == 2
+    assert lifecycle['lifecycle_proof_id'] == proof_id
+    assert lifecycle['exact_absence'] is True
+    assert not qualification.qualification_copy_available(
+        restoring, profile, target)
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'RESTORING'
+    assert mutation['owner_profile_revision_id'] == restoring.id
+    assert mutation['owner_target'] == target.name
+    assert mutation['repository_arn'] == repository_arn
+    assert mutation['runtime_digest'] == _DIGEST
+    assert mutation['lifecycle_proof_id'] == proof_id
+
+    retry, retry_proof = (
+        qualification.begin_qualification_lifecycle_restoration(
+            restoring,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            now=22))
+    assert retry_proof == proof_id
+    assert retry.attestations[lifecycle_key] == lifecycle
+
+    rejected = qualification.record_qualification_copy(
+        retry,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=proof_id,
+        expected_mutation_proof_id=('00000000-0000-4000-8000-000000000098'),
+        now=23)
+    assert rejected is None
+    assert qualification.get_qualification_mutation() is not None
+    unchanged = topology_state.get_profile_revision(restoring.id)
+    assert unchanged is not None
+    assert unchanged.attestations[copy_key] == legacy.attestations[copy_key]
+
+    restored = qualification.record_qualification_copy(
+        retry,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=proof_id,
+        expected_mutation_proof_id=proof_id,
+        now=24)
+
+    assert restored is not None
+    assert qualification.qualification_copy_available(restored, profile, target)
+    assert qualification.get_qualification_mutation() is None
+
+    orphan_proof = '00000000-0000-4000-8000-000000000097'
+    orphan = topology_state.record_profile_attestation(
+        profile_revision_id=restored.id,
+        kind=lifecycle_key,
+        evidence=qualification.qualification_lifecycle_evidence(
+            status='READY',
+            target=target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lifecycle_proof_id=orphan_proof,
+            exact_absence=True),
+        expected_generation=restored.desired_generation,
+        expected_config_hash=restored.config_hash,
+        now=25)
+    adopted, adopted_proof = (
+        qualification.begin_qualification_lifecycle_restoration(
+            orphan,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            now=26))
+
+    assert adopted_proof == orphan_proof
+    assert (qualification.qualification_lifecycle_proof_id(
+        adopted.attestations[lifecycle_key]) == orphan_proof)
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'RESTORING'
+    assert mutation['lifecycle_proof_id'] == orphan_proof
+
+
 def test_pending_canary_does_not_reserve_cost_after_copy_deletion(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -1236,6 +1369,34 @@ def test_global_running_canary_prevents_other_workspace_lifecycle_delete(
     assert qualification.get_qualification_mutation() is None
     assert qualification.qualification_copy_available(unchanged, profile,
                                                       target)
+    legacy = topology_state.record_profile_attestation(
+        profile_revision_id=unchanged.id,
+        kind=models.profile_attestation_key('lifecycle', target.name),
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
+            'runtime_digest': _DIGEST,
+            'exact_absence': True,
+        },
+        expected_generation=unchanged.desired_generation,
+        expected_config_hash=unchanged.config_hash,
+        now=104)
+    restoring, restoration_proof = (
+        qualification.begin_qualification_lifecycle_restoration(
+            legacy,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            now=105))
+    assert restoration_proof is not None
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'RESTORING'
+    assert (qualification.qualification_lifecycle_proof_id(
+        restoring.attestations[models.profile_attestation_key(
+            'lifecycle', target.name)]) == restoration_proof)
     still_running = catalog_state.get_operation(running.id, 'biology')
     assert still_running is not None
     assert still_running.state == models.ImageOperationState.RUNNING
@@ -7662,6 +7823,45 @@ def test_profile_activation_preflight_ignores_fast_host_clock(
 
     assert activated is not None
     assert activated.state == models.ImageProfileState.ACTIVE
+
+
+def test_profile_activation_rejects_mismatched_copy_restoration_proof(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    short_lived, revision, scheduler_now = _short_lived_qualifying_profile(
+        image_database, profile)
+    target = short_lived.targets[0]
+    copy_key = models.profile_attestation_key('copy', target.name)
+    copy_evidence = dict(revision.attestations[copy_key])
+    copy_evidence['restores_lifecycle_proof_id'] = (
+        '00000000-0000-4000-8000-000000000099')
+    revision = topology_state.record_profile_attestation(
+        profile_revision_id=revision.id,
+        kind=copy_key,
+        evidence=copy_evidence,
+        expected_generation=revision.desired_generation,
+        expected_config_hash=revision.config_hash,
+        now=scheduler_now)
+
+    activated = qualification.maybe_activate_profile(revision.id,
+                                                     now=scheduler_now)
+
+    assert activated is None
+    assert revision.terraform_hash is not None
+    assert revision.attestations_hash is not None
+    requirements = qualification._attestation_requirements(  # pylint: disable=protected-access
+        short_lived, revision.attestations)
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        transactions.activate_profile(
+            profile_revision_id=revision.id,
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            expected_terraform_hash=revision.terraform_hash,
+            expected_attestations_hash=revision.attestations_hash,
+            required_attestations=requirements,
+            now=scheduler_now)
+    unchanged = topology_state.get_profile_revision(revision.id)
+    assert unchanged is not None
+    assert unchanged.state == models.ImageProfileState.QUALIFYING
 
 
 def test_profile_activation_rechecks_freshness_after_advisory_lock(

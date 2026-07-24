@@ -1364,10 +1364,12 @@ def _activation_shard_capacities(
     return max_manifests, max_declared_bytes, max_in_flight
 
 
-def _validate_activation_attestations(attestations: dict[str, Any],
-                                      required_attestations: dict[str,
-                                                                  int | None],
-                                      *, now: int) -> None:
+def _validate_activation_attestations(
+        attestations: dict[str, Any],
+        required_attestations: dict[str, int | None],
+        *,
+        now: int,
+        profile: models.ManagedRegistryProfile | None = None) -> None:
     """Revalidates every required proof at one post-lock database epoch."""
     for attestation, max_age_seconds in required_attestations.items():
         evidence = attestations.get(attestation)
@@ -1377,6 +1379,19 @@ def _validate_activation_attestations(attestations: dict[str, Any],
                 now < evidence['observed_at'] or
             (max_age_seconds is not None and
              now - evidence['observed_at'] > max_age_seconds)):
+            raise ValueError('QUALIFICATION_FAILED')
+    if profile is None:
+        return
+    for target in (profile.canonical,) + profile.targets:
+        copy_key = models.profile_attestation_key('copy', target.name)
+        lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+        if (copy_key not in required_attestations and
+                lifecycle_key not in required_attestations):
+            continue
+        if (copy_key not in required_attestations or
+                lifecycle_key not in required_attestations or
+                not models.qualification_copy_proof_matches(
+                    attestations, profile, target)):
             raise ValueError('QUALIFICATION_FAILED')
 
 
@@ -1444,7 +1459,8 @@ def activate_profile(
         lock_current = catalog_state.database_epoch(session, now=now)
         _validate_activation_attestations(attestations,
                                           required_attestations,
-                                          now=lock_current)
+                                          now=lock_current,
+                                          profile=configured)
         budget_facts = _activation_budget_facts(configured,
                                                 attestations,
                                                 now=lock_current)
@@ -1470,7 +1486,8 @@ def activate_profile(
         current = catalog_state.database_epoch(session, now=now)
         _validate_activation_attestations(attestations,
                                           required_attestations,
-                                          now=current)
+                                          now=current,
+                                          profile=configured)
         _activation_budget_facts(configured, attestations, now=current)
         if len(shard_rows) != sum(target.shard_count for target in targets):
             raise ValueError('QUALIFICATION_FAILED')

@@ -5254,6 +5254,7 @@ def test_qualification_lifecycle_does_not_redelete_restored_copy(
                 'status': 'READY',
                 'observed_at': 101,
                 'target_fingerprint': target.target_fingerprint,
+                'repository_arn': 'qualification-repository-arn',
                 'runtime_digest': _DIGEST,
                 'platform': profile.qualification.canary_platform,
                 'restores_lifecycle_proof_id': lifecycle_proof_id,
@@ -5270,6 +5271,7 @@ def test_qualification_lifecycle_does_not_redelete_restored_copy(
             },
         })
     from_role = mock.Mock()
+    begin_restoration = mock.Mock()
     activate = mock.Mock()
     monkeypatch.setattr(lifecycle_worker_service.topology_state,
                         'list_qualifying_profiles',
@@ -5277,6 +5279,9 @@ def test_qualification_lifecycle_does_not_redelete_restored_copy(
     monkeypatch.setattr(
         lifecycle_worker_service.qualification, 'qualification_repository',
         lambda *_args: ('qualification', 'qualification-repository-arn'))
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'begin_qualification_lifecycle_restoration',
+                        begin_restoration)
     monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
                         from_role)
     monkeypatch.setattr(lifecycle_worker_service.qualification,
@@ -5286,10 +5291,11 @@ def test_qualification_lifecycle_does_not_redelete_restored_copy(
         mock.sentinel.limiter)
 
     from_role.assert_not_called()
+    begin_restoration.assert_not_called()
     activate.assert_called_once_with(revision.id)
 
 
-def test_qualification_lifecycle_upgrades_legacy_proof_without_provider_io(
+def test_qualification_lifecycle_adopts_legacy_proof_into_restoration_barrier(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     target = profile.canonical
@@ -5315,29 +5321,34 @@ def test_qualification_lifecycle_upgrades_legacy_proof_without_provider_io(
             },
         })
     from_role = mock.Mock()
-    record = mock.Mock(return_value=revision)
+    restoration_proof_id = '00000000-0000-4000-8000-000000000099'
+    begin_restoration = mock.Mock(return_value=(revision, restoration_proof_id))
+    activate = mock.Mock()
     monkeypatch.setattr(lifecycle_worker_service.topology_state,
                         'list_qualifying_profiles',
                         lambda **_kwargs: [revision])
     monkeypatch.setattr(
         lifecycle_worker_service.qualification, 'qualification_repository',
         lambda *_args: ('qualification', 'qualification-repository-arn'))
-    monkeypatch.setattr(lifecycle_worker_service.topology_state,
-                        'record_profile_attestation', record)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'begin_qualification_lifecycle_restoration',
+                        begin_restoration)
     monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
                         from_role)
     monkeypatch.setattr(lifecycle_worker_service.qualification,
-                        'maybe_activate_profile', mock.Mock())
+                        'maybe_activate_profile', activate)
 
     assert lifecycle_worker_service.reconcile_qualification_lifecycle(
         mock.sentinel.limiter)
 
     from_role.assert_not_called()
-    record.assert_called_once()
-    evidence = record.call_args.kwargs['evidence']
-    assert evidence['exact_absence'] is True
-    assert (lifecycle_worker_service.qualification.
-            qualification_lifecycle_proof_id(evidence) is not None)
+    begin_restoration.assert_called_once_with(
+        revision,
+        target,
+        repository_arn='qualification-repository-arn',
+        runtime_digest=_DIGEST,
+        now=None)
+    activate.assert_called_once_with(revision.id)
 
 
 def test_failed_reservation_reaper_stops_after_provider_acquisition(
