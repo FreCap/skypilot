@@ -7882,6 +7882,104 @@ class TestPaidLocationLaunchBudget:
         assert manager._next_replica_id == 2
         assert len(manager._launch_thread_pool) == 1
 
+    def test_authoritative_service_saturation_stops_paid_wave(self):
+        cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({cheap: 1.0, expensive: 2.0})
+        manager._service_hash = 'hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        budget = paid_capacity.LaunchBudget(remaining_by_location={
+            cheap: 4,
+            expensive: 4,
+        },
+                                            pool_key_by_location={
+                                                cheap: 'cheap',
+                                                expensive: 'expensive',
+                                            },
+                                            states_by_pool_key={},
+                                            globally_managed=True,
+                                            service_remaining=1)
+
+        with mock.patch.object(
+                paid_capacity,
+                'try_persist_claim',
+                return_value=paid_capacity.ClaimResult.
+                SERVICE_SATURATED) as claim, mock.patch(
+                    'sky.serve.replica_managers._should_use_spot',
+                    return_value=True), mock.patch(
+                        'sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), mock.patch(
+                            'sky.serve.replica_managers.thread_utils.SafeThread'
+                        ) as safe_thread:
+            launched = manager._scale_up_one_locked(
+                None,
+                set(), [],
+                paid_location_launch_budget=budget,
+                launch_priority=20)
+
+        assert not launched
+        assert claim.call_count == 1
+        assert budget.service_remaining == 0
+        assert paid_capacity.select_location(manager._spot_placer,
+                                             budget) is None
+        assert manager._next_replica_id == 1
+        assert not manager._launch_thread_pool
+        safe_thread.assert_called_once()
+
+    def test_service_envelope_stops_large_physical_wave(self):
+        cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({cheap: 1.0, expensive: 2.0})
+        manager._service_hash = 'hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        budget = paid_capacity.LaunchBudget(remaining_by_location={
+            cheap: 4,
+            expensive: 4,
+        },
+                                            pool_key_by_location={
+                                                cheap: 'cheap',
+                                                expensive: 'expensive',
+                                            },
+                                            states_by_pool_key={},
+                                            globally_managed=True,
+                                            service_remaining=2)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), mock.patch.object(
+                                   paid_capacity,
+                                   'build_launch_budget',
+                                   return_value=budget), mock.patch.object(
+                                       paid_capacity,
+                                       'try_persist_claim',
+                                       return_value=paid_capacity.ClaimResult.
+                                       ACQUIRED) as claim, mock.patch(
+                                           'sky.serve.replica_managers.'
+                                           '_should_use_spot',
+                                           return_value=True), mock.patch(
+                                               'sky.serve.replica_managers.'
+                                               '_get_resources_ports',
+                                               return_value='8080'), mock.patch(
+                                                   'sky.serve.'
+                                                   'replica_managers.'
+                                                   'thread_utils.SafeThread'):
+            manager._scale_up_batch_locked([{'use_spot': True}] * 20)
+
+        assert claim.call_count == 2
+        assert budget.service_remaining == 0
+        assert manager._next_replica_id == 3
+        assert len(manager._launch_thread_pool) == 2
+
     def test_priority_deferral_does_not_exhaust_or_spill_pool(self):
         cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
         expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')

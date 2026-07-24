@@ -3475,6 +3475,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     f'{location}: {claim_result.value}.')
                         return False
                     if (claim_result ==
+                            paid_capacity.ClaimResult.SERVICE_SATURATED):
+                        paid_capacity.exhaust_service(
+                            paid_location_launch_budget)
+                        logger.info('Deferring paid demand launch because the '
+                                    'service paid-capacity envelope is full.')
+                        return False
+                    if (claim_result ==
                             paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING):
                         paid_capacity.defer_for_priority(
                             paid_location_launch_budget, location)
@@ -3977,6 +3984,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{batch_version} scale-up batch because version '
                             f'{pending_version} is waiting to be applied.')
                 break
+            if paid_capacity.service_exhausted(paid_location_launch_budget):
+                logger.info('Stopping physical scale-up wave at the service '
+                            'paid-capacity envelope.')
+                break
             scale_up_kwargs: dict[str, Any] = {}
             if paid_location_launch_budget is not None:
                 scale_up_kwargs['paid_location_launch_budget'] = (
@@ -4246,6 +4257,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         deferred_cards: set[str] = set()
         launched_capacity = 0
         while True:
+            if paid_capacity.service_exhausted(paid_location_launch_budget):
+                logger.info('Stopping logical scale-up wave at the service '
+                            'paid-capacity envelope.')
+                break
             if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,

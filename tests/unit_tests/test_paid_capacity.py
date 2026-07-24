@@ -63,14 +63,18 @@ def test_pool_key_normalizes_equivalent_accelerator_counts():
 def test_default_limits_and_invalid_failure_cooldown(monkeypatch):
     monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
     monkeypatch.delenv(paid_capacity._MAX_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(paid_capacity._SERVICE_LIMIT_ENV_VAR, raising=False)
     monkeypatch.delenv(paid_capacity._FAILURE_COOLDOWN_SECONDS_ENV_VAR,
                        raising=False)
     assert paid_capacity.base_limit() == 4
     assert paid_capacity.max_limit() == 480
+    assert paid_capacity.service_limit() == 16
     assert paid_capacity.failure_cooldown_seconds() == 600
 
+    monkeypatch.setenv(paid_capacity._SERVICE_LIMIT_ENV_VAR, '0')
     monkeypatch.setenv(paid_capacity._FAILURE_COOLDOWN_SECONDS_ENV_VAR, '0')
     paid_capacity._parse_positive_int.cache_clear()
+    assert paid_capacity.service_limit() == 16
     assert paid_capacity.failure_cooldown_seconds() == 600
 
 
@@ -173,9 +177,15 @@ def test_admission_summary_is_bounded_and_redacts_pool_keys():
                            'monotonic',
                            side_effect=[100, 101, 500]), \
          mock.patch.object(paid_capacity.logger, 'info') as info:
-        paid_capacity._log_admission_summary(states)
-        paid_capacity._log_admission_summary(states)
-        paid_capacity._log_admission_summary(states)
+        paid_capacity._log_admission_summary(states,
+                                             service_claims=17,
+                                             service_claim_limit=16)
+        paid_capacity._log_admission_summary(states,
+                                             service_claims=17,
+                                             service_claim_limit=16)
+        paid_capacity._log_admission_summary(states,
+                                             service_claims=17,
+                                             service_claim_limit=16)
 
     assert info.call_count == 2
     message = info.call_args.args[0]
@@ -184,6 +194,9 @@ def test_admission_summary_is_bounded_and_redacts_pool_keys():
     assert "'cooldown': 1" in message
     assert 'active_claims=5' in message
     assert 'legacy_overage_claims=3' in message
+    assert 'service_claims=17' in message
+    assert 'service_limit=16' in message
+    assert 'service_remaining=0' in message
     assert 'secret-a' not in message
     assert 'secret-b' not in message
 
@@ -294,8 +307,55 @@ def test_global_snapshot_uses_shared_headroom_by_exact_pool():
                                                    globally_managed=True)
 
     assert budget.remaining_by_location == {cheap: 7, expensive: 3}
+    assert budget.service_remaining == 16
     assert zero not in budget.pool_key_by_location
     get_states.assert_called_once()
+
+
+def test_global_budget_caps_paid_selection_across_exact_pools(monkeypatch):
+    monkeypatch.setenv(paid_capacity._SERVICE_LIMIT_ENV_VAR, '2')
+    cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    expensive = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    placer = make_placer({cheap: 1.0, expensive: 2.0})
+    infos = [_pending_info(1, cheap), _pending_info(2, expensive)]
+    infos[0].paid_capacity_pool_key = 'cheap'
+    infos[1].paid_capacity_pool_key = 'expensive'
+    states = {
+        paid_capacity.pool_key(cheap, workspace='w', num_nodes=1): {
+            'remaining': 4
+        },
+        paid_capacity.pool_key(expensive, workspace='w', num_nodes=1): {
+            'remaining': 4
+        },
+    }
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=states):
+        budget = paid_capacity.build_launch_budget(placer,
+                                                   workspace='w',
+                                                   existing_replica_infos=infos,
+                                                   globally_managed=True)
+
+    assert budget.service_remaining == 0
+    assert paid_capacity.select_location(placer, budget) is None
+
+
+def test_debit_and_authoritative_saturation_exhaust_service_budget():
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    budget = paid_capacity.LaunchBudget(remaining_by_location={location: 4},
+                                        pool_key_by_location={location: 'pool'},
+                                        states_by_pool_key={},
+                                        globally_managed=True,
+                                        service_remaining=2)
+
+    paid_capacity.debit(budget, location)
+    assert budget.service_remaining == 1
+    paid_capacity.exhaust_service(budget)
+    assert budget.service_remaining == 0
 
 
 def test_legacy_local_snapshot_only_debits_unresolved_rows(monkeypatch):
@@ -391,6 +451,7 @@ def test_claim_clamps_priority_and_returns_typed_result():
     assert result is paid_capacity.ClaimResult.ACQUIRED
     assert claim.call_args.kwargs['priority'] == (
         constants.LB_REQUEST_PRIORITY_MAX)
+    assert claim.call_args.kwargs['service_limit'] == 16
 
 
 def test_saturated_pool_exhaustion_spills_to_next_pool():
