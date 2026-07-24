@@ -200,6 +200,15 @@ sky jobs launch --pool <pool> --num-jobs N <phase-job.yaml>
 The job maps `SKYPILOT_JOB_RANK` to `shard_index` and
 `SKYPILOT_NUM_JOBS` to `num_shards`.
 
+Pool admission accounts for at most one current nonterminal task per Managed
+Job. Both the single-worker and batched pool queries select that row by
+`row_number()` over the scalar `(spot_job_id, task_id)` identity, choosing the
+lowest nonterminal `task_id` to match the serial-job lifecycle. They must not
+apply SQL `DISTINCT` to `full_resources`: the central PostgreSQL schema stores
+that payload as `json`, which has no equality operator. Missing, unresolved
+heterogeneous, or otherwise invalid resource payloads continue to fail closed
+and disable resource-aware packing for the affected scheduling decision.
+
 ### 5. Phase orchestration
 
 The launcher creates a unique run ID and immutable code bundle, applies the
@@ -282,6 +291,8 @@ global manifest contract.
   validate with `dynamic_fallback`;
 - explicit instance-type pool entries reach provider feasibility as
   cloud-bound launchable resources;
+- pool resource accounting executes on PostgreSQL without comparing the
+  `full_resources` JSON payload and counts at most one active task per job;
 - existing pools without placement policy preserve their serialized form;
 
 ### Control-plane verification
