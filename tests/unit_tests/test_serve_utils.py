@@ -284,6 +284,17 @@ def test_postgres_lifecycle_epoch_uses_lock_owning_session():
     assert lifecycle_lock.epoch == 7
 
 
+def test_lifecycle_epoch_cancellation_releases_lock():
+    pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
+    pg_lock.run_in_lock_session.side_effect = KeyboardInterrupt
+    lifecycle_lock = serve_utils.ServiceLifecycleLock('svc', pg_lock)
+
+    with pytest.raises(KeyboardInterrupt):
+        lifecycle_lock.acquire()
+
+    pg_lock.release.assert_called_once()
+
+
 @pytest.mark.parametrize('status', [
     serve_state.ServiceStatus.SHUTTING_DOWN,
     serve_state.ServiceStatus.FAILED_CLEANUP,

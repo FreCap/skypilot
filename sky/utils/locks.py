@@ -213,22 +213,20 @@ class PostgresLock(DistributedLock):
         if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             raise ValueError('PostgresLock requires PostgreSQL database. '
                              f'Current dialect: {engine.dialect.name}')
-        # Borrow a dedicated connection from the pool. Idempotent under
-        # retry: raw_connection() either returns a checked-out conn or
-        # raises with nothing taken — no partial state, no leak.
-        return engine.raw_connection()
+        # Session advisory locks can outlive an ORM transaction (or an entire
+        # daemon).  Keep them off the ordinary QueuePool so protected code can
+        # still make progress even when the configured pool has one slot.
+        # Idempotent under retry: the helper either returns a fresh checked-out
+        # connection or raises with nothing retained.
+        return db_utils.get_postgres_lock_connection(engine)
 
     def acquire(self, blocking: bool = True) -> AcquireReturnProxy:
         """Acquire the postgres advisory lock."""
         if self._acquired:
             return AcquireReturnProxy(self)
 
-        self._connection = self._get_connection()
-        cursor = self._connection.cursor()
-
         deadline = (None if self.timeout is None else time.monotonic() +
                     self.timeout)
-
         if self._shared_lock:
             lock_func = 'pg_try_advisory_lock_shared'
         else:
@@ -243,13 +241,41 @@ class PostgresLock(DistributedLock):
                     raise LockTimeout(
                         f'Failed to acquire {mode_str} postgres lock '
                         f'{self.lock_id} within {self.timeout} seconds')
+                is_first_attempt = first_attempt
                 first_attempt = False
-                cursor.execute(f'SELECT {lock_func}(%s)', (self._lock_key,))
-                result = cursor.fetchone()[0]
+
+                self._connection = self._get_connection()
+                # Opening a new session may itself take time. Preserve the
+                # historical guarantee of one attempt even for timeout=0, but
+                # do not issue a later lock probe after its deadline.
+                if (not is_first_attempt and deadline is not None and
+                        time.monotonic() >= deadline):
+                    self._close_connection()
+                    raise LockTimeout(
+                        f'Failed to acquire {mode_str} postgres lock '
+                        f'{self.lock_id} within {self.timeout} seconds')
+                cursor = None
+                try:
+                    cursor = self._connection.cursor()
+                    cursor.execute(f'SELECT {lock_func}(%s)', (self._lock_key,))
+                    result = cursor.fetchone()[0]
+                    # psycopg2 starts a transaction for SELECT.  Session-level
+                    # advisory locks survive commit, so end every probe
+                    # transaction immediately instead of leaving long-lived
+                    # holders (or polling contenders) idle in transaction.
+                    self._connection.commit()
+                finally:
+                    if cursor is not None:
+                        cursor.close()
 
                 if result:
                     self._acquired = True
                     return AcquireReturnProxy(self)
+
+                # A polling contender does not own a lock.  Close its physical
+                # session between attempts so waiters do not consume scarce
+                # PostgreSQL backends while sleeping.
+                self._close_connection()
 
                 if not blocking:
                     raise LockTimeout(
@@ -267,8 +293,12 @@ class PostgresLock(DistributedLock):
 
                 time.sleep(sleep_interval)
 
-        except Exception:
-            self._close_connection()
+        except BaseException as e:
+            # Cancellation uses KeyboardInterrupt in executor workers.  It can
+            # arrive after PostgreSQL grants the lock but before acquire()
+            # returns, so cleanup must cover BaseException and then re-raise.
+            self._close_connection(invalidate=isinstance(e, psycopg2.Error))
+            self._acquired = False
             raise
 
     def release(self) -> None:

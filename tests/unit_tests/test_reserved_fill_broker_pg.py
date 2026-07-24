@@ -53,6 +53,7 @@ from sky.serve import serve_state
 from sky.serve import spot_placer
 from sky.utils import common_utils
 from sky.utils import locks
+from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 _POSTGRES_REQUIRED = os.environ.get('SKYPILOT_REQUIRE_SERVE_POSTGRES') == '1'
@@ -4049,3 +4050,73 @@ class TestConcurrentRoundsPG:
             round_row = serve_state.get_reserved_fill_round(pool)
             assert round_row is not None
             assert int(round_row['round_id']) == 1
+
+
+def test_advisory_lock_does_not_consume_ordinary_pool(pg_server, monkeypatch):
+    """Nested session locks leave a one-slot ORM QueuePool available."""
+    url = _create_database(pg_server, f'lock_pool_{uuid.uuid4().hex[:8]}')
+    engine = create_engine(url,
+                           poolclass=sqlalchemy.pool.QueuePool,
+                           pool_size=1,
+                           max_overflow=0,
+                           pool_timeout=1)
+    monkeypatch.setattr(locks.global_user_state, 'initialize_and_get_db',
+                        lambda: engine)
+    lock = locks.PostgresLock('dedicated-lock-session')
+    nested_lock = locks.PostgresLock('nested-lock-session')
+    successor = locks.PostgresLock('dedicated-lock-session')
+    connection_url = engine.url.render_as_string(hide_password=False)
+
+    try:
+        lock.acquire()
+        nested_lock.acquire()
+        assert engine.pool.checkedout() == 0
+
+        def _get_holder_pid(connection):
+            cursor = connection.cursor()
+            try:
+                cursor.execute('SELECT pg_backend_pid()')
+                pid = cursor.fetchone()[0]
+                connection.commit()
+                return pid
+            finally:
+                cursor.close()
+
+        holder_pid = lock.run_in_lock_session(_get_holder_pid)
+        with engine.connect() as observer:
+            state, transaction_started, application_name = observer.execute(
+                sqlalchemy.text('SELECT state, xact_start, application_name '
+                                'FROM pg_stat_activity WHERE pid = :pid'), {
+                                    'pid': holder_pid
+                                }).one()
+        assert state == 'idle'
+        assert transaction_started is None
+        assert application_name == 'skypilot-advisory-lock'
+        assert engine.pool.checkedout() == 0
+
+        contender = locks.PostgresLock('dedicated-lock-session')
+        with pytest.raises(locks.LockTimeout):
+            contender.acquire(blocking=False)
+        assert engine.pool.checkedout() == 0
+        with engine.connect() as observer:
+            lock_sessions = observer.execute(
+                sqlalchemy.text('SELECT count(*) FROM pg_stat_activity '
+                                'WHERE datname = current_database() '
+                                'AND application_name = :application_name'), {
+                                    'application_name': 'skypilot-advisory-lock'
+                                }).scalar_one()
+        # Only the two acquired locks retain sessions; the failed contender
+        # commits and disconnects before returning LockTimeout.
+        assert lock_sessions == 2
+
+        lock.release()
+        successor.acquire(blocking=False)
+    finally:
+        successor.release()
+        nested_lock.release()
+        lock.release()
+        engine.dispose()
+        lock_engine = db_utils._postgres_lock_engine_cache.pop(
+            connection_url, None)
+        if lock_engine is not None:
+            lock_engine.dispose()

@@ -901,7 +901,10 @@ class ServiceLifecycleLock:
             if not self.session_is_valid():
                 raise RuntimeError('Lifecycle lock session was lost while '
                                    f'claiming {self.service_name!r}.')
-        except Exception:
+        except BaseException:
+            # Executor cancellation is delivered as KeyboardInterrupt.  If it
+            # lands while claiming the fencing epoch, release the already-held
+            # advisory lock before the worker is reused.
             self.lock.release()
             raise
         return self

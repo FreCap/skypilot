@@ -57,6 +57,7 @@ _SQLITE_BUSY_BACKOFF_MULTIPLIER = 3
 # unavailable. libpq otherwise has no connection deadline, so one transient
 # routing failure can indefinitely stall a Serve controller's reconciliation.
 _POSTGRES_CONNECT_TIMEOUT_SECONDS = 15
+_POSTGRES_LOCK_APPLICATION_NAME = 'skypilot-advisory-lock'
 # Bound QueuePool checkout separately from connection establishment. A leaked
 # or unexpectedly long transaction must not leave a worker waiting forever for
 # another connection from its process-local budget.
@@ -597,6 +598,13 @@ class DatabaseManager:
 
 _max_connections = 0
 _postgres_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
+# Session-level advisory locks must keep their PostgreSQL connection for the
+# entire lock lifetime.  Reusing the ordinary QueuePool for those connections
+# can therefore deadlock a process: a lock checks out the last pooled
+# connection, then the protected operation waits for an ORM connection from
+# that same pool.  A cached NullPool engine keeps lock sessions on a separate
+# connection path and physically closes them when the lock is released.
+_postgres_lock_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
 _sqlite_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
 
 _db_creation_lock = threading.Lock()
@@ -618,6 +626,40 @@ def set_max_connections(max_connections: int):
 
 def get_max_connections():
     return _max_connections
+
+
+def get_postgres_lock_connection(
+    engine: sqlalchemy.engine.Engine,) -> sqlalchemy.pool.PoolProxiedConnection:
+    """Open a dedicated, non-reused connection for a session advisory lock.
+
+    PostgreSQL session advisory locks are owned by one backend session and
+    survive transaction commits.  They cannot safely share the process-local
+    QueuePool used by ORM operations: protected code often needs another
+    connection, and some cluster operations deliberately nest two advisory
+    locks.  ``NullPool`` gives each held lock its required backend session
+    without consuming an ordinary pooled checkout.  Closing the returned
+    connection also closes the physical session, providing a final guarantee
+    that PostgreSQL releases every lock owned by it.
+    """
+    if engine.dialect.name != SQLAlchemyDialect.POSTGRESQL.value:
+        raise ValueError('Postgres lock connections require PostgreSQL. '
+                         f'Current dialect: {engine.dialect.name}')
+
+    # Preserve credentials when deriving the dedicated engine.  ``str(url)``
+    # redacts the password and cannot be used to reconnect.
+    connection_url = engine.url.render_as_string(hide_password=False)
+    with _db_creation_lock:
+        if connection_url not in _postgres_lock_engine_cache:
+            _postgres_lock_engine_cache[connection_url] = (
+                sqlalchemy.create_engine(
+                    engine.url,
+                    poolclass=sqlalchemy.NullPool,
+                    connect_args={
+                        'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS,
+                        'application_name': _POSTGRES_LOCK_APPLICATION_NAME,
+                    }))
+        lock_engine = _postgres_lock_engine_cache[connection_url]
+    return lock_engine.raw_connection()
 
 
 def _make_asyncpg_creator(dsn: str) -> Callable[[], Any]:

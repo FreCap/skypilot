@@ -256,6 +256,8 @@ class TestPostgresLock:
         assert lock._connection is connection
         cursor.execute.assert_called_once_with(
             'SELECT pg_try_advisory_lock(%s)', (mock.ANY,))
+        connection.commit.assert_called_once()
+        cursor.close.assert_called_once()
 
     @mock.patch.object(locks.PostgresLock, '_get_connection')
     def test_postgres_lock_acquire_already_acquired(self, mock_get_connection,
@@ -284,6 +286,25 @@ class TestPostgresLock:
 
         with pytest.raises(locks.LockTimeout):
             lock.acquire()
+
+    @mock.patch.object(locks.PostgresLock, '_get_connection')
+    def test_postgres_lock_acquire_commits_every_probe(self,
+                                                       mock_get_connection,
+                                                       mock_connection):
+        """Failed probes must not remain idle in a transaction."""
+        connection, cursor = mock_connection
+        mock_get_connection.return_value = connection
+        cursor.fetchone.side_effect = [[False], [True]]
+
+        lock = locks.PostgresLock('test_lock', poll_interval=0)
+        lock.acquire()
+
+        assert cursor.execute.call_count == 2
+        assert connection.commit.call_count == 2
+        assert cursor.close.call_count == 2
+        connection.close.assert_called_once()
+        assert mock_get_connection.call_count == 2
+        assert lock.is_locked()
 
     @mock.patch.object(locks.PostgresLock, '_get_connection')
     def test_postgres_lock_acquire_clamps_poll_to_deadline(
@@ -335,6 +356,11 @@ class TestPostgresLock:
         with pytest.raises(locks.LockTimeout):
             lock.acquire(blocking=False)
 
+        connection.commit.assert_called_once()
+        cursor.close.assert_called_once()
+        connection.close.assert_called_once()
+        assert lock._connection is None
+
     @mock.patch.object(locks.PostgresLock, '_get_connection')
     def test_postgres_lock_acquire_exception_cleanup(self, mock_get_connection,
                                                      mock_connection):
@@ -349,8 +375,45 @@ class TestPostgresLock:
             lock.acquire()
 
         # Connection should be closed on exception
+        cursor.close.assert_called_once()
         connection.close.assert_called_once()
         assert lock._connection is None
+
+    @mock.patch.object(locks.PostgresLock, '_get_connection')
+    def test_postgres_lock_acquire_cursor_failure_invalidates_connection(
+            self, mock_get_connection, mock_connection):
+        """A dead session before cursor creation must not leak its checkout."""
+        connection, _ = mock_connection
+        mock_get_connection.return_value = connection
+        connection.cursor.side_effect = locks.psycopg2.InterfaceError(
+            'connection already closed')
+
+        lock = locks.PostgresLock('test_lock')
+        with pytest.raises(locks.psycopg2.InterfaceError):
+            lock.acquire()
+
+        connection.invalidate.assert_called_once()
+        connection.close.assert_not_called()
+        assert lock._connection is None
+        assert not lock.is_locked()
+
+    @mock.patch.object(locks.PostgresLock, '_get_connection')
+    def test_postgres_lock_acquire_cancellation_releases_session(
+            self, mock_get_connection, mock_connection):
+        """Cancellation after the lock is granted must close its session."""
+        connection, cursor = mock_connection
+        mock_get_connection.return_value = connection
+        cursor.fetchone.return_value = [True]
+        connection.commit.side_effect = KeyboardInterrupt
+
+        lock = locks.PostgresLock('test_lock')
+        with pytest.raises(KeyboardInterrupt):
+            lock.acquire()
+
+        cursor.close.assert_called_once()
+        connection.close.assert_called_once()
+        assert lock._connection is None
+        assert not lock.is_locked()
 
     def test_postgres_lock_release_not_acquired(self):
         """Test postgres lock release when not acquired."""
@@ -494,15 +557,18 @@ class TestPostgresLock:
         mock_engine = mock.Mock()
         mock_engine.dialect.name = db_utils.SQLAlchemyDialect.POSTGRESQL.value
         mock_connection = mock.Mock()
-        mock_engine.raw_connection.return_value = mock_connection
         mock_init_db.return_value = mock_engine
 
-        lock = locks.PostgresLock('test_lock')
-        result = lock._get_connection()
+        with mock.patch.object(
+                db_utils,
+                'get_postgres_lock_connection',
+                return_value=mock_connection) as mock_get_lock_connection:
+            lock = locks.PostgresLock('test_lock')
+            result = lock._get_connection()
 
         assert result is mock_connection
         mock_init_db.assert_called_once()
-        mock_engine.raw_connection.assert_called_once()
+        mock_get_lock_connection.assert_called_once_with(mock_engine)
 
     @mock.patch.object(global_user_state, 'initialize_and_get_db')
     def test_postgres_lock_get_connection_wrong_dialect(self, mock_init_db):
@@ -542,6 +608,8 @@ class TestPostgresLock:
         assert lock._acquired
         cursor.execute.assert_called_once_with(
             'SELECT pg_try_advisory_lock_shared(%s)', (mock.ANY,))
+        connection.commit.assert_called_once()
+        cursor.close.assert_called_once()
 
     @mock.patch.object(locks.PostgresLock, '_get_connection')
     def test_postgres_lock_release_shared(self, mock_get_connection,
