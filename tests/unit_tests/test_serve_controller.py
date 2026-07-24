@@ -2660,6 +2660,7 @@ class TestAuthoritativeLbReportIngestion:
             }, 1)
 
         assert breakdown == {
+            'capacity_semantics_version': 2,
             'configured_accelerators': ['A100', 'A100-80GB'],
             'min_replicas': {
                 'A100-80GB': 1
@@ -3424,6 +3425,37 @@ class TestGetCapacityHint:
                 logical_versions=set())
         assert counts_mock.call_count == 1
         assert hint['total_replicas'] == 5
+
+    def test_exact_card_committed_unready_membership_is_exhaustive(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=4,
+            recomputed=True,
+            latest_version=2)
+        replicas = [
+            _FakeReplicaInfo(replica_id, status, version=2)
+            for replica_id, status in enumerate(serve_state.ReplicaStatus,
+                                                start=1)
+        ]
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            info.replica_id: (f'http://{info.replica_id}', info.status.value, 1)
+            for info in replicas
+        }
+        committed_unready_statuses = {
+            serve_state.ReplicaStatus.PENDING,
+            serve_state.ReplicaStatus.PROVISIONING,
+            serve_state.ReplicaStatus.STARTING,
+            serve_state.ReplicaStatus.NOT_READY,
+        }
+        assert set(
+            serve_state.ReplicaStatus) == {info.status for info in replicas}
+
+        counts = ctrl._get_replica_counts(  # pylint: disable=protected-access
+            replicas)
+
+        assert counts['provisioning_replicas_by_accelerator'] == {
+            status.value: 1 for status in committed_unready_statuses
+        }
 
     def test_logical_hint_sums_persisted_backend_widths(self):
         ctrl = _make_controller()

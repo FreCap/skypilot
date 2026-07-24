@@ -125,6 +125,22 @@ export function normalizeAcceleratorBreakdown(value) {
     return null;
   }
   const normalized = { configuredAccelerators: [...cards] };
+  // `version` is the long-lived accelerator-breakdown/LB compatibility
+  // schema. Capacity interpretation evolves independently so old samples stay
+  // readable without relabeling their broader provisioning counts.
+  if (
+    value.capacity_semantics_version !== undefined &&
+    value.capacity_semantics_version !== null
+  ) {
+    const capacitySemanticsVersion = Number(value.capacity_semantics_version);
+    if (
+      !Number.isInteger(capacitySemanticsVersion) ||
+      capacitySemanticsVersion < 1
+    ) {
+      return null;
+    }
+    normalized.capacitySemanticsVersion = capacitySemanticsVersion;
+  }
   for (const [source, target] of ACCELERATOR_HISTORY_FIELDS) {
     const raw = value[source];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;

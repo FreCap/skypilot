@@ -118,7 +118,7 @@ function chartRanges() {
     'Prediction time trend chart',
     'Demand pressure chart',
     'L4 accelerator history chart',
-    'Machine history chart',
+    'Tracked capacity history chart',
   ].map((label) => {
     const chart = screen.getByRole('button', { name: label });
     return {
@@ -147,7 +147,9 @@ describe('ServeHistorySection', () => {
       'true'
     );
     expect(
-      screen.getByText('Status by physical backend in the selected range')
+      screen.getByText(
+        /Tracked capacity status by physical backend in the selected range/
+      )
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '1h' })).toHaveAttribute(
       'aria-pressed',
@@ -183,7 +185,7 @@ describe('ServeHistorySection', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '1h' }));
     fireEvent.click(
-      screen.getByRole('button', { name: 'Machine history chart' })
+      screen.getByRole('button', { name: 'Tracked capacity history chart' })
     );
     expect(chartRanges()).toEqual([
       { start: 120, end: 300 },

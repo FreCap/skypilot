@@ -15,6 +15,7 @@ import {
   getServicePlacement,
   getServiceVersions,
   getServices,
+  normalizeAcceleratorBreakdown,
   normalizeReplicaHistory,
   normalizeService,
   normalizeServicePlacement,
@@ -22,6 +23,40 @@ import {
 } from '@/data/connectors/services';
 
 const REQUEST_ID = 'req-123';
+
+describe('normalizeAcceleratorBreakdown capacity semantics', () => {
+  const legacyBreakdown = {
+    version: 1,
+    configured_accelerators: ['L4'],
+    min_replicas: { L4: 1 },
+    demand_target: { L4: 2 },
+    ready_capacity: { L4: 1 },
+    provisioning_capacity: { L4: 1 },
+    total_capacity: { L4: 2 },
+    zero_cost_ready_capacity: { L4: 0 },
+    fill_target: { L4: 0 },
+    free_reserved_slots: { L4: 0 },
+  };
+
+  it('keeps schema version 1 while optionally exposing capacity semantics v2', () => {
+    expect(normalizeAcceleratorBreakdown(legacyBreakdown)).not.toHaveProperty(
+      'capacitySemanticsVersion'
+    );
+    expect(
+      normalizeAcceleratorBreakdown({
+        ...legacyBreakdown,
+        capacity_semantics_version: 2,
+      })
+    ).toHaveProperty('capacitySemanticsVersion', 2);
+    expect(
+      normalizeAcceleratorBreakdown({
+        ...legacyBreakdown,
+        version: 2,
+        capacity_semantics_version: 2,
+      })
+    ).toBeNull();
+  });
+});
 
 function mockDispatchResponse() {
   return {
@@ -362,6 +397,7 @@ describe('getServices', () => {
             peak_queue_depth: 3,
             accelerator_breakdown: {
               version: 1,
+              capacity_semantics_version: 2,
               configured_accelerators: ['A100', 'A100-80GB'],
               min_replicas: { A100: 1, 'A100-80GB': 0 },
               demand_target: { A100: 3, 'A100-80GB': 1 },
@@ -467,6 +503,7 @@ describe('getServices', () => {
           peakInFlight: 5,
           peakQueueDepth: 3,
           acceleratorBreakdown: {
+            capacitySemanticsVersion: 2,
             configuredAccelerators: ['A100', 'A100-80GB'],
             minReplicas: { A100: 1, 'A100-80GB': 0 },
             demandTarget: { A100: 3, 'A100-80GB': 1 },

@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 from unittest import mock
 
+import pytest
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
@@ -9,6 +10,17 @@ from sky.serve import constants
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.utils import common_utils
+
+
+@pytest.fixture(autouse=True)
+def _clear_paid_capacity_config_cache():
+    paid_capacity._parse_positive_int.cache_clear()
+    paid_capacity._admission_summary_log_signature = None
+    paid_capacity._admission_summary_logged_at = 0
+    yield
+    paid_capacity._parse_positive_int.cache_clear()
+    paid_capacity._admission_summary_log_signature = None
+    paid_capacity._admission_summary_logged_at = 0
 
 
 def _pending_info(replica_id, location):
@@ -48,7 +60,42 @@ def test_pool_key_normalizes_equivalent_accelerator_counts():
                                       floating, workspace='w1', num_nodes=1)
 
 
-def test_adaptive_limit_ramps_60_to_480_and_resets_on_failure():
+def test_default_limits_and_invalid_failure_cooldown(monkeypatch):
+    monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(paid_capacity._MAX_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(paid_capacity._FAILURE_COOLDOWN_SECONDS_ENV_VAR,
+                       raising=False)
+    assert paid_capacity.base_limit() == 4
+    assert paid_capacity.max_limit() == 480
+    assert paid_capacity.failure_cooldown_seconds() == 600
+
+    monkeypatch.setenv(paid_capacity._FAILURE_COOLDOWN_SECONDS_ENV_VAR, '0')
+    paid_capacity._parse_positive_int.cache_clear()
+    assert paid_capacity.failure_cooldown_seconds() == 600
+
+
+def test_default_adaptive_limit_ramps_four_to_480():
+    state = paid_capacity.RampUpdate(current_limit=4,
+                                     successes_since_resize=0,
+                                     expired=False,
+                                     failed=False)
+    for expected in (8, 16, 32, 64, 128, 256, 480):
+        state = paid_capacity.record_outcomes(
+            state.current_limit,
+            state.successes_since_resize,
+            last_success_at=100,
+            outcomes=[paid_capacity.LaunchOutcome.SUCCESS] *
+            state.current_limit,
+            bootstrap_limit=4,
+            ceiling_limit=480,
+            now=101,
+            ttl_seconds=600)
+        assert state.current_limit == expected
+        assert state.successes_since_resize == 0
+        assert not state.failed
+
+
+def test_explicit_sixty_limit_ramps_to_480_and_resets_on_failure():
     state = paid_capacity.RampUpdate(current_limit=60,
                                      successes_since_resize=0,
                                      expired=False,
@@ -83,6 +130,88 @@ def test_adaptive_limit_ramps_60_to_480_and_resets_on_failure():
     assert failed.current_limit == 60
     assert failed.successes_since_resize == 0
     assert failed.failed
+
+
+@pytest.mark.parametrize('legacy_limit', [60, 120, 240])
+def test_legacy_limit_normalizes_to_default_bootstrap(legacy_limit):
+    assert paid_capacity.effective_limit(legacy_limit,
+                                         last_success_at=100,
+                                         bootstrap_limit=4,
+                                         ceiling_limit=480,
+                                         now=101,
+                                         ttl_seconds=600) == (4, True)
+
+
+def test_fresh_valid_ceiling_survives_ladder_normalization():
+    assert paid_capacity.effective_limit(480,
+                                         last_success_at=100,
+                                         bootstrap_limit=4,
+                                         ceiling_limit=480,
+                                         now=101,
+                                         ttl_seconds=600) == (480, False)
+    assert paid_capacity.limit_ladder(60, 480) == (60, 120, 240, 480)
+
+
+def test_admission_summary_is_bounded_and_redacts_pool_keys():
+    states = {
+        '{"workspace":"secret-a"}': {
+            'admission_state': 'cooldown',
+            'active_claims': 3,
+            'admission_limit': 0,
+            'remaining': 0,
+            'legacy_overage': 3,
+        },
+        '{"workspace":"secret-b"}': {
+            'admission_state': 'active',
+            'active_claims': 2,
+            'admission_limit': 4,
+            'remaining': 2,
+            'legacy_overage': 0,
+        },
+    }
+    with mock.patch.object(paid_capacity.time,
+                           'monotonic',
+                           side_effect=[100, 101, 500]), \
+         mock.patch.object(paid_capacity.logger, 'info') as info:
+        paid_capacity._log_admission_summary(states)
+        paid_capacity._log_admission_summary(states)
+        paid_capacity._log_admission_summary(states)
+
+    assert info.call_count == 2
+    message = info.call_args.args[0]
+    assert 'pools=2' in message
+    assert "'active': 1" in message
+    assert "'cooldown': 1" in message
+    assert 'active_claims=5' in message
+    assert 'legacy_overage_claims=3' in message
+    assert 'secret-a' not in message
+    assert 'secret-b' not in message
+
+
+def test_failure_epoch_closes_then_allows_one_probe():
+    closed = paid_capacity.effective_admission_limit(current_limit=4,
+                                                     last_success_at=None,
+                                                     last_failure_at=100,
+                                                     bootstrap_limit=4,
+                                                     ceiling_limit=480,
+                                                     now=699,
+                                                     success_ttl=600,
+                                                     failure_cooldown=600)
+    assert closed == paid_capacity.AdmissionLimit(limit=0,
+                                                  state='cooldown',
+                                                  cooldown_until=700)
+
+    probe = paid_capacity.effective_admission_limit(current_limit=1,
+                                                    last_success_at=None,
+                                                    last_failure_at=100,
+                                                    bootstrap_limit=4,
+                                                    ceiling_limit=480,
+                                                    now=700,
+                                                    success_ttl=600,
+                                                    failure_cooldown=600)
+    assert probe == paid_capacity.AdmissionLimit(limit=1,
+                                                 state='probe',
+                                                 cooldown_until=700)
 
 
 def test_adaptive_limit_expires_before_counting_new_successes():

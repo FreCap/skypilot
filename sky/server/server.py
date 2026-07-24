@@ -2428,6 +2428,7 @@ if __name__ == '__main__':
         cmd_args.deploy,
         max_db_connections,
         reserved_memory_mb=reserved_memory_mb)
+    server_config.publish_serve_launch_parallelism(config)
 
     num_workers = config.num_server_workers
 

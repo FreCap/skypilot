@@ -6540,9 +6540,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.info(f'Launch thread for replica {replica_id} finished.')
             error_in_sky_launch = False
             if t.format_exc is not None:
-                logger.warning(f'Launch thread for replica {replica_id} '
-                               f'exited abnormally with exception '
-                               f'{t.format_exc}. Terminating...')
+                is_capacity_failure = isinstance(t.exception,
+                                                 _ReplicaLaunchCapacityError)
+                if is_capacity_failure:
+                    capacity_launch_failures.add(replica_id)
+                else:
+                    logger.warning(f'Launch thread for replica {replica_id} '
+                                   f'exited abnormally with exception '
+                                   f'{t.format_exc}. Terminating...')
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.FAILED)
                 if replica_id in unfenced_launch_failures:
@@ -6552,8 +6557,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # unrecoverable so the autoscaler stops creating rows
                     # until the operator purges/recreates the service.
                     info.status_property.user_app_failed = True
-                if isinstance(t.exception, _ReplicaLaunchCapacityError):
-                    capacity_launch_failures.add(replica_id)
                 error_in_sky_launch = True
             else:
                 info.status_property.sky_launch_status = (
@@ -6572,6 +6575,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                         replica_id not in unfenced_launch_failures):
                     info.status_property.failed_spot_availability = True
             completed_launches.append((replica_id, info, error_in_sky_launch))
+
+        if capacity_launch_failures:
+            affected_pool_keys = {
+                info.paid_capacity_pool_key
+                for replica_id, info, _ in completed_launches
+                if replica_id in capacity_launch_failures and
+                isinstance(info.paid_capacity_pool_key, str)
+            }
+            pool_count = len(affected_pool_keys)
+            pool_count_text = str(pool_count) if pool_count else 'unknown'
+            logger.warning(
+                'Provider-capacity launch failure wave: '
+                f'failures={len(capacity_launch_failures)}, '
+                f'exact_pools={pool_count_text}; '
+                'shared paid-capacity admission will close the affected '
+                'pools. Per-replica tracebacks remain in replica logs.')
 
         # Persist one completed launch wave in one transaction while holding
         # the manager lock. A per-replica transaction here delays admission of

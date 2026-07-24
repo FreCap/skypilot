@@ -513,6 +513,591 @@ class TestPaidCapacityAuthorityPG:
         assert state['last_success_at'] is None
         assert state['last_failure_at'] == 110
 
+    def test_failure_cooldown_allows_one_global_successful_probe(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        owners = {
+            'failed': ('hash-failed', 11),
+            'probe-a': ('hash-a', 22),
+            'probe-b': ('hash-b', 33),
+        }
+        for name, (service_hash, pid) in owners.items():
+            self._add_service(name, service_hash, pid)
+
+        failed = self._info('failed', 1)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'failed',
+            'hash-failed',
+            1,
+            failed,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=100,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        failed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'failed',
+            'hash-failed', [(1, failed)],
+            {1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=110,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        def _claim(name: str, now: float) -> str:
+            service_hash, pid = owners[name]
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                name,
+                service_hash,
+                1,
+                self._info(name, 1),
+                pool_key='pool',
+                priority=20,
+                base_limit=2,
+                max_limit=8,
+                now=now,
+                success_ttl_seconds=60,
+                failure_cooldown_seconds=10,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(pid, '10.0.0.1'))
+
+        assert _claim('probe-a', 119) == 'saturated'
+        closed = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=119,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10)['pool']
+        assert closed['admission_state'] == 'cooldown'
+        assert closed['admission_limit'] == 0
+        assert closed['remaining'] == 0
+
+        barrier = threading.Barrier(2)
+        results = {}
+        errors = []
+
+        def _race(name: str) -> None:
+            try:
+                barrier.wait(timeout=20)
+                results[name] = _claim(name, 120)
+            except Exception as e:  # pylint: disable=broad-except
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=_race, args=(name,))
+            for name in ('probe-a', 'probe-b')
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), 'probe admission thread hung'
+        assert not errors, errors
+        assert list(results.values()).count('acquired') == 1
+        assert set(results.values()) <= {
+            'acquired', 'saturated', 'higher_priority_waiting'
+        }
+
+        probing = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=120,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10)['pool']
+        assert probing['current_limit'] == 1
+        assert probing['admission_state'] == 'probe'
+        assert probing['admission_limit'] == 1
+        assert probing['active_claims'] == 1
+        assert probing['remaining'] == 0
+
+        winner = next(
+            name for name, result in results.items() if result == 'acquired')
+        service_hash, pid = owners[winner]
+        probe = serve_state.get_replica_info_from_id(winner, 1)
+        assert probe is not None
+        probe.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            winner,
+            service_hash, [(1, probe)],
+            {1: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=2,
+            max_limit=8,
+            now=121,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(pid, '10.0.0.1'))
+        reopened = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=121,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10)['pool']
+        assert reopened['admission_state'] == 'active'
+        assert reopened['admission_limit'] == 2
+        assert reopened['current_limit'] == 2
+        assert reopened['successes_since_resize'] == 1
+        assert reopened['last_failure_at'] is None
+
+    def test_other_failure_releases_probe_without_restarting_cooldown(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        first = self._info('svc', 1)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            first,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=100,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        first.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, first)],
+            {1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=110,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        probe = self._info('svc', 2)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            2,
+            probe,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=120,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        probe.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(2, probe)],
+            {2: paid_capacity.LaunchOutcome.OTHER_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=121,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        state = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=121,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10)['pool']
+        assert state['last_failure_at'] == 110
+        assert state['admission_state'] == 'probe'
+        assert state['remaining'] == 1
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            3,
+            self._info('svc', 3),
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=122,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+
+    def test_legacy_limit_is_normalized_while_holding_pool_lock(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        with broker_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.paid_capacity_pools_table).values(
+                    pool_key='legacy',
+                    current_limit=60,
+                    successes_since_resize=59,
+                    last_success_at=100,
+                    updated_at=100))
+
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            self._info('svc', 1),
+            pool_key='legacy',
+            priority=20,
+            base_limit=4,
+            max_limit=480,
+            now=101,
+            success_ttl_seconds=600,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        state = serve_state.get_paid_capacity_pool_states(
+            ['legacy'],
+            base_limit=4,
+            max_limit=480,
+            now=101,
+            success_ttl_seconds=600)['legacy']
+        assert state['current_limit'] == 4
+        assert state['successes_since_resize'] == 0
+        assert state['last_success_at'] is None
+
+    def test_legacy_overage_drains_and_old_marker_overwrite_stays_sticky(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        infos = {}
+        for replica_id in range(1, 5):
+            infos[replica_id] = self._info('svc', replica_id)
+            assert serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                infos[replica_id],
+                pool_key='pool',
+                priority=20,
+                base_limit=4,
+                max_limit=480,
+                now=100,
+                success_ttl_seconds=600,
+                failure_cooldown_seconds=10,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        infos[4].status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(4, infos[4])],
+            {4: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=4,
+            max_limit=480,
+            now=110,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        overage = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=4,
+            max_limit=480,
+            now=120,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10)['pool']
+        assert overage['admission_limit'] == 1
+        assert overage['active_claims'] == 3
+        assert overage['legacy_overage'] == 2
+        assert overage['remaining'] == 0
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            5,
+            self._info('svc', 5),
+            pool_key='pool',
+            priority=20,
+            base_limit=4,
+            max_limit=480,
+            now=120,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'saturated'
+
+        for replica_id in range(1, 4):
+            infos[replica_id].status_property.sky_launch_status = (
+                common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash',
+            [(replica_id, infos[replica_id]) for replica_id in range(1, 4)], {
+                replica_id: paid_capacity.LaunchOutcome.OTHER_FAILURE
+                for replica_id in range(1, 4)
+            },
+            base_limit=4,
+            max_limit=480,
+            now=121,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        old_binary_probe = self._info('svc', 5)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            5,
+            old_binary_probe,
+            pool_key='pool',
+            priority=20,
+            base_limit=4,
+            max_limit=480,
+            now=122,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        with broker_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state.paid_capacity_pools_table).where(
+                    serve_state.paid_capacity_pools_table.c.pool_key ==
+                    'pool').values(current_limit=60, updated_at=122.5))
+        old_binary_probe.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(5, old_binary_probe)],
+            {5: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=4,
+            max_limit=480,
+            now=123,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+        sticky = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=4,
+            max_limit=480,
+            now=123,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10)['pool']
+        assert sticky['current_limit'] == 60
+        assert sticky['last_failure_at'] == 110
+        assert sticky['active_claims'] == 0
+
+        fresh_probe = self._info('svc', 6)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            6,
+            fresh_probe,
+            pool_key='pool',
+            priority=20,
+            base_limit=4,
+            max_limit=480,
+            now=124,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        fresh_probe.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(6, fresh_probe)],
+            {6: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=4,
+            max_limit=480,
+            now=125,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+        reopened = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=4,
+            max_limit=480,
+            now=125,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=10)['pool']
+        assert reopened['current_limit'] == 4
+        assert reopened['last_failure_at'] is None
+
+    def test_post_lock_database_clock_crosses_cooldown_boundary(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        with broker_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.paid_capacity_pools_table).values(
+                    pool_key='pool',
+                    current_limit=4,
+                    successes_since_resize=0,
+                    updated_at=0))
+
+        entered_ensure = threading.Event()
+        original_ensure = serve_state._ensure_paid_capacity_pool_in_session
+
+        def _signal_ensure(*args, **kwargs):
+            entered_ensure.set()
+            return original_ensure(*args, **kwargs)
+
+        monkeypatch.setattr(serve_state,
+                            '_ensure_paid_capacity_pool_in_session',
+                            _signal_ensure)
+        results = []
+        errors = []
+
+        def _claim() -> None:
+            try:
+                results.append(
+                    serve_state.try_add_replica_with_paid_capacity_claim(
+                        'svc',
+                        'hash',
+                        1,
+                        self._info('svc', 1),
+                        pool_key='pool',
+                        priority=20,
+                        base_limit=4,
+                        max_limit=480,
+                        now=None,
+                        success_ttl_seconds=600,
+                        failure_cooldown_seconds=1,
+                        waiter_ttl_seconds=30,
+                        expected_controller_owner=(11, '10.0.0.1')))
+            except Exception as e:  # pylint: disable=broad-except
+                errors.append(e)
+
+        with sqlalchemy.orm.Session(broker_engine) as blocker:
+            blocker.execute(
+                sqlalchemy.select(serve_state.paid_capacity_pools_table).where(
+                    serve_state.paid_capacity_pools_table.c.pool_key ==
+                    'pool').with_for_update())
+            failure_at = float(
+                blocker.execute(
+                    sqlalchemy.update(serve_state.paid_capacity_pools_table).
+                    where(serve_state.paid_capacity_pools_table.c.pool_key ==
+                          'pool').values(
+                              last_failure_at=sqlalchemy.extract(
+                                  'epoch', sqlalchemy.func.clock_timestamp()),
+                              updated_at=sqlalchemy.extract(
+                                  'epoch',
+                                  sqlalchemy.func.clock_timestamp())).returning(
+                                      serve_state.paid_capacity_pools_table.c.
+                                      last_failure_at)).scalar_one())
+            thread = threading.Thread(target=_claim)
+            thread.start()
+            assert entered_ensure.wait(timeout=20)
+            # A transaction-stable/pre-lock clock remains inside cooldown;
+            # clock_timestamp() sampled after this lock is released does not.
+            time.sleep(1.25)
+            blocker.commit()
+        thread.join(timeout=20)
+        assert not thread.is_alive(), 'clock-ordering claim thread hung'
+        assert not errors, errors
+        assert results == ['acquired']
+        with broker_engine.connect() as connection:
+            claimed_at = float(
+                connection.execute(
+                    sqlalchemy.select(serve_state.paid_capacity_claims_table.c.
+                                      claimed_at)).scalar_one())
+        assert claimed_at >= failure_at + 1
+
+    def test_outcome_failure_uses_post_lock_database_clock(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        failed = self._info('svc', 1)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            failed,
+            pool_key='pool',
+            priority=20,
+            base_limit=4,
+            max_limit=480,
+            now=100,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=1,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        failed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+
+        entered_pool_lock = threading.Event()
+        original_pool_lock = serve_state._paid_capacity_pool_row_for_update
+
+        def _signal_pool_lock(*args, **kwargs):
+            entered_pool_lock.set()
+            return original_pool_lock(*args, **kwargs)
+
+        monkeypatch.setattr(serve_state, '_paid_capacity_pool_row_for_update',
+                            _signal_pool_lock)
+        results = []
+        errors = []
+
+        def _record_failure() -> None:
+            try:
+                results.append(
+                    serve_state.
+                    add_or_update_replicas_with_paid_capacity_outcomes(
+                        'svc',
+                        'hash', [(1, failed)],
+                        {1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+                        base_limit=4,
+                        max_limit=480,
+                        now=None,
+                        success_ttl_seconds=600,
+                        failure_cooldown_seconds=1,
+                        expected_controller_owner=(11, '10.0.0.1')))
+            except Exception as e:  # pylint: disable=broad-except
+                errors.append(e)
+
+        with sqlalchemy.orm.Session(broker_engine) as blocker:
+            blocker.execute(
+                sqlalchemy.select(serve_state.paid_capacity_pools_table).where(
+                    serve_state.paid_capacity_pools_table.c.pool_key ==
+                    'pool').with_for_update())
+            thread = threading.Thread(target=_record_failure)
+            thread.start()
+            assert entered_pool_lock.wait(timeout=20)
+            time.sleep(1.25)
+            release_floor = float(
+                blocker.execute(
+                    sqlalchemy.select(
+                        sqlalchemy.extract(
+                            'epoch',
+                            sqlalchemy.func.clock_timestamp()))).scalar_one())
+            blocker.commit()
+        thread.join(timeout=20)
+        assert not thread.is_alive(), 'clock-ordering outcome thread hung'
+        assert not errors, errors
+        assert results == [True]
+
+        state = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=4,
+            max_limit=480,
+            now=None,
+            success_ttl_seconds=600,
+            failure_cooldown_seconds=1)['pool']
+        assert state['last_failure_at'] >= release_floor
+        assert state['admission_state'] == 'cooldown'
+
     @pytest.mark.parametrize('status', [
         serve_state.ServiceStatus.SHUTTING_DOWN,
         serve_state.ServiceStatus.FAILED_CLEANUP
@@ -614,6 +1199,15 @@ class TestPaidCapacityAuthorityPG:
             success_ttl_seconds=60,
             waiter_ttl_seconds=30,
             expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        with broker_engine.connect() as connection:
+            claimed_at = connection.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.claimed_at).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc',
+                        serve_state.paid_capacity_claims_table.c.replica_id ==
+                        1)).scalar_one()
+        assert claimed_at == 100
         slow.status_property.sky_launch_status = (
             common_utils.ProcessStatus.SUCCEEDED)
         assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
@@ -818,6 +1412,7 @@ class TestPaidCapacityAuthorityPG:
                     serve_state.paid_capacity_claims_table)).fetchall()
         assert row[0] == 'pool'
         assert len(claims) == 1
+        assert claims[0].claimed_at == 0
         restored = serve_state.get_replica_info_from_id('svc', 1)
         assert restored is not None
         assert restored.paid_capacity_pool_key == 'pool'
@@ -2345,6 +2940,59 @@ class TestServeStatusHistoryPG:
         mixed = serve_history.get_status_history('svc',
                                                  timestamp=timestamp + 22)
         assert mixed['autoscaler_samples'][0]['accelerator_breakdown'] is None
+
+    def test_autoscaler_history_serializes_legacy_and_new_capacity_semantics(
+            self, history_engine):
+        timestamp = 1784207110.0
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        snapshot = {
+            'version': 1,
+            'replica_unit': 'physical_backend',
+            'demand_target': 0,
+            'capacity_target': 0,
+            'ready_capacity': 0,
+            'provisioning_capacity': 0,
+            'total_capacity': 0,
+        }
+        capacity_semantics_version = (
+            serve_history.ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION)
+        serve_history.record_autoscaler_snapshot(
+            'svc',
+            'hash-a',
+            'a' * 32,
+            accelerator_breakdown={'configured_accelerators': ['A100']},
+            timestamp=timestamp,
+            **snapshot)
+        serve_history.record_autoscaler_snapshot(
+            'svc',
+            'hash-a',
+            'a' * 32,
+            accelerator_breakdown={
+                'capacity_semantics_version': capacity_semantics_version,
+                'configured_accelerators': ['A100'],
+            },
+            timestamp=timestamp + 60,
+            **snapshot)
+
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 61)
+        samples_by_timestamp = {
+            sample['timestamp']: sample
+            for sample in history['autoscaler_samples']
+        }
+        legacy = samples_by_timestamp[float(int(timestamp) // 60 *
+                                            60)]['accelerator_breakdown']
+        current = samples_by_timestamp[float(int(timestamp) // 60 * 60 +
+                                             60)]['accelerator_breakdown']
+
+        assert legacy['version'] == constants.LB_REQUEST_ACCELERATORS_VERSION
+        assert 'capacity_semantics_version' not in legacy
+        assert current['version'] == constants.LB_REQUEST_ACCELERATORS_VERSION
+        assert current['capacity_semantics_version'] == 2
 
     def test_mixed_reporter_rejection_history_is_not_false_zero(
             self, history_engine):

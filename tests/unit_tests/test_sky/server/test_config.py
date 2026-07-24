@@ -7,6 +7,7 @@ import pytest
 
 from sky.jobs import utils as job_utils
 from sky.server import config
+from sky.skylet import constants as skylet_constants
 from sky.utils import controller_utils
 
 
@@ -14,6 +15,15 @@ from sky.utils import controller_utils
 def _clear_long_worker_cpu_multiplier_env(monkeypatch):
     """Isolate worker sizing from process-global deployment state."""
     monkeypatch.delenv(config.LONG_WORKER_CPU_MULTIPLIER_ENV_VAR, raising=False)
+    monkeypatch.delenv(config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM,
+                       raising=False)
+    monkeypatch.delenv(skylet_constants.SERVE_OVERRIDE_CONCURRENT_LAUNCHES,
+                       raising=False)
+    monkeypatch.delenv(skylet_constants.OVERRIDE_CONSOLIDATION_MODE,
+                       raising=False)
+    monkeypatch.delenv(
+        controller_utils.serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+        raising=False)
     monkeypatch.setattr(job_utils, 'is_consolidation_mode', lambda: False)
     monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
                         lambda _pool: False)
@@ -22,6 +32,122 @@ def _clear_long_worker_cpu_multiplier_env(monkeypatch):
     yield
     controller_utils._get_parallelism.cache_clear()
     controller_utils._get_request_parallelism.cache_clear()
+
+
+def _publish_and_get_serve_parallelism(
+        monkeypatch, server_config: config.ServerConfig) -> int:
+    # Startup overwrites any inherited value with the config it actually uses
+    # before the clean controller environment is captured.
+    monkeypatch.setenv(config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM,
+                       'stale')
+    config.publish_serve_launch_parallelism(server_config)
+    assert os.environ[
+        config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM] == str(
+            server_config.long_worker_config.garanteed_parallelism)
+    monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
+                        lambda pool: not pool)
+    monkeypatch.setattr(controller_utils, '_get_number_of_services',
+                        lambda _pool: 20)
+    controller_utils._get_request_parallelism.cache_clear()
+    return controller_utils._get_request_parallelism(pool=False)
+
+
+@mock.patch('sky.utils.common_utils.get_mem_size_gb', return_value=100)
+@mock.patch('sky.utils.common_utils.get_cpu_count', return_value=3)
+def test_consolidated_serve_parallelism_uses_cpu_bound_worker_config(
+        cpu_count, mem_size_gb, monkeypatch):
+    server_config = config.compute_server_config(deploy=True)
+
+    assert server_config.long_worker_config.garanteed_parallelism == 6
+    assert _publish_and_get_serve_parallelism(monkeypatch, server_config) == 6
+
+
+@mock.patch('sky.utils.common_utils.get_mem_size_gb', return_value=5)
+@mock.patch('sky.utils.common_utils.get_cpu_count', return_value=100)
+def test_consolidated_serve_parallelism_uses_memory_bound_worker_config(
+        cpu_count, mem_size_gb, monkeypatch):
+    server_config = config.compute_server_config(deploy=True)
+
+    assert server_config.long_worker_config.garanteed_parallelism == 4
+    assert _publish_and_get_serve_parallelism(monkeypatch, server_config) == 4
+
+
+@mock.patch('sky.utils.common_utils.get_mem_size_gb', return_value=16)
+@mock.patch('sky.utils.common_utils.get_cpu_count', return_value=100)
+def test_consolidated_serve_parallelism_uses_reserved_memory_worker_config(
+        cpu_count, mem_size_gb, monkeypatch):
+    server_config = config.compute_server_config(deploy=True,
+                                                 reserved_memory_mb=7.5 * 1024)
+
+    assert server_config.long_worker_config.garanteed_parallelism == 9
+    assert _publish_and_get_serve_parallelism(monkeypatch, server_config) == 9
+
+
+def test_worker_cap_only_applies_to_consolidated_non_pool_serve(monkeypatch):
+    monkeypatch.setenv(config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM, '2')
+    monkeypatch.setattr(controller_utils, '_get_number_of_services',
+                        lambda _pool: 10)
+
+    monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
+                        lambda _pool: False)
+    assert controller_utils._get_request_parallelism(pool=False) == 40
+
+    controller_utils._get_request_parallelism.cache_clear()
+    monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
+                        lambda _pool: True)
+    assert controller_utils._get_request_parallelism(pool=False) == 2
+
+    controller_utils._get_request_parallelism.cache_clear()
+    assert controller_utils._get_request_parallelism(pool=True) == 80
+
+
+@pytest.mark.parametrize('runtime_signal', ['controller', 'external_lb'])
+def test_worker_cap_honors_runtime_consolidation_signal(monkeypatch,
+                                                        runtime_signal):
+    monkeypatch.setenv(config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM, '2')
+    monkeypatch.setattr(controller_utils, '_get_number_of_services',
+                        lambda _pool: 10)
+    monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
+                        lambda _pool: False)
+    if runtime_signal == 'controller':
+        monkeypatch.setenv(skylet_constants.OVERRIDE_CONSOLIDATION_MODE, 'true')
+    else:
+        monkeypatch.setenv(
+            controller_utils.serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+            'true')
+
+    assert controller_utils._get_request_parallelism(pool=False) == 2
+
+
+def test_explicit_serve_parallelism_override_remains_authoritative(monkeypatch):
+    monkeypatch.setenv(config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM, '2')
+    monkeypatch.setenv(skylet_constants.SERVE_OVERRIDE_CONCURRENT_LAUNCHES,
+                       '17')
+    monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
+                        lambda _pool: True)
+    monkeypatch.setattr(controller_utils, '_get_number_of_services',
+                        lambda _pool: 10)
+
+    assert controller_utils._get_request_parallelism(pool=False) == 17
+
+
+@pytest.mark.parametrize('published_value', [None, '', '0', '-1', 'invalid'])
+def test_missing_or_invalid_worker_cap_preserves_derived_bound(
+        monkeypatch, published_value):
+    if published_value is not None:
+        monkeypatch.setenv(config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM,
+                           published_value)
+    monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
+                        lambda _pool: True)
+    monkeypatch.setattr(controller_utils, '_get_number_of_services',
+                        lambda _pool: 10)
+
+    with mock.patch.object(controller_utils.logger, 'warning') as warning:
+        assert controller_utils._get_request_parallelism(pool=False) == 40
+
+    warning.assert_called_once()
+    assert config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM in (
+        warning.call_args.args[0])
 
 
 @mock.patch('sky.utils.common_utils.get_mem_size_gb', return_value=8)

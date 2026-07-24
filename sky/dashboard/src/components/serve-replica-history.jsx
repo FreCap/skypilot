@@ -24,7 +24,7 @@ const SERIES = [
   },
   {
     key: 'provisioningCount',
-    label: 'Provisioning',
+    label: 'Committed / starting',
     borderColor: 'rgb(2, 132, 199)',
     backgroundColor: 'rgba(14, 165, 233, 0.38)',
   },
@@ -237,7 +237,7 @@ function versionFooter(versionRows, mode) {
       counts.readyReservedCount === null
         ? ''
         : ` (${counts.readyReservedCount} free reserved)`;
-    return `v${row.version}: ${counts.readyCount} ready${reserved}, ${counts.provisioningCount} provisioning, ${counts.erroredCount} errored, ${counts.stoppingCount} stopping`;
+    return `v${row.version}: ${counts.readyCount} ready${reserved}, ${counts.provisioningCount} committed / starting, ${counts.erroredCount} errored, ${counts.stoppingCount} stopping`;
   });
 }
 
@@ -324,9 +324,11 @@ export function ReplicaHistoryCard({
     <div className="mb-6">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
         <div>
-          <h3 className="text-lg font-semibold">Replica history</h3>
+          <h3 className="text-lg font-semibold">Tracked capacity history</h3>
           <div className="text-sm text-gray-500">
-            Status by {view.config.singular} in the selected range
+            Tracked capacity status by {view.config.singular} in the selected
+            range. Committed / starting combines queued, provider-launching, and
+            application-starting capacity.
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -389,7 +391,7 @@ export function ReplicaHistoryCard({
               range={range}
               bucketSeconds={history.bucketSeconds || 60}
               onRangeSelect={onRangeSelect}
-              ariaLabel="Machine history chart"
+              ariaLabel="Tracked capacity history chart"
             />
           </div>
         )}

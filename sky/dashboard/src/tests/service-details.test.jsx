@@ -77,6 +77,8 @@ describe('AcceleratorCapacityCard', () => {
     expect(
       screen.getByText('Aggregate free reserved slots: 2')
     ).toBeInTheDocument();
+    expect(screen.getByText('Committed / unready')).toBeInTheDocument();
+    expect(screen.queryByText('Provisioning')).not.toBeInTheDocument();
   });
 });
 
@@ -103,17 +105,6 @@ function detailSummaryArgs(serviceName) {
 
 function detailFullArgs(serviceName) {
   return [{ serviceNames: [serviceName] }];
-}
-
-function detailHistoryArgs(serviceName) {
-  return [
-    {
-      serviceNames: [serviceName],
-      summaryOnly: true,
-      includeTargetReplicas: false,
-      historyHours: 24,
-    },
-  ];
 }
 
 describe('useServiceDetails stale-response fencing', () => {
@@ -163,11 +154,10 @@ describe('useServiceDetails stale-response fencing', () => {
 
     expect(secondRefresh).toBe(firstRefresh);
     expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
-    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(3);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
     expect(dashboardCache.invalidate.mock.calls).toEqual([
       [getServices, detailSummaryArgs('svc')],
       [getServices, detailFullArgs('svc')],
-      [getServices, detailHistoryArgs('svc')],
     ]);
     expect(dashboardCache.get).toHaveBeenCalledTimes(4);
 
@@ -229,7 +219,7 @@ describe('useServiceDetails stale-response fencing', () => {
 
     expect(duplicateRefresh).toBe(failedRefresh);
     expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
-    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(3);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       failedSummary.reject(new Error('summary unavailable'));
@@ -254,7 +244,7 @@ describe('useServiceDetails stale-response fencing', () => {
 
     expect(recoveredRefresh).not.toBe(failedRefresh);
     expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
-    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(6);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(4);
     expect(dashboardCache.get).toHaveBeenCalledTimes(6);
 
     await act(async () => {
@@ -263,78 +253,48 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.serviceData.status).toBe('recovered-full');
   });
 
-  it('ignores an earlier refresh cycle that resolves after a manual refresh', async () => {
+  it('coalesces a manual refresh with an in-flight initial load', async () => {
     const initialSummary = deferred();
     const initialFull = deferred();
-    const refreshedSummary = deferred();
-    const refreshedFull = deferred();
 
     dashboardCache.get
       .mockImplementationOnce(() => initialSummary.promise)
-      .mockImplementationOnce(() => initialFull.promise)
-      .mockImplementationOnce(() => refreshedSummary.promise)
-      .mockImplementationOnce(() => refreshedFull.promise);
+      .mockImplementationOnce(() => initialFull.promise);
 
     const { result } = renderHook(() =>
       useServiceDetails({ serviceName: 'svc' })
     );
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
-    expect(dashboardCache.get.mock.calls[0][1][0]).toMatchObject({
-      historyHours: 24,
-    });
-
     let refreshPromise;
-    await act(async () => {
+    act(() => {
       refreshPromise = result.current.refreshData();
     });
 
-    await waitFor(() =>
-      expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
-        1,
-        getServices,
-        detailSummaryArgs('svc')
-      )
-    );
-    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
-      2,
-      getServices,
-      detailFullArgs('svc')
-    );
-    expect(dashboardCache.invalidate).toHaveBeenNthCalledWith(
-      3,
-      getServices,
-      detailHistoryArgs('svc')
-    );
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
     expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
-      refreshedSummary.resolve({
-        services: [{ name: 'svc', status: 'fresh-summary', summaryOnly: true }],
+      initialSummary.resolve({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
       });
       await Promise.resolve();
     });
-    expect(result.current.serviceData.status).toBe('fresh-summary');
+    expect(result.current.serviceData.status).toBe('initial-summary');
 
     await act(async () => {
       initialFull.resolve({
-        services: [{ name: 'svc', status: 'stale-full', replicas: ['old'] }],
-      });
-      await Promise.resolve();
-    });
-    expect(result.current.serviceData.status).toBe('fresh-summary');
-
-    await act(async () => {
-      refreshedFull.resolve({
-        services: [{ name: 'svc', status: 'fresh-full', replicas: ['new'] }],
+        services: [{ name: 'svc', status: 'initial-full', replicas: ['r1'] }],
       });
       await refreshPromise;
     });
 
-    expect(result.current.serviceData.status).toBe('fresh-full');
-    expect(result.current.serviceData.replicas).toEqual(['new']);
-    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+    expect(result.current.serviceData.status).toBe('initial-full');
+    expect(result.current.serviceData.replicas).toEqual(['r1']);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
   it('drops stale results from a previous service after the route target changes', async () => {
@@ -388,19 +348,23 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.serviceData.status).toBe('svc-b-full');
   });
 
-  it('does not overlap history refreshes at the fixed polling cadence', async () => {
+  it('refreshes summary and replicas without overlapping at the polling cadence', async () => {
     jest.useFakeTimers();
-    const historyRefresh = deferred();
+    const refreshedSummary = deferred();
+    const refreshedFull = deferred();
     dashboardCache.get
       .mockResolvedValueOnce({
-        services: [{ name: 'svc', status: 'READY' }],
+        services: [{ name: 'svc', status: 'initial-summary' }],
       })
       .mockResolvedValueOnce({
-        services: [{ name: 'svc', status: 'READY', replicas: [] }],
+        services: [
+          { name: 'svc', status: 'initial-full', replicas: ['old-replica'] },
+        ],
       })
-      .mockImplementation(() => historyRefresh.promise);
+      .mockImplementationOnce(() => refreshedSummary.promise)
+      .mockImplementationOnce(() => refreshedFull.promise);
 
-    const { unmount } = renderHook(() =>
+    const { result, unmount } = renderHook(() =>
       useServiceDetails({ serviceName: 'svc' })
     );
     let mounted = true;
@@ -415,37 +379,62 @@ describe('useServiceDetails stale-response fencing', () => {
         jest.advanceTimersByTime(60 * 1000);
         await Promise.resolve();
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+      expect(dashboardCache.invalidate.mock.calls).toEqual([
+        [getServices, detailSummaryArgs('svc')],
+        [getServices, detailFullArgs('svc')],
+      ]);
 
       await act(async () => {
         jest.advanceTimersByTime(2 * 60 * 1000 + 30 * 1000);
         await Promise.resolve();
       });
 
-      // A slow history query must not accumulate one new request per timer
-      // boundary. Apart from the initial summary and full fetches, only one
-      // automatic history request may be pending.
-      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+      // A slow full refresh must not accumulate a new summary/full pair at
+      // every timer boundary.
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
 
       await act(async () => {
-        historyRefresh.resolve({
+        refreshedSummary.resolve({
           services: [
-            { name: 'svc', replicaHistory: { currentReadyReplicas: 1 } },
+            {
+              name: 'svc',
+              status: 'fresh-summary',
+              summaryOnly: true,
+              replicaHistory: { currentReadyReplicas: 1 },
+            },
           ],
         });
         await Promise.resolve();
       });
+      expect(result.current.serviceData.status).toBe('fresh-summary');
+      expect(result.current.serviceData.replicas).toEqual(['old-replica']);
 
       await act(async () => {
-        jest.advanceTimersByTime(30 * 1000 - 1);
-      });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
-
-      await act(async () => {
-        jest.advanceTimersByTime(1);
+        refreshedFull.resolve({
+          services: [
+            { name: 'svc', status: 'fresh-full', replicas: ['new-replica'] },
+          ],
+        });
         await Promise.resolve();
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+      expect(result.current.serviceData.status).toBe('fresh-full');
+      expect(result.current.serviceData.replicas).toEqual(['new-replica']);
+
+      dashboardCache.get
+        .mockResolvedValueOnce({
+          services: [{ name: 'svc', status: 'next-summary' }],
+        })
+        .mockResolvedValueOnce({
+          services: [{ name: 'svc', status: 'next-full', replicas: [] }],
+        });
+      await act(async () => {
+        jest.advanceTimersByTime(30 * 1000);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(6);
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(4);
 
       unmount();
       mounted = false;
@@ -453,7 +442,7 @@ describe('useServiceDetails stale-response fencing', () => {
         jest.advanceTimersByTime(2 * 60 * 1000);
         await Promise.resolve();
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(6);
     } finally {
       if (mounted) {
         unmount();
@@ -462,7 +451,7 @@ describe('useServiceDetails stale-response fencing', () => {
     }
   });
 
-  it('does not start a history poll while manual refresh already owns service history', async () => {
+  it('does not start a periodic refresh while a manual refresh is in flight', async () => {
     jest.useFakeTimers();
     const refreshedSummary = deferred();
     const refreshedFull = deferred();
@@ -496,7 +485,7 @@ describe('useServiceDetails stale-response fencing', () => {
       });
 
       expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
-      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(3);
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
       expect(dashboardCache.get).toHaveBeenCalledTimes(4);
 
       await act(async () => {
@@ -504,9 +493,10 @@ describe('useServiceDetails stale-response fencing', () => {
         await Promise.resolve();
       });
 
-      // The manual refresh already owns the service summary request that
-      // carries replica history, so the timer must not start a duplicate poll.
+      // The manual refresh owns both selected-service reads, so the timer must
+      // not start a duplicate summary/full pair.
       expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
 
       await act(async () => {
         refreshedSummary.resolve({
@@ -524,21 +514,26 @@ describe('useServiceDetails stale-response fencing', () => {
         await refreshPromise;
       });
 
-      dashboardCache.get.mockResolvedValueOnce({
-        services: [
-          {
-            name: 'svc',
-            replicaHistory: { currentReadyReplicas: 3 },
-          },
-        ],
-      });
+      dashboardCache.get
+        .mockResolvedValueOnce({
+          services: [
+            {
+              name: 'svc',
+              replicaHistory: { currentReadyReplicas: 3 },
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          services: [{ name: 'svc', status: 'READY', replicas: ['r2'] }],
+        });
 
       await act(async () => {
         jest.advanceTimersByTime(60 * 1000);
         await Promise.resolve();
       });
 
-      expect(dashboardCache.get).toHaveBeenCalledTimes(5);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(6);
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(4);
 
       unmount();
       mounted = false;
@@ -621,7 +616,7 @@ describe('useServiceDetails stale-response fencing', () => {
 
     expect(newRefreshPromise).not.toBe(oldRefreshPromise);
     expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
-    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(6);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(4);
 
     await act(async () => {
       newSummary.resolve({
@@ -692,7 +687,6 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(dashboardCache.invalidate.mock.calls).toEqual([
       [getServices, detailSummaryArgs('svc')],
       [getServices, detailFullArgs('svc')],
-      [getServices, detailHistoryArgs('svc')],
     ]);
     expect(dashboardCache.get).toHaveBeenCalledTimes(4);
     expect(result.current.serviceData.status).toBe('refreshed-full');
@@ -932,7 +926,18 @@ describe('service replica placement breakdown', () => {
     {
       cloud: 'Kubernetes',
       region: 'research-context',
+      status: 'PROVISIONING',
+      launched_at: 100,
+    },
+    {
+      cloud: 'Kubernetes',
+      region: 'research-context',
       status: 'STARTING',
+    },
+    {
+      cloud: 'Kubernetes',
+      region: 'research-context',
+      status: 'FAILED_CLEANUP',
     },
     {
       cloud: 'Kubernetes',
@@ -952,62 +957,71 @@ describe('service replica placement breakdown', () => {
       {
         cloud: 'AWS',
         region: 'us-east-1',
-        pending: 1,
-        provisioning: 0,
-        initializing: 0,
+        queuedIntent: 1,
+        providerSetup: 0,
+        initializingNotReady: 0,
         ready: 1,
-        notReady: 0,
         stopping: 0,
-        error: 0,
+        cleanupUncertain: 0,
+        historicalFailure: 0,
         other: 0,
-        total: 2,
+        currentOrUncertain: 2,
+        trackedAttempts: 2,
       },
       {
         cloud: 'GCP',
         region: 'us-central1',
-        pending: 0,
-        provisioning: 0,
-        initializing: 0,
+        queuedIntent: 0,
+        providerSetup: 0,
+        initializingNotReady: 1,
         ready: 0,
-        notReady: 1,
         stopping: 1,
-        error: 1,
+        cleanupUncertain: 0,
+        historicalFailure: 1,
         other: 0,
-        total: 3,
+        currentOrUncertain: 2,
+        trackedAttempts: 3,
       },
       {
         cloud: 'Kubernetes',
         region: 'research-context',
-        pending: 0,
-        provisioning: 1,
-        initializing: 1,
+        queuedIntent: 1,
+        providerSetup: 1,
+        initializingNotReady: 1,
         ready: 1,
-        notReady: 0,
         stopping: 0,
-        error: 1,
+        cleanupUncertain: 1,
+        historicalFailure: 1,
         other: 0,
-        total: 4,
+        currentOrUncertain: 5,
+        trackedAttempts: 6,
       },
       {
         cloud: 'Unknown',
         region: 'Pending placement',
-        pending: 0,
-        provisioning: 0,
-        initializing: 0,
+        queuedIntent: 0,
+        providerSetup: 0,
+        initializingNotReady: 0,
         ready: 0,
-        notReady: 0,
         stopping: 0,
-        error: 0,
+        cleanupUncertain: 0,
+        historicalFailure: 0,
         other: 1,
-        total: 1,
+        currentOrUncertain: 1,
+        trackedAttempts: 1,
       },
     ]);
   });
 
-  it('renders one row per provider and region after machines load', () => {
+  it('renders tracked attempts without presenting the total as machines', () => {
     render(<ReplicaPlacementCard replicas={replicas} loading={false} />);
 
-    expect(screen.getByText('Machines by region')).toBeTruthy();
+    expect(screen.getByText('Replica attempts by placement')).toBeTruthy();
+    expect(
+      screen.getByText(/Queued intent and retained failure history/)
+    ).toBeTruthy();
+    expect(screen.getByText('Current / uncertain')).toBeTruthy();
+    expect(screen.getByText('Tracked attempts')).toBeTruthy();
     const researchRow = screen.getByText('research-context').closest('tr');
     expect(
       within(researchRow)
@@ -1016,15 +1030,16 @@ describe('service replica placement breakdown', () => {
     ).toEqual([
       'Kubernetes',
       'research-context',
-      '0',
       '1',
       '1',
       '1',
-      '0',
-      '0',
       '1',
       '0',
-      '4',
+      '1',
+      '1',
+      '0',
+      '5',
+      '6',
     ]);
     expect(screen.getByText('Pending placement')).toBeTruthy();
   });

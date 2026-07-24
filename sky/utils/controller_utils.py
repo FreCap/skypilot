@@ -912,8 +912,31 @@ def _get_request_parallelism(pool: bool) -> int:
     # Limitation per service x number of services
     launches_per_worker = (LAUNCHES_PER_WORKER
                            if pool else LAUNCHES_PER_SERVICE)
-    return (launches_per_worker * POOL_JOBS_RESOURCES_RATIO *
-            _get_number_of_services(pool))
+    derived_parallelism = (launches_per_worker * POOL_JOBS_RESOURCES_RATIO *
+                           _get_number_of_services(pool))
+    serve_consolidated = (
+        os.environ.get(constants.OVERRIDE_CONSOLIDATION_MODE) is not None or
+        os.environ.get(serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+                       '').lower() == 'true' or _is_consolidation_mode(pool))
+    if pool or not serve_consolidated:
+        return derived_parallelism
+
+    published_parallelism = os.environ.get(
+        server_config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM)
+    try:
+        if published_parallelism is None:
+            raise ValueError
+        guaranteed_parallelism = int(published_parallelism)
+        if guaranteed_parallelism <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning(
+            'Missing or invalid '
+            f'{server_config.SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM} '
+            f'value {published_parallelism!r}; preserving the derived Serve '
+            f'launch bound of {derived_parallelism}.')
+        return derived_parallelism
+    return min(derived_parallelism, guaranteed_parallelism)
 
 
 def in_flight_launch_count() -> float:

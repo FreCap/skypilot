@@ -68,6 +68,15 @@ describe('buildReplicaHistoryView', () => {
     });
     expect(view.stats.current.readyCount).toBe(4);
     expect(view.stats.current.readyReservedCount).toBe(1);
+    expect(
+      view.datasets.find(({ key }) => key === 'provisioningCount')
+    ).toMatchObject({
+      label: 'Committed / starting',
+      data: [1, null, 0],
+    });
+    expect(
+      view.datasets.find(({ key }) => key === 'notReadyCount').data
+    ).toEqual([0, null, 1]);
   });
 
   it('defaults to logical slots and gaps an incomplete legacy minute', () => {

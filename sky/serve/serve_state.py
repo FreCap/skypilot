@@ -2953,12 +2953,16 @@ def _delete_paid_capacity_claims_in_session(
 def _ensure_paid_capacity_pool_in_session(session: orm.Session,
                                           engine: sqlalchemy.engine.Engine,
                                           pool_key: str, base_limit: int,
-                                          now: float) -> None:
+                                          now: float | None) -> None:
+    updated_at = now
+    if updated_at is None:
+        updated_at = sqlalchemy.extract('epoch',
+                                        sqlalchemy.func.clock_timestamp())
     insert_stmt = _upsert_insert_func(engine)(paid_capacity_pools_table).values(
         pool_key=pool_key,
         current_limit=base_limit,
         successes_since_resize=0,
-        updated_at=now)
+        updated_at=updated_at)
     session.execute(
         insert_stmt.on_conflict_do_nothing(index_elements=['pool_key']))
 
@@ -2974,13 +2978,27 @@ def _paid_capacity_pool_row_for_update(session: orm.Session,
     return row
 
 
+def _paid_capacity_clock_timestamp(session: orm.Session,
+                                   test_now: float | None) -> float:
+    """Sample PostgreSQL wall time after the caller holds the pool lock."""
+    if test_now is not None:
+        # Deterministic PostgreSQL policy tests inject a synthetic DB clock.
+        return float(test_now)
+    value = session.execute(
+        sqlalchemy.select(
+            sqlalchemy.extract(
+                'epoch', sqlalchemy.func.clock_timestamp()))).scalar_one()
+    return float(value)
+
+
 def get_paid_capacity_pool_states(
     pool_keys: list[str],
     *,
     base_limit: int,
     max_limit: int,
-    now: float,
+    now: float | None,
     success_ttl_seconds: float,
+    failure_cooldown_seconds: float = 10 * 60,
 ) -> dict[str, dict[str, Any]]:
     """Read advisory shared headroom for exact paid provider pools."""
     pool_keys = list(dict.fromkeys(pool_keys))
@@ -2988,6 +3006,7 @@ def get_paid_capacity_pool_states(
         return {}
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        now = _paid_capacity_clock_timestamp(session, now)
         pool_rows = {
             row.pool_key: row for row in session.execute(
                 sqlalchemy.select(paid_capacity_pools_table).where(
@@ -3023,23 +3042,43 @@ def get_paid_capacity_pool_states(
         row = pool_rows.get(pool_key)
         current_limit = base_limit if row is None else row.current_limit
         last_success_at = None if row is None else row.last_success_at
-        effective_limit, expired = paid_capacity.effective_limit(
+        last_failure_at = None if row is None else row.last_failure_at
+        learned_limit, expired = paid_capacity.effective_limit(
             current_limit,
             last_success_at,
             bootstrap_limit=base_limit,
             ceiling_limit=max_limit,
             now=now,
             ttl_seconds=success_ttl_seconds)
+        admission = paid_capacity.effective_admission_limit(
+            current_limit,
+            last_success_at,
+            last_failure_at,
+            bootstrap_limit=base_limit,
+            ceiling_limit=max_limit,
+            now=now,
+            success_ttl=success_ttl_seconds,
+            failure_cooldown=failure_cooldown_seconds)
         active_claims = valid_counts[pool_key]
         result[pool_key] = {
-            'current_limit': effective_limit,
+            'current_limit':
+                (current_limit if last_failure_at is not None else learned_limit
+                ),
+            'learned_limit':
+                (base_limit if last_failure_at is not None else learned_limit),
+            'admission_limit': admission.limit,
+            'admission_state': admission.state,
+            'cooldown_until': admission.cooldown_until,
             'active_claims': active_claims,
-            'remaining': max(0, effective_limit - active_claims),
-            'successes_since_resize': (
-                0 if row is None or expired else int(row.successes_since_resize)
+            'legacy_overage': max(0, active_claims - admission.limit),
+            'remaining': max(0, admission.limit - active_claims),
+            'successes_since_resize':
+                (0 if row is None or expired or last_failure_at is not None else
+                 int(row.successes_since_resize)),
+            'last_success_at': (
+                None if expired and last_failure_at is None else last_success_at
             ),
-            'last_success_at': last_success_at,
-            'last_failure_at': None if row is None else row.last_failure_at,
+            'last_failure_at': last_failure_at,
         }
     return result
 
@@ -3054,8 +3093,9 @@ def try_add_replica_with_paid_capacity_claim(
     priority: int,
     base_limit: int,
     max_limit: int,
-    now: float,
+    now: float | None,
     success_ttl_seconds: float,
+    failure_cooldown_seconds: float = 10 * 60,
     waiter_ttl_seconds: float,
     expected_controller_owner: tuple[int | None, str | None] | None,
 ) -> str:
@@ -3072,23 +3112,36 @@ def try_add_replica_with_paid_capacity_claim(
         _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
                                               base_limit, now)
         pool = _paid_capacity_pool_row_for_update(session, pool_key)
-        effective_limit, expired = paid_capacity.effective_limit(
-            pool.current_limit,
-            pool.last_success_at,
-            bootstrap_limit=base_limit,
-            ceiling_limit=max_limit,
-            now=now,
-            ttl_seconds=success_ttl_seconds)
-        if expired or effective_limit != pool.current_limit:
-            session.execute(
-                sqlalchemy.update(paid_capacity_pools_table).where(
-                    paid_capacity_pools_table.c.pool_key == pool_key).values(
-                        current_limit=effective_limit,
-                        successes_since_resize=(0 if expired else
-                                                pool.successes_since_resize),
-                        last_success_at=(None
-                                         if expired else pool.last_success_at),
-                        updated_at=now))
+        now = _paid_capacity_clock_timestamp(session, now)
+        if pool.last_failure_at is None:
+            effective_limit, reset = paid_capacity.effective_limit(
+                pool.current_limit,
+                pool.last_success_at,
+                bootstrap_limit=base_limit,
+                ceiling_limit=max_limit,
+                now=now,
+                ttl_seconds=success_ttl_seconds)
+            if reset or effective_limit != pool.current_limit:
+                session.execute(
+                    sqlalchemy.update(paid_capacity_pools_table).where(
+                        paid_capacity_pools_table.c.pool_key == pool_key).
+                    values(current_limit=effective_limit,
+                           successes_since_resize=(0 if reset else
+                                                   pool.successes_since_resize),
+                           last_success_at=(None
+                                            if reset else pool.last_success_at),
+                           updated_at=now))
+        else:
+            admission = paid_capacity.effective_admission_limit(
+                pool.current_limit,
+                pool.last_success_at,
+                pool.last_failure_at,
+                bootstrap_limit=base_limit,
+                ceiling_limit=max_limit,
+                now=now,
+                success_ttl=success_ttl_seconds,
+                failure_cooldown=failure_cooldown_seconds)
+            effective_limit = admission.limit
 
         valid_claims, stale_claims = _valid_paid_capacity_claims_in_session(
             session, pool_key)
@@ -3145,6 +3198,17 @@ def try_add_replica_with_paid_capacity_claim(
                     best_waiter.service_hash) != (service_name, service_hash):
                 session.commit()
                 return 'higher_priority_waiting'
+            if pool.last_failure_at is not None:
+                # The row-lock-serialized first post-cooldown claim marks the
+                # sole probe. A revision-027 controller may conservatively
+                # clobber this marker, but can never clear last_failure_at.
+                session.execute(
+                    sqlalchemy.update(paid_capacity_pools_table).where(
+                        paid_capacity_pools_table.c.pool_key ==
+                        pool_key).values(current_limit=1,
+                                         successes_since_resize=0,
+                                         last_success_at=None,
+                                         updated_at=now))
 
         replica_info.paid_capacity_pool_key = pool_key
         replica_insert = _upsert_insert_func(engine)(replicas_table).values(
@@ -3187,7 +3251,7 @@ def adopt_paid_capacity_claims(
     claims: list[tuple[int, str, int, 'replica_managers.ReplicaInfo']],
     *,
     base_limit: int,
-    now: float,
+    now: float | None,
     expected_controller_owner: tuple[int | None, str | None] | None,
 ) -> bool:
     """Attach pre-migration unresolved rows to shared pool claims."""
@@ -3230,7 +3294,7 @@ def adopt_paid_capacity_claims(
                                                    replica_id=replica_id,
                                                    pool_key=pool_key,
                                                    priority=priority,
-                                                   claimed_at=now)
+                                                   claimed_at=0)
             session.execute(
                 claim_insert.on_conflict_do_update(index_elements=[
                     'service_name', 'service_hash', 'replica_id'
@@ -3251,8 +3315,9 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
     *,
     base_limit: int,
     max_limit: int,
-    now: float,
+    now: float | None,
     success_ttl_seconds: float,
+    failure_cooldown_seconds: float = 10 * 60,
     expected_controller_owner: tuple[int | None, str | None] | None,
 ) -> bool:
     """Persist a completed launch wave and release claims atomically."""
@@ -3289,6 +3354,7 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
             identities.append((service_name, service_hash, replica_id))
         for pool_key in sorted(outcomes_by_pool):
             _paid_capacity_pool_row_for_update(session, pool_key)
+        now = _paid_capacity_clock_timestamp(session, now)
         _delete_paid_capacity_claims_in_session(session, identities)
         for pool_key, pool_outcomes in outcomes_by_pool.items():
             pool = session.execute(
@@ -3310,11 +3376,36 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
                                          last_failure_at=now,
                                          updated_at=now))
                 continue
+            if pool.last_failure_at is not None:
+                probe_succeeded = (pool.current_limit == 1 and any(
+                    outcome == paid_capacity.LaunchOutcome.SUCCESS and
+                    claimed_at >= (pool.last_failure_at +
+                                   failure_cooldown_seconds)
+                    for outcome, claimed_at in pool_outcomes))
+                if not probe_succeeded:
+                    continue
+                ramp_update = paid_capacity.record_outcomes(
+                    base_limit,
+                    0,
+                    None, [paid_capacity.LaunchOutcome.SUCCESS],
+                    bootstrap_limit=base_limit,
+                    ceiling_limit=max_limit,
+                    now=now,
+                    ttl_seconds=success_ttl_seconds)
+                session.execute(
+                    sqlalchemy.update(paid_capacity_pools_table).where(
+                        paid_capacity_pools_table.c.pool_key ==
+                        pool_key).values(
+                            current_limit=ramp_update.current_limit,
+                            successes_since_resize=(
+                                ramp_update.successes_since_resize),
+                            last_success_at=now,
+                            last_failure_at=None,
+                            updated_at=now))
+                continue
             evidence = [
-                outcome for outcome, claimed_at in pool_outcomes
-                if (outcome == paid_capacity.LaunchOutcome.SUCCESS and
-                    (pool.last_failure_at is None or
-                     claimed_at >= pool.last_failure_at))
+                outcome for outcome, _ in pool_outcomes
+                if outcome == paid_capacity.LaunchOutcome.SUCCESS
             ]
             if not evidence:
                 continue

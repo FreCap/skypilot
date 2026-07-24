@@ -7411,13 +7411,13 @@ class TestPaidLocationLaunchBudget:
     def test_env_override_and_invalid_fallback(self, monkeypatch):
         paid_capacity._parse_positive_int.cache_clear()
         monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
-        assert paid_capacity.base_limit() == 60
+        assert paid_capacity.base_limit() == 4
 
         monkeypatch.setenv(paid_capacity._BASE_LIMIT_ENV_VAR, '7')
         assert paid_capacity.base_limit() == 7
 
         monkeypatch.setenv(paid_capacity._BASE_LIMIT_ENV_VAR, '0')
-        assert paid_capacity.base_limit() == 60
+        assert paid_capacity.base_limit() == 4
         paid_capacity._parse_positive_int.cache_clear()
 
     def test_only_pending_and_provisioning_rows_consume_window(self):
@@ -7482,7 +7482,7 @@ class TestPaidLocationLaunchBudget:
         assert all(replica_id in manager._launch_thread_pool
                    for replica_id in (1, 2, 3, 4))
 
-    def test_default_window_spills_after_sixty_unresolved_launches(
+    def test_default_window_spills_after_four_unresolved_launches(
             self, monkeypatch):
         monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
         paid_capacity._parse_positive_int.cache_clear()
@@ -7497,8 +7497,8 @@ class TestPaidLocationLaunchBudget:
         manager._demand_should_skip_saturated_zero_cost = mock.Mock(
             return_value=False)
         budget = paid_capacity.LaunchBudget(remaining_by_location={
-            cheap: 60,
-            expensive: 60
+            cheap: 4,
+            expensive: 4
         },
                                             pool_key_by_location={
                                                 cheap: 'cheap',
@@ -7522,11 +7522,11 @@ class TestPaidLocationLaunchBudget:
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
              mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
-            manager._scale_up_batch_locked([{'use_spot': True}] * 61)
+            manager._scale_up_batch_locked([{'use_spot': True}] * 5)
 
         assert [
             call.kwargs['location'].region for call in claim.call_args_list
-        ] == ['us-east-1'] * 60 + ['us-west-2']
+        ] == ['us-east-1'] * 4 + ['us-west-2']
 
     def test_exact_card_subsets_keep_independent_paid_windows(self):
         cheap_l4 = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -8598,13 +8598,14 @@ class TestRefreshThreadPoolUnfencedLaunch:
              mock.patch(
                  'sky.serve.replica_managers.serve_state'
                  '.get_replica_infos_from_ids',
-                 return_value={replica_id: info}):
+                 return_value={replica_id: info}), \
+             mock.patch.object(replica_managers.logger, 'warning') as warning:
             manager._refresh_thread_pool()
 
-        return info, placer, terminated, persist_paid_outcomes
+        return info, placer, terminated, persist_paid_outcomes, warning
 
     def test_unfenced_failure_is_unrecoverable_and_not_benched(self):
-        info, placer, terminated, persist_paid_outcomes = self._run(
+        info, placer, terminated, persist_paid_outcomes, _ = self._run(
             replica_managers._UnfencedExternalLbLaunchError('no fence'))
         # Unrecoverable so the autoscaler stops recreating replica rows.
         assert info.status_property.user_app_failed is True
@@ -8619,7 +8620,7 @@ class TestRefreshThreadPoolUnfencedLaunch:
         assert terminated == [7]
 
     def test_generic_failure_still_benches_location_and_stays_recoverable(self):
-        info, placer, terminated, persist_paid_outcomes = self._run(
+        info, placer, terminated, persist_paid_outcomes, _ = self._run(
             RuntimeError('transient'))
         # An ordinary launch failure keeps the historical behavior: the
         # location is benched and the replica remains recoverable.
@@ -8632,7 +8633,7 @@ class TestRefreshThreadPoolUnfencedLaunch:
         assert terminated == [7]
 
     def test_typed_capacity_failure_resets_shared_pool_evidence(self):
-        info, placer, terminated, persist_paid_outcomes = self._run(
+        info, placer, terminated, persist_paid_outcomes, warning = self._run(
             replica_managers._ReplicaLaunchCapacityError('exhausted'))
         assert info.status_property.user_app_failed is False
         placer.set_preemptive.assert_called_once_with(mock.ANY)
@@ -8640,4 +8641,8 @@ class TestRefreshThreadPoolUnfencedLaunch:
         assert persist_paid_outcomes.call_args.kwargs['outcomes'] == {
             7: replica_managers.paid_capacity.LaunchOutcome.CAPACITY_FAILURE
         }
+        warning.assert_called_once()
+        message = warning.call_args.args[0]
+        assert 'failure wave: failures=1, exact_pools=unknown' in message
+        assert 'boom traceback' not in message
         assert terminated == [7]

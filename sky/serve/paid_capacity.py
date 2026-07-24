@@ -5,6 +5,7 @@ which provider location is cheapest and currently usable. This module owns the
 cross-service limit on unresolved, genuine demand launches into one exact paid
 provider pool.
 """
+import collections
 from collections.abc import Iterable
 from collections.abc import Mapping
 import dataclasses
@@ -12,6 +13,7 @@ import enum
 import functools
 import json
 import os
+import threading
 import time
 import typing
 from typing import Any
@@ -27,7 +29,7 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 
-_BASE_LIMIT_DEFAULT = 60
+_BASE_LIMIT_DEFAULT = 4
 _LEGACY_LOCAL_LIMIT_DEFAULT = 4
 _MAX_LIMIT_DEFAULT = 480
 _BASE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW'
@@ -38,8 +40,16 @@ _SUCCESS_TTL_SECONDS_ENV_VAR = (
 _WAITER_TTL_SECONDS_DEFAULT = 45
 _WAITER_TTL_SECONDS_ENV_VAR = (
     'SKYPILOT_SERVE_PAID_LOCATION_WAITER_TTL_SECONDS')
+_FAILURE_COOLDOWN_SECONDS_DEFAULT = 10 * 60
+_FAILURE_COOLDOWN_SECONDS_ENV_VAR = (
+    'SKYPILOT_SERVE_PAID_LOCATION_FAILURE_COOLDOWN_SECONDS')
+_ADMISSION_SUMMARY_LOG_MIN_INTERVAL_SECONDS = 30
+_ADMISSION_SUMMARY_LOG_INTERVAL_SECONDS = 5 * 60
 _POOL_KEY_VERSION = 1
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
+_admission_summary_log_lock = threading.Lock()
+_admission_summary_log_signature: tuple[Any, ...] | None = None
+_admission_summary_logged_at = 0.0
 
 
 class ClaimResult(enum.Enum):
@@ -80,6 +90,15 @@ class RampUpdate:
     successes_since_resize: int
     expired: bool
     failed: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionLimit:
+    """Effective admission bound for one exact paid-capacity pool."""
+
+    limit: int
+    state: str
+    cooldown_until: float | None
 
 
 @functools.cache
@@ -131,6 +150,26 @@ def waiter_ttl_seconds() -> int:
                                _WAITER_TTL_SECONDS_ENV_VAR)
 
 
+def failure_cooldown_seconds() -> int:
+    """Return how long typed capacity failure closes an exact paid pool."""
+    return _parse_positive_int(
+        os.environ.get(_FAILURE_COOLDOWN_SECONDS_ENV_VAR),
+        _FAILURE_COOLDOWN_SECONDS_DEFAULT, _FAILURE_COOLDOWN_SECONDS_ENV_VAR)
+
+
+def limit_ladder(bootstrap_limit: int, ceiling_limit: int) -> tuple[int, ...]:
+    """Return every valid persisted adaptive-limit rung."""
+    bootstrap_limit = max(1, int(bootstrap_limit))
+    ceiling_limit = max(bootstrap_limit, int(ceiling_limit))
+    values = [bootstrap_limit]
+    while values[-1] < ceiling_limit:
+        next_value = min(ceiling_limit, values[-1] * 2)
+        if next_value == values[-1]:
+            break
+        values.append(next_value)
+    return tuple(values)
+
+
 def effective_limit(
     current_limit: int,
     last_success_at: float | None,
@@ -141,12 +180,49 @@ def effective_limit(
     ttl_seconds: float,
 ) -> tuple[int, bool]:
     """Clamp and expire one persisted adaptive limit."""
-    effective = max(bootstrap_limit, min(ceiling_limit, int(current_limit)))
+    ladder = limit_ladder(bootstrap_limit, ceiling_limit)
+    if int(current_limit) not in ladder:
+        # Revision 027 used a 60/120/240/480 ladder. Conservatively reset old
+        # rungs when the configured bootstrap changes instead of preserving an
+        # unearned cohort. The failure/probe path bypasses this helper while
+        # current_limit=1 is its intentional marker.
+        return bootstrap_limit, True
+    effective = int(current_limit)
     has_positive_evidence = (effective > bootstrap_limit or
                              last_success_at is not None)
     expired = (has_positive_evidence and (last_success_at is None or
                                           now - last_success_at >= ttl_seconds))
     return (bootstrap_limit if expired else effective), expired
+
+
+def effective_admission_limit(
+    current_limit: int,
+    last_success_at: float | None,
+    last_failure_at: float | None,
+    *,
+    bootstrap_limit: int,
+    ceiling_limit: int,
+    now: float,
+    success_ttl: float,
+    failure_cooldown: float,
+) -> AdmissionLimit:
+    """Return normal, cooldown-closed, or one-probe pool admission."""
+    if last_failure_at is not None:
+        cooldown_until = last_failure_at + failure_cooldown
+        if now < cooldown_until:
+            return AdmissionLimit(limit=0,
+                                  state='cooldown',
+                                  cooldown_until=cooldown_until)
+        return AdmissionLimit(limit=1,
+                              state='probe',
+                              cooldown_until=cooldown_until)
+    effective, _ = effective_limit(current_limit,
+                                   last_success_at,
+                                   bootstrap_limit=bootstrap_limit,
+                                   ceiling_limit=ceiling_limit,
+                                   now=now,
+                                   ttl_seconds=success_ttl)
+    return AdmissionLimit(limit=effective, state='active', cooldown_until=None)
 
 
 def record_outcomes(
@@ -256,6 +332,43 @@ def central_authority_available() -> bool:
     return (serve_state.get_database_engine().dialect.name == 'postgresql')
 
 
+def _log_admission_summary(states: dict[str, dict[str, Any]]) -> None:
+    """Log one bounded shared-admission summary on transition or interval."""
+    if not states:
+        return
+    state_counts = collections.Counter(
+        str(state.get('admission_state', 'active'))
+        for state in states.values())
+    overage_pools = sum(
+        int(state.get('legacy_overage', 0)) > 0 for state in states.values())
+    saturated_pools = sum(
+        int(state.get('remaining', 0)) == 0 for state in states.values())
+    signature = (len(states), tuple(sorted(state_counts.items())), overage_pools
+                 > 0)
+    observed_at = time.monotonic()
+    global _admission_summary_log_signature
+    global _admission_summary_logged_at
+    with _admission_summary_log_lock:
+        elapsed = observed_at - _admission_summary_logged_at
+        if (_admission_summary_log_signature is not None and
+                elapsed < _ADMISSION_SUMMARY_LOG_MIN_INTERVAL_SECONDS):
+            return
+        if (signature == _admission_summary_log_signature and
+                elapsed < _ADMISSION_SUMMARY_LOG_INTERVAL_SECONDS):
+            return
+        _admission_summary_log_signature = signature
+        _admission_summary_logged_at = observed_at
+    logger.info(
+        'Global paid-capacity admission: '
+        f'pools={len(states)}, states={dict(sorted(state_counts.items()))}, '
+        f'active_claims={sum(int(state.get("active_claims", 0)) for state in states.values())}, '
+        f'admission_limit={sum(int(state.get("admission_limit", 0)) for state in states.values())}, '
+        f'remaining={sum(int(state.get("remaining", 0)) for state in states.values())}, '
+        f'saturated_pools={saturated_pools}, '
+        f'legacy_overage_claims={sum(int(state.get("legacy_overage", 0)) for state in states.values())}.'
+    )
+
+
 def build_launch_budget(
     placer: spot_placer.SpotPlacer,
     *,
@@ -282,21 +395,18 @@ def build_launch_budget(
                             states_by_pool_key={},
                             globally_managed=False)
 
-    now = time.time()
     states = serve_state.get_paid_capacity_pool_states(
         list(keys.values()),
         base_limit=base_limit(),
         max_limit=max_limit(),
-        now=now,
-        success_ttl_seconds=success_ttl_seconds())
+        now=None,
+        success_ttl_seconds=success_ttl_seconds(),
+        failure_cooldown_seconds=failure_cooldown_seconds())
     remaining = {
         location: int(states[key]['remaining'])
         for location, key in keys.items()
     }
-    logger.debug('Global paid-capacity snapshot: '
-                 f'limits={base_limit()}..{max_limit()}, '
-                 f'pools={len(states)}, remaining='
-                 f'{sorted(state["remaining"] for state in states.values())}.')
+    _log_admission_summary(states)
     return LaunchBudget(remaining_by_location=remaining,
                         pool_key_by_location=keys,
                         states_by_pool_key=states,
@@ -411,8 +521,9 @@ def try_persist_claim(
                      min(constants.LB_REQUEST_PRIORITY_MAX, priority)),
         base_limit=base_limit(),
         max_limit=max_limit(),
-        now=time.time(),
+        now=None,
         success_ttl_seconds=success_ttl_seconds(),
+        failure_cooldown_seconds=failure_cooldown_seconds(),
         waiter_ttl_seconds=waiter_ttl_seconds(),
         expected_controller_owner=controller_owner)
     return ClaimResult(result)
@@ -464,7 +575,7 @@ def adopt_existing_claims(
         service_hash,
         claims,
         base_limit=base_limit(),
-        now=time.time(),
+        now=None,
         expected_controller_owner=controller_owner)
 
 
@@ -486,6 +597,7 @@ def persist_completed_launches(
         outcomes,
         base_limit=base_limit(),
         max_limit=max_limit(),
-        now=time.time(),
+        now=None,
         success_ttl_seconds=success_ttl_seconds(),
+        failure_cooldown_seconds=failure_cooldown_seconds(),
         expected_controller_owner=controller_owner)

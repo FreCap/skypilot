@@ -28,6 +28,7 @@ const history = {
       timestamp: 120,
       replicaUnit: 'logical_slot',
       acceleratorBreakdown: {
+        capacitySemanticsVersion: 2,
         configuredAccelerators: ['A100', 'A100-80GB'],
         minReplicas: { A100: 1, 'A100-80GB': 2 },
         demandTarget: { A100: 3, 'A100-80GB': 4 },
@@ -56,6 +57,45 @@ describe('AcceleratorHistoryCard', () => {
     expect(view.valuesByCard['A100-80GB'].demandTarget).toEqual([4]);
     expect(view.valuesByCard.A100.warmRetentionTarget).toEqual([2]);
     expect(view.valuesByCard['A100-80GB'].coldLaunchAuthority).toEqual([3]);
+    expect(view.hasLegacyCommittedCapacityGaps).toBe(false);
+  });
+
+  it('gaps legacy committed capacity while preserving other exact-card series', () => {
+    const sample = history.autoscalerSamples[0];
+    const mixedHistory = {
+      ...history,
+      autoscalerSamples: [
+        {
+          ...sample,
+          timestamp: 60,
+          acceleratorBreakdown: {
+            ...sample.acceleratorBreakdown,
+            capacitySemanticsVersion: undefined,
+            provisioningCapacity: { A100: 9, 'A100-80GB': 9 },
+          },
+        },
+        sample,
+      ],
+    };
+    const view = buildAcceleratorHistoryView(mixedHistory, {
+      start: 60,
+      end: 120,
+    });
+
+    expect(view.valuesByCard.A100.readyCapacity).toEqual([2, 2]);
+    expect(view.valuesByCard.A100.provisioningCapacity).toEqual([null, 1]);
+    expect(view.hasLegacyCommittedCapacityGaps).toBe(true);
+
+    render(
+      <AcceleratorHistoryCard
+        history={mixedHistory}
+        range={{ start: 60, end: 120 }}
+        onRangeSelect={jest.fn()}
+      />
+    );
+    expect(
+      screen.getByText(/Older samples appear as gaps.*capacity semantics v2/)
+    ).toBeInTheDocument();
   });
 
   it('switches between serving and reserved signals without losing cards', () => {
@@ -76,6 +116,9 @@ describe('AcceleratorHistoryCard', () => {
     expect(
       screen.getByLabelText('A100-80GB accelerator history chart')
     ).toHaveTextContent('Ready capacity');
+    expect(
+      screen.getByLabelText('A100 accelerator history chart')
+    ).toHaveTextContent('Committed / unready capacity');
 
     fireEvent.click(screen.getByRole('button', { name: 'Reserved capacity' }));
     expect(

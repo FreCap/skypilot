@@ -44,19 +44,18 @@ import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
 import { CLOUD_CANONICALIZATIONS } from '@/data/connectors/constants';
 
 const REPLICA_PLACEMENT_COLUMNS = [
-  { key: 'pending', label: 'Pending' },
-  { key: 'provisioning', label: 'Provisioning' },
-  { key: 'initializing', label: 'Initializing' },
+  { key: 'queuedIntent', label: 'Queued intent' },
+  { key: 'providerSetup', label: 'Provider / setup' },
+  { key: 'initializingNotReady', label: 'Initializing / not ready' },
   { key: 'ready', label: 'Ready' },
-  { key: 'notReady', label: 'Not ready' },
   { key: 'stopping', label: 'Stopping' },
-  { key: 'error', label: 'Error' },
+  { key: 'cleanupUncertain', label: 'Cleanup uncertain' },
+  { key: 'historicalFailure', label: 'Historical failure' },
   { key: 'other', label: 'Other' },
 ];
 
-const REPLICA_ERROR_STATUSES = new Set([
+const REPLICA_HISTORICAL_FAILURE_STATUSES = new Set([
   'FAILED',
-  'FAILED_CLEANUP',
   'FAILED_INITIAL_DELAY',
   'FAILED_PROBING',
   'FAILED_PROVISION',
@@ -65,22 +64,28 @@ const REPLICA_ERROR_STATUSES = new Set([
 
 const SERVICE_HISTORY_HOURS = 24;
 
-function getReplicaPlacementStatusBucket(status) {
-  if (REPLICA_ERROR_STATUSES.has(status)) return 'error';
+function getReplicaPlacementStatusBucket(replica) {
+  const { status } = replica;
+  if (REPLICA_HISTORICAL_FAILURE_STATUSES.has(status)) {
+    return 'historicalFailure';
+  }
   switch (status) {
     case 'PENDING':
-      return 'pending';
+      return 'queuedIntent';
     case 'PROVISIONING':
-      return 'provisioning';
+      return replica.launched_at === null || replica.launched_at === undefined
+        ? 'queuedIntent'
+        : 'providerSetup';
     case 'STARTING':
-      return 'initializing';
+    case 'NOT_READY':
+      return 'initializingNotReady';
     case 'READY':
       return 'ready';
-    case 'NOT_READY':
-      return 'notReady';
     case 'SHUTTING_DOWN':
     case 'PREEMPTED':
       return 'stopping';
+    case 'FAILED_CLEANUP':
+      return 'cleanupUncertain';
     default:
       return 'other';
   }
@@ -102,20 +107,25 @@ export function getReplicaPlacementBreakdown(replicas) {
       row = {
         cloud,
         region,
-        pending: 0,
-        provisioning: 0,
-        initializing: 0,
+        queuedIntent: 0,
+        providerSetup: 0,
+        initializingNotReady: 0,
         ready: 0,
-        notReady: 0,
         stopping: 0,
-        error: 0,
+        cleanupUncertain: 0,
+        historicalFailure: 0,
         other: 0,
-        total: 0,
+        currentOrUncertain: 0,
+        trackedAttempts: 0,
       };
       rowsByPlacement.set(placementKey, row);
     }
-    row[getReplicaPlacementStatusBucket(replica.status)] += 1;
-    row.total += 1;
+    const bucket = getReplicaPlacementStatusBucket(replica);
+    row[bucket] += 1;
+    if (bucket !== 'historicalFailure') {
+      row.currentOrUncertain += 1;
+    }
+    row.trackedAttempts += 1;
   });
 
   return Array.from(rowsByPlacement.values()).sort(
@@ -133,7 +143,6 @@ export function useServiceDetails({ serviceName }) {
   const [historyLoading, setHistoryLoading] = useState(true);
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
-  const historyRefreshInFlightRef = useRef(null);
   const summaryArgs = useMemo(
     () => [
       {
@@ -149,163 +158,130 @@ export function useServiceDetails({ serviceName }) {
     () => [{ serviceNames: [serviceName] }],
     [serviceName]
   );
-  const historyArgs = useMemo(
-    () => [
-      {
-        serviceNames: [serviceName],
-        summaryOnly: true,
-        includeTargetReplicas: false,
-        historyHours: SERVICE_HISTORY_HOURS,
-      },
-    ],
-    [serviceName]
-  );
 
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
   //   1. summary_only — near-instant; renders the header/summary card.
   //   2. full — per-replica table; takes tens of seconds at fleet scale,
   //      fills in when it lands.
-  const fetchData = useCallback(async () => {
-    if (!serviceName) return;
-    const requestVersion = requestVersionRef.current + 1;
-    requestVersionRef.current = requestVersion;
-    setLoading(true);
-    setReplicasLoading(true);
-    setHistoryLoading(true);
-    setReplicaHistory(null);
-    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
-    // Ordering within THIS invocation only: once the full result has
-    // landed, a later-resolving summary must not overwrite it — but a
-    // fresh summary must still replace whatever an earlier invocation
-    // left behind.
-    let fullLanded = false;
-    let summaryPromise;
-    summaryPromise = dashboardCache
-      .get(getServices, summaryArgs)
-      .then(({ services }) => {
-        if (!isCurrentRequest()) return;
-        const found = (services || []).find((s) => s.name === serviceName);
-        setReplicaHistory(found?.replicaHistory || null);
-        if (fullLanded) return;
-        setServiceData(found || null);
-      })
-      .catch((error) => {
-        console.error('Failed to fetch service summary:', error);
-      })
-      .finally(() => {
-        if (historyRefreshInFlightRef.current?.promise === summaryPromise) {
-          historyRefreshInFlightRef.current = null;
-        }
-        if (isCurrentRequest()) {
-          setLoading(false);
-          setHistoryLoading(false);
+  const fetchData = useCallback(
+    ({ invalidate = false, resetHistory = false } = {}) => {
+      if (!serviceName) return Promise.resolve();
+      const inFlight = refreshInFlightRef.current;
+      if (inFlight?.serviceName === serviceName) {
+        return inFlight.promise;
+      }
+      if (invalidate) {
+        dashboardCache.invalidate(getServices, summaryArgs);
+        dashboardCache.invalidate(getServices, fullArgs);
+      }
+
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      setLoading(true);
+      setReplicasLoading(true);
+      setHistoryLoading(true);
+      if (resetHistory) {
+        setReplicaHistory(null);
+      }
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
+      let fullLanded = false;
+      let refreshPromise;
+      refreshPromise = (async () => {
+        const summaryPromise = dashboardCache
+          .get(getServices, summaryArgs)
+          .then(({ services }) => {
+            if (!isCurrentRequest()) return;
+            const found = (services || []).find((s) => s.name === serviceName);
+            setReplicaHistory(found?.replicaHistory || null);
+            if (fullLanded) return;
+            setServiceData((previous) => {
+              if (!found) return null;
+              if (
+                previous?.name !== serviceName ||
+                previous.summaryOnly === true ||
+                !Array.isArray(previous.replicas)
+              ) {
+                return found;
+              }
+              // Summary mode is the cheap, current view, but it omits the full
+              // replica list. Keep the last complete snapshot visible while
+              // the corresponding full request is still in flight.
+              return {
+                ...previous,
+                ...found,
+                replicas: previous.replicas,
+                summaryOnly: false,
+              };
+            });
+          })
+          .catch((error) => {
+            if (isCurrentRequest()) {
+              console.error('Failed to fetch service summary:', error);
+            }
+          })
+          .finally(() => {
+            if (isCurrentRequest()) {
+              setLoading(false);
+              setHistoryLoading(false);
+            }
+          });
+        const fullPromise = dashboardCache
+          .get(getServices, fullArgs)
+          .then(({ services }) => {
+            if (!isCurrentRequest()) return;
+            const found = (services || []).find((s) => s.name === serviceName);
+            fullLanded = true;
+            setServiceData(found || null);
+          })
+          .catch((error) => {
+            if (isCurrentRequest()) {
+              console.error('Failed to fetch service replicas:', error);
+            }
+          })
+          .finally(() => {
+            if (isCurrentRequest()) {
+              setReplicasLoading(false);
+            }
+          });
+        await Promise.allSettled([summaryPromise, fullPromise]);
+      })().finally(() => {
+        if (refreshInFlightRef.current?.promise === refreshPromise) {
+          refreshInFlightRef.current = null;
         }
       });
-    historyRefreshInFlightRef.current = {
-      serviceName,
-      promise: summaryPromise,
-    };
-    const fullPromise = dashboardCache
-      .get(getServices, fullArgs)
-      .then(({ services }) => {
-        if (!isCurrentRequest()) return;
-        const found = (services || []).find((s) => s.name === serviceName);
-        fullLanded = true;
-        setServiceData(found || null);
-      })
-      .catch((error) => {
-        console.error('Failed to fetch service replicas:', error);
-      })
-      .finally(() => {
-        if (isCurrentRequest()) {
-          setReplicasLoading(false);
-        }
-      });
-    await Promise.allSettled([summaryPromise, fullPromise]);
-  }, [fullArgs, serviceName, summaryArgs]);
+      refreshInFlightRef.current = {
+        serviceName,
+        promise: refreshPromise,
+      };
+      return refreshPromise;
+    },
+    [fullArgs, serviceName, summaryArgs]
+  );
 
   useEffect(() => {
-    fetchData();
+    fetchData({ resetHistory: true });
     return () => {
       requestVersionRef.current += 1;
       if (refreshInFlightRef.current?.serviceName === serviceName) {
         refreshInFlightRef.current = null;
       }
-      if (historyRefreshInFlightRef.current?.serviceName === serviceName) {
-        historyRefreshInFlightRef.current = null;
-      }
     };
   }, [fetchData, serviceName]);
 
+  const refreshData = useCallback(
+    () => fetchData({ invalidate: true }),
+    [fetchData]
+  );
+
   useEffect(() => {
     if (!serviceName) return undefined;
-    let active = true;
-    const refreshHistory = async () => {
-      const inFlight = historyRefreshInFlightRef.current;
-      if (inFlight?.serviceName === serviceName) {
-        return inFlight.promise;
-      }
-      const requestVersion = requestVersionRef.current;
-      const isCurrentRequest = () =>
-        active && requestVersionRef.current === requestVersion;
-      let historyPromise;
-      historyPromise = (async () => {
-        setHistoryLoading(true);
-        dashboardCache.invalidate(getServices, historyArgs);
-        try {
-          const { services } = await dashboardCache.get(
-            getServices,
-            historyArgs
-          );
-          if (!isCurrentRequest()) return;
-          const found = (services || []).find((s) => s.name === serviceName);
-          setReplicaHistory(found?.replicaHistory || null);
-        } catch (error) {
-          if (isCurrentRequest()) {
-            console.error('Failed to refresh service history:', error);
-          }
-        } finally {
-          if (historyRefreshInFlightRef.current?.promise === historyPromise) {
-            historyRefreshInFlightRef.current = null;
-          }
-          if (isCurrentRequest()) {
-            setHistoryLoading(false);
-          }
-        }
-      })();
-      historyRefreshInFlightRef.current = {
-        serviceName,
-        promise: historyPromise,
-      };
-      return historyPromise;
-    };
-    const interval = setInterval(refreshHistory, 60 * 1000);
+    const interval = setInterval(refreshData, 60 * 1000);
     return () => {
-      active = false;
       clearInterval(interval);
     };
-  }, [historyArgs, serviceName]);
-
-  const refreshData = useCallback(() => {
-    const inFlight = refreshInFlightRef.current;
-    if (inFlight?.serviceName === serviceName) {
-      return inFlight.promise;
-    }
-
-    const refreshPromise = (async () => {
-      dashboardCache.invalidate(getServices, summaryArgs);
-      dashboardCache.invalidate(getServices, fullArgs);
-      dashboardCache.invalidate(getServices, historyArgs);
-      await fetchData();
-    })().finally(() => {
-      if (refreshInFlightRef.current?.promise === refreshPromise) {
-        refreshInFlightRef.current = null;
-      }
-    });
-    refreshInFlightRef.current = { serviceName, promise: refreshPromise };
-    return refreshPromise;
-  }, [fetchData, fullArgs, historyArgs, serviceName, summaryArgs]);
+  }, [refreshData, serviceName]);
 
   return {
     serviceData,
@@ -488,7 +464,10 @@ export function AcceleratorCapacityCard({ serviceData }) {
             Demand target assigns flexible work to the cheapest compatible card.
             Warm retention shows work staying on its current card. Only cold
             launch authority requests incremental exact card capacity. Reserved
-            fill capacity remains independent.
+            fill capacity remains independent. Committed / unready is the
+            controller-reported non-ready capacity already assigned to the card;
+            it includes queued, provider-launching, initializing, and not-ready
+            work.
           </p>
         </div>
         {(serviceData.fillTarget != null ||
@@ -510,7 +489,7 @@ export function AcceleratorCapacityCard({ serviceData }) {
           <TableRow>
             <TableHead>Card</TableHead>
             <TableHead className="text-right">Ready</TableHead>
-            <TableHead className="text-right">Provisioning</TableHead>
+            <TableHead className="text-right">Committed / unready</TableHead>
             <TableHead className="text-right">Total</TableHead>
             <TableHead className="text-right">Demand target</TableHead>
             <TableHead className="text-right">Warm retention</TableHead>
@@ -888,16 +867,18 @@ export function ReplicaPlacementCard({ replicas, loading }) {
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">
         <div>
-          <h3 className="text-lg font-semibold">Machines by region</h3>
+          <h3 className="text-lg font-semibold">
+            Replica attempts by placement
+          </h3>
           <p className="text-sm text-gray-500">
-            Physical backends by Kubernetes context or cloud region, grouped by
-            lifecycle state.
+            Selected or confirmed placement for every tracked attempt. Queued
+            intent and retained failure history are not live-machine counts.
           </p>
         </div>
         {loading && (
           <span className="text-sm text-gray-500 whitespace-nowrap">
             <CircularProgress size={14} className="mr-2" />
-            Loading machines…
+            Loading attempts…
           </span>
         )}
       </div>
@@ -919,7 +900,10 @@ export function ReplicaPlacementCard({ replicas, loading }) {
                   </TableHead>
                 ))}
                 <TableHead className="whitespace-nowrap text-right">
-                  Total
+                  Current / uncertain
+                </TableHead>
+                <TableHead className="whitespace-nowrap text-right">
+                  Tracked attempts
                 </TableHead>
               </TableRow>
             </TableHeader>
@@ -942,17 +926,20 @@ export function ReplicaPlacementCard({ replicas, loading }) {
                       </TableCell>
                     ))}
                     <TableCell className="text-right tabular-nums font-semibold">
-                      {row.total}
+                      {row.currentOrUncertain}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums font-semibold">
+                      {row.trackedAttempts}
                     </TableCell>
                   </TableRow>
                 ))
               ) : (
                 <TableRow>
                   <TableCell
-                    colSpan={REPLICA_PLACEMENT_COLUMNS.length + 3}
+                    colSpan={REPLICA_PLACEMENT_COLUMNS.length + 4}
                     className="text-center py-6 text-gray-500"
                   >
-                    {loading ? 'Loading machine placement…' : 'No replicas.'}
+                    {loading ? 'Loading attempt placement…' : 'No replicas.'}
                   </TableCell>
                 </TableRow>
               )}

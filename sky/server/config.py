@@ -32,6 +32,10 @@ SHORT_WORKER_MEM_GB = 0.3
 _CPU_MULTIPLIER_FOR_LONG_WORKERS = 2
 # Env var to override _CPU_MULTIPLIER_FOR_LONG_WORKERS.
 LONG_WORKER_CPU_MULTIPLIER_ENV_VAR = 'SKYPILOT_LONG_WORKER_CPU_MULTIPLIER'
+# Actual guaranteed long-worker parallelism published by the API server before
+# it captures the immutable environment inherited by consolidated controllers.
+SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM = (
+    'SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM')
 # Limit the number of long workers of local API server, since local server is
 # typically:
 # 1. launched automatically in an environment with high resource contention
@@ -85,6 +89,12 @@ class ServerConfig:
     short_worker_config: WorkerConfig
     num_db_connections_per_worker: int
     queue_backend: QueueBackend
+
+
+def publish_serve_launch_parallelism(server_config: ServerConfig) -> None:
+    """Publish the worker bound inherited by consolidated Serve controllers."""
+    os.environ[SKYPILOT_API_SERVER_LONG_WORKER_PARALLELISM] = str(
+        server_config.long_worker_config.garanteed_parallelism)
 
 
 def compute_server_config(

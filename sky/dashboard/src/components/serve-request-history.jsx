@@ -237,7 +237,7 @@ export function RequestHistoryCard({
               'rgb(22, 163, 74)'
             ),
             capacityLine(
-              'Provisioning capacity',
+              'Committed / unready capacity',
               view.provisioningCapacities,
               'rgb(8, 145, 178)',
               [2, 3]
@@ -291,7 +291,7 @@ export function RequestHistoryCard({
         history.autoscalerSamples?.find((sample) => sample.replicaUnit)
           ?.replicaUnit === 'logical_slot'
           ? 'Capacity slots'
-          : 'Machines',
+          : 'Tracked backend capacity',
     },
   };
   const options = {
@@ -321,7 +321,9 @@ export function RequestHistoryCard({
           <div className="text-sm text-gray-500">
             Traffic target includes autoscaler hysteresis. Traffic or
             reservation target is the larger of traffic and reserved-capacity
-            fill. Non-failed tracked capacity includes stopping and preempted
+            fill. Committed / unready capacity combines queued,
+            provider-launching, application-starting, and not-ready work.
+            Non-failed tracked capacity also includes stopping and preempted
             rows until cleanup finishes
             {loading ? ' · Refreshing…' : ''}
           </div>

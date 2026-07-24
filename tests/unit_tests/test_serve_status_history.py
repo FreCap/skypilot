@@ -33,6 +33,32 @@ def test_status_bucket_mapping_is_exhaustive():
         assert serve_history._status_bucket(status.value) == bucket
 
 
+def test_accelerator_breakdown_preserves_legacy_and_new_capacity_semantics():
+    legacy = serve_history._normalize_accelerator_breakdown(
+        {'configured_accelerators': ['A100']})
+    current = serve_history._normalize_accelerator_breakdown({
+        'capacity_semantics_version':
+            serve_history.ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION,
+        'configured_accelerators': ['A100'],
+    })
+
+    assert legacy['version'] == constants.LB_REQUEST_ACCELERATORS_VERSION
+    assert 'capacity_semantics_version' not in legacy
+    assert current['version'] == constants.LB_REQUEST_ACCELERATORS_VERSION
+    assert current['capacity_semantics_version'] == 2
+
+
+@pytest.mark.parametrize('capacity_semantics_version',
+                         [None, 0, -1, True, 1.5, '2'])
+def test_accelerator_breakdown_rejects_invalid_capacity_semantics(
+        capacity_semantics_version):
+    with pytest.raises(ValueError, match='capacity_semantics_version'):
+        serve_history._normalize_accelerator_breakdown({
+            'capacity_semantics_version': capacity_semantics_version,
+            'configured_accelerators': ['A100'],
+        })
+
+
 def test_build_history_rows_groups_capacity_modes_and_reserved_ready():
     observed_at = datetime.datetime(2026,
                                     7,

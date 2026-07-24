@@ -13,7 +13,12 @@ const SERVING_SERIES = [
   ['Warm retention', 'warmRetentionTarget', 'rgb(168, 85, 247)', [4, 3]],
   ['Cold-launch authority', 'coldLaunchAuthority', 'rgb(220, 38, 38)', [2, 2]],
   ['Ready capacity', 'readyCapacity', 'rgb(22, 163, 74)', []],
-  ['Provisioning capacity', 'provisioningCapacity', 'rgb(8, 145, 178)', [2, 3]],
+  [
+    'Committed / unready capacity',
+    'provisioningCapacity',
+    'rgb(8, 145, 178)',
+    [2, 3],
+  ],
   [
     'Non-failed tracked capacity',
     'totalCapacity',
@@ -57,9 +62,16 @@ export function buildAcceleratorHistoryView(history, range) {
   ) {
     timestamps.push(timestamp);
   }
+  const hasLegacyCommittedCapacityGaps = samples.some(
+    (sample) =>
+      sample.timestamp >= range.start &&
+      sample.timestamp <= range.end &&
+      sample.acceleratorBreakdown.capacitySemanticsVersion !== 2
+  );
   return {
     cards,
     timestamps,
+    hasLegacyCommittedCapacityGaps,
     valuesByCard: Object.fromEntries(
       cards.map((card) => [
         card,
@@ -72,9 +84,16 @@ export function buildAcceleratorHistoryView(history, range) {
             timestamps.map((timestamp) => {
               const breakdown =
                 byTimestamp.get(timestamp)?.acceleratorBreakdown;
-              return breakdown?.configuredAccelerators.includes(card)
-                ? (breakdown[field]?.[card] ?? null)
-                : null;
+              if (!breakdown?.configuredAccelerators.includes(card)) {
+                return null;
+              }
+              if (
+                field === 'provisioningCapacity' &&
+                breakdown.capacitySemanticsVersion !== 2
+              ) {
+                return null;
+              }
+              return breakdown[field]?.[card] ?? null;
             }),
           ])
         ),
@@ -100,8 +119,8 @@ export function AcceleratorHistoryCard({
     history.autoscalerSamples?.find(
       (sample) => sample.acceleratorBreakdown && sample.replicaUnit
     )?.replicaUnit === 'logical_slot'
-      ? 'Capacity slots'
-      : 'Machines';
+      ? 'Tracked capacity slots'
+      : 'Tracked backend capacity';
 
   return (
     <div className="mb-6">
@@ -112,7 +131,10 @@ export function AcceleratorHistoryCard({
             Demand target assigns flexible work to the cheapest compatible card.
             Warm retention shows work staying on its current card. Cold launch
             authority is the incremental shortage allowed to request new
-            capacity
+            capacity. Committed / unready capacity is the controller-reported
+            non-ready work already assigned to that card.
+            {view.hasLegacyCommittedCapacityGaps &&
+              ' Older samples appear as gaps in that series because they predate capacity semantics v2.'}
             {loading ? ' · Refreshing…' : ''}
           </div>
         </div>

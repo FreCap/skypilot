@@ -2042,6 +2042,8 @@ class SkyServeController:
             return None
 
         return {
+            'capacity_semantics_version':
+                serve_history.ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION,
             'configured_accelerators': configured,
             'min_replicas': dict(
                 getattr(self._autoscaler, 'min_replicas_by_accelerator', {})),
@@ -2224,6 +2226,12 @@ class SkyServeController:
         zero_cost_location_classifier = getattr(
             autoscaler, 'is_replica_on_zero_cost_location', None)
         failed_statuses = serve_state.ReplicaStatus.failed_statuses()
+        committed_unready_statuses = {
+            serve_state.ReplicaStatus.PENDING,
+            serve_state.ReplicaStatus.PROVISIONING,
+            serve_state.ReplicaStatus.STARTING,
+            serve_state.ReplicaStatus.NOT_READY,
+        }
         for info in replica_infos:
             status = info.status
             # Pre-activation bridge rows deserialize with planned_capacity=1;
@@ -2282,8 +2290,7 @@ class SkyServeController:
                     zero_cost_total_by_accelerator[accelerator] = (
                         zero_cost_total_by_accelerator.get(accelerator, 0) +
                         width)
-                if (known_accelerator and
-                        status != serve_state.ReplicaStatus.READY):
+                if (known_accelerator and status in committed_unready_statuses):
                     provisioning_by_accelerator[accelerator] = (
                         provisioning_by_accelerator.get(accelerator, 0) + width)
 

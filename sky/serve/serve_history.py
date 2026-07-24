@@ -15,6 +15,7 @@ from sky.utils.db import db_utils
 DEFAULT_HISTORY_HOURS = 12
 RETENTION_HOURS = 72
 BUCKET_SECONDS = 60
+ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION = 2
 
 metadata = sqlalchemy.MetaData()
 
@@ -903,6 +904,14 @@ def _normalize_accelerator_breakdown(
         'version': constants.LB_REQUEST_ACCELERATORS_VERSION,
         'configured_accelerators': configured,
     }
+    if 'capacity_semantics_version' in value:
+        capacity_semantics_version = value['capacity_semantics_version']
+        if (not isinstance(capacity_semantics_version, int) or
+                isinstance(capacity_semantics_version, bool) or
+                capacity_semantics_version < 1):
+            raise ValueError(
+                'capacity_semantics_version must be a positive integer.')
+        result['capacity_semantics_version'] = capacity_semantics_version
     for field in _ACCELERATOR_BREAKDOWN_MAP_FIELDS:
         raw_mapping = value.get(field, {})
         if not isinstance(raw_mapping, dict):
