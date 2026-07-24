@@ -20,6 +20,30 @@ def strip_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
+def test_workspace_allowed_clouds_is_policy_only(monkeypatch):
+    monkeypatch.setattr(sky_check.skypilot_config, 'get_nested',
+                        lambda *_args, **_kwargs: ['AWS', 'Kubernetes'])
+
+    def _workspace_cloud(cloud, *, workspace):
+        assert workspace == 'default'
+        if cloud == 'kubernetes':
+            return {'disabled': True}
+        return {'capabilities': ['storage']}
+
+    monkeypatch.setattr(sky_check.skypilot_config, 'get_workspace_cloud',
+                        _workspace_cloud)
+    refresh = mock.MagicMock(
+        side_effect=AssertionError('policy lookup must not probe providers'))
+    monkeypatch.setattr(sky_check, 'check_capability', refresh)
+
+    assert sky_check.get_workspace_allowed_clouds('default') == ['AWS']
+    assert sky_check.get_workspace_allowed_clouds(
+        'default', capability=CloudCapability.COMPUTE) == []
+    assert sky_check.get_workspace_allowed_clouds(
+        'default', capability=CloudCapability.STORAGE) == ['AWS']
+    refresh.assert_not_called()
+
+
 def test_summary_message_enabled_infra_with_k8s_contexts(monkeypatch):
     """Validate the summary block formatting produced by sky.check._summary_message."""
     # Prepare enabled clouds and capabilities.
@@ -449,6 +473,11 @@ def test_workspace_cloud_capabilities():
                     'capabilities': [CloudCapability.COMPUTE]
                 }
             },
+            'workspace3': {
+                'aws': {
+                    'capabilities': []
+                }
+            },
         }
     })
     with mock.patch('sky.skypilot_config._get_loaded_config',
@@ -468,10 +497,11 @@ def test_workspace_cloud_capabilities():
             'workspace2', 'aws')
         assert capabilities == [CloudCapability.COMPUTE]
 
-        # use global config since workspace config is not specified
+        # an explicit empty workspace list disables every capability rather
+        # than falling back to the global compute capability.
         capabilities = sky_check._get_workspace_cloud_capabilities(
             'workspace3', 'aws')
-        assert capabilities == [CloudCapability.COMPUTE]
+        assert capabilities == []
 
         # no config specified for this cloud in default workspace
         capabilities = sky_check._get_workspace_cloud_capabilities(
@@ -554,6 +584,37 @@ def test_enabled_capabilities_detection():
                     workspace=None,
                 )
                 assert 'AWS' not in capabilities_result['default']
+
+
+def test_explicit_empty_workspace_capabilities_skips_provider_checks():
+    """An empty list is an explicit deny, not an unspecified capability set."""
+    test_config = config_utils.Config({
+        'allowed_clouds': ['aws'],
+        'workspaces': {
+            'default': {
+                'aws': {
+                    'capabilities': []
+                }
+            }
+        },
+    })
+    with mock.patch('sky.skypilot_config._get_loaded_config',
+                    return_value=test_config), \
+         mock.patch(
+             'sky.clouds.aws.AWS._check_compute_credentials',
+             side_effect=AssertionError('compute must not be checked')), \
+         mock.patch(
+             'sky.clouds.aws.AWS._check_storage_credentials',
+             side_effect=AssertionError('storage must not be checked')):
+        capabilities_result = sky_check.check_capabilities(
+            quiet=True,
+            verbose=False,
+            clouds=('aws',),
+            capabilities=sky_cloud.ALL_CAPABILITIES,
+            workspace='default',
+        )
+
+    assert capabilities_result == {'default': {}}
 
 
 # ============ JSON Output Tests ============

@@ -888,6 +888,7 @@ def _load_spot_placer(
     version: int,
     service_spec: 'service_spec.SkyServiceSpec',
     task: 'task_lib.Task',
+    workspace: str | None = None,
 ) -> spot_placer.SpotPlacer | None:
     """Load one version's durable catalog without provider resolution."""
     if service_spec.spot_placer is None:
@@ -900,11 +901,15 @@ def _load_spot_placer(
             'before starting the controller.')
     return spot_placer.SpotPlacer.from_task(service_spec,
                                             task,
-                                            placement_catalog=catalog_data)
+                                            placement_catalog=catalog_data,
+                                            workspace=workspace)
 
 
 def validate_service_update_preflight(
-    service_name: str, version: int, service_spec: 'service_spec.SkyServiceSpec'
+    service_name: str,
+    version: int,
+    service_spec: 'service_spec.SkyServiceSpec',
+    workspace: str | None = None,
 ) -> spot_placer.SpotPlacer | None:
     """Run immutable candidate calculations needed before replica launch."""
     yaml_content = serve_state.get_yaml_content(service_name, version)
@@ -926,7 +931,7 @@ def validate_service_update_preflight(
     candidate_placer = None
     if uses_logical_replicas or isinstance(placer_name, str):
         candidate_placer = _load_spot_placer(service_name, version,
-                                             service_spec, task)
+                                             service_spec, task, workspace)
     if uses_logical_replicas:
         _validate_logical_capacity_sources(default_planned_capacity,
                                            candidate_placer, task.num_nodes)
@@ -2123,6 +2128,11 @@ class ReplicaManager:
                 <= 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 
     @property
+    def workspace(self) -> str:
+        """Durable workspace used for replica placement and launches."""
+        return self._workspace
+
+    @property
     def spot_placer(self) -> Optional['SpotPlacerType']:
         """The placer, if this manager kind carries one (else None).
 
@@ -2536,7 +2546,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             task.resources)
         self._logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
             task.resources) if self._uses_logical_replicas else {})
-        self._spot_placer = _load_spot_placer(service_name, version, spec, task)
+        self._spot_placer = _load_spot_placer(service_name, version, spec, task,
+                                              getattr(self, '_workspace', None))
         self._spot_placement_state_restored = False
         if self._uses_logical_replicas:
             _validate_logical_capacity_sources(self._default_planned_capacity,
@@ -3977,6 +3988,8 @@ class SkyPilotReplicaManager(ReplicaManager):
     @with_lock
     def scale_up(self,
                  resources_override: dict[str, Any] | None = None) -> None:
+        if self._spot_placer is not None:
+            self._spot_placer.refresh_workspace_policy()
         self._scale_up_one_locked(
             resources_override, serve_state.get_replica_ids(self._service_name))
 
@@ -4004,6 +4017,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         later decisions observe in-wave reservations without querying and
         unpickling all existing rows once per launch.
         """
+        if self._spot_placer is not None:
+            self._spot_placer.refresh_workspace_policy()
         needs_reservation = (
             self._batch_needs_placement_snapshot(resources_overrides) and
             self._uses_shared_zero_cost_demand_budget())
@@ -4144,6 +4159,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         next placement decision, so a single 8-slot choice removes eight slots
         from the shortfall instead of causing eight physical launches.
         """
+        if self._spot_placer is not None:
+            self._spot_placer.refresh_workspace_policy()
         if not self._uses_logical_replicas:
             raise RuntimeError('Logical scale target sent to a physical '
                                'replica service.')
@@ -6887,6 +6904,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         replica_drain_delay_seconds=0)
 
         if pending_launches:
+            if self._spot_placer is not None:
+                # Workspace policy is centrally mutable while this controller
+                # is long-lived. Reload exactly once per queued admission wave
+                # so the final pre-thread fence cannot use a startup snapshot;
+                # subsequent replanning also sees the refreshed policy.
+                self._spot_placer.refresh_workspace_policy()
             # Queued launches for one service share the same controller-owner
             # proof; re-checking it per replica only burns DB work and log
             # budget without changing the admission decision for this tick.
@@ -7728,8 +7751,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         new_placer_name = getattr(spec, 'spot_placer', None)
         if ((new_uses_logical_replicas or isinstance(new_placer_name, str)) and
                 new_spot_placer is None):
-            new_spot_placer = _load_spot_placer(self._service_name, version,
-                                                spec, new_task)
+            new_spot_placer = _load_spot_placer(
+                self._service_name, version, spec, new_task,
+                getattr(self, '_workspace', None))
         old_spot_placer = getattr(self, '_spot_placer', None)
         if new_spot_placer is not None and old_spot_placer is not None:
             new_spot_placer.inherit_preemption_state(old_spot_placer)

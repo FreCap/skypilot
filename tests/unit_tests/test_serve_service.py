@@ -950,11 +950,12 @@ def test_legacy_recovery_backfills_catalog_once():
         result = service._prepare_placement_catalog('svc',
                                                     service_spec,
                                                     task,
+                                                    workspace='default',
                                                     is_recovery=True,
                                                     recovery_version=3)
 
     assert result == {'schema_version': 1, 'entries': []}
-    build.assert_called_once_with(service_spec, task)
+    build.assert_called_once_with(service_spec, task, workspace='default')
     persist.assert_called_once_with('svc', 3, result)
 
 

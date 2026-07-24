@@ -556,6 +556,28 @@ class TestScaleUpDoesNotClobberLiveReplica:
         assert launched == [8]
         assert mgr._next_replica_id == 9
 
+    def test_spot_policy_refresh_precedes_scale_up_selection(self):
+        mgr = _make_manager(next_replica_id=1)
+        mgr._spot_placer = mock.Mock()
+        refreshed = False
+
+        def _refresh():
+            nonlocal refreshed
+            refreshed = True
+
+        def _launch(*_args, **_kwargs):
+            assert refreshed
+            return False
+
+        mgr._spot_placer.refresh_workspace_policy.side_effect = _refresh
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_ids',
+                return_value=set()), \
+             mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
+            mgr.scale_up()
+
+        mgr._spot_placer.refresh_workspace_policy.assert_called_once_with()
+
 
 class TestVersionSpecMemoizedPerProbeRound:
     """`_get_version_spec` reads each version's spec from the DB at most once
@@ -2272,6 +2294,10 @@ class TestLaunchOwnershipFence:
             launch_thread.start.assert_called_once_with()
         placer.is_launch_admissible.assert_has_calls(
             [mock.call(location, selected_at=100.0)] * 3)
+        placer.refresh_workspace_policy.assert_called_once_with()
+        assert placer.mock_calls.index(
+            mock.call.refresh_workspace_policy()) < placer.mock_calls.index(
+                mock.call.is_launch_admissible(location, selected_at=100.0))
         assert persist.call_count == 3
 
     def test_fresh_exact_target_supersedes_excess_before_thread_start(
@@ -2994,6 +3020,7 @@ class TestScaleUpBatch:
         assert all(snapshot is snapshots[0][0] for snapshot, _ in snapshots)
         for info in initial:
             info.get_spot_location.assert_not_called()
+        mgr._spot_placer.refresh_workspace_policy.assert_called_once_with()
 
     def test_spot_batch_defers_when_shared_reservation_lock_is_busy(self):
         mgr = _make_manager(next_replica_id=1)
