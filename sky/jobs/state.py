@@ -1805,6 +1805,35 @@ def get_nonterminal_job_counts_by_pool(pool: str) -> dict[str, int]:
         return {row[0]: row[1] for row in rows if row[0] is not None}
 
 
+def get_nonterminal_job_status_counts_by_pool(pool: str) -> dict[str, int]:
+    """Get nonterminal pool queue-row counts grouped by status.
+
+    The pool dashboard badges historically counted the nonterminal task rows
+    returned by ``jobs/queue/v2`` for a pool, not distinct job ids. Keep that
+    semantics while replacing the dashboard's second full queue fetch with one
+    grouped DB query owned by the pool-status snapshot.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        query = sqlalchemy.select(
+            spot_table.c.status,
+            # pylint: disable=not-callable
+            sqlalchemy.func.count(spot_table.c.task_id),
+        ).select_from(
+            spot_table.outerjoin(
+                job_info_table, spot_table.c.spot_job_id ==
+                job_info_table.c.spot_job_id)).where(
+                    sqlalchemy.and_(
+                        ~spot_table.c.status.in_([
+                            status.value
+                            for status in ManagedJobStatus.terminal_statuses()
+                        ]),
+                        job_info_table.c.pool == pool,
+                    )).group_by(spot_table.c.status)
+        rows = session.execute(query).fetchall()
+        return {row[0]: row[1] for row in rows if row[0] is not None}
+
+
 def get_nonterminal_job_ids_by_pool_grouped(
         pool: str) -> dict[str | None, list[int]]:
     """Get nonterminal job ids in a pool, grouped by current_cluster_name.

@@ -1109,6 +1109,39 @@ def test_get_nonterminal_job_ids_by_pool_grouped_all_terminal(
     assert not state.get_nonterminal_job_ids_by_pool_grouped('pool-done')
 
 
+def test_get_nonterminal_job_status_counts_by_pool_uses_one_grouped_query(
+        _mock_managed_jobs_db_conn):
+    """Pool job-status badges should come from one slim grouped query."""
+    engine = state._db_manager.get_engine()
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.PENDING)
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.RUNNING)
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.RECOVERING)
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.SUCCEEDED)
+
+    multi_task_job = state.set_job_info_without_job_id(
+        name='multi-task-pool-a',
+        workspace='ws',
+        entrypoint='entry',
+        pool='pool-a',
+        pool_hash=None,
+        user_hash='u',
+    )
+    _insert_task(engine, multi_task_job, 0, status=ManagedJobStatus.RUNNING)
+    _insert_task(engine, multi_task_job, 1, status=ManagedJobStatus.PENDING)
+
+    _new_pool_job(engine, pool='pool-b', status=ManagedJobStatus.RUNNING)
+
+    with _count_sql_statements(engine) as counts:
+        result = state.get_nonterminal_job_status_counts_by_pool('pool-a')
+
+    assert counts['n'] == 1, counts
+    assert result == {
+        ManagedJobStatus.PENDING.value: 2,
+        ManagedJobStatus.RUNNING.value: 2,
+        ManagedJobStatus.RECOVERING.value: 1,
+    }
+
+
 def test_get_pending_jobs_count_by_pool_counts_distinct_jobs(
         _mock_managed_jobs_db_conn):
     """Pending queue length should count jobs once, even with many tasks."""

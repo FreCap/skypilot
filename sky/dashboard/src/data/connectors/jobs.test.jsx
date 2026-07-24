@@ -93,6 +93,65 @@ describe('getPoolStatus request scope', () => {
     });
     expect(dashboardCache.get).not.toHaveBeenCalled();
   });
+
+  it('uses backend job status counts without fetching managed jobs again', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({
+        return_value:
+          '[{"name":"pool-a","job_status_counts":{"RUNNING":2,"PENDING":1}}]',
+      }),
+    });
+
+    const result = await getPoolStatus({ poolNames: ['pool-a'] });
+
+    expect(result).toEqual({
+      pools: [
+        {
+          name: 'pool-a',
+          job_status_counts: { RUNNING: 2, PENDING: 1 },
+          jobCounts: { RUNNING: 2, PENDING: 1 },
+        },
+      ],
+      controllerStopped: false,
+    });
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the managed-jobs snapshot when backend counts are absent', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ return_value: '[{"name":"pool-a"}]' }),
+    });
+    dashboardCache.get.mockResolvedValue({
+      jobs: [
+        { pool: 'pool-a', status: 'RUNNING' },
+        { pool: 'pool-a', status: 'PENDING' },
+        { pool: 'pool-a', status: 'SUCCEEDED' },
+        { pool: 'pool-b', status: 'RUNNING' },
+      ],
+      controllerStopped: false,
+    });
+
+    const result = await getPoolStatus({ poolNames: ['pool-a'] });
+
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledWith(getManagedJobs, [
+      {
+        allUsers: true,
+        skipFinished: true,
+        fields: ['pool', 'status'],
+      },
+    ]);
+    expect(result).toEqual({
+      pools: [{ name: 'pool-a', jobCounts: { RUNNING: 1, PENDING: 1 } }],
+      controllerStopped: false,
+    });
+  });
 });
 
 describe('useManagedJobPools request ownership', () => {

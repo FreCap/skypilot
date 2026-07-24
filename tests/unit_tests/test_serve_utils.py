@@ -1354,7 +1354,11 @@ class TestPoolStatusBatchedQuery:
         }
         return info
 
-    def _patch_environment(self, replicas, grouped_jobs, cluster_records=None):
+    def _patch_environment(self,
+                           replicas,
+                           grouped_jobs,
+                           cluster_records=None,
+                           job_status_counts=None):
         # pylint: disable=import-outside-toplevel
         from sky.serve import serve_state
 
@@ -1386,6 +1390,10 @@ class TestPoolStatusBatchedQuery:
                        side_effect=Exception('skip yaml')),
             mock.patch(
                 'sky.serve.serve_utils.managed_job_state.'
+                'get_nonterminal_job_status_counts_by_pool',
+                return_value=job_status_counts or {}),
+            mock.patch(
+                'sky.serve.serve_utils.managed_job_state.'
                 'get_nonterminal_job_ids_by_pool_grouped',
                 return_value=grouped_jobs),
             mock.patch('sky.serve.serve_utils.managed_job_state.'
@@ -1415,16 +1423,18 @@ class TestPoolStatusBatchedQuery:
             'replica-1': [20, 21],
             'replica-2': [30],
         }
-        (svc_patch, replica_patch, ctrl_patch, yaml_patch, grouped_patch,
-         legacy_patch, clusters_patch,
+        (svc_patch, replica_patch, ctrl_patch, yaml_patch, counts_patch,
+         grouped_patch, legacy_patch, clusters_patch,
          _) = self._patch_environment(replicas, grouped_jobs)
         with svc_patch, replica_patch, ctrl_patch, yaml_patch, \
-             grouped_patch as mock_grouped, legacy_patch as mock_legacy, \
+             counts_patch as mock_counts, grouped_patch as mock_grouped, \
+             legacy_patch as mock_legacy, \
              clusters_patch:
             record = serve_utils._get_service_status('pool-a', pool=True)
 
         assert record is not None
         # Exactly one DB round-trip — no N+1.
+        mock_counts.assert_called_once_with('pool-a')
         mock_grouped.assert_called_once_with('pool-a')
         mock_legacy.assert_not_called()
 
@@ -1453,11 +1463,11 @@ class TestPoolStatusBatchedQuery:
             'replica-init': [2, 3],
             'replica-other': [4],
         }
-        (svc_patch, replica_patch, ctrl_patch, yaml_patch, grouped_patch,
-         legacy_patch, clusters_patch,
+        (svc_patch, replica_patch, ctrl_patch, yaml_patch, counts_patch,
+         grouped_patch, legacy_patch, clusters_patch,
          _) = self._patch_environment(replicas, grouped_jobs)
         with svc_patch, replica_patch, ctrl_patch, yaml_patch, \
-             grouped_patch, legacy_patch, clusters_patch:
+             counts_patch, grouped_patch, legacy_patch, clusters_patch:
             record = serve_utils._get_service_status('pool-a', pool=True)
 
         assert record is not None
@@ -1499,8 +1509,8 @@ class TestPoolStatusBatchedQuery:
             'r-3': None,
             'r-4': None,
         }
-        (svc_patch, replica_patch, ctrl_patch, yaml_patch, grouped_patch,
-         legacy_patch, clusters_patch,
+        (svc_patch, replica_patch, ctrl_patch, yaml_patch, counts_patch,
+         grouped_patch, legacy_patch, clusters_patch,
          _) = self._patch_environment(replicas, {None: []},
                                       cluster_records=cluster_records)
         # No mock for get_handles_from_cluster_names — the test fails if
@@ -1508,7 +1518,7 @@ class TestPoolStatusBatchedQuery:
         with mock.patch('sky.serve.serve_utils.global_user_state.'
                         'get_handles_from_cluster_names') as mock_handles:
             with svc_patch, replica_patch, ctrl_patch, yaml_patch, \
-                 grouped_patch, legacy_patch, \
+                 counts_patch, grouped_patch, legacy_patch, \
                  clusters_patch as mock_clusters:
                 record = serve_utils._get_service_status('pool-a', pool=True)
 
@@ -1548,18 +1558,38 @@ class TestPoolStatusBatchedQuery:
                 'handle': None
             },
         }
-        (svc_patch, replica_patch, ctrl_patch, yaml_patch, grouped_patch,
-         legacy_patch, clusters_patch,
+        (svc_patch, replica_patch, ctrl_patch, yaml_patch, counts_patch,
+         grouped_patch, legacy_patch, clusters_patch,
          _) = self._patch_environment(replicas, {None: []},
                                       cluster_records=cluster_records)
         with mock.patch('sky.serve.serve_utils.global_user_state.'
                         'get_handles_from_cluster_names') as mock_handles:
             with svc_patch, replica_patch, ctrl_patch, yaml_patch, \
-                 grouped_patch, legacy_patch, clusters_patch:
+                 counts_patch, grouped_patch, legacy_patch, clusters_patch:
                 serve_utils._get_service_status('pool-a', pool=True)
 
         # The handle-fallback batched query was removed entirely.
         mock_handles.assert_not_called()
+
+    def test_pool_status_includes_grouped_job_status_counts(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_state
+
+        replicas = [self._replica('replica-1', serve_state.ReplicaStatus.READY)]
+        job_status_counts = {'RUNNING': 2, 'PENDING': 1}
+        (svc_patch, replica_patch, ctrl_patch, yaml_patch, counts_patch,
+         grouped_patch, legacy_patch, clusters_patch,
+         _) = self._patch_environment(replicas, {None: []},
+                                      job_status_counts=job_status_counts)
+
+        with svc_patch, replica_patch, ctrl_patch, yaml_patch, \
+             counts_patch as mock_counts, grouped_patch, legacy_patch, \
+             clusters_patch:
+            record = serve_utils._get_service_status('pool-a', pool=True)
+
+        assert record is not None
+        mock_counts.assert_called_once_with('pool-a')
+        assert record['job_status_counts'] == job_status_counts
 
 
 class TestServiceStatusEndpointSnapshot:
