@@ -143,6 +143,7 @@ export function useServiceDetails({ serviceName }) {
   const [historyLoading, setHistoryLoading] = useState(true);
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
+  const visibleServiceDataRef = useRef(null);
   const summaryArgs = useMemo(
     () => [
       {
@@ -159,16 +160,30 @@ export function useServiceDetails({ serviceName }) {
     [serviceName]
   );
 
+  useEffect(() => {
+    visibleServiceDataRef.current = serviceData;
+  }, [serviceData]);
+
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
   //   1. summary_only — near-instant; renders the header/summary card.
   //   2. full — per-replica table; takes tens of seconds at fleet scale,
   //      fills in when it lands.
   const fetchData = useCallback(
-    ({ invalidate = false, resetHistory = false } = {}) => {
+    ({
+      invalidate = false,
+      resetHistory = false,
+      source = 'refresh',
+      supersede = false,
+    } = {}) => {
       if (!serviceName) return Promise.resolve();
       const inFlight = refreshInFlightRef.current;
-      if (inFlight?.serviceName === serviceName) {
+      const shouldReuseInFlight =
+        inFlight?.serviceName === serviceName &&
+        (!supersede ||
+          visibleServiceDataRef.current === null ||
+          inFlight.source === 'manual');
+      if (shouldReuseInFlight) {
         return inFlight.promise;
       }
       if (invalidate) {
@@ -254,6 +269,7 @@ export function useServiceDetails({ serviceName }) {
       refreshInFlightRef.current = {
         serviceName,
         promise: refreshPromise,
+        source,
       };
       return refreshPromise;
     },
@@ -261,7 +277,7 @@ export function useServiceDetails({ serviceName }) {
   );
 
   useEffect(() => {
-    fetchData({ resetHistory: true });
+    fetchData({ resetHistory: true, source: 'initial' });
     return () => {
       requestVersionRef.current += 1;
       if (refreshInFlightRef.current?.serviceName === serviceName) {
@@ -271,17 +287,19 @@ export function useServiceDetails({ serviceName }) {
   }, [fetchData, serviceName]);
 
   const refreshData = useCallback(
-    () => fetchData({ invalidate: true }),
+    () => fetchData({ invalidate: true, source: 'manual', supersede: true }),
     [fetchData]
   );
 
   useEffect(() => {
     if (!serviceName) return undefined;
-    const interval = setInterval(refreshData, 60 * 1000);
+    const interval = setInterval(() => {
+      fetchData({ invalidate: true, source: 'poll' });
+    }, 60 * 1000);
     return () => {
       clearInterval(interval);
     };
-  }, [refreshData, serviceName]);
+  }, [fetchData, serviceName]);
 
   return {
     serviceData,
