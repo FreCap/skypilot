@@ -63,6 +63,30 @@ resource "terraform_data" "validation" {
       error_message = "The AWS provider region does not match var.region."
     }
     precondition {
+      condition = alltrue([
+        for arn in var.copy_worker_base_role_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:iam::")
+      ])
+      error_message = "Every copy worker base role must belong to the registry target's AWS partition."
+    }
+    precondition {
+      condition = alltrue([
+        for arn in var.lifecycle_worker_base_role_arns :
+        startswith(arn, "arn:${data.aws_partition.current.partition}:iam::")
+      ])
+      error_message = "Every lifecycle worker base role must belong to the registry target's AWS partition."
+    }
+    precondition {
+      condition = alltrue([
+        for target in values(var.targets) :
+        alltrue([
+          for arn in target.runtime_pull_principal_arns :
+          startswith(arn, "arn:${data.aws_partition.current.partition}:iam::")
+        ])
+      ])
+      error_message = "Every runtime pull principal must belong to the registry target's AWS partition."
+    }
+    precondition {
       condition     = length(distinct(values(local.workspace_hashes))) == length(local.workspace_hashes)
       error_message = "The declared workspace encoding has a collision."
     }
@@ -73,6 +97,16 @@ resource "terraform_data" "validation" {
     precondition {
       condition     = var.encryption_type == "KMS" ? var.kms_key_arn != null : var.kms_key_arn == null
       error_message = "kms_key_arn must be set only when encryption_type is KMS."
+    }
+    precondition {
+      condition = (
+        var.kms_key_arn == null ||
+        startswith(
+          var.kms_key_arn,
+          "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/",
+        )
+      )
+      error_message = "kms_key_arn must belong to the registry target's AWS partition, account, and region."
     }
     precondition {
       condition = alltrue([
@@ -294,6 +328,13 @@ resource "aws_iam_role" "copy_target" {
   permissions_boundary = aws_iam_policy.copy_role_boundary.arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "copy" })
+
+  lifecycle {
+    precondition {
+      condition     = length(data.aws_iam_policy_document.copy_trust.minified_json) <= var.applied_role_trust_policy_quota
+      error_message = "The rendered copy target role trust policy exceeds applied_role_trust_policy_quota."
+    }
+  }
 }
 
 resource "aws_iam_role" "lifecycle_target" {
@@ -302,6 +343,13 @@ resource "aws_iam_role" "lifecycle_target" {
   permissions_boundary = aws_iam_policy.lifecycle_role_boundary.arn
   max_session_duration = 3600
   tags                 = merge(local.common_tags, { "SkyPilotWorkerKind" = "lifecycle" })
+
+  lifecycle {
+    precondition {
+      condition     = length(data.aws_iam_policy_document.lifecycle_trust.minified_json) <= var.applied_role_trust_policy_quota
+      error_message = "The rendered lifecycle target role trust policy exceeds applied_role_trust_policy_quota."
+    }
+  }
 }
 
 locals {

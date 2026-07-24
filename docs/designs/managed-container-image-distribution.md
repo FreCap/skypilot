@@ -4,7 +4,7 @@ Status: implementation and verification in progress, feature disabled by default
 
 Owner: SkyPilot control plane
 
-Last updated: 2026-07-23
+Last updated: 2026-07-24
 
 ## Decision
 
@@ -813,10 +813,14 @@ destruction-protected because every region and any other Spot workload shares
 it; deliberate decommission removes regional targets and grants first. If a
 qualified AMI or snapshot is encrypted with a customer-managed KMS key, the
 regional target module receives that exact key ARN and grants the Spot
-service-linked role only the AWS-documented launch operations. AWS-managed EBS
-keys need no grant. Omitting a required customer-managed key makes
-qualification fail closed; the canary worker never receives direct KMS
-authority.
+service-linked role only the AWS-documented launch operations. The key must be
+in the compute target's partition and region, but it may belong to the source
+account that owns a shared encrypted AMI. The Terraform caller then requires
+cross-account `kms:CreateGrant`, `kms:ListGrants`, and `kms:RevokeGrant`
+authority from both that key policy and its own IAM policy so create, refresh,
+and teardown all remain usable. AWS-managed EBS keys need no grant. Omitting a
+required customer-managed key makes qualification fail closed; the canary
+worker never receives direct KMS authority.
 
 An ECR destination claim executes this fenced algorithm:
 
@@ -2155,6 +2159,17 @@ permissions boundaries, so accidentally broad identity policy on those roles
 cannot escape the fixed repository set. SkyPilot cannot constrain a dedicated
 account administrator; that administrative trust is explicit and all mutations
 are drift-checked and CloudTrail-audited.
+An optional external ID is either absent or satisfies the AWS STS request
+contract exactly: 2-1,224 characters containing only letters, digits, and
+`_+=,.@:/-`. Terraform rejects an invalid external ID before it can create a
+trust policy that workers cannot use at runtime.
+
+Terraform measures each rendered minified target-role trust policy against
+`applied_role_trust_policy_quota`. The account default is 2,048 characters; an
+operator may declare only an integer through AWS's 8,192-character maximum and
+must raise it above the default only after the account quota increase is
+applied. This keeps a long exact-principal list from failing for the first time
+during IAM role creation.
 
 The module renders every repository policy before apply, caps explicit pull
 principals, and fails when the provider policy-byte limit would be exceeded. A
@@ -2176,26 +2191,39 @@ grant-quota qualification.
 ```text
 infra/terraform/modules/aws-image-distribution
 infra/terraform/modules/aws-image-worker-identity
+infra/terraform/modules/aws-image-canary-account
+infra/terraform/modules/aws-image-canary-target
 infra/terraform/examples/aws-dedicated-skypilot-account
 ```
 
-The distribution module accepts partition, dedicated registry account ID,
-regional registry and compute-account provider aliases, catalog authority/realm,
-declared workspaces, prefix,
-fixed shard count/generation, manifest and declared-byte ceilings,
-encryption/scanning settings, quota headroom, exact compute pull-principal ARNs,
-qualified EC2 AMI IDs/helper fingerprint, optional organization/tag policy
-conditions, and exact worker base-role ARNs. It
-reads applied repository and images-per-repository quotas when permitted;
-otherwise it requires explicit validated inputs and leaves readiness false.
+The distribution module derives the partition from its regional AWS provider
+and verifies that provider's account and region against explicit inputs. It
+accepts the catalog authority, realm and profile, declared workspaces and
+repository prefix, exactly one regional target with fixed shard and capacity
+ceilings, exact runtime pull principals, exact worker base roles and target-role
+names, an optional AWS-valid STS external ID, encryption and scanning settings,
+repository-policy and quota ceilings, and the applied trust-policy quota. It
+reads the applied ECR images-per-repository quota when permitted; otherwise the
+operator supplies that verified value explicitly.
 
-Its secret-free qualification manifest contains desired config hash, timestamp,
-workspace encoding version, repository fingerprints and ceilings, role and
-permissions-boundary ARNs, repository-policy hashes, applied quotas, KMS/grant
-facts, rendered policy byte sizes, EC2 AMI/helper facts, and Terraform ownership
-tags. Background
-attesters compare this handoff with live provider state and actual-principal
-canaries before activation. Terraform output alone never claims live readiness.
+The worker-identity module binds three exact Kubernetes service accounts to
+separate IRSA roles and exact same-partition target-role sets. The account module
+owns the account-global EC2 Spot service-linked role. One canary-target module
+per compute account and region owns the bounded launch and inspection role plus
+any same-partition, same-region customer-managed AMI key grants. The companion
+example composes worker identity and two distribution regions; compute-account
+canary targets remain separate provider-scoped module calls as its README
+describes.
+
+The example's secret-free qualification manifest contains desired config and
+timestamp fields, regional repository identities and fingerprints, encryption
+and KMS-key facts, immutability and scanning settings, policy and Terraform-tag
+hashes, capacity ceilings, target-role and boundary-policy fingerprints, and
+ECR quota and worker-rate facts. Compute AMI, credential-helper, and Spot KMS
+grant facts remain in the profile binding and canary-target outputs rather than
+being invented by the distribution module. Background attesters compare the
+handoff with live provider state and actual-principal canaries before activation.
+Terraform output alone never claims live readiness.
 
 Import/adoption accepts only empty repositories with exact immutable settings
 and ownership tags. Nonempty adoption remains external. Repositories use
@@ -4154,6 +4182,143 @@ complete instance inventory, uses a 480-second cleanup budget with an absolute
 60-observation cadence, validates every policy-bearing ARN and target scope,
 and derives the EC2 service principal from the active partition. The acceptance
 streak remains zero.
+
+Codex exact-head review round 15 at
+`017de8ce3ab8a617f35ee54f00a6024504b51407` returned `RESHAPE`; the separate
+`claude-fable-5` maximum-effort request again returned HTTP 429 with zero tokens
+and provided no verdict. Codex re-proved the worker, PostgreSQL, Terraform,
+Helm, Dashboard, Serve, managed-job, and static-analysis gates, then demonstrated
+that the exact-ARN input boundary still admitted impossible AWS resource
+identifiers. Mocked plans accepted overlong IAM terminal names and paths,
+arbitrary-length EC2 IDs, a 600-character EKS cluster name, and an invalid KMS
+key ID even though those values flowed directly into launch, inspection,
+boundary, and grant policies. The intermediate candidate subsequently merged as
+`9e1b6ff8d06de533503662c518e2dc64f42c60d9`.
+
+The follow-up audit then expanded beyond the canary target. The worker-identity
+module also admitted wildcard target roles, unrelated or malformed OIDC
+providers, unbounded Kubernetes subjects, and cross-account permissions
+boundaries. The distribution module admitted wildcard trust and repository
+principals, overlong target role names, and malformed or cross-scope KMS keys.
+The corrective branch now validates all three Terraform boundaries:
+
+- the canary target enforces AWS path and terminal-name ceilings, exact legacy
+  or long lowercase EC2 IDs, bounded EKS cluster names, and UUID or `mrk-` KMS
+  key identifiers in the target partition and region, including keys owned by a
+  shared encrypted AMI's source account. It also fails planning when the
+  rendered, minified trust policy exceeds the account's applied quota, which
+  defaults to 2,048 characters and may be declared up to AWS's 8,192-character
+  adjustable maximum, and rejects optional external IDs outside the exact AWS
+  STS length and character contract;
+- the worker identity correlates the exact OIDC provider ARN with the canonical
+  HTTPS issuer in the active account and partition, bounds Kubernetes subjects,
+  rejects malformed percent escapes, and accepts only bounded exact
+  same-partition target roles and an optional same-account permissions
+  boundary. Each worker target set is capped at 64 roles and an 8,000-character
+  serialized-ARN budget below the 10,240-character role inline-policy ceiling;
+  and
+- the distribution target accepts only bounded exact same-partition worker and
+  runtime principal roles, AWS-valid role names, and an exact KMS key in the
+  active partition, account, and region. Its copy and lifecycle trust policies
+  are checked against the same applied quota before either target role can be
+  created, and its shared optional external ID must satisfy the exact AWS STS
+  request contract.
+
+Negative mocked plans cover wildcard, variable, malformed, overlong, overflow,
+cross-partition, cross-account, cross-region, and invalid external-ID inputs.
+Standard, China, and GovCloud plans prove the partition-neutral contract remains
+usable. The canary-target, worker-identity, and distribution suites pass 35, 30,
+and 25 mocked plans respectively. The acceptance streak remains zero until the
+corrective head passes a new exact-head review.
+
+The intermediate merge was published as immutable release `1.1.749`. Its image
+digest is
+`sha256:e2fdd7401cc4a53a878e1cfc37c329caa4b324ce8b7be259d37714e4b9b4d8f3`,
+and tag `v1.1.749` resolves directly to
+`9e1b6ff8d06de533503662c518e2dc64f42c60d9`. Production Helm revision 232
+completed its revision-scoped PostgreSQL migration Job and converged the API,
+copy, lifecycle, and canary Deployments to one Ready replica each on that exact
+digest. The API reported version `1.1.749` and the exact merge commit, while
+`boltz-l4-fleet` remained `READY` with 18 of 18 replicas. The normal
+improvements release lane subsequently advanced production to Helm revision 233
+and release `1.1.750` at
+`d27c165ebc6edf9d74c2cbdb72ae406ffabe73bf`. That commit changes only a legacy
+SSM unit-test expectation on top of the intermediate merge.
+
+The lane then advanced to Helm revision 234 and release `1.1.751`. Its copy
+worker deterministically found an existing `(workspace, profile, revision)`
+tuple with a different immutable payload, fell through to `INSERT`, and crashed
+on `uq_container_image_profile_revision`. The independently committed repair
+checks the locked candidate first: an exact `QUALIFYING` or `ACTIVE` replay is
+idempotent, while an immutable mismatch or non-operational replay raises a
+sanitized `ValueError` before custody lookup or DML. Qualification ingestion
+then terminalizes the durable operation as `FAILED`, and the per-file worker
+boundary continues to later manifests. Real PostgreSQL tests cover all three
+immutable fields in both operational states, durable failure terminalization,
+and worker continuation.
+
+Production was stabilized on release `1.1.752` and digest
+`sha256:a15552696d49121315e722e92f4bc782526e1a3bab5c5bfac1efdf273264a02d`.
+Helm revisions 235 and 236 completed their migration Jobs with the copy worker
+disabled in stored release values. The API, lifecycle worker, and canary worker
+were Ready on that exact digest. The stranded provider-free
+`PROFILE_QUALIFY` operation was moved through the normal application state
+transition from `PENDING` to `FAILED` with `QUALIFICATION_FAILED`; the
+operation table then contained no `PENDING` or `RUNNING` rows. Helm revision
+237 restored the copy worker on `1.1.752`; its failed-operation replay remained
+stable and did not repeat the unique-key crash.
+
+The ordinary release lane advanced to `1.1.753`. Its first upgrade attempt,
+Helm revision 238, failed after partially updating the workers because two
+stored indexed `extraInitContainers[index].image` values replaced the complete
+strategic-merge list entries with image-only maps. Kubernetes correctly rejected
+those entries because they lacked the required `name` merge key. Revision 239
+supplied the complete init-container objects and converged `1.1.753`. Future
+upgrades must set only the top-level
+`apiService.image`, or replace each list item in full; indexed list-field
+overrides are not safe with `--reuse-values`.
+
+The immutable conflict repair merged in PR 904 as
+`ecb41022a9a9ab2b805cb4560a1f2febea33f95d` and was published as release
+`1.1.754`. The image digest is
+`sha256:ee78c0b3e4e2b90bfb64462e9ea2cf1b959a7245b01b3584785da4d609d99fe4`;
+the chart digest is
+`sha256:c46a2f26cb42f3700925ebec4d83185480831b78eda4455e39969f50f0fdbb87`.
+Production Helm revision 240 completed its revision-scoped migration Job and
+converged the API, copy, lifecycle, and canary Deployments to one Ready replica
+each on that exact image digest with zero restarts. The API reports version
+`1.1.754` and the exact merge commit. Multiple readiness refreshes show fresh,
+idle `1.1.754` worker heartbeats and zero queued, in-flight, failed, or
+quarantined image work. The repaired provider-free operation remains the same
+terminal `FAILED` record with no lease or child.
+
+Qualification then completed for profile revision 2, whose EC2 runtime binding
+uses the new default `canary_use_spot: true`. Revision 2 is now `ACTIVE` with
+all required infrastructure, copy, lifecycle, and runtime attestations Ready;
+revision 1 is `RETIRED`. Existing services and managed jobs retain their own
+capacity policies. Post-rollout verification kept `boltz-l4-fleet` `READY` at
+18 of 18 replicas, and its load-balancer health and liveness endpoints both
+returned HTTP 200.
+
+The normal improvements lane subsequently published release `1.1.755` at
+`c21d7e5e5011605c471568a9ad6598b219dec779`. Its image digest is
+`sha256:1d43416933904f694474a644be5bfaddc12dd3981dff0c0165ba3ed0e7768c67`,
+and its chart digest is
+`sha256:6187278300994576df2e71896646f0684145a53d437e3877296dd3e76c50624a`.
+Helm revision 241 preserved both complete named init-container objects,
+completed its migration Job, and converged the same four Deployments to one
+Ready replica each on that exact image digest with zero restarts. The API
+reports the exact release and commit; all three image workers remain fresh and
+idle, profile revision 2 remains `ACTIVE`, and the repaired qualification
+operation remains unchanged.
+
+The rollout deliberately scaled all three old worker Deployments to zero before
+the Helm upgrade. This prevented the legacy worker binary from overlapping a
+binary that understands `canary_use_spot`. Durable revision 1 omitted that
+field and therefore retained the legacy on-demand interpretation until revision
+2 qualified. The compute-account role now exercises the bounded Spot request,
+tagging, inspection, cancellation, and cleanup contract for new EC2
+qualification canaries.
 
 ### Live prototype verification, July 23, 2026
 
