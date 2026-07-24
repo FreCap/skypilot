@@ -2685,6 +2685,82 @@ class TestRunJobLoopOwnershipCleanup:
         job_done.assert_awaited_once_with(3)
 
     @pytest.mark.asyncio
+    async def test_cleanup_failure_preserves_terminal_job_status(self, caplog):
+        manager = ControllerManager('test-uuid')
+        manager.starting.add(3)
+        manager._cleanup = AsyncMock(
+            side_effect=RuntimeError('worker connection timed out'))
+        manager._cleanup_api_server_access_token = MagicMock()
+
+        ctx = MagicMock()
+        controller = MagicMock()
+        controller.run = AsyncMock(return_value=True)
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'), \
+                patch('sky.jobs.controller.JobController',
+                      return_value=controller), \
+                patch('sky.jobs.controller.managed_job_state.get_status_async',
+                      new_callable=AsyncMock,
+                      side_effect=[
+                          managed_job_state.ManagedJobStatus.SUCCEEDED,
+                          managed_job_state.ManagedJobStatus.SUCCEEDED,
+                      ]), \
+                patch('sky.jobs.controller.managed_job_state.set_failed_async',
+                      new_callable=AsyncMock) as set_failed, \
+                patch('sky.jobs.controller.scheduler.job_done_async',
+                      new_callable=AsyncMock) as job_done:
+            await manager.run_job_loop(3, '/dev/null')
+
+        set_failed.assert_not_awaited()
+        job_done.assert_awaited_once_with(3)
+        assert 'Preserving terminal job status' in caplog.text
+        assert 'worker connection timed out' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_marks_nonterminal_job_failed_controller(
+            self):
+        manager = ControllerManager('test-uuid')
+        manager.starting.add(3)
+        manager._cleanup = AsyncMock(
+            side_effect=RuntimeError('worker connection timed out'))
+        manager._cleanup_api_server_access_token = MagicMock()
+
+        ctx = MagicMock()
+        controller = MagicMock()
+        controller.run = AsyncMock(return_value=True)
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'), \
+                patch('sky.jobs.controller.JobController',
+                      return_value=controller), \
+                patch('sky.jobs.controller.managed_job_state.get_status_async',
+                      new_callable=AsyncMock,
+                      side_effect=[
+                          managed_job_state.ManagedJobStatus.RUNNING,
+                          managed_job_state.ManagedJobStatus.FAILED_CONTROLLER,
+                      ]), \
+                patch('sky.jobs.controller.managed_job_state.set_failed_async',
+                      new_callable=AsyncMock) as set_failed, \
+                patch('sky.jobs.controller.scheduler.job_done_async',
+                      new_callable=AsyncMock) as job_done:
+            await manager.run_job_loop(3, '/dev/null')
+
+        set_failed.assert_awaited_once()
+        _, kwargs = set_failed.await_args
+        assert kwargs['failure_type'] == (
+            managed_job_state.ManagedJobStatus.FAILED_CONTROLLER)
+        assert kwargs['override_terminal']
+        assert 'worker connection timed out' in kwargs['failure_reason']
+        job_done.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('cleanup_error', [
         None,
         RuntimeError('token database unavailable'),
