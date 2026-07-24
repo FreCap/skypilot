@@ -27,6 +27,7 @@ def test_plain_ssm_command_gets_wrapped():
     wrapped = _upgrade(SSM_CMD)
     assert wrapped.startswith('env AWS_RETRY_MODE=adaptive')
     assert 'skypilot_ssm_target=' in wrapped
+    assert '%%s\\n' in wrapped
     assert backend_utils._SSM_TARGET_NOT_FOUND_MESSAGE in wrapped  # pylint: disable=protected-access
 
 
@@ -68,12 +69,25 @@ def test_existing_wrapped_form_gets_empty_target_guard():
     assert backend_utils._SSM_TARGET_NOT_FOUND_MESSAGE in upgraded  # pylint: disable=protected-access
 
 
+def test_existing_guarded_form_repairs_openssh_percent_escape():
+    fixed = _upgrade(SSM_CMD)
+    broken = fixed.replace('%%s\\n', '%s\\n')
+    assert broken != fixed
+    assert _upgrade(broken) == fixed
+
+
 def test_empty_target_fails_before_start_session():
     raw = ("aws ssm start-session --target \"$(printf '')\" "
            '--region us-east-2 --document-name AWS-StartSSHSession '
            '--parameters portNumber=%p')
-    upgraded = _upgrade(raw).replace('%h', '203.0.113.1').replace('%p', '22')
-    result = subprocess.run(['/bin/sh', '-c', f'exec {upgraded}'],
+    upgraded = _upgrade(raw)
+    # Exercise OpenSSH's real ProxyCommand token expansion.  A literal ``%s``
+    # is rejected before the proxy shell starts; ``%%s`` reaches printf as the
+    # intended format string.  The empty lookup exits before any network call.
+    result = subprocess.run([
+        'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=1', '-o',
+        f'ProxyCommand={upgraded}', '203.0.113.1'
+    ],
                             capture_output=True,
                             text=True,
                             check=False)

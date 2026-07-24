@@ -151,6 +151,10 @@ _SSM_ADAPTIVE_RETRY_WRAPPER_PREFIX = (
 _SSM_TARGET_VARIABLE = 'skypilot_ssm_target'
 _SSM_TARGET_NOT_FOUND_MESSAGE = (
     'SkyPilot SSM target instance not found for SSH host %h')
+_SSM_LEGACY_TARGET_NOT_FOUND_PRINTF = "printf '%s\\n'"
+# ProxyCommand percent tokens are expanded by OpenSSH before the shell runs.
+# Escape printf's literal percent so OpenSSH passes ``%s`` to /bin/sh.
+_SSM_TARGET_NOT_FOUND_PRINTF = "printf '%%s\\n'"
 _SSM_START_SESSION_WITH_LOOKUP_PATTERN = re.compile(
     r'^aws ssm start-session --target "\$\((?P<lookup>.*)\)" '
     r'(?P<arguments>.*)$', re.DOTALL)
@@ -176,7 +180,11 @@ def _guard_ssm_proxy_command_target(ssm_proxy_command: str) -> str:
     StartSession is invoked.
     """
     if f'{_SSM_TARGET_VARIABLE}=' in ssm_proxy_command:
-        return ssm_proxy_command
+        # Repair guarded commands persisted by releases that emitted an
+        # unescaped printf format.  OpenSSH rejects ``%s`` as an unknown
+        # ProxyCommand token before executing the otherwise healthy command.
+        return ssm_proxy_command.replace(_SSM_LEGACY_TARGET_NOT_FOUND_PRINTF,
+                                         _SSM_TARGET_NOT_FOUND_PRINTF)
     match = _SSM_START_SESSION_WITH_LOOKUP_PATTERN.fullmatch(ssm_proxy_command)
     if match is None:
         return ssm_proxy_command
@@ -188,7 +196,8 @@ def _guard_ssm_proxy_command_target(ssm_proxy_command: str) -> str:
             'if [ "$skypilot_ssm_lookup_status" -ne 0 ]; then '
             'exit "$skypilot_ssm_lookup_status"; fi; '
             f'if [ -z "${_SSM_TARGET_VARIABLE}" ]; then '
-            f"printf '%s\\n' {message} >&2; exit 255; fi; "
+            f'{_SSM_TARGET_NOT_FOUND_PRINTF} {message} >&2; '
+            'exit 255; fi; '
             'exec aws ssm start-session '
             f'--target "${_SSM_TARGET_VARIABLE}" {arguments}')
 
