@@ -29,6 +29,18 @@ mock_provider "aws" {
     }
   }
 
+  mock_data "aws_iam_policy" {
+    defaults = {
+      arn         = "arn:aws-us-gov:iam::123456789012:policy/boundaries/organization"
+      description = "Organization-managed GovCloud permissions boundary"
+      id          = "arn:aws-us-gov:iam::123456789012:policy/boundaries/organization"
+      name        = "organization"
+      path        = "/boundaries/"
+      policy      = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"OrganizationBoundary\",\"Effect\":\"Allow\",\"Action\":[\"ecr:*\",\"servicequotas:GetAWSDefaultServiceQuota\",\"servicequotas:GetServiceQuota\"],\"Resource\":\"*\"}]}"
+      policy_id   = "ANPAGOVEXTERNALBOUNDARY"
+    }
+  }
+
   mock_data "aws_iam_policy_document" {
     defaults = {
       id            = "terraform-test-policy"
@@ -140,5 +152,29 @@ run "govcloud_accepts_exact_principals_and_kms_key" {
       "arn:aws-us-gov:iam::123456789012:role/workers/image-copy-worker",
     ])
     error_message = "GovCloud target-role trust must preserve the exact worker principal."
+  }
+}
+
+run "govcloud_accepts_same_account_external_boundary" {
+  command = plan
+
+  variables {
+    permissions_boundary_arn = "arn:aws-us-gov:iam::123456789012:policy/boundaries/organization"
+  }
+
+  assert {
+    condition = (
+      aws_iam_role.copy_target.permissions_boundary == var.permissions_boundary_arn &&
+      aws_iam_role.lifecycle_target.permissions_boundary == var.permissions_boundary_arn
+    )
+    error_message = "GovCloud target roles must attach an exact same-account GovCloud boundary."
+  }
+
+  assert {
+    condition = (
+      output.role_fingerprints["us-gov-west-1:copy_boundary_policy_hash"] == sha256(jsonencode(jsondecode(data.aws_iam_policy.external_role_boundary[0].policy))) &&
+      output.role_fingerprints["us-gov-west-1:lifecycle_boundary_policy_hash"] == sha256(jsonencode(jsondecode(data.aws_iam_policy.external_role_boundary[0].policy)))
+    )
+    error_message = "GovCloud qualification must fingerprint the attached external boundary document."
   }
 }

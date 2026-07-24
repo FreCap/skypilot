@@ -23,8 +23,8 @@ output "role_fingerprints" {
     "${var.region}:copy_policy_hash"                  = sha256(data.aws_iam_policy_document.copy_permissions.json)
     "${var.region}:lifecycle_role_arn"                = local.lifecycle_target_role_arn
     "${var.region}:lifecycle_policy_hash"             = sha256(data.aws_iam_policy_document.lifecycle_permissions.json)
-    "${var.region}:copy_boundary_policy_hash"         = sha256(data.aws_iam_policy_document.copy_role_boundary.json)
-    "${var.region}:lifecycle_boundary_policy_hash"    = sha256(data.aws_iam_policy_document.lifecycle_role_boundary.json)
+    "${var.region}:copy_boundary_policy_hash"         = sha256(local.copy_boundary_policy_fingerprint_document)
+    "${var.region}:lifecycle_boundary_policy_hash"    = sha256(local.lifecycle_boundary_policy_fingerprint_document)
     "${var.region}:qualification_repo_arn"            = local.active_qualification_repository.arn
     "${var.region}:qualification_policy_hash"         = sha256(jsonencode(jsondecode(data.aws_iam_policy_document.qualification.json)))
     "${var.region}:qualification_ownership_tags_hash" = sha256(jsonencode(local.active_qualification_repository.tags_all))
