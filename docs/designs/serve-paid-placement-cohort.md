@@ -6,21 +6,28 @@ _Last updated: 2026-07-24_
 
 ## Status
 
-The PostgreSQL global paid-capacity authority shipped in production as
-revision 027. PR #909 reduced its exact-pool bootstrap from 60 to four, added a
-sticky failure cooldown and one-probe recovery, bounded controller submission
-by API worker capacity, and corrected dashboard lifecycle semantics. It passed
-the full PR suite, including the required real-PostgreSQL lane, and shipped as
-image and chart 1.1.759 from merge `1f0bc56953ecc7d7366f7f6858234ea751c2cf98`.
+The PostgreSQL global paid-capacity authority shipped with database migration
+027. PR #909 reduced its exact-pool bootstrap from 60 to four, added a sticky
+failure cooldown and one-probe recovery, bounded controller submission by API
+worker capacity, and corrected dashboard lifecycle semantics. It passed the
+full PR suite, including the required real-PostgreSQL lane, and shipped as
+image and chart 1.1.759 from merge
+`1f0bc56953ecc7d7366f7f6858234ea751c2cf98`.
 
 The first production cycle exposed a second-order amplification across exact
 pools: after the inherited 72-claim legacy cohort drained, one service acquired
 49 unresolved claims across 28 independent pools (four claims in seven new
 pools and one probe in 21 previously failed pools). The exact-pool invariants
 held, but their sum was still too large for one service. The follow-up
-correction adds an atomic 16-claim per-service envelope across pools. Its
-implementation, CI, and production verification are in progress on
-`fix/serve-paid-service-cohort`.
+correction adds an atomic 16-claim per-service envelope across pools. PR #915
+passed the full suite, including the real-PostgreSQL lane, and merged as
+`c249e39368edfa98d7de240716ce88721d1da909`. The exact correction image and
+chart were published as 1.1.768. Production is on the subsequent 1.1.769
+release, which contains that merge, at Helm revision 254. The live controller
+adopted an inherited 27-claim overage, reported `service_limit=16` and
+`service_remaining=0`, and created no post-deployment claim while over limit.
+After normal outcomes reduced the inherited cohort to five, it exposed 11
+slots, acquired exactly 11 fresh claims, and stopped at 16 total.
 
 ## Problem
 
@@ -623,7 +630,7 @@ persist_completed_launches(
 ) -> bool | None
 ```
 
-`ClaimResult` is one of `ACQUIRED`, `SATURATED`,
+`ClaimResult` is one of `ACQUIRED`, `SATURATED`, `SERVICE_SATURATED`,
 `HIGHER_PRIORITY_WAITING`, `OWNERSHIP_LOST`, or `LEGACY_LOCAL`.
 
 `serve_state.py` owns the PostgreSQL transaction, storage primitives, and
@@ -851,19 +858,69 @@ Corrective local evidence on 2026-07-24:
 - PR #909 passed every visible check, including the mandatory PostgreSQL unit
   lane, and merged as `1f0bc56953ecc7d7366f7f6858234ea751c2cf98`.
 - Image and chart 1.1.759 passed registry readback and rolled out through Helm
-  revision 314. The API deployment became healthy and reported the exact merge
-  commit.
+  revisions 248 and 249. The API deployment became healthy and reported the
+  exact merge commit. The previously recorded 314 was the Kubernetes
+  Deployment generation, not a Helm revision.
 - The inherited 72-claim cohort drained without new admissions and produced
   one aggregate `failures=72, exact_pools=3` warning. The next fresh cycle
   proved the exact-pool cooldown/probe policy but exposed 49 aggregate claims
   across 28 pools, motivating the service envelope above.
 
-## Open Release Gates
+Follow-up correction evidence on 2026-07-24:
 
-- Implement and validate the 16-claim service envelope, including a
+- 546 focused Python tests passed serially. A broad xdist run encountered one
+  known shared-state ordering failure that passed immediately in isolation.
+- The two added PostgreSQL cases cover a 12-thread distinct-pool race and
+  legacy-overage reconciliation. They were collected but skipped locally
+  because this host has no Docker daemon; PR #915's mandatory real-PostgreSQL
+  lane passed.
+- Mypy passed 746 source files. Changed production files passed pylint at
+  10.00/10. YAPF, isort, dashboard ESLint/Prettier, and `git diff --check`
+  passed.
+- Every visible PR #915 check passed, including all optimizer, compatibility,
+  limited-dependency, no-parallel, dashboard, static-analysis, and
+  PostgreSQL-backed unit lanes. The PR merged as
+  `c249e39368edfa98d7de240716ce88721d1da909`.
+- Image and chart 1.1.768 passed exact-revision registry readback. The
+  subsequent image and chart 1.1.769 at
+  `7218e4453b3612e9423378b557da775e16785f05` contain the correction merge and
+  deployed with existing Helm values reused. PostgreSQL migration job
+  `skypilot-db-migration-254` completed, Helm revision 254 reached deployed,
+  and Kubernetes Deployment revision 319 became 1/1 ready.
+- The live API reports version 1.1.769 at the exact release commit and external
+  `/api/health` returns healthy. The first service-controller attempt timed out
+  while its external load balancer recovered from the Recreate handoff; the
+  supervised retry became healthy, and both load-balancer slots resumed
+  successful controller synchronization.
+- Immediately before rollout, the service held 201 unresolved paid claims
+  across 110 exact pools. At 08:47 UTC its newest claim was 08:46:39. After
+  normal outcomes drained the inherited cohort to 27, the new controller
+  reported `service_claims=27, service_limit=16, service_remaining=0` and
+  `Stopping logical scale-up wave at the service paid-capacity envelope.`
+  Repeated database samples through 09:12 UTC found zero post-deployment
+  claims; the newest timestamp remained 08:46:39 despite scale-up requests
+  with launch budgets of 83 and 412.
+- At 09:14 UTC a bounded provider-capacity wave reported
+  `failures=5, exact_pools=5`. The next admission summary observed five
+  remaining claims and `service_remaining=11`; the controller acquired exactly
+  11 fresh claims. Four subsequent database samples found 16 total claims and
+  no newer claim timestamp, proving the first below-limit production cycle
+  stopped at the service envelope.
+- The admission summary remained one bounded aggregate without pool keys, and
+  provider-capacity errors remained aggregated in the controller log. The
+  09:11 UTC history bucket carried `capacity_semantics_version=2` and reported
+  target 497, ready capacity 384, and provisioning capacity 27.
+
+## Release Gate Results
+
+- Complete: implement and validate the 16-claim service envelope, including a
   real-PostgreSQL distinct-pool race.
-- Pass the full visible PR CI on the follow-up integrated head.
-- Publish and deploy the follow-up with reused Helm values.
-- Verify the live service drains its existing overage, never exceeds 16 fresh
-  paid claims, retains one-per-failed-pool probes, and keeps bounded aggregate
-  logs and semantics-v2 history.
+- Complete: pass the full visible PR CI on the follow-up integrated head.
+- Complete: publish and deploy the follow-up with reused Helm values.
+- Complete: verify that an upgraded live controller adopts an inherited
+  service overage, admits no fresh claim while over limit, stops large
+  scale-up waves at the envelope, retains bounded aggregate logs, and
+  publishes semantics-v2 history.
+- Complete: observe the inherited production cohort fall below 16 and verify
+  the controller fills only the remaining 11 slots, leaving the first fresh
+  cycle at exactly 16 claims.
