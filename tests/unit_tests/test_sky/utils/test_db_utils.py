@@ -234,21 +234,21 @@ class TestGetEngine:
             assert call_args[0][0] == 'postgresql://user:pass@localhost/db'
             assert call_args[1]['poolclass'] == sqlalchemy.pool.QueuePool
             assert call_args[1]['pool_size'] == 10
-            assert call_args[1]['max_overflow'] == 0  # max(0, 5-10)
+            assert call_args[1]['max_overflow'] == 0
+            assert call_args[1]['pool_timeout'] == 15
             assert call_args[1]['pool_pre_ping'] is True
             assert call_args[1]['pool_recycle'] == 1800
             assert call_args[1]['connect_args'] == {'connect_timeout': 15}
             assert engine == mock_engine
 
-    def test_postgres_sync_engine_queuepool_max_overflow_calculation(
+    def test_postgres_sync_engine_queuepool_limit_has_no_overflow(
             self, monkeypatch):
-        """Test max_overflow calculation with different pool sizes."""
+        """Test small configured limits remain strict QueuePool limits."""
         monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
         monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
                            'postgresql://user:pass@localhost/db')
 
-        # Test with pool_size=2, max_overflow should be 3
-        db_utils.set_max_connections(2)
+        db_utils.set_max_connections(1)
 
         with mock.patch('sqlalchemy.create_engine') as mock_create:
             mock_engine = mock.MagicMock()
@@ -257,7 +257,14 @@ class TestGetEngine:
             db_utils.get_engine(db_name='ignored')
 
             call_args = mock_create.call_args
-            assert call_args[1]['max_overflow'] == 3  # max(0, 5-2)
+            assert call_args[1]['pool_size'] == 1
+            assert call_args[1]['max_overflow'] == 0
+            assert call_args[1]['pool_timeout'] == 15
+
+    def test_max_connections_must_be_non_negative(self):
+        with pytest.raises(ValueError,
+                           match='max_connections must be non-negative'):
+            db_utils.set_max_connections(-1)
 
     def test_postgres_async_engine_creation(self, monkeypatch):
         """Test Postgres async engine uses asyncpg and NullPool."""

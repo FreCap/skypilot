@@ -50,6 +50,9 @@ _MAX_MEM_PERCENT_FOR_BLOCKING = 0.6
 _MIN_LONG_WORKERS = 1
 # Minimal number of idle short workers to ensure responsiveness.
 _MIN_IDLE_SHORT_WORKERS = 1
+# Keep the historical per-process burst ceiling while allocating it from the
+# database-wide connection budget instead of manufacturing QueuePool overflow.
+_MAX_DB_CONNECTIONS_PER_WORKER = 5
 
 # Default number of burstable workers for local API server. A heuristic number
 # that is large enough for most local cases.
@@ -148,9 +151,10 @@ def compute_server_config(
     queue_backend = QueueBackend.MULTIPROCESSING
     burstable_parallel_for_long = 0
     burstable_parallel_for_short = 0
-    # if num_db_connections_per_worker is 0, server will use NullPool
-    # to conserve the number of concurrent db connections.
-    # This could lead to performance degradation.
+    # If num_db_connections_per_worker is 0, synchronous PostgreSQL engines use
+    # NullPool. This keeps idle workers from reserving database connections,
+    # although concurrent unpooled operations remain governed by PostgreSQL.
+    # A positive value is a strict per-process QueuePool limit.
     num_db_connections_per_worker = 0
     num_server_workers = cpu_count
 
@@ -195,12 +199,18 @@ def compute_server_config(
             if not quiet:
                 logger.warning(
                     f'Max parallel all workers ({max_parallel_all_workers}) '
-                    'is greater than max db connections '
+                    'is greater than usable db connections '
                     f'({max_db_connections}). Increase the number of max db '
                     f'connections to at least {max_parallel_all_workers} for '
                     'optimal performance.')
         else:
-            num_db_connections_per_worker = 1
+            # QueuePool is lazy, so this is the strict per-process ceiling
+            # rather than an eager reservation. Integer division guarantees
+            # that the sum of every process-local pool cannot exceed the
+            # PostgreSQL capacity available to ordinary connections.
+            num_db_connections_per_worker = min(
+                _MAX_DB_CONNECTIONS_PER_WORKER,
+                max_db_connections // max_parallel_all_workers)
 
     if not quiet:
         logger.info(

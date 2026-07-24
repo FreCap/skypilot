@@ -57,6 +57,10 @@ _SQLITE_BUSY_BACKOFF_MULTIPLIER = 3
 # unavailable. libpq otherwise has no connection deadline, so one transient
 # routing failure can indefinitely stall a Serve controller's reconciliation.
 _POSTGRES_CONNECT_TIMEOUT_SECONDS = 15
+# Bound QueuePool checkout separately from connection establishment. A leaked
+# or unexpectedly long transaction must not leave a worker waiting forever for
+# another connection from its process-local budget.
+_POSTGRES_POOL_TIMEOUT_SECONDS = 15
 
 
 def is_sqlite_busy_error(e: BaseException) -> bool:
@@ -599,7 +603,16 @@ _db_creation_lock = threading.Lock()
 
 
 def set_max_connections(max_connections: int):
+    """Set the strict process-local synchronous PostgreSQL connection limit.
+
+    Zero disables connection reuse with ``NullPool``; it does not cap concurrent
+    unpooled operations. A positive value is enforced by ``QueuePool`` without
+    overflow. Configure this before creating a synchronous PostgreSQL engine so
+    the cached engine cannot silently retain a stale pool policy.
+    """
     global _max_connections
+    if max_connections < 0:
+        raise ValueError('max_connections must be non-negative')
     _max_connections = max_connections
 
 
@@ -663,6 +676,13 @@ def get_engine(
         db_name: The name of the database. ONLY used for SQLite. On Postgres,
         we use a single database, which we get from the connection string.
         async_engine: Whether to return an async engine.
+
+    PostgreSQL synchronous engines use the process-local policy configured by
+    ``set_max_connections``. Positive limits are strict: pool overflow is
+    disabled and checkout waits are bounded. Async engines deliberately use
+    ``NullPool`` because the cached engine can be used from multiple event
+    loops; their concurrency is governed by the calling server/executor path,
+    not by this synchronous pool setting.
     """
     conn_string = None
     if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None:
@@ -701,12 +721,17 @@ def get_engine(
                             'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS
                         }))
                 else:
-                    # Sync engines can safely use QueuePool for connection reuse
+                    # A positive value is a strict process-local limit, not a
+                    # target idle size. In particular, do not restore the
+                    # historical "at least five" overflow behavior here: the
+                    # server distributes PostgreSQL's usable connection
+                    # capacity across its processes.
                     _postgres_engine_cache[cache_key] = (sqlalchemy.create_engine(
                         conn_string,
                         poolclass=sqlalchemy.pool.QueuePool,
                         pool_size=_max_connections,
-                        max_overflow=max(0, 5 - _max_connections),
+                        max_overflow=0,
+                        pool_timeout=_POSTGRES_POOL_TIMEOUT_SECONDS,
                         pool_pre_ping=True,
                         pool_recycle=1800,
                         connect_args={

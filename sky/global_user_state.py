@@ -4328,13 +4328,21 @@ def mark_operator_notifications_read(user_id: str,
 
 
 def get_max_db_connections() -> int | None:
-    """Get the maximum number of connections for the engine."""
+    """Get PostgreSQL connection capacity available to ordinary clients."""
     engine = _db_manager.get_engine()
     if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
         return None
     with sqlalchemy.orm.Session(engine) as session:
-        max_connections = session.execute(
-            sqlalchemy.text('SHOW max_connections')).scalar()
-        if max_connections is None:
+        settings = session.execute(
+            sqlalchemy.text(
+                "SELECT current_setting('max_connections'), "
+                "current_setting('superuser_reserved_connections'), "
+                "current_setting('reserved_connections', true)")).one()
+        max_connections, superuser_reserved, reserved = settings
+        if max_connections is None or superuser_reserved is None:
             return None
-        return int(max_connections)
+        # ``reserved_connections`` was added in PostgreSQL 16. The
+        # missing_ok=true lookup returns NULL on older supported versions.
+        return max(
+            0,
+            int(max_connections) - int(superuser_reserved) - int(reserved or 0))
