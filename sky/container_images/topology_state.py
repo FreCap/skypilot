@@ -428,14 +428,21 @@ def stage_profile_revision(*,
                 table.c.workspace == workspace, table.c.profile == profile,
                 table.c.revision ==
                 revision).with_for_update()).mappings().first()
-        if (candidate is not None and
+        if candidate is not None:
+            immutable_payload_matches = (
                 str(candidate['config_hash']) == config_hash and
                 str(candidate['config_json']) == encoded_config and
                 str(candidate['physical_manifest_hash'])
-                == physical_manifest_hash and str(candidate['state'])
-                in (models.ImageProfileState.QUALIFYING.value,
-                    models.ImageProfileState.ACTIVE.value)):
-            return _profile(candidate)
+                == physical_manifest_hash)
+            if not immutable_payload_matches:
+                raise ValueError(
+                    'Registry profile revision immutable payload mismatch.')
+            if str(candidate['state']) in (
+                    models.ImageProfileState.QUALIFYING.value,
+                    models.ImageProfileState.ACTIVE.value):
+                return _profile(candidate)
+            raise ValueError(
+                'Registry profile revision is no longer operational.')
 
         custody = session.execute(
             sqlalchemy.select(schema.profile_custody).where(

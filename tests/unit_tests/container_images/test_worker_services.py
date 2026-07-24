@@ -4459,6 +4459,22 @@ def test_manifest_ingestion_stops_between_independent_files(
     assert ingest.call_args.kwargs['profile_name'] == 'a.json'
 
 
+def test_manifest_ingestion_continues_after_sanitized_failure(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    for name in ('a.json', 'b.json'):
+        (tmp_path / name).write_text(json.dumps({'profile': name}),
+                                     encoding='utf-8')
+    ingest = mock.Mock(side_effect=[ValueError('QUALIFICATION_FAILED'), None])
+    monkeypatch.setattr(copy_worker_service.qualification, 'ingest_manifest',
+                        ingest)
+
+    assert copy_worker_service._ingest_qualification_manifests(
+        str(tmp_path)) == 1
+
+    assert [call.kwargs['profile_name'] for call in ingest.call_args_list
+           ] == ['a.json', 'b.json']
+
+
 def test_publication_fanout_stops_between_location_transactions(
         monkeypatch: pytest.MonkeyPatch) -> None:
     stop = threading.Event()

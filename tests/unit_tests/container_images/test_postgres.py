@@ -6047,6 +6047,114 @@ def test_operational_profile_readiness_excludes_unbounded_history_and_uses_index
             in str(qualification_plan))
 
 
+@pytest.mark.parametrize('state', [
+    models.ImageProfileState.QUALIFYING,
+    models.ImageProfileState.ACTIVE,
+])
+def test_profile_staging_exact_operational_replay_is_idempotent(
+        image_database, profile: models.ManagedRegistryProfile,
+        state: models.ImageProfileState) -> None:
+    staged = _stage_candidate_profile(profile, now=10)
+    if state == models.ImageProfileState.ACTIVE:
+        with image_database.begin() as connection:
+            connection.execute(schema.profile_revisions.update().where(
+                schema.profile_revisions.c.id == staged.id).values(
+                    state=state.value))
+    expected = topology_state.get_profile_revision(staged.id)
+    assert expected is not None
+
+    replayed = _stage_candidate_profile(profile, now=20)
+
+    assert replayed == expected
+    assert topology_state.list_profile_revisions(
+        'research', profile=profile.name) == [expected]
+
+
+@pytest.mark.parametrize(('column', 'mismatched_value'), [
+    ('config_hash', '0' * 64),
+    ('config_json', '{}'),
+    ('physical_manifest_hash', '0' * 64),
+])
+@pytest.mark.parametrize('state', [
+    models.ImageProfileState.QUALIFYING,
+    models.ImageProfileState.ACTIVE,
+])
+def test_profile_staging_rejects_immutable_mismatch_before_mutation(
+        image_database, profile: models.ManagedRegistryProfile, column: str,
+        mismatched_value: str, state: models.ImageProfileState) -> None:
+    staged = _stage_candidate_profile(profile, now=10)
+    with image_database.begin() as connection:
+        connection.execute(schema.profile_revisions.update().where(
+            schema.profile_revisions.c.id == staged.id).values(
+                state=state.value, **{column: mismatched_value}))
+    statements: list[str] = []
+
+    def record_statements(_connection, _cursor, statement, _parameters,
+                          _context, _executemany) -> None:
+        statements.append(statement)
+
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            record_statements)
+    try:
+        with pytest.raises(ValueError, match='immutable payload mismatch'):
+            _stage_candidate_profile(profile, now=20)
+    finally:
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                record_statements)
+
+    assert not any(statement.lstrip().upper().startswith(('INSERT', 'UPDATE'))
+                   for statement in statements)
+    current = topology_state.get_profile_revision(staged.id)
+    assert current is not None
+    assert current.state == state
+    assert current.desired_generation == staged.desired_generation
+    assert len(
+        topology_state.list_profile_revisions('research',
+                                              profile=profile.name)) == 1
+
+
+def test_qualification_ingest_immutable_revision_conflict_terminalizes_operation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    existing_profile = dataclasses.replace(profile, realm='legacy')
+    staged = _stage_candidate_profile(existing_profile, now=10)
+    parsed = types.SimpleNamespace(profile=profile.name,
+                                   workspace='research',
+                                   manifest_hash='1' * 64)
+    monkeypatch.setattr(qualification.aws.TerraformQualificationManifest,
+                        'from_json', staticmethod(lambda _payload: parsed))
+    monkeypatch.setattr(
+        qualification.aws, 'ingest_terraform_qualification',
+        lambda _payload: _stage_candidate_profile(profile, now=20))
+
+    with pytest.raises(ValueError, match='^QUALIFICATION_FAILED$'):
+        qualification.ingest_manifest(
+            profile_name=profile.name,
+            manifest={'profile': profile.name},
+            actor_hash='2' * 64,
+            idempotency_key='qualification-conflict-key')
+
+    with image_database.connect() as connection:
+        row = connection.execute(sqlalchemy.select(
+            schema.operations)).mappings().one()
+    operation = catalog_state._operation(row)
+    assert operation.kind == 'PROFILE_QUALIFY'
+    assert operation.state == models.ImageOperationState.FAILED
+    assert operation.result_kind == 'qualification'
+    assert operation.result_id == operation.id
+    assert operation.result == {
+        'profile': profile.name,
+        'state': models.ImageOperationState.FAILED.value,
+    }
+    assert operation.error_code == 'QUALIFICATION_FAILED'
+    assert operation.terminal_expires_at is not None
+    current = topology_state.get_profile_revision(staged.id)
+    assert current is not None
+    assert current.config_hash == existing_profile.config_hash
+    assert topology_state.list_profile_revisions(
+        'research', profile=profile.name) == [current]
+
+
 def test_profile_staging_reads_constant_rows_with_large_retained_history(
         image_database, profile: models.ManagedRegistryProfile) -> None:
     candidate = dataclasses.replace(profile,
