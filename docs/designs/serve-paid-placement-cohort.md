@@ -68,9 +68,9 @@ were created. On the manager's next refresh, the existing atomic outcome
 transaction closes the exact pool and releases the claim before the existing
 idempotent replica teardown reconciles any control-plane leftovers. Retriable
 attempts, cleanup-uncertain failures, and untyped terminal failures retain
-synchronous cleanup. The implementation and exact-tree adversarial review are
-complete; pull-request CI, artifact publication, and production rollout
-evidence are pending.
+synchronous cleanup. The implementation, exact-tree adversarial review,
+pull-request CI, artifact publication, and production rollout verification are
+complete.
 
 Production verification of that follow-up exposed an evidence-preservation
 gap below the launch worker: the per-zone provisioning loop recorded a
@@ -107,6 +107,17 @@ deep and shallow-wide overflow. If every leaf is recognized, quota dominates
 a mixed known capacity/quota history and otherwise the result is capacity.
 This recursive contract applies equally to AWS and GCP and changes neither
 provider cleanup nor controller-side teardown ordering.
+
+PR #941 passed every visible check and merged as
+`5f1f30fceac3c5fbb266a1812b32f6d747fe7eb1`. Image and chart 1.1.789 were
+published from that exact commit. Helm revision 264 deployed the chart with
+the existing values reused and explicit API/init-container image overrides.
+The API, migration job, service controllers, and Protenix external load
+balancer recovered successfully. Two subsequent AWS
+`InsufficientInstanceCapacity` results exercised the typed production path;
+their exact PostgreSQL pools closed and released their claims. A controlled
+API-server restart retained both failure epochs and zero-claim state, proving
+the cooldown authority is durable rather than process-local.
 
 ## Problem
 
@@ -1611,6 +1622,31 @@ Pre-PR terminal-feedback evidence on 2026-07-24:
   exact code and tests then passed a separate adversarial review with no
   blocking findings.
 
+Production evidence after v1.1.789 on 2026-07-24:
+
+- PR #941 passed its full visible CI and merged as
+  `5f1f30fceac3c5fbb266a1812b32f6d747fe7eb1`. The verified chart and image
+  were published as 1.1.789; the chart digest is
+  `sha256:2f3897eeab695b335a1002ea095832fe4a777b89f306f360046fed4b1c0a1106`.
+- Helm revision 264 is deployed on chart/app 1.1.789. Migration job
+  `skypilot-db-migration-264` completed, the API pod reached 2/2 readiness
+  with zero restarts, `/api/health` returned `healthy`, and the runtime
+  reported version 1.1.789 with the exact merge commit.
+- `opendde-10c200s-v4` replicas 9066 and 9067 received structured AWS
+  `InsufficientInstanceCapacity` failures for exact pools
+  `g6.2xlarge/ca-central-1b` and `g6.xlarge/eu-south-2c`. The controller logged
+  each as a provider-availability wave with one typed capacity failure and one
+  exact pool.
+- PostgreSQL advanced the pools' `last_failure_at` values to
+  `1784915307.67927` and `1784915329.776756`, respectively, and released both
+  claims. The service selected different exact pools instead of retrying
+  either closed pool.
+- A controlled API-server restart converged to a fresh 2/2-ready pod with zero
+  restarts and the same exact release. Both PostgreSQL failure epochs remained
+  unchanged and both pools retained zero claims after controller recovery.
+  Protenix remained `READY`, and its recovered external load balancer returned
+  HTTP 200 from `/_lb/health`.
+
 ## Release Gate Results
 
 - Complete: implement and validate the 16-claim service envelope, including a
@@ -1647,8 +1683,9 @@ Pre-PR terminal-feedback evidence on 2026-07-24:
 - Complete: implement and locally validate terminal typed outcome reporting
   before controller-side teardown; complete exact-tree design and code
   adversarial review.
-- Pending: recursively preserve and classify structured provider evidence
+- Complete: recursively preserve and classify structured provider evidence
   through normal optimizer-exhaustion nesting; pass exact-tree adversarial
-  review and pull-request CI; publish the superseding image and chart; deploy
-  with existing Helm values reused; and verify bounded
-  outcome-to-pool-close latency in production.
+  review and pull-request CI; publish image/chart 1.1.789; deploy with existing
+  Helm values reused; verify typed outcome-to-pool-close behavior in
+  production; and verify exact cooldown epochs and released claims survive an
+  API-server restart.
