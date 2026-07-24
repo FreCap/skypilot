@@ -1902,6 +1902,43 @@ def _parse_job_full_resources(
     return next(iter(resources_set))
 
 
+def _ranked_nonterminal_job_resources(
+    *,
+    job_ids: set[int] | None = None,
+    pool: str | None = None,
+) -> Any:
+    """Return nonterminal task resources ranked within each Managed Job.
+
+    ``full_resources`` is a PostgreSQL ``json`` column, so it cannot
+    participate in ``DISTINCT`` or ``GROUP BY``. Rank rows using scalar task
+    identity instead, then let callers select rank one.
+    """
+    columns = [
+        spot_table.c.spot_job_id,
+        spot_table.c.full_resources,
+        sqlalchemy.func.row_number().over(
+            partition_by=spot_table.c.spot_job_id,
+            order_by=spot_table.c.task_id.asc(),
+        ).label('task_rank'),
+    ]
+    from_clause = spot_table
+    conditions = [
+        ~spot_table.c.status.in_(
+            [status.value for status in ManagedJobStatus.terminal_statuses()])
+    ]
+    if job_ids is not None:
+        conditions.append(spot_table.c.spot_job_id.in_(job_ids))
+    if pool is not None:
+        columns.insert(0, job_info_table.c.current_cluster_name)
+        from_clause = spot_table.join(
+            job_info_table,
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+        )
+        conditions.append(job_info_table.c.pool == pool)
+    return sqlalchemy.select(*columns).select_from(from_clause).where(
+        sqlalchemy.and_(*conditions)).subquery()
+
+
 def get_pool_worker_used_resources(
         job_ids: set[int]) -> Optional['resources_lib.Resources']:
     """Get the total used resources by running jobs.
@@ -1922,17 +1959,11 @@ def get_pool_worker_used_resources(
         # terminal task history in spot_table, and those historical rows can
         # retain older full_resources values that should not contribute to the
         # worker's active resource usage.
+        ranked_resources = _ranked_nonterminal_job_resources(job_ids=job_ids)
         query = sqlalchemy.select(
-            spot_table.c.spot_job_id,
-            spot_table.c.full_resources,
-        ).distinct().where(
-            sqlalchemy.and_(
-                spot_table.c.spot_job_id.in_(job_ids),
-                ~spot_table.c.status.in_([
-                    status.value
-                    for status in ManagedJobStatus.terminal_statuses()
-                ]),
-            ))
+            ranked_resources.c.spot_job_id,
+            ranked_resources.c.full_resources,
+        ).where(ranked_resources.c.task_rank == 1)
         rows = session.execute(query).fetchall()
 
         resource_configs = []
@@ -1970,21 +2001,12 @@ def get_pool_worker_used_resources_by_cluster(
     """Get used resources for all nonterminal jobs in a pool in one query."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        ranked_resources = _ranked_nonterminal_job_resources(pool=pool)
         query = sqlalchemy.select(
-            job_info_table.c.current_cluster_name,
-            spot_table.c.spot_job_id,
-            spot_table.c.full_resources,
-        ).distinct().select_from(
-            spot_table.outerjoin(
-                job_info_table, spot_table.c.spot_job_id ==
-                job_info_table.c.spot_job_id)).where(
-                    sqlalchemy.and_(
-                        ~spot_table.c.status.in_([
-                            status.value
-                            for status in ManagedJobStatus.terminal_statuses()
-                        ]),
-                        job_info_table.c.pool == pool,
-                    ))
+            ranked_resources.c.current_cluster_name,
+            ranked_resources.c.spot_job_id,
+            ranked_resources.c.full_resources,
+        ).where(ranked_resources.c.task_rank == 1)
         rows = session.execute(query).fetchall()
 
     totals: dict[str | None, resources_lib.Resources] = {}

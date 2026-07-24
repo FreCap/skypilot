@@ -4,11 +4,13 @@
 
 import asyncio
 import contextlib
+import shutil
 
 import filelock
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy import orm
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
@@ -42,6 +44,27 @@ def managed_jobs_db(tmp_path, monkeypatch):
     finally:
         asyncio.run(async_engine.dispose())
         engine.dispose()
+
+
+@pytest.fixture(scope='module')
+def postgres_engine():
+    """Isolated PostgreSQL 16 DB for the JSON query regression."""
+    if shutil.which('docker') is None:
+        pytest.skip('docker unavailable; skipping real-PostgreSQL test')
+    testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
+    pytest.importorskip('psycopg2')
+    container = testcontainers_postgres.PostgresContainer('postgres:16')
+    try:
+        container.start()
+    except Exception as error:  # pylint: disable=broad-except
+        pytest.skip(f'could not start PostgreSQL container: {error}')
+    engine = create_engine(container.get_connection_url())
+    state.Base.metadata.create_all(engine)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        container.stop()
 
 
 def _insert_task(engine, job_id: int, task_id: int, *, status: ManagedJobStatus,
@@ -147,3 +170,70 @@ def test_pool_worker_used_resources_ignores_terminal_task_history(
     assert float(grouped['replica-1'].cpus) == pytest.approx(2.0)
     assert replica_1_resources is not None
     assert float(replica_1_resources.cpus) == pytest.approx(2.0)
+
+
+def test_pool_worker_used_resources_counts_one_nonterminal_task_per_job(
+        managed_jobs_db):
+    """Serial jobs account for their lowest current nonterminal task only."""
+    job_id = state.set_job_info_without_job_id(name='job-pool-a',
+                                               workspace='ws',
+                                               entrypoint='entry',
+                                               pool='pool-a',
+                                               pool_hash=None,
+                                               user_hash='u')
+    _insert_task(managed_jobs_db,
+                 job_id,
+                 0,
+                 status=ManagedJobStatus.RUNNING,
+                 full_resources=Resources(cpus='2').to_yaml_config())
+    _insert_task(managed_jobs_db,
+                 job_id,
+                 1,
+                 status=ManagedJobStatus.PENDING,
+                 full_resources=Resources(cpus='7').to_yaml_config())
+    state.set_current_cluster_name(job_id, 'replica-1')
+
+    grouped = state.get_pool_worker_used_resources_by_cluster('pool-a')
+    replica_1_resources = state.get_pool_worker_used_resources({job_id})
+
+    assert grouped is not None
+    assert float(grouped['replica-1'].cpus) == pytest.approx(2.0)
+    assert replica_1_resources is not None
+    assert float(replica_1_resources.cpus) == pytest.approx(2.0)
+
+
+def test_pool_worker_resource_query_does_not_distinct_postgres_json():
+    """The PostgreSQL query ranks scalar identity, never the JSON payload."""
+    ranked = state._ranked_nonterminal_job_resources(pool='pool-a')
+    query = state.sqlalchemy.select(
+        ranked.c.current_cluster_name,
+        ranked.c.spot_job_id,
+        ranked.c.full_resources,
+    ).where(ranked.c.task_rank == 1)
+
+    sql = str(query.compile(dialect=postgresql.dialect()))
+
+    assert 'DISTINCT' not in sql.upper()
+    assert 'row_number() OVER' in sql
+    assert 'full_resources' in sql
+
+
+def test_pool_worker_resource_accounting_executes_with_postgres_json(
+        postgres_engine, monkeypatch):
+    """The production PostgreSQL JSON type is accepted by both query paths."""
+    monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
+    job_id = _new_pool_job(
+        postgres_engine,
+        pool='postgres-pool',
+        status=ManagedJobStatus.RUNNING,
+        full_resources=Resources(cpus='3').to_yaml_config(),
+        cluster_name='postgres-replica',
+    )
+
+    grouped = state.get_pool_worker_used_resources_by_cluster('postgres-pool')
+    worker = state.get_pool_worker_used_resources({job_id})
+
+    assert grouped is not None
+    assert float(grouped['postgres-replica'].cpus) == pytest.approx(3.0)
+    assert worker is not None
+    assert float(worker.cpus) == pytest.approx(3.0)
