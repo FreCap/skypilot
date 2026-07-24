@@ -21,6 +21,49 @@ from sky.serve import spot_placer
 class TestCentralPlacementCatalog:
     """One immutable complete catalog drives every runtime lookup."""
 
+    def test_explicit_instance_types_remain_launchable_for_feasibility(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.utils import resources_utils
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  any_of:
+    - infra: aws/us-east-1
+      instance_type: r6a.xlarge
+      use_spot: true
+    - infra: aws/us-east-1
+      instance_type: r6a.xlarge
+      use_spot: false
+run: echo hi
+""")
+        captured = []
+
+        def _feasible(self, resources, num_nodes=1):
+            del num_nodes
+            assert resources.cloud == self
+            assert resources.is_launchable()
+            captured.append(resources)
+            return resources_utils.FeasibleResources([resources], [], None)
+
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _feasible)
+        monkeypatch.setattr(
+            spot_placer.resources_utils,
+            'make_launchables_for_valid_region_zones', lambda resources, **_:
+            [resources.copy(region='us-east-1', zone=None)])
+
+        locations = spot_placer._get_possible_location_from_task(task)
+
+        assert {(location.instance_type, location.use_spot)
+                for location in locations} == {
+                    ('r6a.xlarge', True),
+                    ('r6a.xlarge', False),
+                }
+        assert len(captured) == 2
+
     def test_round_trip_preserves_exact_locations_and_unavailable_price(self):
         reserved = make_location('research-ctx',
                                  accelerators={'A100': 1},

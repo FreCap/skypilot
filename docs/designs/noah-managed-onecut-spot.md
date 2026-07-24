@@ -280,6 +280,8 @@ global manifest contract.
 - service-spec parse/serialize/restart round trip for pool placement;
 - mixed Spot/on-demand pool resources remain rejected without a placer and
   validate with `dynamic_fallback`;
+- explicit instance-type pool entries reach provider feasibility as
+  cloud-bound launchable resources;
 - existing pools without placement policy preserve their serialized form;
 
 ### Control-plane verification

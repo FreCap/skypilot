@@ -627,7 +627,11 @@ def _get_possible_location_from_task(
         # Kubernetes entry, whose feasibility check then rejects
         # custom_disk_tier and silently drops the context).
         for cloud in clouds_list:
-            shape_resources = r.copy(cloud=None, region=None, zone=None)
+            # Strip only location-specific attributes. The provider
+            # feasibility boundary requires explicit instance types to remain
+            # launchable, which includes being bound to the cloud currently
+            # enumerated.
+            shape_resources = r.copy(cloud=cloud, region=None, zone=None)
             resource_shapes = [shape_resources]
             if expand_accelerator_counts:
                 resource_shapes = _expand_accelerator_counts_for_cloud(
