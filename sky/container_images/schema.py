@@ -19,7 +19,8 @@ SHARD_STATES = ('PENDING', 'READY', 'FULL', 'DRIFTED', 'DISABLED')
 DEMAND_STATES = ('WARMING', 'READY', 'FAILED', 'SUPERSEDED', 'RELEASED')
 WORKER_KINDS = ('COPY', 'LIFECYCLE', 'CANARY')
 LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'DELETE', 'READBACK')
-QUALIFICATION_MUTATION_STATES = ('DELETING', 'RESTORING')
+QUALIFICATION_MUTATION_STATES = ('DELETING', 'RESTORING', 'QUARANTINED')
+QUALIFICATION_DELETE_PHASES = ('PRE_INTENT', 'IN_FLIGHT', 'READBACK')
 
 
 def _one_of(column: str, values: tuple[str, ...],
@@ -145,23 +146,65 @@ qualification_mutation = sqlalchemy.Table(
     sqlalchemy.Column('mutation_lease_token', sqlalchemy.Text),
     sqlalchemy.Column('mutation_lease_expires_at', sqlalchemy.BigInteger),
     sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('delete_phase', sqlalchemy.Text),
+    sqlalchemy.Column('quarantine_reason', sqlalchemy.Text),
     sqlalchemy.CheckConstraint(
         "id = 'global'",
         name='ck_container_image_qualification_mutation_singleton'),
     _one_of('state', QUALIFICATION_MUTATION_STATES,
             'ck_container_image_qualification_mutation_state'),
     sqlalchemy.CheckConstraint(
-        "(state = 'DELETING' AND mutation_lease_token IS NOT NULL "
+        "delete_phase IS NULL OR delete_phase IN ('PRE_INTENT', 'IN_FLIGHT', "
+        "'READBACK')",
+        name='ck_container_image_qualification_mutation_delete_phase'),
+    sqlalchemy.CheckConstraint(
+        "(state = 'DELETING' AND delete_phase IS NOT NULL "
+        'AND mutation_lease_token IS NOT NULL '
         'AND mutation_lease_expires_at IS NOT NULL '
-        "AND mutation_lease_expires_at > updated_at) OR (state = 'RESTORING' "
+        'AND mutation_lease_expires_at > updated_at '
+        'AND quarantine_reason IS NULL) OR '
+        "(state = 'RESTORING' AND delete_phase IS NULL "
         'AND mutation_lease_token IS NULL '
-        'AND mutation_lease_expires_at IS NULL)',
+        'AND mutation_lease_expires_at IS NULL '
+        'AND quarantine_reason IS NULL) OR '
+        "(state = 'QUARANTINED' AND delete_phase IS NULL "
+        'AND mutation_lease_token IS NULL '
+        'AND mutation_lease_expires_at IS NULL '
+        "AND quarantine_reason IS NOT NULL AND quarantine_reason <> '')",
         name='ck_container_image_qualification_mutation_lease'),
     sqlalchemy.CheckConstraint(
         "owner_target <> '' AND owner_target_fingerprint <> '' "
         "AND repository_arn <> '' AND runtime_digest <> '' "
         "AND lifecycle_proof_id <> '' AND updated_at >= 0",
         name='ck_container_image_qualification_mutation_identity'),
+)
+
+qualification_repository_quarantines = sqlalchemy.Table(
+    'container_image_qualification_repository_quarantines',
+    metadata,
+    sqlalchemy.Column('repository_arn', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column(
+        'owner_profile_revision_id',
+        sqlalchemy.Text,
+        sqlalchemy.ForeignKey('container_image_profile_revisions.id'),
+        nullable=False),
+    sqlalchemy.Column('owner_target', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('owner_target_fingerprint',
+                      sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column('runtime_digest', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('lifecycle_proof_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('quarantine_reason', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('quarantined_at', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.CheckConstraint(
+        "repository_arn <> '' AND owner_target <> '' "
+        "AND owner_target_fingerprint <> '' AND runtime_digest <> '' "
+        "AND lifecycle_proof_id <> '' AND quarantine_reason <> '' "
+        'AND quarantined_at >= 0',
+        name='ck_container_image_qualification_repository_quarantine_identity'),
+    sqlalchemy.Index(
+        'ix_container_image_qualification_repository_quarantines_history',
+        'quarantined_at', 'repository_arn'),
 )
 
 operations = sqlalchemy.Table(
@@ -872,6 +915,7 @@ TABLES = (
     catalog,
     profile_revisions,
     qualification_mutation,
+    qualification_repository_quarantines,
     operations,
     images,
     sources,

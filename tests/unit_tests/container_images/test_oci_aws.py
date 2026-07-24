@@ -239,17 +239,47 @@ def test_terraform_manifest_parser_is_closed_typed_and_fingerprinted() -> None:
             _terraform_manifest([shard, shard]))
 
 
-def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
-        monkeypatch: pytest.MonkeyPatch,
+def test_qualification_repository_name_preserves_generation_zero_and_scopes_new(
         profile: models.ManagedRegistryProfile) -> None:
     authority = '11111111-1111-4111-8111-111111111111'
+    target = profile.canonical
+    base = (f'{target.repository_prefix}/'
+            'rceirceircfardairceirceirce/qualification')
+
+    assert aws.qualification_repository_name(
+        authority, target) == f'{base}/{target.region}'
+    assert aws.qualification_repository_name(
+        authority,
+        dataclasses.replace(target, qualification_repository_generation=1)) == (
+            f'{base}/g01/{target.region}')
+    assert aws.managed_shard_repository_name(
+        authority, 'research', target,
+        15) == (f'{target.repository_prefix}/'
+                'rceirceircfardairceirceirce/'
+                'wbac6aa34568ba734066ca2b14670fe1b/g00/s0f')
+
+
+@pytest.mark.parametrize('generation', [0, 1])
+def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        generation: int) -> None:
+    authority = '11111111-1111-4111-8111-111111111111'
+    profile = dataclasses.replace(
+        profile,
+        canonical=dataclasses.replace(
+            profile.canonical, qualification_repository_generation=generation),
+        targets=tuple(
+            dataclasses.replace(target,
+                                qualification_repository_generation=generation)
+            for target in profile.targets),
+    )
     shards: list[aws.QualifiedShard] = []
     roles: dict[str, str] = {}
     quotas: dict[str, int] = {}
     for target in (profile.canonical,) + profile.targets:
         for index in range(target.shard_count):
-            repository_name = (
-                f'{target.repository_prefix}/rtest/wtest/g00/s{index:02x}')
+            repository_name = aws.managed_shard_repository_name(
+                authority, 'research', target, index)
             values = {
                 'workspace': 'research',
                 'target': target.name,
@@ -281,8 +311,8 @@ def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
             shards.append(aws.QualifiedShard(**values))
         copy = profile.bindings[target.write_authority]
         lifecycle = profile.bindings[target.qualification_delete_authority]
-        qualification_name = (
-            f'{target.repository_prefix}/rtest/qualification/{target.region}')
+        qualification_name = aws.qualification_repository_name(
+            authority, target)
         roles.update({
             f'{target.region}:copy_role_arn': copy.authority,
             f'{target.region}:copy_policy_hash': '3' * 64,
@@ -293,6 +323,8 @@ def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
             f'{target.region}:qualification_repo_arn':
                 (f'arn:{profile.partition}:ecr:{target.region}:'
                  f'{profile.registry_account}:repository/{qualification_name}'),
+            f'{target.region}:qualification_policy_hash': '7' * 64,
+            f'{target.region}:qualification_ownership_tags_hash': '8' * 64,
         })
         quotas.update({
             f'{target.region}:ecr_api_rate_per_second': 7,
@@ -328,8 +360,9 @@ def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
                         mock.Mock(return_value=object()))
     monkeypatch.setattr(aws.image_config, 'resolve_profile', lambda *_args:
                         (profile, policy))
+    stage_revision = mock.Mock(return_value=desired)
     monkeypatch.setattr(aws.topology_state, 'stage_profile_revision',
-                        lambda **_kwargs: desired)
+                        stage_revision)
     mutation_order: list[str] = []
     lock_shards = mock.Mock(
         side_effect=lambda *_args, **_kwargs: mutation_order.append('lock'))
@@ -348,14 +381,67 @@ def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
     attest = mock.Mock(return_value=desired)
     monkeypatch.setattr(aws.topology_state, 'record_profile_attestation',
                         attest)
+    cutover = mock.Mock(return_value=desired)
+    monkeypatch.setattr(aws.topology_state,
+                        'complete_qualification_quarantine_cutover', cutover)
     session = mock.MagicMock()
     session_context = mock.MagicMock()
     session_context.__enter__.return_value = session
     monkeypatch.setattr(aws.orm, 'Session', lambda _engine: session_context)
 
+    wrong_payload = json.loads(payload)
+    target = profile.canonical
+    wrong_target = dataclasses.replace(
+        target, qualification_repository_generation=1 if generation == 0 else 0)
+    wrong_qualification_name = aws.qualification_repository_name(
+        authority, wrong_target)
+    wrong_payload['role_fingerprints'][
+        f'{target.region}:qualification_repo_arn'] = (
+            f'arn:{profile.partition}:ecr:{target.region}:'
+            f'{profile.registry_account}:'
+            f'repository/{wrong_qualification_name}')
+    with pytest.raises(ValueError,
+                       match='Qualification repository name is invalid'):
+        aws.ingest_terraform_qualification(_raw(wrong_payload), now=100)
+    stage_revision.assert_not_called()
+
+    substituted_payload = json.loads(payload)
+    substituted_shard = substituted_payload['shards'][0]
+    substituted_shard['repository_name'] += '-substituted'
+    substituted_shard['repository_arn'] = (
+        f'arn:{substituted_shard["partition"]}:ecr:'
+        f'{substituted_shard["region"]}:{substituted_shard["account"]}:'
+        f'repository/{substituted_shard["repository_name"]}')
+    substituted_shard['physical_fingerprint'] = '0' * 64
+    provisional = aws.QualifiedShard(**substituted_shard)
+    substituted_shard[
+        'physical_fingerprint'] = provisional.calculated_fingerprint()
+    with pytest.raises(ValueError,
+                       match='Qualification shard contradicts profile'):
+        aws.ingest_terraform_qualification(_raw(substituted_payload), now=100)
+    stage_revision.assert_not_called()
+
+    incomplete_payload = json.loads(payload)
+    del incomplete_payload['role_fingerprints'][
+        f'{target.region}:qualification_policy_hash']
+    with pytest.raises(
+            ValueError,
+            match='Qualification manifest role facts are incomplete'):
+        aws.ingest_terraform_qualification(_raw(incomplete_payload), now=100)
+    stage_revision.assert_not_called()
+
+    malformed_payload = json.loads(payload)
+    malformed_payload['role_fingerprints'][
+        f'{target.region}:qualification_ownership_tags_hash'] = 'not-a-hash'
+    with pytest.raises(ValueError,
+                       match='Qualification repository ownership tags hash'):
+        aws.ingest_terraform_qualification(_raw(malformed_payload), now=100)
+    stage_revision.assert_not_called()
+
     result = aws.ingest_terraform_qualification(payload, now=100)
 
     assert result is desired
+    stage_revision.assert_called_once()
     lock_shards.assert_called_once_with(session,
                                         workspace='research',
                                         profile=profile.name)
@@ -373,6 +459,11 @@ def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
         for call in attest.call_args_list
         if call.kwargs['kind'].startswith('terraform_budget:')
     ]
+    target_evidence = [
+        call.kwargs['evidence']
+        for call in attest.call_args_list
+        if call.kwargs['kind'].startswith('terraform_target:')
+    ]
     assert len(shard_evidence) == len(shards)
     assert all(
         evidence['max_manifests'] == 80 and evidence['max_declared_bytes'] ==
@@ -382,6 +473,13 @@ def test_handoff_ingest_keeps_candidate_limits_revision_scoped(
     assert all(
         evidence['applied_rate_per_second'] == 7 and evidence['burst'] == 3
         for evidence in budget_evidence)
+    assert len(target_evidence) == len((profile.canonical,) + profile.targets)
+    assert all(evidence['qualification_repository_generation'] == generation
+               for evidence in target_evidence)
+    assert all(evidence['qualification_policy_hash'] == '7' *
+               64 and evidence['qualification_ownership_tags_hash'] == '8' * 64
+               for evidence in target_evidence)
+    cutover.assert_called_once_with(profile_revision_id=desired.id, now=100)
 
 
 class _EcrClient:
@@ -658,6 +756,27 @@ def test_ecr_delete_hooked_transport_timeout_never_reads_back() -> None:
     hooks.on_throttle.assert_not_called()
 
 
+def test_ecr_delete_hook_failure_before_raw_sdk_is_not_started() -> None:
+    manifest, config, _ = _image()
+    graph = _graph_from_root(manifest, config, platform='linux/amd64')
+    raw = mock.Mock()
+    hooks = aws.EcrCallHooks(
+        before_call=mock.Mock(side_effect=RuntimeError('final fence lost')),
+        on_throttle=mock.Mock())
+    hooked = aws._HookedEcrClient(  # pylint: disable=protected-access
+        raw, hooks)
+    fence = mock.Mock()
+    fenced = aws._ProviderFencedEcrClient(  # pylint: disable=protected-access
+        hooked, fence)
+    repository = aws.EcrRepository(fenced, 'skypilot/images/shard')
+
+    assert (repository.delete_request_outcome(
+        graph.runtime_digest) == aws.DeleteRequestOutcome.NOT_STARTED)
+    raw.batch_delete_image.assert_not_called()
+    hooks.before_call.assert_called_once_with()
+    assert fence.call_count == 2
+
+
 def test_ecr_concluded_delete_readback_failure_is_retryable() -> None:
     manifest, config, _ = _image()
     graph = _graph_from_root(manifest, config, platform='linux/amd64')
@@ -703,6 +822,31 @@ def test_service_quota_calls_are_synchronously_provider_fenced(
 
     assert quota == 100
     assert events == ['lease', 'sts', 'lease', 'lease', 'quota', 'lease']
+
+
+@pytest.mark.parametrize(
+    ('payload', 'encoded', 'digest'),
+    [({
+        'ProviderDefault': 'café',
+    }, '{"ProviderDefault":"café"}',
+      'f448573b8bfc54d8fdf9e3e6f82463fd5d5f83ffb2da81cfc4058c1e4574e324'),
+     ({
+         'z': ['café', '<>&', '\u2028\u2029'],
+         'a': {
+             'label': 'déjà vu',
+         },
+     }, ('{"a":{"label":"déjà vu"},"z":["café",'
+         '"\\u003c\\u003e\\u0026","\\u2028\\u2029"]}'),
+      '66c72ff0d01d70aaa325784699c66f1a94f2ab63bc9217b03b8304e16d7a9f20')])
+def test_canonical_json_matches_terraform_jsonencode(payload: dict[str, Any],
+                                                     encoded: str,
+                                                     digest: str) -> None:
+    # These strings and digests are direct Terraform jsonencode() and
+    # sha256(jsonencode()) results.
+    assert aws._terraform_jsonencode(  # pylint: disable=protected-access
+        payload) == encoded
+    assert aws._canonical_json_hash(  # pylint: disable=protected-access
+        payload) == digest
 
 
 def test_ecr_role_acquisition_fences_actual_sts_boundary(

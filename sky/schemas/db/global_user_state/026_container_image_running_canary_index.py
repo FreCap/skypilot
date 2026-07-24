@@ -185,5 +185,18 @@ def upgrade():
 
 
 def downgrade():
-    """No-op for backward compatibility."""
-    pass
+    """Remove qualification fences only after the singleton has drained."""
+    bind = op.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return
+    active = int(
+        bind.execute(
+            sqlalchemy.text(
+                'SELECT COUNT(*) FROM '
+                'container_image_qualification_mutation')).scalar_one())
+    if active:
+        raise RuntimeError(
+            'Migration 026 downgrade requires an empty qualification '
+            'mutation table.')
+    op.drop_table('container_image_qualification_mutation')
+    op.drop_index(_INDEX, table_name=_INDEX_TABLE)

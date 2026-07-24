@@ -1739,6 +1739,11 @@ def get_config_schema():
             'minLength': 1,
             'maxLength': 128,
         },
+        'qualification_repository_generation': {
+            'type': 'integer',
+            'minimum': 0,
+            'maximum': 255,
+        },
         'runtime_pull': {
             'type': 'object',
             'minProperties': 1,
@@ -1760,13 +1765,21 @@ def get_config_schema():
     }
     canonical_registry_target_schema = {
         'type': 'object',
-        'required': list(registry_target_properties),
+        'required': [
+            key for key in registry_target_properties
+            if key != 'qualification_repository_generation'
+        ],
         'additionalProperties': False,
         'properties': registry_target_properties,
     }
     regional_registry_target_schema = {
         'type': 'object',
-        'required': ['name', *registry_target_properties],
+        'required': [
+            'name', *[
+                key for key in registry_target_properties
+                if key != 'qualification_repository_generation'
+            ]
+        ],
         'additionalProperties': False,
         'properties': {
             'name': {

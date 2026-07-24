@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import concurrent.futures
 import dataclasses
 import hashlib
@@ -339,6 +340,26 @@ def _activate_profile(
                     expected_config_hash=profile.config_hash,
                     now=12)
     assert attested.attestations_hash is not None
+    for target in (profile.canonical,) + profile.targets:
+        repository_name, repository_arn = (_generated_qualification_repository(
+            profile, target))
+        attested = topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=models.profile_attestation_key('terraform_target',
+                                                target.name),
+            evidence={
+                'status': 'READY',
+                'observed_at': 12,
+                'target_fingerprint': target.target_fingerprint,
+                'registry': target.registry,
+                'repository_name': repository_name,
+                'repository_arn': repository_arn,
+                'qualification_repository_generation':
+                    target.qualification_repository_generation,
+            },
+            expected_generation=revision.desired_generation,
+            expected_config_hash=profile.config_hash,
+            now=12)
     active = transactions.activate_profile(
         profile_revision_id=revision.id,
         expected_generation=revision.desired_generation,
@@ -444,6 +465,35 @@ def _stage_candidate_profile(
         now=now)
 
 
+def test_qualifying_profile_suppresses_only_its_preceding_active_revision(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    unrelated_profile = _workspace_isolated_profile(profile, 'other-workspace')
+    unrelated = _activate_profile(image_database,
+                                  unrelated_profile,
+                                  workspace='other-workspace')
+    candidate = _stage_candidate_profile(_policy_profile(profile), now=20)
+
+    visible = topology_state.list_qualifying_profiles(include_active=True)
+    assert [revision.id for revision in visible] == [candidate.id]
+
+    with image_database.begin() as connection:
+        changed = connection.execute(schema.profile_revisions.update().where(
+            schema.profile_revisions.c.id == candidate.id).values(
+                state=models.ImageProfileState.FAILED.value,
+                failed_code='QUALIFICATION_FAILED',
+                updated_at=21)).rowcount
+    assert changed == 1
+
+    resumed_ids = {
+        revision.id for revision in topology_state.list_qualifying_profiles(
+            include_active=True)
+    }
+    assert active.id in resumed_ids
+    assert unrelated.id in resumed_ids
+    assert candidate.id not in resumed_ids
+
+
 def _request_ec2_canary(
     monkeypatch: pytest.MonkeyPatch,
     profile: models.ManagedRegistryProfile,
@@ -494,6 +544,99 @@ def _qualification_repository_arn(profile: models.ManagedRegistryProfile,
     repository_name = f'{target.repository_prefix}/qualification'
     return (f'arn:{profile.partition}:ecr:{target.region}:'
             f'{profile.registry_account}:repository/{repository_name}')
+
+
+def _generated_qualification_repository(
+    profile: models.ManagedRegistryProfile,
+    target: models.ManagedRegistryTarget,
+) -> tuple[str, str]:
+    authority = catalog_state.get_catalog_authority_id()
+    assert authority is not None
+    repository_name = aws.qualification_repository_name(authority, target)
+    repository_arn = (
+        f'arn:{profile.partition}:ecr:{target.region}:'
+        f'{profile.registry_account}:repository/{repository_name}')
+    return repository_name, repository_arn
+
+
+def _qualification_generation_profile(
+        profile: models.ManagedRegistryProfile,
+        generation: int) -> models.ManagedRegistryProfile:
+    target = dataclasses.replace(profile.targets[0],
+                                 qualification_repository_generation=generation)
+    return dataclasses.replace(profile, targets=(target,) + profile.targets[1:])
+
+
+@pytest.mark.parametrize(
+    ('target_generation', 'evidence_generation', 'allowed'),
+    [
+        (0, None, True),
+        (0, 1, False),
+        (1, None, False),
+        (1, 1, True),
+        (1, True, False),
+    ],
+)
+def test_qualification_repository_requires_matching_generation(
+        image_database, profile: models.ManagedRegistryProfile,
+        target_generation: int, evidence_generation: int | bool | None,
+        allowed: bool) -> None:
+    generated_profile = _qualification_generation_profile(
+        profile, target_generation)
+    active = _activate_profile(image_database, generated_profile)
+    target = generated_profile.targets[0]
+    repository_name, repository_arn = _generated_qualification_repository(
+        generated_profile, target)
+    evidence: dict[str, Any] = {
+        'status': 'READY',
+        'target_fingerprint': target.target_fingerprint,
+        'registry': target.registry,
+        'repository_name': repository_name,
+        'repository_arn': repository_arn,
+    }
+    if evidence_generation is not None:
+        evidence['qualification_repository_generation'] = evidence_generation
+    key = models.profile_attestation_key('terraform_target', target.name)
+    revision = dataclasses.replace(active,
+                                   attestations={
+                                       **active.attestations,
+                                       key: evidence,
+                                   })
+
+    if allowed:
+        assert qualification.qualification_repository(
+            revision, target) == (repository_name, repository_arn)
+    else:
+        with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+            qualification.qualification_repository(revision, target)
+
+
+def test_qualification_repository_rejects_legacy_loose_authority_path(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    repository_name = (
+        f'{target.repository_prefix}/rwrongauthority/qualification/'
+        f'{target.region}')
+    repository_arn = (
+        f'arn:{profile.partition}:ecr:{target.region}:'
+        f'{profile.registry_account}:repository/{repository_name}')
+    key = models.profile_attestation_key('terraform_target', target.name)
+    stale = dataclasses.replace(
+        active,
+        attestations={
+            **active.attestations,
+            key: {
+                'status': 'READY',
+                'target_fingerprint': target.target_fingerprint,
+                'registry': target.registry,
+                'repository_name': repository_name,
+                'repository_arn': repository_arn,
+            },
+        })
+
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        qualification.qualification_repository(stale, target)
 
 
 def test_canary_request_waits_for_exact_copy_restoration(
@@ -587,6 +730,7 @@ def test_canary_request_waits_for_exact_copy_restoration(
 
 def test_legacy_lifecycle_absence_enters_durable_restoration_barrier(
         image_database, profile: models.ManagedRegistryProfile) -> None:
+    profile = _qualification_generation_profile(profile, 1)
     active = _activate_profile(image_database, profile)
     target = profile.targets[0]
     repository_arn = _qualification_repository_arn(profile, target)
@@ -718,6 +862,42 @@ def test_legacy_lifecycle_absence_enters_durable_restoration_barrier(
     assert mutation['lifecycle_proof_id'] == orphan_proof
 
 
+def test_generation_zero_legacy_lifecycle_absence_is_not_adopted(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    assert target.qualification_repository_generation == 0
+    repository_arn = _qualification_repository_arn(profile, target)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    legacy = topology_state.record_profile_attestation(
+        profile_revision_id=active.id,
+        kind=lifecycle_key,
+        evidence={
+            'status': 'READY',
+            'target': target.name,
+            'target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
+            'runtime_digest': _DIGEST,
+            'exact_absence': True,
+        },
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        now=20)
+
+    unchanged, proof_id = (
+        qualification.begin_qualification_lifecycle_restoration(
+            legacy,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            now=21))
+
+    assert proof_id is None
+    assert unchanged.attestations[lifecycle_key] == legacy.attestations[
+        lifecycle_key]
+    assert qualification.get_qualification_mutation() is None
+
+
 def test_pending_canary_does_not_reserve_cost_after_copy_deletion(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -799,6 +979,7 @@ def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion
     assert mutation['repository_arn'] == repository_arn
     assert mutation['runtime_digest'] == _DIGEST
     assert mutation['lifecycle_proof_id'] == proof_id
+    assert mutation['delete_phase'] == 'PRE_INTENT'
     assert mutation['mutation_lease_token'] == first_token
     assert mutation['mutation_lease_expires_at'] == 160
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
@@ -811,6 +992,7 @@ def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion
         'runtime_digest': _DIGEST,
         'lifecycle_proof_id': proof_id,
         'protocol_version': 2,
+        'delete_phase': 'PRE_INTENT',
         'mutation_lease_token': first_token,
         'mutation_lease_expires_at': 160,
         'observed_at': 100,
@@ -868,6 +1050,7 @@ def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion
     mutation = qualification.get_qualification_mutation()
     assert mutation is not None
     assert mutation['state'] == 'DELETING'
+    assert mutation['delete_phase'] == 'PRE_INTENT'
     assert mutation['lifecycle_proof_id'] == proof_id
     assert mutation['mutation_lease_token'] == takeover_token
     assert mutation['mutation_lease_expires_at'] == 270
@@ -887,6 +1070,14 @@ def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion
         lifecycle_proof_id=proof_id,
         mutation_lease_token=takeover_token,
         now=211)
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        taken_over,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=takeover_token,
+        now=211)
     assert qualification.complete_qualification_lifecycle_delete(
         deleting,
         target,
@@ -895,6 +1086,14 @@ def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion
         lifecycle_proof_id=proof_id,
         mutation_lease_token=first_token,
         now=211) is None
+    assert qualification.mark_qualification_lifecycle_delete_readback(
+        taken_over,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=takeover_token,
+        now=211)
 
     completed = qualification.complete_qualification_lifecycle_delete(
         taken_over,
@@ -919,6 +1118,7 @@ def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion
     mutation = qualification.get_qualification_mutation()
     assert mutation is not None
     assert mutation['state'] == 'RESTORING'
+    assert mutation['delete_phase'] is None
     assert mutation['owner_profile_revision_id'] == completed.id
     assert mutation['lifecycle_proof_id'] == proof_id
     assert mutation['mutation_lease_token'] is None
@@ -931,6 +1131,916 @@ def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion
         lifecycle_proof_id=proof_id,
         mutation_lease_token=takeover_token,
         now=211)
+
+
+def _qualification_delete_claim(
+    image_database: sqlalchemy.engine.Engine,
+    profile: models.ManagedRegistryProfile,
+    *,
+    now: int = 100,
+    lease_seconds: int = 60,
+) -> tuple[topology_state.ProfileRevisionRecord, models.ManagedRegistryTarget,
+           str, str, str]:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    armed, armed_now = qualification.arm_qualification_lifecycle(
+        active,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        now=now - 2)
+    assert armed_now
+    armed_proof = qualification.qualification_copy_restoration_proof_id(
+        armed, target, _DIGEST)
+    assert armed_proof is not None
+    copied = qualification.record_qualification_copy(
+        armed,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=armed_proof,
+        now=now - 1)
+    assert copied is not None
+    deleting, proof_id, token = (
+        qualification.begin_qualification_lifecycle_delete(
+            copied,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=lease_seconds,
+            now=now))
+    assert proof_id is not None and token is not None
+    return deleting, target, repository_arn, proof_id, token
+
+
+def test_pre_intent_qualification_delete_defer_shortens_retry_lease(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    deleting, target, repository_arn, proof_id, token = (
+        _qualification_delete_claim(image_database, profile))
+
+    assert qualification.defer_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        retry_seconds=3,
+        now=110)
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['delete_phase'] == 'PRE_INTENT'
+    assert mutation['mutation_lease_token'] != token
+    assert mutation['mutation_lease_expires_at'] == 113
+    assert not qualification.heartbeat_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        lease_seconds=60,
+        now=111)
+
+    _, early_proof, early_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            deleting,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=112))
+    assert early_proof is None and early_token is None
+
+    reclaimed, reclaimed_proof, reclaimed_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            deleting,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=113))
+    assert reclaimed_proof == proof_id
+    assert reclaimed_token is not None and reclaimed_token != token
+    assert reclaimed.attestations[models.profile_attestation_key(
+        'lifecycle', target.name)]['delete_phase'] == 'PRE_INTENT'
+
+
+@pytest.mark.parametrize('defer_at', [110, 160], ids=('live', 'expired'))
+def test_not_started_qualification_delete_rotates_in_flight_to_pre_intent(
+        image_database, profile: models.ManagedRegistryProfile,
+        defer_at: int) -> None:
+    deleting, target, repository_arn, proof_id, in_flight_token = (
+        _qualification_delete_claim(image_database, profile))
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=in_flight_token,
+        now=101)
+
+    assert qualification.defer_qualification_lifecycle_delete_not_started(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=in_flight_token,
+        retry_seconds=3,
+        now=defer_at)
+
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'DELETING'
+    assert mutation['delete_phase'] == 'PRE_INTENT'
+    rotated_token = mutation['mutation_lease_token']
+    assert isinstance(rotated_token, str)
+    assert rotated_token != in_flight_token
+    assert mutation['mutation_lease_expires_at'] == defer_at + 3
+    current = topology_state.get_profile_revision(deleting.id)
+    assert current is not None
+    lifecycle = current.attestations[models.profile_attestation_key(
+        'lifecycle', target.name)]
+    assert lifecycle['status'] == 'DELETING'
+    assert lifecycle['delete_phase'] == 'PRE_INTENT'
+    assert lifecycle['mutation_lease_token'] == rotated_token
+    assert lifecycle['mutation_lease_expires_at'] == defer_at + 3
+
+    assert not qualification.defer_qualification_lifecycle_delete_not_started(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=in_flight_token,
+        retry_seconds=3,
+        now=defer_at + 1)
+    assert not qualification.defer_qualification_lifecycle_delete_not_started(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=str(uuid.uuid4()),
+        retry_seconds=3,
+        now=defer_at + 1)
+
+
+def test_expired_in_flight_qualification_delete_is_quarantined(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    deleting, target, repository_arn, proof_id, token = (
+        _qualification_delete_claim(image_database, profile))
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=101)
+
+    quarantined, takeover_proof, takeover_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            deleting,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=160))
+
+    assert takeover_proof is None and takeover_token is None
+    lifecycle = quarantined.attestations[models.profile_attestation_key(
+        'lifecycle', target.name)]
+    assert lifecycle['status'] == 'QUARANTINED'
+    assert lifecycle['quarantine_reason'] == 'PROVIDER_OUTCOME_AMBIGUOUS'
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'QUARANTINED'
+    assert mutation['delete_phase'] is None
+    assert mutation['mutation_lease_token'] is None
+    assert mutation['mutation_lease_expires_at'] is None
+    assert mutation['quarantine_reason'] == 'PROVIDER_OUTCOME_AMBIGUOUS'
+    assert not qualification.qualification_lifecycle_delete_owned(
+        deleting.id,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        expected_delete_phase=qualification.
+        QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+        now=160)
+    assert qualification.qualification_copy_barrier_snapshot(
+        quarantined,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST) == (False, None)
+    with pytest.raises(topology_state.StaleProfileRevisionError):
+        qualification.begin_qualification_lifecycle_delete(
+            quarantined,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=161)
+
+
+def test_expired_qualification_readback_takeover_never_rearms_implicitly(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    deleting, target, repository_arn, proof_id, first_token = (
+        _qualification_delete_claim(image_database, profile))
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=first_token,
+        now=101)
+    assert qualification.mark_qualification_lifecycle_delete_readback(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=first_token,
+        now=102)
+
+    recovered, recovered_proof, recovered_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            deleting,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=160))
+
+    assert recovered_proof == proof_id
+    assert recovered_token is not None and recovered_token != first_token
+    lifecycle = recovered.attestations[models.profile_attestation_key(
+        'lifecycle', target.name)]
+    assert lifecycle['delete_phase'] == 'READBACK'
+    assert not qualification.begin_qualification_lifecycle_delete_request(
+        recovered,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=recovered_token,
+        now=161)
+    assert qualification.retry_qualification_lifecycle_delete_from_readback(
+        recovered,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=recovered_token,
+        now=161)
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['delete_phase'] == 'PRE_INTENT'
+    assert not qualification.complete_qualification_lifecycle_delete(
+        recovered,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=recovered_token,
+        now=161)
+
+
+def test_ambiguous_qualification_delete_quarantines_immediately(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    deleting, target, repository_arn, proof_id, token = (
+        _qualification_delete_claim(image_database, profile))
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=101)
+
+    quarantined = qualification.quarantine_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        reason='DELETE_REQUEST_TIMEOUT',
+        now=102)
+
+    assert quarantined is not None
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'QUARANTINED'
+    assert mutation['quarantine_reason'] == 'DELETE_REQUEST_TIMEOUT'
+    assert topology_state.qualification_repository_quarantined(repository_arn)
+    with image_database.connect() as connection:
+        tombstone = connection.execute(
+            sqlalchemy.select(
+                schema.qualification_repository_quarantines).where(
+                    schema.qualification_repository_quarantines.c.repository_arn
+                    == repository_arn)).mappings().one()
+    assert tombstone['owner_profile_revision_id'] == deleting.id
+    assert tombstone['owner_target'] == target.name
+    assert tombstone['lifecycle_proof_id'] == proof_id
+    assert tombstone['quarantine_reason'] == 'DELETE_REQUEST_TIMEOUT'
+    assert not qualification.mark_qualification_lifecycle_delete_readback(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=103)
+
+
+def test_quarantine_cutover_requires_fresh_generation_and_retains_tombstone(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    deleting, target, old_repository_arn, proof_id, token = (
+        _qualification_delete_claim(image_database, profile))
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=old_repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=101)
+    quarantined = qualification.quarantine_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=old_repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        reason='DELETE_REQUEST_TIMEOUT',
+        now=102)
+    assert quarantined is not None
+    assert topology_state.qualification_repository_quarantined(
+        old_repository_arn)
+
+    same_repository = dataclasses.replace(profile,
+                                          revision=profile.revision + 1)
+    with pytest.raises(topology_state.QualificationMutationInProgressError):
+        _stage_candidate_profile(same_repository, now=103)
+
+    successor_profile = _qualification_generation_profile(
+        dataclasses.replace(profile, revision=profile.revision + 1), 1)
+    successor_target = successor_profile.target(target.name)
+    assert successor_target.target_fingerprint == target.target_fingerprint
+    successor = _stage_candidate_profile(successor_profile, now=104)
+    with pytest.raises(topology_state.QualificationMutationInProgressError,
+                       match='no fresh Terraform repository evidence'):
+        topology_state.complete_qualification_quarantine_cutover(
+            profile_revision_id=successor.id, now=105)
+
+    successor = topology_state.record_profile_attestation(
+        profile_revision_id=successor.id,
+        kind='terraform',
+        evidence={
+            'status': 'READY',
+            'observed_at': 106,
+        },
+        expected_generation=successor.desired_generation,
+        expected_config_hash=successor.config_hash,
+        terraform_hash='e' * 64,
+        now=106)
+    with pytest.raises(topology_state.QualificationMutationInProgressError,
+                       match='no fresh Terraform repository evidence'):
+        topology_state.complete_qualification_quarantine_cutover(
+            profile_revision_id=successor.id, now=107)
+
+    repository_name, new_repository_arn = (_generated_qualification_repository(
+        successor_profile, successor_target))
+    successor = topology_state.record_profile_attestation(
+        profile_revision_id=successor.id,
+        kind=models.profile_attestation_key('terraform_target', target.name),
+        evidence={
+            'status': 'READY',
+            'observed_at': 108,
+            'target_fingerprint': successor_target.target_fingerprint,
+            'registry': successor_target.registry,
+            'repository_name': repository_name,
+            'repository_arn': new_repository_arn,
+            'qualification_repository_generation':
+                successor_target.qualification_repository_generation,
+        },
+        expected_generation=successor.desired_generation,
+        expected_config_hash=successor.config_hash,
+        now=108)
+    cutover = topology_state.complete_qualification_quarantine_cutover(
+        profile_revision_id=successor.id, now=109)
+
+    assert qualification.get_qualification_mutation() is None
+    assert topology_state.qualification_repository_quarantined(
+        old_repository_arn)
+    assert not topology_state.qualification_repository_quarantined(
+        new_repository_arn)
+    cutover_evidence = cutover.attestations[models.profile_attestation_key(
+        'quarantine_cutover', target.name)]
+    assert cutover_evidence['old_repository_arn'] == old_repository_arn
+    assert cutover_evidence['new_repository_arn'] == new_repository_arn
+    assert cutover_evidence['old_qualification_repository_generation'] == 0
+    assert cutover_evidence['new_qualification_repository_generation'] == 1
+    with image_database.connect() as connection:
+        tombstone_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(schema.qualification_repository_quarantines).where(
+                schema.qualification_repository_quarantines.c.repository_arn ==
+                old_repository_arn)).scalar_one()
+    assert tombstone_count == 1
+
+    decreased = _qualification_generation_profile(
+        dataclasses.replace(profile, revision=profile.revision + 2), 0)
+    with pytest.raises(ValueError,
+                       match='repository generations cannot decrease'):
+        _stage_candidate_profile(decreased, now=110)
+
+    other_workspace = 'other-workspace'
+    other = topology_state.stage_profile_revision(
+        workspace=other_workspace,
+        profile=profile.name,
+        revision=profile.revision,
+        config_hash=profile.config_hash,
+        config_snapshot=profile.to_snapshot(),
+        physical_manifest_hash=profile.physical_manifest_hash,
+        max_daily_canary_microusd=(
+            profile.qualification.max_daily_canary_microusd),
+        now=111)
+    with pytest.raises(topology_state.StaleProfileRevisionError):
+        qualification.arm_qualification_lifecycle(
+            other,
+            target,
+            repository_arn=old_repository_arn,
+            runtime_digest=_DIGEST,
+            now=112)
+
+    other = topology_state.record_profile_attestation(
+        profile_revision_id=other.id,
+        kind='terraform',
+        evidence={
+            'status': 'READY',
+            'observed_at': 113,
+        },
+        expected_generation=other.desired_generation,
+        expected_config_hash=other.config_hash,
+        terraform_hash='d' * 64,
+        now=113)
+    for configured_target in (profile.canonical,) + profile.targets:
+        configured_name, configured_arn = (_generated_qualification_repository(
+            profile, configured_target))
+        if configured_target.name == target.name:
+            configured_arn = old_repository_arn
+        other = topology_state.record_profile_attestation(
+            profile_revision_id=other.id,
+            kind=models.profile_attestation_key('terraform_target',
+                                                configured_target.name),
+            evidence={
+                'status': 'READY',
+                'observed_at': 114,
+                'target_fingerprint': configured_target.target_fingerprint,
+                'registry': configured_target.registry,
+                'repository_name': configured_name,
+                'repository_arn': configured_arn,
+                'qualification_repository_generation':
+                    configured_target.qualification_repository_generation,
+            },
+            expected_generation=other.desired_generation,
+            expected_config_hash=other.config_hash,
+            now=114)
+    assert other.attestations_hash is not None
+    with pytest.raises(ValueError, match='QUALIFICATION_FAILED'):
+        transactions.activate_profile(
+            profile_revision_id=other.id,
+            expected_generation=other.desired_generation,
+            expected_config_hash=other.config_hash,
+            expected_terraform_hash='d' * 64,
+            expected_attestations_hash=other.attestations_hash,
+            required_attestations={'terraform': None},
+            now=115)
+
+
+def test_staging_allows_removing_nonzero_qualification_generation_target(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    assert image_database is not None
+    previous_profile = _qualification_generation_profile(profile, 1)
+    previous = _stage_candidate_profile(previous_profile, now=100)
+    removed_profile = dataclasses.replace(profile,
+                                          revision=profile.revision + 1,
+                                          targets=())
+
+    candidate = _stage_candidate_profile(removed_profile, now=101)
+
+    assert candidate.desired_generation == previous.desired_generation + 1
+    assert candidate.config_hash == removed_profile.config_hash
+    assert candidate.state == models.ImageProfileState.QUALIFYING
+
+
+def test_staging_allows_generation_decrease_for_new_target_fingerprint(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    assert image_database is not None
+    previous_profile = _qualification_generation_profile(profile, 1)
+    previous_target = previous_profile.targets[0]
+    previous = _stage_candidate_profile(previous_profile, now=100)
+    replacement_target = dataclasses.replace(
+        profile.targets[0],
+        repository_prefix=f'{profile.targets[0].repository_prefix}/replacement',
+        qualification_repository_generation=0)
+    replacement_profile = dataclasses.replace(profile,
+                                              revision=profile.revision + 1,
+                                              targets=(replacement_target,))
+    assert replacement_target.name == previous_target.name
+    assert (replacement_target.target_fingerprint
+            != previous_target.target_fingerprint)
+    assert (replacement_target.qualification_repository_generation
+            < previous_target.qualification_repository_generation)
+
+    candidate = _stage_candidate_profile(replacement_profile, now=101)
+
+    assert candidate.desired_generation == previous.desired_generation + 1
+    assert candidate.config_hash == replacement_profile.config_hash
+    assert candidate.state == models.ImageProfileState.QUALIFYING
+
+
+@pytest.mark.parametrize(
+    'admission_path',
+    (
+        'qualification_copy_barrier_snapshot',
+        'qualification_copy_provider_allowed',
+        'arm_qualification_lifecycle',
+        'begin_qualification_lifecycle_restoration',
+        'begin_qualification_lifecycle_delete',
+        'record_qualification_copy',
+    ),
+)
+def test_catalog_lock_closes_cross_workspace_quarantine_cutover_race(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile, admission_path: str) -> None:
+    other = topology_state.stage_profile_revision(
+        workspace='other-workspace',
+        profile=profile.name,
+        revision=profile.revision,
+        config_hash=profile.config_hash,
+        config_snapshot=profile.to_snapshot(),
+        physical_manifest_hash=profile.physical_manifest_hash,
+        max_daily_canary_microusd=(
+            profile.qualification.max_daily_canary_microusd),
+        now=90)
+    deleting, target, repository_arn, proof_id, token = (
+        _qualification_delete_claim(image_database, profile))
+    other = topology_state.record_profile_attestation(
+        profile_revision_id=other.id,
+        kind=models.profile_attestation_key('terraform_target', target.name),
+        evidence={
+            'status': 'READY',
+            'observed_at': 91,
+            'target_fingerprint': target.target_fingerprint,
+            'registry': target.registry,
+            'repository_name': repository_arn.split('repository/', maxsplit=1)
+                               [1],
+            'repository_arn': repository_arn,
+            'qualification_repository_generation':
+                target.qualification_repository_generation,
+        },
+        expected_generation=other.desired_generation,
+        expected_config_hash=other.config_hash,
+        now=91)
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=101)
+
+    admission_paused = threading.Event()
+    allow_admission = threading.Event()
+    exclusive_attempted = threading.Event()
+    exclusive_acquired = threading.Event()
+    pause_lock = threading.Lock()
+    pause_next_admission = [True]
+    cutover_context = threading.local()
+    original_available = (
+        qualification._qualification_repository_available_in_session)
+    original_lock = topology_state.lock_qualification_mutation_in_session
+
+    def _pause_repository_admission(session: orm.Session,
+                                    candidate_arn: str) -> bool:
+        with pause_lock:
+            should_pause = (pause_next_admission[0] and
+                            candidate_arn == repository_arn)
+            if should_pause:
+                pause_next_admission[0] = False
+        if should_pause:
+            admission_paused.set()
+            assert allow_admission.wait(timeout=10)
+        return original_available(session, candidate_arn)
+
+    def _observe_catalog_lock(session: orm.Session, *, exclusive: bool) -> None:
+        is_cutover = bool(getattr(cutover_context, 'active', False))
+        if exclusive and is_cutover:
+            exclusive_attempted.set()
+        original_lock(session, exclusive=exclusive)
+        if exclusive and is_cutover:
+            exclusive_acquired.set()
+
+    monkeypatch.setattr(qualification,
+                        '_qualification_repository_available_in_session',
+                        _pause_repository_admission)
+    monkeypatch.setattr(topology_state,
+                        'lock_qualification_mutation_in_session',
+                        _observe_catalog_lock)
+
+    successor_profile = _qualification_generation_profile(
+        dataclasses.replace(profile, revision=profile.revision + 1), 1)
+    successor_target = successor_profile.target(target.name)
+
+    def _run_admission(now: int) -> Any:
+        if admission_path == 'qualification_copy_barrier_snapshot':
+            return qualification.qualification_copy_barrier_snapshot(
+                other,
+                target,
+                repository_arn=repository_arn,
+                runtime_digest=_DIGEST)
+        if admission_path == 'qualification_copy_provider_allowed':
+            return qualification.qualification_copy_provider_allowed(
+                other, target, repository_arn=repository_arn)
+        if admission_path == 'arm_qualification_lifecycle':
+            return qualification.arm_qualification_lifecycle(
+                other,
+                target,
+                repository_arn=repository_arn,
+                runtime_digest=_DIGEST,
+                now=now)
+        if admission_path == 'begin_qualification_lifecycle_restoration':
+            return qualification.begin_qualification_lifecycle_restoration(
+                other,
+                target,
+                repository_arn=repository_arn,
+                runtime_digest=_DIGEST,
+                now=now)
+        if admission_path == 'begin_qualification_lifecycle_delete':
+            return qualification.begin_qualification_lifecycle_delete(
+                other,
+                target,
+                repository_arn=repository_arn,
+                runtime_digest=_DIGEST,
+                lease_seconds=60,
+                now=now)
+        assert admission_path == 'record_qualification_copy'
+        return qualification.record_qualification_copy(
+            other,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            platform=profile.qualification.canary_platform,
+            copy_outcome='COPIED',
+            expected_lifecycle_proof_id=None,
+            now=now)
+
+    def _quarantine_and_cut_over() -> topology_state.ProfileRevisionRecord:
+        cutover_context.active = True
+        quarantined = qualification.quarantine_qualification_lifecycle_delete(
+            deleting,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lifecycle_proof_id=proof_id,
+            mutation_lease_token=token,
+            reason='PROVIDER_OUTCOME_AMBIGUOUS',
+            now=102)
+        assert quarantined is not None
+        successor = _stage_candidate_profile(successor_profile, now=103)
+        successor = topology_state.record_profile_attestation(
+            profile_revision_id=successor.id,
+            kind='terraform',
+            evidence={
+                'status': 'READY',
+                'observed_at': 104,
+            },
+            expected_generation=successor.desired_generation,
+            expected_config_hash=successor.config_hash,
+            terraform_hash='e' * 64,
+            now=104)
+        repository_name, successor_arn = (_generated_qualification_repository(
+            successor_profile, successor_target))
+        topology_state.record_profile_attestation(
+            profile_revision_id=successor.id,
+            kind=models.profile_attestation_key('terraform_target',
+                                                target.name),
+            evidence={
+                'status': 'READY',
+                'observed_at': 105,
+                'target_fingerprint': successor_target.target_fingerprint,
+                'registry': successor_target.registry,
+                'repository_name': repository_name,
+                'repository_arn': successor_arn,
+                'qualification_repository_generation':
+                    successor_target.qualification_repository_generation,
+            },
+            expected_generation=successor.desired_generation,
+            expected_config_hash=successor.config_hash,
+            now=105)
+        return topology_state.complete_qualification_quarantine_cutover(
+            profile_revision_id=successor.id, now=106)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        stale_admission = executor.submit(_run_admission, 107)
+        assert admission_paused.wait(timeout=10)
+        cutover = executor.submit(_quarantine_and_cut_over)
+        assert exclusive_attempted.wait(timeout=10)
+        assert not exclusive_acquired.wait(timeout=1)
+        allow_admission.set()
+        if admission_path == 'arm_qualification_lifecycle':
+            with pytest.raises(
+                    topology_state.QualificationMutationInProgressError):
+                stale_admission.result(timeout=10)
+        else:
+            stale_result = stale_admission.result(timeout=10)
+            if admission_path == 'qualification_copy_barrier_snapshot':
+                assert stale_result == (False, None)
+            elif admission_path == 'qualification_copy_provider_allowed':
+                assert stale_result is False
+            elif admission_path == (
+                    'begin_qualification_lifecycle_restoration'):
+                assert stale_result[1] is None
+            elif admission_path == 'begin_qualification_lifecycle_delete':
+                assert stale_result[1:] == (None, None)
+            else:
+                assert admission_path == 'record_qualification_copy'
+                assert stale_result is None
+        successor = cutover.result(timeout=10)
+
+    assert successor.state == models.ImageProfileState.QUALIFYING
+    assert topology_state.qualification_repository_quarantined(repository_arn)
+    if admission_path == 'qualification_copy_barrier_snapshot':
+        assert _run_admission(108) == (False, None)
+    elif admission_path == 'qualification_copy_provider_allowed':
+        assert _run_admission(108) is False
+    else:
+        with pytest.raises(topology_state.StaleProfileRevisionError,
+                           match='repository is quarantined'):
+            _run_admission(108)
+
+
+def test_tombstoned_active_history_does_not_starve_fresh_candidate(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    target = profile.targets[0]
+    repository_arn = (f'arn:aws:ecr:{target.region}:{profile.registry_account}:'
+                      'repository/shared-tombstoned-qualification')
+    attestations = json.dumps(
+        {
+            models.profile_attestation_key('terraform_target', target.name): {
+                'status': 'READY',
+                'repository_arn': repository_arn,
+            },
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    with image_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_profile_revisions (
+                    id, workspace, profile, revision, desired_generation,
+                    state, config_hash, config_json, physical_manifest_hash,
+                    attestations_json, canary_reserved_microusd,
+                    max_daily_canary_microusd, created_at, updated_at
+                )
+                SELECT md5('tombstoned-active-' || series::text)::uuid::text,
+                       'tombstoned-workspace-' || series::text,
+                       :profile,
+                       1,
+                       1,
+                       'ACTIVE',
+                       :config_hash,
+                       '{}',
+                       :physical_manifest_hash,
+                       :attestations,
+                       0,
+                       0,
+                       series,
+                       series
+                FROM generate_series(1, 100000) AS series
+            """), {
+                'profile': profile.name,
+                'config_hash': 'a' * 64,
+                'physical_manifest_hash': 'b' * 64,
+                'attestations': attestations,
+            })
+        owner_id = connection.execute(
+            sqlalchemy.select(schema.profile_revisions.c.id).where(
+                schema.profile_revisions.c.workspace ==
+                'tombstoned-workspace-1')).scalar_one()
+        connection.execute(
+            schema.qualification_repository_quarantines.insert().values(
+                repository_arn=repository_arn,
+                owner_profile_revision_id=owner_id,
+                owner_target=target.name,
+                owner_target_fingerprint=target.target_fingerprint,
+                runtime_digest=_DIGEST,
+                lifecycle_proof_id=str(uuid.uuid4()),
+                quarantine_reason='PROVIDER_OUTCOME_AMBIGUOUS',
+                quarantined_at=1))
+        connection.exec_driver_sql('ANALYZE container_image_profile_revisions')
+
+    candidate = _stage_candidate_profile(profile, now=100001)
+    captured: list[tuple[str, Any]] = []
+
+    def _capture_statement(_connection, _cursor, statement, parameters,
+                           _context, _executemany) -> None:
+        if ('SELECT' in statement and
+                'container_image_profile_revisions' in statement):
+            captured.append((statement, parameters))
+
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            _capture_statement)
+    try:
+        visible = topology_state.list_qualifying_profiles(include_active=True,
+                                                          limit=8)
+    finally:
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                _capture_statement)
+
+    assert [revision.id for revision in visible] == [candidate.id]
+    assert len(captured) == 1
+    statement, parameters = captured[0]
+    with image_database.connect() as connection:
+        plan = connection.exec_driver_sql(
+            f'EXPLAIN (ANALYZE, FORMAT JSON) {statement}',
+            parameters).scalar_one()[0]['Plan']
+
+    def _plan_nodes(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        yield node
+        for child in node.get('Plans', []):
+            yield from _plan_nodes(child)
+
+    nodes = list(_plan_nodes(plan))
+    state_index = next(
+        node for node in nodes
+        if node.get('Index Name') == 'ix_container_image_profile_state')
+    assert "state = 'QUALIFYING'" in state_index['Index Cond']
+    assert all(
+        node.get('Index Name') !=
+        'ix_container_image_profile_qualification_queue' for node in nodes)
+
+
+@pytest.mark.parametrize('invalid', ({
+    'state': 'DELETING',
+    'delete_phase': None,
+    'mutation_lease_token': 'token',
+    'mutation_lease_expires_at': 200,
+    'quarantine_reason': None,
+}, {
+    'state': 'RESTORING',
+    'delete_phase': 'READBACK',
+    'mutation_lease_token': None,
+    'mutation_lease_expires_at': None,
+    'quarantine_reason': None,
+}, {
+    'state': 'QUARANTINED',
+    'delete_phase': None,
+    'mutation_lease_token': None,
+    'mutation_lease_expires_at': None,
+    'quarantine_reason': None,
+}, {
+    'state': 'QUARANTINED',
+    'delete_phase': None,
+    'mutation_lease_token': 'token',
+    'mutation_lease_expires_at': 200,
+    'quarantine_reason': 'PROVIDER_OUTCOME_AMBIGUOUS',
+}))
+def test_qualification_mutation_phase_constraints(
+        image_database, profile: models.ManagedRegistryProfile,
+        invalid: dict[str, object]) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    values = {
+        'id': 'global',
+        'owner_profile_revision_id': active.id,
+        'owner_target': target.name,
+        'owner_target_fingerprint': target.target_fingerprint,
+        'repository_arn': _qualification_repository_arn(profile, target),
+        'runtime_digest': _DIGEST,
+        'lifecycle_proof_id': '00000000-0000-4000-8000-000000000109',
+        'updated_at': 100,
+        **invalid,
+    }
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with image_database.begin() as connection:
+            connection.execute(
+                schema.qualification_mutation.insert().values(**values))
 
 
 def test_qualification_lifecycle_samples_clock_after_catalog_mutation_lock(
@@ -1017,6 +2127,30 @@ def test_qualification_lifecycle_samples_clock_after_catalog_mutation_lock(
     assert set(events[1:]) == {'clock-sampled'}
 
     events.clear()
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=103)
+    assert events[0] == 'exclusive-lock-acquired'
+    assert set(events[1:]) == {'clock-sampled'}
+
+    events.clear()
+    assert qualification.mark_qualification_lifecycle_delete_readback(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=103)
+    assert events[0] == 'exclusive-lock-acquired'
+    assert set(events[1:]) == {'clock-sampled'}
+
+    events.clear()
     assert qualification.complete_qualification_lifecycle_delete(
         deleting,
         target,
@@ -1086,6 +2220,7 @@ def test_global_qualification_mutation_defers_cross_workspace_canary_until_owner
     mutation = qualification.get_qualification_mutation()
     assert mutation is not None
     assert mutation['state'] == 'DELETING'
+    assert mutation['delete_phase'] == 'PRE_INTENT'
     assert mutation['owner_profile_revision_id'] == owner.id
 
     assert qualification.claim_canary(worker_id='worker-deleting',
@@ -1098,6 +2233,22 @@ def test_global_qualification_mutation_defers_cross_workspace_canary_until_owner
     assert unchanged_follower is not None
     assert unchanged_follower.canary_reserved_microusd == 0
 
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=mutation_proof,
+        mutation_lease_token=mutation_token,
+        now=102)
+    assert qualification.mark_qualification_lifecycle_delete_readback(
+        deleting,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=mutation_proof,
+        mutation_lease_token=mutation_token,
+        now=102)
     restoring = qualification.complete_qualification_lifecycle_delete(
         deleting,
         owner_target,
@@ -1268,6 +2419,22 @@ def test_mutation_owner_can_queue_canaries_until_exact_restoration(
     assert pending_deleting is not None
     assert pending_deleting.state == models.ImageOperationState.PENDING
 
+    assert qualification.begin_qualification_lifecycle_delete_request(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=lease_token,
+        now=102)
+    assert qualification.mark_qualification_lifecycle_delete_readback(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=lease_token,
+        now=102)
     restoring = qualification.complete_qualification_lifecycle_delete(
         deleting,
         target,
@@ -1369,28 +2536,28 @@ def test_global_running_canary_prevents_other_workspace_lifecycle_delete(
     assert qualification.get_qualification_mutation() is None
     assert qualification.qualification_copy_available(unchanged, profile,
                                                       target)
-    legacy = topology_state.record_profile_attestation(
+    lifecycle_proof_id = '00000000-0000-4000-8000-000000000096'
+    deleted = topology_state.record_profile_attestation(
         profile_revision_id=unchanged.id,
         kind=models.profile_attestation_key('lifecycle', target.name),
-        evidence={
-            'status': 'READY',
-            'target': target.name,
-            'target_fingerprint': target.target_fingerprint,
-            'repository_arn': repository_arn,
-            'runtime_digest': _DIGEST,
-            'exact_absence': True,
-        },
+        evidence=qualification.qualification_lifecycle_evidence(
+            status='READY',
+            target=target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lifecycle_proof_id=lifecycle_proof_id,
+            exact_absence=True),
         expected_generation=unchanged.desired_generation,
         expected_config_hash=unchanged.config_hash,
         now=104)
     restoring, restoration_proof = (
         qualification.begin_qualification_lifecycle_restoration(
-            legacy,
+            deleted,
             target,
             repository_arn=repository_arn,
             runtime_digest=_DIGEST,
             now=105))
-    assert restoration_proof is not None
+    assert restoration_proof == lifecycle_proof_id
     mutation = qualification.get_qualification_mutation()
     assert mutation is not None
     assert mutation['state'] == 'RESTORING'
@@ -1521,6 +2688,7 @@ def test_canary_claim_and_cost_recheck_copy_after_lifecycle_profile_lock(
                 repository_arn=repository_arn,
                 runtime_digest=_DIGEST,
                 lifecycle_proof_id=('00000000-0000-4000-8000-000000000103'),
+                delete_phase='PRE_INTENT',
                 mutation_lease_token=('00000000-0000-4000-8000-000000000104'),
                 mutation_lease_expires_at=database_now + 300),
             expected_generation=active.desired_generation,
@@ -1594,6 +2762,7 @@ def test_authorize_canary_launch_rejects_lifecycle_unavailability(
             repository_arn=repository_arn,
             runtime_digest=_DIGEST,
             lifecycle_proof_id='00000000-0000-4000-8000-000000000105',
+            delete_phase='PRE_INTENT',
             mutation_lease_token='00000000-0000-4000-8000-000000000106',
             mutation_lease_expires_at=600),
         expected_generation=active.desired_generation,
@@ -2229,6 +3398,25 @@ def test_candidate_handoff_is_nonmutating_and_activation_applies_atomically(
                 'api_family': 'ecr',
                 'applied_rate_per_second': 7,
                 'burst': 3,
+            },
+            expected_generation=candidate.desired_generation,
+            expected_config_hash=candidate.config_hash,
+            now=22)
+        qualification_name, qualification_arn = (
+            _generated_qualification_repository(candidate_profile, target))
+        attested = topology_state.record_profile_attestation(
+            profile_revision_id=candidate.id,
+            kind=models.profile_attestation_key('terraform_target',
+                                                target.name),
+            evidence={
+                'status': 'READY',
+                'observed_at': 22,
+                'target_fingerprint': target.target_fingerprint,
+                'registry': target.registry,
+                'repository_name': qualification_name,
+                'repository_arn': qualification_arn,
+                'qualification_repository_generation':
+                    target.qualification_repository_generation,
             },
             expected_generation=candidate.desired_generation,
             expected_config_hash=candidate.config_hash,
@@ -7571,6 +8759,47 @@ def test_profile_staging_is_serialized_by_transaction_advisory_lock(
            ].count(models.ImageProfileState.SUPERSEDED) == 1
 
 
+def test_profile_staging_locks_current_candidate_before_catalog_barrier(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    current = _stage_candidate_profile(profile, now=10)
+    successor = dataclasses.replace(profile, revision=profile.revision + 1)
+    original_mutation = topology_state.get_qualification_mutation_in_session
+    observed = False
+
+    def _observe_catalog_lock(
+        session: orm.Session,
+        *,
+        exclusive: bool,
+    ) -> sqlalchemy.engine.RowMapping | None:
+        nonlocal observed
+        assert not exclusive
+        with image_database.connect() as connection:
+            transaction = connection.begin()
+            try:
+                with pytest.raises(sqlalchemy.exc.OperationalError) as error:
+                    connection.execute(
+                        sqlalchemy.select(schema.profile_revisions).where(
+                            schema.profile_revisions.c.id ==
+                            current.id).with_for_update(nowait=True)).all()
+                assert getattr(error.value.orig, 'pgcode', None) == '55P03'
+            finally:
+                transaction.rollback()
+        observed = True
+        return original_mutation(session, exclusive=exclusive)
+
+    monkeypatch.setattr(topology_state, 'get_qualification_mutation_in_session',
+                        _observe_catalog_lock)
+
+    staged = _stage_candidate_profile(successor, now=20)
+
+    assert observed
+    assert staged.revision == successor.revision
+    prior = topology_state.get_profile_revision(current.id)
+    assert prior is not None
+    assert prior.state == models.ImageProfileState.SUPERSEDED
+
+
 def test_profile_attestation_is_serialized_by_transaction_advisory_lock(
         image_database, profile: models.ManagedRegistryProfile) -> None:
     revision = _activate_profile(image_database, profile)
@@ -7706,8 +8935,8 @@ def _short_lived_qualifying_profile(
             'status': 'READY'
         })
         for target in (short_lived.canonical,) + short_lived.targets:
-            repository_name = f'{target.repository_prefix}/qualification'
-            repository_arn = _qualification_repository_arn(short_lived, target)
+            repository_name, repository_arn = (
+                _generated_qualification_repository(short_lived, target))
             lifecycle_proof_id = str(
                 uuid.uuid5(uuid.NAMESPACE_DNS, f'skypilot-test:{target.name}'))
             if key == models.profile_attestation_key('terraform_target',
@@ -7715,7 +8944,9 @@ def _short_lived_qualifying_profile(
                 evidence.update(target_fingerprint=target.target_fingerprint,
                                 registry=target.registry,
                                 repository_name=repository_name,
-                                repository_arn=repository_arn)
+                                repository_arn=repository_arn,
+                                qualification_repository_generation=(
+                                    target.qualification_repository_generation))
             elif key == models.profile_attestation_key('copy', target.name):
                 evidence.update(
                     target_fingerprint=target.target_fingerprint,
@@ -7862,6 +9093,37 @@ def test_profile_activation_rejects_mismatched_copy_restoration_proof(
     unchanged = topology_state.get_profile_revision(revision.id)
     assert unchanged is not None
     assert unchanged.state == models.ImageProfileState.QUALIFYING
+
+
+def test_profile_activation_accepts_old_exact_lifecycle_proof(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    short_lived, revision, scheduler_now = _short_lived_qualifying_profile(
+        image_database, profile)
+    old_observed_at = scheduler_now - 86_400
+    for target in (short_lived.canonical,) + short_lived.targets:
+        lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+        lifecycle = dict(revision.attestations[lifecycle_key])
+        revision = topology_state.record_profile_attestation(
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=lifecycle,
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=old_observed_at)
+
+    requirements = qualification._attestation_requirements(  # pylint: disable=protected-access
+        short_lived, revision.attestations)
+    for target in (short_lived.canonical,) + short_lived.targets:
+        assert requirements[models.profile_attestation_key(
+            'lifecycle', target.name)] is None
+        assert requirements[models.profile_attestation_key(
+            'copy', target.name)] == 10 * 60
+
+    activated = qualification.maybe_activate_profile(revision.id,
+                                                     now=scheduler_now)
+
+    assert activated is not None
+    assert activated.state == models.ImageProfileState.ACTIVE
 
 
 def test_profile_activation_rechecks_freshness_after_advisory_lock(
@@ -8680,6 +9942,9 @@ def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
         schema.metadata.create_all(runtime_engine)
         with runtime_engine.begin() as connection:
             connection.exec_driver_sql(
+                'DROP TABLE '
+                'container_image_qualification_repository_quarantines')
+            connection.exec_driver_sql(
                 'DROP TABLE container_image_qualification_mutation')
             connection.exec_driver_sql(
                 'DROP INDEX '
@@ -8773,6 +10038,9 @@ def test_migration_025_adds_rollback_compatible_canary_child_evidence(
     migration_026 = importlib.import_module(
         'sky.schemas.db.global_user_state.'
         '026_container_image_running_canary_index')
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '027_container_image_qualification_delete_phases')
     try:
         with migration_engine.begin() as connection:
             connection.exec_driver_sql(
@@ -8780,6 +10048,7 @@ def test_migration_025_adds_rollback_compatible_canary_child_evidence(
         _migration_call(migration_engine, migration_024.upgrade)
         _migration_call(migration_engine, migration_025.upgrade)
         _autocommit_migration_call(migration_engine, migration_026.upgrade)
+        _migration_call(migration_engine, migration_027.upgrade)
         schema.metadata.create_all(runtime_engine)
 
         assert _schema_shape(migration_engine,
@@ -9055,6 +10324,505 @@ def test_migration_026_adds_qualification_mutation_and_running_canary_fences(
                 f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
 
 
+def _prepare_image_schema_for_migration_027(
+        engine: sqlalchemy.engine.Engine) -> None:
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    _prepare_image_schema_for_migration_026(engine)
+    _autocommit_migration_call(engine, migration_026.upgrade)
+
+
+def test_migration_027_quarantines_legacy_deleting_with_exact_tombstone(
+        postgres_engine) -> None:
+    migration_schema = f'image_delete_phase_quarantine_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '027_container_image_qualification_delete_phases')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        revision_id = str(uuid.uuid4())
+        lifecycle_proof_id = str(uuid.uuid4())
+        repository_arn = (
+            'arn:aws:ecr:us-east-1:123456789012:repository/exact-q')
+        _insert_migration_profile_revision(migration_engine, revision_id)
+        with migration_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text("""
+                    INSERT INTO container_image_qualification_mutation (
+                        id, owner_profile_revision_id, owner_target,
+                        owner_target_fingerprint, repository_arn,
+                        runtime_digest, lifecycle_proof_id, state,
+                        mutation_lease_token, mutation_lease_expires_at,
+                        updated_at
+                    ) VALUES (
+                        'global', :revision, 'primary', 'target-fingerprint',
+                        :repository_arn,
+                        :digest, :proof, 'DELETING', :token, 120, 100
+                    )
+                """), {
+                    'revision': revision_id,
+                    'repository_arn': repository_arn,
+                    'digest': _DIGEST,
+                    'proof': lifecycle_proof_id,
+                    'token': str(uuid.uuid4()),
+                })
+
+        _migration_call(migration_engine, migration_027.upgrade)
+
+        with migration_engine.connect() as connection:
+            mutation = connection.execute(
+                sqlalchemy.text("""
+                    SELECT state, delete_phase, mutation_lease_token,
+                           mutation_lease_expires_at, quarantine_reason,
+                           repository_arn, lifecycle_proof_id, updated_at
+                    FROM container_image_qualification_mutation
+                    WHERE id = 'global'
+                """)).mappings().one()
+            tombstone = connection.execute(
+                sqlalchemy.text("""
+                    SELECT owner_profile_revision_id, owner_target,
+                           owner_target_fingerprint, repository_arn,
+                           runtime_digest, lifecycle_proof_id,
+                           quarantine_reason, quarantined_at
+                    FROM
+                        container_image_qualification_repository_quarantines
+                    WHERE repository_arn = :repository_arn
+                """), {
+                    'repository_arn': repository_arn
+                }).mappings().one()
+        assert mutation['state'] == 'QUARANTINED'
+        assert mutation['delete_phase'] is None
+        assert mutation['mutation_lease_token'] is None
+        assert mutation['mutation_lease_expires_at'] is None
+        assert (
+            mutation['quarantine_reason'] == 'LEGACY_DELETE_OUTCOME_UNKNOWN')
+        assert mutation['repository_arn'] == repository_arn
+        assert mutation['lifecycle_proof_id'] == lifecycle_proof_id
+        assert tombstone['owner_profile_revision_id'] == revision_id
+        assert tombstone['owner_target'] == 'primary'
+        assert tombstone['owner_target_fingerprint'] == 'target-fingerprint'
+        assert tombstone['repository_arn'] == repository_arn
+        assert tombstone['runtime_digest'] == _DIGEST
+        assert tombstone['lifecycle_proof_id'] == lifecycle_proof_id
+        assert tombstone['quarantine_reason'] == mutation['quarantine_reason']
+        assert tombstone['quarantined_at'] == mutation['updated_at']
+        assert tombstone['quarantined_at'] > 100
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
+def test_migration_027_quarantines_legacy_restoring_with_exact_tombstone(
+        postgres_engine) -> None:
+    migration_schema = f'image_restoration_quarantine_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '027_container_image_qualification_delete_phases')
+    revision_id = str(uuid.uuid4())
+    lifecycle_proof_id = str(uuid.uuid4())
+    repository_arn = (
+        'arn:aws:ecr:us-east-1:123456789012:repository/exact-restoring-q')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        _insert_migration_profile_revision(migration_engine, revision_id)
+        with migration_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text("""
+                    INSERT INTO container_image_qualification_mutation (
+                        id, owner_profile_revision_id, owner_target,
+                        owner_target_fingerprint, repository_arn,
+                        runtime_digest, lifecycle_proof_id, state,
+                        mutation_lease_token, mutation_lease_expires_at,
+                        updated_at
+                    ) VALUES (
+                        'global', :revision, 'primary', 'target-fingerprint',
+                        :repository_arn, :digest, :proof, 'RESTORING',
+                        NULL, NULL, 100
+                    )
+                """), {
+                    'revision': revision_id,
+                    'repository_arn': repository_arn,
+                    'digest': _DIGEST,
+                    'proof': lifecycle_proof_id,
+                })
+        _migration_call(migration_engine, migration_027.upgrade)
+
+        with migration_engine.connect() as connection:
+            mutation = connection.execute(
+                sqlalchemy.text("""
+                    SELECT state, delete_phase, mutation_lease_token,
+                           mutation_lease_expires_at, quarantine_reason,
+                           repository_arn, lifecycle_proof_id, updated_at
+                    FROM container_image_qualification_mutation
+                    WHERE id = 'global'
+                """)).mappings().one()
+            tombstone = connection.execute(
+                sqlalchemy.text("""
+                    SELECT owner_profile_revision_id, owner_target,
+                           owner_target_fingerprint, repository_arn,
+                           runtime_digest, lifecycle_proof_id,
+                           quarantine_reason, quarantined_at
+                    FROM
+                        container_image_qualification_repository_quarantines
+                    WHERE repository_arn = :repository_arn
+                """), {
+                    'repository_arn': repository_arn
+                }).mappings().one()
+
+        assert mutation['state'] == 'QUARANTINED'
+        assert mutation['delete_phase'] is None
+        assert mutation['mutation_lease_token'] is None
+        assert mutation['mutation_lease_expires_at'] is None
+        assert (mutation['quarantine_reason'] ==
+                'LEGACY_RESTORATION_EVIDENCE_INCOMPLETE')
+        assert (mutation['quarantine_reason']
+                != 'LEGACY_DELETE_OUTCOME_UNKNOWN')
+        assert mutation['repository_arn'] == repository_arn
+        assert mutation['lifecycle_proof_id'] == lifecycle_proof_id
+        assert tombstone['owner_profile_revision_id'] == revision_id
+        assert tombstone['owner_target'] == 'primary'
+        assert tombstone['owner_target_fingerprint'] == 'target-fingerprint'
+        assert tombstone['repository_arn'] == repository_arn
+        assert tombstone['runtime_digest'] == _DIGEST
+        assert tombstone['lifecycle_proof_id'] == lifecycle_proof_id
+        assert tombstone['quarantine_reason'] == mutation['quarantine_reason']
+        assert tombstone['quarantined_at'] == mutation['updated_at']
+        assert tombstone['quarantined_at'] > 100
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
+def test_migration_027_upgrades_empty_026_to_runtime_shape(
+        postgres_engine) -> None:
+    migration_schema = f'image_delete_phase_migration_{uuid.uuid4().hex}'
+    runtime_schema = f'image_delete_phase_runtime_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+        connection.exec_driver_sql(f'CREATE SCHEMA {runtime_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    runtime_engine = _schema_engine(postgres_engine, runtime_schema)
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '027_container_image_qualification_delete_phases')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        _migration_call(migration_engine, migration_027.upgrade)
+        schema.metadata.create_all(runtime_engine)
+
+        assert _schema_shape(migration_engine,
+                             migration_schema) == _schema_shape(
+                                 runtime_engine, runtime_schema)
+        inspector = sqlalchemy.inspect(migration_engine)
+        assert [
+            column['name'] for column in inspector.get_columns(
+                'container_image_qualification_mutation')
+        ] == [
+            'id', 'owner_profile_revision_id', 'owner_target',
+            'owner_target_fingerprint', 'repository_arn', 'runtime_digest',
+            'lifecycle_proof_id', 'state', 'mutation_lease_token',
+            'mutation_lease_expires_at', 'updated_at', 'delete_phase',
+            'quarantine_reason'
+        ]
+        assert {
+            constraint['name']
+            for constraint in inspector.get_check_constraints(
+                'container_image_qualification_mutation')
+        } == {
+            'ck_container_image_qualification_mutation_delete_phase',
+            'ck_container_image_qualification_mutation_identity',
+            'ck_container_image_qualification_mutation_lease',
+            'ck_container_image_qualification_mutation_singleton',
+            'ck_container_image_qualification_mutation_state',
+        }
+        assert [
+            column['name'] for column in inspector.get_columns(
+                'container_image_qualification_repository_quarantines')
+        ] == [
+            'repository_arn', 'owner_profile_revision_id', 'owner_target',
+            'owner_target_fingerprint', 'runtime_digest', 'lifecycle_proof_id',
+            'quarantine_reason', 'quarantined_at'
+        ]
+        assert {
+            constraint['name']
+            for constraint in inspector.get_check_constraints(
+                'container_image_qualification_repository_quarantines')
+        } == {
+            'ck_container_image_qualification_repository_quarantine_identity'
+        }
+        assert {
+            index['name'] for index in inspector.get_indexes(
+                'container_image_qualification_repository_quarantines')
+        } == {
+            'ix_container_image_qualification_repository_quarantines_history'
+        }
+    finally:
+        migration_engine.dispose()
+        runtime_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {runtime_schema} CASCADE')
+
+
+def test_migration_027_empty_downgrade_restores_exact_026_shape(
+        postgres_engine) -> None:
+    migration_schema = f'image_delete_phase_downgrade_{uuid.uuid4().hex}'
+    reference_schema = f'image_delete_phase_reference_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+        connection.exec_driver_sql(f'CREATE SCHEMA {reference_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    reference_engine = _schema_engine(postgres_engine, reference_schema)
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '027_container_image_qualification_delete_phases')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        _migration_call(migration_engine, migration_027.upgrade)
+        _prepare_image_schema_for_migration_027(reference_engine)
+
+        _migration_call(migration_engine, migration_027.downgrade)
+
+        assert _schema_shape(migration_engine,
+                             migration_schema) == _schema_shape(
+                                 reference_engine, reference_schema)
+        inspector = sqlalchemy.inspect(migration_engine)
+        assert not inspector.has_table(
+            'container_image_qualification_repository_quarantines')
+        assert [
+            column['name'] for column in inspector.get_columns(
+                'container_image_qualification_mutation')
+        ] == [
+            'id', 'owner_profile_revision_id', 'owner_target',
+            'owner_target_fingerprint', 'repository_arn', 'runtime_digest',
+            'lifecycle_proof_id', 'state', 'mutation_lease_token',
+            'mutation_lease_expires_at', 'updated_at'
+        ]
+    finally:
+        migration_engine.dispose()
+        reference_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {reference_schema} CASCADE')
+
+
+@pytest.mark.parametrize('residue', ['mutation', 'tombstone'])
+def test_migration_027_downgrade_refuses_durable_residue(
+        postgres_engine, residue: str) -> None:
+    migration_schema = f'image_delete_phase_residue_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '027_container_image_qualification_delete_phases')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        _migration_call(migration_engine, migration_027.upgrade)
+        revision_id = str(uuid.uuid4())
+        _insert_migration_profile_revision(migration_engine, revision_id)
+        with migration_engine.begin() as connection:
+            if residue == 'mutation':
+                connection.execute(
+                    sqlalchemy.text("""
+                        INSERT INTO container_image_qualification_mutation (
+                            id, owner_profile_revision_id, owner_target,
+                            owner_target_fingerprint, repository_arn,
+                            runtime_digest, lifecycle_proof_id, state,
+                            delete_phase, mutation_lease_token,
+                            mutation_lease_expires_at, quarantine_reason,
+                            updated_at
+                        ) VALUES (
+                            'global', :revision, 'primary',
+                            'target-fingerprint', :repository_arn, :digest,
+                            :proof, 'RESTORING', NULL, NULL, NULL, NULL, 100
+                        )
+                    """), {
+                        'revision': revision_id,
+                        'repository_arn': ('arn:aws:ecr:us-east-1:123456789012:'
+                                           'repository/q'),
+                        'digest': _DIGEST,
+                        'proof': str(uuid.uuid4()),
+                    })
+            else:
+                connection.execute(
+                    sqlalchemy.text("""
+                        INSERT INTO
+                            container_image_qualification_repository_quarantines
+                            (repository_arn, owner_profile_revision_id,
+                             owner_target, owner_target_fingerprint,
+                             runtime_digest, lifecycle_proof_id,
+                             quarantine_reason, quarantined_at)
+                        VALUES (
+                            :repository_arn, :revision, 'primary',
+                            'target-fingerprint', :digest, :proof,
+                            'PROVIDER_OUTCOME_AMBIGUOUS', 100
+                        )
+                    """), {
+                        'revision': revision_id,
+                        'repository_arn': ('arn:aws:ecr:us-east-1:123456789012:'
+                                           'repository/q'),
+                        'digest': _DIGEST,
+                        'proof': str(uuid.uuid4()),
+                    })
+
+        with pytest.raises(RuntimeError,
+                           match='requires empty qualification mutation'):
+            _migration_call(migration_engine, migration_027.downgrade)
+
+        inspector = sqlalchemy.inspect(migration_engine)
+        assert inspector.has_table(
+            'container_image_qualification_repository_quarantines')
+        assert {'delete_phase', 'quarantine_reason'}.issubset({
+            column['name'] for column in inspector.get_columns(
+                'container_image_qualification_mutation')
+        })
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
+def test_migration_026_empty_downgrade_restores_exact_025_shape(
+        postgres_engine) -> None:
+    migration_schema = f'image_canary_fence_downgrade_{uuid.uuid4().hex}'
+    reference_schema = f'image_canary_fence_reference_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+        connection.exec_driver_sql(f'CREATE SCHEMA {reference_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    reference_engine = _schema_engine(postgres_engine, reference_schema)
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        _prepare_image_schema_for_migration_026(reference_engine)
+
+        _migration_call(migration_engine, migration_026.downgrade)
+
+        assert _schema_shape(migration_engine,
+                             migration_schema) == _schema_shape(
+                                 reference_engine, reference_schema)
+        inspector = sqlalchemy.inspect(migration_engine)
+        assert not inspector.has_table('container_image_qualification_mutation')
+        assert 'ix_container_image_operations_running_canary_revision' not in {
+            index['name']
+            for index in inspector.get_indexes('container_image_operations')
+        }
+    finally:
+        migration_engine.dispose()
+        reference_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {reference_schema} CASCADE')
+
+
+def test_migration_026_downgrade_refuses_nonempty_mutation(
+        postgres_engine) -> None:
+    migration_schema = f'image_canary_fence_residue_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        revision_id = str(uuid.uuid4())
+        _insert_migration_profile_revision(migration_engine, revision_id)
+        with migration_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text("""
+                    INSERT INTO container_image_qualification_mutation (
+                        id, owner_profile_revision_id, owner_target,
+                        owner_target_fingerprint, repository_arn,
+                        runtime_digest, lifecycle_proof_id, state,
+                        mutation_lease_token, mutation_lease_expires_at,
+                        updated_at
+                    ) VALUES (
+                        'global', :revision, 'primary', 'target-fingerprint',
+                        'arn:aws:ecr:us-east-1:123456789012:repository/q',
+                        :digest, :proof, 'DELETING', :token, 120, 100
+                    )
+                """), {
+                    'revision': revision_id,
+                    'digest': _DIGEST,
+                    'proof': str(uuid.uuid4()),
+                    'token': str(uuid.uuid4()),
+                })
+
+        with pytest.raises(RuntimeError, match='requires an empty'):
+            _migration_call(migration_engine, migration_026.downgrade)
+
+        inspector = sqlalchemy.inspect(migration_engine)
+        assert inspector.has_table('container_image_qualification_mutation')
+        assert 'ix_container_image_operations_running_canary_revision' in {
+            index['name']
+            for index in inspector.get_indexes('container_image_operations')
+        }
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
+def test_migration_027_empty_database_downgrades_through_023(
+        postgres_engine) -> None:
+    migration_schema = f'image_full_downgrade_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
+    migration_025 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '025_container_image_canary_child_evidence')
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '027_container_image_qualification_delete_phases')
+    try:
+        _prepare_image_schema_for_migration_027(migration_engine)
+        _migration_call(migration_engine, migration_027.upgrade)
+
+        _migration_call(migration_engine, migration_027.downgrade)
+        _migration_call(migration_engine, migration_026.downgrade)
+        _migration_call(migration_engine, migration_025.downgrade)
+        _migration_call(migration_engine, migration_024.downgrade)
+
+        inspector = sqlalchemy.inspect(migration_engine)
+        assert set(inspector.get_table_names()) == {'auth_sessions', 'clusters'}
+        assert {column['name'] for column in inspector.get_columns('clusters')
+               } == {'name'}
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
 @pytest.mark.parametrize('index_ddl', [
     ('CREATE INDEX '
      'ix_container_image_operations_running_canary_revision '
@@ -9235,7 +11003,7 @@ finally:
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
             ).scalar_one()
-        assert revision == '026'
+        assert revision == '027'
     finally:
         for process in processes:
             if process.poll() is None:
@@ -9378,7 +11146,7 @@ def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
             assert connection.execute(
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
-            ).scalar_one() == '026'
+            ).scalar_one() == '027'
         assert sqlalchemy.inspect(fresh_engine).has_table(
             'container_image_catalog')
     finally:
@@ -9868,3 +11636,165 @@ def test_builder_prototype_postgres_lease_is_exact_and_recoverable(
         repository._engine.dispose()
         with postgres_engine.begin() as connection:
             connection.exec_driver_sql(f'DROP SCHEMA {schema_name} CASCADE')
+
+
+def test_profile_activation_locks_ordered_rows_before_catalog_barrier(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    short_lived, revision, scheduler_now = _short_lived_qualifying_profile(
+        image_database, profile)
+    shard = topology_state.list_shards('research', short_lived.name)[0]
+    budget = topology_state.get_provider_budget(
+        provider='aws',
+        partition=short_lived.partition,
+        account=short_lived.registry_account,
+        region=short_lived.canonical.region,
+        api_family='ecr')
+    assert budget is not None
+    requirements = qualification._attestation_requirements(  # pylint: disable=protected-access
+        short_lived, revision.attestations)
+    events: list[str] = []
+    original_mutation = (topology_state.get_qualification_mutation_in_session)
+    original_epoch = catalog_state.database_epoch
+
+    def _assert_row_locked(statement: sqlalchemy.sql.Select) -> None:
+        with image_database.connect() as connection:
+            transaction = connection.begin()
+            try:
+                with pytest.raises(sqlalchemy.exc.OperationalError) as error:
+                    connection.execute(
+                        statement.with_for_update(nowait=True)).all()
+                assert getattr(error.value.orig, 'pgcode', None) == '55P03'
+            finally:
+                transaction.rollback()
+
+    def _observe_catalog_lock(
+        session: orm.Session,
+        *,
+        exclusive: bool,
+    ) -> sqlalchemy.engine.RowMapping | None:
+        assert not exclusive
+        _assert_row_locked(
+            sqlalchemy.select(schema.profile_revisions).where(
+                schema.profile_revisions.c.id == revision.id))
+        _assert_row_locked(
+            sqlalchemy.select(schema.provider_budgets).where(
+                schema.provider_budgets.c.id == budget.id))
+        _assert_row_locked(
+            sqlalchemy.select(schema.registry_shards).where(
+                schema.registry_shards.c.id == shard.id))
+        mutation = original_mutation(session, exclusive=exclusive)
+        events.append('catalog-lock-acquired')
+        return mutation
+
+    def _observe_epoch(session: orm.Session, *, now: int | None = None) -> int:
+        assert events == ['catalog-lock-acquired']
+        events.append('clock-sampled')
+        return original_epoch(session, now=now)
+
+    monkeypatch.setattr(topology_state, 'get_qualification_mutation_in_session',
+                        _observe_catalog_lock)
+    monkeypatch.setattr(catalog_state, 'database_epoch', _observe_epoch)
+
+    activated = transactions.activate_profile(
+        profile_revision_id=revision.id,
+        expected_generation=revision.desired_generation,
+        expected_config_hash=revision.config_hash,
+        expected_terraform_hash=revision.terraform_hash,
+        expected_attestations_hash=revision.attestations_hash,
+        required_attestations=requirements,
+        now=scheduler_now)
+
+    assert activated.state == models.ImageProfileState.ACTIVE
+    assert events == ['catalog-lock-acquired', 'clock-sampled']
+
+
+def test_record_qualification_copy_uses_minimum_catalog_lock_mode(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    armed, armed_now = qualification.arm_qualification_lifecycle(
+        active,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        now=20)
+    assert armed_now
+    ordinary_proof = qualification.qualification_copy_restoration_proof_id(
+        armed, target, _DIGEST)
+    assert ordinary_proof is not None
+
+    lock_modes: list[bool] = []
+    original_mutation = (topology_state.get_qualification_mutation_in_session)
+
+    def _observe_catalog_lock(
+        session: orm.Session,
+        *,
+        exclusive: bool,
+    ) -> sqlalchemy.engine.RowMapping | None:
+        lock_modes.append(exclusive)
+        return original_mutation(session, exclusive=exclusive)
+
+    monkeypatch.setattr(topology_state, 'get_qualification_mutation_in_session',
+                        _observe_catalog_lock)
+    copied = qualification.record_qualification_copy(
+        armed,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=ordinary_proof,
+        now=21)
+    assert copied is not None
+    assert lock_modes == [False]
+
+    restoration_profile = _qualification_generation_profile(
+        _workspace_isolated_profile(profile, 'restoration'), 1)
+    restoring_active = _activate_profile(image_database,
+                                         restoration_profile,
+                                         workspace='restoration')
+    restoring_target = restoration_profile.targets[0]
+    restoring_arn = _qualification_repository_arn(restoration_profile,
+                                                  restoring_target)
+    lifecycle_key = models.profile_attestation_key('lifecycle',
+                                                   restoring_target.name)
+    legacy = topology_state.record_profile_attestation(
+        profile_revision_id=restoring_active.id,
+        kind=lifecycle_key,
+        evidence={
+            'status': 'READY',
+            'target': restoring_target.name,
+            'target_fingerprint': restoring_target.target_fingerprint,
+            'repository_arn': restoring_arn,
+            'runtime_digest': _DIGEST,
+            'exact_absence': True,
+        },
+        expected_generation=restoring_active.desired_generation,
+        expected_config_hash=restoring_active.config_hash,
+        now=22)
+    restoring, restoration_proof = (
+        qualification.begin_qualification_lifecycle_restoration(
+            legacy,
+            restoring_target,
+            repository_arn=restoring_arn,
+            runtime_digest=_DIGEST,
+            now=23))
+    assert restoration_proof is not None
+    lock_modes.clear()
+
+    restored = qualification.record_qualification_copy(
+        restoring,
+        restoring_target,
+        repository_arn=restoring_arn,
+        runtime_digest=_DIGEST,
+        platform=restoration_profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=restoration_proof,
+        expected_mutation_proof_id=restoration_proof,
+        now=24)
+
+    assert restored is not None
+    assert lock_modes == [True]

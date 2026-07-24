@@ -460,7 +460,11 @@ def _load_contract(
                 revision, profile, target)):
         raise ValueError('QUALIFICATION_FAILED')
     repository_name, _ = qualification.qualification_repository(
-        revision, target)
+        revision,
+        target,
+        catalog_authority=operation.authority_id,
+        profile=profile,
+        configured_target=target)
     copy_key = models.profile_attestation_key('copy', target.name)
     copy_evidence = revision.attestations.get(copy_key)
     if (not isinstance(copy_evidence, dict) or

@@ -813,8 +813,16 @@ def reconcile_qualification_copy(
         should_stop: Callable[[], bool] | None = None) -> bool:
     """Attests live infrastructure and copies the fixed canary as copy role."""
     _raise_if_stopping(should_stop)
+    qualification_repository_arn: str | None = None
 
     def provider_fence() -> None:
+        _raise_if_stopping(should_stop)
+        if (qualification_repository_arn is not None and
+                not qualification.qualification_copy_provider_allowed(
+                    revision,
+                    target,
+                    repository_arn=qualification_repository_arn)):
+            raise _QualificationDrainRequested()
         _raise_if_stopping(should_stop)
 
     profile = models.ManagedRegistryProfile.from_snapshot(
@@ -827,6 +835,44 @@ def reconcile_qualification_copy(
         return False
     repository_name, repository_arn = qualification.qualification_repository(
         revision, target)
+    qualification_repository_arn = repository_arn
+    expected_uri = f'{target.registry}/{repository_name}'
+    target_key = models.profile_attestation_key('terraform_target', target.name)
+    terraform_target = revision.attestations.get(target_key)
+    if (not isinstance(terraform_target, dict) or
+            terraform_target.get('status') != 'READY' or
+            terraform_target.get('target_fingerprint')
+            != target.target_fingerprint or
+            terraform_target.get('repository_arn') != repository_arn):
+        raise LookupError(
+            'Terraform qualification target attestation is not committed yet.')
+    expected_policy_hash = models.validate_fingerprint(
+        terraform_target.get('qualification_policy_hash'),
+        'Qualification repository policy hash')
+    expected_ownership_tags_hash = models.validate_fingerprint(
+        terraform_target.get('qualification_ownership_tags_hash'),
+        'Qualification repository ownership tags hash')
+    _, terraform_shard = _expected_shard_attestation(revision, shard)
+    expected_encryption_type = terraform_shard.get('encryption_type')
+    expected_kms_key = terraform_shard.get('kms_key')
+    if (terraform_shard.get('target_fingerprint') != target.target_fingerprint
+            or expected_encryption_type not in ('AES256', 'KMS') or
+        (expected_encryption_type == 'AES256' and expected_kms_key is not None)
+            or (expected_encryption_type == 'KMS' and
+                not isinstance(expected_kms_key, str))):
+        raise LookupError(
+            'Terraform qualification encryption attestation is invalid.')
+    expected_metadata = {
+        'repository_arn': repository_arn,
+        'repository_uri': expected_uri,
+        'tag_mutability': 'IMMUTABLE',
+        'encryption_type': expected_encryption_type,
+        'kms_key': expected_kms_key,
+        'scanning_mode': 'MANUAL',
+        'policy_hash': expected_policy_hash,
+        'ownership_tags_hash': expected_ownership_tags_hash,
+    }
+    provider_fence()
     binding = profile.bindings[target.write_authority]
     _raise_if_stopping(should_stop)
     destination = aws.EcrRepository.from_role(
@@ -838,10 +884,7 @@ def reconcile_qualification_copy(
     _raise_if_stopping(should_stop)
     metadata = destination.repository_metadata()
     _raise_if_stopping(should_stop)
-    expected_uri = f'{target.registry}/{repository_name}'
-    if (metadata['repository_arn'] != repository_arn or
-            metadata['repository_uri'] != expected_uri or
-            metadata['tag_mutability'] != 'IMMUTABLE'):
+    if metadata != expected_metadata:
         raise ValueError('Qualification repository live identity drifted.')
     _raise_if_stopping(should_stop)
     revision = topology_state.record_profile_attestation(
@@ -856,6 +899,9 @@ def reconcile_qualification_copy(
             'tag_mutability': metadata['tag_mutability'],
             'encryption_type': metadata['encryption_type'],
             'kms_key': metadata['kms_key'],
+            'scanning_mode': metadata['scanning_mode'],
+            'policy_hash': metadata['policy_hash'],
+            'ownership_tags_hash': metadata['ownership_tags_hash'],
         },
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
@@ -941,6 +987,10 @@ def reconcile_qualification_profiles(
     if should_stop is not None and should_stop():
         return completed
     mutation = qualification.get_qualification_mutation()
+    if mutation is not None and mutation.get('state') == 'QUARANTINED':
+        # No provider read is safe while an ambiguous old delete can still
+        # arrive at the shared physical qualification repository.
+        return completed
     revisions = topology_state.list_qualifying_profiles(include_active=True,
                                                         limit=limit)
     recovery_owner_id: str | None = None

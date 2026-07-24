@@ -44,6 +44,10 @@ mock_provider "aws" {
       arn            = "arn:aws:ecr:us-east-1:123456789012:repository/skypilot/images/test-shard"
       registry_id    = "123456789012"
       repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/skypilot/images/test-shard"
+      tags_all = {
+        ManagedBy       = "Terraform"
+        ProviderDefault = "inherited"
+      }
     }
   }
 
@@ -96,7 +100,7 @@ mock_provider "aws" {
 
 variables {
   catalog_authority                   = "00000000-0000-4000-8000-000000000001"
-  catalog_authority_base32            = "aaaaaaaaaaaaaaaaaaaaaaaaaa"
+  catalog_authority_base32            = "aaaaaaaaabaabaaaaaaaaaaaae"
   realm                               = "terraform-test"
   profile                             = "default"
   registry_account_id                 = "123456789012"
@@ -151,6 +155,15 @@ run "canonical_is_readable_but_never_deletable" {
   assert {
     condition     = output.lifecycle_target_role_arn == aws_iam_role.lifecycle_target.arn
     error_message = "The lifecycle role output must identify the role whose boundary and inline policy are managed here."
+  }
+
+  assert {
+    condition = (
+      one(values(aws_ecr_repository.shard)).tags_all["ProviderDefault"] == "inherited" &&
+      one(output.qualified_shards_by_workspace["workspace-a"]).ownership_tags_hash == sha256(jsonencode(one(values(aws_ecr_repository.shard)).tags_all)) &&
+      one(output.qualified_shards_by_workspace["workspace-a"]).ownership_tags_hash != sha256(jsonencode(one(values(aws_ecr_repository.shard)).tags))
+    )
+    error_message = "The qualified shard handoff must canonically hash tags_all so provider default tags are included."
   }
 
   assert {

@@ -758,6 +758,10 @@ def readiness(request: fastapi.Request,
         shard_records = topology_state.list_shards(resolved, limit=1001)
         workers = topology_state.list_workers(limit=101)
         provider_budgets = topology_state.list_provider_budgets(limit=1001)
+        repository_quarantines = (
+            topology_state.list_qualification_repository_quarantines(
+                limit=1001))
+        qualification_mutation = qualification.get_qualification_mutation()
         authority = catalog_state.get_catalog_authority_id()
         assert authority is not None
     except (RuntimeError, ValueError) as error:
@@ -789,10 +793,28 @@ def readiness(request: fastapi.Request,
             profile for profile in profiles
             if profile.profile != boundary_profile
         ]
+    profile_repository_arns: set[str] = set()
+    for profile_record in profiles:
+        for key, evidence in profile_record.attestations.items():
+            if (key.startswith('terraform_target:') and
+                    isinstance(evidence, dict) and
+                    isinstance(evidence.get('repository_arn'), str)):
+                profile_repository_arns.add(str(evidence['repository_arn']))
+    try:
+        exact_repository_quarantines = (
+            topology_state.qualification_repository_quarantines_for_arns(
+                profile_repository_arns))
+    except (RuntimeError, ValueError) as error:
+        _api_error(error)
     workers_truncated = len(workers) > 100
     workers = workers[:100]
     provider_budgets_truncated = len(provider_budgets) > 1000
     provider_budgets = provider_budgets[:1000]
+    repository_quarantines_truncated = len(repository_quarantines) > 1000
+    repository_quarantines = repository_quarantines[:1000]
+    quarantine_by_repository = {
+        item.repository_arn: item for item in exact_repository_quarantines
+    }
     budgets_by_target = {
         (budget.account, budget.region): budget
         for budget in provider_budgets
@@ -824,7 +846,8 @@ def readiness(request: fastapi.Request,
                 (policy.regional_cache_retention_weeks),
         },
         profiles=[
-            api_models.ProfileView.from_record(item) for item in profiles
+            api_models.ReadinessProfileView.from_readiness_record(
+                item, quarantine_by_repository, authority) for item in profiles
         ],
         profiles_truncated=profiles_truncated,
         shards=[{
@@ -843,4 +866,24 @@ def readiness(request: fastapi.Request,
         provider_budgets_truncated=provider_budgets_truncated,
         queues=queues,
         queues_truncated=queues_truncated,
+        qualification_mutation=({
+            key: qualification_mutation.get(key) for key in (
+                'state',
+                'owner_profile_revision_id',
+                'owner_target',
+                'owner_target_fingerprint',
+                'repository_arn',
+                'runtime_digest',
+                'delete_phase',
+                'mutation_lease_expires_at',
+                'quarantine_reason',
+                'updated_at',
+            )
+        } if qualification_mutation is not None else None),
+        qualification_repository_quarantines=[
+            api_models.QualificationRepositoryQuarantineView.from_record(item)
+            for item in repository_quarantines
+        ],
+        qualification_repository_quarantines_truncated=(
+            repository_quarantines_truncated),
         generated_at=int(time.time()))

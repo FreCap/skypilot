@@ -13,6 +13,7 @@ import uuid
 
 import sqlalchemy
 from sqlalchemy import orm
+from sqlalchemy.dialects import postgresql
 
 from sky.container_images import aws
 from sky.container_images import catalog_state
@@ -32,6 +33,15 @@ _LIFECYCLE_PROTOCOL_VERSION = 2
 _QUALIFICATION_MUTATION_ID = 'global'
 _QUALIFICATION_MUTATION_DELETING = 'DELETING'
 _QUALIFICATION_MUTATION_RESTORING = 'RESTORING'
+_QUALIFICATION_MUTATION_QUARANTINED = 'QUARANTINED'
+QUALIFICATION_DELETE_PHASE_PRE_INTENT = 'PRE_INTENT'
+QUALIFICATION_DELETE_PHASE_IN_FLIGHT = 'IN_FLIGHT'
+QUALIFICATION_DELETE_PHASE_READBACK = 'READBACK'
+_QUALIFICATION_DELETE_PHASES = (
+    QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+    QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+    QUALIFICATION_DELETE_PHASE_READBACK,
+)
 
 
 def _database_epoch(*, now: int | None = None) -> int:
@@ -76,8 +86,8 @@ def _attestation_requirements(
             'infrastructure', target.name)] = _AUTOMATIC_WINDOW_SECONDS
         required[models.profile_attestation_key(
             'copy', target.name)] = _AUTOMATIC_WINDOW_SECONDS
-        required[models.profile_attestation_key(
-            'lifecycle', target.name)] = _AUTOMATIC_WINDOW_SECONDS
+        required[models.profile_attestation_key('lifecycle',
+                                                target.name)] = None
         for backend, binding_id in target.runtime_pull:
             binding = profile.bindings[binding_id]
             for runtime_id in runtime_ids(target, backend, binding):
@@ -164,17 +174,25 @@ def qualification_lifecycle_evidence(
         repository_arn: str,
         runtime_digest: str,
         lifecycle_proof_id: str,
+        delete_phase: str | None = None,
         mutation_lease_token: str | None = None,
         mutation_lease_expires_at: int | None = None,
-        exact_absence: bool = False) -> dict[str, Any]:
+        exact_absence: bool = False,
+        quarantine_reason: str | None = None) -> dict[str, Any]:
     """Builds one protocol-versioned lifecycle mutation attestation."""
-    if status not in ('ARMED', 'DELETING', 'READY'):
+    if status not in ('ARMED', 'DELETING', 'READY', 'QUARANTINED'):
         raise ValueError('Lifecycle status is invalid.')
     lease_present = mutation_lease_token is not None
     if ((mutation_lease_token is None) != (mutation_lease_expires_at is None)):
         raise ValueError('Lifecycle mutation lease is incomplete.')
-    if ((status == 'DELETING') != lease_present or
-        (status == 'READY') != exact_absence):
+    deleting = status == 'DELETING'
+    quarantined = status == 'QUARANTINED'
+    if (deleting != lease_present or deleting != (delete_phase is not None) or
+        (delete_phase is not None and
+         delete_phase not in _QUALIFICATION_DELETE_PHASES) or
+        (status == 'READY') != exact_absence or
+            quarantined != (quarantine_reason is not None) or
+        (quarantine_reason is not None and not quarantine_reason)):
         raise ValueError('Lifecycle state evidence is inconsistent.')
     evidence: dict[str, Any] = {
         'status': status,
@@ -186,10 +204,13 @@ def qualification_lifecycle_evidence(
         _LIFECYCLE_PROTOCOL_KEY: _LIFECYCLE_PROTOCOL_VERSION,
     }
     if mutation_lease_token is not None:
+        evidence['delete_phase'] = delete_phase
         evidence['mutation_lease_token'] = mutation_lease_token
         evidence['mutation_lease_expires_at'] = mutation_lease_expires_at
     if exact_absence:
         evidence['exact_absence'] = True
+    if quarantine_reason is not None:
+        evidence['quarantine_reason'] = quarantine_reason
     return evidence
 
 
@@ -202,6 +223,7 @@ def _qualification_mutation_matches(
     repository_arn: str,
     runtime_digest: str,
     lifecycle_proof_id: str,
+    delete_phase: str | None,
     mutation_lease_token: str | None,
 ) -> bool:
     if mutation is None:
@@ -215,6 +237,7 @@ def _qualification_mutation_matches(
         mutation['repository_arn'] == repository_arn and
         mutation['runtime_digest'] == runtime_digest and
         mutation['lifecycle_proof_id'] == lifecycle_proof_id and
+        mutation['delete_phase'] == delete_phase and
         mutation['mutation_lease_token'] == mutation_lease_token)
 
 
@@ -224,6 +247,53 @@ def get_qualification_mutation() -> dict[str, Any] | None:
         mutation = topology_state.get_qualification_mutation_in_session(
             session, exclusive=False)
         return dict(mutation) if mutation is not None else None
+
+
+def _record_qualification_repository_quarantine_in_session(
+    session: orm.Session,
+    *,
+    revision_id: str,
+    target: models.ManagedRegistryTarget,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    reason: str,
+    now: int,
+) -> None:
+    """Persists the physical tombstone before the global barrier can clear."""
+    session.execute(
+        postgresql.insert(schema.qualification_repository_quarantines).values(
+            repository_arn=repository_arn,
+            owner_profile_revision_id=revision_id,
+            owner_target=target.name,
+            owner_target_fingerprint=target.target_fingerprint,
+            runtime_digest=runtime_digest,
+            lifecycle_proof_id=lifecycle_proof_id,
+            quarantine_reason=reason,
+            quarantined_at=now).on_conflict_do_nothing(index_elements=[
+                schema.qualification_repository_quarantines.c.repository_arn
+            ]))
+    if not topology_state.qualification_repository_quarantined_in_session(
+            session, repository_arn):
+        raise RuntimeError(
+            'Qualification repository quarantine tombstone was not recorded.')
+
+
+def _revision_owns_qualification_work_in_session(
+        session: orm.Session,
+        revision: topology_state.ProfileRevisionRecord) -> bool:
+    return topology_state.qualification_revision_owns_work_in_session(
+        session,
+        profile_revision_id=revision.id,
+        workspace=revision.workspace,
+        profile=revision.profile,
+        state=revision.state)
+
+
+def _qualification_repository_available_in_session(session: orm.Session,
+                                                   repository_arn: str) -> bool:
+    return not topology_state.qualification_repository_quarantined_in_session(
+        session, repository_arn)
 
 
 def _qualification_copy_requestable(
@@ -260,7 +330,9 @@ def _qualification_copy_requestable(
     state = mutation.get('state')
     if state == _QUALIFICATION_MUTATION_DELETING:
         token = lifecycle.get('mutation_lease_token')
+        delete_phase = lifecycle.get('delete_phase')
         if (lifecycle.get('status') != 'DELETING' or
+                delete_phase not in _QUALIFICATION_DELETE_PHASES or
                 not isinstance(token, str)):
             return False
         mutation_token: str | None = token
@@ -268,6 +340,7 @@ def _qualification_copy_requestable(
         if (lifecycle.get('status') != 'READY' or
                 lifecycle.get('exact_absence') is not True):
             return False
+        delete_phase = None
         mutation_token = None
     else:
         return False
@@ -279,6 +352,7 @@ def _qualification_copy_requestable(
         repository_arn=copy_evidence['repository_arn'],
         runtime_digest=copy_evidence['runtime_digest'],
         lifecycle_proof_id=proof_id,
+        delete_phase=delete_phase,
         mutation_lease_token=mutation_token)
 
 
@@ -298,10 +372,15 @@ def qualification_copy_barrier_snapshot(
         if (current.state not in (models.ImageProfileState.QUALIFYING,
                                   models.ImageProfileState.ACTIVE) or
                 current.desired_generation != revision.desired_generation or
-                current.config_hash != revision.config_hash):
+                current.config_hash != revision.config_hash or
+                not _revision_owns_qualification_work_in_session(
+                    session, current)):
             return False, None
         mutation = topology_state.get_qualification_mutation_in_session(
             session, exclusive=False)
+        if not _qualification_repository_available_in_session(
+                session, repository_arn):
+            return False, None
         if mutation is None:
             return True, None
         proof_id = mutation['lifecycle_proof_id']
@@ -313,9 +392,52 @@ def qualification_copy_barrier_snapshot(
                 repository_arn=repository_arn,
                 runtime_digest=runtime_digest,
                 lifecycle_proof_id=proof_id,
+                delete_phase=None,
                 mutation_lease_token=None)):
             return True, proof_id
         return False, None
+
+
+def qualification_copy_provider_allowed(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+) -> bool:
+    """Fences every qualification-copy provider call at its admission point."""
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        if (current.state not in (models.ImageProfileState.QUALIFYING,
+                                  models.ImageProfileState.ACTIVE) or
+                current.desired_generation != revision.desired_generation or
+                current.config_hash != revision.config_hash or
+                not _revision_owns_qualification_work_in_session(
+                    session, current)):
+            return False
+        terraform_target = current.attestations.get(
+            models.profile_attestation_key('terraform_target', target.name))
+        if (not isinstance(terraform_target, dict) or
+                terraform_target.get('status') != 'READY' or
+                terraform_target.get('target_fingerprint')
+                != target.target_fingerprint or
+                terraform_target.get('repository_arn') != repository_arn):
+            return False
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=False)
+        if not _qualification_repository_available_in_session(
+                session, repository_arn):
+            return False
+        if mutation is None:
+            return True
+        return bool(mutation['state'] == _QUALIFICATION_MUTATION_RESTORING and
+                    mutation['owner_profile_revision_id'] == current.id and
+                    mutation['owner_target'] == target.name and
+                    mutation['owner_target_fingerprint']
+                    == target.target_fingerprint and
+                    mutation['repository_arn'] == repository_arn)
 
 
 def arm_qualification_lifecycle(
@@ -336,9 +458,17 @@ def arm_qualification_lifecycle(
         if (current.state not in (models.ImageProfileState.QUALIFYING,
                                   models.ImageProfileState.ACTIVE) or
                 current.desired_generation != revision.desired_generation or
-                current.config_hash != revision.config_hash):
+                current.config_hash != revision.config_hash or
+                not _revision_owns_qualification_work_in_session(
+                    session, current)):
             raise topology_state.StaleProfileRevisionError(
                 'Lifecycle epoch no longer matches the desired revision.')
+        topology_state.lock_qualification_mutation_in_session(session,
+                                                              exclusive=False)
+        if not _qualification_repository_available_in_session(
+                session, repository_arn):
+            raise topology_state.StaleProfileRevisionError(
+                'Lifecycle epoch repository is quarantined.')
         lifecycle = current.attestations.get(lifecycle_key)
         if isinstance(lifecycle, dict):
             same_identity = (lifecycle.get('target_fingerprint')
@@ -391,12 +521,18 @@ def begin_qualification_lifecycle_restoration(
         if (current.state not in (models.ImageProfileState.QUALIFYING,
                                   models.ImageProfileState.ACTIVE) or
                 current.desired_generation != revision.desired_generation or
-                current.config_hash != revision.config_hash):
+                current.config_hash != revision.config_hash or
+                not _revision_owns_qualification_work_in_session(
+                    session, current)):
             raise topology_state.StaleProfileRevisionError(
                 'Lifecycle restoration no longer matches the desired revision.')
         lifecycle = current.attestations.get(lifecycle_key)
         mutation = topology_state.get_qualification_mutation_in_session(
             session, exclusive=True)
+        if not _qualification_repository_available_in_session(
+                session, repository_arn):
+            raise topology_state.StaleProfileRevisionError(
+                'Lifecycle restoration repository is quarantined.')
         current_time = catalog_state.database_epoch(session, now=now)
         if (not isinstance(lifecycle, dict) or
                 lifecycle.get('status') != 'READY' or
@@ -413,6 +549,13 @@ def begin_qualification_lifecycle_restoration(
         proof_id = qualification_lifecycle_proof_id(lifecycle)
         upgrade_legacy = proof_id is None
         if upgrade_legacy:
+            # Generation zero may name a pre-existing repository whose prior
+            # contents and deletion history are not fenced by this protocol.
+            # A positive generation is the explicit fresh-repository boundary
+            # that makes exact legacy absence safe to adopt without deleting
+            # again. Protocol-2 evidence remains self-authenticating below.
+            if target.qualification_repository_generation <= 0:
+                return current, None
             # Reject malformed partial protocol-2 evidence. Only the exact
             # pre-protocol shape may be adopted without repeating deletion.
             if (lifecycle.get(_LIFECYCLE_PROTOCOL_KEY) is not None or
@@ -433,6 +576,7 @@ def begin_qualification_lifecycle_restoration(
                     repository_arn=repository_arn,
                     runtime_digest=runtime_digest,
                     lifecycle_proof_id=proof_id,
+                    delete_phase=None,
                     mutation_lease_token=None):
                 return current, proof_id
             return current, None
@@ -446,8 +590,10 @@ def begin_qualification_lifecycle_restoration(
             runtime_digest=runtime_digest,
             lifecycle_proof_id=proof_id,
             state=_QUALIFICATION_MUTATION_RESTORING,
+            delete_phase=None,
             mutation_lease_token=None,
             mutation_lease_expires_at=None,
+            quarantine_reason=None,
             updated_at=current_time))
         if not upgrade_legacy:
             return current, proof_id
@@ -469,18 +615,49 @@ def begin_qualification_lifecycle_restoration(
 
 
 def qualification_repository(
-        revision: topology_state.ProfileRevisionRecord,
-        target: models.ManagedRegistryTarget) -> tuple[str, str]:
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    catalog_authority: str | None = None,
+    profile: models.ManagedRegistryProfile | None = None,
+    configured_target: models.ManagedRegistryTarget | None = None,
+) -> tuple[str, str]:
     """Returns the Terraform-attested non-catalog repository identity."""
+    if profile is None:
+        profile = models.ManagedRegistryProfile.from_snapshot(
+            revision.config_snapshot)
+    if configured_target is None:
+        try:
+            configured_target = profile.target(target.name)
+        except ValueError:
+            raise ValueError('QUALIFICATION_FAILED') from None
+    elif configured_target.name != target.name:
+        raise ValueError('QUALIFICATION_FAILED')
+    if configured_target.target_fingerprint != target.target_fingerprint:
+        raise ValueError('QUALIFICATION_FAILED')
+    if catalog_authority is None:
+        catalog_authority = catalog_state.get_catalog_authority_id()
+    if catalog_authority is None:
+        raise ValueError('QUALIFICATION_FAILED')
+    expected_repository_name = aws.qualification_repository_name(
+        catalog_authority, configured_target)
+    expected_repository_arn = (
+        f'arn:{profile.partition}:ecr:{configured_target.region}:'
+        f'{profile.registry_account}:repository/{expected_repository_name}')
     key = models.profile_attestation_key('terraform_target', target.name)
     evidence = revision.attestations.get(key)
+    evidence_generation = (evidence.get('qualification_repository_generation',
+                                        0) if isinstance(evidence, dict) else 0)
     if (not isinstance(evidence, dict) or evidence.get('status') != 'READY' or
             evidence.get('target_fingerprint') != target.target_fingerprint or
             evidence.get('registry') != target.registry or
-            not isinstance(evidence.get('repository_name'), str) or
-            not isinstance(evidence.get('repository_arn'), str)):
+            not isinstance(evidence_generation, int) or
+            isinstance(evidence_generation, bool) or
+            evidence_generation != target.qualification_repository_generation or
+            evidence.get('repository_name') != expected_repository_name or
+            evidence.get('repository_arn') != expected_repository_arn):
         raise ValueError('QUALIFICATION_FAILED')
-    return str(evidence['repository_name']), str(evidence['repository_arn'])
+    return expected_repository_name, expected_repository_arn
 
 
 def _running_canary_exists_in_session(session: orm.Session) -> bool:
@@ -502,7 +679,14 @@ def begin_qualification_lifecycle_delete(
     lease_seconds: int,
     now: int | None = None,
 ) -> tuple[topology_state.ProfileRevisionRecord, str | None, str | None]:
-    """Closes canary admission before one lifecycle provider mutation."""
+    """Claims fresh, pre-intent, or concluded-readback lifecycle work.
+
+    Expired pre-intent work is safe to reclaim because no provider delete could
+    begin without a later durable phase transition. Expired readback work is
+    also reclaimable, but its phase tells the caller that it may only read.
+    Expired in-flight work is quarantined because an older request may still
+    arrive after any successor read.
+    """
     if lease_seconds <= 0:
         raise ValueError('Lifecycle mutation lease must be positive.')
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
@@ -514,15 +698,22 @@ def begin_qualification_lifecycle_delete(
         if (current.state not in (models.ImageProfileState.QUALIFYING,
                                   models.ImageProfileState.ACTIVE) or
                 current.desired_generation != revision.desired_generation or
-                current.config_hash != revision.config_hash):
+                current.config_hash != revision.config_hash or
+                not _revision_owns_qualification_work_in_session(
+                    session, current)):
             raise topology_state.StaleProfileRevisionError(
                 'Lifecycle delete no longer matches the desired revision.')
         lifecycle = current.attestations.get(lifecycle_key)
         mutation = topology_state.get_qualification_mutation_in_session(
             session, exclusive=True)
+        if not _qualification_repository_available_in_session(
+                session, repository_arn):
+            raise topology_state.StaleProfileRevisionError(
+                'Lifecycle delete repository is quarantined.')
         current_time = catalog_state.database_epoch(session, now=now)
         proof_id: str | None = None
         prior_token: str | None = None
+        delete_phase = QUALIFICATION_DELETE_PHASE_PRE_INTENT
         takeover = False
         if (isinstance(lifecycle, dict) and lifecycle.get('target_fingerprint')
                 == target.target_fingerprint and
@@ -535,12 +726,15 @@ def begin_qualification_lifecycle_delete(
             proof_id = qualification_lifecycle_proof_id(lifecycle)
             if (status == 'DELETING' and lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
                     == _LIFECYCLE_PROTOCOL_VERSION and proof_id is not None and
+                    lifecycle.get('delete_phase')
+                    in _QUALIFICATION_DELETE_PHASES and
                     isinstance(lifecycle.get('mutation_lease_token'), str) and
                     isinstance(lifecycle.get('mutation_lease_expires_at'),
                                int)):
                 if lifecycle['mutation_lease_expires_at'] > current_time:
                     return current, None, None
                 prior_token = lifecycle['mutation_lease_token']
+                delete_phase = str(lifecycle['delete_phase'])
                 takeover = True
             elif (status == 'ARMED' and proof_id is not None and
                   qualification_copy_restoration_proof_id(
@@ -566,10 +760,58 @@ def begin_qualification_lifecycle_delete(
                     repository_arn=repository_arn,
                     runtime_digest=runtime_digest,
                     lifecycle_proof_id=proof_id,
+                    delete_phase=delete_phase,
                     mutation_lease_token=prior_token) or
                     not isinstance(mutation_expires_at, int) or
                     mutation_expires_at > current_time):
                 return current, None, None
+            if delete_phase == QUALIFICATION_DELETE_PHASE_IN_FLIGHT:
+                reason = 'PROVIDER_OUTCOME_AMBIGUOUS'
+                changed = session.execute(
+                    schema.qualification_mutation.update().where(
+                        schema.qualification_mutation.c.id ==
+                        _QUALIFICATION_MUTATION_ID,
+                        schema.qualification_mutation.c.state ==
+                        _QUALIFICATION_MUTATION_DELETING,
+                        schema.qualification_mutation.c.delete_phase ==
+                        QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+                        schema.qualification_mutation.c.lifecycle_proof_id ==
+                        proof_id,
+                        schema.qualification_mutation.c.mutation_lease_token ==
+                        prior_token).values(
+                            state=_QUALIFICATION_MUTATION_QUARANTINED,
+                            delete_phase=None,
+                            mutation_lease_token=None,
+                            mutation_lease_expires_at=None,
+                            quarantine_reason=reason,
+                            updated_at=current_time)).rowcount
+                if changed != 1:
+                    return current, None, None
+                _record_qualification_repository_quarantine_in_session(
+                    session,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=proof_id,
+                    reason=reason,
+                    now=current_time)
+                quarantined = (
+                    topology_state.record_profile_attestation_in_session(
+                        session,
+                        profile_revision_id=revision.id,
+                        kind=lifecycle_key,
+                        evidence=qualification_lifecycle_evidence(
+                            status='QUARANTINED',
+                            target=target,
+                            repository_arn=repository_arn,
+                            runtime_digest=runtime_digest,
+                            lifecycle_proof_id=proof_id,
+                            quarantine_reason=reason),
+                        expected_generation=revision.desired_generation,
+                        expected_config_hash=revision.config_hash,
+                        now=current_time))
+                return quarantined, None, None
         else:
             if mutation is not None or _running_canary_exists_in_session(
                     session):
@@ -583,8 +825,10 @@ def begin_qualification_lifecycle_delete(
             'repository_arn': repository_arn,
             'runtime_digest': runtime_digest,
             'lifecycle_proof_id': proof_id,
+            'delete_phase': delete_phase,
             'mutation_lease_token': lease_token,
             'mutation_lease_expires_at': current_time + lease_seconds,
+            'quarantine_reason': None,
             'updated_at': current_time,
         }
         if takeover:
@@ -612,6 +856,7 @@ def begin_qualification_lifecycle_delete(
                 repository_arn=repository_arn,
                 runtime_digest=runtime_digest,
                 lifecycle_proof_id=proof_id,
+                delete_phase=delete_phase,
                 mutation_lease_token=lease_token,
                 mutation_lease_expires_at=current_time + lease_seconds),
             expected_generation=revision.desired_generation,
@@ -627,6 +872,8 @@ def qualification_lifecycle_delete_owned(revision_id: str,
                                          runtime_digest: str,
                                          lifecycle_proof_id: str,
                                          mutation_lease_token: str,
+                                         expected_delete_phase: str |
+                                         None = None,
                                          now: int | None = None) -> bool:
     """Returns whether one worker still owns the destructive provider fence."""
     with orm.Session(catalog_state.engine()) as session, session.begin():
@@ -644,6 +891,8 @@ def qualification_lifecycle_delete_owned(revision_id: str,
         current = catalog_state.database_epoch(session, now=now)
         mutation_expires_at = (mutation['mutation_lease_expires_at']
                                if mutation is not None else None)
+        delete_phase = (lifecycle.get('delete_phase') if isinstance(
+            lifecycle, dict) else None)
         return bool(
             revision.state in (models.ImageProfileState.QUALIFYING,
                                models.ImageProfileState.ACTIVE) and
@@ -654,6 +903,9 @@ def qualification_lifecycle_delete_owned(revision_id: str,
             lifecycle.get('runtime_digest') == runtime_digest and
             lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
             == _LIFECYCLE_PROTOCOL_VERSION and
+            delete_phase in _QUALIFICATION_DELETE_PHASES and
+            (expected_delete_phase is None or
+             delete_phase == expected_delete_phase) and
             qualification_lifecycle_proof_id(lifecycle) == lifecycle_proof_id
             and
             lifecycle.get('mutation_lease_token') == mutation_lease_token and
@@ -667,6 +919,7 @@ def qualification_lifecycle_delete_owned(revision_id: str,
                 repository_arn=repository_arn,
                 runtime_digest=runtime_digest,
                 lifecycle_proof_id=lifecycle_proof_id,
+                delete_phase=str(delete_phase),
                 mutation_lease_token=mutation_lease_token) and
             isinstance(mutation_expires_at, int) and
             mutation_expires_at > current)
@@ -681,6 +934,7 @@ def heartbeat_qualification_lifecycle_delete(
     lifecycle_proof_id: str,
     mutation_lease_token: str,
     lease_seconds: int,
+    expected_delete_phase: str | None = None,
     now: int | None = None,
 ) -> bool:
     """Renews one exact lifecycle mutation lease under the profile lock."""
@@ -698,6 +952,8 @@ def heartbeat_qualification_lifecycle_delete(
         current = catalog_state.database_epoch(session, now=now)
         mutation_expires_at = (mutation['mutation_lease_expires_at']
                                if mutation is not None else None)
+        delete_phase = (lifecycle.get('delete_phase') if isinstance(
+            lifecycle, dict) else None)
         if (current_revision.state not in (models.ImageProfileState.QUALIFYING,
                                            models.ImageProfileState.ACTIVE) or
                 current_revision.desired_generation
@@ -710,6 +966,9 @@ def heartbeat_qualification_lifecycle_delete(
                 lifecycle.get('runtime_digest') != runtime_digest or
                 lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
                 != _LIFECYCLE_PROTOCOL_VERSION or
+                delete_phase not in _QUALIFICATION_DELETE_PHASES or
+            (expected_delete_phase is not None and
+             delete_phase != expected_delete_phase) or
                 qualification_lifecycle_proof_id(lifecycle)
                 != lifecycle_proof_id or
                 lifecycle.get('mutation_lease_token') != mutation_lease_token or
@@ -723,6 +982,7 @@ def heartbeat_qualification_lifecycle_delete(
                     repository_arn=repository_arn,
                     runtime_digest=runtime_digest,
                     lifecycle_proof_id=lifecycle_proof_id,
+                    delete_phase=str(delete_phase),
                     mutation_lease_token=mutation_lease_token) or
                 not isinstance(mutation_expires_at, int) or
                 mutation_expires_at <= current):
@@ -731,6 +991,7 @@ def heartbeat_qualification_lifecycle_delete(
             schema.qualification_mutation.c.id == _QUALIFICATION_MUTATION_ID,
             schema.qualification_mutation.c.state ==
             _QUALIFICATION_MUTATION_DELETING,
+            schema.qualification_mutation.c.delete_phase == delete_phase,
             schema.qualification_mutation.c.lifecycle_proof_id ==
             lifecycle_proof_id,
             schema.qualification_mutation.c.mutation_lease_token ==
@@ -749,12 +1010,459 @@ def heartbeat_qualification_lifecycle_delete(
                 repository_arn=repository_arn,
                 runtime_digest=runtime_digest,
                 lifecycle_proof_id=lifecycle_proof_id,
+                delete_phase=str(delete_phase),
                 mutation_lease_token=mutation_lease_token,
                 mutation_lease_expires_at=current + lease_seconds),
             expected_generation=revision.desired_generation,
             expected_config_hash=revision.config_hash,
             now=now)
         return True
+
+
+def _defer_qualification_lifecycle_delete(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    retry_seconds: int,
+    allowed_delete_phases: tuple[str, ...],
+    require_live_lease: bool,
+    now: int | None = None,
+) -> bool:
+    """Normalizes a provably safe claim into a short pre-intent retry lease.
+
+    Token rotation fences a heartbeat that passed its process-local stop check
+    before this transaction. It therefore cannot race the short retry back to
+    the ordinary five-minute failure lease.
+    """
+    if retry_seconds <= 0:
+        raise ValueError('Lifecycle retry delay must be positive.')
+    if (not allowed_delete_phases or
+            any(phase not in _QUALIFICATION_DELETE_PHASES
+                for phase in allowed_delete_phases)):
+        raise ValueError('Lifecycle retry phases are invalid.')
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current_revision = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        lifecycle = current_revision.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current = catalog_state.database_epoch(session, now=now)
+        lifecycle_expires_at = (lifecycle.get('mutation_lease_expires_at')
+                                if isinstance(lifecycle, dict) else None)
+        delete_phase = (lifecycle.get('delete_phase') if isinstance(
+            lifecycle, dict) else None)
+        mutation_expires_at = (mutation['mutation_lease_expires_at']
+                               if mutation is not None else None)
+        if (current_revision.state not in (models.ImageProfileState.QUALIFYING,
+                                           models.ImageProfileState.ACTIVE) or
+                current_revision.desired_generation
+                != revision.desired_generation or
+                current_revision.config_hash != revision.config_hash or
+                not isinstance(lifecycle, dict) or
+                lifecycle.get('status') != 'DELETING' or
+                delete_phase not in allowed_delete_phases or
+                lifecycle.get('target_fingerprint') != target.target_fingerprint
+                or lifecycle.get('repository_arn') != repository_arn or
+                lifecycle.get('runtime_digest') != runtime_digest or
+                lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+                != _LIFECYCLE_PROTOCOL_VERSION or
+                qualification_lifecycle_proof_id(lifecycle)
+                != lifecycle_proof_id or
+                lifecycle.get('mutation_lease_token') != mutation_lease_token or
+                not isinstance(lifecycle_expires_at, int) or
+            (require_live_lease and lifecycle_expires_at <= current) or
+                not _qualification_mutation_matches(
+                    mutation,
+                    state=_QUALIFICATION_MUTATION_DELETING,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=lifecycle_proof_id,
+                    delete_phase=str(delete_phase),
+                    mutation_lease_token=mutation_lease_token) or
+                not isinstance(mutation_expires_at, int) or
+            (require_live_lease and mutation_expires_at <= current)):
+            return False
+        deferred_token = str(uuid.uuid4())
+        deferred_expiry = current + retry_seconds
+        changed = session.execute(schema.qualification_mutation.update().where(
+            schema.qualification_mutation.c.id == _QUALIFICATION_MUTATION_ID,
+            schema.qualification_mutation.c.state ==
+            _QUALIFICATION_MUTATION_DELETING,
+            schema.qualification_mutation.c.delete_phase.in_(
+                allowed_delete_phases),
+            schema.qualification_mutation.c.lifecycle_proof_id ==
+            lifecycle_proof_id,
+            schema.qualification_mutation.c.mutation_lease_token ==
+            mutation_lease_token).values(
+                delete_phase=QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+                mutation_lease_token=deferred_token,
+                mutation_lease_expires_at=deferred_expiry,
+                updated_at=current)).rowcount
+        if changed != 1:
+            return False
+        topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='DELETING',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                delete_phase=QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+                mutation_lease_token=deferred_token,
+                mutation_lease_expires_at=deferred_expiry),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=current)
+        return True
+
+
+def defer_qualification_lifecycle_delete(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    retry_seconds: int,
+    now: int | None = None,
+) -> bool:
+    """Rotates a safe pre-intent claim into a short retry lease."""
+    return _defer_qualification_lifecycle_delete(
+        revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=runtime_digest,
+        lifecycle_proof_id=lifecycle_proof_id,
+        mutation_lease_token=mutation_lease_token,
+        retry_seconds=retry_seconds,
+        allowed_delete_phases=(QUALIFICATION_DELETE_PHASE_PRE_INTENT,),
+        require_live_lease=True,
+        now=now)
+
+
+def defer_qualification_lifecycle_delete_not_started(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    retry_seconds: int,
+    now: int | None = None,
+) -> bool:
+    """Defers a delete that the provider adapter proved never started.
+
+    The intent transition may have committed even when its response was lost,
+    so this CAS accepts either durable phase and always rotates back to a fresh
+    pre-intent token.
+    """
+    return _defer_qualification_lifecycle_delete(
+        revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=runtime_digest,
+        lifecycle_proof_id=lifecycle_proof_id,
+        mutation_lease_token=mutation_lease_token,
+        retry_seconds=retry_seconds,
+        allowed_delete_phases=(
+            QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+            QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+        ),
+        require_live_lease=False,
+        now=now)
+
+
+def _transition_qualification_lifecycle_delete_phase(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    from_phase: str,
+    to_phase: str,
+    now: int | None,
+) -> bool:
+    """Moves one live exact delete lease between durable provider phases."""
+    if (from_phase not in _QUALIFICATION_DELETE_PHASES or
+            to_phase not in _QUALIFICATION_DELETE_PHASES):
+        raise ValueError('Lifecycle delete phase is invalid.')
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current_revision = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        lifecycle = current_revision.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current = catalog_state.database_epoch(session, now=now)
+        mutation_expires_at = (mutation['mutation_lease_expires_at']
+                               if mutation is not None else None)
+        lifecycle_expires_at = (lifecycle.get('mutation_lease_expires_at')
+                                if isinstance(lifecycle, dict) else None)
+        if (current_revision.state not in (models.ImageProfileState.QUALIFYING,
+                                           models.ImageProfileState.ACTIVE) or
+                current_revision.desired_generation
+                != revision.desired_generation or
+                current_revision.config_hash != revision.config_hash or
+                not isinstance(lifecycle, dict) or
+                lifecycle.get('status') != 'DELETING' or
+                lifecycle.get('delete_phase') != from_phase or
+                lifecycle.get('target_fingerprint') != target.target_fingerprint
+                or lifecycle.get('repository_arn') != repository_arn or
+                lifecycle.get('runtime_digest') != runtime_digest or
+                lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+                != _LIFECYCLE_PROTOCOL_VERSION or
+                qualification_lifecycle_proof_id(lifecycle)
+                != lifecycle_proof_id or
+                lifecycle.get('mutation_lease_token') != mutation_lease_token or
+                not isinstance(lifecycle_expires_at, int) or
+                lifecycle_expires_at <= current or
+                not _qualification_mutation_matches(
+                    mutation,
+                    state=_QUALIFICATION_MUTATION_DELETING,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=lifecycle_proof_id,
+                    delete_phase=from_phase,
+                    mutation_lease_token=mutation_lease_token) or
+                not isinstance(mutation_expires_at, int) or
+                mutation_expires_at <= current):
+            return False
+        changed = session.execute(schema.qualification_mutation.update().where(
+            schema.qualification_mutation.c.id == _QUALIFICATION_MUTATION_ID,
+            schema.qualification_mutation.c.state ==
+            _QUALIFICATION_MUTATION_DELETING,
+            schema.qualification_mutation.c.delete_phase == from_phase,
+            schema.qualification_mutation.c.lifecycle_proof_id ==
+            lifecycle_proof_id,
+            schema.qualification_mutation.c.mutation_lease_token ==
+            mutation_lease_token).values(delete_phase=to_phase,
+                                         updated_at=current)).rowcount
+        if changed != 1:
+            return False
+        topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='DELETING',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                delete_phase=to_phase,
+                mutation_lease_token=mutation_lease_token,
+                mutation_lease_expires_at=mutation_expires_at),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=current)
+        return True
+
+
+def begin_qualification_lifecycle_delete_request(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    now: int | None = None,
+) -> bool:
+    """Commits provider-call intent before the raw ECR delete may begin."""
+    return _transition_qualification_lifecycle_delete_phase(
+        revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=runtime_digest,
+        lifecycle_proof_id=lifecycle_proof_id,
+        mutation_lease_token=mutation_lease_token,
+        from_phase=QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+        to_phase=QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+        now=now)
+
+
+def cancel_qualification_lifecycle_delete_request(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    now: int | None = None,
+) -> bool:
+    """Returns to pre-intent only after the adapter proves no call began."""
+    return _transition_qualification_lifecycle_delete_phase(
+        revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=runtime_digest,
+        lifecycle_proof_id=lifecycle_proof_id,
+        mutation_lease_token=mutation_lease_token,
+        from_phase=QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+        to_phase=QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+        now=now)
+
+
+def mark_qualification_lifecycle_delete_readback(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    now: int | None = None,
+) -> bool:
+    """Persists a conclusive delete response before exact readback."""
+    return _transition_qualification_lifecycle_delete_phase(
+        revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=runtime_digest,
+        lifecycle_proof_id=lifecycle_proof_id,
+        mutation_lease_token=mutation_lease_token,
+        from_phase=QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+        to_phase=QUALIFICATION_DELETE_PHASE_READBACK,
+        now=now)
+
+
+def retry_qualification_lifecycle_delete_from_readback(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    now: int | None = None,
+) -> bool:
+    """Rearms deletion after concluded readback proves exact presence."""
+    return _transition_qualification_lifecycle_delete_phase(
+        revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=runtime_digest,
+        lifecycle_proof_id=lifecycle_proof_id,
+        mutation_lease_token=mutation_lease_token,
+        from_phase=QUALIFICATION_DELETE_PHASE_READBACK,
+        to_phase=QUALIFICATION_DELETE_PHASE_PRE_INTENT,
+        now=now)
+
+
+def quarantine_qualification_lifecycle_delete(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    reason: str = 'PROVIDER_OUTCOME_AMBIGUOUS',
+    now: int | None = None,
+) -> topology_state.ProfileRevisionRecord | None:
+    """Permanently fences one request that may still reach the provider."""
+    if not reason:
+        raise ValueError('Lifecycle delete quarantine reason is required.')
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current_revision = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        lifecycle = current_revision.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current = catalog_state.database_epoch(session, now=now)
+        if (current_revision.state not in (models.ImageProfileState.QUALIFYING,
+                                           models.ImageProfileState.ACTIVE) or
+                current_revision.desired_generation
+                != revision.desired_generation or
+                current_revision.config_hash != revision.config_hash or
+                not isinstance(lifecycle, dict) or
+                lifecycle.get('status') != 'DELETING' or
+                lifecycle.get('delete_phase')
+                != QUALIFICATION_DELETE_PHASE_IN_FLIGHT or
+                lifecycle.get('target_fingerprint') != target.target_fingerprint
+                or lifecycle.get('repository_arn') != repository_arn or
+                lifecycle.get('runtime_digest') != runtime_digest or
+                lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+                != _LIFECYCLE_PROTOCOL_VERSION or
+                qualification_lifecycle_proof_id(lifecycle)
+                != lifecycle_proof_id or
+                lifecycle.get('mutation_lease_token') != mutation_lease_token or
+                not _qualification_mutation_matches(
+                    mutation,
+                    state=_QUALIFICATION_MUTATION_DELETING,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=lifecycle_proof_id,
+                    delete_phase=QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+                    mutation_lease_token=mutation_lease_token)):
+            return None
+        changed = session.execute(schema.qualification_mutation.update().where(
+            schema.qualification_mutation.c.id == _QUALIFICATION_MUTATION_ID,
+            schema.qualification_mutation.c.state ==
+            _QUALIFICATION_MUTATION_DELETING,
+            schema.qualification_mutation.c.delete_phase ==
+            QUALIFICATION_DELETE_PHASE_IN_FLIGHT,
+            schema.qualification_mutation.c.lifecycle_proof_id ==
+            lifecycle_proof_id,
+            schema.qualification_mutation.c.mutation_lease_token ==
+            mutation_lease_token).values(
+                state=_QUALIFICATION_MUTATION_QUARANTINED,
+                delete_phase=None,
+                mutation_lease_token=None,
+                mutation_lease_expires_at=None,
+                quarantine_reason=reason,
+                updated_at=current)).rowcount
+        if changed != 1:
+            return None
+        _record_qualification_repository_quarantine_in_session(
+            session,
+            revision_id=revision.id,
+            target=target,
+            repository_arn=repository_arn,
+            runtime_digest=runtime_digest,
+            lifecycle_proof_id=lifecycle_proof_id,
+            reason=reason,
+            now=current)
+        return topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='QUARANTINED',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                quarantine_reason=reason),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=current)
 
 
 def complete_qualification_lifecycle_delete(
@@ -784,6 +1492,8 @@ def complete_qualification_lifecycle_delete(
                                   models.ImageProfileState.ACTIVE) or
                 not isinstance(lifecycle, dict) or
                 lifecycle.get('status') != 'DELETING' or
+                lifecycle.get('delete_phase')
+                != QUALIFICATION_DELETE_PHASE_READBACK or
                 lifecycle.get('target_fingerprint') != target.target_fingerprint
                 or lifecycle.get('repository_arn') != repository_arn or
                 lifecycle.get('runtime_digest') != runtime_digest or
@@ -802,6 +1512,7 @@ def complete_qualification_lifecycle_delete(
                     repository_arn=repository_arn,
                     runtime_digest=runtime_digest,
                     lifecycle_proof_id=lifecycle_proof_id,
+                    delete_phase=QUALIFICATION_DELETE_PHASE_READBACK,
                     mutation_lease_token=mutation_lease_token) or
                 not isinstance(mutation_expires_at, int) or
                 mutation_expires_at <= current_time):
@@ -810,13 +1521,17 @@ def complete_qualification_lifecycle_delete(
             schema.qualification_mutation.c.id == _QUALIFICATION_MUTATION_ID,
             schema.qualification_mutation.c.state ==
             _QUALIFICATION_MUTATION_DELETING,
+            schema.qualification_mutation.c.delete_phase ==
+            QUALIFICATION_DELETE_PHASE_READBACK,
             schema.qualification_mutation.c.lifecycle_proof_id ==
             lifecycle_proof_id,
             schema.qualification_mutation.c.mutation_lease_token ==
             mutation_lease_token).values(
                 state=_QUALIFICATION_MUTATION_RESTORING,
+                delete_phase=None,
                 mutation_lease_token=None,
                 mutation_lease_expires_at=None,
+                quarantine_reason=None,
                 updated_at=current_time)).rowcount
         if changed != 1:
             return None
@@ -857,11 +1572,17 @@ def record_qualification_copy(
         if (current.state not in (models.ImageProfileState.QUALIFYING,
                                   models.ImageProfileState.ACTIVE) or
                 current.desired_generation != revision.desired_generation or
-                current.config_hash != revision.config_hash):
+                current.config_hash != revision.config_hash or
+                not _revision_owns_qualification_work_in_session(
+                    session, current)):
             raise topology_state.StaleProfileRevisionError(
                 'Qualification copy no longer matches the desired revision.')
         mutation = topology_state.get_qualification_mutation_in_session(
-            session, exclusive=True)
+            session, exclusive=expected_mutation_proof_id is not None)
+        if not _qualification_repository_available_in_session(
+                session, repository_arn):
+            raise topology_state.StaleProfileRevisionError(
+                'Qualification copy repository is quarantined.')
         if expected_mutation_proof_id is None:
             if mutation is not None:
                 return None
@@ -873,6 +1594,7 @@ def record_qualification_copy(
                 repository_arn=repository_arn,
                 runtime_digest=runtime_digest,
                 lifecycle_proof_id=expected_mutation_proof_id,
+                delete_phase=None,
                 mutation_lease_token=None):
             return None
         current_proof_id = qualification_copy_restoration_proof_id(
@@ -1131,7 +1853,15 @@ def _canary_admission_available_in_session(
     revision: topology_state.ProfileRevisionRecord,
 ) -> bool:
     topology_state.assert_qualification_mutation_idle_in_session(session)
-    return _canary_copy_available(payload, revision)
+    target_evidence = revision.attestations.get(
+        models.profile_attestation_key('terraform_target', payload['target']))
+    repository_arn = (target_evidence.get('repository_arn') if isinstance(
+        target_evidence, dict) else None)
+    return (isinstance(repository_arn, str) and
+            _qualification_repository_available_in_session(
+                session, repository_arn) and
+            _revision_owns_qualification_work_in_session(session, revision) and
+            _canary_copy_available(payload, revision))
 
 
 def _validate_canary_ec2_instance_profile_arn(instance_profile_arn: Any) -> str:
@@ -1677,7 +2407,21 @@ def maybe_activate_profile(
     profile = models.ManagedRegistryProfile.from_snapshot(
         revision.config_snapshot)
     preflight_current = _database_epoch(now=now)
+    catalog_authority = catalog_state.get_catalog_authority_id()
+    if catalog_authority is None:
+        return None
     for target in (profile.canonical,) + profile.targets:
+        try:
+            _, repository_arn = qualification_repository(
+                revision,
+                target,
+                catalog_authority=catalog_authority,
+                profile=profile,
+                configured_target=target)
+        except ValueError:
+            return None
+        if topology_state.qualification_repository_quarantined(repository_arn):
+            return None
         if not qualification_copy_available(revision, profile, target):
             return None
     try:

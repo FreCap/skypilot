@@ -1277,9 +1277,14 @@ def _activation_budget_facts(
     profile: models.ManagedRegistryProfile,
     attestations: dict[str, Any],
     *,
-    now: int,
+    now: int | None,
 ) -> list[dict[str, Any]]:
-    """Returns exact candidate budget facts in a global lock order."""
+    """Returns exact candidate budget facts in a global lock order.
+
+    A ``None`` clock performs the structural preflight needed to acquire every
+    provider-budget row before the catalog-wide qualification lock. Freshness
+    is then rechecked against one post-lock database epoch.
+    """
     facts: list[dict[str, Any]] = []
     expected_shape = {
         'status', 'observed_at', 'provider', 'partition', 'account', 'region',
@@ -1294,7 +1299,8 @@ def _activation_budget_facts(
         if (not isinstance(evidence, dict) or set(evidence) != expected_shape or
                 evidence.get('status') != 'READY' or
                 type(evidence.get('observed_at')) is not int or
-                not 0 <= now - evidence['observed_at'] or
+                evidence['observed_at'] < 0 or
+            (now is not None and now < evidence['observed_at']) or
                 evidence.get('provider') != 'aws' or
                 evidence.get('partition') != profile.partition or
                 evidence.get('account') != profile.registry_account or
@@ -1433,7 +1439,6 @@ def activate_profile(
                 != expected_attestations_hash):
             raise topology_state.StaleProfileRevisionError(
                 'Qualification result no longer matches the desired revision.')
-        topology_state.assert_qualification_mutation_idle_in_session(session)
         custody = session.execute(
             sqlalchemy.select(schema.profile_custody).where(
                 schema.profile_custody.c.workspace == desired['workspace'],
@@ -1456,15 +1461,15 @@ def activate_profile(
         attestations = json.loads(str(desired['attestations_json']))
         configured = models.ManagedRegistryProfile.from_snapshot(
             json.loads(str(desired['config_json'])))
-        lock_current = catalog_state.database_epoch(session, now=now)
-        _validate_activation_attestations(attestations,
-                                          required_attestations,
-                                          now=lock_current,
-                                          profile=configured)
         budget_facts = _activation_budget_facts(configured,
                                                 attestations,
-                                                now=lock_current)
+                                                now=None)
         for fact in budget_facts:
+            # The qualification ingest path normally creates these rows. The
+            # zero-time upsert also safely materializes a missing first-use row
+            # while acquiring every provider-budget lock before the catalog
+            # lock. These provisional values are transaction-local and are
+            # replaced using the post-lock database clock before commit.
             topology_state.upsert_provider_budget_in_session(
                 session,
                 provider=fact['provider'],
@@ -1474,7 +1479,7 @@ def activate_profile(
                 api_family=fact['api_family'],
                 applied_rate_per_second=fact['applied_rate_per_second'],
                 burst=fact['burst'],
-                now=lock_current)
+                now=0)
         shards = schema.registry_shards
         targets = (configured.canonical,) + configured.targets
         target_by_name = {target.name: target for target in targets}
@@ -1483,34 +1488,60 @@ def activate_profile(
                 shards.c.workspace == desired['workspace'],
                 shards.c.profile == desired['profile']).order_by(
                     shards.c.id).with_for_update()).mappings().all()
+        topology_state.assert_qualification_mutation_idle_in_session(session)
+        for target in targets:
+            terraform_target = attestations.get(
+                models.profile_attestation_key('terraform_target', target.name))
+            repository_arn = (terraform_target.get('repository_arn')
+                              if isinstance(terraform_target, dict) else None)
+            if (not isinstance(repository_arn, str) or topology_state.
+                    qualification_repository_quarantined_in_session(
+                        session, repository_arn)):
+                raise ValueError('QUALIFICATION_FAILED')
         current = catalog_state.database_epoch(session, now=now)
         _validate_activation_attestations(attestations,
                                           required_attestations,
                                           now=current,
                                           profile=configured)
-        _activation_budget_facts(configured, attestations, now=current)
+        budget_facts = _activation_budget_facts(configured,
+                                                attestations,
+                                                now=current)
+        for fact in budget_facts:
+            # Every row was already acquired above. This only applies the
+            # qualified values and final clock to locks owned by this
+            # transaction.
+            topology_state.upsert_provider_budget_in_session(
+                session,
+                provider=fact['provider'],
+                partition=fact['partition'],
+                account=fact['account'],
+                region=fact['region'],
+                api_family=fact['api_family'],
+                applied_rate_per_second=fact['applied_rate_per_second'],
+                burst=fact['burst'],
+                now=current)
         if len(shard_rows) != sum(target.shard_count for target in targets):
             raise ValueError('QUALIFICATION_FAILED')
         target_counts = {target.name: 0 for target in targets}
         for shard in shard_rows:
-            target = target_by_name.get(str(shard['target_id']))
-            if (target is None or
-                    shard['target_fingerprint'] != target.target_fingerprint or
-                    str(shard['state'])
+            shard_target = target_by_name.get(str(shard['target_id']))
+            if (shard_target is None or shard['target_fingerprint']
+                    != shard_target.target_fingerprint or str(shard['state'])
                     not in (models.ImageShardState.READY.value,
                             models.ImageShardState.FULL.value) or
                 (shard['profile_revision_id'] is not None and
                  str(shard['profile_revision_id']) not in active_ids)):
                 raise ValueError('QUALIFICATION_FAILED')
-            target_counts[target.name] += 1
+            target_counts[shard_target.name] += 1
             max_manifests, max_declared_bytes, max_in_flight = (
-                _activation_shard_capacities(shard, target, attestations))
+                _activation_shard_capacities(shard, shard_target, attestations))
             full = (int(shard['reserved_manifests']) >= max_manifests or
                     int(shard['reserved_declared_bytes']) >= max_declared_bytes)
             session.execute(
                 shards.update().where(shards.c.id == shard['id']).values(
                     profile_revision_id=profile_revision_id,
-                    eviction_enabled=(target.delete_authority is not None),
+                    eviction_enabled=(shard_target.delete_authority
+                                      is not None),
                     max_manifests=max_manifests,
                     max_declared_bytes=max_declared_bytes,
                     max_in_flight=max_in_flight,

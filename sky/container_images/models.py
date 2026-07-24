@@ -594,6 +594,7 @@ class ManagedRegistryTarget:
     delete_authority: str | None
     qualification_delete_authority: str
     runtime_pull: tuple[tuple[str, str], ...]
+    qualification_repository_generation: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -633,6 +634,12 @@ class ManagedRegistryTarget:
             validate_control_plane_identifier(
                 self.qualification_delete_authority,
                 'Qualification delete authority'))
+        if (not isinstance(self.qualification_repository_generation, int) or
+                isinstance(self.qualification_repository_generation, bool) or
+                not 0 <= self.qualification_repository_generation <= 255):
+            raise ValueError(
+                'Qualification repository generation must be an integer from '
+                '0 through 255.')
 
     def runtime_binding(self, backend: str) -> str | None:
         return dict(self.runtime_pull).get(backend)
@@ -764,6 +771,9 @@ class ManagedRegistryProfile:
                     field.name: normalize(getattr(value, field.name))
                     for field in dataclasses.fields(value)
                 }
+                if (isinstance(value, ManagedRegistryTarget) and
+                        value.qualification_repository_generation == 0):
+                    normalized.pop('qualification_repository_generation')
                 if (isinstance(value, RegistryAccessBinding) and
                         value.canary_use_spot is None):
                     normalized.pop('canary_use_spot')

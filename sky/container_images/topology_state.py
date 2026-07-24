@@ -76,6 +76,18 @@ class ProfileRevisionRecord:
 
 
 @dataclasses.dataclass(frozen=True)
+class QualificationRepositoryQuarantineRecord:
+    repository_arn: str
+    owner_profile_revision_id: str
+    owner_target: str
+    owner_target_fingerprint: str
+    runtime_digest: str
+    lifecycle_proof_id: str
+    quarantine_reason: str
+    quarantined_at: int
+
+
+@dataclasses.dataclass(frozen=True)
 class ShardRecord:
     id: str
     workspace: str
@@ -203,6 +215,20 @@ def _profile(row: sqlalchemy.engine.RowMapping) -> ProfileRevisionRecord:
         created_at=int(row['created_at']),
         updated_at=int(row['updated_at']),
     )
+
+
+def _qualification_repository_quarantine(
+    row: sqlalchemy.engine.RowMapping,
+) -> QualificationRepositoryQuarantineRecord:
+    return QualificationRepositoryQuarantineRecord(
+        repository_arn=str(row['repository_arn']),
+        owner_profile_revision_id=str(row['owner_profile_revision_id']),
+        owner_target=str(row['owner_target']),
+        owner_target_fingerprint=str(row['owner_target_fingerprint']),
+        runtime_digest=str(row['runtime_digest']),
+        lifecycle_proof_id=str(row['lifecycle_proof_id']),
+        quarantine_reason=str(row['quarantine_reason']),
+        quarantined_at=int(row['quarantined_at']))
 
 
 def _shard(row: sqlalchemy.engine.RowMapping) -> ShardRecord:
@@ -363,6 +389,89 @@ def assert_qualification_mutation_idle_in_session(session: orm.Session) -> None:
             'Qualification delete or restoration is in progress.')
 
 
+def qualification_repository_quarantined_in_session(
+        session: orm.Session, repository_arn: str) -> bool:
+    """Returns whether a physical qualification repository is tombstoned."""
+    if not isinstance(repository_arn, str) or not repository_arn:
+        raise ValueError('Qualification repository ARN is invalid.')
+    return bool(
+        session.execute(
+            sqlalchemy.select(sqlalchemy.exists().where(
+                schema.qualification_repository_quarantines.c.repository_arn ==
+                repository_arn))).scalar_one())
+
+
+def qualification_repository_quarantined(repository_arn: str) -> bool:
+    """Returns the durable catalog-wide quarantine for one repository."""
+    with orm.Session(catalog_state.engine()) as session:
+        return qualification_repository_quarantined_in_session(
+            session, repository_arn)
+
+
+def list_qualification_repository_quarantines(
+    *,
+    limit: int = 1001,
+) -> list[QualificationRepositoryQuarantineRecord]:
+    """Returns a bounded oldest-first physical quarantine projection."""
+    if not 1 <= limit <= 1001:
+        raise ValueError(
+            'Qualification repository quarantine page size is invalid.')
+    table = schema.qualification_repository_quarantines
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(
+            sqlalchemy.select(table).order_by(
+                table.c.quarantined_at,
+                table.c.repository_arn).limit(limit)).mappings().all()
+    return [_qualification_repository_quarantine(row) for row in rows]
+
+
+def qualification_repository_quarantines_for_arns(
+    repository_arns: set[str],
+) -> list[QualificationRepositoryQuarantineRecord]:
+    """Returns exact tombstones for a caller-bounded repository identity set."""
+    if (len(repository_arns) > 257_000 or
+            any(not isinstance(repository_arn, str) or not repository_arn
+                for repository_arn in repository_arns)):
+        raise ValueError('Qualification repository ARN lookup is invalid.')
+    if not repository_arns:
+        return []
+    table = schema.qualification_repository_quarantines
+    repository_array = sqlalchemy.bindparam('qualification_repository_arns',
+                                            value=sorted(repository_arns),
+                                            type_=postgresql.ARRAY(
+                                                sqlalchemy.Text))
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.repository_arn == sqlalchemy.any_(
+                    repository_array)).order_by(
+                        table.c.repository_arn)).mappings().all()
+    return [_qualification_repository_quarantine(row) for row in rows]
+
+
+def qualification_revision_owns_work_in_session(
+    session: orm.Session,
+    *,
+    profile_revision_id: str,
+    workspace: str,
+    profile: str,
+    state: models.ImageProfileState,
+) -> bool:
+    """Checks that a revision still owns provider qualification work."""
+    if state == models.ImageProfileState.QUALIFYING:
+        return True
+    if state != models.ImageProfileState.ACTIVE:
+        return False
+    candidate = schema.profile_revisions.alias('qualification_successor')
+    return not bool(
+        session.execute(
+            sqlalchemy.select(sqlalchemy.exists().where(
+                candidate.c.workspace == workspace, candidate.c.profile
+                == profile, candidate.c.id != profile_revision_id,
+                candidate.c.state
+                == models.ImageProfileState.QUALIFYING.value))).scalar_one())
+
+
 def lock_profile_revision_mutation_in_session(
         session: orm.Session,
         profile_revision_id: str) -> sqlalchemy.engine.RowMapping:
@@ -436,6 +545,86 @@ def record_profile_custody_in_session(session: orm.Session,
             'release is published.')
 
 
+def _is_fresh_qualification_repository_successor(
+    session: orm.Session,
+    mutation: sqlalchemy.engine.RowMapping,
+    *,
+    workspace: str,
+    profile: str,
+    revision: int,
+    config_snapshot: dict[str, Any],
+    physical_manifest_hash: str,
+) -> bool:
+    """Validates the only revision allowed through a quarantine barrier."""
+    if str(mutation['state']) != 'QUARANTINED':
+        return False
+    owner = session.execute(
+        sqlalchemy.select(schema.profile_revisions).where(
+            schema.profile_revisions.c.id ==
+            mutation['owner_profile_revision_id'])).mappings().first()
+    if (owner is None or str(owner['workspace']) != workspace or
+            str(owner['profile']) != profile or
+            revision <= int(owner['revision']) or
+            str(owner['physical_manifest_hash']) != physical_manifest_hash):
+        return False
+    try:
+        owner_profile = models.ManagedRegistryProfile.from_snapshot(
+            json.loads(str(owner['config_json'])))
+        successor_profile = models.ManagedRegistryProfile.from_snapshot(
+            config_snapshot)
+        owner_target = owner_profile.target(str(mutation['owner_target']))
+        successor_target = successor_profile.target(
+            str(mutation['owner_target']))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(successor_profile.name == profile and
+                successor_profile.revision == revision and
+                owner_target.target_fingerprint == str(
+                    mutation['owner_target_fingerprint']) and
+                successor_target.target_fingerprint
+                == owner_target.target_fingerprint and
+                successor_target.qualification_repository_generation
+                > owner_target.qualification_repository_generation)
+
+
+def _qualification_repository_generations_are_monotonic(
+    session: orm.Session,
+    *,
+    workspace: str,
+    profile: str,
+    config_snapshot: dict[str, Any],
+) -> bool:
+    """Rejects an immediate generation decrease for an unchanged target."""
+    previous = session.execute(
+        sqlalchemy.select(schema.profile_revisions).where(
+            schema.profile_revisions.c.workspace == workspace,
+            schema.profile_revisions.c.profile == profile).order_by(
+                schema.profile_revisions.c.desired_generation.desc()).limit(
+                    1)).mappings().first()
+    if previous is None:
+        return True
+    try:
+        previous_profile = models.ManagedRegistryProfile.from_snapshot(
+            json.loads(str(previous['config_json'])))
+        candidate_profile = models.ManagedRegistryProfile.from_snapshot(
+            config_snapshot)
+        for previous_target in ((previous_profile.canonical,) +
+                                previous_profile.targets):
+            try:
+                candidate_target = candidate_profile.target(
+                    previous_target.name)
+            except ValueError:
+                continue
+            if (candidate_target.target_fingerprint
+                    == previous_target.target_fingerprint and
+                    candidate_target.qualification_repository_generation
+                    < previous_target.qualification_repository_generation):
+                return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def stage_profile_revision(*,
                            workspace: str,
                            profile: str,
@@ -479,9 +668,36 @@ def stage_profile_revision(*,
             raise ValueError(
                 'Registry profile revision is no longer operational.')
 
-        # Superseding the barrier owner could strand a provider delete or let a
-        # replacement revision certify bytes before the owner restores them.
-        assert_qualification_mutation_idle_in_session(session)
+        current_qualifying = session.execute(
+            sqlalchemy.select(table.c.id).where(
+                table.c.workspace == workspace, table.c.profile == profile,
+                table.c.state == models.ImageProfileState.QUALIFYING.value).
+            with_for_update()).mappings().first()
+
+        # A quarantine may only be superseded by a later revision that selects
+        # a fresh physical qualification repository generation. The barrier
+        # remains present until Terraform evidence for that exact repository is
+        # recorded, so staging alone cannot re-admit provider work.
+        mutation = get_qualification_mutation_in_session(session,
+                                                         exclusive=False)
+        if (mutation is not None and
+                not _is_fresh_qualification_repository_successor(
+                    session,
+                    mutation,
+                    workspace=workspace,
+                    profile=profile,
+                    revision=revision,
+                    config_snapshot=config_snapshot,
+                    physical_manifest_hash=physical_manifest_hash)):
+            raise QualificationMutationInProgressError(
+                'Qualification delete or restoration is in progress.')
+        if not _qualification_repository_generations_are_monotonic(
+                session,
+                workspace=workspace,
+                profile=profile,
+                config_snapshot=config_snapshot):
+            raise ValueError(
+                'Qualification repository generations cannot decrease.')
         custody = session.execute(
             sqlalchemy.select(schema.profile_custody).where(
                 schema.profile_custody.c.workspace == workspace,
@@ -493,11 +709,11 @@ def stage_profile_revision(*,
                 'V0 cannot change the canonical physical manifest after a '
                 'release is published.')
         current = catalog_state.database_epoch(session, now=now)
-        session.execute(table.update().where(
-            table.c.workspace == workspace, table.c.profile == profile,
-            table.c.state == models.ImageProfileState.QUALIFYING.value).values(
-                state=models.ImageProfileState.SUPERSEDED.value,
-                updated_at=current))
+        if current_qualifying is not None:
+            session.execute(table.update().where(
+                table.c.id == current_qualifying['id']).values(
+                    state=models.ImageProfileState.SUPERSEDED.value,
+                    updated_at=current))
         generation = int(
             session.execute(
                 sqlalchemy.select(
@@ -521,6 +737,120 @@ def stage_profile_revision(*,
             created_at=current,
             updated_at=current).returning(table)).mappings().one()
         return _profile(row)
+
+
+def complete_qualification_quarantine_cutover(
+    *,
+    profile_revision_id: str,
+    now: int | None = None,
+) -> ProfileRevisionRecord:
+    """Clears quarantine only after a fresh repository is Terraform-attested."""
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        candidate = lock_profile_revision_mutation_in_session(
+            session, profile_revision_id)
+        mutation = get_qualification_mutation_in_session(session,
+                                                         exclusive=True)
+        current = _profile(candidate)
+        if mutation is None:
+            return current
+        if str(mutation['state']) != 'QUARANTINED':
+            raise QualificationMutationInProgressError(
+                'Qualification delete or restoration is in progress.')
+        if (current.state != models.ImageProfileState.QUALIFYING or
+                not _is_fresh_qualification_repository_successor(
+                    session,
+                    mutation,
+                    workspace=current.workspace,
+                    profile=current.profile,
+                    revision=current.revision,
+                    config_snapshot=current.config_snapshot,
+                    physical_manifest_hash=current.physical_manifest_hash)):
+            raise QualificationMutationInProgressError(
+                'Qualification quarantine requires a fresh repository '
+                'generation.')
+        if not qualification_repository_quarantined_in_session(
+                session, str(mutation['repository_arn'])):
+            raise RuntimeError(
+                'Qualification quarantine has no durable repository '
+                'tombstone.')
+        if session.execute(
+                sqlalchemy.select(sqlalchemy.exists().where(
+                    schema.operations.c.kind == 'PROFILE_CANARY',
+                    schema.operations.c.state ==
+                    models.ImageOperationState.RUNNING.value))).scalar_one():
+            raise QualificationMutationInProgressError(
+                'Qualification quarantine cannot cut over while a canary is '
+                'running.')
+
+        owner = session.execute(
+            sqlalchemy.select(schema.profile_revisions).where(
+                schema.profile_revisions.c.id ==
+                mutation['owner_profile_revision_id'])).mappings().one()
+        owner_profile = models.ManagedRegistryProfile.from_snapshot(
+            json.loads(str(owner['config_json'])))
+        successor_profile = models.ManagedRegistryProfile.from_snapshot(
+            current.config_snapshot)
+        target_name = str(mutation['owner_target'])
+        owner_target = owner_profile.target(target_name)
+        successor_target = successor_profile.target(target_name)
+        target_evidence = current.attestations.get(
+            models.profile_attestation_key('terraform_target', target_name))
+        if (current.terraform_hash is None or
+                not isinstance(target_evidence, dict) or
+                target_evidence.get('status') != 'READY' or
+                target_evidence.get('target_fingerprint')
+                != successor_target.target_fingerprint or
+                target_evidence.get('registry') != successor_target.registry or
+                target_evidence.get('qualification_repository_generation')
+                != successor_target.qualification_repository_generation or
+                not isinstance(target_evidence.get('repository_name'), str) or
+                not isinstance(target_evidence.get('repository_arn'), str) or
+                target_evidence['repository_arn'] == mutation['repository_arn']
+                or qualification_repository_quarantined_in_session(
+                    session, str(target_evidence['repository_arn']))):
+            raise QualificationMutationInProgressError(
+                'Qualification quarantine successor has no fresh Terraform '
+                'repository evidence.')
+        quarantine_reason = mutation['quarantine_reason']
+        if not isinstance(quarantine_reason, str) or not quarantine_reason:
+            raise RuntimeError('Qualification quarantine reason is missing.')
+        updated = record_profile_attestation_in_session(
+            session,
+            profile_revision_id=current.id,
+            kind=models.profile_attestation_key('quarantine_cutover',
+                                                target_name),
+            evidence={
+                'status': 'READY',
+                'owner_profile_revision_id': str(owner['id']),
+                'owner_target': target_name,
+                'owner_target_fingerprint': str(
+                    mutation['owner_target_fingerprint']),
+                'old_repository_arn': str(mutation['repository_arn']),
+                'new_repository_arn': str(target_evidence['repository_arn']),
+                'old_qualification_repository_generation':
+                    owner_target.qualification_repository_generation,
+                'new_qualification_repository_generation':
+                    successor_target.qualification_repository_generation,
+                'lifecycle_proof_id': str(mutation['lifecycle_proof_id']),
+                'quarantine_reason': quarantine_reason,
+            },
+            expected_generation=current.desired_generation,
+            expected_config_hash=current.config_hash,
+            now=now)
+        cleared = session.execute(schema.qualification_mutation.delete().where(
+            schema.qualification_mutation.c.id == 'global',
+            schema.qualification_mutation.c.state == 'QUARANTINED',
+            schema.qualification_mutation.c.owner_profile_revision_id ==
+            owner['id'],
+            schema.qualification_mutation.c.owner_target == target_name,
+            schema.qualification_mutation.c.repository_arn ==
+            mutation['repository_arn'],
+            schema.qualification_mutation.c.lifecycle_proof_id ==
+            mutation['lifecycle_proof_id'])).rowcount
+        if cleared != 1:
+            raise RuntimeError(
+                'Qualification quarantine cutover barrier CAS drifted.')
+        return updated
 
 
 def get_profile_revision(
@@ -584,20 +914,57 @@ def list_active_profile_revisions(
 def list_qualifying_profiles(*,
                              include_active: bool = False,
                              limit: int = 100) -> list[ProfileRevisionRecord]:
-    """Returns a bounded fair qualification work page."""
+    """Returns a bounded fair qualification work page.
+
+    A desired revision exclusively owns qualification for its logical profile.
+    The preceding ACTIVE revision becomes eligible for maintenance again only
+    after that candidate leaves QUALIFYING.  This prevents workers from
+    mutating a superseded qualification repository while its replacement is
+    being proven. QUALIFYING work is queried first and returned without filling
+    from ACTIVE maintenance, so a large tombstoned ACTIVE population cannot
+    delay a fresh candidate.
+    """
     if not 1 <= limit <= 1000:
         raise ValueError('Qualifying profile page size is invalid.')
     with orm.Session(catalog_state.engine()) as session:
-        states = [models.ImageProfileState.QUALIFYING.value]
-        if include_active:
-            states.append(models.ImageProfileState.ACTIVE.value)
-        rows = session.execute(
-            sqlalchemy.select(schema.profile_revisions).where(
-                schema.profile_revisions.c.state.in_(states)).order_by(
-                    schema.profile_revisions.c.updated_at,
-                    schema.profile_revisions.c.id).limit(
-                        limit)).mappings().all()
-    return [_profile(row) for row in rows]
+        table = schema.profile_revisions
+
+        def _tombstoned_repository() -> sqlalchemy.ColumnElement[bool]:
+            attestation = sqlalchemy.func.jsonb_each(
+                sqlalchemy.cast(table.c.attestations_json,
+                                postgresql.JSONB)).table_valued(
+                                    'key',
+                                    'value').alias('qualification_attestation')
+            return sqlalchemy.exists(
+                sqlalchemy.select(sqlalchemy.literal(1)).select_from(
+                    attestation.join(
+                        schema.qualification_repository_quarantines, schema.
+                        qualification_repository_quarantines.c.repository_arn ==
+                        attestation.c.value.op('->>')('repository_arn'))).where(
+                            attestation.c.key.like('terraform_target:%')))
+
+        qualifying_rows = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.state == models.ImageProfileState.QUALIFYING.value,
+                ~_tombstoned_repository()).order_by(
+                    table.c.updated_at,
+                    table.c.id).limit(limit)).mappings().all()
+        if qualifying_rows or not include_active:
+            return [_profile(row) for row in qualifying_rows]
+
+        candidate = table.alias('qualification_candidate')
+        candidate_exists = sqlalchemy.exists(
+            sqlalchemy.select(sqlalchemy.literal(1)).where(
+                candidate.c.workspace == table.c.workspace,
+                candidate.c.profile == table.c.profile,
+                candidate.c.state == models.ImageProfileState.QUALIFYING.value))
+        active_rows = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.state == models.ImageProfileState.ACTIVE.value,
+                ~candidate_exists, ~_tombstoned_repository()).order_by(
+                    table.c.updated_at,
+                    table.c.id).limit(limit)).mappings().all()
+        return [_profile(row) for row in active_rows]
 
 
 def list_profile_revisions(

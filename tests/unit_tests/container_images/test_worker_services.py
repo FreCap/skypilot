@@ -40,6 +40,8 @@ _ARTIFACT_ID = '00000000-0000-4000-8000-000000000001'
 _LOCATION_ID = '00000000-0000-4000-8000-000000000002'
 _SHARD_ID = '00000000-0000-4000-8000-000000000003'
 _REVISION_ID = '00000000-0000-4000-8000-000000000004'
+_QUALIFICATION_POLICY_HASH = '7' * 64
+_QUALIFICATION_OWNERSHIP_TAGS_HASH = '8' * 64
 
 
 def test_canary_credential_helper_can_remove_baked_docker_auth() -> None:
@@ -70,6 +72,16 @@ def _persist_canary_profile_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
         copy_worker_service.qualification,
         'get_qualification_mutation',
         lambda: None,
+    )
+    monkeypatch.setattr(
+        copy_worker_service.qualification,
+        'qualification_copy_provider_allowed',
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        lifecycle_worker_service.topology_state,
+        'qualification_repository_quarantined',
+        lambda *_args, **_kwargs: False,
     )
 
 
@@ -186,7 +198,11 @@ def test_canary_contract_rejects_deleted_copy_before_launch_but_allows_cleanup(
     binding = profile.bindings[binding_id]
     runtime_id = canary_worker_service.qualification.runtime_ids(
         target, 'aws_vm', binding)[0]
-    repository_name = f'{target.repository_prefix}/qualification'
+    authority = _canary_operation().authority_id
+    repository_name = aws.qualification_repository_name(authority, target)
+    repository_arn = (
+        f'arn:{profile.partition}:ecr:{target.region}:'
+        f'{profile.registry_account}:repository/{repository_name}')
     revision = dataclasses.replace(
         _revision(profile),
         attestations={
@@ -195,7 +211,9 @@ def test_canary_contract_rejects_deleted_copy_before_launch_but_allows_cleanup(
                 'target_fingerprint': target.target_fingerprint,
                 'registry': target.registry,
                 'repository_name': repository_name,
-                'repository_arn': 'qualification-repository-arn',
+                'repository_arn': repository_arn,
+                'qualification_repository_generation':
+                    target.qualification_repository_generation,
             },
             models.profile_attestation_key('copy', target.name): {
                 'status': 'READY',
@@ -1748,6 +1766,59 @@ def _revision(
         max_daily_canary_microusd=5_000_000,
         created_at=10,
         updated_at=11)
+
+
+def _qualification_revision(
+    profile: models.ManagedRegistryProfile,
+    target: models.ManagedRegistryTarget,
+    repository_arn: str,
+    *,
+    encryption_type: str = 'AES256',
+    kms_key: str | None = None,
+    attestations: dict[str, dict[str, Any]] | None = None,
+) -> topology_state.ProfileRevisionRecord:
+    shard = _shard(profile, target.name)
+    evidence = dict(attestations or {})
+    evidence[models.profile_attestation_key(
+        'terraform_target', target.name
+    )] = {
+        'status': 'READY',
+        'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
+        'qualification_policy_hash': _QUALIFICATION_POLICY_HASH,
+        'qualification_ownership_tags_hash': _QUALIFICATION_OWNERSHIP_TAGS_HASH,
+    }
+    evidence[models.profile_attestation_key(
+        'terraform_shard', shard.physical_fingerprint)] = {
+            'status': 'READY',
+            'physical_fingerprint': shard.physical_fingerprint,
+            'target_fingerprint': target.target_fingerprint,
+            'live_attestation_key': models.profile_attestation_key(
+                'infrastructure_shard', shard.physical_fingerprint),
+            'encryption_type': encryption_type,
+            'kms_key': kms_key,
+        }
+    return dataclasses.replace(_revision(profile), attestations=evidence)
+
+
+def _qualification_metadata(
+    target: models.ManagedRegistryTarget,
+    repository_name: str,
+    repository_arn: str,
+    *,
+    encryption_type: str = 'AES256',
+    kms_key: str | None = None,
+) -> dict[str, Any]:
+    return {
+        'repository_arn': repository_arn,
+        'repository_uri': f'{target.registry}/{repository_name}',
+        'tag_mutability': 'IMMUTABLE',
+        'encryption_type': encryption_type,
+        'kms_key': kms_key,
+        'scanning_mode': 'MANUAL',
+        'policy_hash': _QUALIFICATION_POLICY_HASH,
+        'ownership_tags_hash': _QUALIFICATION_OWNERSHIP_TAGS_HASH,
+    }
 
 
 def _policy_profile(
@@ -4513,8 +4584,8 @@ def test_copy_qualification_stops_after_metadata_before_database_write(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     stop = threading.Event()
-    revision = _revision(profile)
     target = profile.canonical
+    revision = _qualification_revision(profile, target, 'qualification-arn')
     destination = mock.Mock()
     destination.repository_metadata.side_effect = (lambda: stop.set() or {
         'repository_arn': 'unused'
@@ -4524,6 +4595,9 @@ def test_copy_qualification_stops_after_metadata_before_database_write(
     monkeypatch.setattr(copy_worker_service.qualification,
                         'qualification_repository', lambda *_args:
                         ('qualification', 'qualification-arn'))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_copy_provider_allowed',
+                        lambda *_args, **_kwargs: True)
     monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
                         lambda *_args, **_kwargs: destination)
     monkeypatch.setattr(copy_worker_service.catalog_state,
@@ -4539,22 +4613,131 @@ def test_copy_qualification_stops_after_metadata_before_database_write(
     record.assert_not_called()
 
 
+def test_copy_qualification_provider_fence_rechecks_drain_after_database_check(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    stop = threading.Event()
+    target = profile.canonical
+    revision = _qualification_revision(profile, target, 'qualification-arn')
+    provider_allowed = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: (stop.set() or True))
+    acquire_repository = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_target_shard',
+                        lambda *_args: _shard(profile, target.name))
+    monkeypatch.setattr(
+        copy_worker_service.qualification, 'qualification_repository',
+        lambda *_args, **_kwargs: ('qualification', 'qualification-arn'))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_copy_provider_allowed', provider_allowed)
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        acquire_repository)
+
+    with pytest.raises(copy_worker_service._QualificationDrainRequested):
+        copy_worker_service.reconcile_qualification_copy(
+            revision, target, limiter=mock.Mock(), should_stop=stop.is_set)
+
+    provider_allowed.assert_called_once_with(revision,
+                                             target,
+                                             repository_arn='qualification-arn')
+    acquire_repository.assert_not_called()
+
+
+def test_copy_qualification_requires_complete_terraform_metadata_before_provider(
+        monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    revision = _revision(profile)
+    target = profile.canonical
+    acquire_repository = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_target_shard',
+                        lambda *_args: _shard(profile, target.name))
+    monkeypatch.setattr(
+        copy_worker_service.qualification, 'qualification_repository',
+        lambda *_args, **_kwargs: ('qualification', 'qualification-arn'))
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        acquire_repository)
+
+    with pytest.raises(LookupError,
+                       match='Terraform qualification target attestation'):
+        copy_worker_service.reconcile_qualification_copy(revision,
+                                                         target,
+                                                         limiter=mock.Mock())
+
+    acquire_repository.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('encryption_type', 'kms_key', 'metadata_override'),
+    (
+        ('AES256', None, {
+            'policy_hash': '9' * 64
+        }),
+        ('KMS', 'arn:aws:kms:us-east-1:123456789012:key/' + '1' * 36, {
+            'kms_key': 'arn:aws:kms:us-east-1:123456789012:key/' + '2' * 36
+        }),
+        ('AES256', None, {
+            'scanning_mode': 'SCAN_ON_PUSH'
+        }),
+        ('AES256', None, {
+            'ownership_tags_hash': '9' * 64
+        }),
+    ),
+)
+def test_copy_qualification_rejects_live_repository_metadata_drift(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        encryption_type: str, kms_key: str | None,
+        metadata_override: dict[str, Any]) -> None:
+    target = profile.canonical
+    repository_name = 'qualification'
+    repository_arn = 'qualification-arn'
+    revision = _qualification_revision(profile,
+                                       target,
+                                       repository_arn,
+                                       encryption_type=encryption_type,
+                                       kms_key=kms_key)
+    metadata = _qualification_metadata(target,
+                                       repository_name,
+                                       repository_arn,
+                                       encryption_type=encryption_type,
+                                       kms_key=kms_key)
+    metadata.update(metadata_override)
+    destination = mock.Mock()
+    destination.repository_metadata.return_value = metadata
+    monkeypatch.setattr(copy_worker_service.topology_state, 'get_target_shard',
+                        lambda *_args: _shard(profile, target.name))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_repository', lambda *_args:
+                        (repository_name, repository_arn))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_copy_provider_allowed',
+                        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
+                        lambda *_args, **_kwargs: destination)
+    monkeypatch.setattr(copy_worker_service.catalog_state,
+                        'get_catalog_authority_id', lambda: 'catalog')
+    record = mock.Mock()
+    monkeypatch.setattr(copy_worker_service.topology_state,
+                        'record_profile_attestation', record)
+
+    with pytest.raises(ValueError, match='live identity drifted'):
+        copy_worker_service.reconcile_qualification_copy(revision,
+                                                         target,
+                                                         limiter=mock.Mock())
+
+    record.assert_not_called()
+    destination.copy_graph.assert_not_called()
+
+
 def test_copy_qualification_transfer_receives_live_stop_event(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     stop = threading.Event()
-    revision = _revision(profile)
     target = profile.canonical
     repository_name = 'qualification'
     repository_arn = 'qualification-arn'
+    revision = _qualification_revision(profile, target, repository_arn)
     destination = mock.Mock()
-    destination.repository_metadata.return_value = {
-        'repository_arn': repository_arn,
-        'repository_uri': f'{target.registry}/{repository_name}',
-        'tag_mutability': 'IMMUTABLE',
-        'encryption_type': 'AES256',
-        'kms_key': None,
-    }
+    destination.repository_metadata.return_value = _qualification_metadata(
+        target, repository_name, repository_arn)
     graph = SimpleNamespace(runtime_digest=_DIGEST, platform='linux/amd64')
 
     def copy_graph(_graph, _read_blob, cancel_event):
@@ -4569,6 +4752,9 @@ def test_copy_qualification_transfer_receives_live_stop_event(
     monkeypatch.setattr(copy_worker_service.qualification,
                         'qualification_repository', lambda *_args:
                         (repository_name, repository_arn))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_copy_provider_allowed',
+                        lambda *_args, **_kwargs: True)
     monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
                         lambda *_args, **_kwargs: destination)
     monkeypatch.setattr(copy_worker_service.catalog_state,
@@ -4599,18 +4785,13 @@ def test_copy_qualification_transfer_receives_live_stop_event(
 def test_copy_qualification_barrier_blocks_before_provider_transfer(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
-    revision = _revision(profile)
     target = profile.canonical
     repository_name = 'qualification'
     repository_arn = 'qualification-arn'
+    revision = _qualification_revision(profile, target, repository_arn)
     destination = mock.Mock()
-    destination.repository_metadata.return_value = {
-        'repository_arn': repository_arn,
-        'repository_uri': f'{target.registry}/{repository_name}',
-        'tag_mutability': 'IMMUTABLE',
-        'encryption_type': 'AES256',
-        'kms_key': None,
-    }
+    destination.repository_metadata.return_value = _qualification_metadata(
+        target, repository_name, repository_arn)
     graph = SimpleNamespace(runtime_digest=_DIGEST, platform='linux/amd64')
     reader = SimpleNamespace(read_blob=mock.sentinel.read_blob)
     monkeypatch.setattr(copy_worker_service.topology_state, 'get_target_shard',
@@ -4618,6 +4799,9 @@ def test_copy_qualification_barrier_blocks_before_provider_transfer(
     monkeypatch.setattr(copy_worker_service.qualification,
                         'qualification_repository', lambda *_args:
                         (repository_name, repository_arn))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_copy_provider_allowed',
+                        lambda *_args, **_kwargs: True)
     monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
                         lambda *_args, **_kwargs: destination)
     monkeypatch.setattr(copy_worker_service.catalog_state,
@@ -4665,8 +4849,10 @@ def test_copy_qualification_snapshots_restoration_proof_before_transfer_and_cas(
     repository_arn = 'qualification-arn'
     lifecycle_proof_id = '00000000-0000-4000-8000-000000000099'
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
-    revision = dataclasses.replace(
-        _revision(profile),
+    revision = _qualification_revision(
+        profile,
+        target,
+        repository_arn,
         attestations={
             lifecycle_key: {
                 'status': 'READY',
@@ -4680,13 +4866,8 @@ def test_copy_qualification_snapshots_restoration_proof_before_transfer_and_cas(
             },
         })
     destination = mock.Mock()
-    destination.repository_metadata.return_value = {
-        'repository_arn': repository_arn,
-        'repository_uri': f'{target.registry}/{repository_name}',
-        'tag_mutability': 'IMMUTABLE',
-        'encryption_type': 'AES256',
-        'kms_key': None,
-    }
+    destination.repository_metadata.return_value = _qualification_metadata(
+        target, repository_name, repository_arn)
     destination.copy_graph.return_value = aws.CopyOutcome.WRITTEN
     destination.verify_graph.return_value = True
     graph = SimpleNamespace(runtime_digest=_DIGEST, platform='linux/amd64')
@@ -4711,6 +4892,9 @@ def test_copy_qualification_snapshots_restoration_proof_before_transfer_and_cas(
     monkeypatch.setattr(copy_worker_service.qualification,
                         'qualification_repository', lambda *_args:
                         (repository_name, repository_arn))
+    monkeypatch.setattr(copy_worker_service.qualification,
+                        'qualification_copy_provider_allowed',
+                        lambda *_args, **_kwargs: True)
     monkeypatch.setattr(copy_worker_service.aws.EcrRepository, 'from_role',
                         lambda *_args, **_kwargs: destination)
     monkeypatch.setattr(copy_worker_service.catalog_state,
@@ -4937,6 +5121,28 @@ def test_qualification_lifecycle_stops_after_provider_acquisition(
     repository.delete_request_outcome.assert_not_called()
 
 
+@pytest.mark.parametrize('blocking_check', ('heartbeat', 'ownership'))
+def test_qualification_lifecycle_provider_fence_rechecks_drain_after_blocking_check(
+        blocking_check: str) -> None:
+    stop = threading.Event()
+    heartbeat = SimpleNamespace(assert_owned=mock.Mock())
+    ownership_check = mock.Mock(return_value=True)
+    if blocking_check == 'heartbeat':
+        heartbeat.assert_owned.side_effect = stop.set
+    else:
+        ownership_check.side_effect = lambda: (stop.set() or True)
+
+    with pytest.raises(lifecycle_worker_service._QualificationDrainRequested):
+        lifecycle_worker_service._qualification_delete_provider_fence(
+            stop.is_set, heartbeat, ownership_check)
+
+    heartbeat.assert_owned.assert_called_once_with()
+    if blocking_check == 'heartbeat':
+        ownership_check.assert_not_called()
+    else:
+        ownership_check.assert_called_once_with()
+
+
 def test_qualification_lifecycle_delete_owner_bypasses_bounded_page(
         monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
@@ -5120,12 +5326,17 @@ def test_qualification_lifecycle_contender_without_delete_lease_skips_provider(
 
 
 @pytest.mark.parametrize(
-    ('stop_after_delete', 'complete_succeeds'), [(True, True), (False, True),
-                                                 (False, False)],
-    ids=['stop-before-readback', 'concluded-absence', 'completion-cas-lost'])
+    ('stop_after_delete', 'complete_succeeds', 'budget_unavailable'),
+    [(True, True, False), (False, True, False), (False, False, False),
+     (False, True, True)],
+    ids=[
+        'stop-before-readback', 'concluded-absence', 'completion-cas-lost',
+        'provider-budget-before-intent'
+    ])
 def test_qualification_lifecycle_fences_delete_readback_boundary(
         monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
-        stop_after_delete: bool, complete_succeeds: bool) -> None:
+        stop_after_delete: bool, complete_succeeds: bool,
+        budget_unavailable: bool) -> None:
     target = profile.canonical
     copy_key = models.profile_attestation_key('copy', target.name)
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
@@ -5180,10 +5391,10 @@ def test_qualification_lifecycle_fences_delete_readback_boundary(
     }
 
     def repository_from_role(*_args, **kwargs):
-        client = aws._ProviderFencedEcrClient(  # pylint: disable=protected-access
-            raw_client, kwargs['provider_fence'])
         client = aws._HookedEcrClient(  # pylint: disable=protected-access
-            client, kwargs['hooks'])
+            raw_client, kwargs['hooks'])
+        client = aws._ProviderFencedEcrClient(  # pylint: disable=protected-access
+            client, kwargs['provider_fence'])
         return aws.EcrRepository(client,
                                  'qualification',
                                  provider_fence=kwargs['provider_fence'])
@@ -5201,12 +5412,47 @@ def test_qualification_lifecycle_fences_delete_readback_boundary(
                         lambda *_args: mock.sentinel.role)
     monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
                         repository_from_role)
-    begin = mock.Mock(return_value=(revision,
-                                    '00000000-0000-4000-8000-000000000099',
+    delete_proof_id = '00000000-0000-4000-8000-000000000099'
+    claimed_revision = dataclasses.replace(
+        revision,
+        attestations={
+            **revision.attestations,
+            lifecycle_key: {
+                'status': 'DELETING',
+                'observed_at': 101,
+                'target_fingerprint': target.target_fingerprint,
+                'repository_arn': 'qualification-arn',
+                'runtime_digest': _DIGEST,
+                'lifecycle_proof_id': delete_proof_id,
+                'protocol_version': 2,
+                'delete_phase': 'PRE_INTENT',
+                'mutation_lease_token': 'mutation-lease',
+                'mutation_lease_expires_at': 1000,
+            },
+        })
+    begin = mock.Mock(return_value=(claimed_revision, delete_proof_id,
                                     'mutation-lease'))
+    begin_request = mock.Mock(return_value=True)
+    mark_readback = mock.Mock(return_value=True)
+    quarantine = mock.Mock(return_value=claimed_revision)
+    defer = mock.Mock(return_value=True)
+    defer_not_started = mock.Mock(return_value=True)
     complete = mock.Mock(return_value=revision if complete_succeeds else None)
     monkeypatch.setattr(lifecycle_worker_service.qualification,
                         'begin_qualification_lifecycle_delete', begin)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'begin_qualification_lifecycle_delete_request',
+                        begin_request)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'mark_qualification_lifecycle_delete_readback',
+                        mark_readback)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'quarantine_qualification_lifecycle_delete', quarantine)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'defer_qualification_lifecycle_delete', defer)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'defer_qualification_lifecycle_delete_not_started',
+                        defer_not_started)
     monkeypatch.setattr(lifecycle_worker_service.qualification,
                         'qualification_lifecycle_delete_owned',
                         lambda *_args, **_kwargs: True)
@@ -5219,25 +5465,181 @@ def test_qualification_lifecycle_fences_delete_readback_boundary(
     monkeypatch.setattr(lifecycle_worker_service.qualification,
                         'maybe_activate_profile', activate)
 
+    limiter = mock.Mock()
+    if budget_unavailable:
+        limiter.before_call.side_effect = (
+            budgets.ProviderBudgetUnavailableError('retry provider budget'))
     reconciled = lifecycle_worker_service.reconcile_qualification_lifecycle(
-        mock.Mock(), should_stop=stop.is_set)
+        limiter, should_stop=stop.is_set)
 
-    raw_client.batch_delete_image.assert_called_once()
-    if stop_after_delete:
+    if budget_unavailable:
+        assert reconciled
+        raw_client.batch_delete_image.assert_not_called()
+        raw_client.batch_get_image.assert_not_called()
+        begin_request.assert_not_called()
+        mark_readback.assert_not_called()
+        quarantine.assert_not_called()
+        defer.assert_not_called()
+        defer_not_started.assert_called_once()
+        complete.assert_not_called()
+        activate.assert_called_once_with(revision.id)
+    elif stop_after_delete:
+        raw_client.batch_delete_image.assert_called_once()
         assert not reconciled
         raw_client.batch_get_image.assert_not_called()
+        begin_request.assert_called_once()
+        mark_readback.assert_not_called()
+        quarantine.assert_called_once()
+        defer.assert_not_called()
+        defer_not_started.assert_not_called()
         complete.assert_not_called()
         activate.assert_not_called()
     elif complete_succeeds:
+        raw_client.batch_delete_image.assert_called_once()
         assert reconciled
         raw_client.batch_get_image.assert_called_once()
+        begin_request.assert_called_once()
+        mark_readback.assert_called_once()
+        quarantine.assert_not_called()
+        defer.assert_not_called()
+        defer_not_started.assert_not_called()
         complete.assert_called_once()
         activate.assert_called_once_with(revision.id)
     else:
+        raw_client.batch_delete_image.assert_called_once()
         assert not reconciled
         raw_client.batch_get_image.assert_called_once()
+        begin_request.assert_called_once()
+        mark_readback.assert_called_once()
+        quarantine.assert_not_called()
+        defer.assert_not_called()
+        defer_not_started.assert_not_called()
         complete.assert_called_once()
         activate.assert_not_called()
+
+
+@pytest.mark.parametrize('present', [False, True],
+                         ids=['absent-restores', 'present-retries-soon'])
+def test_qualification_lifecycle_recovered_readback_never_redeletes(
+        monkeypatch: pytest.MonkeyPatch, profile: models.ManagedRegistryProfile,
+        present: bool) -> None:
+    target = profile.canonical
+    copy_key = models.profile_attestation_key('copy', target.name)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    lifecycle_proof_id = '00000000-0000-4000-8000-000000000099'
+    revision = dataclasses.replace(
+        _revision(profile),
+        attestations={
+            copy_key: {
+                'status': 'READY',
+                'observed_at': 100,
+                'target_fingerprint': target.target_fingerprint,
+                'repository_arn': 'qualification-arn',
+                'runtime_digest': _DIGEST,
+                'platform': profile.qualification.canary_platform,
+            },
+            lifecycle_key: {
+                'status': 'DELETING',
+                'observed_at': 101,
+                'target_fingerprint': target.target_fingerprint,
+                'repository_arn': 'qualification-arn',
+                'runtime_digest': _DIGEST,
+                'lifecycle_proof_id': lifecycle_proof_id,
+                'protocol_version': 2,
+                'delete_phase': 'READBACK',
+                'mutation_lease_token': 'mutation-lease',
+                'mutation_lease_expires_at': 1000,
+            },
+        })
+    repository = mock.Mock()
+
+    def repository_from_role(*_args, **kwargs):
+
+        def exact_manifest_exists(_digest):
+            kwargs['hooks'].before_call()
+            return present
+
+        repository.exact_manifest_exists.side_effect = exact_manifest_exists
+        return repository
+
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_qualifying_profiles',
+                        lambda **_kwargs: [revision])
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'get_target_shard',
+                        lambda *_args: _shard(profile, target.name))
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'qualification_repository', lambda *_args:
+                        ('qualification', 'qualification-arn'))
+    monkeypatch.setattr(lifecycle_worker_service, '_lifecycle_role',
+                        lambda *_args: mock.sentinel.role)
+    monkeypatch.setattr(lifecycle_worker_service.aws.EcrRepository, 'from_role',
+                        repository_from_role)
+    monkeypatch.setattr(
+        lifecycle_worker_service.qualification,
+        'begin_qualification_lifecycle_delete', lambda *_args, **_kwargs:
+        (revision, lifecycle_proof_id, 'mutation-lease'))
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'qualification_lifecycle_delete_owned',
+                        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'heartbeat_qualification_lifecycle_delete',
+                        lambda *_args, **_kwargs: True)
+    begin_request = mock.Mock()
+    mark_readback = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'begin_qualification_lifecycle_delete_request',
+                        begin_request)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'mark_qualification_lifecycle_delete_readback',
+                        mark_readback)
+    retry = mock.Mock(return_value=True)
+    defer = mock.Mock(return_value=True)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'retry_qualification_lifecycle_delete_from_readback',
+                        retry)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'defer_qualification_lifecycle_delete', defer)
+    complete = mock.Mock(return_value=revision)
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'complete_qualification_lifecycle_delete', complete)
+    activate = mock.Mock()
+    monkeypatch.setattr(lifecycle_worker_service.qualification,
+                        'maybe_activate_profile', activate)
+
+    assert lifecycle_worker_service.reconcile_qualification_lifecycle(
+        mock.Mock())
+
+    repository.delete_request_outcome.assert_not_called()
+    begin_request.assert_not_called()
+    mark_readback.assert_not_called()
+    repository.exact_manifest_exists.assert_called_once_with(_DIGEST)
+    if present:
+        retry.assert_called_once()
+        defer.assert_called_once()
+        complete.assert_not_called()
+    else:
+        retry.assert_not_called()
+        defer.assert_not_called()
+        complete.assert_called_once()
+    activate.assert_called_once_with(revision.id)
+
+
+def test_qualification_lifecycle_quarantine_blocks_automatic_recovery(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    list_profiles = mock.Mock()
+    monkeypatch.setattr(
+        lifecycle_worker_service.qualification, 'get_qualification_mutation',
+        lambda: {
+            'state': 'QUARANTINED',
+            'quarantine_reason': 'PROVIDER_OUTCOME_AMBIGUOUS',
+        })
+    monkeypatch.setattr(lifecycle_worker_service.topology_state,
+                        'list_qualifying_profiles', list_profiles)
+
+    assert not lifecycle_worker_service.reconcile_qualification_lifecycle(
+        mock.Mock())
+    list_profiles.assert_not_called()
 
 
 def test_qualification_lifecycle_does_not_redelete_restored_copy(

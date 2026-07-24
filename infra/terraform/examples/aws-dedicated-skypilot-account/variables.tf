@@ -30,6 +30,39 @@ variable "profile" {
   default = "aws-managed"
 }
 
+variable "qualification_repository_generations" {
+  description = "Qualification repository generations retained in every configured region. Keep generation 0 and every previously applied generation."
+  type        = set(number)
+  default     = [0]
+
+  validation {
+    condition = (
+      length(var.qualification_repository_generations) >= 1 &&
+      contains(var.qualification_repository_generations, 0) &&
+      alltrue([
+        for generation in var.qualification_repository_generations :
+        generation >= 0 && generation <= 255 && floor(generation) == generation
+      ])
+    )
+    error_message = "qualification_repository_generations must retain generation 0 and contain only integer generations from 0 through 255."
+  }
+}
+
+variable "active_qualification_repository_generation" {
+  description = "Highest retained qualification repository generation selected in every regional Terraform handoff."
+  type        = number
+  default     = 0
+
+  validation {
+    condition = (
+      var.active_qualification_repository_generation >= 0 &&
+      var.active_qualification_repository_generation <= 255 &&
+      floor(var.active_qualification_repository_generation) == var.active_qualification_repository_generation
+    )
+    error_message = "active_qualification_repository_generation must be an integer from 0 through 255."
+  }
+}
+
 variable "profile_revision" {
   type = number
 }
