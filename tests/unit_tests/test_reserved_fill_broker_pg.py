@@ -4120,3 +4120,51 @@ def test_advisory_lock_does_not_consume_ordinary_pool(pg_server, monkeypatch):
             connection_url, None)
         if lock_engine is not None:
             lock_engine.dispose()
+
+
+def test_held_advisory_lock_leaves_pool_free_for_protected_query(
+        pg_server, monkeypatch):
+    """Reproduce the exact circular wait #936 fixes, end to end.
+
+    ``test_advisory_lock_does_not_consume_ordinary_pool`` asserts the necessary
+    precondition (``pool.checkedout() == 0``).  This test asserts the sufficient
+    condition the bug actually broke: while an advisory lock is held, the
+    protected code can still complete an *ordinary* pooled ORM checkout on a
+    strict one-slot ``QueuePool(pool_size=1, max_overflow=0)`` engine.
+
+    Pre-fix (``engine.raw_connection()`` off the ordinary pool) the lock
+    consumed the single slot, so ``engine.connect()`` below blocked for
+    ``pool_timeout`` and raised ``sqlalchemy.exc.TimeoutError`` -- the reported
+    ``QueuePool timeout``/``idle in transaction`` wedge.  The dedicated
+    ``NullPool`` lock session keeps the slot free so the query returns.
+    """
+    url = _create_database(pg_server, f'lock_circular_{uuid.uuid4().hex[:8]}')
+    pool_timeout = 3
+    engine = create_engine(url,
+                           poolclass=sqlalchemy.pool.QueuePool,
+                           pool_size=1,
+                           max_overflow=0,
+                           pool_timeout=pool_timeout)
+    monkeypatch.setattr(locks.global_user_state, 'initialize_and_get_db',
+                        lambda: engine)
+    lock = locks.PostgresLock('circular-wait-lock')
+    connection_url = engine.url.render_as_string(hide_password=False)
+
+    try:
+        lock.acquire()
+        assert engine.pool.checkedout() == 0
+
+        started = time.monotonic()
+        with engine.connect() as protected:
+            assert protected.execute(sqlalchemy.text('SELECT 1')).scalar() == 1
+        # A completed checkout proves no circular wait; guard against a silent
+        # near-timeout regression that still technically returns.
+        assert time.monotonic() - started < pool_timeout
+        assert engine.pool.checkedout() == 0
+    finally:
+        lock.release()
+        engine.dispose()
+        lock_engine = db_utils._postgres_lock_engine_cache.pop(
+            connection_url, None)
+        if lock_engine is not None:
+            lock_engine.dispose()
