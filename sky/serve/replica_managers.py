@@ -3984,7 +3984,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{batch_version} scale-up batch because version '
                             f'{pending_version} is waiting to be applied.')
                 break
-            if paid_capacity.service_exhausted(paid_location_launch_budget):
+            if self._paid_service_envelope_blocks_launch(
+                    paid_location_launch_budget, resources_override):
                 logger.info('Stopping physical scale-up wave at the service '
                             'paid-capacity envelope.')
                 break
@@ -4257,10 +4258,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         deferred_cards: set[str] = set()
         launched_capacity = 0
         while True:
-            if paid_capacity.service_exhausted(paid_location_launch_budget):
-                logger.info('Stopping logical scale-up wave at the service '
-                            'paid-capacity envelope.')
-                break
             if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,
@@ -4288,6 +4285,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     break
             elif committed >= target_capacity:
                 break
+            resources_override = None
+            if selected_card is not None:
+                resources_override = {
+                    'accelerators': {
+                        selected_card: shapes[selected_card]
+                    }
+                }
+            if self._paid_service_envelope_blocks_launch(
+                    paid_location_launch_budget, resources_override):
+                if selected_card is not None:
+                    deferred_cards.add(selected_card)
+                    continue
+                break
             before = len(existing_replica_infos)
             launch_kwargs: dict[str, Any] = {}
             if paid_location_launch_budget is not None:
@@ -4309,13 +4319,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_kwargs['unknown_capacity_replacement'] = True
                 launch_kwargs[
                     'logical_reconcile_fence_requires_exact_generation'] = True
-            resources_override = None
-            if selected_card is not None:
-                resources_override = {
-                    'accelerators': {
-                        selected_card: shapes[selected_card]
-                    }
-                }
             launched = self._scale_up_one_locked(
                 resources_override,
                 used_replica_ids,
@@ -4416,6 +4419,29 @@ class SkyPilotReplicaManager(ReplicaManager):
             resource_override=None,
             service_spec=getattr(self, '_version_specs', {}).get(
                 self.latest_version)))
+
+    def _paid_service_envelope_blocks_launch(
+            self, budget: paid_capacity.LaunchBudget | None,
+            resources_override: dict[str, Any] | None) -> bool:
+        """Whether this launch can only use an exhausted paid envelope."""
+        if not paid_capacity.service_exhausted(budget):
+            return False
+        override = resources_override or {}
+        if (serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY in override or
+                serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY
+                in override or override.get('use_spot') is False):
+            return False
+        if self._spot_placer is None:
+            return True
+        allowed_locations = self._locations_for_accelerator_override(override)
+        if allowed_locations is not None and not allowed_locations:
+            # Preserve the normal exact-shape validation error.
+            return False
+        active_locations = set(self._spot_placer.active_locations())
+        return not any(
+            location in active_locations and
+            (allowed_locations is None or location in allowed_locations)
+            for location in self._spot_placer.zero_cost_locations())
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: str | None) -> None:
