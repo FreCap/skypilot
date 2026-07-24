@@ -77,15 +77,6 @@ def _autoscaler(spec=None):
     return scaler
 
 
-def _instance_aware_autoscaler():
-    spec = _spec(target_qps_per_replica={'L4': 1.0})
-    scaler = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
-                                                            spec,
-                                                            version=1)
-    scaler.latest_version_ever_ready = 1
-    return scaler
-
-
 def _report(scaler, replicas):
     scaler.collect_request_information({
         'timestamps': [],
@@ -208,160 +199,24 @@ class TestEconomicDecisions:
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]
 
-    def test_candidate_costs_resolve_before_decision_lock(self):
+    def test_uncached_candidate_does_not_resolve_cost_under_decision_lock(self):
         scaler = _autoscaler()
-        placer, paid, cheap, replicas = self._fleet(candidate_cost=0.0)
+        placer, _, cheap, replicas = self._fleet(candidate_cost=0.0)
+        del placer.location2cost[cheap]
         scaler.set_spot_placer(placer)
-        _report(scaler, replicas)
-        costs = {paid: 1.0, cheap: 0.0}
-
-        def _resolve_with_lock_probe(location):
-            acquired = []
-
-            def _probe():
-                got_lock = scaler._logical_state_lock.acquire(timeout=1)
-                acquired.append(got_lock)
-                if got_lock:
-                    scaler._logical_state_lock.release()
-
-            probe = threading.Thread(target=_probe)
-            probe.start()
-            probe.join(timeout=2)
-            assert not probe.is_alive()
-            assert acquired == [True]
-            return costs[location]
-
-        with mock.patch.object(placer,
-                               'cost_per_hour',
-                               side_effect=_resolve_with_lock_probe) as resolve:
-            decisions = _decisions(scaler, replicas)
-
-        launches = [
-            decision for decision in decisions if decision.operator ==
-            autoscalers.AutoscalerDecisionOperator.SCALE_UP
-        ]
-        assert len(launches) == 1
-        assert launches[0].target['region'] == cheap.region
-        assert resolve.call_count == len(costs)
-
-    @pytest.mark.parametrize('autoscaler_factory,lock_name', [
-        (_autoscaler, '_logical_state_lock'),
-        (_instance_aware_autoscaler, '_instance_state_lock'),
-    ])
-    def test_price_resolution_does_not_block_demand_ingestion(
-            self, autoscaler_factory, lock_name):
-        scaler = autoscaler_factory()
-        placer, paid, cheap, _ = self._fleet(candidate_cost=0.0)
-        scaler.set_spot_placer(placer)
-        costs = {paid: 1.0, cheap: 0.0}
-        resolution_started = threading.Event()
-        release_resolution = threading.Event()
-        ingestion_finished = threading.Event()
-        decision_errors = []
-        ingestion_errors = []
-
-        def _blocking_cost(location):
-            resolution_started.set()
-            if not release_resolution.wait(timeout=5):
-                raise TimeoutError('test did not release cost resolution')
-            return costs[location]
-
-        def _decide():
-            try:
-                scaler.generate_scaling_decisions([], [1])
-            except Exception as error:  # pylint: disable=broad-except
-                decision_errors.append(error)
-
-        def _ingest():
-            try:
-                scaler.collect_request_information({'timestamps': []})
-            except Exception as error:  # pylint: disable=broad-except
-                ingestion_errors.append(error)
-            finally:
-                ingestion_finished.set()
-
-        with mock.patch.object(placer,
-                               'cost_per_hour',
-                               side_effect=_blocking_cost), mock.patch.object(
-                                   scaler,
-                                   '_generate_scaling_decisions_locked',
-                                   return_value=[]):
-            decision_thread = threading.Thread(target=_decide)
-            decision_thread.start()
-            assert resolution_started.wait(timeout=5)
-            ingestion_thread = threading.Thread(target=_ingest)
-            ingestion_thread.start()
-            assert ingestion_finished.wait(timeout=1), lock_name
-            release_resolution.set()
-            decision_thread.join(timeout=5)
-            ingestion_thread.join(timeout=5)
-
-        assert not decision_thread.is_alive()
-        assert not ingestion_thread.is_alive()
-        assert not decision_errors
-        assert not ingestion_errors
-        assert scaler._cost_rebalance_costs_for_tick is None
-
-    def test_candidate_cost_failure_does_not_abort_other_candidate(self):
-        scaler = _autoscaler()
-        paid = make_location('paid', accelerators={'L4': 1}, use_spot=True)
-        broken = make_location('broken',
-                               accelerators={'A100': 1},
-                               use_spot=False)
-        cheap = make_location('research',
-                              accelerators={'A100': 1},
-                              use_spot=False)
-        placer = make_placer({paid: 1.0, broken: 0.1, cheap: 0.2})
-        scaler.set_spot_placer(placer)
-        replicas = [_Replica(1, paid, 1.0), _Replica(2, paid, 1.0)]
-        _report(scaler, replicas)
-
-        def _cost(location):
-            if location is broken:
-                raise RuntimeError('catalog unavailable')
-            return placer.location2cost[location]
-
-        with mock.patch.object(placer, 'cost_per_hour', side_effect=_cost):
-            decisions = _decisions(scaler, replicas)
-
-        launches = [
-            decision for decision in decisions if decision.operator ==
-            autoscalers.AutoscalerDecisionOperator.SCALE_UP
-        ]
-        assert len(launches) == 1
-        assert launches[0].target['region'] == cheap.region
-
-    def test_disabled_policy_does_not_warm_candidate_costs(self):
-        scaler = _autoscaler()
-        placer, _, _, replicas = self._fleet(candidate_cost=0.0)
-        scaler.set_spot_placer(placer)
-        scaler.cost_rebalance = False
         _report(scaler, replicas)
 
         with mock.patch.object(
                 placer,
                 'cost_per_hour',
                 side_effect=AssertionError(
-                    'disabled policy must not warm candidate costs')):
-            _decisions(scaler, replicas)
+                    'autoscaler decisions must not resolve provider costs')):
+            decisions = _decisions(scaler, replicas)
 
-    @pytest.mark.parametrize('autoscaler_factory', [
-        _autoscaler,
-        _instance_aware_autoscaler,
-    ])
-    def test_cost_snapshot_is_cleared_after_decision_failure(
-            self, autoscaler_factory):
-        scaler = autoscaler_factory()
-        placer, _, _, _ = self._fleet(candidate_cost=0.0)
-        scaler.set_spot_placer(placer)
-
-        with mock.patch.object(scaler,
-                               '_generate_scaling_decisions_locked',
-                               side_effect=RuntimeError('decision failed')):
-            with pytest.raises(RuntimeError, match='decision failed'):
-                scaler.generate_scaling_decisions([], [1])
-
-        assert scaler._cost_rebalance_costs_for_tick is None
+        assert not [
+            decision for decision in decisions if decision.operator ==
+            autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]
 
     def test_lower_capacity_candidate_is_rejected(self):
         scaler = _autoscaler()

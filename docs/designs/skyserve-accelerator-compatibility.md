@@ -37,10 +37,9 @@ Scheduling and scaling follow these rules:
    explicit service resource order. Candidate-set growth therefore cannot
    prevent the controller from binding its health endpoint.
 10. Load-balancer sync reads the cached zero-cost identity set and the cached
-    reserved-capacity observations, with that PostgreSQL observation read
-    dispatched off the FastAPI event loop. Autoscaler decision critical
-    sections read only already-materialized paid-cost snapshots. Neither the
-    logical-concurrency nor instance-aware QPS lock may warm paid-provider
+    reserved-capacity observations, with all PostgreSQL reads dispatched off
+    the FastAPI event loop. Autoscaler decisions taken under the logical-state
+    lock also read only cached paid costs. Neither path may warm paid-provider
     costs or make the controller health endpoint wait behind a catalog-wide
     price scan or a blocking database read.
 
@@ -118,25 +117,23 @@ cached free-capacity observations. Its batched PostgreSQL observation read
 runs in the executor with the other sync-path database reads, so routing
 refresh cannot block the FastAPI event loop or trigger the same catalog-wide
 price warm-up after the health endpoint binds. Cold-paid card ordering runs
-while the autoscaler holds the demand-state lock used by load balancer reports,
-so it also uses only already-cached prices. Cost-rebalance candidate prices
-are resolved before acquiring either the logical-concurrency or instance-aware
-QPS lock and consumed as an immutable per-tick snapshot while scoring. This
-preserves restart-time economic rebalancing without making load-balancer
-ingestion wait for provider lookups. An incomplete cold-card cache for any
-inspected location preserves service order and lets later background placement
-resolve the selected location without delaying health or sync requests.
+while the autoscaler holds the logical-state lock used by load balancer demand
+reports, so it also uses only already-cached prices. Cost-rebalance candidate
+scoring follows the same rule and defers any candidate whose price is not yet
+cached. An incomplete cold-card cache for any inspected location preserves
+service order and lets later background placement resolve the selected
+location without delaying health or sync requests.
 
 Regression coverage must include a large set of uncached paid candidates and
 prove that both pre-bind exact-card configuration and startup seeding use only
 cached values without calling resource feasibility or pricing code. Recovery
 claim adoption must satisfy the same no-resolution rule. Production rollout
 and load-balancer sync must satisfy the same no-resolution rule, including
-autoscaler cold-card ordering and cost-rebalance snapshot consumption under
-the shared logical-concurrency and instance-aware QPS locks. Production
-rollout verification requires the exact deployed commit, healthy controller
-endpoints for the one-replica canary and the production fleet, successful
-load-balancer syncs, and continuity of pre-existing ready replicas.
+autoscaler cold-card ordering and cost-rebalance scoring under the shared
+logical-state lock. Production rollout verification requires the exact
+deployed commit, healthy controller endpoints for the one-replica canary and
+the production fleet, successful load-balancer syncs, and continuity of
+pre-existing ready replicas.
 
 The dashboard's provisioning count is not itself a paid-capacity signal. For a
 launch audit, combine `cold_launch_authority_by_accelerator` with the durable
