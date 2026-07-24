@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 from typing import cast, Literal
 
 from alembic import command as alembic_command
@@ -18,6 +19,7 @@ from sky.skylet import constants
 logger = sky_logging.init_logger(__name__)
 
 DB_INIT_LOCK_TIMEOUT_SECONDS = 10
+_DISTRIBUTED_MIGRATION_LOCK_POLL_SECONDS = 0.1
 
 # Serialize all Alembic migrations within a process. Alembic's
 # EnvironmentContext stores the active migration context in a module-level
@@ -40,7 +42,7 @@ def configured_migration_mode() -> MigrationMode:
 
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '025'  # restart-safe managed-image canary evidence
+GLOBAL_USER_STATE_VERSION = '026'  # qualification mutation and canary fences
 GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
@@ -181,10 +183,20 @@ def _distributed_migration_lock(engine: sqlalchemy.engine.Engine, section: str):
         yield
         return
     lock_name = f'skypilot:alembic:{section}'
-    with engine.connect() as connection:
-        connection.execute(
-            sqlalchemy.text('SELECT pg_advisory_lock(hashtext(:name))'),
-            {'name': lock_name})
+    # PostgreSQL session advisory locks do not require a transaction. Keep this
+    # connection in DBAPI autocommit and poll with pg_try_advisory_lock. A
+    # blocking pg_advisory_lock statement still owns a transaction while it
+    # waits, which can deadlock with CREATE INDEX CONCURRENTLY running under
+    # the current lock owner.
+    with engine.connect().execution_options(
+            isolation_level='AUTOCOMMIT') as connection:
+        lock_query = sqlalchemy.text(
+            'SELECT pg_try_advisory_lock(hashtext(:name))')
+        while not bool(
+                connection.execute(lock_query, {
+                    'name': lock_name
+                }).scalar_one()):
+            time.sleep(_DISTRIBUTED_MIGRATION_LOCK_POLL_SECONDS)
         try:
             yield
         finally:

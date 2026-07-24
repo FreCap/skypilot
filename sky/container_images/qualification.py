@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from collections.abc import Mapping
+import functools
 import hashlib
 import json
 import secrets
@@ -25,6 +27,11 @@ _AUTOMATIC_ACTOR_HASH = hashlib.sha256(
 _AUTOMATIC_WINDOW_SECONDS = 10 * 60
 _COPY_RESTORES_LIFECYCLE_KEY = 'restores_lifecycle_proof_id'
 _LIFECYCLE_PROOF_KEY = 'lifecycle_proof_id'
+_LIFECYCLE_PROTOCOL_KEY = 'protocol_version'
+_LIFECYCLE_PROTOCOL_VERSION = 2
+_QUALIFICATION_MUTATION_ID = 'global'
+_QUALIFICATION_MUTATION_DELETING = 'DELETING'
+_QUALIFICATION_MUTATION_RESTORING = 'RESTORING'
 
 
 def _database_epoch(*, now: int | None = None) -> int:
@@ -119,40 +126,283 @@ def qualification_copy_available(revision: topology_state.ProfileRevisionRecord,
             copy_evidence.get('target_fingerprint') != target.target_fingerprint
             or copy_evidence.get('platform')
             != profile.qualification.canary_platform or
+            not isinstance(copy_evidence.get('repository_arn'), str) or
             not isinstance(copy_evidence.get('runtime_digest'), str) or
             not isinstance(copy_evidence.get('observed_at'), int)):
         return False
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
     lifecycle = revision.attestations.get(lifecycle_key)
-    if (not isinstance(lifecycle, dict) or lifecycle.get('status') != 'READY' or
-            lifecycle.get('runtime_digest') != copy_evidence['runtime_digest']):
-        return True
-    if (lifecycle.get('target_fingerprint') != target.target_fingerprint or
-            lifecycle.get('exact_absence') is not True or
+    if (not isinstance(lifecycle, dict) or
+            lifecycle.get('target_fingerprint') != target.target_fingerprint or
+            lifecycle.get('repository_arn') != copy_evidence['repository_arn']
+            or lifecycle.get('runtime_digest')
+            != copy_evidence['runtime_digest'] or
+            lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+            != _LIFECYCLE_PROTOCOL_VERSION or
             not isinstance(lifecycle.get('observed_at'), int)):
+        return False
+    status = lifecycle.get('status')
+    if status == 'ARMED':
+        if lifecycle.get('exact_absence') is not None:
+            return False
+    elif status == 'READY':
+        if lifecycle.get('exact_absence') is not True:
+            return False
+    else:
         return False
     proof_id = qualification_lifecycle_proof_id(lifecycle)
     return (proof_id is not None and
             copy_evidence.get(_COPY_RESTORES_LIFECYCLE_KEY) == proof_id)
 
 
-def qualification_copy_restoration_evidence(
+def qualification_copy_restoration_proof_id(
         revision: topology_state.ProfileRevisionRecord,
         target: models.ManagedRegistryTarget,
-        runtime_digest: str) -> dict[str, str]:
-    """Acknowledges the exact same-digest lifecycle proof a copy restores."""
+        runtime_digest: str) -> str | None:
+    """Returns the exact lifecycle epoch eligible for copy acknowledgement."""
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
     lifecycle = revision.attestations.get(lifecycle_key)
-    if (not isinstance(lifecycle, dict) or lifecycle.get('status') != 'READY' or
+    if (not isinstance(lifecycle, dict) or
             lifecycle.get('target_fingerprint') != target.target_fingerprint or
             lifecycle.get('runtime_digest') != runtime_digest or
-            lifecycle.get('exact_absence') is not True or
+            lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+            != _LIFECYCLE_PROTOCOL_VERSION or
             not isinstance(lifecycle.get('observed_at'), int)):
+        return None
+    status = lifecycle.get('status')
+    if status == 'ARMED':
+        if lifecycle.get('exact_absence') is not None:
+            return None
+    elif status == 'READY':
+        if lifecycle.get('exact_absence') is not True:
+            return None
+    else:
+        return None
+    return qualification_lifecycle_proof_id(lifecycle)
+
+
+def qualification_copy_restoration_evidence(
+        lifecycle_proof_id: str | None) -> dict[str, str]:
+    """Acknowledges the exact same-digest lifecycle proof a copy restores."""
+    if lifecycle_proof_id is None:
         return {}
+    return {_COPY_RESTORES_LIFECYCLE_KEY: lifecycle_proof_id}
+
+
+def qualification_lifecycle_evidence(
+        *,
+        status: str,
+        target: models.ManagedRegistryTarget,
+        repository_arn: str,
+        runtime_digest: str,
+        lifecycle_proof_id: str,
+        mutation_lease_token: str | None = None,
+        mutation_lease_expires_at: int | None = None,
+        exact_absence: bool = False) -> dict[str, Any]:
+    """Builds one protocol-versioned lifecycle mutation attestation."""
+    if status not in ('ARMED', 'DELETING', 'READY'):
+        raise ValueError('Lifecycle status is invalid.')
+    lease_present = mutation_lease_token is not None
+    if ((mutation_lease_token is None) != (mutation_lease_expires_at is None)):
+        raise ValueError('Lifecycle mutation lease is incomplete.')
+    if ((status == 'DELETING') != lease_present or
+        (status == 'READY') != exact_absence):
+        raise ValueError('Lifecycle state evidence is inconsistent.')
+    evidence: dict[str, Any] = {
+        'status': status,
+        'target': target.name,
+        'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
+        'runtime_digest': runtime_digest,
+        _LIFECYCLE_PROOF_KEY: lifecycle_proof_id,
+        _LIFECYCLE_PROTOCOL_KEY: _LIFECYCLE_PROTOCOL_VERSION,
+    }
+    if mutation_lease_token is not None:
+        evidence['mutation_lease_token'] = mutation_lease_token
+        evidence['mutation_lease_expires_at'] = mutation_lease_expires_at
+    if exact_absence:
+        evidence['exact_absence'] = True
+    return evidence
+
+
+def _qualification_mutation_matches(
+    mutation: Mapping[str, Any] | None,
+    *,
+    state: str,
+    revision_id: str,
+    target: models.ManagedRegistryTarget,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str | None,
+) -> bool:
+    if mutation is None:
+        return False
+    return bool(
+        mutation['id'] == _QUALIFICATION_MUTATION_ID and
+        mutation['state'] == state and
+        mutation['owner_profile_revision_id'] == revision_id and
+        mutation['owner_target'] == target.name and
+        mutation['owner_target_fingerprint'] == target.target_fingerprint and
+        mutation['repository_arn'] == repository_arn and
+        mutation['runtime_digest'] == runtime_digest and
+        mutation['lifecycle_proof_id'] == lifecycle_proof_id and
+        mutation['mutation_lease_token'] == mutation_lease_token)
+
+
+def get_qualification_mutation() -> dict[str, Any] | None:
+    """Returns a diagnostic snapshot of the catalog-wide mutation barrier."""
+    with orm.Session(catalog_state.engine()) as session:
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=False)
+        return dict(mutation) if mutation is not None else None
+
+
+def _qualification_copy_requestable(
+        revision: topology_state.ProfileRevisionRecord,
+        profile: models.ManagedRegistryProfile,
+        target: models.ManagedRegistryTarget) -> bool:
+    """Allows intent queueing while this exact revision owns restoration."""
+    if qualification_copy_available(revision, profile, target):
+        return True
+    copy_key = models.profile_attestation_key('copy', target.name)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    copy_evidence = revision.attestations.get(copy_key)
+    lifecycle = revision.attestations.get(lifecycle_key)
+    if (not isinstance(copy_evidence, dict) or
+            copy_evidence.get('status') != 'READY' or
+            copy_evidence.get('target_fingerprint') != target.target_fingerprint
+            or copy_evidence.get('platform')
+            != profile.qualification.canary_platform or
+            not isinstance(copy_evidence.get('repository_arn'), str) or
+            not isinstance(copy_evidence.get('runtime_digest'), str) or
+            not isinstance(copy_evidence.get('observed_at'), int) or
+            not isinstance(lifecycle, dict) or
+            lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+            != _LIFECYCLE_PROTOCOL_VERSION or
+            lifecycle.get('target_fingerprint') != target.target_fingerprint or
+            lifecycle.get('repository_arn') != copy_evidence['repository_arn']
+            or
+            lifecycle.get('runtime_digest') != copy_evidence['runtime_digest']):
+        return False
     proof_id = qualification_lifecycle_proof_id(lifecycle)
-    if proof_id is None:
-        return {}
-    return {_COPY_RESTORES_LIFECYCLE_KEY: proof_id}
+    mutation = get_qualification_mutation()
+    if proof_id is None or mutation is None:
+        return False
+    state = mutation.get('state')
+    if state == _QUALIFICATION_MUTATION_DELETING:
+        token = lifecycle.get('mutation_lease_token')
+        if (lifecycle.get('status') != 'DELETING' or
+                not isinstance(token, str)):
+            return False
+        mutation_token: str | None = token
+    elif state == _QUALIFICATION_MUTATION_RESTORING:
+        if (lifecycle.get('status') != 'READY' or
+                lifecycle.get('exact_absence') is not True):
+            return False
+        mutation_token = None
+    else:
+        return False
+    return _qualification_mutation_matches(
+        mutation,
+        state=str(state),
+        revision_id=revision.id,
+        target=target,
+        repository_arn=copy_evidence['repository_arn'],
+        runtime_digest=copy_evidence['runtime_digest'],
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=mutation_token)
+
+
+def qualification_copy_barrier_snapshot(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+) -> tuple[bool, str | None]:
+    """Snapshots whether copy may run and any restoration proof it must clear."""
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        if (current.state not in (models.ImageProfileState.QUALIFYING,
+                                  models.ImageProfileState.ACTIVE) or
+                current.desired_generation != revision.desired_generation or
+                current.config_hash != revision.config_hash):
+            return False, None
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=False)
+        if mutation is None:
+            return True, None
+        proof_id = mutation['lifecycle_proof_id']
+        if (isinstance(proof_id, str) and _qualification_mutation_matches(
+                mutation,
+                state=_QUALIFICATION_MUTATION_RESTORING,
+                revision_id=revision.id,
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=proof_id,
+                mutation_lease_token=None)):
+            return True, proof_id
+        return False, None
+
+
+def arm_qualification_lifecycle(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    now: int | None = None,
+) -> tuple[topology_state.ProfileRevisionRecord, bool]:
+    """Creates the protocol epoch that an initial copy must acknowledge."""
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        if (current.state not in (models.ImageProfileState.QUALIFYING,
+                                  models.ImageProfileState.ACTIVE) or
+                current.desired_generation != revision.desired_generation or
+                current.config_hash != revision.config_hash):
+            raise topology_state.StaleProfileRevisionError(
+                'Lifecycle epoch no longer matches the desired revision.')
+        lifecycle = current.attestations.get(lifecycle_key)
+        if isinstance(lifecycle, dict):
+            same_identity = (lifecycle.get('target_fingerprint')
+                             == target.target_fingerprint and
+                             lifecycle.get('repository_arn') == repository_arn
+                             and
+                             lifecycle.get('runtime_digest') == runtime_digest)
+            valid_epoch = (
+                same_identity and
+                (qualification_copy_restoration_proof_id(
+                    current, target, runtime_digest) is not None or
+                 (lifecycle.get('status') == 'DELETING' and
+                  lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+                  == _LIFECYCLE_PROTOCOL_VERSION and
+                  qualification_lifecycle_proof_id(lifecycle) is not None)))
+            if valid_epoch or lifecycle.get('status') == 'DELETING':
+                return current, False
+        topology_state.assert_qualification_mutation_idle_in_session(session)
+        updated = topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='ARMED',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=str(uuid.uuid4())),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=now)
+        return updated, True
 
 
 def qualification_repository(
@@ -168,6 +418,452 @@ def qualification_repository(
             not isinstance(evidence.get('repository_arn'), str)):
         raise ValueError('QUALIFICATION_FAILED')
     return str(evidence['repository_name']), str(evidence['repository_arn'])
+
+
+def _running_canary_exists_in_session(session: orm.Session) -> bool:
+    """Returns whether any catalog canary still owns provider cleanup."""
+    return bool(
+        session.execute(
+            sqlalchemy.select(sqlalchemy.exists().where(
+                schema.operations.c.kind == 'PROFILE_CANARY',
+                schema.operations.c.state ==
+                models.ImageOperationState.RUNNING.value))).scalar())
+
+
+def begin_qualification_lifecycle_delete(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lease_seconds: int,
+    now: int | None = None,
+) -> tuple[topology_state.ProfileRevisionRecord, str | None, str | None]:
+    """Closes canary admission before one lifecycle provider mutation."""
+    if lease_seconds <= 0:
+        raise ValueError('Lifecycle mutation lease must be positive.')
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        if (current.state not in (models.ImageProfileState.QUALIFYING,
+                                  models.ImageProfileState.ACTIVE) or
+                current.desired_generation != revision.desired_generation or
+                current.config_hash != revision.config_hash):
+            raise topology_state.StaleProfileRevisionError(
+                'Lifecycle delete no longer matches the desired revision.')
+        lifecycle = current.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current_time = catalog_state.database_epoch(session, now=now)
+        proof_id: str | None = None
+        prior_token: str | None = None
+        takeover = False
+        if (isinstance(lifecycle, dict) and lifecycle.get('target_fingerprint')
+                == target.target_fingerprint and
+                lifecycle.get('repository_arn') == repository_arn and
+                lifecycle.get('runtime_digest') == runtime_digest):
+            if (lifecycle.get('status') == 'READY' and
+                    lifecycle.get('exact_absence') is True):
+                return current, None, None
+            status = lifecycle.get('status')
+            proof_id = qualification_lifecycle_proof_id(lifecycle)
+            if (status == 'DELETING' and lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+                    == _LIFECYCLE_PROTOCOL_VERSION and proof_id is not None and
+                    isinstance(lifecycle.get('mutation_lease_token'), str) and
+                    isinstance(lifecycle.get('mutation_lease_expires_at'),
+                               int)):
+                if lifecycle['mutation_lease_expires_at'] > current_time:
+                    return current, None, None
+                prior_token = lifecycle['mutation_lease_token']
+                takeover = True
+            elif (status == 'ARMED' and proof_id is not None and
+                  qualification_copy_restoration_proof_id(
+                      current, target, runtime_digest) == proof_id):
+                # Deletion is a new epoch. Reusing the acknowledged ARMED epoch
+                # would make the pre-delete copy look available again.
+                proof_id = str(uuid.uuid4())
+            else:
+                return current, None, None
+        else:
+            # A protocol-2 worker must arm the target before deletion. Unknown
+            # or legacy state is never interpreted as mutation authority.
+            return current, None, None
+        assert proof_id is not None
+        mutation_expires_at = (mutation['mutation_lease_expires_at']
+                               if mutation is not None else None)
+        if takeover:
+            if (prior_token is None or not _qualification_mutation_matches(
+                    mutation,
+                    state=_QUALIFICATION_MUTATION_DELETING,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=proof_id,
+                    mutation_lease_token=prior_token) or
+                    not isinstance(mutation_expires_at, int) or
+                    mutation_expires_at > current_time):
+                return current, None, None
+        else:
+            if mutation is not None or _running_canary_exists_in_session(
+                    session):
+                return current, None, None
+        lease_token = str(uuid.uuid4())
+        mutation_values = {
+            'state': _QUALIFICATION_MUTATION_DELETING,
+            'owner_profile_revision_id': revision.id,
+            'owner_target': target.name,
+            'owner_target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
+            'runtime_digest': runtime_digest,
+            'lifecycle_proof_id': proof_id,
+            'mutation_lease_token': lease_token,
+            'mutation_lease_expires_at': current_time + lease_seconds,
+            'updated_at': current_time,
+        }
+        if takeover:
+            changed = session.execute(schema.qualification_mutation.update(
+            ).where(
+                schema.qualification_mutation.c.id ==
+                _QUALIFICATION_MUTATION_ID,
+                schema.qualification_mutation.c.state ==
+                _QUALIFICATION_MUTATION_DELETING,
+                schema.qualification_mutation.c.lifecycle_proof_id == proof_id,
+                schema.qualification_mutation.c.mutation_lease_token ==
+                prior_token).values(**mutation_values)).rowcount
+            if changed != 1:
+                return current, None, None
+        else:
+            session.execute(schema.qualification_mutation.insert().values(
+                id=_QUALIFICATION_MUTATION_ID, **mutation_values))
+        updated = topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='DELETING',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=proof_id,
+                mutation_lease_token=lease_token,
+                mutation_lease_expires_at=current_time + lease_seconds),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=now)
+        return updated, proof_id, lease_token
+
+
+def qualification_lifecycle_delete_owned(revision_id: str,
+                                         target: models.ManagedRegistryTarget,
+                                         *,
+                                         repository_arn: str,
+                                         runtime_digest: str,
+                                         lifecycle_proof_id: str,
+                                         mutation_lease_token: str,
+                                         now: int | None = None) -> bool:
+    """Returns whether one worker still owns the destructive provider fence."""
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        try:
+            row = topology_state.lock_profile_revision_mutation_in_session(
+                session, revision_id)
+        except topology_state.StaleProfileRevisionError:
+            return False
+        revision = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+        lifecycle = revision.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current = catalog_state.database_epoch(session, now=now)
+        mutation_expires_at = (mutation['mutation_lease_expires_at']
+                               if mutation is not None else None)
+        return bool(
+            revision.state in (models.ImageProfileState.QUALIFYING,
+                               models.ImageProfileState.ACTIVE) and
+            isinstance(lifecycle, dict) and
+            lifecycle.get('status') == 'DELETING' and
+            lifecycle.get('target_fingerprint') == target.target_fingerprint and
+            lifecycle.get('repository_arn') == repository_arn and
+            lifecycle.get('runtime_digest') == runtime_digest and
+            lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+            == _LIFECYCLE_PROTOCOL_VERSION and
+            qualification_lifecycle_proof_id(lifecycle) == lifecycle_proof_id
+            and
+            lifecycle.get('mutation_lease_token') == mutation_lease_token and
+            isinstance(lifecycle.get('mutation_lease_expires_at'), int) and
+            lifecycle['mutation_lease_expires_at'] > current and
+            _qualification_mutation_matches(
+                mutation,
+                state=_QUALIFICATION_MUTATION_DELETING,
+                revision_id=revision_id,
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                mutation_lease_token=mutation_lease_token) and
+            isinstance(mutation_expires_at, int) and
+            mutation_expires_at > current)
+
+
+def heartbeat_qualification_lifecycle_delete(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    lease_seconds: int,
+    now: int | None = None,
+) -> bool:
+    """Renews one exact lifecycle mutation lease under the profile lock."""
+    if lease_seconds <= 0:
+        raise ValueError('Lifecycle mutation lease must be positive.')
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current_revision = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        lifecycle = current_revision.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current = catalog_state.database_epoch(session, now=now)
+        mutation_expires_at = (mutation['mutation_lease_expires_at']
+                               if mutation is not None else None)
+        if (current_revision.state not in (models.ImageProfileState.QUALIFYING,
+                                           models.ImageProfileState.ACTIVE) or
+                current_revision.desired_generation
+                != revision.desired_generation or
+                current_revision.config_hash != revision.config_hash or
+                not isinstance(lifecycle, dict) or
+                lifecycle.get('status') != 'DELETING' or
+                lifecycle.get('target_fingerprint') != target.target_fingerprint
+                or lifecycle.get('repository_arn') != repository_arn or
+                lifecycle.get('runtime_digest') != runtime_digest or
+                lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+                != _LIFECYCLE_PROTOCOL_VERSION or
+                qualification_lifecycle_proof_id(lifecycle)
+                != lifecycle_proof_id or
+                lifecycle.get('mutation_lease_token') != mutation_lease_token or
+                not isinstance(lifecycle.get('mutation_lease_expires_at'), int)
+                or lifecycle['mutation_lease_expires_at'] <= current or
+                not _qualification_mutation_matches(
+                    mutation,
+                    state=_QUALIFICATION_MUTATION_DELETING,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=lifecycle_proof_id,
+                    mutation_lease_token=mutation_lease_token) or
+                not isinstance(mutation_expires_at, int) or
+                mutation_expires_at <= current):
+            return False
+        changed = session.execute(schema.qualification_mutation.update().where(
+            schema.qualification_mutation.c.id == _QUALIFICATION_MUTATION_ID,
+            schema.qualification_mutation.c.state ==
+            _QUALIFICATION_MUTATION_DELETING,
+            schema.qualification_mutation.c.lifecycle_proof_id ==
+            lifecycle_proof_id,
+            schema.qualification_mutation.c.mutation_lease_token ==
+            mutation_lease_token).values(mutation_lease_expires_at=current +
+                                         lease_seconds,
+                                         updated_at=current)).rowcount
+        if changed != 1:
+            return False
+        topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='DELETING',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                mutation_lease_token=mutation_lease_token,
+                mutation_lease_expires_at=current + lease_seconds),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=now)
+        return True
+
+
+def complete_qualification_lifecycle_delete(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    lifecycle_proof_id: str,
+    mutation_lease_token: str,
+    now: int | None = None,
+) -> topology_state.ProfileRevisionRecord | None:
+    """Commits exact absence only for the current destructive lease owner."""
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        lifecycle = current.attestations.get(lifecycle_key)
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        current_time = catalog_state.database_epoch(session, now=now)
+        mutation_expires_at = (mutation['mutation_lease_expires_at']
+                               if mutation is not None else None)
+        if (current.state not in (models.ImageProfileState.QUALIFYING,
+                                  models.ImageProfileState.ACTIVE) or
+                not isinstance(lifecycle, dict) or
+                lifecycle.get('status') != 'DELETING' or
+                lifecycle.get('target_fingerprint') != target.target_fingerprint
+                or lifecycle.get('repository_arn') != repository_arn or
+                lifecycle.get('runtime_digest') != runtime_digest or
+                lifecycle.get(_LIFECYCLE_PROTOCOL_KEY)
+                != _LIFECYCLE_PROTOCOL_VERSION or
+                qualification_lifecycle_proof_id(lifecycle)
+                != lifecycle_proof_id or
+                lifecycle.get('mutation_lease_token') != mutation_lease_token or
+                not isinstance(lifecycle.get('mutation_lease_expires_at'), int)
+                or lifecycle['mutation_lease_expires_at'] <= current_time or
+                not _qualification_mutation_matches(
+                    mutation,
+                    state=_QUALIFICATION_MUTATION_DELETING,
+                    revision_id=revision.id,
+                    target=target,
+                    repository_arn=repository_arn,
+                    runtime_digest=runtime_digest,
+                    lifecycle_proof_id=lifecycle_proof_id,
+                    mutation_lease_token=mutation_lease_token) or
+                not isinstance(mutation_expires_at, int) or
+                mutation_expires_at <= current_time):
+            return None
+        changed = session.execute(schema.qualification_mutation.update().where(
+            schema.qualification_mutation.c.id == _QUALIFICATION_MUTATION_ID,
+            schema.qualification_mutation.c.state ==
+            _QUALIFICATION_MUTATION_DELETING,
+            schema.qualification_mutation.c.lifecycle_proof_id ==
+            lifecycle_proof_id,
+            schema.qualification_mutation.c.mutation_lease_token ==
+            mutation_lease_token).values(
+                state=_QUALIFICATION_MUTATION_RESTORING,
+                mutation_lease_token=None,
+                mutation_lease_expires_at=None,
+                updated_at=current_time)).rowcount
+        if changed != 1:
+            return None
+        return topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=lifecycle_key,
+            evidence=qualification_lifecycle_evidence(
+                status='READY',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=lifecycle_proof_id,
+                exact_absence=True),
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=now)
+
+
+def record_qualification_copy(
+    revision: topology_state.ProfileRevisionRecord,
+    target: models.ManagedRegistryTarget,
+    *,
+    repository_arn: str,
+    runtime_digest: str,
+    platform: str,
+    copy_outcome: str,
+    expected_lifecycle_proof_id: str | None,
+    expected_mutation_proof_id: str | None = None,
+    now: int | None = None,
+) -> topology_state.ProfileRevisionRecord | None:
+    """Records a copy and atomically clears its owned restoration barrier."""
+    with orm.Session(catalog_state.engine()) as session, session.begin():
+        row = topology_state.lock_profile_revision_mutation_in_session(
+            session, revision.id)
+        current = topology_state._profile(  # pylint: disable=protected-access
+            row)
+        if (current.state not in (models.ImageProfileState.QUALIFYING,
+                                  models.ImageProfileState.ACTIVE) or
+                current.desired_generation != revision.desired_generation or
+                current.config_hash != revision.config_hash):
+            raise topology_state.StaleProfileRevisionError(
+                'Qualification copy no longer matches the desired revision.')
+        mutation = topology_state.get_qualification_mutation_in_session(
+            session, exclusive=True)
+        if expected_mutation_proof_id is None:
+            if mutation is not None:
+                return None
+        elif not _qualification_mutation_matches(
+                mutation,
+                state=_QUALIFICATION_MUTATION_RESTORING,
+                revision_id=revision.id,
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=runtime_digest,
+                lifecycle_proof_id=expected_mutation_proof_id,
+                mutation_lease_token=None):
+            return None
+        current_proof_id = qualification_copy_restoration_proof_id(
+            current, target, runtime_digest)
+        lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+        lifecycle = current.attestations.get(lifecycle_key)
+        if expected_lifecycle_proof_id is None:
+            if isinstance(lifecycle, dict):
+                return None
+        elif (current_proof_id != expected_lifecycle_proof_id or
+              not isinstance(lifecycle, dict) or
+              lifecycle.get('repository_arn') != repository_arn):
+            return None
+        if (expected_mutation_proof_id is not None and
+                expected_lifecycle_proof_id != expected_mutation_proof_id):
+            return None
+        updated = topology_state.record_profile_attestation_in_session(
+            session,
+            profile_revision_id=revision.id,
+            kind=models.profile_attestation_key('copy', target.name),
+            evidence={
+                'status': 'READY',
+                'target': target.name,
+                'target_fingerprint': target.target_fingerprint,
+                'repository_arn': repository_arn,
+                'runtime_digest': runtime_digest,
+                'platform': platform,
+                'copy_outcome': copy_outcome,
+                **qualification_copy_restoration_evidence(expected_lifecycle_proof_id),
+            },
+            expected_generation=revision.desired_generation,
+            expected_config_hash=revision.config_hash,
+            now=now)
+        if expected_mutation_proof_id is not None:
+            cleared = session.execute(
+                schema.qualification_mutation.delete().where(
+                    schema.qualification_mutation.c.id ==
+                    _QUALIFICATION_MUTATION_ID,
+                    schema.qualification_mutation.c.state ==
+                    _QUALIFICATION_MUTATION_RESTORING,
+                    schema.qualification_mutation.c.owner_profile_revision_id ==
+                    revision.id,
+                    schema.qualification_mutation.c.owner_target_fingerprint ==
+                    target.target_fingerprint,
+                    schema.qualification_mutation.c.repository_arn ==
+                    repository_arn,
+                    schema.qualification_mutation.c.runtime_digest ==
+                    runtime_digest,
+                    schema.qualification_mutation.c.lifecycle_proof_id ==
+                    expected_mutation_proof_id)).rowcount
+            if cleared != 1:
+                raise RuntimeError(
+                    'Qualification restoration barrier CAS drifted.')
+        return updated
 
 
 def _hash(payload: dict[str, Any]) -> str:
@@ -212,6 +908,10 @@ def ingest_manifest(
         return operation, revision
     try:
         revision = aws.ingest_terraform_qualification(payload)
+    except topology_state.QualificationMutationInProgressError:
+        # Keep the idempotent operation retryable until the catalog-wide
+        # qualification restoration barrier is cleared.
+        raise
     except (TypeError, ValueError):
         catalog_state.bind_operation_result(
             operation.id,
@@ -270,7 +970,7 @@ def request_canary(
     if (desired is None or desired.revision != profile.revision or
             desired.config_hash != profile.config_hash):
         raise ValueError('QUALIFICATION_FAILED')
-    if not qualification_copy_available(desired, profile, target):
+    if not _qualification_copy_requestable(desired, profile, target):
         raise ValueError('QUALIFICATION_FAILED')
     authority_id = catalog_state.get_catalog_authority_id()
     assert authority_id is not None
@@ -347,10 +1047,10 @@ def canary_payload(operation: catalog_state.OperationRecord) -> dict[str, Any]:
     return payload
 
 
-def _pending_canary_copy_available(payload: dict[str, Any]) -> bool:
-    revision = topology_state.get_profile_revision(
-        payload['profile_revision_id'])
-    if (revision is None or
+def _canary_copy_available(
+        payload: dict[str, Any],
+        revision: topology_state.ProfileRevisionRecord) -> bool:
+    if (revision.id != payload['profile_revision_id'] or
             revision.desired_generation != payload['desired_generation'] or
             revision.config_hash != payload['config_hash']):
         return False
@@ -360,6 +1060,15 @@ def _pending_canary_copy_available(payload: dict[str, Any]) -> bool:
     if target.target_fingerprint != payload['target_fingerprint']:
         return False
     return qualification_copy_available(revision, profile, target)
+
+
+def _canary_admission_available_in_session(
+    session: orm.Session,
+    payload: dict[str, Any],
+    revision: topology_state.ProfileRevisionRecord,
+) -> bool:
+    topology_state.assert_qualification_mutation_idle_in_session(session)
+    return _canary_copy_available(payload, revision)
 
 
 def _validate_canary_ec2_instance_profile_arn(instance_profile_arn: Any) -> str:
@@ -469,16 +1178,21 @@ def claim_canary(
             try:
                 payload = canary_payload(operation)
                 if operation.state == models.ImageOperationState.PENDING:
-                    if not _pending_canary_copy_available(payload):
-                        raise ValueError('QUALIFICATION_FAILED')
                     _, claim_time = topology_state.reserve_canary_cost(
                         session,
                         profile_revision_id=payload['profile_revision_id'],
                         expected_generation=payload['desired_generation'],
                         worst_case_microusd=payload['worst_case_microusd'],
+                        admission_check=functools.partial(
+                            _canary_admission_available_in_session, session,
+                            payload),
                         now=now)
                 else:
                     claim_time = catalog_state.database_epoch(session, now=now)
+            except topology_state.QualificationMutationInProgressError:
+                # The operation stays PENDING and cost-free while the rare
+                # catalog-wide delete/restoration window drains.
+                continue
             except (TypeError, ValueError,
                     topology_state.StaleProfileRevisionError) as error:
                 if (operation.state == models.ImageOperationState.RUNNING and
@@ -644,6 +1358,21 @@ def authorize_canary_launch(operation_id: str,
                 row['lease_expires_at'] is None or
                 int(row['lease_expires_at']) <= current or deadline is None or
                 int(deadline) <= current):
+            return None
+        try:
+            operation = catalog_state._operation(  # pylint: disable=protected-access
+                row)
+            payload = canary_payload(operation)
+            revision_row = (
+                topology_state.lock_profile_revision_mutation_in_session(
+                    session, payload['profile_revision_id']))
+            revision = topology_state._profile(  # pylint: disable=protected-access
+                revision_row)
+            if not _canary_admission_available_in_session(
+                    session, payload, revision):
+                return None
+        except (TypeError, ValueError,
+                topology_state.StaleProfileRevisionError):
             return None
         return int(deadline) - current
 

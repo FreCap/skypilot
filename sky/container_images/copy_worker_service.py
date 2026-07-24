@@ -769,6 +769,22 @@ def _qualification_copy_needed(revision: topology_state.ProfileRevisionRecord,
         isinstance(copy_evidence.get('observed_at'), int) and
         0 <= now - copy_evidence['observed_at'] <= _CONFIG_REFRESH_SECONDS * 10)
     if not copy_available:
+        if (isinstance(copy_evidence, dict) and
+                isinstance(copy_evidence.get('runtime_digest'), str)):
+            lifecycle_key = models.profile_attestation_key(
+                'lifecycle', target.name)
+            lifecycle = revision.attestations.get(lifecycle_key)
+            if not isinstance(lifecycle, dict):
+                # The initial unacknowledged copy gives lifecycle its digest.
+                # Wait for lifecycle to arm an epoch before re-verifying it.
+                return False
+            matching_lifecycle = (lifecycle.get('runtime_digest') ==
+                                  copy_evidence['runtime_digest'])
+            if matching_lifecycle:
+                return (qualification.qualification_copy_restoration_proof_id(
+                    revision, target, copy_evidence['runtime_digest'])
+                        is not None)
+            return False
         return True
     if revision.state == models.ImageProfileState.QUALIFYING:
         return not copy_fresh
@@ -866,6 +882,28 @@ def reconcile_qualification_copy(
     graph = _inspection_graph(reader, profile.qualification.canary_platform,
                               profile.limits.max_artifact_bytes)
     _raise_if_stopping(should_stop)
+    current_revision = topology_state.get_profile_revision(revision.id)
+    _raise_if_stopping(should_stop)
+    if current_revision is None:
+        return False
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    lifecycle = current_revision.attestations.get(lifecycle_key)
+    matching_lifecycle = (isinstance(lifecycle, dict) and
+                          lifecycle.get('runtime_digest')
+                          == graph.runtime_digest)
+    expected_lifecycle_proof_id = (
+        qualification.qualification_copy_restoration_proof_id(
+            current_revision, target, graph.runtime_digest))
+    if matching_lifecycle and expected_lifecycle_proof_id is None:
+        return False
+    copy_allowed, expected_mutation_proof_id = (
+        qualification.qualification_copy_barrier_snapshot(
+            current_revision,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=graph.runtime_digest))
+    if not copy_allowed:
+        return False
     outcome = destination.copy_graph(graph, reader.read_blob,
                                      _StopPredicateEvent(should_stop))
     _raise_if_stopping(should_stop)
@@ -878,31 +916,18 @@ def reconcile_qualification_copy(
         raise aws.DestinationContentMismatchError(
             'Qualification canary did not verify after copy.')
     _raise_if_stopping(should_stop)
-    current_revision = topology_state.get_profile_revision(revision.id)
-    _raise_if_stopping(should_stop)
-    if current_revision is None:
-        return False
-    restoration_evidence = (
-        qualification.qualification_copy_restoration_evidence(
-            current_revision, target, graph.runtime_digest))
-    topology_state.record_profile_attestation(
-        profile_revision_id=revision.id,
-        kind=models.profile_attestation_key('copy', target.name),
-        evidence={
-            'status': 'READY',
-            'target': target.name,
-            'target_fingerprint': target.target_fingerprint,
-            'repository_arn': repository_arn,
-            'runtime_digest': graph.runtime_digest,
-            'platform': graph.platform,
-            'copy_outcome': outcome.value,
-            **restoration_evidence,
-        },
-        expected_generation=revision.desired_generation,
-        expected_config_hash=revision.config_hash,
+    recorded = qualification.record_qualification_copy(
+        current_revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=graph.runtime_digest,
+        platform=graph.platform,
+        copy_outcome=outcome.value,
+        expected_lifecycle_proof_id=expected_lifecycle_proof_id,
+        expected_mutation_proof_id=expected_mutation_proof_id,
         now=now)
     _raise_if_stopping(should_stop)
-    return True
+    return recorded is not None
 
 
 def reconcile_qualification_profiles(
@@ -915,8 +940,26 @@ def reconcile_qualification_profiles(
     completed = 0
     if should_stop is not None and should_stop():
         return completed
+    mutation = qualification.get_qualification_mutation()
     revisions = topology_state.list_qualifying_profiles(include_active=True,
                                                         limit=limit)
+    recovery_owner_id: str | None = None
+    recovery_target: str | None = None
+    if mutation is not None and mutation.get('state') == 'RESTORING':
+        owner_id = mutation.get('owner_profile_revision_id')
+        owner_target = mutation.get('owner_target')
+        if isinstance(owner_id, str) and isinstance(owner_target, str):
+            recovery_owner_id = owner_id
+            recovery_target = owner_target
+            owner = next((item for item in revisions if item.id == owner_id),
+                         None)
+            if owner is None:
+                owner = topology_state.get_profile_revision(owner_id)
+            if owner is not None:
+                revisions = [owner] + [
+                    item for item in revisions if item.id != owner_id
+                ]
+                revisions = revisions[:limit]
     if should_stop is not None and should_stop():
         return completed
     for revision in revisions:
@@ -924,7 +967,12 @@ def reconcile_qualification_profiles(
             break
         profile = models.ManagedRegistryProfile.from_snapshot(
             revision.config_snapshot)
-        for target in (profile.canonical,) + profile.targets:
+        targets = (profile.canonical,) + profile.targets
+        if revision.id == recovery_owner_id and recovery_target is not None:
+            targets = tuple(
+                sorted(targets,
+                       key=lambda target: target.name != recovery_target))
+        for target in targets:
             if should_stop is not None and should_stop():
                 return completed
             try:

@@ -162,10 +162,13 @@ def test_operation_lookup_filters_authorized_kinds_in_postgres(
 
 
 def _activate_profile(
-    engine: sqlalchemy.engine.Engine, profile: models.ManagedRegistryProfile
+    engine: sqlalchemy.engine.Engine,
+    profile: models.ManagedRegistryProfile,
+    *,
+    workspace: str = 'research',
 ) -> topology_state.ProfileRevisionRecord:
     revision = topology_state.stage_profile_revision(
-        workspace='research',
+        workspace=workspace,
         profile=profile.name,
         revision=profile.revision,
         config_hash=profile.config_hash,
@@ -184,7 +187,7 @@ def _activate_profile(
                     f'{target.repository_prefix}/test/s{shard_index:02x}')
                 topology_state.upsert_qualified_shard(
                     session,
-                    workspace='research',
+                    workspace=workspace,
                     profile=profile.name,
                     target_id=target.name,
                     provider='aws',
@@ -206,7 +209,7 @@ def _activate_profile(
                     max_in_flight=4,
                     now=11)
         session.execute(schema.registry_shards.update().where(
-            schema.registry_shards.c.workspace == 'research',
+            schema.registry_shards.c.workspace == workspace,
             schema.registry_shards.c.profile == profile.name).values(
                 state=models.ImageShardState.READY.value,
                 qualified_at=11,
@@ -217,7 +220,10 @@ def _activate_profile(
         assert not any(
             session.execute(
                 sqlalchemy.select(
-                    schema.registry_shards.c.eviction_enabled)).scalars())
+                    schema.registry_shards.c.eviction_enabled).where(
+                        schema.registry_shards.c.workspace == workspace,
+                        schema.registry_shards.c.profile
+                        == profile.name)).scalars())
     attested = topology_state.record_profile_attestation(
         profile_revision_id=revision.id,
         kind='terraform',
@@ -251,7 +257,7 @@ def _activate_profile(
             expected_generation=revision.desired_generation,
             expected_config_hash=profile.config_hash,
             now=12)
-    for shard in topology_state.list_shards('research', profile.name):
+    for shard in topology_state.list_shards(workspace, profile.name):
         target = profile.target(shard.target_id)
         live_key = models.profile_attestation_key('infrastructure_shard',
                                                   shard.physical_fingerprint)
@@ -341,7 +347,7 @@ def _activate_profile(
         expected_attestations_hash=attested.attestations_hash,
         required_attestations={'terraform': None},
         now=13)
-    shards = topology_state.list_shards('research', profile.name)
+    shards = topology_state.list_shards(workspace, profile.name)
     expected_eviction = {
         target.name: target.delete_authority is not None
         for target in (profile.canonical,) + profile.targets
@@ -406,6 +412,21 @@ def _policy_profile(
                                access_bindings=bindings)
 
 
+def _workspace_isolated_profile(
+    profile: models.ManagedRegistryProfile,
+    suffix: str,
+) -> models.ManagedRegistryProfile:
+    """Uses distinct catalog shards while preserving one shared DB catalog."""
+    canonical = dataclasses.replace(
+        profile.canonical,
+        repository_prefix=f'{profile.canonical.repository_prefix}/{suffix}')
+    targets = tuple(
+        dataclasses.replace(
+            target, repository_prefix=f'{target.repository_prefix}/{suffix}')
+        for target in profile.targets)
+    return dataclasses.replace(profile, canonical=canonical, targets=targets)
+
+
 def _stage_candidate_profile(
     profile: models.ManagedRegistryProfile,
     *,
@@ -428,28 +449,32 @@ def _request_ec2_canary(
     profile: models.ManagedRegistryProfile,
     *,
     idempotency_key: str,
+    workspace: str = 'research',
 ) -> catalog_state.OperationRecord:
     _configure_profile(monkeypatch, profile)
     target = profile.targets[0]
-    revision = topology_state.get_active_profile('research', profile.name)
+    revision = topology_state.get_active_profile(workspace, profile.name)
     assert revision is not None
-    topology_state.record_profile_attestation(
-        profile_revision_id=revision.id,
-        kind=models.profile_attestation_key('copy', target.name),
-        evidence={
-            'status': 'READY',
-            'target': target.name,
-            'target_fingerprint': target.target_fingerprint,
-            'runtime_digest': _DIGEST,
-            'platform': profile.qualification.canary_platform,
-        },
-        expected_generation=revision.desired_generation,
-        expected_config_hash=revision.config_hash)
+    repository_arn = _qualification_repository_arn(profile, target)
+    revision, _ = qualification.arm_qualification_lifecycle(
+        revision, target, repository_arn=repository_arn, runtime_digest=_DIGEST)
+    lifecycle_proof_id = qualification.qualification_copy_restoration_proof_id(
+        revision, target, _DIGEST)
+    assert lifecycle_proof_id is not None
+    revision = qualification.record_qualification_copy(
+        revision,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='ALREADY_PRESENT',
+        expected_lifecycle_proof_id=lifecycle_proof_id)
+    assert revision is not None
     binding_id = target.runtime_binding('aws_vm')
     assert binding_id is not None
     runtime_id = qualification.runtime_ids(target, 'aws_vm',
                                            profile.bindings[binding_id])[0]
-    operation, _ = qualification.request_canary(workspace='research',
+    operation, _ = qualification.request_canary(workspace=workspace,
                                                 profile_name=profile.name,
                                                 target_id=target.name,
                                                 backend='aws_vm',
@@ -464,12 +489,20 @@ def _request_ec2_canary(
     return catalog_state._operation(row)
 
 
+def _qualification_repository_arn(profile: models.ManagedRegistryProfile,
+                                  target: models.ManagedRegistryTarget) -> str:
+    repository_name = f'{target.repository_prefix}/qualification'
+    return (f'arn:{profile.partition}:ecr:{target.region}:'
+            f'{profile.registry_account}:repository/{repository_name}')
+
+
 def test_canary_request_waits_for_exact_copy_restoration(
         image_database, monkeypatch: pytest.MonkeyPatch,
         profile: models.ManagedRegistryProfile) -> None:
     revision = _activate_profile(image_database, profile)
     _configure_profile(monkeypatch, profile)
     target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
     copy_key = models.profile_attestation_key('copy', target.name)
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
     lifecycle_proof_id = '00000000-0000-4000-8000-000000000099'
@@ -480,6 +513,7 @@ def test_canary_request_waits_for_exact_copy_restoration(
             'status': 'READY',
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
             'runtime_digest': _DIGEST,
             'platform': profile.qualification.canary_platform,
         },
@@ -493,9 +527,11 @@ def test_canary_request_waits_for_exact_copy_restoration(
             'status': 'READY',
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
             'runtime_digest': _DIGEST,
             'exact_absence': True,
             'lifecycle_proof_id': lifecycle_proof_id,
+            'protocol_version': 2,
         },
         expected_generation=revision.desired_generation,
         expected_config_hash=revision.config_hash,
@@ -526,6 +562,7 @@ def test_canary_request_waits_for_exact_copy_restoration(
             'status': 'READY',
             'target': target.name,
             'target_fingerprint': target.target_fingerprint,
+            'repository_arn': repository_arn,
             'runtime_digest': _DIGEST,
             'platform': profile.qualification.canary_platform,
             'restores_lifecycle_proof_id': lifecycle_proof_id,
@@ -580,6 +617,842 @@ def test_pending_canary_does_not_reserve_cost_after_copy_deletion(
     unchanged = topology_state.get_profile_revision(revision.id)
     assert unchanged is not None
     assert unchanged.canary_reserved_microusd == 0
+
+
+def test_qualification_lifecycle_delete_lease_serializes_takeover_and_completion(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    armed, armed_now = qualification.arm_qualification_lifecycle(
+        active,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        now=19)
+    assert armed_now
+    armed_proof = qualification.qualification_copy_restoration_proof_id(
+        armed, target, _DIGEST)
+    assert armed_proof is not None
+    copied = qualification.record_qualification_copy(
+        armed,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=armed_proof,
+        now=20)
+    assert copied is not None
+    assert qualification.qualification_copy_available(copied, profile, target)
+
+    deleting, proof_id, first_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            copied,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=100))
+    assert proof_id is not None
+    assert proof_id != armed_proof
+    assert first_token is not None
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'DELETING'
+    assert mutation['owner_profile_revision_id'] == copied.id
+    assert mutation['owner_target'] == target.name
+    assert mutation['owner_target_fingerprint'] == target.target_fingerprint
+    assert mutation['repository_arn'] == repository_arn
+    assert mutation['runtime_digest'] == _DIGEST
+    assert mutation['lifecycle_proof_id'] == proof_id
+    assert mutation['mutation_lease_token'] == first_token
+    assert mutation['mutation_lease_expires_at'] == 160
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    lifecycle = deleting.attestations[lifecycle_key]
+    assert lifecycle == {
+        'status': 'DELETING',
+        'target': target.name,
+        'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
+        'runtime_digest': _DIGEST,
+        'lifecycle_proof_id': proof_id,
+        'protocol_version': 2,
+        'mutation_lease_token': first_token,
+        'mutation_lease_expires_at': 160,
+        'observed_at': 100,
+    }
+    assert not qualification.qualification_copy_available(
+        deleting, profile, target)
+    assert qualification.qualification_lifecycle_delete_owned(
+        deleting.id,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=first_token,
+        now=149)
+    assert qualification.heartbeat_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=first_token,
+        lease_seconds=60,
+        now=150)
+    renewed = topology_state.get_profile_revision(deleting.id)
+    assert renewed is not None
+    renewed_lifecycle = renewed.attestations[lifecycle_key]
+    assert renewed_lifecycle['mutation_lease_expires_at'] == 210
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['mutation_lease_token'] == first_token
+    assert mutation['mutation_lease_expires_at'] == 210
+
+    unchanged, duplicate_proof, duplicate_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            renewed,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=209))
+    assert duplicate_proof is None
+    assert duplicate_token is None
+    assert unchanged.attestations[lifecycle_key] == renewed_lifecycle
+
+    taken_over, takeover_proof, takeover_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            renewed,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=210))
+    assert takeover_proof == proof_id
+    assert takeover_token is not None and takeover_token != first_token
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'DELETING'
+    assert mutation['lifecycle_proof_id'] == proof_id
+    assert mutation['mutation_lease_token'] == takeover_token
+    assert mutation['mutation_lease_expires_at'] == 270
+    assert not qualification.qualification_lifecycle_delete_owned(
+        taken_over.id,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=first_token,
+        now=211)
+    assert qualification.qualification_lifecycle_delete_owned(
+        taken_over.id,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=takeover_token,
+        now=211)
+    assert qualification.complete_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=first_token,
+        now=211) is None
+
+    completed = qualification.complete_qualification_lifecycle_delete(
+        taken_over,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=takeover_token,
+        now=211)
+    assert completed is not None
+    assert completed.attestations[lifecycle_key] == {
+        'status': 'READY',
+        'target': target.name,
+        'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
+        'runtime_digest': _DIGEST,
+        'lifecycle_proof_id': proof_id,
+        'protocol_version': 2,
+        'exact_absence': True,
+        'observed_at': 211,
+    }
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'RESTORING'
+    assert mutation['owner_profile_revision_id'] == completed.id
+    assert mutation['lifecycle_proof_id'] == proof_id
+    assert mutation['mutation_lease_token'] is None
+    assert mutation['mutation_lease_expires_at'] is None
+    assert not qualification.qualification_lifecycle_delete_owned(
+        completed.id,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=takeover_token,
+        now=211)
+
+
+def test_qualification_lifecycle_samples_clock_after_catalog_mutation_lock(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    armed, armed_now = qualification.arm_qualification_lifecycle(
+        active,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        now=19)
+    assert armed_now
+    armed_proof = qualification.qualification_copy_restoration_proof_id(
+        armed, target, _DIGEST)
+    assert armed_proof is not None
+    copied = qualification.record_qualification_copy(
+        armed,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=armed_proof,
+        now=20)
+    assert copied is not None
+
+    events: list[str] = []
+    original_lock = topology_state.get_qualification_mutation_in_session
+    original_epoch = catalog_state.database_epoch
+
+    def observed_lock(session: orm.Session, *,
+                      exclusive: bool) -> sqlalchemy.engine.RowMapping | None:
+        mutation = original_lock(session, exclusive=exclusive)
+        if exclusive:
+            events.append('exclusive-lock-acquired')
+        return mutation
+
+    def observed_epoch(session: orm.Session, *, now: int | None = None) -> int:
+        events.append('clock-sampled')
+        return original_epoch(session, now=now)
+
+    monkeypatch.setattr(topology_state, 'get_qualification_mutation_in_session',
+                        observed_lock)
+    monkeypatch.setattr(catalog_state, 'database_epoch', observed_epoch)
+
+    deleting, proof_id, token = (
+        qualification.begin_qualification_lifecycle_delete(
+            copied,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=60,
+            now=100))
+    assert proof_id is not None and token is not None
+    assert events[0] == 'exclusive-lock-acquired'
+    assert set(events[1:]) == {'clock-sampled'}
+
+    events.clear()
+    assert qualification.qualification_lifecycle_delete_owned(
+        deleting.id,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=101)
+    assert events[0] == 'exclusive-lock-acquired'
+    assert set(events[1:]) == {'clock-sampled'}
+
+    events.clear()
+    assert qualification.heartbeat_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        lease_seconds=60,
+        now=102)
+    assert events[0] == 'exclusive-lock-acquired'
+    assert set(events[1:]) == {'clock-sampled'}
+
+    events.clear()
+    assert qualification.complete_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=token,
+        now=103) is not None
+    assert events[0] == 'exclusive-lock-acquired'
+    assert set(events[1:]) == {'clock-sampled'}
+
+
+def test_global_qualification_mutation_defers_cross_workspace_canary_until_owner_restores(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    owner = _activate_profile(image_database, profile, workspace='research')
+    follower_profile = _workspace_isolated_profile(profile, 'biology')
+    _activate_profile(image_database, follower_profile, workspace='biology')
+    operation = _request_ec2_canary(
+        monkeypatch,
+        follower_profile,
+        workspace='biology',
+        idempotency_key='cross-workspace-mutation-barrier-canary')
+    follower = topology_state.get_active_profile('biology',
+                                                 follower_profile.name)
+    assert follower is not None
+    follower_target = follower_profile.targets[0]
+    follower_repository_arn = _qualification_repository_arn(
+        follower_profile, follower_target)
+    follower_proof = qualification.qualification_copy_restoration_proof_id(
+        follower, follower_target, _DIGEST)
+    assert follower_proof is not None
+
+    owner_target = profile.targets[0]
+    owner_repository_arn = _qualification_repository_arn(profile, owner_target)
+    armed, armed_now = qualification.arm_qualification_lifecycle(
+        owner,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        now=20)
+    assert armed_now
+    armed_proof = qualification.qualification_copy_restoration_proof_id(
+        armed, owner_target, _DIGEST)
+    assert armed_proof is not None
+    copied = qualification.record_qualification_copy(
+        armed,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=armed_proof,
+        now=21)
+    assert copied is not None
+
+    deleting, mutation_proof, mutation_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            copied,
+            owner_target,
+            repository_arn=owner_repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=300,
+            now=100))
+    assert mutation_proof is not None
+    assert mutation_token is not None
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'DELETING'
+    assert mutation['owner_profile_revision_id'] == owner.id
+
+    assert qualification.claim_canary(worker_id='worker-deleting',
+                                      lease_seconds=60,
+                                      now=101) is None
+    pending = catalog_state.get_operation(operation.id, 'biology')
+    assert pending is not None
+    assert pending.state == models.ImageOperationState.PENDING
+    unchanged_follower = topology_state.get_profile_revision(follower.id)
+    assert unchanged_follower is not None
+    assert unchanged_follower.canary_reserved_microusd == 0
+
+    restoring = qualification.complete_qualification_lifecycle_delete(
+        deleting,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=mutation_proof,
+        mutation_lease_token=mutation_token,
+        now=102)
+    assert restoring is not None
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None
+    assert mutation['state'] == 'RESTORING'
+    assert mutation['mutation_lease_token'] is None
+    assert mutation['mutation_lease_expires_at'] is None
+
+    assert qualification.claim_canary(worker_id='worker-restoring',
+                                      lease_seconds=60,
+                                      now=103) is None
+    pending = catalog_state.get_operation(operation.id, 'biology')
+    assert pending is not None
+    assert pending.state == models.ImageOperationState.PENDING
+    unchanged_follower = topology_state.get_profile_revision(follower.id)
+    assert unchanged_follower is not None
+    assert unchanged_follower.canary_reserved_microusd == 0
+    assert qualification.qualification_copy_barrier_snapshot(
+        follower,
+        follower_target,
+        repository_arn=follower_repository_arn,
+        runtime_digest=_DIGEST) == (False, None)
+
+    assert qualification.record_qualification_copy(
+        follower,
+        follower_target,
+        repository_arn=follower_repository_arn,
+        runtime_digest=_DIGEST,
+        platform=follower_profile.qualification.canary_platform,
+        copy_outcome='ALREADY_PRESENT',
+        expected_lifecycle_proof_id=follower_proof,
+        expected_mutation_proof_id=mutation_proof,
+        now=104) is None
+    assert qualification.record_qualification_copy(
+        restoring,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='ALREADY_PRESENT',
+        expected_lifecycle_proof_id=mutation_proof,
+        expected_mutation_proof_id=str(uuid.uuid4()),
+        now=104) is None
+    assert qualification.record_qualification_copy(
+        restoring,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='ALREADY_PRESENT',
+        expected_lifecycle_proof_id=mutation_proof,
+        now=104) is None
+    mutation = qualification.get_qualification_mutation()
+    assert mutation is not None and mutation['state'] == 'RESTORING'
+
+    restored = qualification.record_qualification_copy(
+        restoring,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=mutation_proof,
+        expected_mutation_proof_id=mutation_proof,
+        now=104)
+    assert restored is not None
+    assert qualification.get_qualification_mutation() is None
+    assert qualification.qualification_copy_available(restored, profile,
+                                                      owner_target)
+    assert qualification.record_qualification_copy(
+        restored,
+        owner_target,
+        repository_arn=owner_repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='ALREADY_PRESENT',
+        expected_lifecycle_proof_id=mutation_proof,
+        expected_mutation_proof_id=mutation_proof,
+        now=104) is None
+
+    claimed = qualification.claim_canary(worker_id='worker-after-restore',
+                                         lease_seconds=60,
+                                         now=105)
+    assert claimed is not None
+    assert claimed.id == operation.id
+    assert claimed.state == models.ImageOperationState.RUNNING
+    assert qualification.claim_canary(worker_id='duplicate-worker',
+                                      lease_seconds=60,
+                                      now=105) is None
+    charged_follower = topology_state.get_profile_revision(follower.id)
+    assert charged_follower is not None
+    assert charged_follower.canary_reserved_microusd == (
+        follower_profile.qualification.canary_worst_case_microusd)
+
+
+def test_mutation_owner_can_queue_canaries_until_exact_restoration(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    owner = _activate_profile(image_database, profile)
+    _configure_profile(monkeypatch, profile)
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    armed, armed_now = qualification.arm_qualification_lifecycle(
+        owner,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        now=20)
+    assert armed_now
+    armed_proof = qualification.qualification_copy_restoration_proof_id(
+        armed, target, _DIGEST)
+    assert armed_proof is not None
+    copied = qualification.record_qualification_copy(
+        armed,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=armed_proof,
+        now=21)
+    assert copied is not None
+    deleting, proof_id, lease_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            copied,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=300,
+            now=100))
+    assert proof_id is not None
+    assert lease_token is not None
+
+    binding_id = target.runtime_binding('aws_vm')
+    assert binding_id is not None
+    runtime_id = qualification.runtime_ids(target, 'aws_vm',
+                                           profile.bindings[binding_id])[0]
+
+    def request(key: str, timestamp: int) -> catalog_state.OperationRecord:
+        operation, _ = qualification.request_canary(workspace='research',
+                                                    profile_name=profile.name,
+                                                    target_id=target.name,
+                                                    backend='aws_vm',
+                                                    runtime_id=runtime_id,
+                                                    actor_hash='1' * 64,
+                                                    idempotency_key=key)
+        with image_database.begin() as connection:
+            row = connection.execute(schema.operations.update().where(
+                schema.operations.c.id == operation.id).values(
+                    created_at=timestamp, updated_at=timestamp).returning(
+                        schema.operations)).mappings().one()
+        return catalog_state._operation(  # pylint: disable=protected-access
+            row)
+
+    deleting_operation = request('owner-deleting-canary', 1)
+    assert qualification.claim_canary(worker_id='worker-deleting',
+                                      lease_seconds=60,
+                                      now=101) is None
+    pending_deleting = catalog_state.get_operation(deleting_operation.id,
+                                                   'research')
+    assert pending_deleting is not None
+    assert pending_deleting.state == models.ImageOperationState.PENDING
+
+    restoring = qualification.complete_qualification_lifecycle_delete(
+        deleting,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        lifecycle_proof_id=proof_id,
+        mutation_lease_token=lease_token,
+        now=102)
+    assert restoring is not None
+    restoring_operation = request('owner-restoring-canary', 2)
+    assert qualification.claim_canary(worker_id='worker-restoring',
+                                      lease_seconds=60,
+                                      now=103) is None
+    pending_restoring = catalog_state.get_operation(restoring_operation.id,
+                                                    'research')
+    assert pending_restoring is not None
+    assert pending_restoring.state == models.ImageOperationState.PENDING
+    unchanged_owner = topology_state.get_profile_revision(owner.id)
+    assert unchanged_owner is not None
+    assert unchanged_owner.canary_reserved_microusd == 0
+
+    restored = qualification.record_qualification_copy(
+        restoring,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=proof_id,
+        expected_mutation_proof_id=proof_id,
+        now=104)
+    assert restored is not None
+    claimed = qualification.claim_canary(worker_id='worker-after-restore',
+                                         lease_seconds=60,
+                                         now=105)
+    assert claimed is not None
+    assert claimed.id == deleting_operation.id
+    still_pending = catalog_state.get_operation(restoring_operation.id,
+                                                'research')
+    assert still_pending is not None
+    assert still_pending.state == models.ImageOperationState.PENDING
+
+
+def test_global_running_canary_prevents_other_workspace_lifecycle_delete(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    owner = _activate_profile(image_database, profile, workspace='research')
+    running_profile = _workspace_isolated_profile(profile, 'biology')
+    _activate_profile(image_database, running_profile, workspace='biology')
+    running_operation = _request_ec2_canary(
+        monkeypatch,
+        running_profile,
+        workspace='biology',
+        idempotency_key='cross-workspace-running-canary')
+    running = qualification.claim_canary(worker_id='worker',
+                                         lease_seconds=300,
+                                         now=100)
+    assert running is not None
+    assert running.id == running_operation.id
+    with image_database.begin() as connection:
+        connection.execute(schema.operations.update().where(
+            schema.operations.c.id == running.id).values(result_kind=None,
+                                                         result_id=None,
+                                                         result_json=None))
+
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    armed, armed_now = qualification.arm_qualification_lifecycle(
+        owner,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        now=101)
+    assert armed_now
+    armed_proof = qualification.qualification_copy_restoration_proof_id(
+        armed, target, _DIGEST)
+    assert armed_proof is not None
+    copied = qualification.record_qualification_copy(
+        armed,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='COPIED',
+        expected_lifecycle_proof_id=armed_proof,
+        now=102)
+    assert copied is not None
+
+    unchanged, mutation_proof, mutation_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            copied,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=300,
+            now=103))
+    assert mutation_proof is None
+    assert mutation_token is None
+    assert qualification.get_qualification_mutation() is None
+    assert qualification.qualification_copy_available(unchanged, profile,
+                                                      target)
+    still_running = catalog_state.get_operation(running.id, 'biology')
+    assert still_running is not None
+    assert still_running.state == models.ImageOperationState.RUNNING
+    assert still_running.result_kind is None
+    assert still_running.result_id is None
+    charged = topology_state.get_active_profile('biology', running_profile.name)
+    assert charged is not None
+    assert charged.canary_reserved_microusd == (
+        running_profile.qualification.canary_worst_case_microusd)
+
+
+def test_qualification_copy_acknowledgment_cas_rejects_changed_lifecycle_proof(
+        image_database, profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    copy_key = models.profile_attestation_key('copy', target.name)
+    first_proof = '00000000-0000-4000-8000-000000000101'
+    second_proof = '00000000-0000-4000-8000-000000000102'
+    first_epoch = topology_state.record_profile_attestation(
+        profile_revision_id=active.id,
+        kind=lifecycle_key,
+        evidence=qualification.qualification_lifecycle_evidence(
+            status='READY',
+            target=target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lifecycle_proof_id=first_proof,
+            exact_absence=True),
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        now=20)
+    assert qualification.qualification_copy_restoration_proof_id(
+        first_epoch, target, _DIGEST) == first_proof
+
+    second_epoch = topology_state.record_profile_attestation(
+        profile_revision_id=active.id,
+        kind=lifecycle_key,
+        evidence=qualification.qualification_lifecycle_evidence(
+            status='READY',
+            target=target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lifecycle_proof_id=second_proof,
+            exact_absence=True),
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        now=21)
+    assert qualification.record_qualification_copy(
+        first_epoch,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='ALREADY_PRESENT',
+        expected_lifecycle_proof_id=first_proof,
+        now=22) is None
+    unchanged = topology_state.get_profile_revision(active.id)
+    assert unchanged is not None
+    assert copy_key not in unchanged.attestations
+    assert unchanged.attestations[lifecycle_key][
+        'lifecycle_proof_id'] == second_proof
+
+    restored = qualification.record_qualification_copy(
+        second_epoch,
+        target,
+        repository_arn=repository_arn,
+        runtime_digest=_DIGEST,
+        platform=profile.qualification.canary_platform,
+        copy_outcome='ALREADY_PRESENT',
+        expected_lifecycle_proof_id=second_proof,
+        now=23)
+    assert restored is not None
+    assert restored.attestations[copy_key][
+        'restores_lifecycle_proof_id'] == second_proof
+    assert qualification.qualification_copy_available(restored, profile, target)
+
+
+def test_canary_claim_and_cost_recheck_copy_after_lifecycle_profile_lock(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    operation = _request_ec2_canary(
+        monkeypatch,
+        profile,
+        idempotency_key='canary-copy-admission-profile-lock-key')
+    target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    profile_select_attempted = threading.Event()
+
+    def observe_claim_profile_lock(_connection, _cursor, statement, _parameters,
+                                   _context, _executemany) -> None:
+        normalized = ' '.join(statement.split()).upper()
+        if (threading.current_thread().name.startswith('canary-claim-race') and
+                'PG_ADVISORY_XACT_LOCK' in normalized):
+            profile_select_attempted.set()
+
+    sqlalchemy.event.listen(image_database, 'before_cursor_execute',
+                            observe_claim_profile_lock)
+    lock_session = orm.Session(image_database)
+    lock_transaction = lock_session.begin()
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='canary-claim-race')
+    try:
+        topology_state.lock_profile_revision_mutation_in_session(
+            lock_session, active.id)
+        database_now = catalog_state.database_epoch(lock_session)
+        future = executor.submit(qualification.claim_canary,
+                                 worker_id='worker',
+                                 lease_seconds=60)
+        assert profile_select_attempted.wait(timeout=5)
+        assert not future.done()
+        topology_state.record_profile_attestation_in_session(
+            lock_session,
+            profile_revision_id=active.id,
+            kind=lifecycle_key,
+            evidence=qualification.qualification_lifecycle_evidence(
+                status='DELETING',
+                target=target,
+                repository_arn=repository_arn,
+                runtime_digest=_DIGEST,
+                lifecycle_proof_id=('00000000-0000-4000-8000-000000000103'),
+                mutation_lease_token=('00000000-0000-4000-8000-000000000104'),
+                mutation_lease_expires_at=database_now + 300),
+            expected_generation=active.desired_generation,
+            expected_config_hash=active.config_hash,
+            now=database_now)
+        lock_transaction.commit()
+        assert future.result(timeout=10) is None
+    finally:
+        if lock_transaction.is_active:
+            lock_transaction.rollback()
+        lock_session.close()
+        executor.shutdown(wait=True)
+        sqlalchemy.event.remove(image_database, 'before_cursor_execute',
+                                observe_claim_profile_lock)
+
+    failed = catalog_state.get_operation(operation.id, 'research')
+    assert failed is not None
+    assert failed.state == models.ImageOperationState.FAILED
+    assert failed.error_code == 'QUALIFICATION_FAILED'
+    revision = topology_state.get_profile_revision(active.id)
+    assert revision is not None
+    assert revision.attestations[lifecycle_key]['status'] == 'DELETING'
+    assert revision.canary_reserved_microusd == 0
+
+
+def test_authorize_canary_launch_rejects_lifecycle_unavailability(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active = _activate_profile(image_database, profile)
+    _request_ec2_canary(monkeypatch,
+                        profile,
+                        idempotency_key='canary-launch-lifecycle-fence-key')
+    claimed = qualification.claim_canary(worker_id='worker',
+                                         lease_seconds=2000,
+                                         now=300)
+    assert claimed is not None and claimed.lease_token is not None
+    assert claimed.teardown_deadline is not None
+    target = profile.targets[0]
+    child_id = f'ec2:{target.region}:{claimed.id}'
+    assert qualification.attach_canary_child(claimed.id,
+                                             claimed.lease_token,
+                                             child_id,
+                                             now=301)
+    assert qualification.authorize_canary_launch(
+        claimed.id, claimed.lease_token, child_id,
+        now=301) == claimed.teardown_deadline - 301
+
+    repository_arn = _qualification_repository_arn(profile, target)
+    current = topology_state.get_profile_revision(active.id)
+    assert current is not None
+    unchanged, blocked_proof, blocked_token = (
+        qualification.begin_qualification_lifecycle_delete(
+            current,
+            target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lease_seconds=300,
+            now=302))
+    assert blocked_proof is None
+    assert blocked_token is None
+    assert qualification.qualification_copy_available(unchanged, profile,
+                                                      target)
+
+    lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
+    unavailable = topology_state.record_profile_attestation(
+        profile_revision_id=active.id,
+        kind=lifecycle_key,
+        evidence=qualification.qualification_lifecycle_evidence(
+            status='DELETING',
+            target=target,
+            repository_arn=repository_arn,
+            runtime_digest=_DIGEST,
+            lifecycle_proof_id='00000000-0000-4000-8000-000000000105',
+            mutation_lease_token='00000000-0000-4000-8000-000000000106',
+            mutation_lease_expires_at=600),
+        expected_generation=active.desired_generation,
+        expected_config_hash=active.config_hash,
+        now=302)
+    assert not qualification.qualification_copy_available(
+        unavailable, profile, target)
+    assert qualification.authorize_canary_launch(claimed.id,
+                                                 claimed.lease_token,
+                                                 child_id,
+                                                 now=302) is None
+
+    cleanup_owner = catalog_state.get_operation(claimed.id, 'research')
+    assert cleanup_owner is not None
+    assert cleanup_owner.state == models.ImageOperationState.RUNNING
+    assert cleanup_owner.child_launch_id == child_id
+    revision = topology_state.get_profile_revision(active.id)
+    assert revision is not None
+    assert revision.canary_reserved_microusd == (
+        profile.qualification.canary_worst_case_microusd)
 
 
 def test_expired_canary_owner_cannot_attach_or_terminalize_successor_work(
@@ -6608,6 +7481,7 @@ def test_exact_absence_requires_same_second_copy_restoration_handshake(
     active = _activate_profile(image_database, profile)
     target = profile.targets[0]
     lifecycle_proof_id = '00000000-0000-4000-8000-000000000099'
+    repository_arn = _qualification_repository_arn(profile, target)
     copy_key = models.profile_attestation_key('copy', target.name)
     lifecycle_key = models.profile_attestation_key('lifecycle', target.name)
     attestations = dict(active.attestations)
@@ -6615,6 +7489,7 @@ def test_exact_absence_requires_same_second_copy_restoration_handshake(
         'status': 'READY',
         'observed_at': 20,
         'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
         'runtime_digest': _DIGEST,
         'platform': profile.qualification.canary_platform,
     }
@@ -6622,9 +7497,11 @@ def test_exact_absence_requires_same_second_copy_restoration_handshake(
         'status': 'READY',
         'observed_at': 20,
         'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
         'runtime_digest': _DIGEST,
         'exact_absence': True,
         'lifecycle_proof_id': lifecycle_proof_id,
+        'protocol_version': 2,
     }
     deleted = dataclasses.replace(active, attestations=attestations)
 
@@ -6634,7 +7511,8 @@ def test_exact_absence_requires_same_second_copy_restoration_handshake(
         deleted, profile, target, 20)
 
     restoration = qualification.qualification_copy_restoration_evidence(
-        deleted, target, _DIGEST)
+        qualification.qualification_copy_restoration_proof_id(
+            deleted, target, _DIGEST))
     assert restoration == {
         'restores_lifecycle_proof_id': lifecycle_proof_id,
     }
@@ -6666,8 +7544,32 @@ def _short_lived_qualifying_profile(
         evidence = (dict(existing) if isinstance(existing, dict) else {
             'status': 'READY'
         })
-        if key.startswith(('copy:', 'lifecycle:')):
-            evidence['runtime_digest'] = _DIGEST
+        for target in (short_lived.canonical,) + short_lived.targets:
+            repository_name = f'{target.repository_prefix}/qualification'
+            repository_arn = _qualification_repository_arn(short_lived, target)
+            lifecycle_proof_id = str(
+                uuid.uuid5(uuid.NAMESPACE_DNS, f'skypilot-test:{target.name}'))
+            if key == models.profile_attestation_key('terraform_target',
+                                                     target.name):
+                evidence.update(target_fingerprint=target.target_fingerprint,
+                                registry=target.registry,
+                                repository_name=repository_name,
+                                repository_arn=repository_arn)
+            elif key == models.profile_attestation_key('copy', target.name):
+                evidence.update(
+                    target_fingerprint=target.target_fingerprint,
+                    repository_arn=repository_arn,
+                    runtime_digest=_DIGEST,
+                    platform=short_lived.qualification.canary_platform,
+                    restores_lifecycle_proof_id=lifecycle_proof_id)
+            elif key == models.profile_attestation_key('lifecycle',
+                                                       target.name):
+                evidence.update(target_fingerprint=target.target_fingerprint,
+                                repository_arn=repository_arn,
+                                runtime_digest=_DIGEST,
+                                exact_absence=True,
+                                lifecycle_proof_id=lifecycle_proof_id,
+                                protocol_version=2)
         observed_at = int(time.time())
         evidence.update(status='READY', observed_at=observed_at)
         revision = topology_state.record_profile_attestation(
@@ -6716,13 +7618,26 @@ def test_automatic_canary_scheduler_uses_database_clock_under_host_skew(
                 sqlalchemy.select(
                     catalog_state.database_epoch_expression())).scalar_one())
     target = profile.targets[0]
+    repository_arn = _qualification_repository_arn(profile, target)
+    lifecycle_proof_id = '00000000-0000-4000-8000-000000000096'
     attestations = dict(active.attestations)
     attestations[models.profile_attestation_key('copy', target.name)] = {
         'status': 'READY',
         'observed_at': database_now + proof_offset,
         'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
         'runtime_digest': _DIGEST,
         'platform': profile.qualification.canary_platform,
+        'restores_lifecycle_proof_id': lifecycle_proof_id,
+    }
+    attestations[models.profile_attestation_key('lifecycle', target.name)] = {
+        'status': 'ARMED',
+        'observed_at': database_now + proof_offset,
+        'target_fingerprint': target.target_fingerprint,
+        'repository_arn': repository_arn,
+        'runtime_digest': _DIGEST,
+        'lifecycle_proof_id': lifecycle_proof_id,
+        'protocol_version': 2,
     }
     revision = dataclasses.replace(active, attestations=attestations)
     monkeypatch.setattr(topology_state, 'list_qualifying_profiles',
@@ -7332,6 +8247,16 @@ def _migration_call(engine: sqlalchemy.engine.Engine, function: Any) -> None:
             function()
 
 
+def _autocommit_migration_call(engine: sqlalchemy.engine.Engine,
+                               function: Any) -> None:
+    """Runs a migration whose concurrent DDL needs Alembic transaction state."""
+    with engine.connect() as connection:
+        context = migration.MigrationContext.configure(connection)
+        with context.begin_transaction():
+            with operations.Operations.context(context):
+                function()
+
+
 def _schema_engine(base: sqlalchemy.engine.Engine,
                    schema_name: str) -> sqlalchemy.engine.Engine:
     # Keep the schema in the URL so migration_utils.get_alembic_config() also
@@ -7554,6 +8479,11 @@ def test_migration_024_matches_runtime_metadata_and_downgrade_is_empty_only(
         _migration_call(migration_engine, migration_024.upgrade)
         schema.metadata.create_all(runtime_engine)
         with runtime_engine.begin() as connection:
+            connection.exec_driver_sql(
+                'DROP TABLE container_image_qualification_mutation')
+            connection.exec_driver_sql(
+                'DROP INDEX '
+                'ix_container_image_operations_running_canary_revision')
             connection.exec_driver_sql('ALTER TABLE container_image_operations '
                                        'DROP COLUMN canary_child_evidence_json')
         assert _schema_shape(migration_engine,
@@ -7640,12 +8570,16 @@ def test_migration_025_adds_rollback_compatible_canary_child_evidence(
     migration_025 = importlib.import_module(
         'sky.schemas.db.global_user_state.'
         '025_container_image_canary_child_evidence')
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
     try:
         with migration_engine.begin() as connection:
             connection.exec_driver_sql(
                 'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
         _migration_call(migration_engine, migration_024.upgrade)
         _migration_call(migration_engine, migration_025.upgrade)
+        _autocommit_migration_call(migration_engine, migration_026.upgrade)
         schema.metadata.create_all(runtime_engine)
 
         assert _schema_shape(migration_engine,
@@ -7694,6 +8628,338 @@ def test_migration_025_adds_rollback_compatible_canary_child_evidence(
                 f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
             connection.exec_driver_sql(
                 f'DROP SCHEMA IF EXISTS {runtime_schema} CASCADE')
+
+
+def _prepare_image_schema_for_migration_026(
+        engine: sqlalchemy.engine.Engine) -> None:
+    migration_024 = importlib.import_module(
+        'sky.schemas.db.global_user_state.024_container_images')
+    migration_025 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '025_container_image_canary_child_evidence')
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'CREATE TABLE clusters (name TEXT PRIMARY KEY)')
+    _migration_call(engine, migration_024.upgrade)
+    _migration_call(engine, migration_025.upgrade)
+
+
+def _insert_migration_profile_revision(engine: sqlalchemy.engine.Engine,
+                                       revision_id: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO container_image_profile_revisions (
+                    id, workspace, profile, revision, desired_generation,
+                    state, config_hash, config_json, physical_manifest_hash,
+                    created_at, updated_at
+                ) VALUES (
+                    :id, 'research', 'migration-profile', 1, 1, 'ACTIVE',
+                    :config_hash, '{}', :manifest_hash, 1, 1
+                )
+            """), {
+                'id': revision_id,
+                'config_hash': '1' * 64,
+                'manifest_hash': '2' * 64,
+            })
+
+
+def test_migration_026_adds_qualification_mutation_and_running_canary_fences(
+        postgres_engine) -> None:
+    migration_schema = f'image_canary_fence_migration_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    index_name = 'ix_container_image_operations_running_canary_revision'
+    try:
+        _prepare_image_schema_for_migration_026(migration_engine)
+        _autocommit_migration_call(migration_engine, migration_026.upgrade)
+
+        inspector = sqlalchemy.inspect(migration_engine)
+        indexes = {
+            index['name']: index
+            for index in inspector.get_indexes('container_image_operations')
+        }
+        assert indexes[index_name]['column_names'] == ['result_id']
+        index_predicate = str(
+            indexes[index_name]['dialect_options']['postgresql_where'])
+        normalized_predicate = ''.join(
+            index_predicate.replace('::text',
+                                    '').split()).replace('(',
+                                                         '').replace(')', '')
+        assert normalized_predicate == (
+            "kind='PROFILE_CANARY'ANDstate='RUNNING'")
+        mutation_columns = {
+            column['name']: column for column in inspector.get_columns(
+                'container_image_qualification_mutation')
+        }
+        assert list(mutation_columns) == [
+            'id', 'owner_profile_revision_id', 'owner_target',
+            'owner_target_fingerprint', 'repository_arn', 'runtime_digest',
+            'lifecycle_proof_id', 'state', 'mutation_lease_token',
+            'mutation_lease_expires_at', 'updated_at'
+        ]
+        assert {
+            constraint['name']
+            for constraint in inspector.get_check_constraints(
+                'container_image_qualification_mutation')
+        } == {
+            'ck_container_image_qualification_mutation_identity',
+            'ck_container_image_qualification_mutation_lease',
+            'ck_container_image_qualification_mutation_singleton',
+            'ck_container_image_qualification_mutation_state',
+        }
+
+        revision_id = str(uuid.uuid4())
+        _insert_migration_profile_revision(migration_engine, revision_id)
+        with migration_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text("""
+                    INSERT INTO container_image_qualification_mutation (
+                        id, owner_profile_revision_id, owner_target,
+                        owner_target_fingerprint, repository_arn,
+                        runtime_digest, lifecycle_proof_id, state,
+                        mutation_lease_token, mutation_lease_expires_at,
+                        updated_at
+                    ) VALUES (
+                        'global', :revision, 'primary', 'target-fingerprint',
+                        'arn:aws:ecr:us-east-1:123456789012:repository/q',
+                        :digest, :proof, 'DELETING', :token, 120, 100
+                    )
+                """), {
+                    'revision': revision_id,
+                    'digest': _DIGEST,
+                    'proof': str(uuid.uuid4()),
+                    'token': str(uuid.uuid4()),
+                })
+            connection.execute(
+                sqlalchemy.text("""
+                    UPDATE container_image_qualification_mutation
+                    SET state = 'RESTORING',
+                        mutation_lease_token = NULL,
+                        mutation_lease_expires_at = NULL,
+                        updated_at = 121
+                    WHERE id = 'global'
+                """))
+            mutation = connection.execute(
+                sqlalchemy.text("""
+                    SELECT id, owner_profile_revision_id, state,
+                           mutation_lease_token, mutation_lease_expires_at,
+                           updated_at
+                    FROM container_image_qualification_mutation
+                """)).one()
+            assert tuple(mutation) == ('global', revision_id, 'RESTORING', None,
+                                       None, 121)
+            connection.execute(
+                sqlalchemy.text("""
+                    INSERT INTO container_image_operations
+                        (id, authority_id, scope, actor_hash, kind,
+                         idempotency_key, request_hash, state, result_kind,
+                         result_id, lease_token, lease_expires_at,
+                         teardown_deadline, created_at, updated_at)
+                    SELECT 'migration-operation-' || value::text, :authority,
+                           'research', :actor, 'PROFILE_CANARY',
+                           'migration-canary-' || value::text, :request_hash,
+                           CASE WHEN value = 1 THEN 'RUNNING' ELSE 'PENDING' END,
+                           CASE WHEN value = 1
+                                THEN NULL ELSE 'profile_revision' END,
+                           CASE WHEN value = 1 THEN NULL ELSE :revision END,
+                           CASE WHEN value = 1 THEN 'lease' ELSE NULL END,
+                           CASE WHEN value = 1 THEN 1000 ELSE NULL END,
+                           CASE WHEN value = 1 THEN 1000 ELSE NULL END,
+                           value, value
+                    FROM generate_series(1, 1000) AS value
+                """), {
+                    'authority': str(uuid.uuid4()),
+                    'actor': '1' * 64,
+                    'request_hash': '2' * 64,
+                    'revision': revision_id,
+                })
+            connection.exec_driver_sql('ANALYZE container_image_operations')
+            connection.exec_driver_sql('SET LOCAL enable_seqscan = off')
+            plan = connection.execute(
+                sqlalchemy.text("""
+                    EXPLAIN (FORMAT JSON, COSTS OFF)
+                    SELECT 1 FROM container_image_operations
+                    WHERE kind = 'PROFILE_CANARY'
+                      AND state = 'RUNNING'
+                    LIMIT 1
+                """)).scalar_one()
+        assert index_name in json.dumps(plan)
+
+        with migration_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text(
+                    'DELETE FROM container_image_qualification_mutation'))
+        invalid_rows = (
+            {
+                'id': 'not-global',
+                'state': 'RESTORING',
+                'token': None,
+                'expires': None,
+                'updated': 1,
+            },
+            {
+                'id': 'global',
+                'state': 'DELETING',
+                'token': None,
+                'expires': 2,
+                'updated': 1,
+            },
+            {
+                'id': 'global',
+                'state': 'RESTORING',
+                'token': 'unexpected',
+                'expires': 2,
+                'updated': 1,
+            },
+            {
+                'id': 'global',
+                'state': 'DELETING',
+                'token': 'lease',
+                'expires': 1,
+                'updated': 1,
+            },
+        )
+        for row in invalid_rows:
+            with pytest.raises(sqlalchemy.exc.IntegrityError):
+                with migration_engine.begin() as connection:
+                    connection.execute(
+                        sqlalchemy.text("""
+                            INSERT INTO container_image_qualification_mutation (
+                                id, owner_profile_revision_id, owner_target,
+                                owner_target_fingerprint, repository_arn,
+                                runtime_digest, lifecycle_proof_id, state,
+                                mutation_lease_token,
+                                mutation_lease_expires_at, updated_at
+                            ) VALUES (
+                                :id, :revision, 'primary',
+                                'target-fingerprint',
+                                'arn:aws:ecr:us-east-1:123456789012:repository/q',
+                                :digest, :proof, :state, :token, :expires,
+                                :updated
+                            )
+                        """), {
+                            **row,
+                            'revision': revision_id,
+                            'digest': _DIGEST,
+                            'proof': str(uuid.uuid4()),
+                        })
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
+@pytest.mark.parametrize('index_ddl', [
+    ('CREATE INDEX '
+     'ix_container_image_operations_running_canary_revision '
+     'ON container_image_operations (state)'),
+    ('CREATE INDEX '
+     'ix_container_image_operations_running_canary_revision '
+     'ON container_image_operations (result_id) '
+     "WHERE kind = 'PROFILE_CANARY' AND state = 'RUNNING' "
+     "AND result_kind = 'profile_revision'"),
+    ('CREATE UNIQUE INDEX '
+     'ix_container_image_operations_running_canary_revision '
+     'ON container_image_operations (result_id) '
+     "WHERE kind = 'PROFILE_CANARY' AND state = 'RUNNING'"),
+],
+                         ids=('wrong-column', 'wrong-predicate', 'unique'))
+def test_migration_026_rejects_malformed_running_canary_index(
+        postgres_engine, index_ddl: str) -> None:
+    migration_schema = f'image_canary_collision_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    try:
+        _prepare_image_schema_for_migration_026(migration_engine)
+        with migration_engine.begin() as connection:
+            connection.exec_driver_sql(index_ddl)
+        with pytest.raises(RuntimeError, match='unexpected shape'):
+            _autocommit_migration_call(migration_engine, migration_026.upgrade)
+        assert not sqlalchemy.inspect(migration_engine).has_table(
+            'container_image_qualification_mutation')
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
+def test_migration_026_accepts_exact_existing_running_canary_index(
+        postgres_engine) -> None:
+    migration_schema = f'image_canary_existing_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    index_name = 'ix_container_image_operations_running_canary_revision'
+    try:
+        _prepare_image_schema_for_migration_026(migration_engine)
+        with migration_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'CREATE INDEX {index_name} '
+                'ON container_image_operations (result_id) '
+                "WHERE kind = 'PROFILE_CANARY' AND state = 'RUNNING'")
+        _autocommit_migration_call(migration_engine, migration_026.upgrade)
+        assert sqlalchemy.inspect(migration_engine).has_table(
+            'container_image_qualification_mutation')
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
+
+
+def test_migration_026_repairs_invalid_running_canary_index_residue(
+        postgres_engine) -> None:
+    migration_schema = f'image_canary_repair_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {migration_schema}')
+    migration_engine = _schema_engine(postgres_engine, migration_schema)
+    migration_026 = importlib.import_module(
+        'sky.schemas.db.global_user_state.'
+        '026_container_image_running_canary_index')
+    index_name = 'ix_container_image_operations_running_canary_revision'
+    try:
+        _prepare_image_schema_for_migration_026(migration_engine)
+        with migration_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'CREATE INDEX {index_name} '
+                'ON container_image_operations (result_id) '
+                "WHERE kind = 'PROFILE_CANARY' AND state = 'RUNNING'")
+            connection.execute(
+                sqlalchemy.text('UPDATE pg_index SET indisvalid = FALSE, '
+                                'indisready = FALSE '
+                                f"WHERE indexrelid = '{index_name}'::regclass"))
+        _autocommit_migration_call(migration_engine, migration_026.upgrade)
+        with migration_engine.connect() as connection:
+            state = connection.execute(
+                sqlalchemy.text("""
+                    SELECT indisvalid, indisready
+                    FROM pg_index
+                    WHERE indexrelid =
+                        'ix_container_image_operations_running_canary_revision'
+                        ::regclass
+                """)).one()
+        assert tuple(state) == (True, True)
+        assert sqlalchemy.inspect(migration_engine).has_table(
+            'container_image_qualification_mutation')
+    finally:
+        migration_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {migration_schema} CASCADE')
 
 
 def test_safe_alembic_upgrade_serializes_api_processes_with_postgres_lock(
@@ -7769,7 +9035,7 @@ finally:
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
             ).scalar_one()
-        assert revision == '025'
+        assert revision == '026'
     finally:
         for process in processes:
             if process.poll() is None:
@@ -7912,7 +9178,7 @@ def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
             assert connection.execute(
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
-            ).scalar_one() == '025'
+            ).scalar_one() == '026'
         assert sqlalchemy.inspect(fresh_engine).has_table(
             'container_image_catalog')
     finally:

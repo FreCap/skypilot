@@ -115,6 +115,7 @@ here.
 | Profile | Complete registry topology and policy snapshot | server configuration |
 | Access binding | Credential-free reference to one qualified read, write, pull, or delete authority | provider adapter |
 | Qualification | Timestamped proof that one profile revision and its access bindings are usable | background worker |
+| Qualification mutation barrier | The one catalog-wide durable fence around qualification-digest deletion and restoration | qualification workers |
 | Registry shard | One preprovisioned physical repository and its hard admission budget | shard repository |
 | Location | One digest in one physical registry target | materialization service |
 | Demand | Durable placement pin shared by one logical deployment and target | demand transaction service |
@@ -130,7 +131,7 @@ sky/container_images/
   models.py                 value objects and validators
   config.py                 profile and workspace policy snapshots
   catalog_state.py          artifact, source, publication, and release aggregate
-  topology_state.py         profiles, budgets, shards, locations, leases, workers
+  topology_state.py         profiles, global qualification barrier, shards, leases
   demand_state.py           durable demands, pull plans, tombstones, watermarks
   transactions.py           cross-repository PostgreSQL transitions
   publication.py            explicit publication service
@@ -601,11 +602,12 @@ resolves the revision's immutable workspace/profile identity, acquires that
 profile's transaction advisory lock, locks the candidate revision, samples
 `clock_timestamp()`, and overwrites any producer-supplied `observed_at` before
 hashing and storing the evidence. Candidate-shard and inventory finalizers take
-the profile lock before their revision and shard rows. Runtime-canary completion
-retains the documented operation-before-profile exception: canary claims already
-lock operation rows before their profile cost row, while no profile-lock owner
-subsequently requests a canary-operation row, so the exception serializes
-activation without introducing the inverse cycle.
+the profile lock before their revision and shard rows. Generic non-copy
+attestations may still be recorded while the catalog mutation barrier exists;
+they cannot become actionable because staging, activation, canary admission,
+and qualification-copy publication perform the later barrier check. Canary
+claim retains the documented operation-before-profile order and then acquires
+the shared catalog qualification lock as its final coordination lock.
 
 Producer clocks remain useful only for local diagnostics and never determine
 freshness, ordering, or whether provider work is due. Copy-role infrastructure,
@@ -1352,13 +1354,22 @@ container_image_consumer_watermarks
 container_image_workers
 ```
 
+Global-state revision 025 adds only restart-safe canary child evidence to the
+operation row. Revision 026 adds
+`container_image_qualification_mutation`, whose primary key is constrained to
+the single literal `global` row, and the partial index over `result_id` for
+`RUNNING` `PROFILE_CANARY` operations. The table is empty while qualification
+mutation is idle and contains exactly one `DELETING` or `RESTORING` owner while
+the catalog-wide barrier is active.
+
 The catalog singleton contains only a stable authority UUID and creation time.
 Migration/bootstrap is its sole creator. Runtime reads require exactly the
 fixed singleton row, a valid UUID, and a positive creation time; missing,
 additional, or malformed authority state fails closed instead of silently
 creating a new realm identity.
-There is no forced RLS policy, API-version GUC, runtime-wide advisory lock,
-global configuration apply ledger, realm generation, dynamic repository
+Apart from the one qualification-only catalog shared/exclusive advisory lock,
+there is no forced RLS policy, API-version GUC, general runtime-wide advisory
+lock, global configuration apply ledger, realm generation, dynamic repository
 creation, catalog projection, or facet table in v0. A physical shard row is the
 small admission primitive required to enforce the profile's permanent artifact
 count and conservative declared-byte ceilings. It is a custody limit, not a
@@ -1375,6 +1386,10 @@ Important constraints include:
   for RUNNING PROFILE_CANARY. A generated `canary_claimable_at` is `updated_at`
   for pending canaries, the later of lease expiry and `updated_at` for running
   canaries, and null for every unrelated or terminal operation;
+- zero or one catalog-wide qualification mutation row with literal ID `global`,
+  immutable owner revision/target/repository/digest/proof identity across
+  `DELETING` and `RESTORING`, a required unexpired lease only in `DELETING`,
+  and row deletion as the only idle representation;
 - one permanent custody row per `(workspace, profile)`, written atomically with
   the first READY publication and carrying the immutable physical-manifest hash
   plus its first profile revision. Profile staging and activation use this
@@ -1473,14 +1488,27 @@ Every command that locks more than one participating row uses this order:
 5. publication and operation rows, ordered by ID; and
 6. consumer watermark and demand rows, ordered by ID.
 
+Qualification claim, authorization, copy, staging, activation, and lifecycle
+transitions acquire the catalog qualification advisory lock in the required
+shared or exclusive mode only after their applicable ordered rows above, then
+inspect the singleton barrier. It is their final coordination lock. Generic
+non-copy attestation writes do not acquire it.
+
 Initial insert races rely on unique constraints and restart the transaction.
 No ordinary repository function acquires an earlier class after a later one.
 Canonical completion and publication retry both lock location before
 publication. The PROFILE_CANARY queue is the one explicit class-order
-exception: claim and
-completion both lock their operation row before the referenced profile revision.
-No profile-locking transaction acquires a canary operation, so this consistent
-one-way edge cannot close a cycle.
+exception: claim and completion both lock their operation row before the
+referenced profile revision. Claim then takes the shared catalog qualification
+lock. A lifecycle transition locks its owner profile/revision, takes the
+exclusive catalog lock, and reads the catalog-wide running-canary predicate
+without locking operation rows. No catalog-lock owner requests an earlier lock,
+so this consistent one-way edge cannot close a cycle. On the same profile,
+either lifecycle waits for claim's profile lock without holding the catalog
+lock, or claim waits for lifecycle's profile lock without holding the catalog
+lock. Across profiles, a claim may wait for lifecycle's exclusive catalog lock,
+but lifecycle performs only the nonlocking indexed running-canary read and can
+commit without requesting the claim's operation or profile row.
 Inspection completion reads its publication optimistically, locks profile/shard,
 artifact/source, and location rows first, then locks and rechecks the publication
 token; an invalid token rolls the entire transaction back. Demand READY commit
@@ -1783,21 +1811,118 @@ lifecycle-authority proof, not a permanent desired state for the qualification
 artifact. Once exact absence is attested, the copy worker restores the same
 fixed digest for later manual and automatic canaries. A lifecycle attestation
 for that digest remains the completed deletion proof and must not delete the
-restored copy again. Every completed exact-absence attestation carries an
-opaque lifecycle proof ID. Copy availability uses an explicit restoration
-handshake, not wall-clock ordering: the restored copy attestation names the
-exact lifecycle proof ID it follows. A canary request or worker must reject a
-copy when the same-digest exact-absence proof is not acknowledged by that
-restoration field, while the copy worker treats that state as immediately due
-even when every runtime attestation remains fresh. A matching restoration field
-makes the digest eligible again. A rolling upgrade stamps an existing
-same-digest legacy exact-absence proof with a new proof ID without repeating
-provider deletion; any old worker that subsequently deletes and overwrites that
-proof removes the ID, closes admission again, and is safely superseded by
-another upgrade-and-restore cycle. This remains unambiguous when deletion and
-restoration occur in the same database-clock second, keeps repeat canaries
-nonblocking after bounded reconciliation, and does not weaken the initial copy,
-runtime, delete, and exact-absence activation gate.
+restored copy again.
+
+The qualification repository and its fixed digest are physical catalog state,
+not profile-revision state. Every workspace and every old, desired, or active
+profile revision may refer to the same repository. A revision-local lifecycle
+epoch therefore cannot fence deletion: a worker for workspace A could otherwise
+delete the digest while a canary for workspace B or an older revision is using
+it. Protocol 2 instead has one durable catalog-wide qualification mutation row.
+V0 deliberately serializes every physical qualification target through this
+single row; qualification is infrequent, and one conservative global fence is
+smaller and safer than a partially keyed lock hierarchy.
+
+The singleton row exists only while a destructive mutation is active. It stores
+the owner profile revision, target fingerprint, repository ARN, runtime digest,
+opaque proof ID, and exactly one state: `DELETING` or `RESTORING`. `DELETING`
+also carries a database-clock lease token and expiry; `RESTORING` carries
+neither. Row absence means idle. The proof and owner revision remain stable
+across both states and across a delete-lease takeover. An expired delete lease
+may be rotated only for that same durable owner and proof; it does not let
+another revision adopt the mutation.
+
+The participating transactions share one transaction-scoped advisory lock
+keyed by the catalog authority. Ordinary canary claim, launch authorization,
+qualification copy snapshot/publication, profile staging, and activation use
+the shared form and require the singleton row to be absent. Lifecycle state
+transitions and owner restoration publication use the exclusive form. Generic
+non-copy attestation writes do not need the barrier because none can admit work
+or activate a revision by itself. The advisory lock is held only for PostgreSQL
+decisions, never over provider I/O; the durable row keeps the interval closed
+after the transaction commits.
+
+The catalog advisory lock is the last lock in every participating transaction,
+after the operation row when present, profile advisory lock and revision row,
+and provider budget when present. No transaction acquires one of those earlier
+locks after it holds the catalog lock. A lifecycle transition first locks its
+owner profile and revision, takes the exclusive catalog lock, and evaluates the
+catalog-wide zero-running predicate without locking canary operation rows. This
+preserves the existing operation-to-profile order while preventing an inverse
+cycle.
+
+To begin deletion, the lifecycle worker locks its owner profile and revision,
+takes the exclusive catalog lock, requires the barrier to be absent, revalidates
+the exact owner and physical target, and proves that no `PROFILE_CANARY`
+operation is `RUNNING` anywhere in the catalog. The zero-running predicate is
+catalog-wide, not scoped to a workspace, profile, revision, target, or result
+projection: every `PROFILE_CANARY` row in `RUNNING` counts even when an older
+or future binary left its result kind or ID null or unknown. The matching
+partial index has that exact kind-and-state predicate. It then commits
+`DELETING`, a new proof ID, and an execution lease before acquiring lifecycle
+credentials or starting provider I/O. Every lease comparison samples the
+database clock only after the final catalog lock has been acquired. A claim
+that has not yet reached the final shared barrier check cannot commit
+`RUNNING`; either a completed claim prevents deletion, or `DELETING` commits
+first and makes that claim roll back without reserving cost.
+
+Every lifecycle credential acquisition, delete request, and exact readback is
+fenced by process-drain state and exact database ownership of the singleton
+row, owner revision, target fingerprint, repository ARN, digest, proof, state,
+unexpired lease, and lease token. A background heartbeat and the synchronous
+pre-call fence renew that lease; the interval exceeds the adapter's
+bounded, single-attempt AWS connect and read timeouts. After expiry, a successor
+for the same durable owner keeps the proof but rotates the token, so a stale
+worker cannot issue another provider call or complete either state. An
+ambiguous provider outcome, expired lease, failed fence, or failed CAS leaves
+the global barrier present and all new qualification admission closed.
+
+After exact absence is proved, the current owner locks its profile and revision,
+takes the exclusive catalog lock, and CASes `DELETING` to `RESTORING` without
+changing the owner revision, physical identity, or proof. The provider
+identities remain split: the lifecycle worker cannot write ECR, and only the
+copy worker reconciling that recorded owner may snapshot the exact `RESTORING`
+proof and perform its copy. No ordinary or other revision's copy may run while
+the row exists. The restoration owner copies and exactly verifies the recorded
+digest, then reacquires its profile/revision locks followed by the exclusive
+catalog lock and in one transaction CASes the exact `RESTORING` row, records the
+owner revision's restored-copy evidence against the same lifecycle proof, and
+deletes the singleton row. Admission opens only at that atomic commit. A failed
+CAS may leave a physically restored digest, but the row remains and the
+recorded owner must reverify it before clearing the barrier.
+Worker restart recovery reads the singleton owner directly and places that
+revision and target ahead of the ordinary bounded eight-revision page:
+`DELETING` routes first to lifecycle recovery and `RESTORING` routes first to
+copy recovery. Unrelated repeatedly failing revisions therefore cannot strand
+the catalog-wide barrier.
+
+A canary request may be durably queued while another qualification mutation is
+active, including for the mutation owner whose local copy evidence temporarily
+reflects `DELETING` or exact absence, but claim is authoritative. Owner
+queueing requires the exact singleton owner, target, repository, digest, proof,
+and state; unrelated missing-copy evidence still fails. Claim locks its
+operation, profile revision, and cost row, then takes the shared catalog lock,
+requires no barrier, checks exact revision evidence, and reserves worst-case
+daily cost in the same transaction. Persisting `child_launch_id` records only
+intent. Immediately before the first billable provider create, launch
+authorization repeats the shared-lock barrier check after its
+operation/profile locks and rechecks the operation lease, child ID, teardown
+deadline, revision, target, and copy evidence. Qualification copy snapshot and
+publication, profile staging, and activation also repeat the shared check after
+their ordinary locks. Thus a provider readback, a recovered launch intent, a
+new workspace, or another revision cannot cross either `DELETING` or
+`RESTORING`. Existing workload pull plans, generic non-copy evidence, and
+ordinary catalog image copies do not use the qualification repository and
+remain usable.
+
+Legacy revision-local lifecycle proofs are evidence only and never substitute
+for the catalog barrier. After the first protocol-2 rollout is quiesced, the new
+workers revalidate the physical digest through the global flow before admitting
+new canaries or activating a revision. Helm renders the lifecycle worker
+Deployment with `Recreate`, which drains the old destructive worker before a new
+worker can create or advance the singleton mutation. Copy and canary Deployments
+remain `RollingUpdate`; the durable barrier and provider leases fence their
+cross-version work.
 
 The runtime binding also declares the minimum launch tuple needed for an
 automatic canary. EC2 qualification pins one IAM role, instance-profile name,
@@ -1967,7 +2092,10 @@ It also creates one fixed, non-catalog qualification repository per region. That
 repository uses the same encryption and rendered access-policy template but is
 outside workspace capacity. Copy, actual-runtime-pull, and lifecycle canaries use
 only bounded untagged digests there, and the lifecycle attestation verifies their
-removal. A qualification digest is never returned in a workload pull plan.
+removal. The repository is intentionally shared by all declared workspaces and
+profile revisions in the catalog, which is why its delete/restore barrier is
+catalog-wide rather than revision-scoped. A qualification digest is never
+returned in a workload pull plan.
 
 `authority-base32` encodes the 128-bit catalog authority. `workspace-hash` is a
 128-bit, versioned hash of authority plus normalized workspace name. Terraform
@@ -2915,7 +3043,37 @@ CLI or Dashboard locates such a publication for explicit retry.
    qualification manifest and stage the desired profile revision without
    activating it.
 5. Deploy one copy worker, one lifecycle worker, and one runtime-canary worker
-   with separate identities.
+   with separate identities. The lifecycle Deployment uses `Recreate`, so
+   normal upgrades and rollbacks never overlap lifecycle binaries with
+   destructive provider authority. Copy and runtime-canary Deployments use
+   `RollingUpdate`.
+   An existing installation's first protocol-2 upgrade uses a deliberate
+   four-revision sequence performed only through Helm. The currently deployed
+   `1.1.770` chart validates `imageCanaryWorker.replicaCount` with a minimum of
+   one, so the first quiescing revision must set all three
+   `imageCopyWorker.enabled=false`, `imageLifecycleWorker.enabled=false`, and
+   `imageCanaryWorker.enabled=false`; setting the canary replica count to zero
+   is invalid. Wait for all three Deployments to disappear, for PostgreSQL to
+   contain no `RUNNING` `PROFILE_CANARY` operation anywhere in the catalog,
+   and for every already-created provider child to have verified teardown.
+   Pending operations may remain durable. Next, upgrade to the target image and
+   chart with `imageCopyWorker.enabled=true`,
+   `imageLifecycleWorker.enabled=false`,
+   `imageCanaryWorker.enabled=true`, and
+   `imageCanaryWorker.replicaCount=0` set explicitly. The target chart supports
+   and renders that zero-replica maintenance state; the explicit enable is
+   required because `--reuse-values` otherwise preserves the first revision's
+   `false`. Wait for the migration Job, API replacement, and copy-worker
+   rollout to prove that no pre-protocol API or image-worker pod remains. Then
+   use the same target chart to set `imageLifecycleWorker.enabled=true` while
+   canary replicas remain zero. Wait for the lifecycle `Recreate` rollout,
+   global `DELETING`-to-`RESTORING` convergence, owner recopy, atomic barrier
+   removal, and physical digest verification. Finally, use the same target
+   chart with `imageCanaryWorker.enabled=true` and
+   `imageCanaryWorker.replicaCount=1`. Every revision preserves existing
+   values, pins the exact image, waits for the migration Job and workloads, and
+   rolls back on failure. This one-time quiescing prevents any pre-protocol
+   worker from crossing a barrier that only the new binary understands.
 6. Let each worker attest only its own capability, run actual-principal EC2 and
    EKS canaries, and atomically activate the desired generation only after all
    repository, quota, KMS, policy, runtime, and fingerprint evidence is fresh.
@@ -2926,10 +3084,19 @@ CLI or Dashboard locates such a publication for explicit retry.
 9. Enable production only if the operations or performance gate passes.
 
 Rollback first disables profile activation and new publication, then stops
-worker claims, and only then rolls old API binaries. Existing digest pull plans
-remain usable and PostgreSQL intent is preserved. Old binaries tolerate the
-additive 024 schema. Unchanged direct digest-pinned OCI behavior remains the
-escape hatch.
+worker claims, and only then rolls old API binaries. A rollback across the
+protocol-2 boundary must first quiesce all image workers through Helm, using
+`enabled=false` for a chart such as `1.1.770` whose canary schema rejects zero
+and explicit `enabled=true, replicaCount=0` only for the target chart's canary
+maintenance state. It then waits for zero catalog-wide `RUNNING`
+`PROFILE_CANARY` operations and verified cleanup of every child, and keeps
+copy, canary, and lifecycle workers quiesced while returning to a pre-protocol
+binary. A blind `helm rollback` that can restore any pre-protocol image worker
+is forbidden. Keep all image workers quiesced and roll forward, or perform the
+documented empty-database downgrade before starting the older workers.
+Existing digest pull plans remain usable and PostgreSQL intent is preserved.
+Old binaries tolerate the additive 024 schema. Unchanged direct digest-pinned
+OCI behavior remains the escape hatch.
 Downgrade is a separate manual operation allowed only after every new process is
 drained and every image table is empty; it is never part of Helm rollback.
 
@@ -2971,16 +3138,25 @@ drained and every image table is empty; it is never part of Helm rollback.
   authority, and never uploads the parent or an unselected child.
 - Managed EC2 pulls use a prequalified native helper and never install AWS CLI or
   run per-deployment `docker login` on the image hot path.
+- A qualification digest delete is globally serialized across all workspaces,
+  profiles, revisions, and physical targets; no claim, provider create,
+  qualification copy, stage, or activation can cross its durable
+  `DELETING` or `RESTORING` barrier except the exact recorded owner's
+  CAS-protected restoration.
 - Every mutation is idempotent, typed, and detachable without abandoning durable
   or ambiguous provider work; every read bypasses generic request rows.
 
 ### Required verification
 
-- real PostgreSQL migration, concurrency, lease, retry, and downgrade tests;
+- real PostgreSQL migration through global-state revision 026, concurrency,
+  lease, retry, and downgrade tests;
 - fresh-through-024 and literal 023-to-024 exact schema equivalence, preview
   adoption rejection for table, column, default, generated-expression,
   cluster-binding-column, constraint, foreign-key, index, and catalog-singleton
   drift, concurrent migration-lock, and mixed-023/024 feature-disabled tests;
+- 024-to-026 migration tests proving restart-safe child evidence, the exact
+  reserved running-canary index shape, and the singleton
+  qualification-mutation table and constraints;
 - old-server/new-client and new-server/old-client feature-gate tests;
 - API 61/62 behavior across launch/exec, jobs, Serve up/update, pools, nested DAGs,
   resource alternatives, forged private fields, and request config overrides;
@@ -3013,8 +3189,10 @@ drained and every image table is empty; it is never part of Helm rollback.
   duplicate environment, volume, and mount-path collisions, excludes API-only
   inputs from the Job, mounts shared database TLS material into every database
   consumer, and keeps two same-namespace source-secret grants distinct under a
-  63-character fullname; schema-bypassed template tests independently reject
-  explicit zero, sub-600, non-integral, and string canary grace values;
+  63-character fullname; asserts `RollingUpdate` for copy and canary workers
+  and `Recreate` for the destructive lifecycle worker; schema-bypassed template
+  tests independently reject explicit zero, sub-600, non-integral, and string
+  canary grace values;
 - worker kill/restart and ambiguous-outcome tests around source reads, layer
   availability/download/upload/complete, `PutImage`, exact verification, SQL
   completion, publication fan-out, eviction, and attestation activation;
@@ -3025,12 +3203,51 @@ drained and every image table is empty; it is never part of Helm rollback.
   a mismatched observed ARN, a path-qualified IAM lookup ARN that differs from
   the expected profile ARN, or a marker-free terminal record still fails
   closed;
-- qualification-copy lifecycle tests proving exact absence makes the copy
-  immediately due, an exact restoration handshake restores canary admission
-  even at the same database-clock second, the one-time lifecycle proof does not
-  delete that restored digest again, a legacy proof is upgraded without
-  provider deletion, and a request cannot create a billable canary intent
-  during the bounded post-deletion recopy window;
+- real-PostgreSQL catalog-barrier tests proving the singleton schema and
+  `DELETING`/`RESTORING` lease constraints, shared-reader versus
+  exclusive-transition advisory-lock ordering, post-lock database-clock
+  sampling, and the catalog-wide zero-`RUNNING` predicate through its exact
+  partial index even for null or unknown result projections;
+- deterministic cross-workspace and cross-revision interleavings in separate
+  PostgreSQL sessions: a `RUNNING` canary for workspace A/revision 1 prevents
+  workspace B/revision 2 from inserting `DELETING`; if B commits `DELETING`
+  first, A cannot claim, reserve cost, authorize a persisted child, start or
+  complete a qualification copy, stage a successor, or activate until the same
+  mutation reaches `RESTORING` and is cleared; generic non-copy evidence may
+  still be recorded but remains non-actionable;
+  repeat the schedule with old and desired revisions of one profile and with
+  different physical targets to prove that the intentionally global row, not a
+  coincidentally matching revision key, supplies exclusion;
+- delete-owner takeover tests proving `DELETING` is committed before any
+  credential or provider call, a successor for the same durable owner retains
+  its proof while rotating an expired token, and the old token cannot issue
+  another delete/readback or transition exact absence; an unrelated
+  workspace/revision can neither take over nor rewrite the owner identity;
+- restoration tests proving exact absence CASes the same owner/proof from
+  `DELETING` to lease-free `RESTORING`, only the recorded owner revision may
+  copy, and exact copy verification plus attestation and singleton deletion
+  commit atomically under the exclusive catalog lock; a stale owner, unrelated
+  copy, mismatched target/repository/digest/proof, or lost CAS leaves the row
+  present and every admission path closed even when bytes happen to exist;
+  eight older failing revisions cannot hide the direct `DELETING` lifecycle
+  owner or `RESTORING` copy owner from worker recovery;
+- deterministic claim/delete interleavings proving claim takes the shared
+  catalog lock after its operation/profile/cost locks and reserves worst-case
+  cost only after the barrier check: deletion wins with zero cost reserved, or
+  claim wins and the catalog-wide `RUNNING` predicate prevents deletion;
+  recovered `child_launch_id` tests prove launch authorization repeats the
+  shared barrier check immediately before EC2 or Kubernetes create; canary
+  requests for the exact mutation owner remain durably PENDING and cost-free
+  through both barrier states, then become claimable after owner restoration;
+- protocol-boundary Helm rehearsals proving the live `1.1.770` chart quiesces
+  copy, lifecycle, and canary workers with `enabled=false` because its canary
+  schema rejects replica count zero; the target chart is then explicitly
+  rendered with copy enabled, lifecycle disabled, and canary
+  `enabled=true, replicaCount=0`, proves every pre-protocol pod is gone, enables
+  lifecycle with no old/new lifecycle overlap, waits for owner restoration and
+  barrier removal, and finally restores canary
+  `enabled=true, replicaCount=1`; rollback rehearsals keep all image workers
+  quiesced rather than starting pre-protocol binaries;
 - lost-response Spot tests where cancellation first reports a terminal request
   without an instance, a request-to-instance edge appears on a later exact
   read, a late request transition cannot reuse an earlier absence interval, and

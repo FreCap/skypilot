@@ -19,6 +19,7 @@ SHARD_STATES = ('PENDING', 'READY', 'FULL', 'DRIFTED', 'DISABLED')
 DEMAND_STATES = ('WARMING', 'READY', 'FAILED', 'SUPERSEDED', 'RELEASED')
 WORKER_KINDS = ('COPY', 'LIFECYCLE', 'CANARY')
 LOCATION_LEASE_KINDS = ('COPY', 'VERIFY', 'EVICT', 'DELETE', 'READBACK')
+QUALIFICATION_MUTATION_STATES = ('DELETING', 'RESTORING')
 
 
 def _one_of(column: str, values: tuple[str, ...],
@@ -124,6 +125,45 @@ profile_custody = sqlalchemy.Table(
     sqlalchemy.Column('acquired_at', sqlalchemy.BigInteger, nullable=False),
 )
 
+qualification_mutation = sqlalchemy.Table(
+    'container_image_qualification_mutation',
+    metadata,
+    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column(
+        'owner_profile_revision_id',
+        sqlalchemy.Text,
+        sqlalchemy.ForeignKey('container_image_profile_revisions.id'),
+        nullable=False),
+    sqlalchemy.Column('owner_target', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('owner_target_fingerprint',
+                      sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column('repository_arn', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('runtime_digest', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('lifecycle_proof_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('state', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('mutation_lease_token', sqlalchemy.Text),
+    sqlalchemy.Column('mutation_lease_expires_at', sqlalchemy.BigInteger),
+    sqlalchemy.Column('updated_at', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.CheckConstraint(
+        "id = 'global'",
+        name='ck_container_image_qualification_mutation_singleton'),
+    _one_of('state', QUALIFICATION_MUTATION_STATES,
+            'ck_container_image_qualification_mutation_state'),
+    sqlalchemy.CheckConstraint(
+        "(state = 'DELETING' AND mutation_lease_token IS NOT NULL "
+        'AND mutation_lease_expires_at IS NOT NULL '
+        "AND mutation_lease_expires_at > updated_at) OR (state = 'RESTORING' "
+        'AND mutation_lease_token IS NULL '
+        'AND mutation_lease_expires_at IS NULL)',
+        name='ck_container_image_qualification_mutation_lease'),
+    sqlalchemy.CheckConstraint(
+        "owner_target <> '' AND owner_target_fingerprint <> '' "
+        "AND repository_arn <> '' AND runtime_digest <> '' "
+        "AND lifecycle_proof_id <> '' AND updated_at >= 0",
+        name='ck_container_image_qualification_mutation_identity'),
+)
+
 operations = sqlalchemy.Table(
     'container_image_operations',
     metadata,
@@ -188,6 +228,10 @@ operations = sqlalchemy.Table(
         'terminal_expires_at',
         'id',
         postgresql_where=sqlalchemy.text('terminal_expires_at IS NOT NULL')),
+    sqlalchemy.Index('ix_container_image_operations_running_canary_revision',
+                     'result_id',
+                     postgresql_where=sqlalchemy.text(
+                         "kind = 'PROFILE_CANARY' AND state = 'RUNNING'")),
 )
 
 images = sqlalchemy.Table(
@@ -827,6 +871,7 @@ workers = sqlalchemy.Table(
 TABLES = (
     catalog,
     profile_revisions,
+    qualification_mutation,
     operations,
     images,
     sources,

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import dataclasses
 import hashlib
 import json
@@ -21,6 +22,10 @@ from sky.container_images import schema
 
 class StaleProfileRevisionError(ValueError):
     """A worker or activation attempted to use a superseded revision."""
+
+
+class QualificationMutationInProgressError(ValueError):
+    """A global qualification delete or restoration is still active."""
 
 
 class CanonicalCustodyChangeError(ValueError):
@@ -328,6 +333,36 @@ def lock_profile_mutation_in_session(session: orm.Session, *, workspace: str,
         {'key': f'skypilot:container-image-profile:{lock_key}'})
 
 
+def lock_qualification_mutation_in_session(session: orm.Session, *,
+                                           exclusive: bool) -> None:
+    """Locks the catalog-wide destructive qualification barrier."""
+    function = ('pg_advisory_xact_lock'
+                if exclusive else 'pg_advisory_xact_lock_shared')
+    session.execute(
+        sqlalchemy.text(f'SELECT {function}(hashtextextended(:key, 0))'),
+        {'key': 'skypilot:container-image-qualification-mutation'})
+
+
+def get_qualification_mutation_in_session(
+    session: orm.Session,
+    *,
+    exclusive: bool,
+) -> sqlalchemy.engine.RowMapping | None:
+    """Locks and returns the singleton destructive qualification barrier."""
+    lock_qualification_mutation_in_session(session, exclusive=exclusive)
+    return session.execute(
+        sqlalchemy.select(schema.qualification_mutation).where(
+            schema.qualification_mutation.c.id == 'global')).mappings().first()
+
+
+def assert_qualification_mutation_idle_in_session(session: orm.Session) -> None:
+    """Acquires a shared barrier lock and rejects active mutation windows."""
+    if get_qualification_mutation_in_session(session,
+                                             exclusive=False) is not None:
+        raise QualificationMutationInProgressError(
+            'Qualification delete or restoration is in progress.')
+
+
 def lock_profile_revision_mutation_in_session(
         session: orm.Session,
         profile_revision_id: str) -> sqlalchemy.engine.RowMapping:
@@ -444,6 +479,9 @@ def stage_profile_revision(*,
             raise ValueError(
                 'Registry profile revision is no longer operational.')
 
+        # Superseding the barrier owner could strand a provider delete or let a
+        # replacement revision certify bytes before the owner restores them.
+        assert_qualification_mutation_idle_in_session(session)
         custody = session.execute(
             sqlalchemy.select(schema.profile_custody).where(
                 schema.profile_custody.c.workspace == workspace,
@@ -777,13 +815,13 @@ def reserve_canary_cost(
     profile_revision_id: str,
     expected_generation: int,
     worst_case_microusd: int,
+    admission_check: Callable[[ProfileRevisionRecord], bool] | None = None,
     now: int | None = None,
 ) -> tuple[ProfileRevisionRecord, int]:
     """Hard-reserves one canary's worst-case daily cost before launch."""
     table = schema.profile_revisions
-    row = session.execute(
-        sqlalchemy.select(table).where(table.c.id == profile_revision_id).
-        with_for_update()).mappings().one()
+    row = lock_profile_revision_mutation_in_session(session,
+                                                    profile_revision_id)
     current = catalog_state.database_epoch(session, now=now)
     utc_day = time.strftime('%Y-%m-%d', time.gmtime(current))
     if (str(row['state']) not in (models.ImageProfileState.QUALIFYING.value,
@@ -791,6 +829,10 @@ def reserve_canary_cost(
             int(row['desired_generation']) != expected_generation):
         raise StaleProfileRevisionError(
             'Canary no longer matches the desired profile revision.')
+    revision = _profile(row)
+    if admission_check is not None and not admission_check(revision):
+        raise StaleProfileRevisionError(
+            'Canary qualification copy is not available.')
     reserved = (0 if row['canary_window_day'] != utc_day else int(
         row['canary_reserved_microusd']))
     if (worst_case_microusd < 0 or reserved + worst_case_microusd > int(

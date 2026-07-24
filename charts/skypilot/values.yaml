@@ -410,7 +410,8 @@ imageLifecycleWorker:
 imageCanaryWorker:
   # @schema type: [boolean]
   enabled: false
-  # @schema type: [integer]; minimum: 1
+  # Zero is supported for protocol-boundary maintenance and safe quiescing.
+  # @schema type: [integer]; minimum: 0
   replicaCount: 1
   # Maximum temporary compute canaries handled concurrently by each replica.
   # @schema type: [integer]; minimum: 1

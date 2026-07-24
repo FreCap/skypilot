@@ -1418,6 +1418,7 @@ def activate_profile(
                 != expected_attestations_hash):
             raise topology_state.StaleProfileRevisionError(
                 'Qualification result no longer matches the desired revision.')
+        topology_state.assert_qualification_mutation_idle_in_session(session)
         custody = session.execute(
             sqlalchemy.select(schema.profile_custody).where(
                 schema.profile_custody.c.workspace == desired['workspace'],
