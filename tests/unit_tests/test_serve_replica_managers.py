@@ -5750,6 +5750,169 @@ class TestLogicalCapacityPlanning:
 
         assert [call.args[0] for call in terminate.call_args_list] == [1, 3]
 
+    def test_logical_scale_down_batches_absent_finished_launch_cleanup(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        victims = [
+            self._ready_backend(replica_id, 1) for replica_id in range(1, 16)
+        ]
+        for victim in victims:
+            victim.status_property.first_ready_time = None
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._replica_to_request_id[1] = 'request-1'
+        mgr._replica_to_launch_cancelled[1] = True
+        mgr._replica_to_logical_launch_fence[1] = (1, 4)
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+        mgr._terminate_replica = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=victims), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value=set()) as cluster_inventory, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=True) as remove_batch, \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id') as point_read, \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists') as cluster_exists, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replica') as remove_one:
+            mgr.scale_down_logically_batch(list(range(1, 16)), 0, 1, 4)
+
+        cluster_inventory.assert_called_once_with(victims)
+        remove_batch.assert_called_once_with(
+            'svc',
+            list(range(1, 16)),
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'))
+        mgr._terminate_replica.assert_not_called()
+        point_read.assert_not_called()
+        cluster_exists.assert_not_called()
+        remove_one.assert_not_called()
+        assert 1 not in mgr._launch_thread_pool
+        assert 1 not in mgr._replica_to_request_id
+        assert 1 not in mgr._replica_to_launch_cancelled
+        assert 1 not in mgr._replica_to_logical_launch_fence
+
+    def test_logical_scale_down_batch_preserves_live_cleanup_paths(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        victims = [
+            self._ready_backend(replica_id, 1) for replica_id in (1, 2, 3, 4)
+        ]
+        for victim in victims:
+            victim.status_property.first_ready_time = None
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        live_launch = mock.Mock()
+        live_launch.is_alive.return_value = True
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._launch_thread_pool[3] = live_launch
+        mgr._down_thread_pool[4] = mock.Mock()
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+        mgr._terminate_replica = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=victims), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value={victims[1].cluster_name}) as cluster_inventory, \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=True) as remove_batch:
+            mgr.scale_down_logically_batch([1, 2, 3, 4], 0, 1, 4)
+
+        cluster_inventory.assert_called_once_with(victims[:2])
+        remove_batch.assert_called_once_with(
+            'svc', [1],
+            'incarnation-a',
+            expected_controller_owner=(101, '10.0.0.1'))
+        assert [call.args[0] for call in mgr._terminate_replica.call_args_list
+               ] == [2, 3, 4]
+        assert 1 not in mgr._launch_thread_pool
+        assert 3 in mgr._launch_thread_pool
+        assert 4 in mgr._down_thread_pool
+
+    def test_logical_scale_down_batch_keeps_tracking_on_fence_loss(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        victim = self._ready_backend(1, 1)
+        victim.status_property.first_ready_time = None
+        finished_launch = mock.Mock()
+        finished_launch.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = finished_launch
+        mgr._replica_to_request_id[1] = 'request-1'
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=4,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 4, 0)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[victim]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'get_existing_replica_cluster_names',
+                 return_value=set()), \
+             mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               return_value=False), \
+             pytest.raises(RuntimeError, match='incarnation changed'):
+            mgr.scale_down_logically_batch([1], 0, 1, 4)
+
+        assert 1 in mgr._launch_thread_pool
+        assert 1 in mgr._replica_to_request_id
+
     def test_logical_scale_down_batch_matches_sequential_singletons(self):
 
         def _run(batch: bool):
