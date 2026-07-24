@@ -2529,6 +2529,27 @@ def get_service_mode_and_hash(
     return bool(row[0]), row[1]
 
 
+def get_service_mode_and_hashes(
+        service_names: list[str]) -> dict[str, tuple[bool, str | None]]:
+    """Batch raw mode/hash identity reads for existing service rows."""
+    if not service_names:
+        return {}
+    names = sorted(set(service_names))
+    engine = _db_manager.get_engine()
+    rows = []
+    with orm.Session(engine) as session:
+        for start in range(0, len(names), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            name_batch = names[start:start +
+                               _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            rows.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        services_table.c.name, services_table.c.pool,
+                        services_table.c.hash).where(
+                            services_table.c.name.in_(name_batch))).fetchall())
+    return {row.name: (bool(row.pool), row.hash) for row in rows}
+
+
 def add_ephemeral_storage_cleanup_intent(service_name: str, resource_scope: str,
                                          storage_generation: str,
                                          yaml_content: str, pool: bool,
@@ -4414,6 +4435,32 @@ def get_latest_committed_version(service_name: str) -> int | None:
                         version_specs_table.c.yaml_content.isnot(
                             None)))).fetchone()
     return result[0] if result else None
+
+
+def get_latest_committed_versions(service_names: list[str]) -> dict[str, int]:
+    """Return the latest committed version for each requested service."""
+    if not service_names:
+        return {}
+    names = sorted(set(service_names))
+    engine = _db_manager.get_engine()
+    rows = []
+    with orm.Session(engine) as session:
+        for start in range(0, len(names), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
+            name_batch = names[start:start +
+                               _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
+            rows.extend(
+                session.execute(
+                    sqlalchemy.select(
+                        version_specs_table.c.service_name,
+                        sqlalchemy.func.max(
+                            version_specs_table.c.version).label('version'),
+                    ).where(
+                        sqlalchemy.and_(
+                            version_specs_table.c.service_name.in_(name_batch),
+                            version_specs_table.c.yaml_content.isnot(None),
+                        )).group_by(
+                            version_specs_table.c.service_name)).fetchall())
+    return {row.service_name: int(row.version) for row in rows}
 
 
 def get_latest_committed_version_spec(

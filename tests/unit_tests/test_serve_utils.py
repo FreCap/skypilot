@@ -2087,11 +2087,13 @@ class TestHaRecoveryRetiresUnbootableRows:
                  return_value=[]), \
              mock.patch(
                  'sky.serve.serve_utils.serve_state.'
-                 'get_latest_committed_version',
-                 return_value=None), \
+                 'get_latest_committed_versions',
+                 return_value={}), \
              mock.patch(
-                 'sky.serve.serve_utils.serve_state.get_service_mode_and_hash',
-                 return_value=(False, 'incarnation-a')), \
+                 'sky.serve.serve_utils.serve_state.get_service_mode_and_hashes',
+                 return_value={
+                     'svc': (False, 'incarnation-a')
+                 }), \
              mock.patch(
                  'sky.serve.serve_utils.serve_state.'
                  'mark_unrecoverable_service_for_cleanup',
@@ -2122,11 +2124,12 @@ def test_ha_recovery_retires_raw_row_with_no_committed_version(tmp_path):
                            'get_service_liveness_snapshots',
                            return_value=[]), \
          mock.patch.object(serve_state,
-                           'get_latest_committed_version',
-                           return_value=None), \
+                           'get_latest_committed_versions', return_value={}), \
          mock.patch.object(serve_state,
-                           'get_service_mode_and_hash',
-                           return_value=(True, 'orphan-hash')), \
+                           'get_service_mode_and_hashes',
+                           return_value={
+                               'svc': (True, 'orphan-hash')
+                           }), \
          mock.patch.object(
              serve_state,
              'mark_unrecoverable_service_for_cleanup',
@@ -2166,10 +2169,12 @@ def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
                            'get_service_liveness_snapshots',
                            return_value=[placeholder]), \
          mock.patch.object(serve_state,
-                           'get_latest_committed_version', return_value=None), \
+                           'get_latest_committed_versions', return_value={}), \
          mock.patch.object(serve_state,
-                           'get_service_mode_and_hash',
-                           return_value=(False, 'placeholder-hash')), \
+                           'get_service_mode_and_hashes',
+                           return_value={
+                               'svc': (False, 'placeholder-hash')
+                           }), \
          mock.patch.object(
              serve_state,
              'mark_unrecoverable_service_for_cleanup',
@@ -2188,6 +2193,109 @@ def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
 
     retire.assert_called_once_with('svc', 'placeholder-hash', False)
     runner_cls.return_value.run.assert_not_called()
+
+
+def test_ha_recovery_batches_placeholder_and_raw_identity_fallback_reads(
+        tmp_path):
+    placeholder = {
+        'name': 'placeholder-svc',
+        'yaml_content': None,
+        'controller_pid': None,
+        'controller_ip': None,
+        'hash': 'placeholder-hash',
+        'resource_scope': 'placeholder-hash',
+        'status': serve_state.ServiceStatus.CONTROLLER_INIT,
+    }
+    with mock.patch.object(
+            serve_state,
+            'get_glob_service_names',
+            return_value=['orphan-svc', 'placeholder-svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[placeholder]), \
+         mock.patch.object(
+             serve_state,
+             'get_latest_committed_versions',
+             return_value={}) as committed_versions, \
+         mock.patch.object(
+             serve_state,
+             'get_service_mode_and_hashes',
+             return_value={
+                 'orphan-svc': (True, 'orphan-hash'),
+                 'placeholder-svc': (False, 'placeholder-hash'),
+             }) as identities, \
+         mock.patch.object(
+             serve_state,
+             'mark_unrecoverable_service_for_cleanup',
+             return_value=True) as retire, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls:
+        serve_utils.ha_recovery_for_consolidation_mode(pool=False)
+
+    committed_versions.assert_called_once_with(
+        ['orphan-svc', 'placeholder-svc'])
+    identities.assert_called_once_with(['orphan-svc', 'placeholder-svc'])
+    retire.assert_called_once_with('placeholder-svc', 'placeholder-hash', False)
+    runner_cls.return_value.run.assert_not_called()
+
+
+def test_ha_recovery_preserves_placeholder_with_committed_version(tmp_path):
+    placeholder = {
+        'name': 'svc',
+        'yaml_content': None,
+        'controller_pid': None,
+        'controller_ip': None,
+        'hash': 'incarnation-a',
+        'resource_scope': 'incarnation-a',
+        'status': serve_state.ServiceStatus.CONTROLLER_INIT,
+    }
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names', return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[placeholder]), \
+         mock.patch.object(
+             serve_state,
+             'get_latest_committed_versions',
+             return_value={
+                 'svc': 1
+             }) as committed_versions, \
+         mock.patch.object(
+             serve_state,
+             'get_service_mode_and_hashes',
+             return_value={}) as identities, \
+         mock.patch.object(
+             serve_state,
+             'mark_unrecoverable_service_for_cleanup') as retire, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_state,
+                           'get_ha_recovery_script',
+                           return_value='recover'), \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls:
+        runner_cls.return_value.run.return_value = (0, '', '')
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    committed_versions.assert_called_once_with(['svc'])
+    identities.assert_called_once_with([])
+    retire.assert_not_called()
+    runner_cls.return_value.run.assert_called_once_with('recover',
+                                                        require_outputs=True)
 
 
 class TestHaRecoveryDefensiveOnAliveCheckException:

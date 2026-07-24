@@ -1139,6 +1139,17 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             record['name']: record
             for record in serve_state.get_service_liveness_snapshots(pool=pool)
         }
+        committed_version_candidates = [
+            service_name for service_name in service_names
+            if ((svc := liveness_snapshots.get(service_name)) is None or
+                svc.get('yaml_content') is None)
+        ]
+        latest_committed_versions = serve_state.get_latest_committed_versions(
+            committed_version_candidates)
+        raw_identities = serve_state.get_service_mode_and_hashes([
+            service_name for service_name in committed_version_candidates
+            if service_name not in latest_committed_versions
+        ])
         for service_name in service_names:
             svc = liveness_snapshots.get(service_name)
             # A row with no version_specs row is invisible to the joined
@@ -1151,11 +1162,9 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                                              ('yaml_content' in svc and
                                               svc['yaml_content'] is None))
             if needs_committed_version_check:
-                committed_version = (
-                    serve_state.get_latest_committed_version(service_name))
+                committed_version = latest_committed_versions.get(service_name)
                 if committed_version is None:
-                    raw_identity = serve_state.get_service_mode_and_hash(
-                        service_name)
+                    raw_identity = raw_identities.get(service_name)
                     if (raw_identity is not None and raw_identity[0] == pool and
                             isinstance(raw_identity[1], str) and
                             raw_identity[1]):

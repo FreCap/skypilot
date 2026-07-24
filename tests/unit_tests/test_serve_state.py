@@ -2457,6 +2457,16 @@ class TestUnrecoverableServiceRows:
         assert (
             serve_state.get_ha_recovery_script('svc') == 'impossible script')
 
+    def test_ha_retirement_rechecks_concurrent_committed_version(
+            self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc')
+        assert serve_state.set_ha_recovery_script('svc', 'bootable script')
+        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+
+        assert not serve_state.mark_unrecoverable_service_for_cleanup(
+            'svc', 'orphan', pool=False)
+        assert serve_state.get_ha_recovery_script('svc') == 'bootable script'
+
     def test_purge_claim_refuses_committed_version(self, _mock_serve_db):
         assert _add_minimal_service('svc', service_hash='incarnation-a')
         serve_state.set_service_status_and_active_versions(
@@ -2490,6 +2500,69 @@ class TestRecoveryVersionSelection:
     def test_committed_version_none_when_only_placeholder(self, _mock_serve_db):
         serve_state.add_version('svc')  # placeholder v1, no committed yaml
         assert serve_state.get_latest_committed_version('svc') is None
+
+    def test_batch_committed_versions_match_single_row_answers(
+            self, _mock_serve_db):
+        serve_state.add_or_update_version('svc-a', 1, 'spec-a1', 'yaml: a1')
+        serve_state.add_or_update_version('svc-a', 2, 'spec-a2', 'yaml: a2')
+        serve_state.add_version('svc-a')  # placeholder v3
+        serve_state.add_version('svc-b')  # placeholder v1, never committed
+        serve_state.add_or_update_version('svc-c', 1, 'spec-c1', 'yaml: c1')
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            committed_versions = serve_state.get_latest_committed_versions(
+                ['svc-a', 'svc-b', 'svc-c', 'missing', 'svc-a'])
+
+        assert counts['n'] == 1
+        assert committed_versions == {
+            'svc-a': 2,
+            'svc-c': 1,
+        }
+        assert committed_versions.get('svc-a') == (
+            serve_state.get_latest_committed_version('svc-a'))
+        assert committed_versions.get('svc-c') == (
+            serve_state.get_latest_committed_version('svc-c'))
+        assert 'svc-b' not in committed_versions
+        assert 'missing' not in committed_versions
+        assert serve_state.get_latest_committed_version('svc-b') is None
+
+    def test_batch_service_mode_and_hashes_match_single_row_answers(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc-a', service_hash='hash-a', pool=False)
+        assert _add_minimal_service('svc-b', service_hash='hash-b', pool=True)
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            identities = serve_state.get_service_mode_and_hashes(
+                ['svc-a', 'svc-b', 'missing', 'svc-a'])
+
+        assert counts['n'] == 1
+        assert identities == {
+            'svc-a': (False, 'hash-a'),
+            'svc-b': (True, 'hash-b'),
+        }
+        assert identities.get('svc-a') == serve_state.get_service_mode_and_hash(
+            'svc-a')
+        assert identities.get('svc-b') == serve_state.get_service_mode_and_hash(
+            'svc-b')
+        assert 'missing' not in identities
+        assert serve_state.get_service_mode_and_hash('missing') is None
+
+    @pytest.mark.parametrize('getter_name', [
+        'get_latest_committed_versions',
+        'get_service_mode_and_hashes',
+    ])
+    def test_batch_recovery_fallbacks_bound_empty_and_chunked_queries(
+            self, _mock_serve_db, getter_name):
+        getter = getattr(serve_state, getter_name)
+        with _count_sql_statements(_mock_serve_db) as empty_counts:
+            assert getter([]) == {}
+        assert empty_counts['n'] == 0
+
+        batch_size = serve_state._TERMINAL_IDENTITY_QUERY_BATCH_SIZE
+        missing_names = [f'missing-{i}' for i in range(batch_size + 1)]
+        with _count_sql_statements(_mock_serve_db) as chunked_counts:
+            assert getter(missing_names + [missing_names[0]]) == {}
+        assert chunked_counts['n'] == 2
 
     def test_version_records_include_commit_provenance(self, _mock_serve_db,
                                                        monkeypatch):
