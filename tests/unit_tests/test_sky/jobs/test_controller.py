@@ -8,6 +8,9 @@ Tests cover controller recovery during rolling upgrades for:
 Also tests the cancelled job log download feature in ControllerManager
 and file mount cleanup in task_cleanup().
 """
+# pylint: disable=assignment-from-none,import-outside-toplevel,no-value-for-parameter
+# pylint: disable=protected-access,redefined-outer-name,reimported
+# pylint: disable=unused-argument,unused-variable
 import asyncio
 import pathlib
 import threading
@@ -2025,6 +2028,71 @@ class TestTransientJobStatusFetchDeadline:
                 set_recovering, executor)
 
     @pytest.mark.asyncio
+    async def test_single_node_running_fast_path_skips_cluster_refresh(self):
+        controller = self._make_controller()
+        task = MagicMock(name='task')
+        task.num_nodes = 1
+        executor = MagicMock()
+        executor.recover = AsyncMock(
+            side_effect=AssertionError('unexpected recovery'))
+        get_status = AsyncMock(side_effect=[
+            (job_lib.JobStatus.RUNNING, None),
+            (job_lib.JobStatus.RUNNING, None),
+            (job_lib.JobStatus.SUCCEEDED, None),
+        ])
+        refresh_cluster = MagicMock(
+            side_effect=AssertionError('single-node running path refreshed '
+                                       'cluster status'))
+        sleep = AsyncMock()
+        monotonic = MagicMock(
+            side_effect=AssertionError('healthy fast path used retry timer'))
+        wall_clock = MagicMock(
+            side_effect=AssertionError('healthy fast path used wall clock'))
+        fake_time = SimpleNamespace(monotonic=monotonic, time=wall_clock)
+        set_succeeded = AsyncMock()
+
+        with patch.object(controller_lib, 'time', fake_time), patch.object(
+                controller_lib.asyncio, 'sleep', new=sleep), patch.object(
+                    controller_lib.backend_utils,
+                    'async_check_network_connection',
+                    new=AsyncMock()), patch.object(
+                        controller_lib.managed_job_utils,
+                        'get_job_status',
+                        new=get_status), patch.object(
+                            controller_lib.backend_utils,
+                            'refresh_cluster_status_handle',
+                            new=refresh_cluster), patch.object(
+                                controller_lib.managed_job_utils,
+                                'try_to_get_job_end_time',
+                                return_value=123.0), patch.object(
+                                    controller_lib.backend_utils,
+                                    'get_clusters',
+                                    return_value=[]), patch.object(
+                                        controller_lib.managed_job_state,
+                                        'set_succeeded_async',
+                                        new=set_succeeded):
+            succeeded = await controller._monitor_one_task(
+                task_id=0,
+                task=task,
+                cluster_name='test-cluster',
+                executor=executor,
+                callback_func=AsyncMock(),
+                cleanup_cluster_on_success=False,
+            )
+
+        assert succeeded is True
+        assert [call.args[0] for call in sleep.await_args_list] == [
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
+        ]
+        assert get_status.await_count == 3
+        monotonic.assert_not_called()
+        wall_clock.assert_not_called()
+        set_succeeded.assert_awaited_once()
+        executor.recover.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_transient_status_fetch_uses_monotonic_deadline(self):
         results = await self._run_until_stopped(
             statuses=[(None, 'transient'), (None, 'transient')],
@@ -2046,33 +2114,82 @@ class TestTransientJobStatusFetchDeadline:
         executor.recover.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_transient_status_fetch_resets_deadline_after_success(self):
-        results = await self._run_until_stopped(
-            statuses=[
-                (None, 'transient'),
-                (job_lib.JobStatus.RUNNING, None),
-                (None, 'transient'),
-                (None, 'transient'),
-            ],
-            monotonic_values=[100.0, 100.0, 200.0, 200.0, 260.0],
-        )
-        (sleep, get_status, refresh_cluster, monotonic, wall_clock,
-         set_recovering, executor) = results
+    async def test_transient_status_fetch_holds_healthy_job_until_status_recovers(
+            self):
+        controller = self._make_controller()
+        task = MagicMock(name='task')
+        task.num_nodes = 1
+        executor = MagicMock()
+        executor.recover = AsyncMock(
+            side_effect=AssertionError('healthy UP cluster should not recover'))
+        get_status = AsyncMock(side_effect=[
+            (job_lib.JobStatus.RUNNING, None),
+            (None, 'transient'),
+            (None, 'transient'),
+            (job_lib.JobStatus.SUCCEEDED, None),
+        ])
+        refresh_cluster = MagicMock(return_value=(status_lib.ClusterStatus.UP,
+                                                  None))
+        sleep = AsyncMock()
+        monotonic = MagicMock(side_effect=[100.0, 100.0, 160.0])
+        wall_clock = MagicMock(side_effect=AssertionError(
+            'status-fetch hold used wall-clock time'))
+        fake_time = SimpleNamespace(monotonic=monotonic, time=wall_clock)
+        set_recovering = AsyncMock()
+        set_succeeded = AsyncMock()
 
+        with patch.object(controller_lib, 'time', fake_time), patch.object(
+                controller_lib.asyncio, 'sleep', new=sleep), patch.object(
+                    controller_lib.backend_utils,
+                    'async_check_network_connection',
+                    new=AsyncMock()), patch.object(
+                        controller_lib.managed_job_utils,
+                        'get_job_status',
+                        new=get_status), patch.object(
+                            controller_lib.backend_utils,
+                            'refresh_cluster_status_handle',
+                            new=refresh_cluster), patch.object(
+                                controller_lib.common_utils, 'Backoff'
+                            ) as backoff_cls, patch.object(
+                                controller_lib.managed_job_utils,
+                                'try_to_get_job_end_time',
+                                return_value=123.0), patch.object(
+                                    controller_lib.backend_utils,
+                                    'get_clusters',
+                                    return_value=[]), patch.object(
+                                        controller_lib.managed_job_state,
+                                        'set_recovering_async',
+                                        new=set_recovering), patch.object(
+                                            controller_lib.managed_job_state,
+                                            'set_succeeded_async',
+                                            new=set_succeeded):
+            backoff = MagicMock()
+            backoff.current_backoff.return_value = 10
+            backoff_cls.return_value = backoff
+            succeeded = await controller._monitor_one_task(
+                task_id=0,
+                task=task,
+                cluster_name='test-cluster',
+                executor=executor,
+                callback_func=AsyncMock(),
+                cleanup_cluster_on_success=False,
+            )
+
+        assert succeeded is True
         assert [call.args[0] for call in sleep.await_args_list] == [
             controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
-            10,
-            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
             controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
             10,
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
             controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS,
         ]
         assert get_status.await_count == 4
-        assert refresh_cluster.call_count == 3
-        assert monotonic.call_count == 5
+        assert refresh_cluster.call_count == 2
+        assert monotonic.call_count == 3
         wall_clock.assert_not_called()
-        set_recovering.assert_awaited_once()
-        executor.recover.assert_awaited_once()
+        set_recovering.assert_not_awaited()
+        set_succeeded.assert_awaited_once()
+        executor.recover.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_recovery_resets_transient_status_fetch_deadline(self):

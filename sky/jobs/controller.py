@@ -137,6 +137,23 @@ def _should_wait_for_cluster_not_up_confirmation(
     return not debouncer.should_recover_now()
 
 
+def _should_keep_monitoring_healthy_cluster(
+        last_known_job_status: job_lib.JobStatus | None,
+        transient_job_check_error_reason: str | None) -> bool:
+    """Return whether a healthy cluster should keep waiting for job status.
+
+    A transient control-plane failure is not evidence that a previously
+    running job has died. If the cluster is still UP and the last confirmed
+    remote status was non-terminal, keep monitoring instead of tearing the job
+    down and relaunching it.
+    """
+    if transient_job_check_error_reason is None:
+        return False
+    if last_known_job_status is None:
+        return False
+    return not last_known_job_status.is_terminal()
+
+
 def create_background_task(coro: typing.Coroutine) -> None:
     """Create a background task and add it to the set of background tasks.
 
@@ -877,6 +894,8 @@ class JobController:
         transient_job_check_retry: tuple[float,
                                          common_utils.Backoff] | None = None
         not_up_debouncer = _ClusterNotUpDebouncer(task.num_nodes)
+        last_known_job_status: job_lib.JobStatus | None = None
+        healthy_cluster_hold_logged = False
 
         while True:
             # Get job status (skip on first iteration if forcing recovery)
@@ -917,6 +936,13 @@ class JobController:
                         f'Exception: {common_utils.format_exception(fetch_e)}\n'
                         f'Traceback: {traceback.format_exc()}')
                     # Fall through to recovery logic below
+
+            if job_status is not None:
+                healthy_cluster_hold_logged = False
+                if job_status.is_terminal():
+                    last_known_job_status = None
+                else:
+                    last_known_job_status = job_status
 
             # When job status check fails, we need to retry to avoid false alarm
             # for job failure, as it could be a transient error for
@@ -1019,6 +1045,7 @@ class JobController:
                 # cluster confirmation/recovery path and starts a fresh retry
                 # budget once the cluster reports UP again.
                 transient_job_check_retry = None
+                healthy_cluster_hold_logged = False
                 # The cluster is (partially) preempted or failed. It can be
                 # down, INIT or STOPPED, based on the interruption behavior of
                 # the cloud. Spot recovery is needed (will be done later in the
@@ -1216,6 +1243,22 @@ class JobController:
                             await asyncio.sleep(backoff_time)
                             continue
                         else:
+                            if _should_keep_monitoring_healthy_cluster(
+                                    last_known_job_status,
+                                    transient_job_check_error_reason):
+                                if not healthy_cluster_hold_logged:
+                                    assert last_known_job_status is not None
+                                    logger.warning(
+                                        'Failed to fetch the job status after '
+                                        'retrying for '
+                                        f'{managed_job_utils.JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS:.1f} '
+                                        'seconds, but the cluster is still UP '
+                                        'and the last confirmed job status was '
+                                        f'{last_known_job_status.value}. '
+                                        'Keep monitoring instead of '
+                                        'restarting the job/cluster.')
+                                    healthy_cluster_hold_logged = True
+                                continue
                             logger.info(
                                 'Failed to fetch the job status after retrying '
                                 'for '
@@ -1288,6 +1331,8 @@ class JobController:
             # Recovery starts a fresh monitoring epoch. Retry state from the
             # old cluster must not shorten the next transient-error budget.
             transient_job_check_retry = None
+            last_known_job_status = None
+            healthy_cluster_hold_logged = False
             force_transit_to_recovering = False
             # Observations accumulated against the old cluster must not count
             # toward recovering the fresh one.
