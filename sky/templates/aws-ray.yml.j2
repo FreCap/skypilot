@@ -41,6 +41,18 @@ provider:
     # AWS config file must include security group name
     GroupName: {{security_group}}
     ManagedBySkyPilot: {{security_group_managed_by_skypilot}}
+  # Source CIDRs allowed to reach the cluster's SSH port and any requested
+  # `resources.ports`. Read by sky.provision.aws {config,instance} off the
+  # provider config; the deploy path always sets it (defaulting to
+  # ['0.0.0.0/0'], the historical behaviour) and narrows it via
+  # `aws.ingress_source_ranges`. Without this the deploy variable never reaches
+  # the provider config, so the knob is a silent no-op. Guarded so a direct
+  # template render that omits the variable (e.g. unit tests) does not fail on
+  # an undefined value; an absent value leaves consumers on their 0.0.0.0/0
+  # default.
+{% if ingress_source_ranges %}
+  ingress_source_ranges: {{ingress_source_ranges | tojson}}
+{% endif %}
 {% if vpc_name is not none %}
   # NOTE: This is a new field added by SkyPilot to force use a specific VPC.
   vpc_name: {{vpc_name}}
