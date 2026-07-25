@@ -2157,3 +2157,141 @@ class TestReplicaManagerInitIntact(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestFillDemandSample(unittest.TestCase):
+    """The gate's signal: per-replica, and blind unless the report is fresh."""
+
+    def _autoscaler(self):
+        spec = service_spec.SkyServiceSpec(
+            readiness_path='/health',
+            initial_delay_seconds=60,
+            readiness_timeout_seconds=30,
+            endpoint_probe_interval_seconds=10,
+            lb_stream_timeout_seconds=60,
+            min_replicas=1,
+            max_replicas=100,
+            target_concurrency_per_replica=1,
+            reserved_capacity_fill={'utilization_gate': True})
+        autoscaler = autoscalers.ConcurrencyAutoscaler('svc', spec)
+        autoscaler.seed_zero_cost_locations([_K8S_KEY])
+        return autoscaler
+
+    def _fill_replica(self, replica_id, **kwargs):
+        info = _replica(replica_id, _K8S_KEY, **kwargs)
+        info.reserved_fill = True
+        return info
+
+    def test_blind_without_a_fresh_report(self):
+        # Releasing on an unobservable fleet is the one outcome this
+        # feature must never produce, so no report means no gating.
+        autoscaler = self._autoscaler()
+        self.assertIsNone(autoscaler.fill_demand_sample([]))
+
+    def test_base_autoscaler_class_is_never_gated(self):
+        spec = service_spec.SkyServiceSpec(readiness_path='/health',
+                                           initial_delay_seconds=60,
+                                           readiness_timeout_seconds=30,
+                                           endpoint_probe_interval_seconds=10,
+                                           lb_stream_timeout_seconds=60,
+                                           min_replicas=1,
+                                           max_replicas=10,
+                                           target_qps_per_replica=1.0,
+                                           reserved_capacity_fill=True)
+        autoscaler = autoscalers.RequestRateAutoscaler('svc', spec)
+        self.assertIsNone(autoscaler.fill_demand_sample([]))
+
+    def test_unknown_occupancy_counts_per_replica_not_per_service(self):
+        # The decisive property. A service-level "any unknown occupancy"
+        # boolean would let 3 flapping replicas out of 77 pin the whole
+        # fleet busy forever, making the gate inert on exactly the service
+        # it exists for.
+        autoscaler = self._autoscaler()
+        replicas = [self._fill_replica(i) for i in range(1, 78)]
+        autoscaler._in_flight_by_replica_id = {}
+        autoscaler._unknown_in_flight_replica_ids = set()
+        autoscaler._report_received_at = time.time()
+        autoscaler._replica_is_busy = lambda info: info.replica_id <= 3
+
+        sample = autoscaler.fill_demand_sample(replicas)
+
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.busy_fill_holdings, 3)
+        self.assertEqual(sample.demonstrated_need(), 3)
+
+    def test_pre_ready_fill_rows_hold_a_release_step(self):
+        autoscaler = self._autoscaler()
+        booting = self._fill_replica(
+            1, status=serve_state.ReplicaStatus.PROVISIONING)
+        autoscaler._in_flight_by_replica_id = {}
+        autoscaler._unknown_in_flight_replica_ids = set()
+        autoscaler._report_received_at = time.time()
+
+        sample = autoscaler.fill_demand_sample([booting])
+
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.pre_ready_fill_holdings, 1)
+        self.assertTrue(sample.boot_hold())
+        self.assertEqual(sample.demonstrated_need(), 1)
+
+    def test_fully_idle_fleet_demonstrates_no_need(self):
+        autoscaler = self._autoscaler()
+        replicas = [self._fill_replica(i) for i in range(1, 10)]
+        autoscaler._in_flight_by_replica_id = {}
+        autoscaler._unknown_in_flight_replica_ids = set()
+        autoscaler._report_received_at = time.time()
+        autoscaler._replica_is_busy = lambda info: False
+
+        sample = autoscaler.fill_demand_sample(replicas)
+
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.demonstrated_need(), 0)
+        self.assertFalse(sample.boot_hold())
+
+    def test_demand_placed_zero_cost_rows_are_not_counted(self):
+        # They are demand-protected and exempt from the grant ceiling, so
+        # counting them would inflate need by capacity the gate can never
+        # reclaim anyway.
+        autoscaler = self._autoscaler()
+        demand_row = _replica(1, _K8S_KEY)
+        demand_row.reserved_fill = False
+        autoscaler._in_flight_by_replica_id = {}
+        autoscaler._unknown_in_flight_replica_ids = set()
+        autoscaler._report_received_at = time.time()
+        autoscaler._replica_is_busy = lambda info: True
+
+        sample = autoscaler.fill_demand_sample([demand_row])
+
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.busy_fill_holdings, 0)
+
+
+class TestOutstandingWorkPartsExtraction(unittest.TestCase):
+    """The pure variant must not clobber decision-owned observability."""
+
+    def test_pure_variant_assigns_nothing(self):
+        spec = service_spec.SkyServiceSpec(readiness_path='/health',
+                                           initial_delay_seconds=60,
+                                           readiness_timeout_seconds=30,
+                                           endpoint_probe_interval_seconds=10,
+                                           lb_stream_timeout_seconds=60,
+                                           min_replicas=1,
+                                           max_replicas=10,
+                                           target_concurrency_per_replica=1,
+                                           reserved_capacity_fill=True)
+        autoscaler = autoscalers.ConcurrencyAutoscaler('svc', spec)
+        autoscaler._in_flight_by_replica_id = {}
+        autoscaler._unknown_in_flight_replica_ids = set()
+        autoscaler._weighted_queue_work = -1.0
+        autoscaler._rejected_concurrency = -1.0
+
+        autoscaler._outstanding_work_parts([])
+
+        self.assertEqual(autoscaler._weighted_queue_work, -1.0)
+        self.assertEqual(autoscaler._rejected_concurrency, -1.0)
+
+        total = autoscaler._outstanding_work([])
+
+        self.assertEqual(autoscaler._weighted_queue_work, 0.0)
+        self.assertEqual(autoscaler._rejected_concurrency, 0.0)
+        self.assertEqual(total, 0.0)

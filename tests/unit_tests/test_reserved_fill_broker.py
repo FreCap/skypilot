@@ -2132,3 +2132,315 @@ class TestDrainWindowConservation:
         round_row = serve_state.get_reserved_fill_round(_POOL)
         assert round_row is not None
         assert round_row['shrink_baseline'] is None  # consumed
+
+
+class TestAdvanceReleaseTarget:
+    """The release governor: rise fast, release slowly and reversibly."""
+
+    _KW = dict(dwell=300.0,
+               step_seconds=300.0,
+               step_fraction=0.25,
+               min_step=2,
+               headroom=0.25,
+               blind_grace=900.0)
+
+    def _advance(self, prev, **kwargs):
+        params = dict(floor=0,
+                      holdings=0,
+                      need=0,
+                      boot_hold=False,
+                      blind=False,
+                      now=0.0)
+        params.update(kwargs)
+        return broker.advance_release_target(prev, **params, **self._KW)
+
+    def test_first_round_anchors_on_holdings_and_starts_the_dwell(self):
+        entry = self._advance(None, floor=16, holdings=77, now=1000.0)
+        assert entry['cap'] == 77
+        assert entry['hot_until'] == 1300.0
+
+    def test_rise_is_immediate_and_ignores_the_step_schedule(self):
+        # A burst must reclaim entitlement in ONE round: waiting out a dwell
+        # or a step window would make reacquisition slower than the cold
+        # start the floor exists to avoid.
+        prev = {
+            'cap': 16,
+            'hot_until': 0.0,
+            'stepped_at': 0.0,
+            'blind_since': None
+        }
+        entry = self._advance(prev, floor=16, holdings=16, need=40, now=5000.0)
+        # 40 * 1.25 headroom.
+        assert entry['cap'] == 50
+        assert entry['hot_until'] == 5300.0
+
+    def test_dwell_blocks_the_first_step_in_wall_clock(self):
+        prev = {
+            'cap': 77,
+            'hot_until': 1300.0,
+            'stepped_at': 1000.0,
+            'blind_since': None
+        }
+        # A skipped or delayed round must not shorten the dwell.
+        assert self._advance(prev, floor=16, holdings=77,
+                             now=1299.0)['cap'] == 77
+        assert self._advance(prev, floor=16, holdings=77,
+                             now=1301.0)['cap'] < 77
+
+    def test_boot_hold_blocks_a_step_and_extends_the_dwell(self):
+        # Pre-ready fill rows are the FIRST scale-down victims, so stepping
+        # while they boot would cull exactly the capacity just ordered.
+        prev = {
+            'cap': 77,
+            'hot_until': 1300.0,
+            'stepped_at': 1000.0,
+            'blind_since': None
+        }
+        entry = self._advance(prev,
+                              floor=16,
+                              holdings=77,
+                              boot_hold=True,
+                              now=2000.0)
+        assert entry['cap'] == 77
+        assert entry['hot_until'] == 2300.0
+
+    def test_unactuated_step_blocks_the_next_one(self):
+        # holdings above the cap means the previous step has not drained.
+        prev = {
+            'cap': 40,
+            'hot_until': 0.0,
+            'stepped_at': 0.0,
+            'blind_since': None
+        }
+        entry = self._advance(prev, floor=16, holdings=60, now=5000.0)
+        assert entry['cap'] == 40
+
+    def test_step_rate_and_convergence_to_the_floor(self):
+        floor = 16
+        cap = 77
+        now = 1000.0
+        prev = {
+            'cap': cap,
+            'hot_until': now,
+            'stepped_at': now - 400.0,
+            'blind_since': None
+        }
+        seen = [cap]
+        for _ in range(50):
+            now += 400.0
+            prev = self._advance(prev,
+                                 floor=floor,
+                                 holdings=prev['cap'],
+                                 now=now)
+            seen.append(prev['cap'])
+            if prev['cap'] == floor:
+                break
+        assert seen[1] == 61  # 77 - ceil(0.25 * 61)
+        assert seen[-1] == floor
+        assert all(b <= a for a, b in zip(seen, seen[1:]))  # monotone
+        # min_step guarantees termination rather than a 1-replica tail.
+        assert len(seen) < 20
+
+    def test_never_steps_below_the_floor(self):
+        prev = {
+            'cap': 17,
+            'hot_until': 0.0,
+            'stepped_at': 0.0,
+            'blind_since': None
+        }
+        entry = self._advance(prev, floor=16, holdings=17, now=5000.0)
+        assert entry['cap'] == 16
+
+    def test_blind_freezes_without_raising_or_lowering(self):
+        # Every serve controller lives in the api-server pod, so one deploy
+        # blinds the whole pool at once. Raising here would reset every
+        # in-progress decay on every deploy; lowering would release capacity
+        # from a fleet that may be fully busy.
+        prev = {
+            'cap': 40,
+            'hot_until': 1000.0,
+            'stepped_at': 1000.0,
+            'blind_since': None
+        }
+        entry = self._advance(prev,
+                              floor=16,
+                              holdings=77,
+                              blind=True,
+                              now=5000.0)
+        assert entry['cap'] == 40
+        assert entry['blind_since'] == 5000.0
+        assert entry['hot_until'] == 5300.0
+
+    def test_blind_past_grace_resumes_the_decay(self):
+        # A permanently wedged telemetry path must not pin the pool.
+        prev = {
+            'cap': 40,
+            'hot_until': 1000.0,
+            'stepped_at': 1000.0,
+            'blind_since': 1000.0
+        }
+        entry = self._advance(prev,
+                              floor=16,
+                              holdings=40,
+                              blind=True,
+                              now=1000.0 + 901.0)
+        assert entry['cap'] < 40
+
+
+class TestUtilizationCapEntitlements:
+    """compute_entitlements with the gate: floors immune, total conserved."""
+
+    def _claim(self, **kwargs):
+        base = dict(floor=0, weight=1.0, holdings_fill=0, launchable=True)
+        base.update(kwargs)
+        return broker.ClaimInput(**base)
+
+    def test_gated_claimant_releases_its_share_to_a_busy_peer(self):
+        idle = self._claim(floor=0,
+                           weight=1e6,
+                           holdings_fill=74,
+                           utilization_cap=0)
+        busy = self._claim(floor=10, weight=100, holdings_fill=10)
+        out = broker.compute_entitlements(84, {'idle': idle, 'busy': busy})
+        # Despite a 10000:1 weight advantage, the idle claimant keeps only
+        # its floor and the whole remainder flows to the working peer.
+        assert out['idle'] == 0
+        assert out['busy'] == 84
+
+    def test_floor_is_immune_to_the_gate(self):
+        claim = self._claim(floor=10,
+                            weight=1.0,
+                            holdings_fill=40,
+                            utilization_cap=0)
+        out = broker.compute_entitlements(40, {'a': claim})
+        assert out['a'] == 10
+
+    def test_conservation_holds_with_caps_on_both_sides(self):
+        for cap in (None, 0, 5, 50):
+            for eff in (None, 0, 7, 90):
+                claims = {
+                    'a': self._claim(floor=10,
+                                     weight=3.0,
+                                     holdings_fill=20,
+                                     utilization_cap=cap,
+                                     effective_cap=eff),
+                    'b': self._claim(floor=5, weight=1.0, holdings_fill=5),
+                }
+                out = broker.compute_entitlements(60, claims)
+                assert sum(out.values()) <= 60, (cap, eff)
+                for name, claim in claims.items():
+                    assert out[name] >= claim.attainable_floor(), (cap, eff)
+
+    def test_all_gated_collapses_to_the_sum_of_floors(self):
+        claims = {
+            'a': self._claim(floor=4, weight=2.0, utilization_cap=4),
+            'b': self._claim(floor=6, weight=9.0, utilization_cap=6),
+        }
+        out = broker.compute_entitlements(80, claims)
+        assert out == {'a': 4, 'b': 6}
+
+    def test_ungated_claim_is_byte_identical_to_before_the_gate(self):
+        claims = {
+            'a': self._claim(floor=10, weight=100.0, holdings_fill=10),
+            'b': self._claim(floor=0, weight=1e6, holdings_fill=74),
+        }
+        assert broker.compute_entitlements(84, claims) == {'a': 10, 'b': 74}
+
+
+class TestActivityInputSkew:
+    """activity_ts is the version-skew discriminator, not decoration."""
+
+    def _row(self, **kwargs):
+        base = {
+            'service_name': 'svc',
+            'demonstrated_need': 3,
+            'boot_hold': 0,
+            'activity_ts': 1000.0,
+            'heartbeat_ts': 1000.0,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_paired_signal_is_trusted(self):
+        got = broker._activity_input(self._row())
+        assert got.blind is False
+        assert got.demonstrated_need == 3
+
+    def test_absent_signal_reads_blind(self):
+        # A pre-migration row, or a claimant whose gate is off.
+        assert broker._activity_input(
+            self._row(demonstrated_need=None, activity_ts=None)).blind
+
+    def test_frozen_signal_from_an_old_writer_reads_blind(self):
+        # The upsert builds its values dict from the columns ITS binary
+        # knows, so a pre-gate writer advances heartbeat_ts while leaving
+        # demonstrated_need frozen. Trusting a frozen 0 would walk a fully
+        # busy service down to its floor.
+        stale = self._row(demonstrated_need=0, heartbeat_ts=1000.0 + 61.0)
+        assert broker._activity_input(stale).blind
+
+    def test_negative_lag_reads_blind(self):
+        assert broker._activity_input(self._row(heartbeat_ts=999.0)).blind
+
+    def test_env_kill_switch_blinds_every_claim(self):
+        with mock.patch.dict(
+                'os.environ',
+            {serve_constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR: 'false'}):
+            assert broker._activity_input(self._row()).blind
+
+
+class TestApplyUtilizationGate:
+    """Only claimants that have ever reported a signal are gated."""
+
+    def _claim(self, **kwargs):
+        base = dict(floor=0, weight=1.0, holdings_fill=0, launchable=True)
+        base.update(kwargs)
+        return broker.ClaimInput(**base)
+
+    def test_never_signalled_claimant_stays_ungated(self):
+        # Services that do not opt in must be byte-identical to before.
+        claims = {'a': self._claim(floor=2, holdings_fill=9)}
+        activity = {
+            'a': broker.ActivityInput(demonstrated_need=0,
+                                      boot_hold=False,
+                                      blind=True)
+        }
+        gated, state = broker._apply_utilization_gate(claims, activity, {},
+                                                      1000.0)
+        assert gated['a'].utilization_cap is None
+        assert not state
+
+    def test_blind_round_keeps_an_already_earned_cap_applied(self):
+        # Dropping the cap while blind would be a RISE, restoring full
+        # entitlement on every deploy.
+        claims = {'a': self._claim(floor=2, holdings_fill=40)}
+        activity = {
+            'a': broker.ActivityInput(demonstrated_need=0,
+                                      boot_hold=False,
+                                      blind=True)
+        }
+        prev = {
+            'a': {
+                'cap': 20,
+                'hot_until': 0.0,
+                'stepped_at': 0.0,
+                'blind_since': None
+            }
+        }
+        gated, state = broker._apply_utilization_gate(claims, activity, prev,
+                                                      1000.0)
+        assert gated['a'].utilization_cap == 20
+        assert state['a']['cap'] == 20
+
+
+class TestDemandGateGrant:
+    """The demand gate reads the permissive grant, the ceiling the damped."""
+
+    def test_rise_reopens_the_demand_gate_before_damping_catches_up(self):
+        assert broker._demand_gate_grant(16, 50) == 50
+
+    def test_no_ceiling_stays_inert(self):
+        assert broker._demand_gate_grant(None, 50) is None
+
+    def test_missing_raw_falls_back_to_the_damped_grant(self):
+        assert broker._demand_gate_grant(16, None) == 16

@@ -473,6 +473,21 @@ def _broker_cycle(
     # absorbs entitlement and feed the service never launches.
     effective_cap = max(
         0, autoscaler.max_replicas - autoscaler.get_final_target_num_replicas())
+    # Utilization signal for the release governor. Sampled HERE rather than
+    # inside the decision tick's request-information path, which early
+    # returns without a report, does not run when the controller is not
+    # demand-authoritative, and stamps the freshness timestamp itself (so a
+    # freshness check evaluated beside it would be vacuously true). This
+    # cycle runs unconditionally every poll interval and holds a live
+    # reference to the very autoscaler the decision tick uses.
+    activity: dict[str, Any] | None = None
+    if autoscaler.reserved_fill_utilization_gate:
+        sample = autoscaler.fill_demand_sample(replica_infos)
+        if sample is not None:
+            activity = {
+                'demonstrated_need': sample.demonstrated_need(),
+                'boot_hold': sample.boot_hold(),
+            }
     claim_persisted = reserved_capacity_broker.upsert_claim(
         service_name,
         pool_key=pool_key,
@@ -482,6 +497,7 @@ def _broker_cycle(
         holdings_fill=holdings_fill,
         effective_cap=effective_cap,
         launchable=_placer_can_launch_zero_cost(placer),
+        activity=activity,
         **fence_kwargs)
     if claim_persisted is False:
         autoscaler.collect_reserved_capacity(0, keys, time.time())

@@ -255,6 +255,28 @@ reserved_fill_claims_table = sqlalchemy.Table(
     # tier is not benched): feeds to un-launchable claimants are wasted for a
     # whole round, so the feed split redistributes them.
     sqlalchemy.Column('launchable', sqlalchemy.Integer, server_default='1'),
+    # Utilization gate signal (NULL on every pre-030 row and on every row a
+    # pre-gate binary writes; the broker reads NULL as ungated, which is the
+    # behavior before the gate existed).
+    #
+    # demonstrated_need: replicas this claimant can prove it is using right
+    # now, fusing in-flight work, queued work, retained rejections, busy
+    # fill replicas and fill replicas still booting.
+    sqlalchemy.Column('demonstrated_need',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    # boot_hold: the claimant has fill replicas it already authorized still
+    # coming up. Blocks a release step so the gate cannot order a fleet,
+    # hold it through a 20-minute readiness delay, then cull it mid-boot
+    # (pre-ready rows are the FIRST scale-down victims).
+    sqlalchemy.Column('boot_hold', sqlalchemy.Integer, server_default=None),
+    # activity_ts: when the two columns above were measured. Mandatory
+    # anti-skew witness, always written in the same statement as
+    # heartbeat_ts. An old binary's upsert advances heartbeat_ts while
+    # leaving these frozen, and a frozen demonstrated_need of 0 would walk a
+    # busy service to its floor; the broker rejects the signal unless
+    # heartbeat_ts - activity_ts is within the staleness bound.
+    sqlalchemy.Column('activity_ts', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float),
 )
 
@@ -285,6 +307,15 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     sqlalchemy.Column('raw_grants', sqlalchemy.Text),
     # JSON {service: {'amount': int, 'since': ts}}: sticky feed assignments.
     sqlalchemy.Column('feed_state', sqlalchemy.Text),
+    # JSON {service: {'cap': int, 'hot_until': ts, 'stepped_at': ts,
+    # 'blind_since': ts|null}}: the utilization gate's durable release
+    # target. On the round row rather than in controller memory because
+    # every serve controller is a process inside the api-server pod, so a
+    # routine deploy restarts all of them at once and an in-memory decay
+    # would reset pool-wide on every deploy. Written under the same lease
+    # CAS as grants/feeds; a pre-gate binary's publish omits it from its
+    # values dict, so a mixed-version round leaves the state untouched.
+    sqlalchemy.Column('utilization_state', sqlalchemy.Text),
     # Conserved fill holdings (live + draining) at the last MEASURED round
     # (blackout rounds carry it unchanged, staying transparent to the
     # shrink confirmation): a confirmed shrink means pods are physically
@@ -4954,6 +4985,9 @@ def upsert_reserved_fill_claim(
     effective_cap: int | None,
     launchable: bool,
     heartbeat_ts: float,
+    demonstrated_need: int | None = None,
+    boot_hold: bool | None = None,
+    activity_ts: float | None = None,
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
@@ -4968,6 +5002,14 @@ def upsert_reserved_fill_claim(
         'holdings_fill': holdings_fill,
         'effective_cap': effective_cap,
         'launchable': int(launchable),
+        # Written unconditionally, including as an explicit NULL triple when
+        # the caller has no sample. A claimant that goes blind must CLEAR its
+        # previous signal in the same statement that advances heartbeat_ts;
+        # leaving a stale need behind would let the broker keep gating on a
+        # measurement nothing is refreshing.
+        'demonstrated_need': demonstrated_need,
+        'boot_hold': None if boot_hold is None else int(boot_hold),
+        'activity_ts': activity_ts,
         'heartbeat_ts': heartbeat_ts,
     }
     with orm.Session(engine) as session:
@@ -5218,15 +5260,23 @@ def acquire_reserved_fill_lease_token(
     return token, lease_expired
 
 
-def publish_reserved_fill_round(pool_key: str, *, round_id: int,
-                                snapshot_time: float, epoch: int, grants: str,
-                                feeds: str, raw_grants: str, feed_state: str,
+def publish_reserved_fill_round(pool_key: str,
+                                *,
+                                round_id: int,
+                                snapshot_time: float,
+                                epoch: int,
+                                grants: str,
+                                feeds: str,
+                                raw_grants: str,
+                                feed_state: str,
                                 sum_holdings: int,
                                 last_observed_free: int | None,
                                 last_observed_free_ts: float | None,
                                 phantom_streak: int,
-                                shrink_baseline: int | None, lease_token: int,
-                                lease_expires_at: float) -> bool:
+                                shrink_baseline: int | None,
+                                lease_token: int,
+                                lease_expires_at: float,
+                                utilization_state: str | None = None) -> bool:
     """Publishes a round iff the lease still holds the writer's token.
 
     `epoch` is the POOL's fencing epoch, stored on the round row (per-pool:
@@ -5277,6 +5327,12 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
             'phantom_streak': phantom_streak,
             'shrink_baseline': shrink_baseline,
             'fence_pending': 0,
+            # Always written, never conditionally omitted: a round in which
+            # no claimant is gated must CLEAR the state, otherwise disarming
+            # the gate would leave a stale release target that re-arms into
+            # a decay already half-finished. Carrying the state forward
+            # across rounds is the broker's job, not this writer's.
+            'utilization_state': utilization_state,
         }
         insert_stmt = _upsert_insert_func(engine)(
             reserved_fill_rounds_table).values(**values)

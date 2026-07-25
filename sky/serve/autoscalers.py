@@ -85,6 +85,46 @@ class UnrecoverableRolloutFailure:
     reason: str
 
 
+@dataclasses.dataclass(frozen=True)
+class FillDemandSample:
+    """Work a service can demonstrate, for the reserved-fill gate.
+
+    Sampled by the poller thread once per poll interval, published on the
+    broker claim, and consumed by the release governor. Every term is a
+    RETAIN signal: any of them being non-zero keeps the claimant's
+    entitlement, and only the conjunction of all of them being zero starts
+    a release. That asymmetry is deliberate, because the cost of a false
+    "idle" (culling a fleet that is working) is far higher than the cost of
+    a false "busy" (holding capacity one dwell longer).
+    """
+
+    outstanding_work: float
+    # Fill replicas individually reporting work. Per-replica on purpose: a
+    # service-level "any unknown occupancy" boolean would let three flapping
+    # replicas out of seventy-seven pin the whole fleet as busy forever, and
+    # the gate would be silently inert on exactly the service it is for.
+    busy_fill_holdings: int
+    # Fill replicas in PENDING / PROVISIONING / STARTING. Boot protection:
+    # these are the FIRST scale-down victims, so without this term the gate
+    # would order a fleet, hold it through a 20-minute readiness delay, and
+    # cull it before it served a request.
+    pre_ready_fill_holdings: int
+    upscale_pending: bool
+    work_per_replica: float
+
+    def demonstrated_need(self) -> int:
+        """Replicas this claimant can prove it is using right now."""
+        per_replica = max(1e-9, float(self.work_per_replica))
+        return max(
+            self.busy_fill_holdings + self.pre_ready_fill_holdings,
+            math.ceil(max(0.0, self.outstanding_work) / per_replica),
+        )
+
+    def boot_hold(self) -> bool:
+        """Whether a step must be deferred: authorized fleet still booting."""
+        return self.pre_ready_fill_holdings > 0 or self.upscale_pending
+
+
 @dataclasses.dataclass
 class AutoscalerDecision:
     """Autoscaling decisions.
@@ -383,6 +423,10 @@ class Autoscaler:
             getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
         self.reserved_fill_weight: float = float(
             getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
+        # Whether this service releases its above-floor entitlement while
+        # it demonstrates no work (see reserved_capacity_broker).
+        self.reserved_fill_utilization_gate: bool = bool(
+            getattr(spec, 'reserved_fill_utilization_gate', False))
         # Damped free-slot value the fill target acts on (see
         # collect_reserved_capacity for the two-poll increase damping).
         self._fill_free_slots: int = 0
@@ -558,6 +602,8 @@ class Autoscaler:
             getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
         self.reserved_fill_weight = float(
             getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
+        self.reserved_fill_utilization_gate = bool(
+            getattr(spec, 'reserved_fill_utilization_gate', False))
         self.cost_rebalance = bool(getattr(spec, 'cost_rebalance', False))
         self.cost_rebalance_min_savings_fraction = float(
             getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
@@ -691,6 +737,24 @@ class Autoscaler:
         self._fill_grant = grant
         self._fill_grant_epoch = grant_epoch
         self._fill_grant_pool_key = grant_pool_key
+
+    def fill_demand_sample(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> 'FillDemandSample | None':
+        """Work this service can demonstrate on its zero-cost tier.
+
+        Read-only projection for the reserved-fill poller thread, which
+        calls it once per poll from _broker_cycle. None means "no usable
+        telemetry", and the utilization gate treats that as blind: it
+        freezes rather than releasing, so an autoscaler class without
+        occupancy telemetry is never gated at all.
+
+        The base class has no per-replica occupancy signal, so it returns
+        None and every subclass that does not override this stays ungated.
+        """
+        del replica_infos  # Unused: no occupancy telemetry on the base.
+        return None
 
     def count_zero_cost_holdings(
             self, replica_infos: list['replica_managers.ReplicaInfo']
@@ -4214,6 +4278,65 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return self._tick_fresh
         return self.has_fresh_demand_report()
 
+    def fill_demand_sample(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> 'FillDemandSample | None':
+        """Demonstrated work for the reserved-fill utilization gate.
+
+        Called from the poller thread, never from the decision tick, so it
+        must not mutate decision-owned state: it uses the pure
+        _outstanding_work_parts rather than _outstanding_work.
+
+        Returns None (blind, and therefore ungated) whenever the demand
+        report is not fresh. That is the fail-safe direction: without a
+        current report we cannot distinguish idle from unobservable, and
+        releasing on an unobservable fleet is the one outcome this design
+        must never produce.
+        """
+        with self._logical_state_lock:
+            if not self.has_fresh_demand_report():
+                return None
+            if self._in_flight_by_replica_id is None:
+                return None
+            queue_work, rejected, unknown_floor = (
+                self._outstanding_work_parts(replica_infos))
+            outstanding = float(
+                sum(self._in_flight_by_replica_id.values()) + queue_work +
+                rejected + unknown_floor)
+            busy = 0
+            pre_ready = 0
+            pre_ready_statuses = (
+                serve_state.ReplicaStatus.PENDING,
+                serve_state.ReplicaStatus.PROVISIONING,
+                serve_state.ReplicaStatus.STARTING,
+            )
+            for info in replica_infos:
+                if info.is_terminal:
+                    continue
+                if not self._replica_on_zero_cost_location(info):
+                    continue
+                if not getattr(info, 'reserved_fill', False):
+                    # Demand-placed zero-cost rows are demand-protected and
+                    # already exempt from the grant ceiling, so counting
+                    # them here would inflate the need by capacity the gate
+                    # can never reclaim anyway.
+                    continue
+                if getattr(info, 'status', None) in pre_ready_statuses:
+                    pre_ready += 1
+                elif self._replica_is_busy(info):
+                    busy += 1
+            work_per_replica = float(self.target_concurrency_per_replica)
+            if self.replica_unit == 'logical':
+                work_per_replica = self._effective_logical_capacity_per_gpu()
+            return FillDemandSample(
+                outstanding_work=outstanding,
+                busy_fill_holdings=busy,
+                pre_ready_fill_holdings=pre_ready,
+                upscale_pending=self.upscale_counter > 0,
+                work_per_replica=work_per_replica,
+            )
+
     def _replica_is_busy(self, info: 'replica_managers.ReplicaInfo') -> bool:
         """Whether the latest report shows in-flight work on a replica.
 
@@ -5237,6 +5360,23 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         rejected_in_window (a later sync) -- at most a 2x count per job,
         absorbed by hysteresis (accepted in the plan).
         """
+        queue_work, rejected, unknown_floor = self._outstanding_work_parts(
+            replica_infos)
+        # These two are observability fields owned by the decision tick (see
+        # info()). The pure variant assigns nothing, so the reserved-fill
+        # poller thread can sample outstanding work without clobbering them.
+        self._weighted_queue_work = queue_work
+        self._rejected_concurrency = rejected
+        assert self._in_flight_by_replica_id is not None
+        return float(
+            sum(self._in_flight_by_replica_id.values()) + queue_work +
+            rejected + unknown_floor)
+
+    def _outstanding_work_parts(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'] | None = None,
+    ) -> tuple[float, float, float]:
+        """(queue work, rejected work, unknown-occupancy floor). Pure."""
         assert self._in_flight_by_replica_id is not None
         unknown_floor = 0.0
         if self._unknown_in_flight_replica_ids:
@@ -5278,12 +5418,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # not manufacture a slot from arithmetic noise.
             unknown_floor = round(
                 max(original_unknown_floor, replacement_unknown_floor), 12)
-        self._weighted_queue_work = self._queue_work()
-        self._rejected_concurrency = self._rejected_work()
-        return float(
-            sum(self._in_flight_by_replica_id.values()) +
-            self._weighted_queue_work + self._rejected_concurrency +
-            unknown_floor)
+        return (self._queue_work(), self._rejected_work(), unknown_floor)
 
     def _unknown_occupancy_work(self,
                                 info: 'replica_managers.ReplicaInfo') -> float:
