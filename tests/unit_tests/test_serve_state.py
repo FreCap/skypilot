@@ -788,6 +788,55 @@ def test_submitted_version_yaml_migration_adds_nullable_column(
     assert 'submitted_yaml_content' in columns
 
 
+def test_placement_catalog_migration_adds_nullable_column(
+        tmp_path, monkeypatch):
+    # Regression guard for PR #906: migration 028 adds the nullable
+    # `placement_catalog` column via ALTER TABLE. The durable round-trip tests
+    # (test_version_placement_catalog_persists_and_backfills_once) build the
+    # schema with `create_all`, which already includes the column, so they
+    # never exercise the upgrade path on a database that predates it. This
+    # pins that an on-disk service DB stamped at 027 gains the column and that
+    # a pre-existing (legacy) row reads back as SQL NULL, matching 016->017.
+    engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
+    legacy_metadata = sqlalchemy.MetaData()
+    sqlalchemy.Table(
+        'version_specs',
+        legacy_metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
+        sqlalchemy.Column('yaml_content', sqlalchemy.Text),
+    )
+    legacy_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text('CREATE TABLE alembic_version_serve_state_db '
+                            '(version_num VARCHAR(32) NOT NULL)'))
+        connection.execute(
+            sqlalchemy.text(
+                "INSERT INTO alembic_version_serve_state_db VALUES ('027')"))
+        connection.execute(
+            sqlalchemy.text('INSERT INTO version_specs '
+                            '(service_name, version, yaml_content) '
+                            "VALUES ('legacy-svc', 1, 'yaml: v1')"))
+
+    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '028')
+    serve_state.create_table(engine)
+
+    columns = {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('version_specs')
+    }
+    assert 'placement_catalog' in columns
+    with engine.begin() as connection:
+        legacy_catalog = connection.execute(
+            sqlalchemy.text('SELECT placement_catalog FROM version_specs '
+                            'WHERE service_name = :name'), {
+                                'name': 'legacy-svc'
+                            }).scalar()
+    assert legacy_catalog is None
+
+
 def test_service_version_terminal_lookup_uses_only_exact_history_keys(
         _mock_serve_db):
     engine = _mock_serve_db
@@ -2591,6 +2640,51 @@ class TestRecoveryVersionSelection:
         with _count_sql_statements(_mock_serve_db) as chunked_counts:
             assert getter(missing_names + [missing_names[0]]) == {}
         assert chunked_counts['n'] == 2
+
+    @pytest.mark.parametrize('getter_name', [
+        'get_latest_committed_versions',
+        'get_service_mode_and_hashes',
+    ])
+    def test_batch_recovery_fallbacks_return_second_chunk_values(
+            self, _mock_serve_db, getter_name):
+        # Regression guard for PR #911: the batched HA-recovery reads
+        # accumulate results across `_TERMINAL_IDENTITY_QUERY_BATCH_SIZE`
+        # chunks via `rows.extend(...)`. The sibling ...bound_empty_and_chunked
+        # test requests only all-missing names, so it asserts the statement
+        # count but never that a real row landing in the SECOND chunk survives
+        # accumulation. A refactor that dropped later chunks (e.g. `rows =`
+        # instead of `rows.extend`, or an early `break`) would still issue two
+        # statements yet silently lose the second-chunk service. This pins that
+        # a real second-chunk value is returned and equals the single-row read.
+        batch_size = serve_state._TERMINAL_IDENTITY_QUERY_BATCH_SIZE
+        # The getters read sorted(set(names)); a 'zzz-' name sorts after the
+        # `batch_size` fillers, landing at index == batch_size (first row of
+        # the second chunk).
+        filler_names = [f'chunk-miss-{i:04d}' for i in range(batch_size)]
+        real_name = 'zzz-second-chunk-svc'
+        getter = getattr(serve_state, getter_name)
+        if getter_name == 'get_latest_committed_versions':
+            serve_state.add_or_update_version(real_name, 1, 'spec-1',
+                                              'yaml: v1')
+            serve_state.add_or_update_version(real_name, 2, 'spec-2',
+                                              'yaml: v2')
+            serve_state.add_version(real_name)  # uncommitted placeholder v3
+            expected_value = 2
+            single_row_value = serve_state.get_latest_committed_version(
+                real_name)
+        else:
+            assert _add_minimal_service(real_name,
+                                        service_hash='hash-z',
+                                        pool=True)
+            expected_value = (True, 'hash-z')
+            single_row_value = serve_state.get_service_mode_and_hash(real_name)
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            result = getter(filler_names + [real_name])
+
+        assert counts['n'] == 2, counts
+        assert result == {real_name: expected_value}
+        assert result.get(real_name) == single_row_value
 
     def test_version_records_include_commit_provenance(self, _mock_serve_db,
                                                        monkeypatch):
