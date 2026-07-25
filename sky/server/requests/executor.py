@@ -971,6 +971,22 @@ def _record_memory_metrics(request_name: str, proc: psutil.Process,
         name=request_name).observe(max(peak_rss - rss_begin, 0))
 
 
+async def _join_cancelled_child(task: asyncio.Task) -> BaseException | None:
+    """Join a child without completing the shielded waiter exceptionally.
+
+    Returning failures as values prevents a cancelled ``asyncio.shield`` from
+    reporting the waiter's later exception as unhandled on Python 3.14. The
+    caller re-raises the failure, including KeyboardInterrupt and SystemExit.
+    """
+    try:
+        await task
+    except asyncio.CancelledError:  # noqa: ASYNC103
+        return None  # noqa: ASYNC104
+    except BaseException as e:  # pylint: disable=broad-exception-caught
+        return e
+    return None
+
+
 class CoroutineTask:
     """Wrapper of a background task runs in coroutine"""
 
@@ -979,22 +995,29 @@ class CoroutineTask:
 
     async def cancel(self):
         self.task.cancel()
-        current_task = asyncio.current_task()
+        # Normalize the child's expected cancellation to a successful result.
+        # A CancelledError raised while shielding this waiter therefore belongs
+        # to this parent cleanup task on every supported Python version.
+        join_task = asyncio.create_task(_join_cancelled_child(self.task))
         parent_cancellation: asyncio.CancelledError | None = None
         while True:
             try:
-                await asyncio.shield(self.task)
+                await asyncio.shield(join_task)
                 break
             except asyncio.CancelledError as e:  # noqa: ASYNC103
-                if (parent_cancellation is None and current_task is not None and
-                        current_task.cancelling()):
+                if parent_cancellation is None:
                     parent_cancellation = e
-                if not self.task.done():
+                if not join_task.done():
                     # Keep the child's cancellation cleanup alive if this
                     # background cleanup task is itself cancelled.
                     continue  # noqa: ASYNC104
-                # Cancellation raised by the child is expected here.
                 break  # noqa: ASYNC104
+        # Consume the waiter result even if parent cancellation raced with its
+        # completion. Child cleanup failures retain precedence, including
+        # process-control exceptions such as KeyboardInterrupt and SystemExit.
+        child_error = join_task.result()
+        if child_error is not None:
+            raise child_error
         if parent_cancellation is not None:
             raise parent_cancellation
 

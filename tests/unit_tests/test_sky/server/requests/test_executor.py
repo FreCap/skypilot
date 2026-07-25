@@ -456,6 +456,27 @@ async def test_process_sanitizes_only_typed_image_boundary_failures(
 
 
 @pytest.mark.asyncio
+async def test_coroutine_task_cancel_cancels_and_joins_child():
+    child_started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def child_task() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_finished.set()
+
+    child = asyncio.create_task(child_task())
+    await asyncio.wait_for(child_started.wait(), timeout=1)
+
+    await executor.CoroutineTask(child).cancel()
+
+    assert cleanup_finished.is_set()
+    assert child.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_coroutine_task_cancel_joins_cleanup_through_repeated_cancel():
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
@@ -483,6 +504,87 @@ async def test_coroutine_task_cancel_joins_cleanup_through_repeated_cancel():
         await asyncio.wait_for(cancel_task, timeout=1)
     assert cleanup_finished.is_set()
     assert child.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_coroutine_task_cancel_does_not_require_task_cancelling(
+        monkeypatch):
+
+    class LegacyTask:
+        """Task-like current task from before asyncio.Task.cancelling()."""
+
+    monkeypatch.setattr(executor.asyncio, 'current_task', LegacyTask)
+    child = asyncio.create_task(asyncio.Event().wait())
+
+    await executor.CoroutineTask(child).cancel()
+
+    assert child.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_coroutine_task_cancel_propagates_child_cleanup_error():
+    child_started = asyncio.Event()
+
+    async def child_task() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError('child cleanup failed') from None
+
+    child = asyncio.create_task(child_task())
+    await asyncio.wait_for(child_started.wait(), timeout=1)
+
+    with pytest.raises(RuntimeError, match='child cleanup failed'):
+        await executor.CoroutineTask(child).cancel()
+
+    assert child.done()
+    assert isinstance(child.exception(), RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_coroutine_task_cancel_preserves_racing_child_cleanup_error():
+    child_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    unhandled_contexts = []
+
+    async def child_task() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            raise RuntimeError('racing child cleanup failed') from None
+
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+    loop.set_exception_handler(
+        lambda _loop, context: unhandled_contexts.append(context))
+    child = asyncio.create_task(child_task())
+    try:
+        await asyncio.wait_for(child_started.wait(), timeout=1)
+        cancel_task = asyncio.create_task(
+            executor.CoroutineTask(child).cancel())
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        cancel_task.cancel()
+        await asyncio.sleep(0)
+        assert not cancel_task.done()
+
+        release_cleanup.set()
+        with pytest.raises(RuntimeError, match='racing child cleanup failed'):
+            await asyncio.wait_for(cancel_task, timeout=1)
+        # Let cancelled shield callbacks run before inspecting the handler.
+        await asyncio.sleep(0)
+
+        assert child.done()
+        assert isinstance(child.exception(), RuntimeError)
+        assert not unhandled_contexts
+    finally:
+        release_cleanup.set()
+        loop.set_exception_handler(previous_exception_handler)
 
 
 @pytest.mark.asyncio
