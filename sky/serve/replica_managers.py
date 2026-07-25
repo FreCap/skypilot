@@ -304,6 +304,51 @@ class _UnfencedExternalLbLaunchError(RuntimeError):
     """A legacy controller cannot satisfy the API replica-launch fence."""
 
 
+def _scope_security_group_to_service(task: 'task_lib.Task',
+                                     service_name: str | None) -> None:
+    """Pins a service's replicas to ONE security group instead of one each.
+
+    A cluster that declares ports gets its own group, named after the cluster.
+    For a service that is one group per replica, and this fleet replaces spot
+    replicas continuously across 20 AWS regions, so the count grows without
+    bound: measured at ~3000 groups against a 2500-per-VPC quota, ~99% of them
+    referenced by no network interface because teardown cannot wait long enough
+    for the interface to detach.
+
+    Naming the group after the SERVICE collapses that to one per service, and
+    is the tightest scope that still bounds growth. It is not the same as
+    sharing a group across services: the group carries a self-referencing rule
+    that grants ALL protocols and ports between its members, and skylet listens
+    on an unauthenticated port, so members of one group can execute code on each
+    other. Replicas of a single service already share an image, a spec and their
+    secrets, so that is within an existing trust boundary; two different
+    services are not, and must never share.
+
+    Implemented through ``aws.security_group_name``, which additionally gives
+    exactly the lifecycle we need for free: SkyPilot marks a caller-specified
+    group as not-managed-by-SkyPilot, so a single replica's teardown will not
+    delete a group its siblings are still using, while ``open_ports`` still
+    reconciles the service's ports onto it.
+
+    Only applies when the caller did not already pin a group, so an explicit
+    operator override always wins.
+    """
+    if not service_name:
+        return
+    scoped = f'sky-sg-{service_name}'
+    new_resources = []
+    for resource in task.resources:
+        existing = dict(resource.cluster_config_overrides or {})
+        aws_overrides = dict(existing.get('aws', {}))
+        if aws_overrides.get('security_group_name'):
+            # An operator pinned a group explicitly; do not second-guess it.
+            return
+        aws_overrides['security_group_name'] = scoped
+        existing['aws'] = aws_overrides
+        new_resources.append(resource.copy(_cluster_config_overrides=existing))
+    task.set_resources(type(task.resources)(new_resources))
+
+
 def _inject_replica_tls_material(task: 'task_lib.Task') -> None:
     """Hand a replica the TLS material its proxy needs, if TLS is enabled.
 
@@ -360,7 +405,8 @@ def launch_cluster(
         continue_guard: Callable[[], bool] | None = None,
         launch_fence: dict[str, Any] | None = None,
         service_spec: 'service_spec.SkyServiceSpec | None' = None,
-        workspace: str | None = None) -> None:
+        workspace: str | None = None,
+        service_name: str | None = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -407,6 +453,7 @@ def launch_cluster(
                 task.set_resources(type(resources)(overrided_resources))
         task.update_envs({serve_constants.REPLICA_ID_ENV_VAR: str(replica_id)})
         _inject_replica_tls_material(task)
+        _scope_security_group_to_service(task, service_name)
 
         logger.info(f'Launching replica (id: {replica_id}) cluster '
                     f'{cluster_name} with resources: {task.resources}')
@@ -3555,6 +3602,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'launch_fence':
                     self._replica_launch_fence_context(launch_version),
                 'service_spec': launch_spec,
+                'service_name': self._service_name,
                 'workspace': getattr(
                     self, '_workspace',
                     skypilot_config.get_active_workspace() or

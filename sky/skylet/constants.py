@@ -551,6 +551,10 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: list[tuple[str, ...]] = [
     ('kubernetes', 'remote_identity'),
     ('kubernetes', 'enable_docker'),
     ('kubernetes', 'set_pod_resource_limits'),
+    # A SkyServe controller pins its replicas to one group per SERVICE rather
+    # than the default one per cluster, which otherwise grows without bound as
+    # spot replicas churn.
+    ('aws', 'security_group_name'),
     ('azure', 'remote_identity'),
     ('azure', 'vpc_name'),
     ('gcp', 'vpc_name'),

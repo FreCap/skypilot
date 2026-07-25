@@ -36,9 +36,15 @@ def test_default_name_is_decoupled_from_the_hostname_hash():
 
 
 def test_legacy_hostname_derived_names_are_treated_as_shared():
-    """A teardown must not start deleting groups other clusters still use."""
-    for legacy in ('sky-sg-root-e495', 'sky-sg-root-7508', 'sky-sg-root-41c2',
-                   'sky-sg-ubuntu-abcd'):
+    """A teardown must not start deleting groups other clusters still use.
+
+    Matching is anchored to the CURRENT user, because the legacy scheme was
+    f'sky-sg-{getpass.getuser()}-{hostname_hash}' -- the user component is the
+    same one rendered today.
+    """
+    user = getpass.getuser()
+    for suffix in ('e495', '7508', '41c2', 'abcd'):
+        legacy = f'sky-sg-{user}-{suffix}'
         assert aws.is_shared_default_security_group(legacy), legacy
 
 
@@ -54,10 +60,20 @@ def test_per_cluster_names_are_not_treated_as_shared():
         assert not aws.is_shared_default_security_group(own), own
 
 
-def test_ambiguous_names_fail_safe():
-    """An ambiguous name must be treated as shared, i.e. NOT deleted.
+def test_a_cluster_named_like_a_legacy_default_is_not_spared():
+    """The predicate must be anchored to the user, not just the shape.
 
-    Erring toward 'shared' leaks one group; erring the other way deletes a
-    group other live clusters depend on.
+    An unanchored pattern matched real per-cluster groups whose cluster name is
+    a single token and whose replica id happens to be four hex digits --
+    sky-sg-scaletest-1425, -1433 and -1434 all exist in the fleet account right
+    now. Treating those as shared leaks them permanently, because a teardown
+    then refuses to delete a group that is genuinely its own.
+
+    Anchoring is safe in the other direction too: AWS refuses to delete a group
+    any network interface still references, so a misclassification cannot take
+    a group away from a live cluster -- it can only fail with
+    DependencyViolation, which cleanup_ports already handles.
     """
-    assert aws.is_shared_default_security_group('sky-sg-run-abcd')
+    for own in ('sky-sg-scaletest-1425', 'sky-sg-scaletest-1433',
+                'sky-sg-scaletest-1434', 'sky-sg-run-abcd'):
+        assert not aws.is_shared_default_security_group(own), own

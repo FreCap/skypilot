@@ -115,7 +115,16 @@ DEFAULT_SECURITY_GROUP_NAME = f'sky-sg-{getpass.getuser()}'
 # Groups created by the pre-change naming scheme. They are shared by every
 # port-less cluster of one API-server generation, so a teardown must never
 # delete one just because its name no longer equals the current default.
-_LEGACY_DEFAULT_SECURITY_GROUP_RE = re.compile(r'^sky-sg-[^-]+-[0-9a-f]{4}$')
+#
+# Anchored to THIS user, because the legacy scheme was
+# f'sky-sg-{getpass.getuser()}-{hostname_hash}' -- the user component is the
+# same one we render today. An unanchored `[^-]+` matched real per-cluster
+# groups whose cluster name is a single token and whose replica id happens to
+# be four hex digits: sky-sg-scaletest-1425, -1433 and -1434 all exist right
+# now. Misclassifying those as shared leaks them permanently, since a teardown
+# then refuses to delete a group that is genuinely its own.
+_LEGACY_DEFAULT_SECURITY_GROUP_RE = re.compile(
+    rf'^sky-sg-{re.escape(getpass.getuser())}-[0-9a-f]{{4}}$')
 
 
 def is_shared_default_security_group(name: str) -> bool:
@@ -921,7 +930,8 @@ class AWS(clouds.Cloud):
             cloud='aws',
             region=region_name,
             keys=('security_group_name',),
-            default_value=None)
+            default_value=None,
+            override_configs=resources.cluster_config_overrides)
         user_security_group = None
         if isinstance(user_security_group_config, str):
             user_security_group = user_security_group_config
@@ -939,13 +949,17 @@ class AWS(clouds.Cloud):
                 security_group = USER_PORTS_SECURITY_GROUP_NAME.format(
                     cluster_name.display_name)
         elif resources.ports is not None:
-            with ux_utils.print_exception_no_traceback():
-                logger.warning(
-                    f'Skip opening ports {resources.ports} for cluster {cluster_name!r}, '
-                    'as `aws.security_group_name` in `~/.sky/config.yaml` is specified as '
-                    f' {security_group!r}. Please make sure the specified security group '
-                    'has requested ports setup; or, leave out `aws.security_group_name` '
-                    'in `~/.sky/config.yaml`.')
+            # NOT skipped: `open_ports` reconciles the requested ports onto the
+            # named group regardless of who named it. What DOES change is
+            # lifecycle -- the group is marked not-managed-by-SkyPilot below, so
+            # a teardown will not delete it. That is required when the group is
+            # shared, and is why a SkyServe controller scopes its replicas to
+            # one group per service this way.
+            logger.debug(
+                f'Cluster {cluster_name!r} will open ports {resources.ports} on '
+                f'the specified security group {security_group!r}. The group is '
+                'treated as externally owned and will not be deleted on '
+                'teardown.')
 
         # Source CIDRs for the cluster's SSH port and any requested
         # `resources.ports`. The default reproduces the historical behaviour of
