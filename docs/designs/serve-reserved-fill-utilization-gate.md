@@ -16,6 +16,27 @@ All line references are at prod SHA `a0028d62c7be576a97937d8fe7471bfa7c019849` (
 which is an ancestor of the branch this lands on. Read them with
 `git show a0028d62c7be576a97937d8fe7471bfa7c019849:<path>`.
 
+## Blocking dependency: drain proof across load balancer restarts
+
+Measured after this design was accepted, and it changes the rollout order.
+`protenixv2-hybrid-v1`'s load balancer Deployment rolled **46 times in 41.9
+hours** (mean interval 55 minutes), essentially all of them side effects of
+control-plane deploys, because the load balancer pod template pins the
+controller image digest. Every such roll makes the controller mark every live
+replica occupancy-unknown, and the logical retirement gate reads that blind
+capacity view as a shortfall and **aborts the whole in-progress drain wave**,
+returning its victims to routing with their elapsed drain lost.
+
+So on this cluster the gate's release does not merely run slowly, it is
+repeatedly reverted: any wave lasting more than about an hour is expected to
+span at least one roll. The trajectory in "Release path and end-to-end latency
+budget" below assumes no roll and is therefore a best case, not a typical one.
+
+The gate is still correct to ship (it is default off, and the mechanism is
+independent), but do not enable it on `protenixv2-hybrid-v1` before Milestones
+1 and 2 of `serve-drain-proof-across-lb-restarts.md` are deployed. Enabling it
+earlier will produce churn without release.
+
 ## Operator decisions on record
 
 Taken 2026-07-25, and they override the sizing recommendations in "Configuration for the live
