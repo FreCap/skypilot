@@ -42,15 +42,29 @@ def upgrade() -> None:
     under the same lease CAS, and an old binary's publish omits it from its
     values dict so the state survives a mixed-version round untouched.
     """
+    # Skip tables this database does not have. add_column_to_table_alembic
+    # only tolerates "already exists"; a MISSING table re-raises, and on
+    # PostgreSQL the failed statement then poisons the surrounding block. A
+    # database stamped past revision 004 without ever running it (an upgrade
+    # from a hand-built legacy schema, which the migration-chain tests
+    # construct) has no reserved-fill tables at all. Nothing is lost by
+    # skipping: whenever those tables are finally created they come from
+    # Base.metadata, which already declares these columns.
+    inspector = sa.inspect(op.get_bind())
+    claims_present = inspector.has_table('reserved_fill_claims')
+    rounds_present = inspector.has_table('reserved_fill_rounds')
     with op.get_context().autocommit_block():
-        db_utils.add_column_to_table_alembic('reserved_fill_claims',
-                                             'demonstrated_need', sa.Integer())
-        db_utils.add_column_to_table_alembic('reserved_fill_claims',
-                                             'boot_hold', sa.Integer())
-        db_utils.add_column_to_table_alembic('reserved_fill_claims',
-                                             'activity_ts', sa.Float())
-        db_utils.add_column_to_table_alembic('reserved_fill_rounds',
-                                             'utilization_state', sa.Text())
+        if claims_present:
+            db_utils.add_column_to_table_alembic('reserved_fill_claims',
+                                                 'demonstrated_need',
+                                                 sa.Integer())
+            db_utils.add_column_to_table_alembic('reserved_fill_claims',
+                                                 'boot_hold', sa.Integer())
+            db_utils.add_column_to_table_alembic('reserved_fill_claims',
+                                                 'activity_ts', sa.Float())
+        if rounds_present:
+            db_utils.add_column_to_table_alembic('reserved_fill_rounds',
+                                                 'utilization_state', sa.Text())
 
 
 def downgrade() -> None:

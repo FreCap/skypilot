@@ -2002,12 +2002,6 @@ class ReplicaManager:
                                   controller_pid is not None or
                                   controller_ip is not None else None)
         self._enforce_launch_fence = enforce_launch_fence
-        # Process-local drain/retirement counters, surfaced through the
-        # controller's /autoscaler/info. On the base class so the controller's
-        # typed reference resolves and every manager exposes them, even though
-        # only the SkyPilot manager increments them. See
-        # docs/designs/serve-drain-proof-across-lb-restarts.md, Milestone 0.
-        self._drain_proof_stats = drain_observability.DrainProofStats()
         self._uptime: float | None = None
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
         self._is_pool: bool = spec.pool
@@ -2308,6 +2302,25 @@ class ReplicaManager:
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of the active replicas."""
         raise NotImplementedError
+
+    @property
+    def _drain_proof_stats(self) -> 'drain_observability.DrainProofStats':
+        """Process-local drain/retirement counters, lazily created.
+
+        Deliberately NOT assigned in __init__: recovery paths and tests build
+        managers without running the current constructor, which is the same
+        reason _wait_for_idle_trackers is rebuilt defensively at its use site.
+        A counter that raises AttributeError on those paths would turn
+        observability into an outage. On the base class so the controller's
+        typed reference resolves, even though only the SkyPilot manager
+        increments them. See
+        docs/designs/serve-drain-proof-across-lb-restarts.md, Milestone 0.
+        """
+        stats = getattr(self, '_drain_proof_stats_value', None)
+        if stats is None:
+            stats = drain_observability.DrainProofStats()
+            self._drain_proof_stats_value = stats
+        return stats
 
     def drain_proof_stats_snapshot(self) -> dict[str, Any]:
         """Drain and retirement counters for /autoscaler/info."""
