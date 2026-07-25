@@ -699,10 +699,14 @@ def _make_update_controller() -> controller.SkyServeController:
 
 class TestServiceUpdateReconciler:
 
-    @pytest.mark.parametrize(('explicit', 'expected_transition'),
-                             [(True, True), (None, False)])
-    def test_ha_update_round_trip_preserves_explicit_migration_only(
-            self, explicit, expected_transition):
+    @pytest.mark.parametrize('explicit', [True, False, None])
+    def test_ha_update_round_trip_never_migrates_from_yaml(self, explicit):
+        """A YAML value cannot move a service off its durable LB mode.
+
+        high_availability is ignored on parse, so every update inherits the
+        durable mode. Migration is only the explicit admin path, covered by
+        test_lb_only_admin_change_reuses_current_committed_spec.
+        """
         service_config = {}
         if explicit is not None:
             service_config['load_balancer'] = {
@@ -731,16 +735,8 @@ class TestServiceUpdateReconciler:
                 'incarnation-a', 7)
 
         assert response.status_code == 200
-        if expected_transition:
-            ctrl._transition_load_balancer_mode.assert_called_once_with(  # pylint: disable=protected-access
-                True,
-                round_tripped,
-                expected_service_hash='incarnation-a',
-                expected_lifecycle_epoch=7)
-            assert commit.call_args.args[2].lb_high_availability
-        else:
-            ctrl._transition_load_balancer_mode.assert_not_called()  # pylint: disable=protected-access
-            assert not commit.call_args.args[2].lb_high_availability
+        ctrl._transition_load_balancer_mode.assert_not_called()  # pylint: disable=protected-access
+        assert not commit.call_args.args[2].lb_high_availability
 
     def test_lb_only_admin_change_reuses_current_committed_spec(self):
         ctrl = _make_update_controller()

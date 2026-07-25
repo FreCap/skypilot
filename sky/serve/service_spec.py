@@ -844,17 +844,25 @@ class SkyServiceSpec:
                                           None))
             service_config['lb_request_queue'] = load_balancer_section.get(
                 'request_queue', None)
-            if (pool_config is not None and
-                    load_balancer_section.get('high_availability') is True):
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError(
-                        'load_balancer.high_availability is not supported for '
-                        'pools because pools have no inference endpoint.')
-            service_config['lb_high_availability'] = (
-                False if pool_config is not None else load_balancer_section.get(
-                    'high_availability', True))
-        else:
-            service_config['lb_high_availability'] = pool_config is None
+            if 'high_availability' in load_balancer_section:
+                logger.warning(
+                    'load_balancer.high_availability is ignored and will be '
+                    'removed. Load balancer high availability is always on '
+                    'for services and never applies to pools, which have no '
+                    'inference endpoint. Drop the field from the service '
+                    'YAML. An existing service keeps its durable load '
+                    'balancer mode until an explicit migration.')
+        # The load balancer topology is derived, not chosen: warm-standby
+        # for services, single-slot for pools. With a single slot the
+        # controller marks every live replica occupancy-unknown during the
+        # maxSurge overlap of each rollout (force_all_live_unknown is
+        # unconditionally true when HA is off), and the logical retirement
+        # gate then aborts an in-progress drain wave and returns its victims
+        # to routing. Two slots remove that term. This does NOT make drain
+        # proof survive a load balancer restart: a rollout replaces both
+        # slots, so the tracker's acknowledgement resets either way (see
+        # docs/designs/serve-drain-proof-across-lb-restarts.md).
+        service_config['lb_high_availability'] = pool_config is None
         if isinstance(post_data, str):
             try:
                 post_data = json.loads(post_data)
@@ -1095,10 +1103,12 @@ class SkyServiceSpec:
                 certfile=tls_section.get('certfile', None),
             )
 
+        # No YAML can assert a load balancer mode any more, so a parsed spec
+        # never carries one. An existing service therefore keeps its durable
+        # mode across unrelated updates; moving it onto warm-standby stays an
+        # explicit migration. A brand new service has no durable mode and
+        # takes the derived value above.
         spec = SkyServiceSpec(**service_config)
-        spec._lb_high_availability_specified = (  # pylint: disable=protected-access
-            load_balancer_section is not None and
-            'high_availability' in load_balancer_section)
         return spec
 
     @staticmethod
@@ -1193,14 +1203,11 @@ class SkyServiceSpec:
         add_if_not_none('load_balancer', 'retry_initial_backoff_seconds',
                         self.lb_retry_initial_backoff_seconds)
         add_if_not_none('load_balancer', 'request_queue', self.lb_request_queue)
-        # HA is the default for newly parsed services. Preserve either an
-        # explicit opt-in or the legacy opt-out across the server-side update
-        # round trip; only an unspecified default stays omitted so unrelated
-        # updates inherit the service's durable mode.
-        if (self.lb_high_availability_specified or
-                not self.lb_high_availability):
-            add_if_not_none('load_balancer', 'high_availability',
-                            self.lb_high_availability)
+        # high_availability is deliberately not emitted. Both sides derive the
+        # same mode from pool-ness, so the round trip needs no carrier, and
+        # emitting one would only re-trigger the ignored-field warning. An
+        # older server parsing this config derives the identical value from
+        # the field's absence.
         add_if_not_none('readiness_probe', 'headers', self._readiness_headers)
         add_if_not_none('replica_policy', 'min_replicas', self.min_replicas)
         add_if_not_none('replica_policy',

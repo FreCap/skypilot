@@ -74,9 +74,12 @@ def get_service_schema():
                 'required': [],
                 'additionalProperties': False,
                 'properties': {
-                    # Run two synchronized one-replica LB slots behind the
-                    # existing stable LoadBalancer Service. Only the selected
-                    # slot accepts new data-plane traffic.
+                    # DEPRECATED and IGNORED. Two synchronized one-replica LB
+                    # slots behind the stable LoadBalancer Service (only the
+                    # selected slot accepts new data-plane traffic) is the
+                    # only supported topology for a service, and pools never
+                    # get one. Still accepted so existing YAMLs keep parsing;
+                    # the value is discarded with a warning.
                     'high_availability': {
                         'type': 'boolean',
                     },

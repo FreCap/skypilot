@@ -10,7 +10,7 @@ from sky.serve import service_spec
 
 
 class TestLoadBalancerHighAvailability:
-    """Default-on and explicit compatibility semantics."""
+    """The mode is derived from pool-ness; the YAML field is ignored."""
 
     def test_new_service_defaults_to_high_availability(self):
         spec = service_spec.SkyServiceSpec.from_yaml_config({})
@@ -18,29 +18,30 @@ class TestLoadBalancerHighAvailability:
         assert spec.lb_high_availability
         assert not spec.lb_high_availability_specified
 
-    def test_explicit_opt_out_round_trips(self):
+    @pytest.mark.parametrize('requested', [True, False])
+    def test_explicit_value_is_ignored(self, requested):
+        spec = service_spec.SkyServiceSpec.from_yaml_config(
+            {'load_balancer': {
+                'high_availability': requested,
+            }})
+
+        assert spec.lb_high_availability
+        # A parsed spec never asserts a mode, so an unrelated update leaves an
+        # existing service on its durable mode.
+        assert not spec.lb_high_availability_specified
+
+    def test_mode_is_not_emitted(self):
         spec = service_spec.SkyServiceSpec.from_yaml_config(
             {'load_balancer': {
                 'high_availability': False,
             }})
 
-        assert not spec.lb_high_availability
-        assert spec.lb_high_availability_specified
-        assert spec.to_yaml_config(
-        )['load_balancer']['high_availability'] is False
-
-    def test_explicit_opt_in_round_trips_with_specified_bit(self):
-        spec = service_spec.SkyServiceSpec.from_yaml_config(
-            {'load_balancer': {
-                'high_availability': True,
-            }})
-
         rendered = spec.to_yaml_config()
         restored = service_spec.SkyServiceSpec.from_yaml_config(rendered)
 
-        assert rendered['load_balancer']['high_availability'] is True
+        assert 'high_availability' not in rendered.get('load_balancer', {})
         assert restored.lb_high_availability
-        assert restored.lb_high_availability_specified
+        assert not restored.lb_high_availability_specified
 
     def test_pool_does_not_enable_unused_load_balancer(self):
         spec = service_spec.SkyServiceSpec.from_yaml_config({
@@ -50,15 +51,18 @@ class TestLoadBalancerHighAvailability:
 
         assert not spec.lb_high_availability
 
-    def test_pool_rejects_explicit_high_availability(self):
-        with pytest.raises(ValueError, match='pools have no inference'):
-            service_spec.SkyServiceSpec.from_yaml_config({
-                'pool': {},
-                'workers': 1,
-                'load_balancer': {
-                    'high_availability': True,
-                },
-            })
+    def test_pool_ignores_explicit_high_availability(self):
+        spec = service_spec.SkyServiceSpec.from_yaml_config({
+            'pool': {},
+            'workers': 1,
+            'load_balancer': {
+                'high_availability': True,
+            },
+        })
+
+        assert not spec.lb_high_availability
+        assert 'high_availability' not in spec.to_yaml_config().get(
+            'load_balancer', {})
 
     def test_old_pickled_spec_stays_legacy(self):
         spec = service_spec.SkyServiceSpec.from_yaml_config({})
