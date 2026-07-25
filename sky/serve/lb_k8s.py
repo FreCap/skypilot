@@ -1405,13 +1405,28 @@ def _service_ports_patch(desired_ports: list[dict[str, Any]]) -> list[dict]:
     list exactly, sees the stale port, and re-runs the whole create path every
     reconcile interval, forever. The same wedge applies in reverse on rollback.
 
-    Only ports this feature owns are ever deleted, so an operator-added port is
+    The same field-retention wedge applies to ``name``. Adding the TLS listener
+    renames the pre-existing plaintext port to ``http`` (Kubernetes requires a
+    name once a Service has more than one port). Fully disabling HTTPS again
+    wants that port back to unnamed, but a merge body that omits ``name`` keeps
+    the stale ``http`` -- so ``_service_has_desired_routing`` sees ``http`` vs
+    ``None`` and re-patches forever. An owned port that is desired-but-unnamed
+    therefore carries an explicit ``name: None`` so the merge clears it, exactly
+    as the dropped port carries an explicit delete.
+
+    Only ports this feature owns are ever touched, so an operator-added port is
     left alone.
     """
     owned = (constants.LOAD_BALANCER_PORT_START,
              constants.EXTERNAL_LB_HTTPS_PORT)
     desired_numbers = {port.get('port') for port in desired_ports}
-    return list(desired_ports) + [{
+    patched: list[dict] = []
+    for port in desired_ports:
+        entry = dict(port)
+        if entry.get('port') in owned and 'name' not in entry:
+            entry['name'] = None
+        patched.append(entry)
+    return patched + [{
         'port': port,
         '$patch': 'delete',
     } for port in owned if port not in desired_numbers]

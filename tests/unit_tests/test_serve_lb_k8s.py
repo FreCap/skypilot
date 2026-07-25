@@ -2402,6 +2402,106 @@ def test_ports_patch_never_deletes_a_port_we_do_not_own():
     assert 9999 not in deleted
 
 
+def test_ports_patch_leaves_a_foreign_port_name_alone():
+    """The name clear is scoped to owned ports; an operator name is untouched."""
+    patch_ports = lb_k8s._service_ports_patch([{'port': 9999}])
+    foreign = next(p for p in patch_ports if p.get('port') == 9999)
+    assert 'name' not in foreign
+
+
+def _apply_service_ports_strategic_merge(live_ports: list,
+                                         patch_ports: list) -> list:
+    """Model a Kubernetes strategic-merge patch of ``Service.spec.ports``.
+
+    ``ports`` carries ``patchMergeKey=port`` / ``patchStrategy=merge``: patch
+    elements are matched to live elements by ``port`` and merged field by field.
+    A field the patch omits is RETAINED, an explicit ``None`` (JSON null)
+    DELETES the field, and ``{'$patch': 'delete'}`` removes the whole element.
+    That retention is exactly what the production reconciler rides on; the other
+    port tests mock ``_strategic_merge_patch`` and so never round-trip it.
+    """
+    merged: dict = {}
+    order: list = []
+    for port in live_ports:
+        merged[port['port']] = dict(port)
+        order.append(port['port'])
+    for entry in patch_ports:
+        number = entry.get('port')
+        if entry.get('$patch') == 'delete':
+            merged.pop(number, None)
+            continue
+        if number not in merged:
+            order.append(number)
+        current = merged.get(number, {})
+        for key, value in entry.items():
+            if key == '$patch':
+                continue
+            if value is None:
+                current.pop(key, None)
+            else:
+                current[key] = value
+        merged[number] = current
+    return [merged[number] for number in order if number in merged]
+
+
+def test_ports_patch_converges_after_disabling_a_dual_listen_service(
+        monkeypatch):
+    """Dropping the renamed plaintext listener must converge in one patch.
+
+    Enabling TLS renames the pre-existing plaintext port to ``http`` (>1 port
+    needs names). Fully disabling HTTPS again wants it unnamed, but strategic
+    merge keeps any field the patch omits, so without an explicit ``name`` clear
+    the live port keeps ``http`` and ``_service_has_desired_routing`` reports
+    drift and re-patches forever -- the same non-convergence the port delete
+    directive fixes, on the ``name`` field this PR added to the drift tuple.
+    """
+    # Live state left by an earlier dual-listen reconcile: renamed plaintext
+    # port plus the TLS listener.
+    live_ports = [
+        {
+            'name': constants.EXTERNAL_LB_HTTP_PORT_NAME,
+            'port': constants.LOAD_BALANCER_PORT_START,
+            'targetPort': constants.LOAD_BALANCER_PORT_START,
+            'protocol': 'TCP',
+        },
+        {
+            'name': constants.EXTERNAL_LB_HTTPS_PORT_NAME,
+            'port': constants.EXTERNAL_LB_HTTPS_PORT,
+            'targetPort': constants.LOAD_BALANCER_PORT_START,
+            'protocol': 'TCP',
+        },
+    ]
+    # Operator unsets the HTTPS config -> desired reverts to one unnamed port.
+    _https_env(monkeypatch, cert=None, suffix=None)
+    desired = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    patch_ports = lb_k8s._service_ports_patch(desired['spec']['ports'])
+    # Mechanism (model-independent): the owned plaintext port carries an
+    # explicit name clear so the merge can drop the stale ``http``.
+    assert {
+        'name': None,
+        'port': constants.LOAD_BALANCER_PORT_START,
+        'targetPort': constants.LOAD_BALANCER_PORT_START,
+        'protocol': 'TCP',
+    } in patch_ports
+
+    # Property: applying the patch to the live Service clears the name and the
+    # drift check then reports convergence, so the reconciler stops re-patching.
+    merged_ports = _apply_service_ports_strategic_merge(live_ports, patch_ports)
+    live_service = {
+        'metadata': {
+            'annotations': dict(desired['metadata'].get('annotations', {})),
+        },
+        'spec': {
+            'type': desired['spec']['type'],
+            'externalTrafficPolicy': desired['spec']['externalTrafficPolicy'],
+            'selector': desired['spec']['selector'],
+            'ports': merged_ports,
+        },
+    }
+    assert lb_k8s._service_has_desired_routing(live_service, desired)
+
+
 def _lb_container(monkeypatch) -> dict:
     """The LB container spec, with the many runtime args defaulted."""
     monkeypatch.setenv('SKYPILOT_SERVE_API_SERVICE_URL',
