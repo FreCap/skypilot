@@ -4242,3 +4242,148 @@ def test_held_advisory_lock_leaves_pool_free_for_protected_query(
             connection_url, None)
         if lock_engine is not None:
             lock_engine.dispose()
+
+
+# =========== Utilization-gate version-skew invariant (#966), on PG ===========
+# The gate's anti-skew guard (activity_ts) only holds if a pre-gate binary's
+# upsert leaves the three new claim columns FROZEN while advancing
+# heartbeat_ts, and if migration 030 makes an existing populated row read as
+# ungated. Both are properties of real Postgres ON CONFLICT / ALTER TABLE
+# semantics that the in-memory unit tests (which hand-build the frozen row as
+# a dict) cannot exercise. The design marks this test mandatory.
+
+
+def _old_binary_upsert_claim(engine, *, service_name, pool_key, heartbeat_ts):
+    """Emulate a pre-gate binary's claim upsert.
+
+    Its values dict omits demonstrated_need / boot_hold / activity_ts, so the
+    ON CONFLICT DO UPDATE set_ (which iterates that dict) updates only the
+    columns that binary knows and leaves the three gate columns untouched --
+    exactly the frozen-signal skew the gate must reject.
+    """
+    table = serve_state.reserved_fill_claims_table
+    values = {
+        'service_name': service_name,
+        'pool_key': pool_key,
+        'weight': 1.0,
+        'floor_replicas': 0,
+        'gpus_per_replica': 1,
+        'holdings_fill': 40,
+        'effective_cap': None,
+        'launchable': 1,
+        'heartbeat_ts': heartbeat_ts,
+    }
+    insert_stmt = serve_state._upsert_insert_func(engine)(table).values(
+        **values)
+    insert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=['service_name'],
+        set_={
+            key: getattr(insert_stmt.excluded, key)
+            for key in values
+            if key != 'service_name'
+        })
+    with engine.begin() as connection:
+        connection.execute(insert_stmt)
+
+
+def _armed_gate():
+    """Ensure the process-wide gate read side is armed for a _activity_input
+    call, so an ambient kill-switch env var cannot mask the invariant."""
+    return mock.patch.dict(
+        os.environ, {constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR: '1'})
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestUtilizationGateSkewPG:
+
+    def test_old_binary_upsert_freezes_signal_so_the_round_reads_blind(self):
+        engine = serve_state._db_manager.get_engine()
+        pool_key = 'skew-pool'
+        # New binary writes a PAIRED idle signal (need 0) at t=1000: fresh,
+        # so a real service WOULD be gated and decayed on it.
+        serve_state.upsert_reserved_fill_claim(service_name='svc',
+                                               pool_key=pool_key,
+                                               weight=1.0,
+                                               floor_replicas=0,
+                                               gpus_per_replica=1,
+                                               holdings_fill=40,
+                                               effective_cap=None,
+                                               launchable=True,
+                                               heartbeat_ts=1000.0,
+                                               demonstrated_need=0,
+                                               boot_hold=False,
+                                               activity_ts=1000.0)
+        fresh = {
+            row['service_name']: row
+            for row in serve_state.get_reserved_fill_claims(pool_key)
+        }['svc']
+        with _armed_gate():
+            assert broker._activity_input(fresh).blind is False
+
+        # A pre-gate binary heartbeats the SAME row 61s later, omitting the
+        # gate columns. Their ON CONFLICT set_ leaves them frozen.
+        _old_binary_upsert_claim(engine,
+                                 service_name='svc',
+                                 pool_key=pool_key,
+                                 heartbeat_ts=1061.0)
+        row = {
+            r['service_name']: r
+            for r in serve_state.get_reserved_fill_claims(pool_key)
+        }['svc']
+        assert row['heartbeat_ts'] == 1061.0
+        assert row['activity_ts'] == 1000.0  # FROZEN, not refreshed to 1061
+        assert row['demonstrated_need'] == 0  # FROZEN
+        with _armed_gate():
+            # lag 61 > RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS (60) -> blind, so
+            # a frozen demonstrated_need of 0 does NOT decay a busy service.
+            assert broker._activity_input(row).blind is True
+
+
+class TestMigration030PopulatedClaimsPG:
+
+    def test_migration_030_on_populated_pre_030_claims_reads_ungated(
+            self, pg_server):
+        # Stand a DB up at revision 029, populate a claim (no gate columns),
+        # then upgrade to 030: the row must gain NULL gate columns and read as
+        # ungated -- today's exact behavior for an already-live claimant.
+        url = _create_database(pg_server, f'skew030_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '029')
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        'INSERT INTO reserved_fill_claims (service_name, '
+                        'pool_key, weight, floor_replicas, gpus_per_replica, '
+                        'holdings_fill, launchable, heartbeat_ts) VALUES '
+                        "('legacy', 'p', 1.0, 0, 1, 40, 1, 1000.0)"))
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+            inspector = sqlalchemy.inspect(engine)
+            claim_cols = {
+                column['name']
+                for column in inspector.get_columns('reserved_fill_claims')
+            }
+            round_cols = {
+                column['name']
+                for column in inspector.get_columns('reserved_fill_rounds')
+            }
+            assert {'demonstrated_need', 'boot_hold',
+                    'activity_ts'} <= claim_cols, claim_cols
+            assert 'utilization_state' in round_cols, round_cols
+            with engine.connect() as connection:
+                got = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT demonstrated_need, boot_hold, activity_ts, '
+                        'heartbeat_ts FROM reserved_fill_claims WHERE '
+                        "service_name = 'legacy'")).mappings().one()
+            assert got['demonstrated_need'] is None
+            assert got['boot_hold'] is None
+            assert got['activity_ts'] is None
+            with _armed_gate():
+                assert broker._activity_input(dict(got)).blind is True
+        finally:
+            engine.dispose()

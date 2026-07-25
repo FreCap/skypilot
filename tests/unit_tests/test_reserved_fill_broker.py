@@ -2432,6 +2432,45 @@ class TestApplyUtilizationGate:
         assert gated['a'].utilization_cap == 20
         assert state['a']['cap'] == 20
 
+    def test_env_kill_switch_ungates_an_already_gated_service(self):
+        # Requirement 2/10: the process-wide kill switch disables the gate
+        # for EVERY service and reverts each to today's entitlement; "the
+        # gate never fails toward release". A claimant that already accrued
+        # release state must be FULLY ungated (cap dropped, state cleared),
+        # not frozen at its decayed cap the way a transient telemetry blind
+        # is (contrast test_blind_round_keeps_an_already_earned_cap_applied,
+        # which runs with the gate armed). Freezing under the kill switch
+        # would, past RESERVED_FILL_BLIND_GRACE_SECONDS, walk a BUSY service
+        # down to its floor via the very lever meant to stop the gate.
+        now = 1_000_000.0
+        claims = {'a': self._claim(floor=16, weight=4.0, holdings_fill=40)}
+        # A genuinely BUSY claim: fresh paired signal, high demonstrated need.
+        row = {
+            'demonstrated_need': 50,
+            'boot_hold': False,
+            'activity_ts': now,
+            'heartbeat_ts': now,
+        }
+        prev = {
+            'a': {
+                'cap': 40,
+                'hot_until': now - 1.0,
+                'stepped_at': now - 10_000.0,
+                'blind_since': None,
+            }
+        }
+        with mock.patch.dict(
+                'os.environ',
+            {serve_constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR: '0'}):
+            activity = {'a': broker._activity_input(row)}
+            gated, state = broker._apply_utilization_gate(
+                claims, activity, prev, now)
+        # Ungated: today's entitlement (no cap), and the release state is
+        # cleared so the round writer publishes NULL utilization_state
+        # (`if utilization_state else None`) rather than a stale target.
+        assert gated['a'].utilization_cap is None
+        assert not state
+
 
 class TestDemandGateGrant:
     """The demand gate reads the permissive grant, the ceiling the damped."""

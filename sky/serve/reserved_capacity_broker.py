@@ -400,6 +400,22 @@ def _apply_utilization_gate(
     persist on the round row. A claimant with no entry in the returned
     state is ungated, which is the pre-gate behavior.
     """
+    if not utilization_gate_enabled():
+        # PROCESS-WIDE KILL SWITCH. The behavior contract (requirement 2)
+        # is that a disabled gate leaves every service ungated at exactly
+        # today's entitlement and "never fails toward release", and the env
+        # var "disables it for every service in the process" (requirement
+        # 10). Relying on _activity_input returning `blind` is not enough:
+        # an already-gated claimant (one carrying prev release state) would
+        # take the blind FREEZE path below instead, holding its decayed cap
+        # and, past RESERVED_FILL_BLIND_GRACE_SECONDS, resuming the decay
+        # toward its floor on a service the operator just told the gate to
+        # stop touching. Force-ungate here and drop all release state; the
+        # empty state clears utilization_state on the round row (the writer
+        # publishes NULL for a falsy state), exactly as "disarming must
+        # clear the state" requires, so re-enabling re-arms from current
+        # holdings rather than resuming a half-finished decay.
+        return claims, {}
     gated: dict[str, ClaimInput] = {}
     state: dict[str, dict[str, Any]] = {}
     for name, claim in claims.items():
