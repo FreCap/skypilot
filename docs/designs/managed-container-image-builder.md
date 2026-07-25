@@ -4,7 +4,7 @@ Status: post-v0 seam and prototype gate, not a v0 public product
 
 Owner: image build service
 
-Last updated: 2026-07-23
+Last updated: 2026-07-25
 
 ## Decision
 
@@ -357,6 +357,88 @@ container startup, command execution, and readiness. It cannot claim that the
 model initialized or that inference succeeded. Because the build adds no
 meaningful payload beyond its marker, it also has no credible deployment-speed
 claim.
+
+### Controlled readiness follow-up, July 24-25, 2026
+
+A second OpenDDE pair fixed both services to one on-demand `g6.xlarge` in
+`us-east-1`. It again showed that an ordinary setup-layer build does not remove
+the workload-data path:
+
+| Phase | Source image | Built image | Built difference |
+| --- | ---: | ---: | ---: |
+| replica record to cluster launched | 250.850 s | 272.951 s | +22.101 s |
+| cluster launched to readiness | 157.973 s | 131.245 s | -26.728 s |
+| replica record to readiness | 408.823 s | 404.196 s | -4.626 s |
+
+Both replicas staged the same 7,835 objects and 10,036,350,627 bytes. The
+4.626-second end-to-end difference is run noise at this scale, not a product
+speedup. This confirms the July 23 productization decision.
+
+The Boltz follow-up injected the real read-only R2 credentials and
+payload-decryption key into isolated one-replica services. A clean source run
+on one on-demand `g6.2xlarge` reached readiness in 254.336 seconds:
+
+| Phase | Source image |
+| --- | ---: |
+| replica record to cluster launched | 86.850 s |
+| cluster launched to readiness | 167.486 s |
+| cluster launch to model loaded | 126.978 s |
+
+The paired managed run cannot be used as end-to-end performance evidence. A
+Helm rollout interrupted provisioning after the durable handle recorded port
+8080 but before AWS authorized the security-group rule. Recovery compared the
+desired ports with the saved handle, treated the set as unchanged, and skipped
+the otherwise idempotent port reconciliation. The model loaded 51.137 seconds
+after cluster launch, but the run had already reused a partially initialized
+instance and required a manual TCP/8080 rule before readiness. The apparent
+75.841-second model-load improvement is therefore diagnostic only.
+
+The first direct-image run failed before VM launch because a new client and API
+server serialized an unset Docker credential helper as
+`credential_helper: null`; the persistent Serve controller rejected that
+newer wire field. Commit `09da9a997109071972436db8d330cc75ca47c212` restores
+the legacy three-key wire shape when the helper is unset while preserving an
+explicit `ecr-login` helper. It was deployed as Helm revision 278 on chart
+`1.1.798`, image digest
+`sha256:602a11955ddf00722521b55041ab9b3377b180855972fc7b698e5d2d69c06204`,
+before starting a clean comparison.
+
+The clean R3 comparison reached real Boltz model readiness on both distribution
+paths. The persisted replica timestamps provide the apples-to-apples comparison
+with the source control:
+
+| Phase | Source R2 | Direct R3 | Managed R3 |
+| --- | ---: | ---: | ---: |
+| replica record to cluster launched | 86.850 s | 312.347 s | 303.512 s |
+| cluster launched to readiness | 167.486 s | 52.797 s | 57.907 s |
+| replica record to readiness | 254.336 s | 365.144 s | 361.419 s |
+| difference from source | - | +110.808 s | +107.083 s |
+
+Direct distribution saved 114.689 seconds after the cluster-launched boundary,
+just 5.311 seconds short of the two-minute phase target. Managed distribution
+saved 109.579 seconds by the persisted timestamps. Neither improved total cold
+readiness because image pull and unpack moved into provisioning. The direct
+default-AMI path spent 177.158 seconds in `initialize_docker`; the qualified
+ECR-helper AMI reduced that phase to 154.233 seconds. The managed path then
+loaded the model 48.326 seconds after the exact cluster-launch log and reached
+readiness after 58.971 seconds.
+
+Both replicas pulled and executed digest
+`sha256:ed172fdedd87822197add9a15cba4b9e27ffa704e43c4bbaf16e0104b2ddc63e`
+from the qualified managed ECR shard.
+Both automatically opened TCP/8080, loaded the model, passed the HTTP readiness
+probe, and remained at the declared one-replica floor. The direct path also
+proves the legacy three-key Docker-login wire shape traverses both the API
+server and persistent Serve controller.
+
+This is a successful correctness and reproducibility prototype, but it fails
+the cold-start performance gate. Registry placement and a credential-helper
+host remove ad hoc authentication and runtime image download from the task
+script; they do not remove the bytes, decompression, or root-volume writes from
+the critical path. A credible two-minute end-to-end improvement now requires a
+separate locality mechanism such as a model-specific prewarmed snapshot, a
+qualified node cache, or a lazy OCI runtime. That mechanism must be measured
+and gated separately rather than represented as an ordinary registry feature.
 
 Chart upgrades must merge the new chart defaults before applying the previous
 release's values. Provider-specific environment variables, volume names, and

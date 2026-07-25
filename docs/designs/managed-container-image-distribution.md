@@ -4,7 +4,7 @@ Status: implementation and verification in progress, feature disabled by default
 
 Owner: SkyPilot control plane
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 ## Decision
 
@@ -4957,6 +4957,25 @@ started the managed container 204.71 seconds after provisioning began, and
 passed HTTP readiness at 301.20 seconds. The test did not receive the
 production fleet's R2 and payload-encryption secrets, so it proves the managed
 pull and executable image boundary but not model readiness or inference.
+
+The July 24-25 full-readiness follow-up injected those secrets into isolated
+one-replica, on-demand `g6.2xlarge` services. Both a direct digest and the
+managed release pulled digest
+`sha256:ed172fdedd87822197add9a15cba4b9e27ffa704e43c4bbaf16e0104b2ddc63e`,
+loaded the real model, opened TCP/8080 automatically, and passed readiness. The
+managed path used the qualified ECR-helper AMI and explicit `ecr-login`
+binding. The direct path exercised the legacy three-key Docker-login shape
+through both the API server and persistent Serve controller after
+`09da9a997109071972436db8d330cc75ca47c212` was deployed in Helm revision 278.
+
+The persisted replica comparison is a correctness success and a performance
+gate failure. The source control reached readiness in 254.336 seconds, the
+direct digest in 365.144 seconds, and the managed release in 361.419 seconds.
+Managed distribution reduced cluster-launched-to-ready time from 167.486 to
+57.907 seconds, but added 216.662 seconds before that boundary. Its cold OCI
+initialization alone took 154.233 seconds. Registry locality and credential
+automation must therefore remain distinct from a future prewarmed snapshot,
+node-cache, or lazy-runtime capability; v0 makes no cold-start claim.
 
 Before round 15, `origin/improvements` advanced through
 `8e37b6dfc27849d09a7a94e323da2c8e5a34de98` to

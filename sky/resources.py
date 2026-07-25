@@ -3002,8 +3002,12 @@ class Resources:
         add_if_not_none('priority', self.priority)
         add_if_not_none('priority_class', self.priority_class)
         if self._docker_login_config is not None:
-            config['_docker_login_config'] = dataclasses.asdict(
-                self._docker_login_config)
+            docker_login_config = dataclasses.asdict(self._docker_login_config)
+            if docker_login_config['credential_helper'] is None:
+                # Older API servers do not recognize this optional field.
+                # Omitting its default value preserves the legacy wire shape.
+                del docker_login_config['credential_helper']
+            config['_docker_login_config'] = docker_login_config
             if redact_secrets:
                 config['_docker_login_config']['password'] = '<redacted>'
         if self._resolved_container_image is not None:

@@ -61,21 +61,36 @@ into an unbounded placement wait. Record controller registration, launch-budget
 wait, Spot acquisition, node provisioning, image pull, runtime setup, and
 readiness separately.
 
-The July 23 OpenDDE comparison did not meet the 120-second readiness target.
-On the same on-demand `g6.xlarge` fallback shape, the source image reached
-readiness 351.09 seconds after provisioning began and the built image took
-375.19 seconds. Both spent about 141 seconds between cluster launch and
-readiness because both still staged 9.35 GiB of workload data. The result
-validates the builder and managed pull path, but it does not justify a
-faster-deployment claim or broadening this prototype into a data-locality
-system.
+The July 23 and July 24 OpenDDE comparisons did not meet the 120-second
+readiness target. The controlled repeat fixed both services to the same
+on-demand `g6.xlarge`. The source replica reached readiness in 408.823 seconds
+and the built replica took 404.196 seconds. Both still staged the same 7,835
+objects and 9.35 GiB of workload data. The 4.626-second difference is run
+noise, not a faster-deployment result.
 
-The Boltz output was also exercised as a secret-free L4 runtime smoke test.
-The managed 4,888,012,862-byte manifest resolved, authenticated with
-`ecr-login`, pulled cold, started its container, executed Python, and passed an
-HTTP readiness probe. This does not replace a model-readiness or inference test:
-the production fleet's R2 and payload-encryption secrets are required for that
-run block and were unavailable to the benchmark.
+The Boltz output first passed a secret-free L4 runtime smoke test. A later
+controlled run injected its real read-only R2 and payload-encryption secrets
+into isolated one-replica services. Both the direct digest path and the
+`boltz-managed` release loaded the real model and passed HTTP readiness. The
+managed release used the qualified ECR-helper AMI and automatically opened
+TCP/8080.
+
+The builder changes where the cold work occurs, but does not yet reduce its
+total:
+
+| Phase | Source R2 | Direct R3 | Managed R3 |
+| --- | ---: | ---: | ---: |
+| replica record to cluster launched | 86.850 s | 312.347 s | 303.512 s |
+| cluster launched to readiness | 167.486 s | 52.797 s | 57.907 s |
+| replica record to readiness | 254.336 s | 365.144 s | 361.419 s |
+
+The direct path saved 114.689 seconds after cluster launch, but its cold OCI
+pull and unpack spent 177.158 seconds in `initialize_docker`. The managed
+ECR-helper path reduced that phase to 154.233 seconds, but remained 107.083
+seconds slower than the source control end to end. Registry locality and
+credential automation therefore pass the correctness gate, not the cold-start
+performance gate. Reaching a real two-minute total improvement requires a
+separate prewarmed snapshot, node-cache, or lazy-runtime capability.
 
 This evidence mode is not a release publisher. It has no durable coordinator,
 does not create a SkyPilot release, and must not be used as the production

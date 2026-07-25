@@ -12,6 +12,7 @@ import pytest
 
 from sky import clouds
 from sky import skypilot_config
+from sky.provision import docker_utils
 from sky.resources import LaunchableResources
 from sky.resources import Resources
 from sky.skylet import autostop_lib
@@ -1202,6 +1203,38 @@ def test_resources_preserves_legacy_positional_argument_order():
     resources = Resources(*([None] * 12 + [100]))
     assert resources.disk_size == 100
     assert resources.container_image is None
+
+
+def test_docker_login_config_yaml_omits_unset_credential_helper():
+    login_config = docker_utils.DockerLoginConfig(
+        username='',
+        password='',
+        server='699626303757.dkr.ecr.us-east-1.amazonaws.com')
+    resources = Resources(_docker_login_config=login_config)
+
+    yaml_config = resources.to_yaml_config()
+
+    assert yaml_config['_docker_login_config'] == {
+        'username': '',
+        'password': '',
+        'server': '699626303757.dkr.ecr.us-east-1.amazonaws.com',
+    }
+    round_tripped = next(iter(Resources.from_yaml_config(yaml_config.copy())))
+    assert round_tripped.docker_login_config == login_config
+    assert round_tripped.to_yaml_config() == yaml_config
+
+
+def test_docker_login_config_yaml_preserves_credential_helper():
+    login_config = docker_utils.DockerLoginConfig(
+        username='',
+        password='',
+        server='699626303757.dkr.ecr.us-east-1.amazonaws.com',
+        credential_helper='ecr-login')
+
+    yaml_config = Resources(_docker_login_config=login_config).to_yaml_config()
+
+    assert yaml_config['_docker_login_config']['credential_helper'] == (
+        'ecr-login')
 
 
 def test_memory_conversion():
