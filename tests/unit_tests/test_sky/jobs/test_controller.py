@@ -1971,11 +1971,12 @@ class TestTransientJobStatusFetchDeadline:
                                  statuses,
                                  monotonic_values,
                                  *,
+                                 num_nodes=1,
                                  recover_side_effect=None,
                                  expected_exception=None):
         controller = self._make_controller()
         task = MagicMock(name='task')
-        task.num_nodes = 1
+        task.num_nodes = num_nodes
         executor = MagicMock()
         if recover_side_effect is None:
             recover_side_effect = self.ExpectedRecovery
@@ -2026,6 +2027,34 @@ class TestTransientJobStatusFetchDeadline:
 
         return (sleep, get_status, refresh_cluster, monotonic, wall_clock,
                 set_recovering, executor)
+
+    @pytest.mark.asyncio
+    async def test_transient_status_fetch_recovers_multi_node_despite_last_running(
+            self):
+        # For multi-node jobs a non-terminal job_status is not a reliable
+        # health signal: the job may not be set to FAILED immediately when
+        # only some nodes are preempted or fail. So once the status-fetch
+        # retry budget is exhausted the controller must fall back to recovery
+        # even though the cluster still reports UP and the last confirmed
+        # status was RUNNING (mirrors the num_nodes == 1 gate on the healthy
+        # fast path). The healthy-cluster status-hold must apply to single-node
+        # jobs only.
+        results = await self._run_until_stopped(
+            statuses=[
+                (job_lib.JobStatus.RUNNING, None),
+                (None, 'transient'),
+                (None, 'transient'),
+            ],
+            monotonic_values=[100.0, 100.0, 160.0],
+            num_nodes=2,
+        )
+        (sleep, get_status, refresh_cluster, monotonic, wall_clock,
+         set_recovering, executor) = results
+
+        # The last confirmed status was RUNNING and the cluster stayed UP, yet
+        # the multi-node job must still be recovered rather than held alive.
+        set_recovering.assert_awaited_once()
+        executor.recover.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_single_node_running_fast_path_skips_cluster_refresh(self):

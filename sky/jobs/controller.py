@@ -139,17 +139,26 @@ def _should_wait_for_cluster_not_up_confirmation(
 
 def _should_keep_monitoring_healthy_cluster(
         last_known_job_status: job_lib.JobStatus | None,
-        transient_job_check_error_reason: str | None) -> bool:
+        transient_job_check_error_reason: str | None, num_nodes: int) -> bool:
     """Return whether a healthy cluster should keep waiting for job status.
 
     A transient control-plane failure is not evidence that a previously
     running job has died. If the cluster is still UP and the last confirmed
     remote status was non-terminal, keep monitoring instead of tearing the job
     down and relaunching it.
+
+    Only single-node jobs qualify. For multi-node jobs a non-terminal
+    job_status is not a reliable health signal: the job may not be set to
+    FAILED immediately when only some of the nodes are preempted or fail, so a
+    stale non-terminal status must not keep a possibly-dead multi-node job
+    alive. This mirrors the ``task.num_nodes == 1`` gate on the healthy job
+    fast path in ``_monitor_one_task``.
     """
     if transient_job_check_error_reason is None:
         return False
     if last_known_job_status is None:
+        return False
+    if num_nodes != 1:
         return False
     return not last_known_job_status.is_terminal()
 
@@ -1245,7 +1254,8 @@ class JobController:
                         else:
                             if _should_keep_monitoring_healthy_cluster(
                                     last_known_job_status,
-                                    transient_job_check_error_reason):
+                                    transient_job_check_error_reason,
+                                    task.num_nodes):
                                 if not healthy_cluster_hold_logged:
                                     assert last_known_job_status is not None
                                     logger.warning(
