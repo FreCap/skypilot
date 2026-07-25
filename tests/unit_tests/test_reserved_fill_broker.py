@@ -2286,6 +2286,39 @@ class TestAdvanceReleaseTarget:
                               now=1000.0 + 901.0)
         assert entry['cap'] < 40
 
+    def test_continuous_blindness_resumes_and_completes_the_decay(self):
+        # SEQUENTIAL regression for the wedged-telemetry escape hatch. The
+        # single-call test above hand-crafts a prev with a stale hot_until and
+        # a pre-set blind_since, a state the real round-over-round dynamics
+        # never reach: the freeze branch pushes hot_until to now + dwell every
+        # blind round, and resetting blind_since to None on the past-grace
+        # return re-arms the grace window, so the one round that crosses grace
+        # lands back in the dwell branch and re-freezes -- forever. Feeding
+        # each output as the next input (holdings tracking the cap, so the
+        # actuation gate never fires) is the only way to exercise it. Before
+        # the fix the cap stays pinned at its start value indefinitely; after
+        # it, the decay resumes past blind_grace and walks to the floor.
+        prev = {
+            'cap': 40,
+            'hot_until': 0.0,
+            'stepped_at': 0.0,
+            'blind_since': None,
+        }
+        now = 1000.0
+        # 80 rounds * 60s = 4800s, ~5x blind_grace (900s) and well past the
+        # full 40 -> 16 step schedule.
+        for _ in range(80):
+            prev = self._advance(prev,
+                                 floor=16,
+                                 holdings=int(prev['cap']),
+                                 need=0,
+                                 blind=True,
+                                 now=now)
+            now += 60.0
+        assert prev['cap'] == 16, (
+            'a permanently blind claimant must resume the decay past '
+            f'blind_grace and reach the floor, got cap={prev["cap"]}')
+
 
 class TestUtilizationCapEntitlements:
     """compute_entitlements with the gate: floors immune, total conserved."""

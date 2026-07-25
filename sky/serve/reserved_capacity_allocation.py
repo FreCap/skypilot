@@ -202,6 +202,19 @@ def advance_release_target(prev: Mapping[str, Any] | None, *, floor: int,
     stepped_at = float(prev['stepped_at']) if prev else now
     blind_since = prev.get('blind_since') if prev else None
 
+    # The blind_since value to persist on the fall-through (non-freeze)
+    # returns. None outside the blind path (today's exact behavior); the
+    # PRESERVED stamp on the wedged-past-grace path. Resetting it to None
+    # there re-arms the grace timer next round (blind_since is None ->
+    # re-stamped to `now` -> back inside the grace window -> FREEZE), and
+    # because the freeze branch keeps pushing hot_until to now + dwell every
+    # round, the single round that reaches past-grace always lands in the
+    # `now < hot_until` dwell branch and re-freezes before it can step. The
+    # net effect of resetting to None is that a permanently blind claimant
+    # freezes forever and NEVER resumes the decay -- the exact pin the grace
+    # period exists to prevent. Preserving the stamp keeps `now - blind_since
+    # > blind_grace` true on subsequent rounds so the decay actually resumes.
+    resumed_blind_since: float | None = None
     if blind:
         blind_since = now if blind_since is None else float(blind_since)
         if now - blind_since <= blind_grace:
@@ -217,7 +230,12 @@ def advance_release_target(prev: Mapping[str, Any] | None, *, floor: int,
                                   blind_since)
         # Wedged past the grace period: a permanently broken telemetry path
         # must not pin the pool forever, so resume the decay as if idle.
+        # Keep the original blind_since stamp so the grace window stays
+        # expired and the decay continues round over round instead of
+        # re-freezing (see resumed_blind_since above). recovery to a
+        # non-blind round clears it via the else branch.
         need, boot_hold = 0, False
+        resumed_blind_since = blind_since
     else:
         blind_since = None
 
@@ -231,23 +249,25 @@ def advance_release_target(prev: Mapping[str, Any] | None, *, floor: int,
         # up. Stepping here would cull them mid-boot: pre-ready rows are
         # the FIRST scale-down victims, so the gate would repeatedly order
         # capacity and destroy it before it ever served a request.
-        return _release_entry(cap, max(hot_until, now + dwell), now, None)
+        return _release_entry(cap, max(hot_until, now + dwell), now,
+                              resumed_blind_since)
     if now < hot_until:
-        return _release_entry(cap, hot_until, stepped_at, None)
+        return _release_entry(cap, hot_until, stepped_at, resumed_blind_since)
     if holdings > cap:
         # ACTUATION GATE: the previous step has not drained yet. Holding
         # here keeps the cap at most one step ahead of physical reality,
         # and turns a stuck drain into a visibly stalled cap rather than a
         # cap parked at the floor with the fleet still running.
-        return _release_entry(cap, hot_until, now, None)
+        return _release_entry(cap, hot_until, now, resumed_blind_since)
     if now - stepped_at < step_seconds:
-        return _release_entry(cap, hot_until, stepped_at, None)
+        return _release_entry(cap, hot_until, stepped_at, resumed_blind_since)
     # Step from what the claimant actually holds, not from the cap: a cap
     # left high by a rise the fleet never materialized must not authorize a
     # correspondingly huge step.
     anchor = max(floor, min(cap, holdings))
     step = max(min_step, math.ceil(step_fraction * (anchor - floor)))
-    return _release_entry(max(floor, anchor - step), hot_until, now, None)
+    return _release_entry(max(floor, anchor - step), hot_until, now,
+                          resumed_blind_since)
 
 
 def damp_grants(raw: Mapping[str, int], prev_grants: Mapping[str, int] | None,
