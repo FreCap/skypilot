@@ -334,6 +334,7 @@ class AWS(clouds.Cloud):
     _SUPPORTED_DISK_TIERS = set(resources_utils.DiskTier)
     PROVISIONER_VERSION = clouds.ProvisionerVersion.SKYPILOT
     STATUS_VERSION = clouds.StatusVersion.SKYPILOT
+    OPEN_PORTS_VERSION = clouds.OpenPortsVersion.RECONCILABLE
 
     @classmethod
     def _unsupported_features_for_resources(

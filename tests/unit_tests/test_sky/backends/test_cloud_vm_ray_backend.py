@@ -1028,6 +1028,69 @@ class TestCloudVmRayBackendLockedProvision:
         assert add_event.call_args.kwargs['existing_cluster_hash'] == (
             'generation-hash')
 
+    @pytest.mark.parametrize(
+        ('prev_cluster_status', 'prev_ports', 'current_ports',
+         'open_ports_version', 'expected_calls'), [
+             (None, None, ['8080'],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.UPDATABLE, 1),
+             (status_lib.ClusterStatus.UP, ['8080'], ['8080'],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.RECONCILABLE, 0),
+             (status_lib.ClusterStatus.UP, ['8080'], ['8080', '8081'],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.RECONCILABLE, 1),
+             (status_lib.ClusterStatus.INIT, ['8080'], ['8080'],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.RECONCILABLE, 1),
+             (status_lib.ClusterStatus.INIT, ['8080'], ['8080'],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.UPDATABLE, 0),
+             (status_lib.ClusterStatus.STOPPED, ['8080'], ['8080'],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.RECONCILABLE, 0),
+             (status_lib.ClusterStatus.INIT, [], [],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.RECONCILABLE, 0),
+             (status_lib.ClusterStatus.INIT, ['8080'], ['8080'],
+              cloud_vm_ray_backend.clouds.OpenPortsVersion.LAUNCH_ONLY, 0),
+         ])
+    def test_ready_transition_reconciles_ports(self, prev_cluster_status,
+                                               prev_ports, current_ports,
+                                               open_ports_version,
+                                               expected_calls):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        launched_resources = MagicMock(spec=resources.Resources)
+        launched_resources.ports = current_ports
+        launched_resources.cloud = MagicMock(
+            OPEN_PORTS_VERSION=open_ports_version)
+        launched_resources.assert_launchable.return_value = launched_resources
+        handle = MagicMock(cluster_name='test-cluster',
+                           launched_nodes=1,
+                           launched_resources=launched_resources)
+        handle.provision_runtime_metadata.has_job_queue = False
+        handle.provision_runtime_metadata.ssh_available = False
+
+        prev_handle = None
+        if prev_ports is not None:
+            prev_handle = MagicMock()
+            prev_handle.launched_resources.ports = prev_ports
+
+        task_obj = MagicMock(resources=set())
+        task_obj.to_yaml_config.return_value = {'run': 'echo ok'}
+
+        with patch.object(backend, '_open_ports') as open_ports, patch.object(
+                cloud_vm_ray_backend.global_user_state,
+                'add_or_update_cluster'), patch.object(
+                    cloud_vm_ray_backend.global_user_state,
+                    'add_cluster_event'), patch.object(
+                        cloud_vm_ray_backend.usage_lib.messages.usage,
+                        'update_cluster_resources'), patch.object(
+                            cloud_vm_ray_backend.usage_lib.messages.usage,
+                            'update_final_cluster_status'):
+            backend._update_after_cluster_provisioned(  # pylint: disable=protected-access
+                handle,
+                prev_handle=prev_handle,
+                task=task_obj,
+                prev_cluster_status=prev_cluster_status,
+                config_hash=None,
+                cluster_hash='generation-hash')
+
+        assert open_ports.call_count == expected_calls
+
 
 class TestPostTeardownCleanupYamlFetch:
     """The teardown double-check loop must not re-read the cluster YAML."""

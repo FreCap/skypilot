@@ -132,9 +132,12 @@ class OpenPortsVersion(enum.Enum):
     2: Open ports after provisioning of the cluster, updatable. This is for most
     of the cloud providers which allow opening ports using an programmable API
     and won't affect the running VMs.
+    3: Reconcile ports after provisioning of the cluster. Repeated calls with
+    the full desired port set are safe and ensure those ports are open.
     """
     LAUNCH_ONLY = 'LAUNCH ONLY'
     UPDATABLE = 'UPDATABLE'
+    RECONCILABLE = 'RECONCILABLE'
 
     def __le__(self, other):
         versions = list(OpenPortsVersion)

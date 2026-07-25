@@ -653,6 +653,33 @@ def _maybe_move_to_new_sg(
     instance.modify_attribute(Groups=[expected_sg.id])
 
 
+def _authorize_ingress_with_duplicate_retry(
+    security_group: Any,
+    permissions: list[dict[str, Any]],
+) -> None:
+    """Authorize ingress while preserving missing rules across duplicate races."""
+    try:
+        security_group.authorize_ingress(IpPermissions=permissions)
+    except aws.botocore_exceptions().ClientError as exc:
+        error_code = exc.response.get('Error', {}).get('Code')
+        if error_code != 'InvalidPermission.Duplicate':
+            raise
+        # The security group snapshot can be stale when an interrupted or
+        # concurrent reconciliation has already committed one of these rules.
+        # Retry each permission independently so a duplicate does not hide
+        # other permissions that are still missing.
+        logger.debug('Security group rules were added concurrently; '
+                     'retrying permissions independently.')
+        for permission in permissions:
+            try:
+                security_group.authorize_ingress(IpPermissions=[permission])
+            except aws.botocore_exceptions().ClientError as retry_exc:
+                retry_error_code = retry_exc.response.get('Error',
+                                                          {}).get('Code')
+                if retry_error_code != 'InvalidPermission.Duplicate':
+                    raise
+
+
 def open_ports(
     cluster_name_on_cloud: str,
     ports: list[str],
@@ -756,7 +783,7 @@ def open_ports(
                 filtered_permissions.append(perm)
 
         if filtered_permissions:
-            sg.authorize_ingress(IpPermissions=filtered_permissions)
+            _authorize_ingress_with_duplicate_retry(sg, filtered_permissions)
 
 
 def cleanup_ports(

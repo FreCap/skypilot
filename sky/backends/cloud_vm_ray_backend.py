@@ -4772,10 +4772,19 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         if prev_handle is not None:
             prev_ports = prev_handle.launched_resources.ports
         current_ports = handle.launched_resources.ports
-        open_new_ports = bool(
-            resources_utils.port_ranges_to_set(current_ports) -
-            resources_utils.port_ranges_to_set(prev_ports))
-        if open_new_ports:
+        current_ports_set = resources_utils.port_ranges_to_set(current_ports)
+        ports_to_reconcile = (current_ports_set -
+                              resources_utils.port_ranges_to_set(prev_ports))
+        if (prev_cluster_status == status_lib.ClusterStatus.INIT and
+                current_ports_set):
+            launched_resources = (handle.launched_resources.assert_launchable())
+            # An INIT handle records desired ports before provider
+            # reconciliation completes. Replay the full desired set only when
+            # the provider guarantees that doing so is safe.
+            if (launched_resources.cloud.OPEN_PORTS_VERSION ==
+                    clouds.OpenPortsVersion.RECONCILABLE):
+                ports_to_reconcile = current_ports_set
+        if ports_to_reconcile:
             launched_resources = handle.launched_resources.assert_launchable()
             if not (launched_resources.cloud.OPEN_PORTS_VERSION
                     <= clouds.OpenPortsVersion.LAUNCH_ONLY):

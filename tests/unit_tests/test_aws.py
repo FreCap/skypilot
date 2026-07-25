@@ -12,12 +12,14 @@ from sky import logs
 from sky import resources
 from sky import skypilot_config
 from sky.backends import backend_utils
+from sky.clouds import OpenPortsVersion
 from sky.clouds import Region
 from sky.clouds import Zone
 from sky.clouds.aws import AWS
 from sky.provision import constants as provision_constants
 from sky.provision.aws import config
 from sky.provision.aws import iam_profile
+from sky.provision.aws import instance as aws_instance
 from sky.utils import common_utils
 from sky.utils import config_utils
 
@@ -40,6 +42,133 @@ def test_aws_label():
         'sprinto:short',
         'thisiexample_string_with_123_characters_length_thing_thing_thing_thing_thing_thing_thing_thin_thing_thing_thing_thing_thing_thingthisiexample_string_with_123_characters_length_thing_thing_thing_thing_thing_thing_thing_thin_thing_thing_thing_thing_thing_thing',
     )[0])
+
+
+def test_aws_open_ports_are_reconcilable():
+    assert AWS.OPEN_PORTS_VERSION == OpenPortsVersion.RECONCILABLE
+
+
+def _mock_aws_open_ports_dependencies(monkeypatch, ip_permissions):
+    security_group = MagicMock(id='sg-1', group_name='sky-sg')
+    security_group.ip_permissions = ip_permissions
+    instance = MagicMock(id='i-1')
+    instance.security_groups = [{'GroupName': 'sky-sg'}]
+    ec2 = MagicMock()
+
+    monkeypatch.setattr(aws_instance, '_default_ec2_resource', lambda _: ec2)
+    monkeypatch.setattr(aws_instance, '_filter_instances',
+                        lambda *args, **kwargs: [instance])
+    monkeypatch.setattr(aws_instance, '_get_vpc_id', lambda _: 'vpc-1')
+    monkeypatch.setattr(aws_instance.aws_config,
+                        'get_security_group_from_vpc_id',
+                        lambda *args, **kwargs: security_group)
+    return instance, security_group
+
+
+def test_aws_open_ports_replay_skips_existing_rule(monkeypatch):
+    instance, security_group = _mock_aws_open_ports_dependencies(
+        monkeypatch, [{
+            'IpProtocol': 'tcp',
+            'FromPort': 8080,
+            'ToPort': 8080,
+            'IpRanges': [{
+                'CidrIp': '0.0.0.0/0'
+            }],
+        }])
+
+    aws_instance.open_ports('test-cluster', ['8080'], {
+        'region': 'us-east-1',
+        'security_group': {
+            'GroupName': 'sky-sg',
+        },
+    })
+
+    instance.modify_attribute.assert_not_called()
+    security_group.authorize_ingress.assert_not_called()
+
+
+def test_aws_open_ports_replay_tolerates_stale_duplicate(monkeypatch):
+    _, security_group = _mock_aws_open_ports_dependencies(monkeypatch, [])
+    duplicate_error = _client_error('InvalidPermission.Duplicate')
+    security_group.authorize_ingress.side_effect = [
+        duplicate_error,
+        duplicate_error,
+    ]
+    permission = {
+        'FromPort': 8080,
+        'ToPort': 8080,
+        'IpProtocol': 'tcp',
+        'IpRanges': [{
+            'CidrIp': '0.0.0.0/0'
+        }],
+    }
+
+    aws_instance.open_ports('test-cluster', ['8080'], {
+        'region': 'us-east-1',
+        'security_group': {
+            'GroupName': 'sky-sg',
+        },
+    })
+
+    assert security_group.authorize_ingress.call_args_list == [
+        call(IpPermissions=[permission]),
+        call(IpPermissions=[permission]),
+    ]
+
+
+def test_aws_open_ports_replay_recovers_from_concurrent_duplicate(monkeypatch):
+    _, security_group = _mock_aws_open_ports_dependencies(monkeypatch, [])
+    duplicate_error = _client_error('InvalidPermission.Duplicate')
+    security_group.authorize_ingress.side_effect = [
+        duplicate_error,
+        duplicate_error,
+        None,
+    ]
+    permission_8080 = {
+        'FromPort': 8080,
+        'ToPort': 8080,
+        'IpProtocol': 'tcp',
+        'IpRanges': [{
+            'CidrIp': '0.0.0.0/0'
+        }],
+    }
+    permission_9090 = {
+        'FromPort': 9090,
+        'ToPort': 9090,
+        'IpProtocol': 'tcp',
+        'IpRanges': [{
+            'CidrIp': '0.0.0.0/0'
+        }],
+    }
+
+    aws_instance.open_ports('test-cluster', ['8080', '9090'], {
+        'region': 'us-east-1',
+        'security_group': {
+            'GroupName': 'sky-sg',
+        },
+    })
+
+    assert security_group.authorize_ingress.call_args_list == [
+        call(IpPermissions=[permission_8080, permission_9090]),
+        call(IpPermissions=[permission_8080]),
+        call(IpPermissions=[permission_9090]),
+    ]
+
+
+def test_aws_open_ports_replay_raises_nonduplicate_error(monkeypatch):
+    _, security_group = _mock_aws_open_ports_dependencies(monkeypatch, [])
+    unauthorized_error = _client_error('UnauthorizedOperation')
+    security_group.authorize_ingress.side_effect = unauthorized_error
+
+    with pytest.raises(type(unauthorized_error)) as exc_info:
+        aws_instance.open_ports('test-cluster', ['8080'], {
+            'region': 'us-east-1',
+            'security_group': {
+                'GroupName': 'sky-sg',
+            },
+        })
+    assert exc_info.value.response['Error']['Code'] == 'UnauthorizedOperation'
+    security_group.authorize_ingress.assert_called_once()
 
 
 def test_usable_subnets(monkeypatch):
