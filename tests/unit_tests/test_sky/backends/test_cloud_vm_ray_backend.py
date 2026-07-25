@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from sky import exceptions
 from sky import resources
 from sky import task
 from sky.backends import cloud_vm_ray_backend
@@ -123,6 +124,73 @@ def test_set_job_info_encodes_nullable_job_group_roles():
     assert list(request.is_primary_in_job_groups) == [False, True]
     assert not request.is_primary_in_job_groups_v2[0].HasField('value')
     assert request.is_primary_in_job_groups_v2[1].value is True
+
+
+def test_add_job_retries_target_not_connected():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.is_grpc_enabled_with_flag = False
+    handle.cluster_name = 'test-cluster'
+    target_not_connected = (
+        255, '',
+        'An error occurred (TargetNotConnected) when calling StartSession')
+    success = (0, 'Job ID: 7\nLog Dir: ~/sky_logs/7-job\n', '')
+
+    with patch.object(
+            backend, 'run_on_head',
+            side_effect=[target_not_connected, success]) as run_on_head, patch(
+                'sky.backends.cloud_vm_ray_backend.time.sleep') as sleep:
+        job_id, log_dir = backend._add_job(  # pylint: disable=protected-access
+            handle, 'job', '{}', '{}')
+
+    assert (job_id, log_dir) == (7, '~/sky_logs/7-job')
+    assert run_on_head.call_count == 2
+    sleep.assert_called_once()
+
+
+def test_add_job_bounds_target_not_connected_retries():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.is_grpc_enabled_with_flag = False
+    handle.cluster_name = 'test-cluster'
+    target_not_connected = (
+        255, '',
+        'An error occurred (TargetNotConnected) when calling StartSession')
+
+    with patch.object(
+            backend, 'run_on_head',
+            return_value=target_not_connected) as run_on_head, patch(
+                'sky.backends.cloud_vm_ray_backend.time.sleep') as sleep:
+        with pytest.raises(exceptions.CommandError,
+                           match='Failed to fetch job id'):
+            backend._add_job(  # pylint: disable=protected-access
+                handle, 'job', '{}', '{}')
+
+    assert run_on_head.call_count == (
+        cloud_vm_ray_backend._JOB_ID_SSM_RECONNECT_MAX_ATTEMPTS)  # pylint: disable=protected-access
+    assert sleep.call_count == run_on_head.call_count - 1
+
+
+@pytest.mark.parametrize(('returncode', 'stderr'),
+                         [(255, 'Connection reset by peer'),
+                          (1, 'TargetNotConnected')])
+def test_add_job_does_not_retry_ambiguous_failures(returncode, stderr):
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.is_grpc_enabled_with_flag = False
+    handle.cluster_name = 'test-cluster'
+
+    with patch.object(
+            backend, 'run_on_head',
+            return_value=(returncode, '', stderr)) as run_on_head, patch(
+                'sky.backends.cloud_vm_ray_backend.time.sleep') as sleep:
+        with pytest.raises(exceptions.CommandError,
+                           match='Failed to fetch job id'):
+            backend._add_job(  # pylint: disable=protected-access
+                handle, 'job', '{}', '{}')
+
+    run_on_head.assert_called_once()
+    sleep.assert_not_called()
 
 
 @pytest.mark.parametrize(('workers_ready', 'expected_status'),

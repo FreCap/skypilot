@@ -253,6 +253,10 @@ _MAX_RAY_UP_RETRY = 5
 # Number of retries for getting zones.
 _MAX_GET_ZONE_RETRY = 3
 
+_JOB_ID_SSM_RECONNECT_MAX_ATTEMPTS = 6
+_JOB_ID_SSM_RECONNECT_INITIAL_BACKOFF_SECONDS = 1
+_JOB_ID_SSM_RECONNECT_MAX_BACKOFF_SECONDS = 8
+
 _JOB_ID_PATTERN = re.compile(r'Job ID: ([0-9]+)')
 _JOB_IDS_PATTERN = re.compile(r'Job IDs: ([0-9,]+)')
 _LOG_DIR_PATTERN = re.compile(r'Log Dir: ([^ ]+)')
@@ -5229,6 +5233,40 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 ux_utils.starting_message(f'Job submitted, ID: {job_id}'))
         rich_utils.stop_safe_status()
 
+    def _run_job_id_command_with_ssm_retries(self,
+                                             handle: CloudVmRayResourceHandle,
+                                             code: str) -> tuple[int, str, str]:
+        """Runs a job-ID command, retrying pre-session AWS SSM failures."""
+        backoff = common_utils.Backoff(
+            initial_backoff=_JOB_ID_SSM_RECONNECT_INITIAL_BACKOFF_SECONDS,
+            max_backoff_factor=(_JOB_ID_SSM_RECONNECT_MAX_BACKOFF_SECONDS //
+                                _JOB_ID_SSM_RECONNECT_INITIAL_BACKOFF_SECONDS),
+            multiplier=2)
+        for attempt in range(1, _JOB_ID_SSM_RECONNECT_MAX_ATTEMPTS + 1):
+            returncode, result_str, stderr = self.run_on_head(
+                handle,
+                code,
+                stream_logs=False,
+                require_outputs=True,
+                separate_stderr=True)
+            target_not_connected = (returncode == 255 and
+                                    'TargetNotConnected' in stderr)
+            if not target_not_connected:
+                return returncode, result_str, stderr
+            if attempt == _JOB_ID_SSM_RECONNECT_MAX_ATTEMPTS:
+                return returncode, result_str, stderr
+            # TargetNotConnected is emitted by SSM StartSession before SSH
+            # establishes a session, so the remote job mutation did not run.
+            # Do not broaden this retry to ambiguous mid-command disconnects.
+            sleep_seconds = backoff.current_backoff()
+            logger.warning(
+                'AWS SSM target is not connected while fetching a job ID; '
+                f'retrying in {sleep_seconds:.1f} seconds '
+                f'(attempt {attempt + 1}/'
+                f'{_JOB_ID_SSM_RECONNECT_MAX_ATTEMPTS}).')
+            time.sleep(sleep_seconds)
+        raise AssertionError('SSM reconnect attempts must be positive.')
+
     def _add_job(self, handle: CloudVmRayResourceHandle, job_name: str | None,
                  resources_str: str, metadata: str) -> tuple[int, str]:
         if handle.is_grpc_enabled_with_flag:
@@ -5254,17 +5292,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             run_timestamp=self.run_timestamp,
             resources_str=resources_str,
             metadata=metadata)
-        returncode, result_str, stderr = self.run_on_head(handle,
-                                                          code,
-                                                          stream_logs=False,
-                                                          require_outputs=True,
-                                                          separate_stderr=True)
+        returncode, result_str, stderr = (
+            self._run_job_id_command_with_ssm_retries(handle, code))
         # Happens when someone calls `sky exec` but remote is outdated for
         # adding a job. Necessitating calling `sky launch`.
         backend_utils.check_stale_runtime_on_remote(returncode, stderr,
                                                     handle.cluster_name)
-        # TODO(zhwu): this sometimes will unexpectedly fail, we can add
-        # retry for this, after we figure out the reason.
         subprocess_utils.handle_returncode(returncode, code,
                                            'Failed to fetch job id.', stderr)
         try:
@@ -5362,12 +5395,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 num_jobs=num_jobs,
                 execution=execution,
                 is_batch=is_batch)
-            returncode, result_str, stderr = self.run_on_head(
-                handle,
-                code,
-                stream_logs=False,
-                require_outputs=True,
-                separate_stderr=True)
+            returncode, result_str, stderr = (
+                self._run_job_id_command_with_ssm_retries(handle, code))
             backend_utils.check_stale_runtime_on_remote(returncode, stderr,
                                                         handle.cluster_name)
             subprocess_utils.handle_returncode(returncode, code,
