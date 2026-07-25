@@ -8,9 +8,8 @@
 - **Blocks:** enabling `reserved_capacity_fill.utilization_gate` on
   `protenixv2-hybrid-v1` (see Milestones)
 
-Line numbers are at this worktree's HEAD, `4f33fb9a46` on
-`feat/serve-reserved-fill-utilization-gate`. Read them with
-`git show 4f33fb9a46:sky/serve/<file>.py`. Note that
+Line numbers are at `13368520fe` on `feat/serve-reserved-fill-utilization-gate`.
+Read them with `git show 13368520fe:sky/serve/<file>.py`. Note that
 `serve-drain-proof-across-lb-restarts.md` and
 `serve-reserved-fill-utilization-gate.md` cite the deployed SHA
 `a0028d62c7be576a97937d8fe7471bfa7c019849` instead, so their line numbers do not
@@ -22,7 +21,7 @@ not need to become a durable object. Its members already are: seven
 `logical_retirement_committed` are persisted on every victim row
 (`replica_managers.py:1145-1171`), and the recovery path's *default* outcome
 after a restart is adoption, which preserves every one of them
-(`replica_managers.py:5778-5826`, whose own log line at `5822-5827` says it
+(`replica_managers.py:5791-5839`, whose own log line at `5835-5840` says it
 preserves "their durable drain deadlines"). What destroys a wave is not the
 ephemeral controller epoch. It is that the pass which owns the wave after a
 restart decides on evidence it does not have, has no bounded outcome, and can be
@@ -46,15 +45,15 @@ created as a plain list: `LogicalScaleDownTarget` decisions emitted by
 `_generate_logical_scaling_decisions` (`autoscalers.py:6290-6302` and
 `6984-6996`), batched by the controller into one call at
 `controller.py:3844-3865` using the *first* decision's fence, and accepted by
-`ReplicaManager.scale_down_logically_batch` (`replica_managers.py:6174-6363`)
+`ReplicaManager.scale_down_logically_batch` (`replica_managers.py:6187-6376`)
 under one lock, one fleet read and one capacity ledger. There is no wave object,
 no wave id and no durable wave record. The only thing the members share is the
 fence tuple `(version, reconcile_generation, target_capacity,
 target_capacity_by_accelerator, accelerator_shapes)`, stamped per row by
-`_defer_scale_down_until_idle` (`replica_managers.py:5119-5129`).
+`_defer_scale_down_until_idle` (`replica_managers.py:5132-5142`).
 
 There is no cap on wave size. Selection is bounded only by the capacity ledger
-(`autoscalers.py:6924-6982`, mirrored at `replica_managers.py:6242-6285`), so
+(`autoscalers.py:6924-6982`, mirrored at `replica_managers.py:6255-6298`), so
 with 78 replicas and an autoscaler target of `{'A100-80GB': 1, 'L4': 1}` a single
 tick legitimately emits about 76 victims and one batch accepts all of them. The
 reserved-capacity reclaim is exactly this shape.
@@ -66,16 +65,16 @@ Two clocks, and the second fires far sooner than the first.
 **The proof clock.** `serve-drain-proof-across-lb-restarts.md` establishes that
 after a load balancer session change an already-off-route url is structurally
 unreachable in all four acknowledgement sets, so `_ReplicaDrainTracker._seen`
-(`replica_managers.py:826-850`) can never be re-established. A member's idle
+(`replica_managers.py:812-850`) can never be re-established. A member's idle
 proof can therefore only complete inside the LB session that acknowledged it.
 Measured session lifetime is 3300 s (46 rollouts in 41.9 h). protenix's
 `graceful_drain_seconds` is 7200 s, the schema maximum. 7200 / 3300 = 2.18, so a
 member that needs its full budget outlives at least two sessions with certainty,
 and its proof becomes unobtainable after the first roll. It then runs to the
 deadline, `outdated_backend` is `False` for a same-version reclaim victim
-(`replica_managers.py:6033-6038`), and control reaches
+(`replica_managers.py:6046-6051`), and control reaches
 `_abort_logical_retirement(info, 'post-routing idle proof timed out')` at
-`6059-6062`, which nulls `drain_started_at` at `5868`. The next tick re-selects
+`6072-6075`, which nulls `drain_started_at` at `5881`. The next tick re-selects
 the same replica, because the ordering at `autoscalers.py:6899-6905` is
 deterministic and its inputs are unchanged, and gives it a fresh 7200 s.
 
@@ -83,18 +82,18 @@ deterministic and its inputs are unchanged, and gives it a fresh 7200 s.
 LB pod template pins `skypilot.co/controller-image-digest`, and on 2026-07-25 the
 api-server pod was recreated at 11:57:47Z with every LB pod following between
 11:59:28Z and 12:02:12Z. `ReplicaManager.__init__` mints a new epoch at
-`replica_managers.py:2029`, every uncommitted member fails the compare at
-`5157-5158`, and the recovery walk at `3019-3023` sweeps all of them into
+`replica_managers.py:2023`, every uncommitted member fails the compare at
+`5170-5171`, and the recovery walk at `3032-3036` sweeps all of them into
 `_recovering_logical_retirement_ids`. `_reconcile_recovering_logical_retirements`
-(`5598-5827`) then decides on the first fresh version-matching snapshot, which
+(`5611-5840`) then decides on the first fresh version-matching snapshot, which
 after a co-restart is blind two independent ways: `observed_slots_by_replica_id`
 is empty because `total_slots_by_url` is only written by a probe round, and
 `force_all_live_unknown` (`controller.py:1073`) marks every live replica unknown.
-`_logical_ready_capacity` skips both cases (`replica_managers.py:5232-5241`, with
+`_logical_ready_capacity` skips both cases (`replica_managers.py:5245-5254`, with
 an in-tree comment that already names this), so ready capacity reads 0, the
-shortfall branch at `5714` fires, and up to
+shortfall branch at `5727` fires, and up to
 `_LOGICAL_RETIREMENT_RECOVERY_MAX_REACTIVATIONS_PER_GENERATION = 20` (line 91,
-enforced at `5761-5765`) members are reactivated per snapshot generation.
+enforced at `5774-5778`) members are reactivated per snapshot generation.
 Generations advance once per LB sync, every 20 s
 (`controller.py:1074-1076`). A 76-member wave is therefore fully undone in four
 generations, about 80 s.
@@ -112,12 +111,12 @@ protenix yet.
 Not the epoch. The recovery pass has two outcomes, and destruction is the
 *exception*:
 
-- **Adoption** (`replica_managers.py:5778-5826`) rewrites only the seven fence
-  fields at `5793-5804`. It never touches `drain_cap_seconds`,
+- **Adoption** (`replica_managers.py:5791-5839`) rewrites only the seven fence
+  fields at `5806-5817`. It never touches `drain_cap_seconds`,
   `drain_started_at` or `wait_for_idle_before_termination`. A wave adopted after
   a restart keeps every member and every elapsed second.
-- **Reactivation** (`5714-5776`) calls `_abort_logical_retirement` at `5747`,
-  which nulls the drain at `5867-5868` and pops the tracker at `5878`.
+- **Reactivation** (`5727-5789`) calls `_abort_logical_retirement` at `5760`,
+  which nulls the drain at `5880-5881` and pops the tracker at `5891`.
 
 The epoch merely routes the wave into that pass. The pass reactivates only when
 it reads a shortfall, and after a co-restart it reads a shortfall because the
@@ -130,23 +129,23 @@ wave durability. This design does not re-derive it.
 
 **(1) A bound on the hold, which C makes the normal outcome.** While a member is
 in `_recovering_logical_retirement_ids` it is neither terminable nor readmittable:
-`_refresh_wait_for_idle` continues at `6015-6023` and down admission continues at
-`7187-7197`. The pass's own 120 s deadline is diagnostic and self-renewing
-(`5641-5651` and `5657-5666` both log and then push the deadline out by another
+`_refresh_wait_for_idle` continues at `6028-6036` and down admission continues at
+`7200-7210`. The pass's own 120 s deadline is diagnostic and self-renewing
+(`5654-5664` and `5670-5679` both log and then push the deadline out by another
 `_LOGICAL_RETIREMENT_RECOVERY_TIMEOUT_SECONDS`), and two other gates return with
-no bound at all: the pending-version gate at `5669-5671` returns silently, and
-the reactivation-generation gate at `5674-5676` returns until a newer generation.
+no bound at all: the pending-version gate at `5682-5684` returns silently, and
+the reactivation-generation gate at `5687-5689` returns until a newer generation.
 Three reachable paths hold a wave forever:
 
 - The target is revoked every tick. `invalidate_logical_target()` is called
   whenever exact-card retirement must fail closed
   (`controller.py:3767-3772`, driven by `autoscalers.py:6275-6280`). Then
-  `target_state is None`, gate A at `5638-5652` renews and returns, forever.
+  `target_state is None`, gate A at `5651-5665` renews and returns, forever.
 - A per-card shortfall that no victim can close. The reactivation loop skips any
-  candidate whose card has no shortfall (`5741-5746`), so an L4 shortfall against
-  76 A100 victims readmits nobody, consumes the generation at `5731-5732`, and
+  candidate whose card has no shortfall (`5754-5759`), so an L4 shortfall against
+  76 A100 victims readmits nobody, consumes the generation at `5744-5745`, and
   returns. Every later generation repeats it. Held victims contribute 0 to
-  `_logical_ready_capacity` because of the `is_scale_down` filter at `5223-5226`,
+  `_logical_ready_capacity` because of the `is_scale_down` filter at `5236-5239`,
   so the shortfall does not close by itself.
 - An aggregate shortfall with `target_by_accelerator` non-empty and every per-card
   shortfall zero. Same loop, same outcome.
@@ -173,9 +172,9 @@ directions and the blind capacity wins, so the outcome is reactivation, which is
 the safe direction for capacity. **Mechanism C removes half of that mask.** With
 the blind capacity read suppressed and then the view becoming sighted, a
 rebuilt-blind target survives into a coverage check that passes:
-`ready_covers_target` at `5202-5205` compares real capacity against
-`min_replicas`. For an outdated-version member the bounded path at `6039-6058`
-and `7211-7228` then completes the teardown with `require_victim_idle=False`,
+`ready_covers_target` at `5215-5218` compares real capacity against
+`min_replicas`. For an outdated-version member the bounded path at `6052-6071`
+and `7224-7241` then completes the teardown with `require_victim_idle=False`,
 that is with no idle proof at all. A mass teardown authorized by a demand
 estimate the autoscaler refuses to act on is failure class 1, and shipping C
 without W1 creates it.
@@ -189,27 +188,27 @@ existing properties this design pins so they cannot be lost.
 1. **NO DURABLE KILL AUTHORIZATION.** No durable record of wave intent exists.
    Every irreversible teardown re-derives its authorization from the currently
    published `_logical_target` and a current fleet snapshot, at all three
-   consumers: `_refresh_wait_for_idle` (`replica_managers.py:6024-6030`),
-   `_finish_logical_retirement` (`5886-5906`, which evaluates the state twice
-   around the confirmation write), and down admission (`7218-7228`). *Test:* hold
+   consumers: `_refresh_wait_for_idle` (`replica_managers.py:6037-6043`),
+   `_finish_logical_retirement` (`5899-5919`, which evaluates the state twice
+   around the confirmation write), and down admission (`7231-7241`). *Test:* hold
    a wave of N members, raise the published target above what the remaining fleet
    covers, assert zero members reach `_terminate_replica`.
 
 2. **POST-KILL COVERAGE.** At the instant a member is admitted, observed ready
    capacity excluding that member covers the live aggregate target and every live
-   per-card target (`5188-5205`, `excluded_ids = {info.replica_id}`; every other
+   per-card target (`5203-5218`, `excluded_ids = {info.replica_id}`; every other
    off-route member already contributes 0 via the `is_scale_down` filter at
-   `5223-5226`). Unchanged. Rules out LOST CAPACITY in the steady state.
+   `5236-5239`). Unchanged. Rules out LOST CAPACITY in the steady state.
 
 3. **THE PUBLISHED TARGET IS BACKED BY A FRESH RECOMPUTE. (NEW, W1)**
    `_logical_target` is non-`None` only if the autoscaler's most recent recompute
    consumed a fresh demand report (`has_recomputed_with_fresh_data()`,
    `autoscalers.py:4238-4250`). Otherwise it is revoked and every member is
-   `'wait'` (`replica_managers.py:5160-5163`). *Test:* an autoscaler with
+   `'wait'` (`replica_managers.py:5173-5176`). *Test:* an autoscaler with
    `_snap_target_on_next_recompute` still `True` publishes no target, and
    `_logical_retirement_state` returns `'wait'` for a member whose fence is
    otherwise current. Rules out LOST CAPACITY across a restart, including the
-   no-idle-proof bounded path at `6039-6058`.
+   no-idle-proof bounded path at `6052-6071`.
 
 4. **THE RECOVERY HOLD NEVER OUTLIVES THE VICTIM'S DURABLE DRAIN BUDGET. (NEW,
    W2)** A member is released from `_recovering_logical_retirement_ids` as soon as
@@ -224,11 +223,11 @@ existing properties this design pins so they cannot be lost.
    non-blind snapshot and a target) or budget-exhaustion release (needs only the
    wall clock). No third state exists and no gate can return without one of the
    two eventually applying. *Test:* enumerate the four evidence gates
-   (`5638-5652`, `5655-5667`, `5669-5671`, `5674-5676`) and assert each one still
+   (`5651-5665`, `5668-5680`, `5682-5684`, `5687-5689`) and assert each one still
    terminates the hold at the budget.
 
 6. **ADOPTION IS NON-DESTRUCTIVE.** Adoption rewrites only the seven fence fields
-   (`5793-5804`) and never `drain_cap_seconds`, `drain_started_at` or
+   (`5806-5817`) and never `drain_cap_seconds`, `drain_started_at` or
    `wait_for_idle_before_termination`. *Test:* pin field-level equality of those
    three across a simulated restart plus adoption. This is the property that
    makes a wave survive a restart, and it already holds; the test exists so a
@@ -239,14 +238,14 @@ existing properties this design pins so they cannot be lost.
    here.
 
 8. **GENERATIONS ARE COMPARED ONLY INSIDE ONE EVIDENCE DOMAIN.** The per-process
-   `_logical_controller_epoch` (`2029`, rotated at `4579`, compared at `5158` and
-   `5682-5684`) is retained verbatim. It is the validity domain for
+   `_logical_controller_epoch` (`2023`, rotated at `4592`, compared at `5171` and
+   `5695-5697`) is retained verbatim. It is the validity domain for
    `_reconcile_generation`, which is process-local and resets to 0
    (`controller.py:417-420`, incremented at `1074-1076`). Without it, incarnation
    B at generation 3 would read incarnation A's persisted
-   `logical_retirement_generation = 2` as newer evidence at `5162`, match a stale
+   `logical_retirement_generation = 2` as newer evidence at `5175`, match a stale
    `logical_retirement_confirmed_generation`, and run
-   `_terminate_replica(..., in_flight_drain_cap_seconds=0)` at `5913-5917`: an
+   `_terminate_replica(..., in_flight_drain_cap_seconds=0)` at `5926-5930`: an
    irreversible zero-drain teardown of async work against a confirmation B never
    observed. Rules out DOUBLE KILL. *Test:* a member persisted at generation 5000
    under a dead epoch is not released by a fresh controller's snapshot at
@@ -254,22 +253,22 @@ existing properties this design pins so they cannot be lost.
 
 9. **ONE ACTOR.** Every replica write carries
    `expected_service_hash` and `expected_controller_owner = (controller_pid,
-   controller_ip)` (`_db_fence_kwargs`, `replica_managers.py:2359-2368`), verified
+   controller_ip)` (`_db_fence_kwargs`, `replica_managers.py:2372-2381`), verified
    under `SELECT ... FOR UPDATE` by `_lock_service_owner_in_session`
    (`serve_state.py:2946-2967`), and `_persist_replica` raises on a `False`
    return. Because `logical_retirement_committed = True` is a *write* that
-   precedes `t.start()` (`7237-7241`), a fenced-out incarnation can never start a
+   precedes `t.start()` (`7250-7254`), a fenced-out incarnation can never start a
    teardown. Unchanged.
 
 10. **IRREVERSIBILITY IS PER REPLICA.** `logical_retirement_committed`, written at
-    `7237` immediately before the RUNNING persist, remains the sole durable
+    `7250` immediately before the RUNNING persist, remains the sole durable
     admission boundary. Committed rows are exempt from abort on every path
-    (`6009-6014`, `5619-5621`) and are detached from their selection by
-    `_detach_committed_logical_retirement` (`5829-5843`). Unchanged.
+    (`6022-6027`, `5632-5634`) and are detached from their selection by
+    `_detach_committed_logical_retirement` (`5842-5856`). Unchanged.
 
 11. **NO REDUNDANT SELECTION.** A replica that is terminal or already carries
     `is_scale_down is True` cannot be selected (`autoscalers.py:6894-6898`,
-    `replica_managers.py:6289-6297`). A resumed incarnation therefore cannot
+    `replica_managers.py:6304-6310`). A resumed incarnation therefore cannot
     re-select a replica a previous incarnation terminated, because terminal rows
     and deleted rows both fail that filter. Rules out the other half of DOUBLE
     KILL. Unchanged.
@@ -325,7 +324,7 @@ if not decision_autoscaler.has_recomputed_with_fresh_data():
     # A target computed before the first fresh-data recompute is the
     # rebuilt-blind minimum (autoscalers.py:5946-5960 deliberately does not
     # consume the one-shot snap on a stale tick). Publishing it would let the
-    # coverage check at replica_managers.py:5202-5205 pass against a demand
+    # coverage check at replica_managers.py:5215-5218 pass against a demand
     # estimate the autoscaler itself refuses to act on, and the bounded
     # rolling-update path completes with no idle proof at all.
     self._replica_manager.invalidate_logical_target()
@@ -347,9 +346,9 @@ exactly "the target was computed on a tick whose demand report was fresh", which
 is the property the coverage check needs.
 
 Fail-closed in both directions. `_logical_target = None` makes
-`_logical_retirement_state` return `'wait'` at `5160-5163`, and it makes
+`_logical_retirement_state` return `'wait'` at `5173-5176`, and it makes
 `_logical_target_fence_holds` reject a new batch in
-`scale_down_logically_batch` (`6189-6199`), so a stale target neither authorizes
+`scale_down_logically_batch` (`6202-6212`), so a stale target neither authorizes
 a teardown nor authorizes a new wave.
 
 Bounded: the flag clears on the first fresh-data recompute, one decision interval
@@ -358,20 +357,20 @@ after the first LB sync.
 ### Logic, W2: the recovery hold never outlives the drain budget
 
 One edit in the triage loop of `_reconcile_recovering_logical_retirements`
-(`replica_managers.py:5613-5628`), which already runs on every pass before any
+(`replica_managers.py:5626-5641`), which already runs on every pass before any
 evidence gate:
 
 ```python
 for replica_id in sorted(list(recovering_ids)):
     info = infos_by_id.get(replica_id)
-    ...                                     # existing three discards, 5615-5627
+    ...                                     # existing three discards, 5628-5640
     if self._logical_recovery_budget_exhausted(info):
         # The durable drain budget is the service's own statement of how long
         # it will hold this GPU off route. The recovery hold refuses both
-        # teardown (7187-7197) and readmission (6015-6023), so it must not
+        # teardown (7200-7210) and readmission (6028-6036), so it must not
         # outlive that budget: the four evidence gates below can all return
         # without acting, and two of them renew their own deadline forever
-        # (5649-5651, 5664-5666).
+        # (5662-5664, 5677-5679).
         self._abort_logical_retirement(
             info,
             'recovery evidence did not arrive within the drain budget',
@@ -404,13 +403,13 @@ Notes on the shape, each of which is load-bearing:
   survives any number of restarts. `_remaining_drain_seconds` (`727-734`) is
   already fail-closed against bounded clock skew.
 - **Abort here rather than merely discard.** Discarding would hand the row to
-  `_refresh_wait_for_idle` in the same `_refresh_thread_pool` pass (`6765`,
-  `6769`, `6772`), where the still-mismatched epoch produces `'abort'` at `5158`
+  `_refresh_wait_for_idle` in the same `_refresh_thread_pool` pass (`6778`,
+  `6782`, `6785`), where the still-mismatched epoch produces `'abort'` at `5171`
   anyway, but with the reason string `'the current target or controller fence
   changed'`, which `_classify_abort_reason` (`737-746`) maps to `fence_changed`.
   Aborting in the triage with an explicit key keeps the accounting honest.
 - **`reason_key` is a new optional argument to `_abort_logical_retirement`**
-  (`5845-5878`), defaulting to `None` and falling back to
+  (`5858-5891`), defaulting to `None` and falling back to
   `_classify_abort_reason`. That preserves the existing property stated in that
   function's docstring, that a new caller cannot add an uncounted abort.
 - **No pacing.** The 20-per-generation bound at line 91 exists so a speculative
@@ -420,23 +419,23 @@ Notes on the shape, each of which is load-bearing:
   longer for no safety gain.
 - **The unevaluable-budget case releases immediately.** In practice
   `drain_cap_seconds` is always set, by `_defer_scale_down_until_idle` at
-  `5110-5111` and by `_register_wait_for_idle` at `5053-5057`. Rows predating the
+  `5127-5128` and by `_register_wait_for_idle` at `5066-5070`. Rows predating the
   field also predate `logical_retirement_committed` and are handled by
-  `_is_legacy_uncertain_logical_retirement` (`5441-5468`) on a separate path
-  (`5470` onward), so they never reach this triage. Releasing an unevaluable row
+  `_is_legacy_uncertain_logical_retirement` (`5454-5481`) on a separate path
+  (`5483` onward), so they never reach this triage. Releasing an unevaluable row
   toward routing is the conservative direction and is deterministic.
 
 The same edit also bounds the in-process version-update handoff, which reuses the
 identical recovery set (`_handoff_logical_retirements_for_version_update`,
-`4559-4593`, `recovering_ids.update(retiring_ids)` at `4585`). This design does
+`4572-4606`, `recovering_ids.update(retiring_ids)` at `4598`). This design does
 not try to distinguish a version handoff from a restart. Once the hold is
 bounded, the distinction buys nothing: both end in adoption or in a
 budget-bounded release.
 
-Second, smaller edit: the pending-version gate at `5669-5671` returns with no log
+Second, smaller edit: the pending-version gate at `5682-5684` returns with no log
 and no deadline renewal, so a version update stalled on the manager lock leaves
 the whole held population invisible. Give it the same log-and-renew treatment the
-two gates above it already use (`5641-5651`, `5657-5666`). This is
+two gates above it already use (`5654-5664`, `5670-5679`). This is
 observability only; W2's budget bound is what makes it safe.
 
 ### Logic, W3: counters
@@ -449,12 +448,12 @@ metric surface, and the same bounded-key discipline (`_ABORT_REASONS` at
 
 - `ABORT_REASON_EVIDENCE_GAP = 'evidence_gap'`, added to `_ABORT_REASONS`. Today
   a co-restart abort and a genuine demand rebound are indistinguishable: the
-  reactivation reason string at `5747-5749` is `'current ready capacity is below
+  reactivation reason string at `5760-5762` is `'current ready capacity is below
   the recovered target'`, which matches none of the substrings at `737-746` and
   is counted as `other`. Set `evidence_gap` explicitly at the W2 release site and
   at mechanism C's past-grace reactivation.
 - `drain_seconds_discarded_total`, computed inside `_abort_logical_retirement`
-  from `time.time() - drain_started_at` **before** the null at `5868`. This is the
+  from `time.time() - drain_started_at` **before** the null at `5881`. This is the
   metric the whole design exists to drive down, and it is the one number that
   distinguishes "the wave is progressing" from "the wave is on a treadmill".
 - `recovery_holds_opened`, `recovery_holds_adopted`,
@@ -470,17 +469,17 @@ matching the module docstring's stated contract at `21-24`.
 
 ### What is explicitly not changed
 
-`_ReplicaDrainTracker` and its four acknowledgement sets (`748-850`);
-`_seed_from_existing_report` (`785-809`); `update_lb_in_flight` (`2053-2079`);
-`_logical_ready_capacity` (`5211-5246`) and
-`_logical_ready_capacity_by_accelerator`; the coverage check at `5188-5205`;
+`_ReplicaDrainTracker` and its four acknowledgement sets (`749-850`);
+`_seed_from_existing_report` (`785-809`); `update_lb_in_flight` (`2047-2073`);
+`_logical_ready_capacity` (`5224-5259`) and
+`_logical_ready_capacity_by_accelerator`; the coverage check at `5203-5218`;
 `_logical_retirement_victim_is_idle`; `_is_committed_logical_retirement`
-(`5340-5385`); `_is_recoverable_uncommitted_logical_retirement` (`5387-5439`);
-`_is_legacy_uncertain_logical_retirement` (`5441-5468`);
-`_defer_scale_down_until_idle` (`5086-5132`); `scale_down_logically_batch`
-(`6174-6363`); the down-admission fence and commit write (`7176-7245`);
+(`5353-5398`); `_is_recoverable_uncommitted_logical_retirement` (`5401-5452`);
+`_is_legacy_uncertain_logical_retirement` (`5454-5481`);
+`_defer_scale_down_until_idle` (`5099-5145`); `scale_down_logically_batch`
+(`6187-6376`); the down-admission fence and commit write (`7189-7258`);
 `_ensure_drain_started_at` (`701-724`); the per-process epoch and its rotation
-(`2029`, `4579`); `lb_ha.py`; `lb_k8s.py`; every service-spec schema field.
+(`2023`, `4592`); `lb_ha.py`; `lb_k8s.py`; every service-spec schema field.
 
 ## Restart behavior
 
@@ -495,18 +494,18 @@ that does not change the LB pod template digest.
 
 1. The new parent CAS-claims `(controller_pid, controller_ip)` via
    `update_service_controller_pid_if_owner` (`service.py:1676-1684`).
-2. `ReplicaManager.__init__` mints a new epoch (`2029`).
+2. `ReplicaManager.__init__` mints a new epoch (`2023`).
    `_recover_replica_operations` re-registers trackers from the durable
-   wall-clock anchor (`3009-3019` into `_register_wait_for_idle` at `5045-5084`,
-   deadline recomputed at `5061-5071`), and the epoch-mismatch branch at
-   `3019-3023` puts every uncommitted member into the recovery hold.
+   wall-clock anchor (`3022-3032` into `_register_wait_for_idle` at `5058-5097`,
+   deadline recomputed at `5074-5084`), and the epoch-mismatch branch at
+   `3032-3036` puts every uncommitted member into the recovery hold.
 3. W1: until the autoscaler's first fresh-data recompute, no target is published,
    so every member is `'wait'`. Bounded by one decision interval.
 4. The LB is warm, so its next sync is not blind. The recovery pass adopts
-   (`5778-5826`), re-fencing every member to the new epoch and
+   (`5791-5839`), re-fencing every member to the new epoch and
    `snapshot.generation` while preserving `drain_cap_seconds` and
    `drain_started_at`.
-5. Release requires one strictly newer generation (`5691-5694`), about 20 s.
+5. Release requires one strictly newer generation (`5704-5707`), about 20 s.
    Members then evaluate normally. Members already proven idle finish; the rest
    keep draining from where they were.
 
@@ -525,17 +524,17 @@ restarting.
 1. The epoch is unchanged, so no member enters the recovery hold and the recovery
    pass does not run.
 2. The new LB's first one or two syncs are blind. Mechanism C's blindness
-   predicate suppresses the `'abort'` at `5203-5205`, and `_logical_retirement_state`
+   predicate suppresses the `'abort'` at `5216-5218`, and `_logical_retirement_state`
    returns `'wait'`. Members stay off route with their drains open.
 
    **Without C this is where the wave dies**, on a single blind tick, because
-   `_refresh_wait_for_idle` acts on `'abort'` immediately at `6026-6030` for every
+   `_refresh_wait_for_idle` acts on `'abort'` immediately at `6039-6043` for every
    member against the same snapshot.
 3. The proof session is gone. With mechanism A the controller advertises the
    off-route urls and the fresh LB re-probes them, so first-party proof returns in
    roughly 40 to 70 s. Without A the proof is unobtainable for the remainder of
    that drain and each member runs to its 7200 s deadline and then aborts at
-   `6059-6062`.
+   `6072-6075`.
 4. Elapsed drain is untouched throughout: nothing aborted.
 
 **Operator view:** with A and C, a brief stall in terminations and then normal
@@ -551,21 +550,21 @@ legitimately take about 330 s to arrive.
 
 - **t+0** Controller boots. Fresh epoch, trackers re-registered from wall clock,
   every uncommitted member into the recovery hold. Adoption and reactivation both
-  require a snapshot, and there is none, so gate A at `5638-5652` renews and
+  require a snapshot, and there is none, so gate A at `5651-5665` renews and
   returns.
 - **t+0 to one decision interval** W1 suppresses the target. Members are
   `'wait'`. Note this is *stricter* than today, which is the point: today the
   first tick can publish `min_replicas`.
 - **t+100 s to t+270 s** LB pods finish rolling. Their first syncs are blind
   (`observed_slots` empty, `force_all_live_unknown` at `controller.py:1073`).
-  Mechanism C suppresses the shortfall read, so the reactivation branch at `5714`
+  Mechanism C suppresses the shortfall read, so the reactivation branch at `5727`
   does not fire. **The wave is not touched.**
 - **t+150 s to t+330 s** Probe rounds repopulate `total_slots_by_url` and, with
   mechanism A, the off-route urls are back in `_occupancy_capable`. The view is
   sighted, the autoscaler has recomputed with fresh data, and the recovery pass
   adopts the whole wave in one loop.
 - **+20 s** One strictly newer generation releases the members
-  (`5691-5694`). Members whose proof arrived finish; the rest keep draining with
+  (`5704-5707`). Members whose proof arrived finish; the rest keep draining with
   their elapsed time intact.
 - **Failure branch:** if evidence never arrives, W2 releases each member at its
   own drain budget rather than holding it forever, counted as `evidence_gap`.
@@ -597,8 +596,8 @@ gated on `wait_for_idle_before_termination`, `logical_retirement_version` and
 them up with no modification. **Ship A first.**
 
 **B (absence is never proof for an async-declared replica): untouched.** This
-design does not modify `_ReplicaDrainTracker` (`748-850`),
-`_seed_from_existing_report` (`785-809`), `update_lb_in_flight` (`2053-2079`),
+design does not modify `_ReplicaDrainTracker` (`749-850`),
+`_seed_from_existing_report` (`785-809`), `update_lb_in_flight` (`2047-2073`),
 `_lb_report_authority`, `_publish_ha_drain_view`, `lb_ha.py` or `lb_k8s.py`. The
 idleness proof is not weakened by one term, and contract 12 removes the only
 mechanism (drain credit) by which it could have been.
@@ -617,7 +616,7 @@ C.
 **C's own stated limit is where W2 lands.** C's Risks section says "The
 co-restart case is only partially solved, by design", because
 `_refresh_wait_for_idle` still refuses authority for recovering ids
-(`6015-6023`) and recovery still requires adoption plus a strictly newer
+(`6028-6036`) and recovery still requires adoption plus a strictly newer
 generation. C's open question 3 asks whether that release fence should be
 shortened. This design's answer is no: the fence is correct and cheap (about
 20 s), and the actual problem is that the hold in front of it has no floor.
@@ -647,14 +646,14 @@ Postgres-guarded create following `012_serve_replica_status_history.py`, a
 `SERVE_VERSION` bump at `sky/utils/db/migration_utils.py:54`, a delete hook in
 the child-deletion loop at `serve_state.py:2801-2807` or wave rows leak on
 service delete, and its own CAS surface, because the owner-tuple fence at
-`replica_managers.py:2359-2368` covers replica writes only. What it buys is
+`replica_managers.py:2372-2381` covers replica writes only. What it buys is
 wave-level accounting, and by its own construction that accounting is audit-only:
-authorization still comes from `_logical_retirement_state` at `5886` and `7218`,
+authorization still comes from `_logical_retirement_state` at `5899` and `7231`,
 so deleting the wave row would not prevent a single kill. Worse, the accounting
 is *wrong* for the largest batches it would ever see, because victims with
 `has_served == False` are killed inside the wave-creating pass, either by the
-bulk delete at `6214-6240` or by `_terminate_replica(...,
-in_flight_drain_cap_seconds=0)` at `6320-6324`, and never pass through
+bulk delete at `6226-6253` or by `_terminate_replica(...,
+in_flight_drain_cap_seconds=0)` at `6334-6338`, and never pass through
 `_defer_scale_down_until_idle`, so they never become members. A 90-replica failed
 logical launch would record 2 members and 0 terminations while destroying 88
 replicas. A table that is audit-only and whose audit is wrong is not worth a
@@ -677,21 +676,21 @@ piece considered. Three reasons.
 First, it does not fix what it claims to. For a same-version wave victim, elapsed
 drain is not progress toward completion: completion requires an idle proof from
 the LB, and the deadline expiring leads to `_abort_logical_retirement` at
-`6059-6062`, not to a termination. Preserving elapsed time makes the next attempt
+`6072-6075`, not to a termination. Preserving elapsed time makes the next attempt
 give up *sooner*, not finish sooner.
 
 Second, the scoping cannot be enforced where it matters.
 `_ensure_drain_started_at` (`701-724`) is the natural consumption site because it
-owns the wall-clock anchor, and it has four callers: `4737` (launch-cancel
-teardown), `4900` (the physical drain worker, whose deadline at `4909` bounds
-`_wait_for_drain` and whose expiry force-terminates), `5061`
-(`_register_wait_for_idle`) and `5116` (`_defer_scale_down_until_idle`, shared by
+owns the wall-clock anchor, and it has four callers: `4750` (launch-cancel
+teardown), `4913` (the physical drain worker, whose deadline at `4922` bounds
+`_wait_for_drain` and whose expiry force-terminates), `5074`
+(`_register_wait_for_idle`) and `5129` (`_defer_scale_down_until_idle`, shared by
 the logical and the plain strict-drain paths). Three of the four end in a kill.
 Restricting who *writes* a credit does not restrict who *spends* it, and the
 credit is a durable field that survives until consumed. A member credited after a
 blind-window abort, returned to routing, given fresh async work, and then retired
 by an unrelated `sky serve update` takes the outdated-version bounded path at
-`6039-6058`, which calls `_finish_logical_retirement(require_victim_idle=False)`
+`6052-6071`, which calls `_finish_logical_retirement(require_victim_idle=False)`
 and terminates with `in_flight_drain_cap_seconds=0`: live jobs killed on a
 credit-shortened deadline with no idle proof. That violates the hard constraint
 that killing real user jobs is worse than holding a GPU.
@@ -716,9 +715,9 @@ failed apply, none of which restart the controller, so a fleet that runs apply o
 a cadence would make its whole live wave foreign-lineage at the next restart and
 silently degrade to today. Risk: the token's real payload is that it lets the
 recovery hold be removed, and removing the hold removes the two guards at
-`6015-6023` and `7187-7197` that stop `_refresh_wait_for_idle` from converting
+`6028-6036` and `7200-7210` that stop `_refresh_wait_for_idle` from converting
 elapsed wall time into readmission authority. Without those, a member whose
-budget elapses during the post-restart evidence gap is aborted at `6059-6062`
+budget elapses during the post-restart evidence gap is aborted at `6072-6075`
 having consulted no snapshot, no target and no capacity evidence at all. Keeping
 the hold and bounding it (W2) gets the safety for one predicate and no new
 identity.
@@ -733,13 +732,13 @@ being replaced, and it introduces a failure mode where a partial or filtered
 read under-seeds the counter and a stale confirmation is read as newer evidence,
 which is the zero-drain teardown in contract 8. Not worth it for a benefit the
 adoption path already delivers by re-stamping
-`logical_retirement_generation = snapshot.generation` at `5796`.
+`logical_retirement_generation = snapshot.generation` at `5809`.
 
 **Rejected: moving coverage failure from `'abort'` to `'wait'` with a single
 readmission owner.** Structurally attractive: it separates the safe act
 (readmit) from the unsafe one (destroy intent), and it would stop one blind tick
 reverting an entire wave. But it concentrates all readmission authority in one
-new function, and that function inherits the per-card skip at `5741-5746`, so a
+new function, and that function inherits the per-card skip at `5754-5759`, so a
 shortfall on a card no victim carries readmits nobody and the victims are then
 neither terminable nor readmittable until their drain deadline. Today the same
 situation aborts every victim in one tick and capacity returns immediately. The
@@ -749,10 +748,10 @@ any readmission authority.
 **Rejected: a pause/cancel split of `_abort_logical_retirement`.** Same insight,
 same objection, plus the specification hazard that "pause" is both an action that
 returns a victim to routing and a return value meaning "take no action", and the
-two readings give opposite restart behaviour. If the epoch-mismatch line `5158`
+two readings give opposite restart behaviour. If the epoch-mismatch line `5171`
 returns the action, every member of every wave is readmitted once per restart,
 including the ones sitting SCHEDULED-uncommitted behind the 64-way down budget
-(`_MAX_CONCURRENT_DOWNS_PER_SERVICE` at line 105, enforced at `7179-7180`), which
+(`_MAX_CONCURRENT_DOWNS_PER_SERVICE` at line 105, enforced at `7191-7192`), which
 are the members closest to completion.
 
 **Rejected: capping or pacing wave size.** 76 victims in one tick is intended
@@ -766,10 +765,10 @@ whether the durability fix worked.
 
 **Rejected: a manager-side demand-freshness conjunct instead of W1's
 controller-side gate.** Adding "the demand report is fresh" as a seventh conjunct
-to `_logical_retirement_state` (`5133-5210`) would work, but it needs a
+to `_logical_retirement_state` (`5146-5223`) would work, but it needs a
 cross-thread read of autoscaler state from inside `_logical_state_lock`, on a
 path that already does a full `serve_state.get_replica_infos` under that lock at
-`5187`. The controller-side gate is three lines, sits where the target is already
+`5203`. The controller-side gate is three lines, sits where the target is already
 computed and published, and fails closed through the existing
 `invalidate_logical_target()` path.
 
@@ -845,9 +844,9 @@ mechanism C, never after.
 
 **W2: bounded recovery hold. About 1 day.**
 `sky/serve/replica_managers.py`: `_logical_recovery_budget_exhausted` (new,
-about 10 lines), the triage-loop branch at `5613-5628`, the optional `reason_key`
-on `_abort_logical_retirement` at `5845-5878`, and the log-and-renew fix for the
-pending-version gate at `5669-5671`. No dependency on A or C. Ship with or before
+about 10 lines), the triage-loop branch at `5626-5641`, the optional `reason_key`
+on `_abort_logical_retirement` at `5858-5891`, and the log-and-renew fix for the
+pending-version gate at `5682-5684`. No dependency on A or C. Ship with or before
 C, because C makes the hold the normal outcome.
 
 **W3: wave counters. About 0.5 day.** `sky/serve/drain_observability.py` plus the
@@ -980,13 +979,13 @@ if any test in this file needs editing, the change has gone wrong.
    agreed with whoever lands C rather than assumed here.
 
 5. **Is `_is_legacy_uncertain_logical_retirement`'s separate reconcile
-   (`5441-5468`, driven from `5470` onward) also unbounded?** It was not audited
+   (`5454-5481`, driven from `5483` onward) also unbounded?** It was not audited
    for this design because those rows predate the commit bit and should not exist
    in production any more. If any remain, they need the same budget bound.
 
 6. **Does the reclaim workstream ever retire outdated-version replicas?** Every
-   argument here about the bounded no-idle-proof path at `6039-6058` assumes the
+   argument here about the bounded no-idle-proof path at `6052-6071` assumes the
    reclaim retires current-version replicas only, so its members always take the
-   abort branch at `6059-6062` rather than the completion branch. If a reclaim
+   abort branch at `6072-6075` rather than the completion branch. If a reclaim
    path can select an outdated member, that member is exposed to W1's hazard for
    the whole window and the two populations must be described separately.

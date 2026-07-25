@@ -1,7 +1,54 @@
 # Datadog observability for SkyServe controllers and load balancers
 
-Status: proposed. Nothing in this document has been executed. Every `kubectl` and
-`helm` invocation used to establish the facts below was read-only.
+- **Status:** M0 and M1 DEPLOYED and verified on 2026-07-25. M2 to M4 (the
+  SkyPilot-side metrics emission) not started.
+- **Last updated:** 2026-07-25
+
+The rest of this document was written before M1 shipped and still reads as a
+proposal. It is retained as the reasoning that produced the design; the
+deployment record and the departures from it are below.
+
+## Deployment record (2026-07-25)
+
+Shipped by boltz-platform PR #7330 (ArgoCD Application `hub-datadog`, namespace
+`observability-datadog`, chart `deployment/helm-addons/datadog-wrapper`).
+
+Verified live, not assumed:
+
+- All 3 hub nodes report to Datadog and are `up`.
+- Agent reports `API key valid`; the logs agent had shipped 201,812 events with
+  0 retries within minutes of rollout.
+- 47 SkyPilot log sources are tailed, covering every external load balancer pod
+  and the API server container. Sample LB lines are queryable in Datadog under
+  `kube_cluster_name:boltz-platform-gitops-hub-rainier-eks-cluster`.
+- DogStatsD is listening on host port 8125/udp, ready for M2.
+- **The controller-log gap in this document is confirmed, not theoretical.**
+  Searching Datadog for `Reserved-fill broker` and `Concurrency report` returns
+  0 hits, because controllers write to `~/.sky/serve/<svc>/controller.log` on
+  the state-volume PVC and never to stdout. M2 remains the fix.
+
+### Departures from this design, and why
+
+1. **Secret name.** This document specifies a new
+   `skypilot/gitops-hub-rainier/datadog/credentials`. What shipped reuses the
+   platform-wide convention `global/datadog/provider-tf-credentials`, seeded
+   into account 255203429798, because the `datadog-wrapper` chart already
+   defaults `externalSecret.awsSecretName` to it and every other account uses
+   that name. The design's substantive point was kept: only `api_key` is
+   replicated, not `app_key`.
+2. **IAM location.** The grant went into
+   `deployment/terragrunt/modules/aws-gitops-hub/irsa_argocd.tf` (the managed
+   policy for the hub's ESO role) rather than the skypilot control-plane
+   `eso.tf`, because the consumer is the cluster-wide agent, not the SkyPilot
+   release.
+3. **Chart source.** The Application uses the git chart path, not the ECR
+   chart. `infra-prod` and `infra-test` pin `datadog-wrapper` 3.653.0 while the
+   registry's newest tag is 3.650.6, so that pin cannot render and both apps
+   read OutOfSync. Using it would have shipped broken.
+
+Everything else landed as designed, including the two structural calls this
+document argues hardest for: the agent holds the only Datadog credential, and
+the load balancer PodSpec was not touched.
 
 Primary approach: **install the Datadog node agent on ghub-skypilot for logs and
 infrastructure signals, then emit SkyServe metrics from the controller process
