@@ -1,11 +1,13 @@
 """Logic tests for load-balancer-to-replica TLS."""
 # pylint: disable=protected-access
+import asyncio
 import http.server
 import os
 import socket
 import ssl
 import threading
 
+import aiohttp
 import httpx
 import pytest
 import requests
@@ -340,5 +342,74 @@ def test_probe_still_rejects_an_impostor_at_a_foreign_address(
     try:
         with pytest.raises(Exception):
             replica_tls.probe_client().get(f'https://[::1]:{port}/', timeout=10)
+    finally:
+        server.shutdown()
+
+
+def _occupancy_probe(port: int, ssl_setting) -> int:
+    """Dials one URL exactly as the load balancer's occupancy probe does.
+
+    Mirrors the connector construction in
+    SkyServeLoadBalancer._fetch_replica_occupancy: aiohttp gets an ``ssl``
+    kwarg only when the setting is not ``None`` (the plaintext/off path).
+    """
+
+    async def _run() -> int:
+        connector_kwargs: dict = {'limit': 1}
+        if ssl_setting is not None:
+            connector_kwargs['ssl'] = ssl_setting
+        connector = aiohttp.TCPConnector(**connector_kwargs)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(
+                    f'https://[::1]:{port}/',
+                    timeout=aiohttp.ClientTimeout(total=10)) as response:
+                return response.status
+
+    return asyncio.run(_run())
+
+
+def test_occupancy_probe_verifies_a_replica_at_a_foreign_address(
+        tmp_path, monkeypatch):
+    """The silent client must reach an IP-addressed replica under pinning.
+
+    The occupancy probe is the one client whose failures are swallowed, so a
+    TLS mistake here degrades concurrency-native autoscaling without an error
+    rather than loudly. The proxy (httpx) and the readiness probe
+    (requests/urllib3) each have a live test at [::1], an address the pinned
+    certificate does not list; aiohttp reaches the same replicas and keys its
+    verification off ``check_hostname`` alone -- differently from urllib3 2.x,
+    whose separate hostname assertion the probe session must disable -- so a
+    later refactor that unified the three clients could silently reintroduce a
+    hostname assertion on this hop and only here. Dialling [::1] is what would
+    catch that.
+    """
+    material = replica_tls.generate_material()
+    monkeypatch.setenv(constants.REPLICA_TLS_MODE_ENV_VAR,
+                       constants.REPLICA_TLS_MODE_PINNED)
+    monkeypatch.setenv(constants.REPLICA_TLS_CERT_ENV_VAR,
+                       material.certificate_pem)
+    ssl_setting = replica_tls.aiohttp_ssl_setting()
+    assert isinstance(ssl_setting, ssl.SSLContext)
+    server, port = _serve_tls_v6(material, tmp_path)
+    try:
+        assert _occupancy_probe(port, ssl_setting) == 200
+    finally:
+        server.shutdown()
+
+
+def test_occupancy_probe_still_rejects_an_impostor_at_a_foreign_address(
+        tmp_path, monkeypatch):
+    """Disabling the hostname assertion must not disable the pin on this hop."""
+    material = replica_tls.generate_material()
+    impostor = replica_tls.generate_material()
+    monkeypatch.setenv(constants.REPLICA_TLS_MODE_ENV_VAR,
+                       constants.REPLICA_TLS_MODE_PINNED)
+    monkeypatch.setenv(constants.REPLICA_TLS_CERT_ENV_VAR,
+                       material.certificate_pem)
+    ssl_setting = replica_tls.aiohttp_ssl_setting()
+    server, port = _serve_tls_v6(impostor, tmp_path)
+    try:
+        with pytest.raises(Exception):
+            _occupancy_probe(port, ssl_setting)
     finally:
         server.shutdown()
