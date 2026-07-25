@@ -18,6 +18,7 @@ from sky.data import data_utils
 from sky.data import mounting_utils
 from sky.data import storage as storage_lib
 from sky.data import storage_utils
+from sky.provision import constants as provision_constants
 from sky.utils import rich_utils
 from sky.utils import ux_utils
 
@@ -521,6 +522,11 @@ class GcsStore(AbstractStore):
         try:
             bucket = self.client.bucket(bucket_name)
             bucket.storage_class = 'STANDARD'
+            bucket.labels = {
+                **(bucket.labels or {}),
+                provision_constants.TAG_SKYPILOT_MANAGED:
+                    provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+            }
             new_bucket = self.client.create_bucket(bucket, location=region)
         except Exception as e:  # pylint: disable=broad-except
             with ux_utils.print_exception_no_traceback():

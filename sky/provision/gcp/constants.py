@@ -369,6 +369,7 @@ GCP_MINIMAL_PERMISSIONS = [
 VM_MINIMAL_PERMISSIONS = [
     'compute.disks.create',
     'compute.disks.list',
+    'compute.disks.setLabels',
     'compute.firewalls.get',
     'compute.instances.create',
     'compute.instances.delete',

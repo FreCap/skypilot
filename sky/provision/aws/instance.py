@@ -180,7 +180,10 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     max_efa_interfaces = config.provider_config.get('max_efa_interfaces', 0)
 
     # sort tags by key to support deterministic unit test stubbing
-    tags = dict(sorted(copy.deepcopy(config.tags).items()))
+    tags = copy.deepcopy(config.tags)
+    tags[constants.TAG_SKYPILOT_MANAGED] = (
+        constants.SKYPILOT_MANAGED_TAG_VALUE)
+    tags = dict(sorted(tags.items()))
     filters: list[ec2_type_defs.FilterTypeDef] = [{
         'Name': 'instance-state-name',
         'Values': ['pending', 'running', 'stopping', 'stopped'],

@@ -6,6 +6,7 @@ from typing import Any
 
 from sky import sky_logging
 from sky.provision import common
+from sky.provision import constants as provision_constants
 
 TPU_NODE_CREATION_FAILURE = 'Failed to provision TPU node.'
 
@@ -30,6 +31,8 @@ def create_tpu_node(
                f'--zone={zone} '
                f'--version={tpu_node_config["runtimeVersion"]} '
                f'--accelerator-type={tpu_type} '
+               f'--labels={provision_constants.TAG_SKYPILOT_MANAGED}='
+               f'{provision_constants.SKYPILOT_MANAGED_TAG_VALUE} '
                f'--network={vpc_name}')
         logger.debug(f'Creating TPU {tpu_name} with command:\n{cmd}')
         proc = subprocess.run(

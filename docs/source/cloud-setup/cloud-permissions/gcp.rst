@@ -101,6 +101,7 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
 
     compute.disks.create
     compute.disks.list
+    compute.disks.setLabels
     compute.firewalls.create
     compute.firewalls.delete
     compute.firewalls.get
@@ -171,6 +172,7 @@ The :ref:`Medium Permissions <gcp-medium-permissions>` assigns admin permissions
     compute.images.create
     compute.images.get
     compute.images.delete
+    compute.images.setLabels
 
 7. **Optional**: To enable opening ports on GCP cluster, you need to have the following permissions for the role as well:
 

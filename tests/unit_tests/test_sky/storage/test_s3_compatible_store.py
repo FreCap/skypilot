@@ -11,8 +11,10 @@ from unittest import mock
 
 import pytest
 
+from sky import exceptions
 from sky.data import storage as storage_lib
 from sky.data import storage_s3
+from sky.provision import constants as provision_constants
 
 _PUBLIC_STORE_CONFIGS = {
     'S3Store': ('S3', 's3://', 'AWS', 'us-east-1'),
@@ -101,6 +103,63 @@ def test_provider_prefixes_cover_compatible_and_external_sources():
         'cos://',
         'oci://',
     }
+
+
+def test_new_aws_bucket_has_reserved_managed_tag():
+    store = object.__new__(storage_lib.S3Store)
+    store.name = 'test-bucket'
+    store.region = 'us-west-2'
+    store.client = mock.Mock()
+    handle = object()
+    store.config = types.SimpleNamespace(
+        cloud_name='AWS', resource_factory=mock.Mock(return_value=handle))
+
+    with mock.patch.object(
+            storage_s3.skypilot_config,
+            'get_effective_region_config',
+            return_value={
+                'team': 'research',
+                provision_constants.TAG_SKYPILOT_MANAGED: 'false',
+            }):
+        result = store._create_bucket(store.name)
+
+    assert result is handle
+    store.client.put_bucket_tagging.assert_called_once_with(
+        Bucket='test-bucket',
+        Tagging={
+            'TagSet': [{
+                'Key': 'team',
+                'Value': 'research',
+            }, {
+                'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+                'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+            }]
+        })
+
+
+def test_new_aws_bucket_tag_failure_cleans_up_empty_bucket():
+    store = object.__new__(storage_lib.S3Store)
+    store.name = 'test-bucket'
+    store.region = 'us-west-2'
+    store.client = mock.Mock()
+    store.config = types.SimpleNamespace(cloud_name='AWS',
+                                         resource_factory=mock.Mock())
+    tag_error = storage_s3.aws.botocore_exceptions().ClientError(
+        {'Error': {
+            'Code': 'AccessDenied',
+            'Message': 'tagging denied',
+        }}, 'PutBucketTagging')
+    store.client.put_bucket_tagging.side_effect = tag_error
+
+    with mock.patch.object(storage_s3.skypilot_config,
+                           'get_effective_region_config',
+                           return_value={}), pytest.raises(
+                               exceptions.StorageBucketCreateError,
+                               match='failed'):
+        store._create_bucket(store.name)
+
+    store.client.delete_bucket.assert_called_once_with(Bucket=store.name)
+    store.config.resource_factory.assert_not_called()
 
 
 def test_s3_compatible_upload_quotes_paths_and_cli_config():

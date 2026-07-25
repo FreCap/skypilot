@@ -150,8 +150,10 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     """See sky/provision/__init__.py"""
     # NOTE: although google cloud instances have IDs, but they are
     #  not used for indexing. Instead, we use the instance name.
-    labels = config.tags  # gcp uses 'labels' instead of aws 'tags'
-    labels = dict(sorted(copy.deepcopy(labels).items()))
+    labels = copy.deepcopy(config.tags)  # gcp uses labels instead of tags
+    labels[provision_constants.TAG_SKYPILOT_MANAGED] = (
+        provision_constants.SKYPILOT_MANAGED_TAG_VALUE)
+    labels = dict(sorted(labels.items()))
     resumed_instance_ids: list[str] = []
     created_instance_ids: list[str] = []
 

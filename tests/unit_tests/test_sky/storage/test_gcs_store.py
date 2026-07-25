@@ -4,6 +4,7 @@
 import contextlib
 import pickle
 import shlex
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -12,6 +13,7 @@ from sky import cloud_stores
 from sky import exceptions
 from sky.data import storage as storage_lib
 from sky.data import storage_gcs
+from sky.provision import constants as provision_constants
 
 
 def _gcs_store(**attributes) -> storage_lib.GcsStore:
@@ -138,6 +140,28 @@ def test_gcs_store_delete_preserves_external_bucket_with_sub_path():
 
     store._delete_sub_path.assert_called_once_with()
     store._delete_gcs_bucket.assert_not_called()
+
+
+def test_gcs_store_marks_new_bucket_as_skypilot_managed():
+    store = _gcs_store()
+    bucket = SimpleNamespace(labels={'owner': 'research'})
+    created_bucket = SimpleNamespace(name=store.name,
+                                     location=store.region,
+                                     storage_class='STANDARD')
+    store.client = mock.Mock()
+    store.client.bucket.return_value = bucket
+    store.client.create_bucket.return_value = created_bucket
+
+    assert store._create_gcs_bucket(store.name, store.region) is created_bucket
+
+    assert bucket.storage_class == 'STANDARD'
+    assert bucket.labels == {
+        'owner': 'research',
+        provision_constants.TAG_SKYPILOT_MANAGED:
+            provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+    }
+    store.client.create_bucket.assert_called_once_with(bucket,
+                                                       location=store.region)
 
 
 def test_gcs_store_sub_path_delete_quotes_target_uri():

@@ -30,6 +30,7 @@ from sky.data import storage_azure
 from sky.data import storage_gcs
 from sky.data import storage_ibm
 from sky.data import storage_utils
+from sky.provision import constants as provision_constants
 from sky.utils import rich_utils
 from sky.utils import ux_utils
 
@@ -687,6 +688,7 @@ class S3CompatibleStore(AbstractStore, ABC):
 
     def _create_bucket(self, bucket_name: str) -> StorageHandle:
         """Create bucket using S3 API."""
+        bucket_created = False
         try:
             create_bucket_config: dict[str, Any] = {'Bucket': bucket_name}
             if self.region is not None and self.region != 'us-east-1':
@@ -694,17 +696,23 @@ class S3CompatibleStore(AbstractStore, ABC):
                     'LocationConstraint': self.region
                 }
             self.client.create_bucket(**create_bucket_config)
+            bucket_created = True
             logger.info(
                 f'  {colorama.Style.DIM}Created S3 bucket {bucket_name!r} in '
                 f'{self.region or "us-east-1"}{colorama.Style.RESET_ALL}')
 
             # Add AWS tags configured in config.yaml to the bucket.
             # This is useful for cost tracking and external cleanup.
-            bucket_tags = skypilot_config.get_effective_region_config(
-                cloud=self.config.cloud_name,
-                region=None,
-                keys=('labels',),
-                default_value={})
+            configured_bucket_tags = (
+                skypilot_config.get_effective_region_config(
+                    cloud=self.config.cloud_name,
+                    region=None,
+                    keys=('labels',),
+                    default_value={}))
+            bucket_tags = dict(configured_bucket_tags or {})
+            if self.config.cloud_name == str(clouds.AWS()):
+                bucket_tags[provision_constants.TAG_SKYPILOT_MANAGED] = (
+                    provision_constants.SKYPILOT_MANAGED_TAG_VALUE)
             if bucket_tags:
                 self.client.put_bucket_tagging(
                     Bucket=bucket_name,
@@ -715,6 +723,15 @@ class S3CompatibleStore(AbstractStore, ABC):
                         } for k, v in bucket_tags.items()]
                     })
         except aws.botocore_exceptions().ClientError as e:
+            if bucket_created:
+                try:
+                    # S3 does not support tags in CreateBucket. Roll back the
+                    # still-empty bucket rather than leave unmarked storage.
+                    self.client.delete_bucket(Bucket=bucket_name)
+                except aws.botocore_exceptions().ClientError as cleanup_error:
+                    logger.warning(
+                        f'Failed to clean up untagged S3 bucket {bucket_name!r} '
+                        f'after bucket tagging failed: {cleanup_error}')
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketCreateError(
                     f'Attempted to create S3 bucket {self.name} but failed.'

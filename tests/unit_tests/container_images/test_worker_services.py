@@ -32,6 +32,7 @@ from sky.container_images import topology_state
 from sky.container_images import transactions
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.provision import constants as provision_constants
 from sky.provision import docker_utils
 
 _DIGEST = 'sha256:' + 'a' * 64
@@ -2416,6 +2417,9 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
     }, {
         'Key': 'SkyPilotProfile',
         'Value': profile.name,
+    }, {
+        'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+        'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
     }]
     tagged_instance = {'InstanceId': 'i-canary'}
     instance = {
@@ -2647,6 +2651,8 @@ def test_ec2_canary_observes_exact_host_and_uses_fenced_clients(
             'SkyPilotCanaryOperation': operation.id,
             'SkyPilotCatalog': 'catalog',
             'SkyPilotProfile': profile.name,
+            provision_constants.TAG_SKYPILOT_MANAGED:
+                provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
         }
     assert "trap 'shutdown -h now' EXIT" in launch['UserData']
     assert acquired_services == ['ec2', 'iam', 'ec2']
@@ -2688,6 +2694,9 @@ def test_ec2_canary_replay_restores_durable_profile_latch(
     }, {
         'Key': 'SkyPilotProfile',
         'Value': profile.name,
+    }, {
+        'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+        'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
     }]
     tagged = {'InstanceId': 'i-canary'}
     terminal = {

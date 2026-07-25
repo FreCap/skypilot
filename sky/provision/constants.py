@@ -3,6 +3,11 @@
 # Tag uniquely identifying all nodes of a cluster
 TAG_RAY_CLUSTER_NAME = 'ray-cluster-name'
 TAG_SKYPILOT_CLUSTER_NAME = 'skypilot-cluster-name'
+# Reserved marker for resources created and managed by SkyPilot.  Providers
+# enforce this after merging user tags/labels so billing attribution cannot be
+# disabled accidentally.
+TAG_SKYPILOT_MANAGED = 'skypilot-managed'
+SKYPILOT_MANAGED_TAG_VALUE = 'true'
 # Legacy tag for backward compatibility to distinguish head and worker nodes.
 TAG_RAY_NODE_KIND = 'ray-node-type'
 TAG_SKYPILOT_HEAD_NODE = 'skypilot-head-node'

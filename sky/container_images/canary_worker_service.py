@@ -24,6 +24,7 @@ from sky.container_images import qualification
 from sky.container_images import topology_state
 from sky.container_images import worker_health
 from sky.container_images import worker_lease
+from sky.provision import constants as provision_constants
 from sky.provision import docker_utils
 from sky.server import database_migrations
 
@@ -1174,6 +1175,8 @@ def _run_ec2_canary_inner(
             'SkyPilotCanaryOperation': operation.id,
             'SkyPilotCatalog': catalog_authority_id,
             'SkyPilotProfile': profile.name,
+            provision_constants.TAG_SKYPILOT_MANAGED:
+                provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
         }
         instances = _tagged_instances(ec2,
                                       operation.id,

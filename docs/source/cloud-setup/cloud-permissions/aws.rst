@@ -336,6 +336,7 @@ These are the minimal policy rules required by SkyPilot:
                 "Resource": [
                     "arn:aws:ec2:*:<account-ID-without-hyphens>:instance/*",
                     "arn:aws:ec2:*:<account-ID-without-hyphens>:network-interface/*",
+                    "arn:aws:ec2:*:<account-ID-without-hyphens>:spot-instances-request/*",
                     "arn:aws:ec2:*:<account-ID-without-hyphens>:subnet/*",
                     "arn:aws:ec2:*:<account-ID-without-hyphens>:volume/*",
                     "arn:aws:ec2:*:<account-ID-without-hyphens>:security-group/*"
@@ -350,7 +351,13 @@ These are the minimal policy rules required by SkyPilot:
                     "ec2:CreateTags",
                     "ec2:StopInstances"
                 ],
-                "Resource": "arn:aws:ec2:*:<account-ID-without-hyphens>:instance/*"
+                "Resource": [
+                    "arn:aws:ec2:*:<account-ID-without-hyphens>:instance/*",
+                    "arn:aws:ec2:*:<account-ID-without-hyphens>:volume/*",
+                    "arn:aws:ec2:*:<account-ID-without-hyphens>:network-interface/*",
+                    "arn:aws:ec2:*:<account-ID-without-hyphens>:spot-instances-request/*",
+                    "arn:aws:ec2:*:<account-ID-without-hyphens>:security-group/*"
+                ]
             },
             {
                 "Effect": "Allow",
@@ -440,6 +447,14 @@ These are the minimal policy rules required by SkyPilot:
                     "ec2:DeregisterImage"
                 ],
                 "Resource": "*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": "ec2:CreateTags",
+                "Resource": [
+                    "arn:aws:ec2:*::image/*",
+                    "arn:aws:ec2:*::snapshot/*"
+                ]
             }
 
 **Optional**: To enable opening ports on AWS cluster, you need to add the following permissions to the policy above as well.

@@ -659,7 +659,8 @@ def _get_or_create_vpc_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
         return security_group
 
     try:
-        # create a new security group with skypilot tag
+        # Create a new security group with both the legacy discovery tag and
+        # the common billing marker.
         ec2.meta.client.create_security_group(
             Description='Auto-created security group for Ray workers',
             GroupName=expected_sg_name,
@@ -669,6 +670,9 @@ def _get_or_create_vpc_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
                 'Tags': [{
                     'Key': SKYPILOT,
                     'Value': 'true',
+                }, {
+                    'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+                    'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
                 }],
             }],
         )

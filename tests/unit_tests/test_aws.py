@@ -349,7 +349,7 @@ def test_subnet_names_wrong_vpc(monkeypatch):
 
 
 def test_security_group_tagged_on_create():
-    """Test that create_security_group is called with skypilot tag."""
+    """Test that a security group gets legacy and managed tags."""
     mock_ec2 = MagicMock()
 
     # No existing security group found
@@ -375,6 +375,9 @@ def test_security_group_tagged_on_create():
         'Tags': [{
             'Key': 'skypilot',
             'Value': 'true',
+        }, {
+            'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+            'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
         }],
     }]
 

@@ -845,6 +845,13 @@ Tags to assign to all instances and buckets created by SkyPilot (optional).
 
 Example use case: cost tracking by user/team/project.
 
+SkyPilot also reserves and automatically applies the
+``skypilot-managed=true`` tag to supported AWS resources it creates, including
+instances and their launch-created volumes and network interfaces, images and
+snapshots, and buckets. To group spend by this marker in AWS billing tools,
+activate ``skypilot-managed`` as a user-defined cost allocation tag in the
+Billing console.
+
 Users should guarantee that these key-values are valid AWS tags, otherwise
 errors from the cloud provider will be surfaced.
 
@@ -1238,6 +1245,11 @@ Apply to all new instances but not existing ones.
 Labels to assign to all instances launched by SkyPilot (optional).
 
 Example use case: cost tracking by user/team/project.
+
+SkyPilot also reserves and automatically applies the
+``skypilot-managed=true`` label to supported GCP resources it creates,
+including instances, newly initialized persistent disks, images, and buckets.
+The marker can be queried through resource labels in a Cloud Billing export.
 
 Users should guarantee that these key-values are valid GCP labels, otherwise
 errors from the cloud provider will be surfaced.

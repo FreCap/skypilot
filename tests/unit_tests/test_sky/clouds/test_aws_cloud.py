@@ -1,10 +1,82 @@
 """Test the AWS class."""
 
+import json
+import shlex
 import unittest.mock as mock
 
 import pytest
 
 from sky.clouds import aws as aws_mod
+from sky.provision import constants as provision_constants
+from sky.utils import resources_utils
+
+
+def _assert_managed_image_tag_specifications(command: str) -> None:
+    args = shlex.split(command)
+    tag_specifications = json.loads(args[args.index('--tag-specifications') +
+                                         1])
+    assert tag_specifications == [{
+        'ResourceType': resource_type,
+        'Tags': [{
+            'Key': provision_constants.TAG_SKYPILOT_MANAGED,
+            'Value': provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+        }],
+    } for resource_type in ('image', 'snapshot')]
+
+
+class TestManagedImageTags:
+    """Tests managed tagging of AMIs and their backing snapshots."""
+
+    def test_create_image_tags_ami_and_snapshots(self):
+        commands = []
+
+        def run_with_retries(command, **kwargs):
+            del kwargs
+            commands.append(command)
+            if ' create-image ' in command:
+                return 0, 'ami-new\n', ''
+            return 0, '', ''
+
+        cluster_name = resources_utils.ClusterName('display', 'on-cloud')
+        with mock.patch.object(aws_mod.provision_lib,
+                               'query_instances',
+                               return_value={'i-source': object()}), \
+             mock.patch.object(aws_mod.subprocess_utils,
+                               'run_with_retries',
+                               side_effect=run_with_retries), \
+             mock.patch.object(aws_mod.subprocess_utils,
+                               'handle_returncode'), \
+             mock.patch.object(aws_mod.rich_utils, 'force_update_status'), \
+             mock.patch.object(aws_mod.sky_logging, 'print'):
+            image_id = aws_mod.AWS.create_image_from_cluster(
+                cluster_name, 'us-west-2', None)
+
+        assert image_id == 'ami-new'
+        _assert_managed_image_tag_specifications(commands[0])
+
+    def test_copy_image_tags_ami_and_snapshots(self):
+        commands = []
+
+        def run_with_retries(command, **kwargs):
+            del kwargs
+            commands.append(command)
+            if ' copy-image ' in command:
+                return 0, 'ami-copy\n', ''
+            return 0, '', ''
+
+        with mock.patch.object(aws_mod.subprocess_utils,
+                               'run_with_retries',
+                               side_effect=run_with_retries), \
+             mock.patch.object(aws_mod.subprocess_utils,
+                               'handle_returncode'), \
+             mock.patch.object(aws_mod.rich_utils, 'force_update_status'), \
+             mock.patch.object(aws_mod.sky_logging, 'print'), \
+             mock.patch.object(aws_mod.AWS, 'delete_image'):
+            image_id = aws_mod.AWS.maybe_move_image('ami-source', 'us-east-1',
+                                                    'us-west-2', None, None)
+
+        assert image_id == 'ami-copy'
+        _assert_managed_image_tag_specifications(commands[0])
 
 
 class TestGetImageRootDeviceName:
