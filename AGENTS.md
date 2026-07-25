@@ -259,8 +259,26 @@ database path is deprecated.
 
 ### SkyServe External Load Balancer Policy
 
-- Warm-standby external load balancer high availability is the default for new
-  non-pool services. Do not introduce new opt-in-only paths for this topology.
+- Warm-standby external load balancer high availability is mandatory for new
+  non-pool services, not a choice. `load_balancer.high_availability` is still
+  accepted in the service YAML for backward compatibility, but the value is
+  discarded with a warning. Rationale: with a single slot,
+  `force_all_live_unknown` is unconditionally true during the maxSurge
+  overlap of every rollout (`controller.py`, the
+  `not drain_authoritative and not ha_enabled` term), which marks every live
+  replica occupancy-unknown and makes the logical retirement gate abort an
+  in-progress drain wave. Two slots remove that term. Do not reintroduce a
+  way to select the topology, and do not add opt-in-only paths for it.
+- High availability is NOT a fix for drain proof across load balancer
+  restarts, and must not be described as one. A rollout replaces both slots
+  (the load balancer pod template pins the controller image digest), so the
+  per-process session id changes either way and `_ReplicaDrainTracker`
+  resets its acknowledgement exactly as it would for a single slot. A
+  restarted load balancer still cannot re-acknowledge a replica that is
+  already off route, because all four acknowledgement sets are structurally
+  unreachable for it. That gap is fixed by the controller-advertised drain
+  watchlist, not by topology. See
+  `docs/designs/serve-drain-proof-across-lb-restarts.md`.
 - Existing persisted services retain their durable load balancer mode until an
   explicit update runs the PostgreSQL-backed migration or rollback protocol.
   Unrelated updates and old pickles must not silently change that mode.
