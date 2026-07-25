@@ -17,7 +17,6 @@ import uuid
 
 import colorama
 import filelock
-import requests
 
 from sky import backends
 from sky import estimated_spend
@@ -31,6 +30,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import constants as serve_constants
 from sky.serve import paid_capacity
+from sky.serve import replica_tls
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
@@ -303,6 +303,41 @@ class _UnfencedExternalLbLaunchError(RuntimeError):
     """A legacy controller cannot satisfy the API replica-launch fence."""
 
 
+def _inject_replica_tls_material(task: 'task_lib.Task') -> None:
+    """Hand a replica the TLS material its proxy needs, if TLS is enabled.
+
+    The certificate is public and travels as an ordinary env var; the private
+    key travels as a task SECRET so it is redacted from task YAML dumps and
+    logs rather than sitting in plain text next to it.
+
+    Only the material is delivered here. Terminating TLS is the task's job:
+    its setup is expected to start a proxy on the service port that forwards
+    to the model server on loopback. A task that ignores the material keeps
+    serving plaintext, which the load balancer will then fail to reach over
+    https -- deliberately visible rather than silently unencrypted.
+    """
+    mode = serve_utils.replica_tls_mode()
+    if mode != serve_constants.REPLICA_TLS_MODE_PINNED:
+        # 'unverified' intentionally ships no material: it exists for
+        # deployments that terminate TLS with their own certificate.
+        return
+    certificate_pem = os.environ.get(serve_constants.REPLICA_TLS_CERT_ENV_VAR,
+                                     '')
+    private_key_pem = os.environ.get(
+        serve_constants.REPLICA_TLS_KEY_SECRET_ENV_VAR, '')
+    if not certificate_pem or not private_key_pem:
+        raise RuntimeError(
+            f'{serve_constants.REPLICA_TLS_MODE_ENV_VAR}='
+            f'{serve_constants.REPLICA_TLS_MODE_PINNED} requires both '
+            f'{serve_constants.REPLICA_TLS_CERT_ENV_VAR} and '
+            f'{serve_constants.REPLICA_TLS_KEY_SECRET_ENV_VAR} in the '
+            'controller environment.')
+    task.update_envs(
+        {serve_constants.REPLICA_TLS_CERT_ENV_VAR: certificate_pem})
+    task.update_secrets(
+        {serve_constants.REPLICA_TLS_KEY_SECRET_ENV_VAR: private_key_pem})
+
+
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
@@ -370,6 +405,7 @@ def launch_cluster(
                 ]
                 task.set_resources(type(resources)(overrided_resources))
         task.update_envs({serve_constants.REPLICA_ID_ENV_VAR: str(replica_id)})
+        _inject_replica_tls_material(task)
 
         logger.info(f'Launching replica (id: {replica_id}) cluster '
                     f'{cluster_name} with resources: {task.resources}')
@@ -1620,9 +1656,13 @@ class ReplicaInfo:
         if not endpoint:
             return None
         assert isinstance(endpoint, str), endpoint
-        # If replica doesn't start with http or https, add http://
+        # If replica doesn't start with http or https, add the configured
+        # scheme. The LB reaches replicas over public IPs across clouds and
+        # regions, so this hop is https whenever replica TLS is enabled.
         if not endpoint.startswith('http'):
-            endpoint = 'http://' + endpoint
+            scheme = ('https' if serve_utils.replica_tls_mode()
+                      != serve_constants.REPLICA_TLS_MODE_OFF else 'http')
+            endpoint = f'{scheme}://{endpoint}'
         return endpoint
 
     @property
@@ -1804,24 +1844,32 @@ class ReplicaInfo:
         probe_time = time.time()
         try:
             msg = ''
-            # TODO(tian): Support HTTPS in the future.
             if url is None:
                 logger.info(f'Error when probing {replica_identity}: '
                             'Cannot get the endpoint.')
                 return self, False, probe_time
             readiness_path = (f'{url}{readiness_path}')
             logger.info(f'Probing {replica_identity} with {readiness_path}.')
+            # This probe is a second, independent client on the same hop as the
+            # load balancer's proxy. It decides readiness, so if it cannot
+            # complete the TLS handshake every healthy replica is marked
+            # NOT_READY and the controller tears down live capacity. It must
+            # therefore trust exactly what the proxy trusts.
+            # With TLS off this IS the `requests` module, so the default
+            # path is unchanged; under TLS it is a session carrying the same
+            # trust the proxy uses.
+            client = replica_tls.probe_client()
             if post_data is not None:
                 msg += 'POST'
-                response = requests.post(readiness_path,
-                                         json=post_data,
-                                         headers=headers,
-                                         timeout=timeout)
+                response = client.post(readiness_path,
+                                       json=post_data,
+                                       headers=headers,
+                                       timeout=timeout)
             else:
                 msg += 'GET'
-                response = requests.get(readiness_path,
-                                        headers=headers,
-                                        timeout=timeout)
+                response = client.get(readiness_path,
+                                      headers=headers,
+                                      timeout=timeout)
             msg += (f' request to {replica_identity} returned status '
                     f'code {response.status_code}')
             if response.status_code == 200:

@@ -72,6 +72,19 @@ LB_SELECTOR_LABEL = SERVE_LB_LABEL_KEY
 _OWNER_API_VERSION = 'apps/v1'
 _OWNER_KIND = 'Deployment'
 
+# AWS Load Balancer Controller TLS annotations. Only these keys are written, so
+# the controller's own injected annotations (notably spec.loadBalancerClass's
+# companions) are left alone; reconciliation compares desired annotations as a
+# subset for the same reason.
+_AWS_LB_SSL_CERT_ANNOTATION = ('service.beta.kubernetes.io/'
+                               'aws-load-balancer-ssl-cert')
+_AWS_LB_SSL_PORTS_ANNOTATION = ('service.beta.kubernetes.io/'
+                                'aws-load-balancer-ssl-ports')
+_AWS_LB_SSL_POLICY_ANNOTATION = ('service.beta.kubernetes.io/'
+                                 'aws-load-balancer-ssl-negotiation-policy')
+_EXTERNAL_DNS_HOSTNAME_ANNOTATION = ('external-dns.alpha.kubernetes.io/'
+                                     'hostname')
+
 # RFC1123 name constraints for k8s object names.
 _MAX_NAME_LEN = 63
 _LB_NAME_PREFIX = 'skypilot-lb-'
@@ -1036,6 +1049,7 @@ def _build_deployment_dict(service_name: str,
             'httpGet': {
                 'path': constants.LB_LIVENESS_ENDPOINT_PATH,
                 'port': constants.LOAD_BALANCER_PORT_START,
+                **_probe_scheme(),
             },
             'periodSeconds': 2,
             'failureThreshold': 60,
@@ -1045,19 +1059,24 @@ def _build_deployment_dict(service_name: str,
             'httpGet': {
                 'path': _LB_HEALTH_PATH,
                 'port': constants.LOAD_BALANCER_PORT_START,
+                **_probe_scheme(),
             },
             'periodSeconds': 2,
             'failureThreshold': 1,
-            'timeoutSeconds': 1,
+            # A TLS handshake on every probe needs more than the plaintext
+            # budget, and readiness has failureThreshold 1: one slow handshake
+            # would pull a healthy pod out of the Service endpoints.
+            'timeoutSeconds': 3 if _pod_serves_tls() else 1,
         },
         'livenessProbe': {
             'httpGet': {
                 'path': constants.LB_LIVENESS_ENDPOINT_PATH,
                 'port': constants.LOAD_BALANCER_PORT_START,
+                **_probe_scheme(),
             },
             'periodSeconds': 10,
             'failureThreshold': 3,
-            'timeoutSeconds': 1,
+            'timeoutSeconds': 3 if _pod_serves_tls() else 1,
         },
     }
     # The LB gets only the sync and data-plane projected files. Its pod UID is
@@ -1076,7 +1095,7 @@ def _build_deployment_dict(service_name: str,
                 }
             },
         },
-    ] + ([{
+    ] + _replica_tls_envs() + ([{
         'name': constants.LB_IMAGE_DIGEST_ENV_VAR,
         'value': controller_image_digest,
     }] if controller_image_digest is not None else []) + ([{
@@ -1162,6 +1181,105 @@ def _build_deployment_dict(service_name: str,
     }
 
 
+def _pod_serves_tls() -> bool:
+    """Whether the LB pod terminates TLS on its own port.
+
+    True only under HTTPS_ONLY, because the backend-protocol annotation is
+    per-Service: during the dual-listen window the plaintext listener would
+    otherwise forward cleartext into a TLS-only socket.
+    """
+    config = external_https_config()
+    return config is not None and config.https_only
+
+
+def _probe_scheme() -> dict[str, str]:
+    """``scheme`` for the LB pod's kubelet probes.
+
+    Forgetting this is not a small bug: a TLS-serving pod probed over plaintext
+    fails startup, readiness and liveness, so every LB pod CrashLoops and every
+    Service loses all its endpoints.
+    """
+    return {'scheme': 'HTTPS'} if _pod_serves_tls() else {}
+
+
+def _replica_tls_envs() -> list[dict[str, Any]]:
+    """Propagate replica-TLS settings from the controller to the LB pod.
+
+    The LB dials replicas, so it needs the mode and (for pinning) the
+    certificate. Only the certificate travels here; the private key goes to
+    replicas alone. Forwarding the controller's own values rather than letting
+    the LB read config independently is what keeps the two ends in agreement
+    about whether replicas speak TLS.
+    """
+    mode = serve_utils.replica_tls_mode()
+    if mode == constants.REPLICA_TLS_MODE_OFF:
+        return []
+    envs: list[dict[str, Any]] = [{
+        'name': constants.REPLICA_TLS_MODE_ENV_VAR,
+        'value': mode,
+    }]
+    certificate_pem = os.environ.get(constants.REPLICA_TLS_CERT_ENV_VAR,
+                                     '').strip()
+    if certificate_pem:
+        envs.append({
+            'name': constants.REPLICA_TLS_CERT_ENV_VAR,
+            'value': certificate_pem,
+        })
+    return envs
+
+
+class ExternalHttpsConfig(NamedTuple):
+    """Helm-rendered TLS termination settings for the LB Service."""
+    certificate_arn: str
+    dns_suffix: str
+    ssl_policy: str
+    https_only: bool
+
+
+def external_https_config() -> ExternalHttpsConfig | None:
+    """TLS settings for the LB Service, or None when not configured.
+
+    Fails closed on a partial configuration rather than emitting a Service
+    that advertises a hostname it cannot serve over TLS, or a certificate on
+    a listener nobody can address by name.
+    """
+    certificate_arn = os.environ.get(
+        constants.EXTERNAL_LB_HTTPS_CERT_ARN_ENV_VAR, '').strip()
+    dns_suffix = os.environ.get(constants.EXTERNAL_LB_HTTPS_DNS_SUFFIX_ENV_VAR,
+                                '').strip().strip('.')
+    if not certificate_arn and not dns_suffix:
+        return None
+    if not certificate_arn or not dns_suffix:
+        raise ValueError(
+            'External load balancer HTTPS requires both '
+            f'{constants.EXTERNAL_LB_HTTPS_CERT_ARN_ENV_VAR} and '
+            f'{constants.EXTERNAL_LB_HTTPS_DNS_SUFFIX_ENV_VAR}; got '
+            f'certificate={"set" if certificate_arn else "unset"}, '
+            f'suffix={"set" if dns_suffix else "unset"}.')
+    ssl_policy = os.environ.get(constants.EXTERNAL_LB_HTTPS_SSL_POLICY_ENV_VAR,
+                                '').strip()
+    https_only = os.environ.get(constants.EXTERNAL_LB_HTTPS_ONLY_ENV_VAR,
+                                '').strip().lower() == 'true'
+    return ExternalHttpsConfig(certificate_arn=certificate_arn,
+                               dns_suffix=dns_suffix,
+                               ssl_policy=ssl_policy or
+                               constants.DEFAULT_EXTERNAL_LB_SSL_POLICY,
+                               https_only=https_only)
+
+
+def external_https_hostname(config: ExternalHttpsConfig,
+                            service_name: str) -> str:
+    """Stable public hostname for one service's TLS endpoint.
+
+    Keyed on the incarnation-independent base name, so the hostname survives
+    ``serve update`` and a ``down``/``up`` cycle. That is deliberately the same
+    identity function as the in-cluster endpoint contract, and it is why this
+    hostname is a safe thing for a consumer to hardcode -- unlike the
+    generated ``*.elb.amazonaws.com`` name, which changes with the Service.
+    """
+    return f'{lb_base_name(service_name)}.{config.dns_suffix}'
+
+
 def _build_service_dict(service_name: str,
                         service_name_k8s: str,
                         deployment_name: str,
@@ -1192,6 +1310,45 @@ def _build_service_dict(service_name: str,
                 DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_runtime_revision,
             } if desired_runtime_revision is not None else {}),
         }
+    https_config = external_https_config()
+    ports: list[dict[str, Any]] = [{
+        'port': constants.LOAD_BALANCER_PORT_START,
+        'targetPort': constants.LOAD_BALANCER_PORT_START,
+        'protocol': 'TCP',
+    }]
+    if https_config is not None:
+        # The NLB terminates TLS on 443 and forwards TCP to the pod's existing
+        # plaintext port, so the LB process is untouched and no certificate is
+        # mounted into any pod. Kubernetes requires every port to be named once
+        # a Service has more than one.
+        https_port = {
+            'name': constants.EXTERNAL_LB_HTTPS_PORT_NAME,
+            'port': constants.EXTERNAL_LB_HTTPS_PORT,
+            'targetPort': constants.LOAD_BALANCER_PORT_START,
+            'protocol': 'TCP',
+        }
+        if https_config.https_only:
+            # Enforcement step: the plaintext listener disappears, so the only
+            # way in is TLS. Deliberately separate from enabling TLS so it can
+            # be reverted on its own.
+            ports = [https_port]
+        else:
+            ports[0]['name'] = constants.EXTERNAL_LB_HTTP_PORT_NAME
+            ports.append(https_port)
+        annotations = {
+            **annotations,
+            _AWS_LB_SSL_CERT_ANNOTATION: https_config.certificate_arn,
+            _AWS_LB_SSL_PORTS_ANNOTATION: constants.EXTERNAL_LB_HTTPS_PORT_NAME,
+            _AWS_LB_SSL_POLICY_ANNOTATION: https_config.ssl_policy,
+            _EXTERNAL_DNS_HOSTNAME_ANNOTATION: external_https_hostname(
+                https_config, service_name),
+        }
+        if https_config.https_only:
+            # Only once the plaintext listener is gone: the annotation applies
+            # to every target group on the Service, so it cannot coexist with
+            # a cleartext 30001 listener.
+            annotations[constants.AWS_LB_BACKEND_PROTOCOL_ANNOTATION] = (
+                constants.AWS_LB_BACKEND_PROTOCOL_SSL)
     return {
         'apiVersion': 'v1',
         'kind': 'Service',
@@ -1211,11 +1368,7 @@ def _build_service_dict(service_name: str,
             # Cluster policy is part of the qualified failover contract.
             'externalTrafficPolicy': 'Cluster',
             'selector': selector,
-            'ports': [{
-                'port': constants.LOAD_BALANCER_PORT_START,
-                'targetPort': constants.LOAD_BALANCER_PORT_START,
-                'protocol': 'TCP',
-            }],
+            'ports': ports,
         },
     }
 
@@ -1243,6 +1396,27 @@ def _build_pdb_dict(service_name: str, pdb_name: str, service_hash: str,
     }
 
 
+def _service_ports_patch(desired_ports: list[dict[str, Any]]) -> list[dict]:
+    """Desired Service ports plus deletions for the ones we no longer want.
+
+    ``v1.ServicePort`` merges on ``port``, so a strategic-merge body that simply
+    omits a port *keeps* it. Without an explicit deletion, dropping the
+    plaintext listener would never converge: the drift check compares the port
+    list exactly, sees the stale port, and re-runs the whole create path every
+    reconcile interval, forever. The same wedge applies in reverse on rollback.
+
+    Only ports this feature owns are ever deleted, so an operator-added port is
+    left alone.
+    """
+    owned = (constants.LOAD_BALANCER_PORT_START,
+             constants.EXTERNAL_LB_HTTPS_PORT)
+    desired_numbers = {port.get('port') for port in desired_ports}
+    return list(desired_ports) + [{
+        'port': port,
+        '$patch': 'delete',
+    } for port in owned if port not in desired_numbers]
+
+
 def _service_has_desired_routing(service, desired: dict) -> bool:
     """Whether mutable Service routing fields match the desired contract."""
     if isinstance(service, dict):
@@ -1263,12 +1437,16 @@ def _service_has_desired_routing(service, desired: dict) -> bool:
                                            None) or 'Cluster')
         annotations = getattr(metadata, 'annotations', {}) or {}
 
-    def _port_tuple(port) -> tuple[Any, Any, Any]:
+    def _port_tuple(port) -> tuple[Any, Any, Any, Any]:
+        # ``name`` participates so that adding the TLS listener also reconciles
+        # the rename of the pre-existing unnamed plaintext port; Kubernetes
+        # requires names once a Service has more than one port.
         if isinstance(port, dict):
-            return (port.get('port'), port.get('targetPort'),
+            return (port.get('name'), port.get('port'), port.get('targetPort'),
                     port.get('protocol', 'TCP'))
-        return (getattr(port, 'port', None), getattr(port, 'target_port', None),
-                getattr(port, 'protocol', None) or 'TCP')
+        return (getattr(port, 'name', None), getattr(port, 'port', None),
+                getattr(port, 'target_port',
+                        None), getattr(port, 'protocol', None) or 'TCP')
 
     desired_spec = desired['spec']
     desired_annotations = desired.get('metadata', {}).get('annotations', {})
@@ -1531,7 +1709,7 @@ def _reconcile_ha_service(
                     'annotations',
                     {}).get(DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
                 if desired_revision is not None:
-                    body = {
+                    body: dict[str, Any] = {
                         'metadata': {
                             'resourceVersion': resource_version,
                             'annotations': {
@@ -1563,7 +1741,8 @@ def _reconcile_ha_service(
                         '$patch': 'replace',
                         **service_dict['spec']['selector'],
                     },
-                    'ports': service_dict['spec']['ports'],
+                    'ports': _service_ports_patch(service_dict['spec']['ports']
+                                                 ),
                 },
             }
             _strategic_merge_patch(
@@ -2021,7 +2200,8 @@ def create_lb_deployment_and_service(
                                 '$patch': 'replace',
                                 **service_dict['spec']['selector'],
                             },
-                            'ports': service_dict['spec']['ports'],
+                            'ports': _service_ports_patch(
+                                service_dict['spec']['ports']),
                         },
                     })
                 break

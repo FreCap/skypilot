@@ -2212,3 +2212,234 @@ def test_reconcile_ignores_another_release_lb(monkeypatch):
         lb_k8s.reconcile_lb_objects(set())
 
     delete.assert_not_called()
+
+
+def _https_env(monkeypatch,
+               cert: str | None = 'arn:aws:acm:us-east-1:1234:certificate/abc',
+               suffix: str | None = 'int.example.test',
+               policy: str | None = None,
+               https_only: str | None = None) -> None:
+    for var, value in (
+        (constants.EXTERNAL_LB_HTTPS_CERT_ARN_ENV_VAR, cert),
+        (constants.EXTERNAL_LB_HTTPS_DNS_SUFFIX_ENV_VAR, suffix),
+        (constants.EXTERNAL_LB_HTTPS_SSL_POLICY_ENV_VAR, policy),
+        (constants.EXTERNAL_LB_HTTPS_ONLY_ENV_VAR, https_only),
+    ):
+        if value is None:
+            monkeypatch.delenv(var, raising=False)
+        else:
+            monkeypatch.setenv(var, value)
+
+
+def test_service_dict_unchanged_without_https_config(monkeypatch):
+    _https_env(monkeypatch, cert=None, suffix=None)
+    service = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    assert 'annotations' not in service['metadata']
+    assert service['spec']['ports'] == [{
+        'port': constants.LOAD_BALANCER_PORT_START,
+        'targetPort': constants.LOAD_BALANCER_PORT_START,
+        'protocol': 'TCP',
+    }]
+
+
+def test_service_dict_adds_tls_listener_and_hostname(monkeypatch):
+    _https_env(monkeypatch)
+    service = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    annotations = service['metadata']['annotations']
+    assert annotations[lb_k8s._AWS_LB_SSL_CERT_ANNOTATION] == (
+        'arn:aws:acm:us-east-1:1234:certificate/abc')
+    assert annotations[lb_k8s._AWS_LB_SSL_PORTS_ANNOTATION] == 'https'
+    assert annotations[lb_k8s._AWS_LB_SSL_POLICY_ANNOTATION] == (
+        constants.DEFAULT_EXTERNAL_LB_SSL_POLICY)
+    assert annotations[lb_k8s._EXTERNAL_DNS_HOSTNAME_ANNOTATION] == (
+        f'{lb_k8s.lb_base_name("svc")}.int.example.test')
+    # Both listeners during migration, and every port named.
+    assert service['spec']['ports'] == [
+        {
+            'name': 'http',
+            'port': constants.LOAD_BALANCER_PORT_START,
+            'targetPort': constants.LOAD_BALANCER_PORT_START,
+            'protocol': 'TCP',
+        },
+        {
+            'name': 'https',
+            'port': 443,
+            'targetPort': constants.LOAD_BALANCER_PORT_START,
+            'protocol': 'TCP',
+        },
+    ]
+
+
+def test_https_only_drops_the_plaintext_listener(monkeypatch):
+    _https_env(monkeypatch, https_only='true')
+    service = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    assert [port['port'] for port in service['spec']['ports']] == [443]
+
+
+def test_https_hostname_survives_incarnation_change(monkeypatch):
+    _https_env(monkeypatch)
+    first = lb_k8s._build_service_dict(
+        'svc', lb_k8s.lb_service_name('svc', 'incarnation-1'), 'deploy')
+    second = lb_k8s._build_service_dict(
+        'svc', lb_k8s.lb_service_name('svc', 'incarnation-2'), 'deploy')
+    hostname_key = lb_k8s._EXTERNAL_DNS_HOSTNAME_ANNOTATION
+    # The Service object name is incarnation-scoped, but a consumer-facing
+    # hostname that moved on every down/up would be unusable.
+    assert first['metadata']['name'] != second['metadata']['name']
+    assert (first['metadata']['annotations'][hostname_key] == second['metadata']
+            ['annotations'][hostname_key])
+
+
+@pytest.mark.parametrize(('cert', 'suffix'),
+                         [('arn:aws:acm:us-east-1:1234:certificate/abc', None),
+                          (None, 'int.example.test')])
+def test_partial_https_config_fails_closed(monkeypatch, cert, suffix):
+    _https_env(monkeypatch, cert=cert, suffix=suffix)
+    with pytest.raises(ValueError):
+        lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                   'deploy')
+
+
+def test_tls_does_not_disturb_the_ha_selector(monkeypatch):
+    """TLS must not perturb selector-only cutover."""
+    _https_env(monkeypatch, cert=None, suffix=None)
+    plain = lb_k8s._build_service_dict('svc',
+                                       lb_k8s.lb_service_name('svc'),
+                                       'deploy',
+                                       'incarnation',
+                                       active_slot=lb_ha.LbSlot.A,
+                                       cutover_generation=3)
+    _https_env(monkeypatch)
+    secured = lb_k8s._build_service_dict('svc',
+                                         lb_k8s.lb_service_name('svc'),
+                                         'deploy',
+                                         'incarnation',
+                                         active_slot=lb_ha.LbSlot.A,
+                                         cutover_generation=3)
+    assert plain['spec']['selector'] == secured['spec']['selector']
+    for key in (lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY,
+                lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY):
+        assert (plain['metadata']['annotations'][key] == secured['metadata']
+                ['annotations'][key])
+
+
+def test_routing_reconciles_a_live_service_missing_tls(monkeypatch):
+    _https_env(monkeypatch)
+    desired = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    live_plaintext = {
+        'metadata': {
+            'annotations': {}
+        },
+        'spec': {
+            'type': 'LoadBalancer',
+            'externalTrafficPolicy': 'Cluster',
+            'selector': desired['spec']['selector'],
+            'ports': [{
+                'port': constants.LOAD_BALANCER_PORT_START,
+                'targetPort': constants.LOAD_BALANCER_PORT_START,
+                'protocol': 'TCP',
+            }],
+        },
+    }
+    assert not lb_k8s._service_has_desired_routing(live_plaintext, desired)
+
+    reconciled = {
+        'metadata': {
+            'annotations': {
+                **desired['metadata']['annotations'],
+                # The AWS controller injects its own annotations; a subset
+                # comparison must tolerate them instead of churning forever.
+                'service.beta.kubernetes.io/aws-load-balancer-type': 'external',
+            }
+        },
+        'spec': {
+            **desired['spec'],
+        },
+    }
+    assert lb_k8s._service_has_desired_routing(reconciled, desired)
+
+
+def test_ports_patch_deletes_the_listener_we_dropped(monkeypatch):
+    """Omitting a port from a strategic merge KEEPS it; convergence needs a
+    delete directive, or the reconciler re-runs forever in both directions."""
+    _https_env(monkeypatch, https_only='true')
+    desired = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    patch_ports = lb_k8s._service_ports_patch(desired['spec']['ports'])
+    assert {
+        'port': constants.LOAD_BALANCER_PORT_START,
+        '$patch': 'delete',
+    } in patch_ports
+    assert any(
+        port.get('port') == 443 and '$patch' not in port
+        for port in patch_ports)
+
+
+def test_ports_patch_deletes_tls_on_rollback(monkeypatch):
+    _https_env(monkeypatch, cert=None, suffix=None)
+    desired = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    patch_ports = lb_k8s._service_ports_patch(desired['spec']['ports'])
+    assert {'port': 443, '$patch': 'delete'} in patch_ports
+
+
+def test_ports_patch_is_inert_while_dual_listening(monkeypatch):
+    _https_env(monkeypatch)
+    desired = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    patch_ports = lb_k8s._service_ports_patch(desired['spec']['ports'])
+    assert patch_ports == desired['spec']['ports']
+
+
+def test_ports_patch_never_deletes_a_port_we_do_not_own():
+    patch_ports = lb_k8s._service_ports_patch([{'port': 9999}])
+    assert {'port': 9999} in patch_ports
+    deleted = {p['port'] for p in patch_ports if p.get('$patch') == 'delete'}
+    assert 9999 not in deleted
+
+
+def _lb_container(monkeypatch) -> dict:
+    """The LB container spec, with the many runtime args defaulted."""
+    monkeypatch.setenv('SKYPILOT_SERVE_API_SERVICE_URL',
+                       'http://sky-api.skypilot.svc.cluster.local')
+    deployment = lb_k8s._build_deployment_dict('svc', 'deploy', 'image:tag', [],
+                                               [], [], [], {}, {},
+                                               'IfNotPresent', 30)
+    return deployment['spec']['template']['spec']['containers'][0]
+
+
+# "Within the instance it is ok, but between instances it should be https."
+# The LB pod's own hop from the NLB is between machines, so under HTTPS_ONLY
+# the NLB re-encrypts to the pod and the pod serves TLS. All three kubelet
+# probes must follow, or every LB pod CrashLoops and every Service empties.
+
+
+def test_backend_stays_plaintext_while_dual_listening(monkeypatch):
+    """The annotation is per-Service, so it cannot coexist with 30001."""
+    _https_env(monkeypatch)
+    service = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    assert (constants.AWS_LB_BACKEND_PROTOCOL_ANNOTATION
+            not in service['metadata']['annotations'])
+    container = _lb_container(monkeypatch)
+    for probe in ('startupProbe', 'readinessProbe', 'livenessProbe'):
+        assert 'scheme' not in container[probe]['httpGet']
+
+
+def test_backend_reencrypts_and_probes_follow_under_https_only(monkeypatch):
+    _https_env(monkeypatch, https_only='true')
+    service = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    assert (service['metadata']['annotations'][
+        constants.AWS_LB_BACKEND_PROTOCOL_ANNOTATION] ==
+            constants.AWS_LB_BACKEND_PROTOCOL_SSL)
+    container = _lb_container(monkeypatch)
+    for probe in ('startupProbe', 'readinessProbe', 'livenessProbe'):
+        assert container[probe]['httpGet']['scheme'] == 'HTTPS', probe
+    # A TLS handshake per probe does not fit the plaintext budget, and
+    # readiness has failureThreshold 1.
+    assert container['readinessProbe']['timeoutSeconds'] > 1

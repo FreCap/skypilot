@@ -110,6 +110,81 @@ LB_AUTHORIZATION_HEADER_BYTES = LB_AUTHORIZATION_HEADER.lower().encode('ascii')
 EXTERNAL_LB_ENABLED_ENV_VAR = 'SKYPILOT_SERVE_EXTERNAL_LB_ENABLED'
 LB_HA_RBAC_READY_ENV_VAR = 'SKYPILOT_SERVE_LB_HA_RBAC_READY'
 
+# HTTPS termination for the external LB Service, rendered by Helm for the same
+# reason as the capability flag above. `_build_service_dict` runs both in the
+# API server (service creation) and in the controller's periodic re-ensure
+# loop; if those two processes disagreed about TLS the Service would oscillate
+# every re-ensure interval. Reading one Helm-injected environment, inherited by
+# consolidated controller children, keeps them in lockstep. A persisted or
+# per-service config would reintroduce the frozen-snapshot split-brain.
+#
+# Both the certificate and the suffix are required together: a certificate with
+# no hostname yields a TLS listener nobody can validate, and a hostname with no
+# certificate yields a name that only answers in plaintext.
+EXTERNAL_LB_HTTPS_CERT_ARN_ENV_VAR = 'SKYPILOT_SERVE_EXTERNAL_HTTPS_CERT_ARN'
+EXTERNAL_LB_HTTPS_DNS_SUFFIX_ENV_VAR = (
+    'SKYPILOT_SERVE_EXTERNAL_HTTPS_DNS_SUFFIX')
+EXTERNAL_LB_HTTPS_SSL_POLICY_ENV_VAR = (
+    'SKYPILOT_SERVE_EXTERNAL_HTTPS_SSL_POLICY')
+# Set to 'true' once every consumer speaks HTTPS, to drop the plaintext
+# listener. Kept separate from the settings above so enabling TLS and enforcing
+# it are independently revertible steps.
+EXTERNAL_LB_HTTPS_ONLY_ENV_VAR = 'SKYPILOT_SERVE_EXTERNAL_HTTPS_ONLY'
+
+# TLS 1.2 floor with TLS 1.3 available. The AWS default (2016-08) still permits
+# TLS 1.0/1.1.
+DEFAULT_EXTERNAL_LB_SSL_POLICY = 'ELBSecurityPolicy-TLS13-1-2-2021-06'
+
+# Service port for the TLS listener. The NLB terminates TLS here and forwards
+# to the load balancer pod's existing plaintext port, so the LB process itself
+# is unchanged.
+EXTERNAL_LB_HTTPS_PORT = 443
+EXTERNAL_LB_HTTPS_PORT_NAME = 'https'
+EXTERNAL_LB_HTTP_PORT_NAME = 'http'
+
+# Re-encrypt the load balancer's own hop. With HTTPS_ONLY the NLB stops
+# forwarding cleartext to the pod and speaks TLS to it, so no serve traffic
+# crosses a machine boundary in the clear.
+#
+# This activates only with HTTPS_ONLY, and cannot be split: the annotation is
+# per-Service, not per-port, so during the dual-listen migration window the pod
+# must stay plaintext or the 30001 listener would forward cleartext into a
+# TLS-only socket.
+#
+# The pod mints its own throwaway certificate at startup. An NLB TLS target
+# group does not validate the backend certificate, and kubelet does not
+# validate HTTPS probe certificates, so this needs no distribution, no
+# rotation, and no configuration -- the encryption is what is wanted here, and
+# the peer is one pod away on the same VPC.
+AWS_LB_BACKEND_PROTOCOL_ANNOTATION = ('service.beta.kubernetes.io/'
+                                      'aws-load-balancer-backend-protocol')
+AWS_LB_BACKEND_PROTOCOL_SSL = 'ssl'
+
+# Encryption for the load-balancer-to-replica hop. Unlike the listener settings
+# above this changes how the LB dials replicas, so it is read in the controller
+# (which mints and injects the material) and in the LB (which pins it).
+#
+#   unset/'off'  - plaintext http, today's behaviour.
+#   'pinned'     - https, verified against the service's own certificate. The
+#                  replica must run a TLS proxy fed the injected key.
+#   'unverified' - https with verification disabled. Defeats passive
+#                  interception only; an active man-in-the-middle still wins.
+#                  For deployments that cannot distribute the key material.
+REPLICA_TLS_MODE_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_TLS_MODE'
+REPLICA_TLS_MODE_OFF = 'off'
+REPLICA_TLS_MODE_PINNED = 'pinned'
+REPLICA_TLS_MODE_UNVERIFIED = 'unverified'
+REPLICA_TLS_MODES = (REPLICA_TLS_MODE_OFF, REPLICA_TLS_MODE_PINNED,
+                     REPLICA_TLS_MODE_UNVERIFIED)
+
+# The certificate is public: it is injected into the replica task so the TLS
+# proxy can present it, and into the LB pod so it can pin it. Same value, two
+# consumers.
+REPLICA_TLS_CERT_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_TLS_CERT'
+# The private key goes only to replicas, and only ever as a task SECRET, so it
+# is redacted from task YAML dumps and logs rather than sitting in plain envs.
+REPLICA_TLS_KEY_SECRET_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_TLS_KEY'
+
 # Downward-API-injected UID of the external LB pod. Unlike a process-local
 # UUID, this survives controller restarts as the durable LB incarnation key.
 LB_POD_UID_ENV_VAR = 'SKYPILOT_SERVE_LB_POD_UID'

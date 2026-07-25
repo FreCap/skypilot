@@ -1095,6 +1095,27 @@ def is_external_load_balancer_mode() -> bool:
                            '').lower() == 'true')
 
 
+def replica_tls_mode() -> str:
+    """Encryption mode for the load-balancer-to-replica hop.
+
+    Read from the same Helm-injected environment as the external-LB capability
+    flag, and for the same reason: the controller (which mints and injects the
+    key material) and the load balancer (which pins it) must never disagree, or
+    the LB would dial https at a plaintext replica, or verify against material
+    the replica was never given.
+    """
+    mode = os.environ.get(constants.REPLICA_TLS_MODE_ENV_VAR,
+                          '').strip().lower()
+    if not mode:
+        return constants.REPLICA_TLS_MODE_OFF
+    if mode not in constants.REPLICA_TLS_MODES:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                f'{constants.REPLICA_TLS_MODE_ENV_VAR}={mode!r} is not one of '
+                f'{", ".join(constants.REPLICA_TLS_MODES)}.')
+    return mode
+
+
 def ha_recovery_for_consolidation_mode(pool: bool,
                                        still_leader: Callable[[], bool] |
                                        None = None):

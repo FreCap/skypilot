@@ -152,7 +152,7 @@ class TestProbeRoundBatching(unittest.TestCase):
         info = object.__new__(replica_managers.ReplicaInfo)
         info.replica_id = 7
         response = mock.Mock(status_code=200)
-        with mock.patch.object(replica_managers.requests,
+        with mock.patch.object(replica_managers.replica_tls.requests,
                                'get',
                                return_value=response) as request:
             probed_info, ready, _ = info.probe('/health', None, 15, None,

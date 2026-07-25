@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import ssl
 import threading
 import time
 import traceback
@@ -27,6 +28,7 @@ from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import load_balancing_policies as lb_policies
+from sky.serve import replica_tls
 from sky.serve import serve_utils
 from sky.serve.load_balancer_http import _DrainableServer
 from sky.serve.load_balancer_http import _InboundAuthMiddleware
@@ -366,6 +368,10 @@ class SkyServeLoadBalancer:
         # connection is available.
         # Reference: https://github.com/encode/httpcore/blob/a8f80980daaca98d556baea1783c5568775daadc/httpcore/_async/connection_pool.py#L69-L71 # pylint: disable=line-too-long
         self._client_pool: dict[str, httpx.AsyncClient] = dict()
+        # Built once: an SSLContext is thread-safe, reusable across clients,
+        # and parsing the pinned certificate per replica would be wasted work.
+        # None means plaintext, which is what `verify=` is ignored for.
+        self._replica_ssl_context_cached = self._build_replica_ssl_context()
         # We need this lock to avoid getting from the client pool while
         # updating it from _sync_with_controller.
         self._client_pool_lock: threading.Lock = threading.Lock()
@@ -3002,7 +3008,15 @@ class SkyServeLoadBalancer:
 
         trace_config = aiohttp.TraceConfig()
         trace_config.on_connection_create_end.append(connection_created)
-        connector = aiohttp.TCPConnector(limit=len(probe_urls))
+        # This probe's failures are swallowed by _fetch_replica_occupancy, so a
+        # TLS mismatch here would not error -- occupancy would just go unknown
+        # and concurrency-native autoscaling would quietly degrade. Configure it
+        # from the same source as the proxy rather than leaving it to default.
+        ssl_setting = replica_tls.aiohttp_ssl_setting()
+        connector_kwargs: dict[str, Any] = {'limit': len(probe_urls)}
+        if ssl_setting is not None:
+            connector_kwargs['ssl'] = ssl_setting
+        connector = aiohttp.TCPConnector(**connector_kwargs)
         async with aiohttp.ClientSession(connector=connector,
                                          trace_configs=[trace_config
                                                        ]) as session:
@@ -3547,7 +3561,8 @@ class SkyServeLoadBalancer:
                     for replica_url in ready_replica_urls:
                         if replica_url not in self._client_pool:
                             self._client_pool[replica_url] = httpx.AsyncClient(
-                                base_url=replica_url)
+                                base_url=replica_url,
+                                verify=self._replica_ssl_context())
                     urls_to_close = set(
                         self._client_pool.keys()) - set(ready_replica_urls)
                     client_to_close = []
@@ -3590,6 +3605,39 @@ class SkyServeLoadBalancer:
             finally:
                 if not request_batch_accepted:
                     self._request_aggregator.restore(request_batch)
+
+    @staticmethod
+    def _build_replica_ssl_context() -> ssl.SSLContext | bool | None:
+        """Verification setting for replica connections, or None if plaintext.
+
+        The mode and the certificate arrive in the same Helm-injected
+        environment the controller uses when it mints and injects the replica
+        key, so the two ends cannot disagree about whether replicas speak TLS.
+        """
+        mode = serve_utils.replica_tls_mode()
+        if mode == constants.REPLICA_TLS_MODE_OFF:
+            return None
+        certificate_pem = os.environ.get(constants.REPLICA_TLS_CERT_ENV_VAR,
+                                         '').strip()
+        if mode == constants.REPLICA_TLS_MODE_PINNED and not certificate_pem:
+            # Fail closed. Silently degrading to unverified TLS here would
+            # present as encrypted while accepting any peer, which is the one
+            # outcome an operator asking for pinning must never get.
+            raise ValueError(
+                f'{constants.REPLICA_TLS_MODE_ENV_VAR}='
+                f'{constants.REPLICA_TLS_MODE_PINNED} requires '
+                f'{constants.REPLICA_TLS_CERT_ENV_VAR} to carry the service '
+                'certificate.')
+        if mode == constants.REPLICA_TLS_MODE_UNVERIFIED:
+            certificate_pem = ''
+        return replica_tls.build_ssl_context(certificate_pem or None)
+
+    def _replica_ssl_context(self) -> Any:
+        """``verify=`` for a replica client; httpx ignores it on http URLs."""
+        context = self._replica_ssl_context_cached
+        # httpx rejects verify=None, and a plaintext base_url ignores the value
+        # entirely, so fall back to the library default when TLS is off.
+        return True if context is None else context
 
     @staticmethod
     def _release_client_refcount(client: httpx.AsyncClient) -> None:
@@ -4584,7 +4632,8 @@ class SkyServeLoadBalancer:
         # the Service.
         config = uvicorn.Config(self._app,
                                 host='0.0.0.0',
-                                port=self._load_balancer_port)
+                                port=self._load_balancer_port,
+                                **replica_tls.uvicorn_tls_kwargs())
         server = _DrainableServer(config, on_drain=self._begin_draining)
         asyncio.run(server.serve_with_drain())
 
