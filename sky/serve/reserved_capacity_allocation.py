@@ -21,6 +21,14 @@ class ClaimInput:
     # (floor > cap) must not absorb entitlement or feed -- the excess
     # joins the burst remainder (work conservation).
     effective_cap: int | None = None
+    # Utilization gate release target: the ceiling the claimant has walked
+    # itself down to after demonstrating no work. None = ungated (no
+    # signal, gate disabled, or a claim written by a binary that predates
+    # the gate), which is the exact behavior before this field existed.
+    # Like effective_cap it clamps only the HEADROOM, never the floor: a
+    # claimant always keeps attainable_floor() regardless of how idle it
+    # is, so the decay target is an invariant rather than a check.
+    utilization_cap: int | None = None
 
     def attainable_floor(self) -> int:
         """The floor, clamped to what the claimant can materialize."""
@@ -139,14 +147,107 @@ def compute_entitlements(total: int,
     remainder = max(0, total) - sum(floors.values())
     caps: dict[str, int | None] = {}
     for name, claim in claims.items():
-        if claim.effective_cap is None:
-            caps[name] = None
-        else:
-            caps[name] = max(0, claim.effective_cap - claim.attainable_floor())
+        # Both caps bound the same quantity (the weighted share ABOVE the
+        # attainable floor), so the binding one is their min, with None
+        # meaning unbounded on either side. When every gated headroom is 0
+        # the water-fill's active list is empty and Sum(entitlements)
+        # collapses to Sum(floors), which is the idle steady state.
+        bounds = []
+        if claim.effective_cap is not None:
+            bounds.append(max(0,
+                              claim.effective_cap - claim.attainable_floor()))
+        if claim.utilization_cap is not None:
+            bounds.append(
+                max(0, claim.utilization_cap - claim.attainable_floor()))
+        caps[name] = min(bounds) if bounds else None
     shares = water_fill(remainder, {
         name: claim.weight for name, claim in claims.items()
     }, caps)
     return {name: floors[name] + shares[name] for name in claims}
+
+
+def _release_entry(cap: int, hot_until: float, stepped_at: float,
+                   blind_since: float | None) -> dict[str, Any]:
+    return {
+        'cap': int(cap),
+        'hot_until': float(hot_until),
+        'stepped_at': float(stepped_at),
+        'blind_since': blind_since,
+    }
+
+
+def advance_release_target(prev: Mapping[str, Any] | None, *, floor: int,
+                           holdings: int, need: int, boot_hold: bool,
+                           blind: bool, now: float, dwell: float,
+                           step_seconds: float, step_fraction: float,
+                           min_step: int, headroom: float,
+                           blind_grace: float) -> dict[str, Any]:
+    """One claimant's release target, advanced by one round.
+
+    Pure: all state is in `prev` and the return value, both JSON-shaped so
+    the caller can persist them on the round row. The cap is a CEILING on
+    the claimant's entitlement, never a target the fleet is driven to; the
+    ordinary autoscaler and effective_cap stay the binding constraints
+    below it.
+
+    Rising is instantaneous and one-sided. Releasing is a dwell followed by
+    a bounded step schedule, and every step is gated on the previous one
+    being physically actuated. That asymmetry is the whole safety argument:
+    a burst reclaims its entitlement within one round, while giving it up
+    takes many rounds and can be interrupted at any point by a single
+    non-zero sample.
+    """
+    cap = int(prev['cap']) if prev else max(floor, holdings)
+    hot_until = float(prev['hot_until']) if prev else now + dwell
+    stepped_at = float(prev['stepped_at']) if prev else now
+    blind_since = prev.get('blind_since') if prev else None
+
+    if blind:
+        blind_since = now if blind_since is None else float(blind_since)
+        if now - blind_since <= blind_grace:
+            # FREEZE. Deliberately neither raises nor lowers. Raising to
+            # max(cap, holdings) would undo a decay in progress on every
+            # blind round, and since every serve controller lives in the
+            # api-server pod, a routine deploy makes every claimant blind
+            # at once: the pool would reset its decay on each deploy and
+            # never complete a release. Lowering is equally wrong, because
+            # a blind claimant may be fully busy. The step clock is paused
+            # so the grace period cannot bank steps.
+            return _release_entry(cap, max(hot_until, now + dwell), now,
+                                  blind_since)
+        # Wedged past the grace period: a permanently broken telemetry path
+        # must not pin the pool forever, so resume the decay as if idle.
+        need, boot_hold = 0, False
+    else:
+        blind_since = None
+
+    target = max(floor, math.ceil(need * (1.0 + headroom)))
+    if target > cap:
+        # RISE: one round, no dwell and no step schedule. hot_until is
+        # pushed out so the release schedule restarts from scratch.
+        return _release_entry(target, now + dwell, now, None)
+    if boot_hold:
+        # Fill replicas this claimant already authorized are still coming
+        # up. Stepping here would cull them mid-boot: pre-ready rows are
+        # the FIRST scale-down victims, so the gate would repeatedly order
+        # capacity and destroy it before it ever served a request.
+        return _release_entry(cap, max(hot_until, now + dwell), now, None)
+    if now < hot_until:
+        return _release_entry(cap, hot_until, stepped_at, None)
+    if holdings > cap:
+        # ACTUATION GATE: the previous step has not drained yet. Holding
+        # here keeps the cap at most one step ahead of physical reality,
+        # and turns a stuck drain into a visibly stalled cap rather than a
+        # cap parked at the floor with the fleet still running.
+        return _release_entry(cap, hot_until, now, None)
+    if now - stepped_at < step_seconds:
+        return _release_entry(cap, hot_until, stepped_at, None)
+    # Step from what the claimant actually holds, not from the cap: a cap
+    # left high by a rise the fleet never materialized must not authorize a
+    # correspondingly huge step.
+    anchor = max(floor, min(cap, holdings))
+    step = max(min_step, math.ceil(step_fraction * (anchor - floor)))
+    return _release_entry(max(floor, anchor - step), hot_until, now, None)
 
 
 def damp_grants(raw: Mapping[str, int], prev_grants: Mapping[str, int] | None,

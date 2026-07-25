@@ -598,6 +598,57 @@ RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS = 3
 # ratio while staying far from float overflow.
 RESERVED_FILL_MAX_WEIGHT = 1e6
 
+# [boltz fork] Utilization gate (opt-in via
+# reserved_capacity_fill.utilization_gate): a claimant that demonstrates no
+# work walks its entitlement down to floor_replicas in bounded steps, and
+# the released capacity returns to genuinely free GPUs where any service
+# can take it -- including one that declares no reserved_capacity_fill at
+# all and can therefore only reach the pool through ordinary
+# cheapest-first demand placement. Floors are structurally immune: the gate
+# only tightens the water-fill headroom, never scale_floors.
+#
+# These are POOL-GLOBAL on purpose. A per-service dwell or step rate would
+# let the slower-decaying claimant win every contested transient purely by
+# decaying slower, which re-creates through timing exactly the static
+# priority this feature removes.
+#
+# Continuously-zero demonstrated need required before the first release
+# step. Equals downscale_delay_seconds on both live services, equals
+# RESERVED_FILL_CLAIM_TTL_SECONDS, and is 5 poll intervals / 15 LB syncs /
+# 5x the report-staleness threshold.
+RESERVED_FILL_IDLE_DWELL_SECONDS = 300.0
+# At most one release step per this window, so the local drain-aware
+# scale-down can actuate a step before the next one is proposed.
+RESERVED_FILL_RELEASE_STEP_SECONDS = 300.0
+# Each step releases this fraction of the surplus above the floor, so the
+# release rate is scale-free across a 10-replica and a 200-replica fleet.
+RESERVED_FILL_RELEASE_STEP_FRACTION = 0.25
+# Integer termination: a pure geometric decay never reaches the floor in
+# integers, and the tail would be a long sequence of 1-replica steps.
+RESERVED_FILL_RELEASE_MIN_STEP = 2
+# Growth room above demonstrated need, so the gate is never the binding
+# constraint on a service that is actively growing. The ordinary
+# autoscaler target and effective_cap stay the binding constraints on the
+# way up, exactly as before this feature.
+RESERVED_FILL_UTILIZATION_HEADROOM = 0.25
+# Maximum heartbeat_ts - activity_ts for a claim's utilization columns to
+# be trusted. This is the version-skew discriminator: an old binary
+# heartbeating a migrated row advances heartbeat_ts while leaving the new
+# columns frozen, and a frozen demonstrated_need of 0 would walk a busy
+# service to its floor. Matches the autoscaler's own report-staleness
+# threshold (3 * LB_CONTROLLER_SYNC_INTERVAL_SECONDS).
+RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS = 3.0 * LB_CONTROLLER_SYNC_INTERVAL_SECONDS
+# How long a blind claimant (no usable telemetry) freezes its release
+# target before the decay resumes anyway. Freezing is the safe direction
+# for a transient outage, but a permanently wedged load balancer must not
+# pin a whole pool indefinitely. 15 rounds, 3x the claim TTL.
+RESERVED_FILL_BLIND_GRACE_SECONDS = 900.0
+# Process-wide kill switch for the gate, parsed like the poll interval and
+# claim TTL overrides. Set to a false-y value to disarm the gate for every
+# service in this api-server without a spec update.
+RESERVED_FILL_UTILIZATION_GATE_ENV_VAR = (
+    'SKYPILOT_SERVE_RESERVED_FILL_UTILIZATION_GATE')
+
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
 # Backward compatibility alias.

@@ -128,6 +128,17 @@ class Allocation:
     round_id: int
     epoch: int
     snapshot_time: float
+    # What the DEMAND-placement gate reads, as opposed to the fill ceiling.
+    # The two consumers need opposite biases. The ceiling must be
+    # conservative on the way up: do not launch fill you are about to cull.
+    # The demand gate must be permissive on the way up: a burst that has
+    # just reclaimed its entitlement must not have its demand replicas
+    # steered onto paid capacity for the two rounds damping takes to walk
+    # the ceiling back, which is both the opposite of the intent and the
+    # slowest possible reacquisition path on a saturated pool. Since a rise
+    # is instantaneous in the raw entitlement, max(damped, raw) reopens the
+    # gate in the same round the burst is observed.
+    demand_gate_grant: int | None = None
 
 
 # Keep the historical broker import and pickle identities as a direct facade.
@@ -139,9 +150,10 @@ water_fill = reserved_capacity_allocation.water_fill
 compute_entitlements = reserved_capacity_allocation.compute_entitlements
 damp_grants = reserved_capacity_allocation.damp_grants
 compute_feeds = reserved_capacity_allocation.compute_feeds
+advance_release_target = reserved_capacity_allocation.advance_release_target
 for _allocation_symbol in (ClaimInput, _largest_remainder_round, scale_floors,
                            water_fill, compute_entitlements, damp_grants,
-                           compute_feeds):
+                           compute_feeds, advance_release_target):
     _allocation_symbol.__module__ = __name__
 del _allocation_symbol
 
@@ -260,6 +272,7 @@ def upsert_claim(
     holdings_fill: int,
     launchable: bool,
     effective_cap: int | None = None,
+    activity: dict[str, Any] | None = None,
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
@@ -297,6 +310,16 @@ def upsert_claim(
             effective_cap=effective_cap,
             launchable=launchable,
             heartbeat_ts=now,
+            demonstrated_need=(None if activity is None else int(
+                activity['demonstrated_need'])),
+            boot_hold=(None
+                       if activity is None else bool(activity['boot_hold'])),
+            # Paired with heartbeat_ts from the SAME `now`, in the same
+            # statement, so the freshness comparison downstream is exact
+            # and epsilon-free. A writer that predates the gate advances
+            # heartbeat_ts without touching activity_ts, which is precisely
+            # what the lag check downstream detects.
+            activity_ts=(None if activity is None else now),
             expected_service_hash=expected_service_hash,
             expected_controller_owner=expected_controller_owner)
 
@@ -313,6 +336,111 @@ def remove_claim(
     if removed or expected_service_hash is None:
         _GRANT_CACHE.pop(service_name, None)
     return removed
+
+
+def utilization_gate_enabled() -> bool:
+    """Process-wide kill switch for the utilization gate."""
+    override = os.environ.get(constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR)
+    if override is None:
+        return True
+    return override.strip().lower() not in ('0', 'false', 'no', 'off', '')
+
+
+@dataclasses.dataclass(frozen=True)
+class ActivityInput:
+    """One claimant's utilization signal, or the absence of one.
+
+    `blind` is the important state: it means the round cannot tell idle
+    from unobservable, and the governor freezes rather than releasing.
+    """
+    demonstrated_need: int
+    boot_hold: bool
+    blind: bool
+
+
+def _activity_input(row: dict[str, Any]) -> ActivityInput:
+    """Reads a claim's utilization signal, rejecting stale or absent ones."""
+    blind = ActivityInput(demonstrated_need=0, boot_hold=False, blind=True)
+    if not utilization_gate_enabled():
+        return blind
+    need = row.get('demonstrated_need')
+    activity_ts = row.get('activity_ts')
+    if need is None or activity_ts is None:
+        # No signal at all: a pre-030 row, a claimant with the gate off, or
+        # an autoscaler class with no occupancy telemetry.
+        return blind
+    try:
+        lag = float(row['heartbeat_ts'] or 0.0) - float(activity_ts)
+    except (TypeError, ValueError):
+        return blind
+    if not 0 <= lag <= constants.RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS:
+        # VERSION-SKEW GUARD. upsert builds its values dict from the columns
+        # its own binary knows, and the ON CONFLICT set_ iterates that dict,
+        # so a pre-gate binary heartbeating a migrated row advances
+        # heartbeat_ts while freezing this signal. Trusting a frozen
+        # demonstrated_need of 0 would walk a fully busy service down to its
+        # floor. Failing to blind here is the whole reason activity_ts
+        # exists; a negative lag is equally untrustworthy (clock surgery or
+        # a hand-edited row).
+        return blind
+    return ActivityInput(demonstrated_need=max(0, int(need)),
+                         boot_hold=bool(row.get('boot_hold')),
+                         blind=False)
+
+
+def _apply_utilization_gate(
+    claims: dict[str, ClaimInput],
+    activity: dict[str, 'ActivityInput'],
+    prev_state: dict[str, dict[str, Any]],
+    now: float,
+) -> tuple[dict[str, ClaimInput], dict[str, dict[str, Any]]]:
+    """Advance every claimant's release target and attach it as a cap.
+
+    Returns the claims with utilization_cap set and the new state to
+    persist on the round row. A claimant with no entry in the returned
+    state is ungated, which is the pre-gate behavior.
+    """
+    gated: dict[str, ClaimInput] = {}
+    state: dict[str, dict[str, Any]] = {}
+    for name, claim in claims.items():
+        signal = activity[name]
+        prev = prev_state.get(name)
+        if signal.blind and prev is None:
+            # NEVER GATED. No usable signal has ever been recorded for this
+            # claimant: the gate is off for it, its claim predates the
+            # feature, or its autoscaler class has no occupancy telemetry.
+            # It gets no cap and no state, which is exactly the behavior
+            # before this feature existed. Distinguishing this from "gated
+            # but momentarily blind" is what makes the gate opt-in in
+            # practice as well as in the schema.
+            gated[name] = claim
+            continue
+        entry = advance_release_target(
+            prev,
+            floor=claim.attainable_floor(),
+            holdings=claim.holdings_fill,
+            need=signal.demonstrated_need,
+            boot_hold=signal.boot_hold,
+            blind=signal.blind,
+            now=now,
+            dwell=constants.RESERVED_FILL_IDLE_DWELL_SECONDS,
+            step_seconds=constants.RESERVED_FILL_RELEASE_STEP_SECONDS,
+            step_fraction=constants.RESERVED_FILL_RELEASE_STEP_FRACTION,
+            min_step=constants.RESERVED_FILL_RELEASE_MIN_STEP,
+            headroom=constants.RESERVED_FILL_UTILIZATION_HEADROOM,
+            blind_grace=constants.RESERVED_FILL_BLIND_GRACE_SECONDS,
+        )
+        state[name] = entry
+        # An already-gated claimant keeps its cap applied even while blind.
+        # Dropping the cap on a blind round would be a RISE, restoring full
+        # weighted entitlement the moment telemetry blips; since every serve
+        # controller is a process in the api-server pod, one deploy would
+        # un-decay the whole pool at once. advance_release_target froze the
+        # value rather than moving it, so what binds here is the level the
+        # claimant had already earned.
+        gated[name] = dataclasses.replace(claim,
+                                          utilization_cap=int(entry['cap']))
+    return gated, state
 
 
 def _claim_input(row: dict[str, Any]) -> ClaimInput:
@@ -590,6 +718,20 @@ def _occupying_debit(
     return feed_debit, entitlement_debit, live_fill, unclaimed_fill
 
 
+def _demand_gate_grant(damped: int | None, raw: Any) -> int | None:
+    """The permissive grant the demand-placement gate reads.
+
+    None (no ceiling) stays None: the gate is inert there by design.
+    """
+    if damped is None:
+        return None
+    try:
+        raw_int = int(raw)
+    except (TypeError, ValueError):
+        return damped
+    return max(damped, raw_int)
+
+
 def _allocation_from_round(service_name: str,
                            round_row: dict[str, Any]) -> Allocation | None:
     grants = json.loads(round_row['grants'] or '{}')
@@ -598,12 +740,16 @@ def _allocation_from_round(service_name: str,
         # next round (at most one poll interval away).
         return None
     feeds = json.loads(round_row['feeds'] or '{}')
+    raw_grants = json.loads(round_row['raw_grants'] or '{}')
     allocation = Allocation(grant=grants[service_name],
                             feed=int(feeds.get(service_name, 0)),
                             round_id=int(round_row['round_id']),
                             epoch=int(round_row['epoch']),
-                            snapshot_time=float(round_row['snapshot_time']))
-    _GRANT_CACHE[service_name] = (allocation.grant, time.time())
+                            snapshot_time=float(round_row['snapshot_time']),
+                            demand_gate_grant=_demand_gate_grant(
+                                grants[service_name],
+                                raw_grants.get(service_name)))
+    _GRANT_CACHE[service_name] = (allocation.demand_gate_grant, time.time())
     return allocation
 
 
@@ -800,6 +946,7 @@ def _run_round_locked(service_name: str, pool_key: str,
             query_ok = False
 
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
+    activity = {name: _activity_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
     prev_grants_json: dict[str, Any] = (json.loads(round_row['grants'] or '{}')
                                         if round_row is not None else {})
@@ -807,6 +954,13 @@ def _run_round_locked(service_name: str, pool_key: str,
                                 if round_row is not None else {})
     sticky: dict[str, dict[str, Any]] = (json.loads(
         round_row['feed_state'] or '{}') if round_row is not None else {})
+    prev_utilization: dict[str, dict[str, Any]] = (
+        json.loads(round_row['utilization_state'] or '{}')
+        if round_row is not None and 'utilization_state' in round_row.keys()
+        else {})
+    # Rebuilt from the current claimants every round, mirroring the sticky
+    # feed state, so entries for departed services cannot accumulate.
+    utilization_state: dict[str, dict[str, Any]] = {}
     last_free: int | None = (round_row['last_observed_free']
                              if round_row is not None else None)
     last_free_ts: float | None = (round_row['last_observed_free_ts']
@@ -827,9 +981,29 @@ def _run_round_locked(service_name: str, pool_key: str,
                     observation.free_slots is not None)
             free = max(0, int(observation.free_slots))
             last_free, last_free_ts = free, snapshot_time
-        grants = {service_name: None}
+        # The gate must survive the fast path. Left alone, a lone claimant
+        # publishes a None grant, the autoscaler applies no ceiling at all,
+        # and the release target would be computed and thrown away every
+        # round. That configuration is not exotic: it is exactly the case
+        # where the pool's other users declare no reserved_capacity_fill
+        # (so they never appear as claimants), and it also arrives by
+        # accident whenever a peer's claim expires.
+        gated_claims, utilization_state = _apply_utilization_gate(
+            claims, activity, prev_utilization, now)
+        claims = gated_claims
+        lone_cap = claims[service_name].utilization_cap
+        grants = {service_name: lone_cap}
         feeds = {service_name: free}
-        raw_grants: dict[str, int] = {}
+        # Raw measured free, unchanged: the launch side is separately
+        # clamped by the autoscaler's launch-side ceiling, so preserving
+        # the pre-broker feed identity here is safe.
+        # raw_grants must carry the cap too. Left empty, the first
+        # multi-claimant round after this transition finds a published
+        # integer grant with no raw baseline, and damp_grants stalls the
+        # move for a round.
+        raw_grants: dict[str, int] = ({} if lone_cap is None else {
+            service_name: lone_cap
+        })
         new_sticky: dict[str, dict[str, Any]] = {}
         # No debit scan on the fast path (#108 identity), so no draining
         # term either; harmless -- a single-claimant round's stored sum is
@@ -905,6 +1079,16 @@ def _run_round_locked(service_name: str, pool_key: str,
             # total conserved.
             entitlement_free = max(0, measured - entitlement_debit)
             total = entitlement_free + conserved_holdings
+            # Advance the release governor HERE, inside the measured
+            # branch, after the live-holdings correction above (so the
+            # actuation gate compares against row-consistent holdings) and
+            # immediately before entitlements are computed. Advancing
+            # before the query_ok split would let the cap walk down across
+            # a run of measurement blackouts in which grants are never
+            # recomputed, and then apply the whole accumulated drop in one
+            # step once the query recovered.
+            claims, utilization_state = _apply_utilization_gate(
+                claims, activity, prev_utilization, now)
             raw_grants = compute_entitlements(total, claims)
             # The immediate-down bypass keys on (holdings + draining): a
             # holdings drop whose slots merely moved into a graceful drain
@@ -981,8 +1165,33 @@ def _run_round_locked(service_name: str, pool_key: str,
             for name, claim in claims.items():
                 base = (prev_published.get(name)
                         if prev_published is not None else None)
+                floor_holdings = claim.holdings_fill
+                carried = prev_utilization.get(name)
+                if carried is not None:
+                    # The holdings floor exists so a blackout never strips a
+                    # live replica's shelter, but for a claimant mid-release
+                    # it would also UN-DECAY the grant back up to holdings
+                    # and make Sum(grants) exceed the round total. Cap the
+                    # floor at the release target the claimant had already
+                    # walked down to.
+                    floor_holdings = min(floor_holdings, int(carried['cap']))
                 damped[name] = max(base if base is not None else 0,
-                                   claim.holdings_fill)
+                                   floor_holdings)
+            # Carry the release state through the blackout with its clocks
+            # pushed forward, so a long outage cannot bank steps and then
+            # apply several at once when measurement recovers.
+            for name in claims:
+                carried = prev_utilization.get(name)
+                if carried is None:
+                    continue
+                utilization_state[name] = {
+                    'cap': int(carried['cap']),
+                    'hot_until': max(
+                        float(carried['hot_until']),
+                        now + constants.RESERVED_FILL_IDLE_DWELL_SECONDS),
+                    'stepped_at': now,
+                    'blind_since': carried.get('blind_since'),
+                }
             feeds = {name: 0 for name in claims}
             new_sticky = dict(sticky)
             published_sum_holdings = (int(prev_sum_holdings)
@@ -1045,7 +1254,9 @@ def _run_round_locked(service_name: str, pool_key: str,
         phantom_streak=phantom_streak,
         shrink_baseline=new_shrink_baseline,
         lease_token=lease_token,
-        lease_expires_at=now + lease_ttl_seconds)
+        lease_expires_at=now + lease_ttl_seconds,
+        utilization_state=(json.dumps(utilization_state, sort_keys=True)
+                           if utilization_state else None))
     if not published:
         logger.error(
             'Reserved-fill broker: lease token superseded while publishing '
@@ -1056,7 +1267,8 @@ def _run_round_locked(service_name: str, pool_key: str,
     logger.info(
         f'Reserved-fill broker: round {round_id} (epoch {new_epoch}) for '
         f'pool {pool_key}: grants={grants} feeds={feeds} '
-        f'claimants={names}.')
+        f'claimants={names}'
+        f'{f" utilization={utilization_state}" if utilization_state else ""}.')
     if service_name not in grants:
         # Confirmed-phantom blackout round: our claim was just rejected
         # along with everyone else's, so there is no allocation to hand
@@ -1067,6 +1279,11 @@ def _run_round_locked(service_name: str, pool_key: str,
                             feed=int(feeds.get(service_name, 0)),
                             round_id=round_id,
                             epoch=new_epoch,
-                            snapshot_time=snapshot_time)
-    _GRANT_CACHE[service_name] = (allocation.grant, time.time())
+                            snapshot_time=snapshot_time,
+                            demand_gate_grant=_demand_gate_grant(
+                                grants.get(service_name),
+                                raw_grants.get(service_name)))
+    # The demand gate reads the permissive grant, the fill ceiling reads
+    # the damped one (see Allocation.demand_gate_grant).
+    _GRANT_CACHE[service_name] = (allocation.demand_gate_grant, time.time())
     return allocation

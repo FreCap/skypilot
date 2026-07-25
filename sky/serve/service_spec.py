@@ -1234,6 +1234,8 @@ class SkyServiceSpec:
                 fill_obj['floor_replicas'] = self.reserved_fill_floor_replicas
             if self.reserved_fill_weight != 1.0:
                 fill_obj['weight'] = self.reserved_fill_weight
+            if self.reserved_fill_utilization_gate:
+                fill_obj['utilization_gate'] = True
             reserved_fill_config = fill_obj if fill_obj else True
         add_if_not_none('replica_policy',
                         'reserved_capacity_fill',
@@ -1518,6 +1520,18 @@ class SkyServiceSpec:
         if isinstance(self._reserved_capacity_fill, dict):
             return float(self._reserved_capacity_fill.get('weight', 1.0))
         return 1.0
+
+    @property
+    def reserved_fill_utilization_gate(self) -> bool:
+        # Whether this service's entitlement above floor_replicas is
+        # released while it demonstrates no work. Off unless the object
+        # form opts in: enabling it makes floor_replicas the whole
+        # burst-latency contract, which is a deliberate operator choice
+        # rather than something a default should make for them.
+        if isinstance(self._reserved_capacity_fill, dict):
+            return bool(
+                self._reserved_capacity_fill.get('utilization_gate', False))
+        return False
 
     @property
     def cost_rebalance(self) -> bool:

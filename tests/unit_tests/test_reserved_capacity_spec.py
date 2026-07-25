@@ -312,3 +312,35 @@ def test_object_form_rejected_with_ondemand_fallback():
                    target_qps_per_replica=1.0,
                    reserved_capacity_fill={},
                    dynamic_ondemand_fallback=True)
+
+
+def test_utilization_gate_defaults_false_and_is_omitted():
+    # Off unless opted in: enabling it makes floor_replicas the service's
+    # whole burst-latency contract.
+    spec = _make_spec(min_replicas=2, reserved_capacity_fill=True)
+    assert spec.reserved_fill_utilization_gate is False
+    config = spec.to_yaml_config()
+    fill = config['replica_policy']['reserved_capacity_fill']
+    assert fill is True
+
+
+def test_utilization_gate_round_trips():
+    spec = _make_spec(min_replicas=2,
+                      max_replicas=100,
+                      target_qps_per_replica=2.0,
+                      reserved_capacity_fill={
+                          'floor_replicas': 10,
+                          'utilization_gate': True,
+                      })
+    assert spec.reserved_fill_utilization_gate is True
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(
+        spec.to_yaml_config())
+    assert restored.reserved_fill_utilization_gate is True
+    assert restored.reserved_fill_floor_replicas == 10
+
+
+def test_utilization_gate_alone_still_implies_enabled():
+    spec = _make_spec(min_replicas=2,
+                      reserved_capacity_fill={'utilization_gate': True})
+    assert spec.reserved_capacity_fill is True
+    assert spec.reserved_fill_utilization_gate is True
