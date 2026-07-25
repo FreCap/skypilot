@@ -183,7 +183,10 @@ def test_aws_make_deploy_variables(*mocks) -> None:
         'docker_run_options': [],
         'initial_setup_commands': [],
         'zones': 'fake-zone',
-        'root_device_name': '/dev/sda1'
+        'root_device_name': '/dev/sda1',
+        # Unconfigured, this must stay the whole internet: SkyPilot's historical
+        # behaviour. Narrowing it is opt-in via aws.ingress_source_ranges.
+        'ingress_source_ranges': ['0.0.0.0/0'],
     }
 
     # test using defaults
@@ -272,7 +275,10 @@ def test_aws_make_deploy_variables_ssh_user(*mocks) -> None:
         'docker_run_options': [],
         'initial_setup_commands': [],
         'zones': 'fake-zone',
-        'root_device_name': '/dev/xvda'
+        'root_device_name': '/dev/xvda',
+        # Unconfigured, this must stay the whole internet: SkyPilot's historical
+        # behaviour. Narrowing it is opt-in via aws.ingress_source_ranges.
+        'ingress_source_ranges': ['0.0.0.0/0'],
     }
 
     # test using defaults

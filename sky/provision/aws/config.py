@@ -32,6 +32,8 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 
+_DEFAULT_INGRESS_SOURCE_RANGE = '0.0.0.0/0'
+
 RAY = 'ray-autoscaler'
 SECURITY_GROUP_TEMPLATE = RAY + '-{}'
 
@@ -110,10 +112,13 @@ def bootstrap_instances(
         extended_ip_rules = security_group_config.get('IpPermissions', [])
         if extended_ip_rules is None:
             extended_ip_rules = []
+        ssh_source_ranges = config.provider_config.get(
+            'ingress_source_ranges') or [_DEFAULT_INGRESS_SOURCE_RANGE]
         security_group_ids = _configure_security_group(ec2, vpc_id,
                                                        expected_sg_name,
                                                        extended_ip_rules,
-                                                       enable_efa)
+                                                       enable_efa,
+                                                       ssh_source_ranges)
         if expected_sg_name != aws_cloud.DEFAULT_SECURITY_GROUP_NAME:
             logger.debug('Attempting to create the default security group.')
             # Attempt to create the default security group. This is needed
@@ -124,7 +129,7 @@ def bootstrap_instances(
             try:
                 _configure_security_group(ec2, vpc_id,
                                           aws_cloud.DEFAULT_SECURITY_GROUP_NAME,
-                                          [], enable_efa)
+                                          [], enable_efa, ssh_source_ranges)
                 logger.debug('Default security group created.')
             except exceptions.NoClusterLaunchedError as e:
                 if 'not authorized to perform: ec2:CreateSecurityGroup' in str(
@@ -538,8 +543,8 @@ def _get_subnet_and_vpc_id(ec2: 'mypy_boto3_ec2.ServiceResource',
 
 def _configure_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
                               vpc_id: str, expected_sg_name: str,
-                              extended_ip_rules: list,
-                              enable_efa: bool) -> list[str]:
+                              extended_ip_rules: list, enable_efa: bool,
+                              ssh_source_ranges: list) -> list[str]:
     security_group = _get_or_create_vpc_security_group(ec2, vpc_id,
                                                        expected_sg_name)
     sg_ids = [security_group.id]
@@ -554,14 +559,15 @@ def _configure_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
                 'GroupId': i
             } for i in sg_ids],
         },
-        # SSH rules
+        # SSH rules. Defaults to the whole internet, which is the historical
+        # behaviour; narrowed by `aws.ingress_source_ranges`.
         {
             'FromPort': 22,
             'ToPort': 22,
             'IpProtocol': 'tcp',
             'IpRanges': [{
-                'CidrIp': '0.0.0.0/0'
-            }],
+                'CidrIp': cidr
+            } for cidr in ssh_source_ranges],
         },
         *extended_ip_rules,
     ]

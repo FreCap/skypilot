@@ -38,6 +38,8 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 
+_DEFAULT_INGRESS_SOURCE_RANGE = '0.0.0.0/0'
+
 # Max retries for general AWS API calls.
 BOTO_MAX_RETRIES = 12
 # Max retries for creating an instance. Kept on this facade for compatibility
@@ -680,6 +682,21 @@ def _authorize_ingress_with_duplicate_retry(
                     raise
 
 
+def _ingress_source_ranges(provider_config: dict[str, Any] | None) -> list[str]:
+    """Source CIDRs for cluster ingress, defaulting to the whole internet.
+
+    The default preserves SkyPilot's historical behaviour. It is a poor default
+    for a workload with no authentication of its own, which is why it is now
+    configurable via ``aws.ingress_source_ranges``.
+    """
+    if not provider_config:
+        return [_DEFAULT_INGRESS_SOURCE_RANGE]
+    configured = provider_config.get('ingress_source_ranges')
+    if not configured:
+        return [_DEFAULT_INGRESS_SOURCE_RANGE]
+    return list(configured)
+
+
 def open_ports(
     cluster_name_on_cloud: str,
     ports: list[str],
@@ -750,6 +767,11 @@ def open_ports(
         ports_to_open = resources_utils.port_set_to_ranges(
             resources_utils.port_ranges_to_set(ports) - existing_ports)
 
+    # Defaults to the whole internet, matching the historical behaviour. A
+    # deployment whose workload behind these ports has no authentication of its
+    # own should narrow `aws.ingress_source_ranges` to the control plane's
+    # egress address; otherwise a requested port is reachable by anyone.
+    source_ranges = _ingress_source_ranges(provider_config)
     ip_permissions = []
     for port in ports_to_open:
         if port.isdigit():
@@ -761,18 +783,22 @@ def open_ports(
             'ToPort': int(to_port),
             'IpProtocol': 'tcp',
             'IpRanges': [{
-                'CidrIp': '0.0.0.0/0'
-            }],
+                'CidrIp': cidr
+            } for cidr in source_ranges],
         })
 
     # For the case when every new ports is already opened.
     if ip_permissions:
         # Filter out any permissions that already exist in the security group
         existing_permissions = set()
+        wanted_ranges = set(source_ranges)
         for rule in sg.ip_permissions:
             if rule['IpProtocol'] == 'tcp':
                 for ip_range in rule.get('IpRanges', []):
-                    if ip_range.get('CidrIp') == '0.0.0.0/0':
+                    # Compare against the configured ranges: a rule that opens
+                    # a port to a DIFFERENT CIDR must not count as already
+                    # satisfying this one.
+                    if ip_range.get('CidrIp') in wanted_ranges:
                         existing_permissions.add(
                             (rule['FromPort'], rule['ToPort']))
 

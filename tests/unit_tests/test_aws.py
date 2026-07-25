@@ -631,7 +631,8 @@ def test_configure_security_group_ignores_concurrent_duplicate_ingress():
                       '_get_or_create_vpc_security_group',
                       return_value=security_group):
         result = config._configure_security_group(MagicMock(), 'vpc-123',
-                                                  'shared-sg', [], False)
+                                                  'shared-sg', [], False,
+                                                  ['0.0.0.0/0'])
 
     assert result == ['sg-shared']
     security_group.authorize_ingress.assert_called_once()
@@ -649,7 +650,7 @@ def test_configure_security_group_raises_nonduplicate_ingress_error():
                       return_value=security_group), pytest.raises(
                           config.aws.botocore_exceptions().ClientError):
         config._configure_security_group(MagicMock(), 'vpc-123', 'shared-sg',
-                                         [], False)
+                                         [], False, ['0.0.0.0/0'])
 
 
 def test_configure_security_group_ignores_concurrent_duplicate_egress():
@@ -663,7 +664,8 @@ def test_configure_security_group_ignores_concurrent_duplicate_egress():
                       '_get_or_create_vpc_security_group',
                       return_value=security_group):
         result = config._configure_security_group(MagicMock(), 'vpc-123',
-                                                  'shared-sg', [], True)
+                                                  'shared-sg', [], True,
+                                                  ['0.0.0.0/0'])
 
     assert result == ['sg-shared']
     security_group.authorize_egress.assert_called_once()

@@ -89,6 +89,7 @@ DEFAULT_ROOT_DEVICE_NAME = '/dev/sda1'
 # Generate the name of the security group we're looking for.
 # (username, last 4 chars of hash of hostname): for uniquefying
 # users on shared-account scenarios.
+_DEFAULT_INGRESS_SOURCE_RANGE = '0.0.0.0/0'
 DEFAULT_SECURITY_GROUP_NAME = f'sky-sg-{common_utils.user_and_hostname_hash()}'
 # Security group to use when user specified ports in their resources.
 USER_PORTS_SECURITY_GROUP_NAME = 'sky-sg-{}'
@@ -908,6 +909,19 @@ class AWS(clouds.Cloud):
                     'has requested ports setup; or, leave out `aws.security_group_name` '
                     'in `~/.sky/config.yaml`.')
 
+        # Source CIDRs for the cluster's SSH port and any requested
+        # `resources.ports`. The default reproduces the historical behaviour of
+        # opening them to the whole internet; a deployment whose workload has
+        # no authentication of its own should narrow this to the control
+        # plane's egress address.
+        ingress_source_ranges = skypilot_config.get_effective_region_config(
+            cloud='aws',
+            region=region_name,
+            keys=('ingress_source_ranges',),
+            default_value=None)
+        if not ingress_source_ranges:
+            ingress_source_ranges = [_DEFAULT_INGRESS_SOURCE_RANGE]
+
         return {
             'instance_type': resources.instance_type,
             'custom_resources': custom_resources,
@@ -919,6 +933,7 @@ class AWS(clouds.Cloud):
             'root_device_name': root_device_name,
             'ssh_user': ssh_user,
             'security_group': security_group,
+            'ingress_source_ranges': ingress_source_ranges,
             'security_group_managed_by_skypilot':
                 str(security_group != user_security_group).lower(),
             'max_efa_interfaces': max_efa_interfaces,

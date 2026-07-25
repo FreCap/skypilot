@@ -2203,6 +2203,20 @@ def get_config_schema():
                 },
                 'security_group_name':
                     (_PROPERTY_NAME_OR_CLUSTER_NAME_TO_PROPERTY),
+                # Source CIDRs allowed to reach a cluster's SSH port and any
+                # ports declared by `resources.ports`. Defaults to
+                # ['0.0.0.0/0'], which is the historical behaviour: SkyPilot
+                # opens requested ports to the whole internet. Narrow this to
+                # the control plane's egress address when the workload behind
+                # those ports has no authentication of its own.
+                'ingress_source_ranges': {
+                    'type': 'array',
+                    'minItems': 1,
+                    'items': {
+                        'type': 'string',
+                        'minLength': 1,
+                    },
+                },
                 'vpc_name': {
                     'oneOf': [{
                         'type': 'string',
