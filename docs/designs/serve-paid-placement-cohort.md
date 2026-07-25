@@ -43,21 +43,19 @@ and implements the physical requirement through a full pass with exact-override
 memoization, so a blocked paid entry cannot hide later reserved-fill or pinned
 work. The earlier production 1.1.769 evidence below predates PR #926 and
 validates the paid envelope, not zero-cost progress while that envelope is
-full. The current production 1.1.776 image contains both corrections.
+full. Release 1.1.776 contained both corrections.
 
-The current bounded-exploration correction layers a default two-pool frontier
+The bounded-exploration correction layered a default two-pool frontier
 per exact accelerator card on top of that deployed service envelope while
 retaining the adaptive exact-pool depth authority. PR #928 passed every visible
 check, including the required real-PostgreSQL lane, and merged as
 `1cea872fe2d83afa676e7a11d12f8c1dfb8dbca7`. Image and chart 1.1.776 were
-published and production is deployed on that chart at Helm revision 258. The
-post-rollout database snapshot satisfies the exact-pool, 16-claim service, and
-two-pool card bounds with no unattributable unresolved row; the API, service
-controller, and both load-balancer slots are healthy. A natural
-`boltz-l4-fleet` scale-up wave has not occurred since rollout, so live
-observation of success-driven deepening and zero-cost/pinned progress under a
-simultaneously closed paid frontier remains follow-up evidence rather than a
-deployment gate.
+published and were deployed at Helm revision 258. That historical post-rollout
+database snapshot satisfied the exact-pool, 16-claim service, and two-pool card
+bounds with no unattributable unresolved row; the API, service controller, and
+both load-balancer slots were healthy. A natural `boltz-l4-fleet` scale-up wave
+had not occurred at that snapshot. Later 1.1.789 evidence below records a
+natural bounded wave and typed provider-capacity failure.
 
 This follow-up shortens the terminal provider-feedback path without changing
 admission bounds or durable state. A launch worker that receives a typed,
@@ -68,9 +66,9 @@ were created. On the manager's next refresh, the existing atomic outcome
 transaction closes the exact pool and releases the claim before the existing
 idempotent replica teardown reconciles any control-plane leftovers. Retriable
 attempts, cleanup-uncertain failures, and untyped terminal failures retain
-synchronous cleanup. The implementation, exact-tree adversarial review,
-pull-request CI, artifact publication, and production rollout verification are
-complete.
+synchronous cleanup. PR #937 passed its release gates and merged as
+`408fd62cd931db854551c9c06d47b474309ddd4b`; release 1.1.784 deployed at
+Helm revision 261 and validated the direct typed-error path.
 
 Production verification of that follow-up exposed an evidence-preservation
 gap below the launch worker: the per-zone provisioning loop recorded a
@@ -82,6 +80,13 @@ refresh the durable paid-pool cooldown. The correction preserves every
 per-zone provider exception in the terminal wrapper. Mixed or unknown
 histories remain unclassified; only the already-recognized structured
 capacity/quota codes reach the durable outcome path.
+
+PR #939 preserved that per-zone provider evidence and merged as
+`5d5c04e41fab0066b06dfe07f9636ab1b8113d84`. Release 1.1.786 deployed at
+Helm revision 263, where natural terminal provider failures still did not reach
+the typed outcome/pool-close path. Code-path analysis and the end-to-end
+provisioning regression identified an additional optimizer-exhaustion wrapper
+as the cause, motivating the recursive contract below.
 
 The normal cross-location path adds another terminal wrapper when optimizer
 exhaustion follows a per-location failure. Provider evidence may therefore be
@@ -108,16 +113,36 @@ a mixed known capacity/quota history and otherwise the result is capacity.
 This recursive contract applies equally to AWS and GCP and changes neither
 provider cleanup nor controller-side teardown ordering.
 
-PR #941 passed every visible check and merged as
-`5f1f30fceac3c5fbb266a1812b32f6d747fe7eb1`. Image and chart 1.1.789 were
-published from that exact commit. Helm revision 264 deployed the chart with
-the existing values reused and explicit API/init-container image overrides.
-The API, migration job, service controllers, and Protenix external load
-balancer recovered successfully. Two subsequent AWS
-`InsufficientInstanceCapacity` results exercised the typed production path;
-their exact PostgreSQL pools closed and released their claims. A controlled
+PR #941 implemented that recursive contract, passed every visible check, and
+merged as `5f1f30fceac3c5fbb266a1812b32f6d747fe7eb1`. Image and chart 1.1.789
+were published from that exact commit and deployed at Helm revision 264 with
+existing values reused and explicit API/init-container image overrides. The
+API, migration job, service controllers, and Protenix external load balancer
+recovered successfully. The declarative production pin merged in boltz-platform
+PR #7298 as
+`83ade2b76d979f7899d8a2f67bad7fc07da1d60c`. A natural production
+provider-capacity failure subsequently exercised the nested classification,
+atomic pool-close transaction, and teardown ordering within one bounded
+controller refresh. Two other AWS `InsufficientInstanceCapacity` results
+closed their exact PostgreSQL pools and released their claims; a controlled
 API-server restart retained both failure epochs and zero-claim state, proving
 the cooldown authority is durable rather than process-local.
+
+Release 1.1.791 subsequently superseded 1.1.789 in production at commit
+`0bcde60a768ec262f2a14f58c3af49c65aaeaa15`. It retains the complete recursive
+classifier and paid-capacity authority while adding the separately reviewed
+per-worker pool Spot-fallback change from PR #945. Boltz-platform PR #7300
+merged the 1.1.791 production pin, and separately enabled the existing Jobs
+consolidation mode, as `4d08a9b6a1`; PR #7301 reconciled the declarative state
+PVC with its already bound 200 GiB capacity as `ae271dccf0`, and PR #7303 added
+a regression guard as `fa465977e3`. The final Terragrunt reconciliation
+deployed Helm revision 269, completed seed job
+`skypilot-seed-config-2120d2f60359`, restarted the API server, and converged to
+a zero-diff plan. The production API and every external load-balancer slot now
+run the 1.1.791 image at digest
+`sha256:a47d7c4135fa540fef709bb73a539749f92de69434b3bfb97bd7cdc61304be06`.
+Post-restart evidence below confirms that the 16-claim service envelope and
+two-pool per-card frontier remained active under a natural L4 scale-up wave.
 
 ## Problem
 
@@ -1323,32 +1348,32 @@ series remain visible.
 ## Rollout and Rollback
 
 Revision 027 is already deployed. This correction reuses its rows and requires
-no migration. The deployment target combines PR #915's 16-claim envelope with
-the per-card frontier in the same API-server and service-controller image.
-Deploy it through the normal HA rolling upgrade with existing Helm values
-reused. A new controller immediately honors a recent persisted
+no migration. The completed deployment combines PR #915's 16-claim envelope,
+the per-card frontier, and terminal provider feedback in the same API-server
+and service-controller image. The HA rolling upgrade reused existing Helm
+values. A new controller immediately honors a recent persisted
 `last_failure_at`; this is intentional and prevents rollout-triggered retry
 storms.
 
-The mixed window may contain three older behaviors. Pre-PR-#909 revision-027
-controllers do not honor the four-wide cooldown policy, service envelope, or
-frontier. v1.1.759/v1.1.760 controllers honor adaptive depth and sticky
-cooldown but not the service envelope or frontier. A PR-#915 controller honors
-adaptive depth, cooldown, and the 16-claim envelope but not the per-card
-frontier; until it exits, its pre-PR-#926 whole-wave stop may also suppress
-zero-cost work while the paid envelope is full. New controllers reconstruct
-service overage and already-overwide card frontiers from valid claims without
-revoking them. They admit no additional service claim while more than 16
-remain and open no additional pool for an overwide card until normal durable
-outcomes drain the relevant bound.
+During earlier mixed-version windows, pre-PR-#909 revision-027 controllers did
+not honor the four-wide cooldown policy, service envelope, or frontier.
+v1.1.759/v1.1.760 controllers honored adaptive depth and sticky cooldown but
+not the service envelope or frontier. A PR-#915 controller honored adaptive
+depth, cooldown, and the 16-claim envelope but not the per-card frontier; until
+it exited, its pre-PR-#926 whole-wave stop could also suppress zero-cost work
+while the paid envelope was full. New controllers reconstruct service overage
+and already-overwide card frontiers from valid claims without revoking them.
+They admit no additional service claim while more than 16 remain and open no
+additional pool for an overwide card until normal durable outcomes drain the
+relevant bound.
 
-Declare the combined correction active only after every older controller
-exits, no exact pool exceeds its effective limit, no service exceeds 16 valid
-unresolved claims, no service/card owns more than two unresolved pools, and no
-unattributable legacy row remains. Then verify newly observed waves stay
-within both breadth bounds. Local SQLite deployments continue using the legacy
-per-service window and do not gain cross-service cooldown, service-envelope,
-or frontier authority.
+The combined correction was declared active only after every older controller
+exited, no exact pool exceeded its effective limit, no service exceeded 16
+valid unresolved claims, no service/card owned more than two unresolved pools,
+and no unattributable legacy row remained. The 1.1.789 rollout repeated those
+checks and then observed a natural wave within both breadth bounds. Local
+SQLite deployments continue using the legacy per-service window and do not
+gain cross-service cooldown, service-envelope, or frontier authority.
 
 Monitor learned pool limit, effective admission limit, cooldown/probe state,
 active and service-owned claims, frontier width, feedback deferrals, oldest
@@ -1360,20 +1385,33 @@ API request queue depth, provider capacity errors, typed-outcome-to-pool-close
 latency, pending teardown duration, and launch latency.
 
 Rollback is an image rollback. Existing pool, claim, waiter, success, and
-failure rows remain schema-compatible with revision 027. Rolling back the
-combined image to PR #915 retains adaptive depth, sticky cooldown, and the
-16-claim envelope but removes frontier enforcement and reintroduces the
-zero-cost liveness regression while that paid envelope is full. Paid-capacity
-safety remains intact. Rolling back farther to v1.1.759/v1.1.760 also removes
-the service envelope; rolling back to the original revision-027 behavior may
-additionally clamp a
-`current_limit=1` probe marker and ignore the refined sticky failure meaning.
-Those binaries still never clear `last_failure_at`, so a later upgrade returns
-conservatively to the negative epoch and requires a new-code probe. No live
-replica is moved or terminated by rollout or rollback. Operators may
-temporarily restore a larger explicit launch window without rolling back if
-the four-wide cold start is too conservative, but doing so does not disable
-the service envelope or frontier.
+failure rows remain schema-compatible with revision 027. From current release
+1.1.791, first redeploy that same artifact through the current declarative
+values when the failure is rollout or configuration drift. If a binary
+rollback is required, the classifier-preserving fallback is 1.1.789, whose
+exact image and chart were proven at Helm revision 264. That release predates
+PR #945's managed-pool Spot-fallback contract, so operators must first confirm
+that no active or recovering pool depends on a per-worker `spot_placer`
+snapshot; the production audit at this rollout found no managed pools.
+Redeploy 1.1.789 through the current declarative values instead of blindly
+replaying the historical revision: current values keep the PVC at 200 GiB and
+keep the prototype image workers disabled. Helm revision 261 / 1.1.784 remains
+the conservative pre-recursive fallback. It retains adaptive depth, sticky
+cooldown, the service envelope, the card frontier, zero-cost liveness, and
+direct typed outcome-before-teardown behavior, but nested optimizer-exhaustion
+failures remain untyped until a newer image returns. Do not use revision 263 /
+1.1.786: it contains the affected non-recursive classifier. Rolling back
+farther to PR #915 removes frontier enforcement and reintroduces the zero-cost
+liveness regression while the paid envelope is full. Rolling back to
+v1.1.759/v1.1.760 also removes the service envelope; rolling back to the
+original revision-027 behavior may additionally clamp a `current_limit=1`
+probe marker and ignore the refined sticky failure meaning. Those binaries
+still never clear `last_failure_at`, so a later upgrade returns conservatively
+to the negative epoch and requires a new-code probe. No live replica is moved
+or terminated by rollout or rollback. Operators may temporarily restore a
+larger explicit launch window without rolling back if the four-wide cold start
+is too conservative, but doing so does not disable the service envelope or
+frontier.
 
 ## Verification Evidence
 
@@ -1622,30 +1660,152 @@ Pre-PR terminal-feedback evidence on 2026-07-24:
   exact code and tests then passed a separate adversarial review with no
   blocking findings.
 
-Production evidence after v1.1.789 on 2026-07-24:
+Terminal-feedback publication and production evidence on 2026-07-24:
 
-- PR #941 passed its full visible CI and merged as
-  `5f1f30fceac3c5fbb266a1812b32f6d747fe7eb1`. The verified chart and image
-  were published as 1.1.789; the chart digest is
+The following 1.1.789 observations are retained as the artifact-specific
+classifier rollout record; release 1.1.791 and Helm revision 269 superseded
+that deployment later the same day.
+
+- PR #937 merged the outcome-before-teardown path as
+  `408fd62cd931db854551c9c06d47b474309ddd4b`. PR #939 merged per-zone
+  provider-evidence preservation as
+  `5d5c04e41fab0066b06dfe07f9636ab1b8113d84`. Production verification of
+  1.1.786 showed that natural terminal provider failures still missed the
+  typed outcome/pool-close path. Code-path analysis and the end-to-end
+  provisioning regression isolated the remaining normal
+  optimizer-exhaustion wrapper rather than treating the partial correction as
+  complete.
+- PR #941 merged recursive, provider-scoped classification as
+  `5f1f30fceac3c5fbb266a1812b32f6d747fe7eb1`. All 24 visible checks passed.
+  The focused classifier tests, the full serial replica-manager suite, YAPF,
+  isort, mypy across 747 source files, pylint at 10.00/10, dashboard checks,
+  and three independent exact-tree reviews passed before merge.
+- Release 1.1.789 resolves to that merge. Its published image is
+  `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.789`
+  at digest
+  `sha256:9ca676f6a5b3378bf6a2162a650ec69da27e2ef10394fa5ea7b4221d32d0ad85`.
+  Its published chart digest is
   `sha256:2f3897eeab695b335a1002ea095832fe4a777b89f306f360046fed4b1c0a1106`.
-- Helm revision 264 is deployed on chart/app 1.1.789. Migration job
-  `skypilot-db-migration-264` completed, the API pod reached 2/2 readiness
-  with zero restarts, `/api/health` returned `healthy`, and the runtime
-  reported version 1.1.789 with the exact merge commit.
+- Helm revision 264 was deployed on chart/app 1.1.789. Revision-263 and
+  revision-264 user values are byte-identical after normalizing only the API
+  and two cloud-init image fields, proving that the existing database,
+  credentials, volumes, and capacity controls were retained. Explicit
+  pre-recursive rollback targeted revision 261 / 1.1.784 rather than the
+  affected revision 263. Migration job `skypilot-db-migration-264` completed.
+- All 17 API, image-worker, and load-balancer containers are ready on the
+  exact 1.1.789 digest. API and load-balancer containers have zero restarts.
+  Each of the three image workers restarted once after initially racing the
+  revision-027 database migration, then remained ready; both cloud-init
+  containers completed on the same digest with exit code zero.
+- `/api/health` reports `healthy`, version and on-disk version 1.1.789,
+  commit `5f1f30fceac3c5fbb266a1812b32f6d747fe7eb1`, and build 7663.
+  `boltz-l4-fleet` was `READY` with 19/21 replicas at the verification
+  snapshot. Its production and test load balancers both had two ready slots,
+  active slot `b`, successful cutover generations 95 and 96, and live
+  external endpoints.
 - `opendde-10c200s-v4` replicas 9066 and 9067 received structured AWS
   `InsufficientInstanceCapacity` failures for exact pools
   `g6.2xlarge/ca-central-1b` and `g6.xlarge/eu-south-2c`. The controller logged
   each as a provider-availability wave with one typed capacity failure and one
-  exact pool.
-- PostgreSQL advanced the pools' `last_failure_at` values to
-  `1784915307.67927` and `1784915329.776756`, respectively, and released both
-  claims. The service selected different exact pools instead of retrying
-  either closed pool.
-- A controlled API-server restart converged to a fresh 2/2-ready pod with zero
-  restarts and the same exact release. Both PostgreSQL failure epochs remained
-  unchanged and both pools retained zero claims after controller recovery.
-  Protenix remained `READY`, and its recovered external load balancer returned
-  HTTP 200 from `/_lb/health`.
+  exact pool. PostgreSQL advanced their `last_failure_at` values to
+  `1784915307.67927` and `1784915329.776756`, released both claims, and the
+  service selected different pools instead of immediately retrying either
+  closed pool.
+- A controlled API-server restart converged to a fresh 2/2-ready pod on the
+  same exact release. Both failure epochs remained unchanged and both pools
+  retained zero claims after recovery. Protenix remained `READY`, and its
+  recovered external load balancer returned HTTP 200 from `/_lb/health`,
+  proving the cooldown authority is durable rather than process-local.
+- The post-rollout paid-capacity audit found one global valid unresolved
+  claim in one exact pool, also the only `boltz-l4-fleet` claim. There were no
+  stale claims, no paid unresolved replica without a valid claim, one exact
+  L4 frontier pool, and a maximum exact-pool depth of one. The 555 persisted
+  pool rows are retained cross-service evidence, not active clusters.
+- During the preceding natural wave, the controller admission summary recorded
+  `service_claims=2`, `service_limit=16`, and `service_remaining=14`, then
+  stopped further L4 exploration at `owned_pools=2` and `limit=2` with the
+  oldest unresolved claim at 33 seconds. A later refresh still reported the
+  same two-pool frontier at 61 seconds. This records the wave's observed
+  concurrent service total and exact-card frontier width; the one-claim
+  database audit above is the post-outcome snapshot.
+- The advisory-lock audit mapped 15 active cluster mutations to exactly
+  15 status/resource lock pairs, plus three expected leaders, one service
+  lifecycle lock, and four additional transient holders whose session ages
+  were at most five seconds in that sample. Every dedicated lock session was
+  idle, outside a transaction, and named `skypilot-advisory-lock`; none used
+  the ordinary connection pool. A later sample fell to 31 dedicated sessions,
+  demonstrating that completed holders released their dedicated sessions; no
+  ordinary-pool or in-transaction advisory holder was observed.
+- A natural `boltz-l4-fleet` launch completed with one typed capacity failure
+  in one exact pool. Its matching API request emitted the terminal
+  `ResourcesUnavailableError` at 18:08:37.071. The controller noticed the
+  completed launch after 18:08:55.357, logged the classified outcome,
+  persisted the atomic paid-capacity wave, and only then entered replica
+  teardown; the first adjacent timestamp after that sequence was
+  18:08:56.573. The exact pool-close timestamp is not independently
+  instrumented, but this cross-log interval gives an upper bound of less than
+  19.503 seconds from terminal API emission through completed manager-side
+  processing. Teardown found no cluster row, consistent with the
+  no-provider-nodes-created fast-path prerequisite.
+- Boltz-platform PR #7298 merged the production pin as
+  `83ade2b76d979f7899d8a2f67bad7fc07da1d60c`. Its post-merge test-fleet
+  deployment checked out the exact SkyPilot merge, updated the test service
+  to version 16, and completed `READY` at 1/1 with a live endpoint.
+- Boltz-platform PR #7300 later pinned release 1.1.791 / SkyPilot commit
+  `0bcde60a768ec262f2a14f58c3af49c65aaeaa15` as platform merge
+  `4d08a9b6a1`. The first Helm attempt, revision 265, safely failed because
+  stale declarative values requested a forbidden shrink of the already-bound
+  200 GiB state PVC to 100 GiB. Recovery revision 268 deployed the complete
+  1.1.791 values. PR #7301 made 200 GiB authoritative in Git, and PR #7303
+  added a dedicated no-regression test.
+- The exact merged-source Terragrunt plan for that reconciliation contained
+  two creates, one in-place Helm update, and zero destroys. Helm revision 269
+  deployed chart/app 1.1.791, the seed job wrote
+  `jobs.controller.consolidation_mode: true`, and the required API restart
+  completed through the private EKS operator path. The first apply had already
+  completed Helm and the seed job when its direct private-endpoint restart
+  timed out; a create-only replay of the tainted reconciliation marker then
+  completed after the operator proxy excluded the OCI registry. Neither
+  recovery plan changed Helm, IAM, or persistent resources. The follow-up
+  Terragrunt plan reported no changes. The PVC remained `Bound` at requested
+  and actual capacity 200 GiB on `gp2`.
+- The restarted API reports SkyPilot 1.1.791 at commit
+  `0bcde60a768ec262f2a14f58c3af49c65aaeaa15`. Its API, log-rotation, and both
+  cloud-init containers are ready with zero restarts on image digest
+  `sha256:a47d7c4135fa540fef709bb73a539749f92de69434b3bfb97bd7cdc61304be06`.
+  Every external load-balancer Deployment is ready on the same digest, and
+  both the production and test `boltz-l4-fleet` services return HTTP 200 from
+  `/_lb/health`.
+- After the restart, the recovered controller continued returning HTTP 200
+  from `/controller/health` while real demand drove a target of 55 L4
+  replicas. PostgreSQL reported the service `READY` with 29 ready, five
+  provisioning, and one starting replica; failed rows remain historical
+  lifecycle records. Its admission snapshot reached `service_claims=16` with
+  `service_limit=16`, `service_remaining=0`, and exactly two saturated pools.
+  A later PostgreSQL snapshot, after provider outcomes released most claims,
+  held two valid provisioning claims in two exact L4 pools: one AWS pool and
+  one GCP pool. This validates the user's spread hypothesis and the deployed
+  remedy: four is the cold per-pool depth, successful pools can adapt through
+  the configured ladder to 480, but one accelerator card explores no more
+  than two unresolved exact pools and one service holds no more than 16
+  unresolved claims.
+- The same live controller classified a provider-availability wave as one
+  capacity failure in one exact pool before teardown. In a ten-minute API log
+  sample under the shortage, 331 expected terminal
+  `ResourcesUnavailableError` events occurred, but there were zero database
+  `OperationalError` events, too-many-client errors, deadlocks, or tracebacks.
+  Controller health therefore does not imply that providers can satisfy the
+  requested target; it means shortage is bounded and processed without
+  destabilizing the control plane.
+- The admission snapshot evaluated 1,055 active-catalog exact-pool candidates
+  (`active=789`, `cooldown=1`, `probe=265`) but only 16 active claims at its
+  peak. Missing database rows are synthesized at the bootstrap default, so
+  this candidate count is neither a persisted-row count nor a running-cluster
+  count. A direct PostgreSQL audit found 555 persisted pool rows, ten current
+  global claim rows, and zero waiters. Bounded retention/compaction for the
+  persisted history, smaller aggregate logs, and explicit cache/admission
+  telemetry remain follow-up optimizations so incident inspection is not
+  unnecessarily noisy.
 
 ## Release Gate Results
 
@@ -1673,19 +1833,28 @@ Production evidence after v1.1.789 on 2026-07-24:
 - Complete: verify the active production state has no exact-pool,
   service-envelope, or service/card overage and retains healthy controller/LB
   processes with bounded aggregate logs.
-- Follow-up observation: on the next natural paid scale-up wave, record that
-  the service opens no more than two unresolved pools per exact card before
-  feedback and remains within 16 claims. Over later natural outcomes, record
-  success-driven adaptive deepening, zero-cost and pinned progress during paid
-  deferral, exact-pool recovery re-drives, and semantics-v2 history. These
-  runtime observations are not prerequisites to keep the already-validated
-  correction active.
+- Complete: observe a natural paid scale-up wave opening no more than two
+  unresolved pools per exact card before feedback while remaining within
+  16 claims.
+- Follow-up observation: over later natural outcomes, record success-driven
+  adaptive deepening, zero-cost and pinned progress during paid deferral,
+  exact-pool recovery re-drives, and semantics-v2 history. These runtime
+  observations are not prerequisites to keep the already-validated correction
+  active.
 - Complete: implement and locally validate terminal typed outcome reporting
   before controller-side teardown; complete exact-tree design and code
   adversarial review.
 - Complete: recursively preserve and classify structured provider evidence
   through normal optimizer-exhaustion nesting; pass exact-tree adversarial
-  review and pull-request CI; publish image/chart 1.1.789; deploy with existing
-  Helm values reused; verify typed outcome-to-pool-close behavior in
-  production; and verify exact cooldown epochs and released claims survive an
-  API-server restart.
+  review and pull-request CI; publish and deploy the superseding 1.1.789 image
+  and chart with existing Helm values retained; merge the declarative
+  production pin; and observe ordered same-refresh outcome persistence before
+  teardown with a less-than-19.503-second cross-log upper bound from API
+  terminal error through completed manager-side processing. Verify exact
+  cooldown epochs and released claims survive an API-server restart.
+- Complete: deploy the superseding 1.1.791 image without changing the
+  classifier contract; reconcile the production PVC at its monotonic 200 GiB
+  capacity; seed Jobs consolidation config; restart the API through the
+  private EKS path; confirm revision 269, exact image digests, API/controller
+  and dual-load-balancer health, the 16-claim service envelope, the two-pool
+  frontier under natural L4 demand, and a zero-diff Terragrunt plan.
