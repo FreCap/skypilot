@@ -4027,6 +4027,14 @@ class SkyServeController:
             if counts is not None:
                 info.update(counts)
             info.update(self._get_update_status())
+            try:
+                info['drain_proof'] = (
+                    self._replica_manager.drain_proof_stats_snapshot())
+            except Exception as e:  # pylint: disable=broad-except
+                # Diagnostics must never take down the endpoint the
+                # supervisor and the dashboard both read.
+                logger.warning('Could not snapshot drain-proof counters: '
+                               f'{common_utils.format_exception(e)}')
             return responses.JSONResponse(content=info, status_code=200)
 
         @self._app.post(

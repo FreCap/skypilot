@@ -29,6 +29,7 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import constants as serve_constants
+from sky.serve import drain_observability
 from sky.serve import paid_capacity
 from sky.serve import replica_tls
 from sky.serve import reserved_capacity
@@ -731,6 +732,18 @@ def _remaining_drain_seconds(started_at: float,
     # zero elapsed until the wall clock catches up.
     elapsed = max(now - started_at, 0.0)
     return max(float(drain_cap_seconds) - elapsed, 0.0)
+
+
+def _classify_abort_reason(reason: str) -> str:
+    """Map a free-text abort reason onto the bounded counter key set."""
+    lowered = reason.lower()
+    if 'covers the target' in lowered or 'coverage' in lowered:
+        return drain_observability.ABORT_REASON_TARGET_COVERAGE
+    if 'idle proof' in lowered:
+        return drain_observability.ABORT_REASON_IDLE_PROOF_TIMEOUT
+    if 'fence' in lowered or 'target or controller' in lowered:
+        return drain_observability.ABORT_REASON_FENCE_CHANGED
+    return drain_observability.ABORT_REASON_OTHER
 
 
 class _ReplicaDrainTracker:
@@ -1989,6 +2002,12 @@ class ReplicaManager:
                                   controller_pid is not None or
                                   controller_ip is not None else None)
         self._enforce_launch_fence = enforce_launch_fence
+        # Process-local drain/retirement counters, surfaced through the
+        # controller's /autoscaler/info. On the base class so the controller's
+        # typed reference resolves and every manager exposes them, even though
+        # only the SkyPilot manager increments them. See
+        # docs/designs/serve-drain-proof-across-lb-restarts.md, Milestone 0.
+        self._drain_proof_stats = drain_observability.DrainProofStats()
         self._uptime: float | None = None
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
         self._is_pool: bool = spec.pool
@@ -2289,6 +2308,10 @@ class ReplicaManager:
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of the active replicas."""
         raise NotImplementedError
+
+    def drain_proof_stats_snapshot(self) -> dict[str, Any]:
+        """Drain and retirement counters for /autoscaler/info."""
+        return self._drain_proof_stats.snapshot()
 
 
 class SkyPilotReplicaManager(ReplicaManager):
@@ -5166,8 +5189,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         # destructive teardown, not re-advertising a still-running backend.
         replica_infos = serve_state.get_replica_infos(self._service_name)
         excluded_ids = {info.replica_id}
-        ready_capacity = self._logical_ready_capacity(replica_infos, snapshot,
-                                                      version, excluded_ids)
+        ready_capacity = self._logical_ready_capacity(
+            replica_infos,
+            snapshot,
+            version,
+            excluded_ids,
+            stats=self._drain_proof_stats)
         ready_by_accelerator = (self._logical_ready_capacity_by_accelerator(
             replica_infos, snapshot, version, excluded_ids, accelerator_shapes)
                                 if accelerator_shapes else {})
@@ -5184,10 +5211,13 @@ class SkyPilotReplicaManager(ReplicaManager):
     @staticmethod
     def _logical_ready_capacity(
             replica_infos: list[ReplicaInfo],
-            snapshot: LogicalReconcileSnapshot, version: int,
-            excluded_replica_ids: set[int] | frozenset[int]) -> int:
+            snapshot: LogicalReconcileSnapshot,
+            version: int,
+            excluded_replica_ids: set[int] | frozenset[int],
+            stats: 'drain_observability.DrainProofStats | None' = None) -> int:
         """Return freshly observed ready capacity from one fleet snapshot."""
         ready_capacity = 0
+        blind_skipped = 0
         for candidate in replica_infos:
             if (candidate.replica_id in excluded_replica_ids or
                     candidate.is_terminal or not candidate.is_ready or
@@ -5203,9 +5233,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                 candidate.replica_id)
             if (observed is None or
                     candidate.replica_id in snapshot.unknown_replica_ids):
+                # Unobserved or explicitly unknown: contributes nothing. A
+                # restarted load balancer makes this true for EVERY replica
+                # for its first sync or two, which reads downstream as a
+                # capacity shortfall and aborts the whole wave.
+                blind_skipped += 1
                 continue
             ready_capacity += min(
                 int(getattr(candidate, 'planned_capacity', 1)), observed)
+        if stats is not None:
+            stats.record_blind_ready_capacity(blind_skipped)
         return ready_capacity
 
     @staticmethod
@@ -5661,8 +5698,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return
 
             ready_capacity = self._logical_ready_capacity(
-                replica_infos, snapshot, self.latest_version,
-                frozenset(recovering_ids))
+                replica_infos,
+                snapshot,
+                self.latest_version,
+                frozenset(recovering_ids),
+                stats=self._drain_proof_stats)
             ready_by_accelerator = (self._logical_ready_capacity_by_accelerator(
                 replica_infos, snapshot, self.latest_version,
                 frozenset(recovering_ids), accelerator_shapes)
@@ -5803,9 +5843,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         status.logical_retirement_committed = False
 
     def _abort_logical_retirement(self, info: ReplicaInfo, reason: str) -> None:
-        """Cancel an optimization retirement and make a healthy backend live."""
+        """Cancel an optimization retirement and make a healthy backend live.
+
+        An abort discards the victim's elapsed drain and returns it to
+        routing, so a wave that keeps aborting makes no progress no matter
+        how long it runs. Classify here rather than at the call sites so a
+        new caller cannot add an uncounted abort.
+        """
         logger.info(f'Aborting logical retirement of replica '
                     f'{info.replica_id}: {reason}.')
+        self._drain_proof_stats.record_logical_abort(
+            _classify_abort_reason(reason))
         down_thread_pool = getattr(self, '_down_thread_pool', {})
         queued_down = down_thread_pool.get(info.replica_id)
         if (queued_down is not None and not queued_down.is_alive() and
@@ -6004,6 +6052,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'post-routing idle-proof deadline; replacement '
                             'capacity still covers the target, so completing '
                             'the bounded rolling-update retirement.')
+                        self._drain_proof_stats.record_bounded_completion()
                         self._finish_logical_retirement(
                             replica_id, info, require_victim_idle=False)
                         continue
@@ -6023,7 +6072,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             if not drained and not deadline_expired:
                 continue
             drain_cap: int | None = 0
-            if not drained:
+            if drained:
+                self._drain_proof_stats.record_proved_drained()
+            else:
+                self._drain_proof_stats.record_deadline_expiry_without_proof()
                 drain_cap = getattr(info.status_property, 'drain_cap_seconds',
                                     None)
                 if drain_cap is None:

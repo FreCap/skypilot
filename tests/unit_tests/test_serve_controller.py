@@ -19,6 +19,8 @@ import pytest
 
 from sky.serve import autoscalers
 from sky.serve import controller
+from sky.serve import drain_observability
+from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.utils import yaml_utils
@@ -4453,3 +4455,63 @@ class TestLbSyncOwnershipFences:
             authority=(True, True, True),
             observed_slots={})
         assert accepted is True
+
+
+class TestDrainProofStats:
+    """Milestone 0 counters: which cost actually dominates on an LB restart."""
+
+    def _stats(self):
+        return drain_observability.DrainProofStats()
+
+    def test_starts_empty(self):
+        snapshot = self._stats().snapshot()
+        assert snapshot['deadline_expiry_without_proof'] == 0
+        assert snapshot['proved_drained'] == 0
+        assert snapshot['logical_aborts_total'] == 0
+        assert snapshot['blind_capacity_rounds'] == 0
+
+    def test_counts_the_two_competing_outcomes_separately(self):
+        stats = self._stats()
+        stats.record_proved_drained()
+        stats.record_proved_drained()
+        stats.record_deadline_expiry_without_proof()
+        snapshot = stats.snapshot()
+        assert snapshot['proved_drained'] == 2
+        assert snapshot['deadline_expiry_without_proof'] == 1
+
+    def test_abort_reasons_are_bounded(self):
+        # Reasons come from call sites, never user input, but an unbounded
+        # Counter key would still leak in a long-lived controller.
+        stats = self._stats()
+        stats.record_logical_abort(
+            drain_observability.ABORT_REASON_TARGET_COVERAGE)
+        stats.record_logical_abort('something nobody defined')
+        snapshot = stats.snapshot()
+        assert snapshot['logical_aborts'] == {
+            drain_observability.ABORT_REASON_TARGET_COVERAGE: 1,
+            drain_observability.ABORT_REASON_OTHER: 1,
+        }
+        assert snapshot['logical_aborts_total'] == 2
+
+    def test_blind_capacity_only_counts_rounds_that_skipped(self):
+        stats = self._stats()
+        stats.record_blind_ready_capacity(0)
+        stats.record_blind_ready_capacity(77)
+        snapshot = stats.snapshot()
+        assert snapshot['blind_capacity_rounds'] == 1
+        assert snapshot['blind_capacity_skipped_replicas'] == 77
+
+    @pytest.mark.parametrize(('reason', 'expected'), [
+        ('replacement capacity still covers the target',
+         drain_observability.ABORT_REASON_TARGET_COVERAGE),
+        ('the bounded rolling-update coverage fence changed',
+         drain_observability.ABORT_REASON_TARGET_COVERAGE),
+        ('post-routing idle proof timed out',
+         drain_observability.ABORT_REASON_IDLE_PROOF_TIMEOUT),
+        ('the current target or controller fence changed',
+         drain_observability.ABORT_REASON_FENCE_CHANGED),
+        ('some unmapped reason', drain_observability.ABORT_REASON_OTHER),
+    ])
+    def test_reason_classifier_covers_the_live_call_sites(
+            self, reason, expected):
+        assert replica_managers._classify_abort_reason(reason) == expected
