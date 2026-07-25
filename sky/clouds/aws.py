@@ -5,6 +5,7 @@ from collections.abc import Iterator
 import enum
 import fnmatch
 import functools
+import getpass
 import hashlib
 import json
 import os
@@ -90,7 +91,44 @@ DEFAULT_ROOT_DEVICE_NAME = '/dev/sda1'
 # (username, last 4 chars of hash of hostname): for uniquefying
 # users on shared-account scenarios.
 _DEFAULT_INGRESS_SOURCE_RANGE = '0.0.0.0/0'
-DEFAULT_SECURITY_GROUP_NAME = f'sky-sg-{common_utils.user_and_hostname_hash()}'
+# Shared, per-cluster-agnostic group for clusters that declare no ports. The
+# name deliberately does NOT include a hostname component.
+#
+# It used to be f'sky-sg-{user_and_hostname_hash()}', whose hostname hash is the
+# pod name on a server deployment, so every API-server restart minted a fresh
+# group that `cleanup_ports` then refused to delete (it never deletes a shared
+# default group). Measured in one region of the fleet account: 123 such groups,
+# 116 of them referenced by no network interface, each still carrying
+# ssh :22 from 0.0.0.0/0. That grows without bound toward the 2500-per-VPC
+# quota, one group per deploy, per region.
+#
+# Dropping only the hostname keeps the user component, so distinct users sharing
+# an account still get distinct groups. Two hosts belonging to the SAME user now
+# share one group, which is correct: a default group's rules do not depend on
+# the host, and being shared is the point.
+#
+# `user_and_hostname_hash()` itself is deliberately untouched -- it also
+# uniquifies cluster names on shared accounts and carries its own documented
+# backward-incompatibility warning.
+DEFAULT_SECURITY_GROUP_NAME = f'sky-sg-{getpass.getuser()}'
+
+# Groups created by the pre-change naming scheme. They are shared by every
+# port-less cluster of one API-server generation, so a teardown must never
+# delete one just because its name no longer equals the current default.
+_LEGACY_DEFAULT_SECURITY_GROUP_RE = re.compile(r'^sky-sg-[^-]+-[0-9a-f]{4}$')
+
+
+def is_shared_default_security_group(name: str) -> bool:
+    """Whether ``name`` is a shared default group rather than a cluster's own.
+
+    Covers both the current name and the legacy hostname-derived names, so a
+    teardown cannot start deleting groups that other clusters are still using
+    merely because the naming scheme changed underneath it.
+    """
+    return (name == DEFAULT_SECURITY_GROUP_NAME or
+            bool(_LEGACY_DEFAULT_SECURITY_GROUP_RE.match(name)))
+
+
 # Security group to use when user specified ports in their resources.
 USER_PORTS_SECURITY_GROUP_NAME = 'sky-sg-{}'
 

@@ -588,7 +588,7 @@ def terminate_instances(
     default_sg = aws_config.get_security_group_from_vpc_id(
         ec2, _get_vpc_id(provider_config),
         aws_cloud.DEFAULT_SECURITY_GROUP_NAME)
-    if sg_name == aws_cloud.DEFAULT_SECURITY_GROUP_NAME:
+    if aws_cloud.is_shared_default_security_group(sg_name):
         # Case 1: The default SG is used, we don't need to ensure instance are
         # terminated.
         instances.terminate()
@@ -825,7 +825,7 @@ def cleanup_ports(
     sg_name = provider_config['security_group']['GroupName']
     managed_by_skypilot = provider_config['security_group'].get(
         'ManagedBySkyPilot', True)
-    if (sg_name == aws_cloud.DEFAULT_SECURITY_GROUP_NAME or
+    if (aws_cloud.is_shared_default_security_group(sg_name) or
             not managed_by_skypilot):
         # 1) Using default AWS SG or 2) the SG is specified by the user.
         # We only want to delete the SG that is dedicated to this cluster (i.e.,
