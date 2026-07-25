@@ -822,6 +822,80 @@ class TestPaidCapacityAuthorityPG:
         assert reopened['successes_since_resize'] == 1
         assert reopened['last_failure_at'] is None
 
+    def test_capacity_failed_probe_restarts_cooldown(self, broker_engine,
+                                                     monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        first = self._info('svc', 1)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            first,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=100,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        first.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, first)],
+            {1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=110,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        probe = self._info('svc', 2)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            2,
+            probe,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=120,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        probe.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(2, probe)],
+            {2: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=121,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        state = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=130,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10)['pool']
+        assert state['last_failure_at'] == 121
+        assert state['admission_state'] == 'cooldown'
+        assert state['admission_limit'] == 0
+        assert state['remaining'] == 0
+
     def test_other_failure_releases_probe_without_restarting_cooldown(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
