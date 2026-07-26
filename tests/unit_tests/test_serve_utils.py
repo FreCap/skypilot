@@ -591,6 +591,51 @@ def test_serve_preemption_skips_autostopping():
     assert stopped_status not in not_preempted_statuses
 
 
+def test_get_provider_configs_for_handles_fans_out_distinct_and_shared():
+    """Each key must receive the provider for ITS OWN cluster_yaml.
+
+    The shipped #900 tests only exercise the all-shared case, where every key
+    resolves to the same provider and a cross-wired fan-out would pass
+    unnoticed. This covers the realistic mixed case: two replicas share cluster
+    ``a`` while a third uses cluster ``b``, and handles without a ``str``
+    cluster_yaml are skipped. It also proves the batched read is deduplicated to
+    a single call over the unique paths in first-occurrence order.
+    """
+    handles_by_key = {
+        1: types.SimpleNamespace(cluster_yaml='/p/a.yaml'),
+        2: types.SimpleNamespace(cluster_yaml='/p/b.yaml'),
+        3: types.SimpleNamespace(cluster_yaml='/p/a.yaml'),
+        4: types.SimpleNamespace(cluster_yaml=None),
+        5: types.SimpleNamespace(cluster_yaml=object()),
+    }
+    provider_a = {'context': 'a'}
+    provider_b = {'context': 'b'}
+    configs_by_path = {
+        '/p/a.yaml': {
+            'provider': provider_a
+        },
+        '/p/b.yaml': {
+            'provider': provider_b
+        },
+    }
+
+    with mock.patch.object(
+            serve_utils.global_user_state,
+            'get_cluster_yaml_dict_multiple',
+            side_effect=lambda paths: [configs_by_path[path] for path in paths],
+    ) as get_yamls:
+        result = serve_utils.get_provider_configs_for_handles(handles_by_key)
+
+    # One batched read over the unique paths, in first-occurrence order.
+    get_yamls.assert_called_once_with(['/p/a.yaml', '/p/b.yaml'])
+    # Every key resolves to the provider for ITS OWN yaml; skipped handles
+    # (None / non-str cluster_yaml) are absent from the result.
+    assert result == {1: provider_a, 2: provider_b, 3: provider_a}
+    # The fan-out shares the exact parsed provider object across shared keys.
+    assert result[1] is provider_a
+    assert result[3] is provider_a
+
+
 class TestIsConsolidationMode:
     """Tests for serve_utils.is_consolidation_mode(pool=...).
 
