@@ -91,6 +91,39 @@ status is `AUTOSTOPPING`. It must not use `status_updated_at`, because that fiel
 correctly advances whenever provider state is refreshed and represents cache
 freshness rather than the original transition time.
 
+### Keeping the grace anchor stable
+
+The refresh loop both reads that transition event and writes it, so the anchor is
+only as stable as the loop's own status decisions. Whenever a refresh demotes an
+autodowning cluster to `UP` or `INIT`, the next sweep records a *new*
+`AUTOSTOPPING` transition, and the deadline restarts from zero.
+
+The skylet autostopping probe is the demotion path that matters. It answers over
+gRPC or SSH from inside the head pod, and a transient failure there is exactly
+the condition a stalled autodown produces. A probe that reports "not
+autostopping" for a failed call is therefore indistinguishable from a genuine
+negative, and a probe flapping more often than the grace period defers recovery
+forever: the leaked pods this design exists to reclaim are never reclaimed.
+
+The probe must report three outcomes: autostopping, not autostopping, and
+unknown. On unknown, the refresh keeps the persisted status when the cluster is
+already `AUTOSTOPPING` and the autostop intent is still armed (`autostop >= 0`).
+This holds both the status and the anchor, and on the abnormal-cluster path it
+also stops an unreachable skylet from disarming autostop, which would gate the
+reconciler off permanently.
+
+The hold is deliberately narrow. It never invents an autodown for a cluster that
+is not already `AUTOSTOPPING`, a definitive probe answer always wins, and
+cancelling autostop releases the hold on the next sweep. A cluster whose skylet
+is permanently unreachable therefore stays `AUTOSTOPPING` until its autostop is
+cancelled, relaunched, or the reconciler completes the teardown.
+
+The anchor stays the *most recent* `AUTOSTOPPING` transition rather than the
+generation's first. Using the first would let a second autodown episode in the
+same generation inherit a long-expired deadline and terminate a pod while a
+legitimate `down` hook is still running, which is the semantic regression the
+Event-or-grace gate exists to prevent.
+
 ## Alternatives
 
 ### Only remove `ray stop`
@@ -149,6 +182,18 @@ existing persisted autodown intent, rollback does not require data repair.
   refresh, leaving the row available for the next fault-isolated sweep.
 - Unit test that grace uses the original `AUTOSTOPPING` event time even when
   `status_updated_at` is newer.
+- Unit test, against a real event log rather than a mocked lookup, that a
+  transient skylet-probe failure inside the grace period does not re-anchor the
+  deadline, and that the stalled autodown is still reconciled once the original
+  deadline passes. The same test with no probe failure is the control.
+- Unit test that the probe reports unknown for a failed gRPC call and for an
+  empty or nonzero-exit SSH payload, while `is_definitely_autostopping` keeps
+  its boolean contract.
+- Unit test that an unknown probe holds only an armed autodown: it does not hold
+  a cluster that is not `AUTOSTOPPING`, and it does not hold one whose autostop
+  was cancelled.
+- Unit test that the abnormal-cluster path does not disarm autostop when the
+  skylet is unreachable.
 - Run the focused pytest files, then run `bash format.sh --files` for every
   changed Python file.
 

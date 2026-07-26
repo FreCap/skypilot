@@ -6800,15 +6800,18 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 idle_minutes_to_autostop=idle_minutes_to_autostop,
                 down=down)
 
-    def is_definitely_autostopping(self,
-                                   handle: CloudVmRayResourceHandle,
-                                   stream_logs: bool = True) -> bool:
-        """Check if the cluster is autostopping.
+    def probe_autostopping(self,
+                           handle: CloudVmRayResourceHandle,
+                           stream_logs: bool = True) -> bool | None:
+        """Ask the skylet whether the cluster is autostopping.
 
         Returns:
-            True if the cluster is definitely autostopping. It is possible
-            that the cluster is still autostopping when False is returned,
-            due to errors like transient network issues.
+            True or False when the skylet answered, and None when the probe
+            itself failed (transient network/gRPC issues, or a misbehaving
+            cluster) so the caller can tell "not autostopping" apart from
+            "unknown". Collapsing the two lets a single failed probe demote a
+            live autodown to UP, which rewrites the cluster's AUTOSTOPPING
+            transition event and re-anchors any deadline measured from it.
         """
         if not handle.provision_runtime_metadata.has_skylet:
             return False
@@ -6817,36 +6820,46 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # We cannot check if the cluster is autostopping.
             return False
 
-        is_autostopping = False
-
         if handle.is_grpc_enabled_with_flag:
             try:
                 request = autostopv1_pb2.IsAutostoppingRequest()
                 response = backend_utils.invoke_skylet_with_retries(
                     lambda: SkyletClient(handle.get_grpc_channel()
                                         ).is_autostopping(request))
-                is_autostopping = response.is_autostopping
+                return response.is_autostopping
             except Exception as e:  # pylint: disable=broad-except
                 # The cluster may have been terminated, causing the gRPC call
                 # to timeout and fail.
                 logger.debug(f'Failed to check if cluster is autostopping: {e}')
-                return False
-        else:
-            code = autostop_lib.AutostopCodeGen.is_autostopping()
-            returncode, stdout, stderr = self.run_on_head(
-                handle, code, require_outputs=True, stream_logs=stream_logs)
-            # We see some cases in the wild where a misbehaving cluster/k8s
-            # apiserver (not sure which) can have a returncode of 0 but
-            # incorrectly empty stdout. Don't try to decode this.
-            if returncode == 0 and stdout:
-                is_autostopping = message_utils.decode_payload(stdout)
-            else:
-                logger.debug('Failed to check if cluster is autostopping with '
-                             f'{returncode}: {stdout+stderr}\n'
-                             f'Command: {code}')
-                return False
+                return None
 
-        return is_autostopping
+        code = autostop_lib.AutostopCodeGen.is_autostopping()
+        returncode, stdout, stderr = self.run_on_head(handle,
+                                                      code,
+                                                      require_outputs=True,
+                                                      stream_logs=stream_logs)
+        # We see some cases in the wild where a misbehaving cluster/k8s
+        # apiserver (not sure which) can have a returncode of 0 but
+        # incorrectly empty stdout. Don't try to decode this.
+        if returncode == 0 and stdout:
+            return message_utils.decode_payload(stdout)
+        logger.debug('Failed to check if cluster is autostopping with '
+                     f'{returncode}: {stdout+stderr}\n'
+                     f'Command: {code}')
+        return None
+
+    def is_definitely_autostopping(self,
+                                   handle: CloudVmRayResourceHandle,
+                                   stream_logs: bool = True) -> bool:
+        """Check if the cluster is autostopping.
+
+        Returns:
+            True if the cluster is definitely autostopping. It is possible
+            that the cluster is still autostopping when False is returned,
+            due to errors like transient network issues. Callers that must
+            distinguish those two cases should use ``probe_autostopping``.
+        """
+        return self.probe_autostopping(handle, stream_logs=stream_logs) is True
 
     # TODO(zhwu): Refactor this to a CommandRunner class, so different backends
     # can support its own command runner.
