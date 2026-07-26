@@ -2883,6 +2883,12 @@ class ControllerManager:
                         job_id=job_id,
                         callback_func=managed_job_utils.event_callback_func(
                             job_id=job_id, task_id=None, task=None))
+                    # get_waiting_job_async already moved this job to LAUNCHING
+                    # under our pid. Without this the schedule state would stay
+                    # LAUNCHING forever: get_num_alive_jobs() would never drop,
+                    # so the controller could never autostop, and every status
+                    # sweep would keep re-checking the job.
+                    await scheduler.job_done_async(job_id, idempotent=True)
                     continue
 
             await self.start_job(job_id, pool)

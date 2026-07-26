@@ -2631,6 +2631,8 @@ class TestCancelSignalScan:
                 patch('sky.jobs.controller.managed_job_state.'
                       'set_cancelled_async', new_callable=AsyncMock
                      ) as set_cancelled, \
+                patch('sky.jobs.controller.scheduler.job_done_async',
+                      new_callable=AsyncMock) as job_done, \
                 patch('sky.jobs.controller.managed_job_utils.'
                       'event_callback_func'):
             with pytest.raises(asyncio.CancelledError):
@@ -2641,6 +2643,11 @@ class TestCancelSignalScan:
         set_cancelling.assert_awaited_once()
         set_cancelled.assert_awaited_once()
         manager.start_job.assert_not_awaited()
+        # get_waiting_job_async already moved the job to LAUNCHING under this
+        # controller's pid. Without the DONE transition the schedule state
+        # would stay LAUNCHING forever, so get_num_alive_jobs() would never
+        # drop and the jobs controller could never autostop.
+        job_done.assert_awaited_once_with(12, idempotent=True)
 
     @pytest.mark.asyncio
     async def test_non_digit_and_lock_files_skipped(self, signal_dir):

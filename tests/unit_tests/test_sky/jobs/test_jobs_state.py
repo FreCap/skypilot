@@ -11,6 +11,7 @@ from unittest import mock
 
 import filelock
 import pytest
+import sqlalchemy
 from sqlalchemy import create_engine
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -1291,7 +1292,6 @@ class TestStatusExprSeam:
     status filter without changing the raw spot.status column."""
 
     def _seed(self, engine):
-        import sqlalchemy
         rows = [
             # (job_id, status, status_override)
             (1, 'STARTING', 'PENDING'),  # queued -> surfaces as PENDING
@@ -1311,7 +1311,6 @@ class TestStatusExprSeam:
 
     @staticmethod
     def _override_expr():
-        import sqlalchemy
         spot = state.spot_table
         starting = state.ManagedJobStatus.STARTING.value
         return sqlalchemy.case((sqlalchemy.and_(
@@ -1320,7 +1319,6 @@ class TestStatusExprSeam:
                                else_=spot.c.status)
 
     def test_status_override_column_exists(self, _mock_managed_jobs_db_conn):
-        import sqlalchemy
         cols = [
             c['name'] for c in sqlalchemy.inspect(
                 _mock_managed_jobs_db_conn).get_columns('spot')
@@ -1629,3 +1627,191 @@ class TestSetFailedRecoveringAdjustment:
             event.remove(engine, 'before_cursor_execute',
                          _before_cursor_execute)
         assert not selects
+
+
+async def _noop_callback(_status: str) -> None:
+    """Async state transitions require a callback; these tests ignore it."""
+
+
+class TestSetPendingCancelledFinalizes:
+    """Cancelling a never-started job must finalize it completely.
+
+    Regression: set_pending_cancelled only wrote spot.status=CANCELLED. It
+    left schedule_state in a pre-launch state and end_at NULL, so
+    get_waiting_job_async re-claimed the job and the controller actually ran
+    it; the job also stayed in the status-sweep working set and (once claimed)
+    kept get_num_alive_jobs() above zero, which gates controller autostop.
+    """
+
+    def _seed(self, schedule_state=None):
+        job_id = state.set_job_info_without_job_id(name='j',
+                                                   workspace='ws1',
+                                                   entrypoint='ep',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='u1')
+        state.set_pending(job_id,
+                          task_id=0,
+                          task_name='t0',
+                          resources_str='{}',
+                          metadata='{}')
+        if schedule_state is state.ManagedJobScheduleState.WAITING:
+            state.scheduler_set_waiting([job_id], '/tmp/d.yaml', '/tmp/u.yaml',
+                                        '/tmp/e', None, 100)
+        return job_id
+
+    def _end_at(self, job_id):
+        jobs, _ = state.get_managed_jobs_with_filters()
+        return [j for j in jobs if j['job_id'] == job_id][0]['end_at']
+
+    def test_waiting_cancel_finalizes_all_three_fields(
+            self, _mock_managed_jobs_db_conn):
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+
+        assert state.set_pending_cancelled(job_id) is True
+
+        assert state.get_status(job_id) == state.ManagedJobStatus.CANCELLED
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.DONE)
+        assert self._end_at(job_id) is not None
+
+    def test_cancelled_job_is_not_reclaimed_and_never_runs(
+            self, _mock_managed_jobs_db_conn):
+        # The liveness invariant that matters most: a cancelled job must not
+        # be handed back to a controller, which would provision a cluster and
+        # run the user's task after the CLI reported the job cancelled.
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+        assert state.set_pending_cancelled(job_id) is True
+
+        reclaimed = asyncio.run(
+            state.get_waiting_job_async(pid=4242, pid_started_at=1.0))
+
+        assert reclaimed is None
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.DONE)
+
+    def test_cancelled_job_leaves_status_sweep_working_set(
+            self, _mock_managed_jobs_db_conn):
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+        assert job_id in state.get_jobs_to_check_status()
+
+        assert state.set_pending_cancelled(job_id) is True
+
+        assert job_id not in state.get_jobs_to_check_status()
+
+    def test_inactive_cancel_also_finalizes(self, _mock_managed_jobs_db_conn):
+        # Boundary: the pre-submit backlog state is accepted by the same
+        # predicate and must be finalized the same way.
+        job_id = self._seed()
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.INACTIVE)
+
+        assert state.set_pending_cancelled(job_id) is True
+
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.DONE)
+        assert self._end_at(job_id) is not None
+
+    def test_losing_the_claim_race_is_a_complete_no_op(
+            self, _mock_managed_jobs_db_conn):
+        # A controller claimed the job first (WAITING -> LAUNCHING). The
+        # cancel must lose the compare-and-set and write nothing at all: no
+        # status change, no end_at, and no CANCELLED event on a job that is
+        # about to run.
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+        claimed = asyncio.run(
+            state.get_waiting_job_async(pid=4242, pid_started_at=1.0))
+        assert claimed is not None
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.LAUNCHING)
+
+        assert state.set_pending_cancelled(job_id) is False
+
+        assert state.get_status(job_id) == state.ManagedJobStatus.PENDING
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.LAUNCHING)
+        assert self._end_at(job_id) is None
+        assert state.ManagedJobStatus.CANCELLED.value not in self._event_statuses(
+            _mock_managed_jobs_db_conn, job_id)
+
+    def _event_statuses(self, engine, job_id):
+        with engine.begin() as conn:
+            return [
+                row[0] for row in conn.execute(
+                    sqlalchemy.select(state.job_events_table.c.new_status).
+                    where(state.job_events_table.c.spot_job_id == job_id))
+            ]
+
+    def test_non_pending_job_is_not_cancelled(self, _mock_managed_jobs_db_conn):
+        # Guard boundary: a job whose task already left PENDING (e.g. an
+        # upgrade/recovery job waiting to be reclaimed) must not be finalized.
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+        engine = _mock_managed_jobs_db_conn
+        with engine.begin() as conn:
+            conn.execute(
+                sqlalchemy.update(state.spot_table).where(
+                    state.spot_table.c.spot_job_id == job_id).values({
+                        state.spot_table.c.status:
+                            state.ManagedJobStatus.STARTING.value
+                    }))
+
+        assert state.set_pending_cancelled(job_id) is False
+
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.WAITING)
+
+    def test_cancel_issues_no_extra_round_trips(self,
+                                                _mock_managed_jobs_db_conn):
+        # Performance guard: the finalizer must stay two guarded UPDATEs in
+        # one transaction. The previous version issued one UPDATE with a
+        # correlated join subquery; adding the schedule-state transition must
+        # not turn this into a read-modify-write or a per-task loop.
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+        engine = _mock_managed_jobs_db_conn
+        statements = []
+
+        def _before_cursor_execute(_conn, _cursor, statement, *_args):
+            head = statement.lstrip().upper()
+            if head.startswith(('SELECT', 'UPDATE')):
+                statements.append(head.split()[0])
+
+        event.listen(engine, 'before_cursor_execute', _before_cursor_execute)
+        try:
+            assert state.set_pending_cancelled(job_id) is True
+        finally:
+            event.remove(engine, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        # Two UPDATEs (job_info schedule state, then the spot task rows) and
+        # no SELECT: the PENDING guard rides along as an EXISTS subquery.
+        assert statements.count('UPDATE') == 2
+        assert 'SELECT' not in statements
+
+    def test_cancel_at_claim_releases_the_autostop_counter(
+            self, _mock_managed_jobs_db_conn):
+        # The other pre-launch cancel path: the cancel signal lands after
+        # get_waiting_job_async already moved the job WAITING -> LAUNCHING.
+        # The controller finalizes it with set_cancelling/set_cancelled plus
+        # scheduler_set_done_async; without that last step the schedule state
+        # stays LAUNCHING, so get_num_alive_jobs() (which gates jobs-controller
+        # autostop in sky/skylet/events.py) never returns to zero.
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+        assert asyncio.run(
+            state.get_waiting_job_async(pid=4242,
+                                        pid_started_at=1.0)) is not None
+        assert state.get_num_alive_jobs() == 1
+
+        async def _finalize():
+            await state.set_cancelling_async(job_id=job_id,
+                                             callback_func=_noop_callback)
+            await state.set_cancelled_async(job_id=job_id,
+                                            callback_func=_noop_callback)
+            await state.scheduler_set_done_async(job_id, idempotent=True)
+
+        asyncio.run(_finalize())
+
+        assert state.get_num_alive_jobs() == 0
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.DONE)
+        assert state.get_status(job_id) == state.ManagedJobStatus.CANCELLED
+        assert self._end_at(job_id) is not None

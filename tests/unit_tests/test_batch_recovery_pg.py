@@ -189,3 +189,99 @@ def test_postgres_takeover_waits_for_old_owner_commit(postgres_engine,
     assert not takeover_thread.is_alive()
     assert not errors
     new_launch.assert_called_once_with()
+
+
+def _seed_waiting_pending_job(engine, job_id):
+    """Seed a submitted-but-never-started job: PENDING task, WAITING state."""
+    with engine.begin() as connection:
+        connection.execute(state.job_info_table.insert().values(
+            spot_job_id=job_id,
+            schedule_state=state.ManagedJobScheduleState.WAITING.value))
+        connection.execute(state.spot_table.insert().values(
+            spot_job_id=job_id,
+            task_id=0,
+            job_name='cancel-me',
+            status=state.ManagedJobStatus.PENDING.value))
+
+
+def test_postgres_pending_cancel_finalizes_in_one_transaction(
+        postgres_engine, monkeypatch):
+    """set_pending_cancelled must finalize completely on real PostgreSQL.
+
+    SQLite serializes writers, so it cannot show that the UPDATE ... WHERE
+    EXISTS guard and the two-statement transaction behave under PostgreSQL's
+    READ COMMITTED isolation.
+    """
+    monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
+    _seed_waiting_pending_job(postgres_engine, 4101)
+
+    assert state.set_pending_cancelled(4101) is True
+
+    assert state.get_status(4101) == state.ManagedJobStatus.CANCELLED
+    assert (state.get_job_schedule_state(4101) ==
+            state.ManagedJobScheduleState.DONE)
+    with postgres_engine.connect() as connection:
+        end_at = connection.execute(
+            sqlalchemy.select(state.spot_table.c.end_at).where(
+                state.spot_table.c.spot_job_id == 4101)).scalar()
+    assert end_at is not None
+    # The finalized job is no longer alive for autostop accounting.
+    assert state.get_num_alive_jobs() == 0
+
+
+def test_postgres_cancel_and_claim_cannot_both_win(postgres_engine,
+                                                   monkeypatch):
+    """Exactly one of "cancel" and "claim" may win the schedule-state CAS.
+
+    Both writers compare-and-swap job_info.schedule_state, so on real
+    PostgreSQL the second one must observe the first one's committed row and
+    fail its own guard. If both could win, a cancelled job would still be
+    handed to a controller and run.
+    """
+    monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
+    _seed_waiting_pending_job(postgres_engine, 4102)
+
+    async_url = postgres_engine.url.render_as_string(
+        hide_password=False).replace('postgresql+psycopg2',
+                                     'postgresql+asyncpg')
+    async_engine = sqlalchemy_async.create_async_engine(async_url)
+    monkeypatch.setattr(state._db_manager, '_engine_async', async_engine)
+
+    cancel_result = {}
+    claim_result = {}
+    barrier = threading.Barrier(2, timeout=10)
+
+    def _cancel():
+        barrier.wait()
+        cancel_result['won'] = state.set_pending_cancelled(4102)
+
+    def _claim():
+        barrier.wait()
+        claimed = asyncio.run(
+            state.get_waiting_job_async(pid=7777, pid_started_at=1.0))
+        claim_result['won'] = claimed is not None
+
+    threads = [
+        threading.Thread(target=_cancel),
+        threading.Thread(target=_claim),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        assert not any(thread.is_alive() for thread in threads)
+
+        # Never both: the losing writer's guard must have matched zero rows.
+        assert not (cancel_result['won'] and claim_result['won'])
+
+        schedule_state = state.get_job_schedule_state(4102)
+        if cancel_result['won']:
+            assert schedule_state == state.ManagedJobScheduleState.DONE
+            assert state.get_status(4102) == (state.ManagedJobStatus.CANCELLED)
+        else:
+            # The controller claimed it; the job stays runnable and PENDING.
+            assert schedule_state == (state.ManagedJobScheduleState.LAUNCHING)
+            assert state.get_status(4102) == state.ManagedJobStatus.PENDING
+    finally:
+        asyncio.run(async_engine.dispose())

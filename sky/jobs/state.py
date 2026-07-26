@@ -457,48 +457,75 @@ def set_failed(
 
 
 def set_pending_cancelled(job_id: int):
-    """Set the job as cancelled, if it is PENDING and WAITING/INACTIVE.
+    """Finalize a job cancelled before it ever started.
 
-    This may fail if the job is not PENDING, e.g. another process has changed
-    its state in the meantime.
+    Only applies if the job is still PENDING and its schedule state is a
+    pre-launch backlog state (WAITING/INACTIVE); it may fail if another
+    process has changed its state in the meantime.
+
+    Finalization is atomic and complete: the schedule state becomes DONE and
+    the pending tasks become CANCELLED with an ``end_at``, in one transaction.
+    Leaving the schedule state in a pre-launch state would let
+    ``get_waiting_job_async`` re-claim the job and actually run it, and would
+    keep it counted by ``get_num_alive_jobs`` (which gates controller
+    autostop) and re-scanned by every status sweep. Leaving ``end_at`` unset
+    would let the job loop's cleanup rewrite the terminal CANCELLED status
+    back to CANCELLING, and would render an ever-growing duration.
+
+    The schedule-state compare-and-set is the serialization point: it targets
+    the same column ``get_waiting_job_async`` compare-and-swaps, so exactly
+    one of "cancel" and "claim" can win.
 
     Returns:
         True if the job was cancelled, False otherwise.
     """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        # Note: it's possible that a WAITING job actually needs to be cleaned
+        # up, if we are in the middle of an upgrade/recovery and the job is
+        # waiting to be reclaimed by a new controller. But, in this case the
+        # job will have no PENDING task, so this EXISTS guard will not match.
+        has_pending_task = sqlalchemy.exists(
+            sqlalchemy.select(spot_table.c.job_id).where(
+                sqlalchemy.and_(
+                    spot_table.c.spot_job_id == job_id,
+                    spot_table.c.status == ManagedJobStatus.PENDING.value,
+                )))
+
+        claimed = session.execute(
+            sqlalchemy.update(job_info_table).where(
+                sqlalchemy.and_(
+                    job_info_table.c.spot_job_id == job_id,
+                    job_info_table.c.schedule_state.in_([
+                        ManagedJobScheduleState.WAITING.value,
+                        ManagedJobScheduleState.INACTIVE.value,
+                    ]),
+                    has_pending_task,
+                )).values({
+                    job_info_table.c.schedule_state:
+                        ManagedJobScheduleState.DONE.value
+                })).rowcount
+
+        if not claimed:
+            session.rollback()
+            return False
+
+        session.execute(
+            sqlalchemy.update(spot_table).where(
+                sqlalchemy.and_(
+                    spot_table.c.spot_job_id == job_id,
+                    spot_table.c.status == ManagedJobStatus.PENDING.value,
+                )).values({
+                    spot_table.c.status: ManagedJobStatus.CANCELLED.value,
+                    spot_table.c.end_at: time.time(),
+                }))
+        session.commit()
+
+    # Only record the event once the cancel has actually been applied, so a
+    # no-op cancel does not leave a CANCELLED event on a job that kept running.
     add_job_event(job_id, None, ManagedJobStatus.CANCELLED,
                   'Job has been cancelled')
-    engine = _db_manager.get_engine()
-    count = 0
-    with orm.Session(engine) as session:
-        # Subquery to get the spot_job_ids that match the joined condition.
-        # Build it as a select() construct (rather than Query.subquery()) so it
-        # can be passed directly to in_() without SQLAlchemy emitting a
-        # "Coercing Subquery object into a select()" warning.
-        subquery = sqlalchemy.select(spot_table.c.job_id).select_from(
-            spot_table.join(
-                job_info_table,
-                spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
-        ).where(
-            spot_table.c.spot_job_id == job_id,
-            spot_table.c.status == ManagedJobStatus.PENDING.value,
-            # Note: it's possible that a WAITING job actually needs to be
-            # cleaned up, if we are in the middle of an upgrade/recovery and
-            # the job is waiting to be reclaimed by a new controller. But,
-            # in this case the status will not be PENDING.
-            sqlalchemy.or_(
-                job_info_table.c.schedule_state ==
-                ManagedJobScheduleState.WAITING.value,
-                job_info_table.c.schedule_state ==
-                ManagedJobScheduleState.INACTIVE.value,
-            ),
-        )
-
-        count = session.query(spot_table).filter(
-            spot_table.c.job_id.in_(subquery)).update(
-                {spot_table.c.status: ManagedJobStatus.CANCELLED.value},
-                synchronize_session=False)
-        session.commit()
-        return count > 0
+    return True
 
 
 @db_retries.retry
