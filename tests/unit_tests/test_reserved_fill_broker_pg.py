@@ -384,6 +384,159 @@ class TestPaidCapacityAuthorityPG:
             success_ttl_seconds=60)
         assert states[pool_key]['current_limit'] == 2
 
+    def test_equal_priority_waiters_break_ties_by_first_wait_time(
+            self, broker_engine, monkeypatch):
+        # The best-waiter query orders by ``priority DESC, first_wait_at,
+        # service_name``. When two services wait at the same priority for one
+        # freed slot, the one that started waiting first must win, even if its
+        # service name sorts last. The service names are chosen so a lost
+        # ``first_wait_at`` tiebreaker (falling back to ``service_name``) would
+        # award the slot to the later waiter instead.
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('holder', 'hash-holder', 11)
+        self._add_service('z-early', 'hash-early', 22)
+        self._add_service('a-late', 'hash-late', 33)
+        owners = {
+            'holder': ('hash-holder', 11),
+            'z-early': ('hash-early', 22),
+            'a-late': ('hash-late', 33),
+        }
+
+        def _claim(name: str, replica_id: int, now: float) -> str:
+            service_hash, pid = owners[name]
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                name,
+                service_hash,
+                replica_id,
+                self._info(name, replica_id),
+                pool_key='pool',
+                priority=30,
+                base_limit=1,
+                max_limit=8,
+                now=now,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(pid, '10.0.0.1'))
+
+        # ``holder`` takes the sole slot; the other two register waiters at
+        # distinct wait times while the pool is saturated.
+        assert _claim('holder', 1, 100) == 'acquired'
+        assert _claim('z-early', 1, 100) == 'saturated'
+        assert _claim('a-late', 1, 101) == 'saturated'
+
+        # Free the slot by resolving the holder's launch.
+        holder = serve_state.get_replica_info_from_id('holder', 1)
+        assert holder is not None
+        holder.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'holder',
+            'hash-holder', [(1, holder)],
+            {1: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=1,
+            max_limit=8,
+            now=102,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        # The later waiter still defers to the earlier one for the freed slot,
+        # and the earlier waiter acquires it despite sorting last by name.
+        assert _claim('a-late', 1, 103) == 'higher_priority_waiting'
+        assert _claim('z-early', 1, 103) == 'acquired'
+
+    def test_quota_failure_closes_pool_through_outcomes(self, broker_engine,
+                                                        monkeypatch):
+        # A typed QUOTA failure must close the shared pool exactly like a
+        # capacity failure when driven through the integrated outcomes
+        # transaction: zero admission during the cooldown, then a single probe.
+        # The existing integrated failure tests only exercise CAPACITY_FAILURE.
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        first = self._info('svc', 1)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            first,
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=100,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        first.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, first)],
+            {1: paid_capacity.LaunchOutcome.QUOTA_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=110,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            expected_controller_owner=(11, '10.0.0.1'))
+
+        closed = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=115,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10)['pool']
+        assert closed['admission_state'] == 'cooldown'
+        assert closed['admission_limit'] == 0
+        assert closed['remaining'] == 0
+        assert closed['last_failure_at'] == 110
+        assert closed['current_limit'] == 2
+
+        # No new claim is admitted while the quota cooldown is in effect.
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            2,
+            self._info('svc', 2),
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=115,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'saturated'
+
+        # After the cooldown exactly one probe reopens.
+        probing = serve_state.get_paid_capacity_pool_states(
+            ['pool'],
+            base_limit=2,
+            max_limit=8,
+            now=121,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10)['pool']
+        assert probing['admission_state'] == 'probe'
+        assert probing['admission_limit'] == 1
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            3,
+            self._info('svc', 3),
+            pool_key='pool',
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=121,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=10,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+
     def test_service_envelope_serializes_distinct_pool_claims(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
