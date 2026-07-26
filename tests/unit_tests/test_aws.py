@@ -171,6 +171,59 @@ def test_aws_open_ports_replay_raises_nonduplicate_error(monkeypatch):
     security_group.authorize_ingress.assert_called_once()
 
 
+def test_aws_open_ports_replay_raises_nonduplicate_error_during_retry(
+        monkeypatch):
+    """A real error during per-permission retry must surface, not be hidden.
+
+    The batch call fails as a stale ``InvalidPermission.Duplicate`` (so we fall
+    into the per-permission retry loop). The first permission is a genuine
+    duplicate and is swallowed, but the second is rejected by IAM. That real
+    error must propagate rather than be masked by the earlier duplicate --
+    otherwise a still-missing port would be reported as opened.
+    """
+    _, security_group = _mock_aws_open_ports_dependencies(monkeypatch, [])
+    duplicate_error = _client_error('InvalidPermission.Duplicate')
+    unauthorized_error = _client_error('UnauthorizedOperation')
+    security_group.authorize_ingress.side_effect = [
+        duplicate_error,
+        duplicate_error,
+        unauthorized_error,
+    ]
+    permission_8080 = {
+        'FromPort': 8080,
+        'ToPort': 8080,
+        'IpProtocol': 'tcp',
+        'IpRanges': [{
+            'CidrIp': '0.0.0.0/0'
+        }],
+    }
+    permission_9090 = {
+        'FromPort': 9090,
+        'ToPort': 9090,
+        'IpProtocol': 'tcp',
+        'IpRanges': [{
+            'CidrIp': '0.0.0.0/0'
+        }],
+    }
+
+    with pytest.raises(type(unauthorized_error)) as exc_info:
+        aws_instance.open_ports('test-cluster', ['8080', '9090'], {
+            'region': 'us-east-1',
+            'security_group': {
+                'GroupName': 'sky-sg',
+            },
+        })
+
+    assert exc_info.value.response['Error']['Code'] == 'UnauthorizedOperation'
+    # The batch attempt plus one independent retry per permission: the loop
+    # reached and re-raised on the second permission.
+    assert security_group.authorize_ingress.call_args_list == [
+        call(IpPermissions=[permission_8080, permission_9090]),
+        call(IpPermissions=[permission_8080]),
+        call(IpPermissions=[permission_9090]),
+    ]
+
+
 def test_usable_subnets(monkeypatch):
     """Test the output of the usable_subnets function."""
 
