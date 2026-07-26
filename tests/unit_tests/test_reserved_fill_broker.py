@@ -2319,6 +2319,67 @@ class TestAdvanceReleaseTarget:
             'a permanently blind claimant must resume the decay past '
             f'blind_grace and reach the floor, got cap={prev["cap"]}')
 
+    def _drive_intermittent_blind(self,
+                                  cadence_rounds,
+                                  *,
+                                  rounds=400,
+                                  poll=60.0,
+                                  floor=16,
+                                  start_cap=40):
+        """Idle-when-seen claimant with one blind round every cadence_rounds.
+
+        Each round reads need==0 whenever it is seen; only the periodic blind
+        round hides the (still zero) signal. Holdings track the cap so the
+        actuation gate never masks the schedule -- the only brake exercised is
+        the blind freeze itself. Returns the final cap.
+        """
+        prev = {
+            'cap': start_cap,
+            'hot_until': 0.0,
+            'stepped_at': 0.0,
+            'blind_since': None,
+        }
+        now = 1000.0
+        for i in range(rounds):
+            prev = self._advance(prev,
+                                 floor=floor,
+                                 holdings=int(prev['cap']),
+                                 need=0,
+                                 blind=(i % cadence_rounds == 0),
+                                 now=now)
+            now += poll
+        return int(prev['cap'])
+
+    def test_intermittent_blindness_within_the_dwell_stalls_the_release(self):
+        # KNOWN CONSERVATIVE LIMITATION, pinned so a future change is a visible
+        # diff. The blind freeze both restarts the dwell (hot_until = now +
+        # dwell) and pauses the step clock (stepped_at = now). A blind round
+        # recurring within the dwell window therefore rewinds the schedule
+        # before it can complete: an idle-whenever-seen claimant NEVER
+        # releases, even though the grace escape (test above) never triggers
+        # because blind_since is cleared on every seen round. At poll 60s the
+        # dwell (300s) is five rounds, so any blind cadence <= 5 rounds pins
+        # the cap. This errs on the safe side (a possibly-busy service keeps
+        # its capacity, never over-released) but silently defeats reclamation
+        # under a flapping-telemetry / crash-looping-LB service -- see the
+        # limitation note in docs/designs/serve-reserved-fill-utilization-gate
+        # .md. The rollout gate that watches blind DURATION (<= one poll
+        # interval) does not catch it, because the cadence, not the length, of
+        # the blind rounds is what stalls the release.
+        assert self._drive_intermittent_blind(4) == 40, (
+            'a blind round recurring within the dwell must stall the release '
+            'at the start cap (documented conservative behavior)')
+
+    def test_intermittent_blindness_spaced_past_the_dwell_still_releases(self):
+        # The complement of the boundary: once seen-idle runs longer than the
+        # dwell AND the step schedule (both 300s = 5 rounds at poll 60s), a
+        # periodic blind blip only delays the decay, it does not defeat it. A
+        # cadence of 8 rounds (480s) leaves clean windows to complete the
+        # dwell and each step, so the cap still walks to the floor.
+        assert self._drive_intermittent_blind(8) == 16, (
+            'blind rounds spaced beyond the dwell must not pin an idle '
+            'claimant -- the decay resumes and reaches the floor')
+
 
 class TestUtilizationCapEntitlements:
     """compute_entitlements with the gate: floors immune, total conserved."""
