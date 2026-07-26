@@ -3707,9 +3707,20 @@ def _maybe_reconcile_stalled_kubernetes_autodown(
         since=record['launched_at'])
     reason = 'durable Kubernetes autodown Event'
     if autostop_event is None:
-        transition_times = global_user_state.get_last_status_change_times(
-            {record['cluster_hash']}, status_lib.ClusterStatus.AUTOSTOPPING)
-        transitioned_at = transition_times.get(record['cluster_hash'])
+        # The *first* AUTOSTOPPING transition of this launch generation, not
+        # the most recent one. `is_definitely_autostopping` returns False on
+        # transient transport errors (documented on the method), which parks
+        # the cluster in UP for one sweep and re-enters AUTOSTOPPING with a
+        # fresh timestamp. Anchoring on the latest row would let one blip per
+        # grace period defer this reconciliation forever, which is exactly the
+        # leak this function exists to close. `launched_at` bounds the lookback
+        # to the current generation - it is rewritten by every launch,
+        # including `sky start`, and rows older than it belong to a finished
+        # cycle on a different machine boot, so anchoring on one of those would
+        # terminate a freshly autodowning cluster before its down hooks finish.
+        transitioned_at = global_user_state.get_first_status_change_time_since(
+            record['cluster_hash'], status_lib.ClusterStatus.AUTOSTOPPING,
+            record['launched_at'])
         if transitioned_at is None:
             return False
         grace_seconds = _kubernetes_autodown_reconciliation_grace_seconds(

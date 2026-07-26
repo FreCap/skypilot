@@ -1631,6 +1631,33 @@ def get_last_status_change_times(
     return result
 
 
+def get_first_status_change_time_since(cluster_hash: str,
+                                       ending_status: status_lib.ClusterStatus,
+                                       since: float) -> int | None:
+    """Earliest STATUS_CHANGE.transitioned_at into ``ending_status``.
+
+    Only rows at or after ``since`` are considered, so callers can scope the
+    answer to the current cluster generation. Returns None when no such row
+    exists.
+
+    Unlike :func:`get_last_status_change_times`, this answers "when did the
+    cluster first enter this status", which is the right question whenever a
+    status can be re-entered by a transient probe failure: the repeated entry
+    writes a fresh row, and the latest one would keep sliding forward.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.query(
+            sqlalchemy.func.min(cluster_event_table.c.transitioned_at)).filter(
+                cluster_event_table.c.cluster_hash == cluster_hash,
+                cluster_event_table.c.type ==
+                ClusterEventType.STATUS_CHANGE.value,
+                cluster_event_table.c.ending_status == ending_status.value,
+                cluster_event_table.c.transitioned_at >= since,
+            ).scalar()
+    return None if row is None else int(row)
+
+
 def cleanup_cluster_events_with_retention(retention_hours: float,
                                           event_type: ClusterEventType) -> None:
     engine = _db_manager.get_engine()
