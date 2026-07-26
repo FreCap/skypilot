@@ -120,8 +120,8 @@ def test_fresh_transition_waits_for_hook_grace():
                            return_value=None), \
          mock.patch.object(
              backend_utils.global_user_state,
-             'get_last_status_change_times',
-             return_value={'cluster-hash': transitioned_at}), \
+             'get_first_status_change_time_since',
+             return_value=transitioned_at), \
          mock.patch.object(backend_utils.provision_lib,
                            'terminate_instances') as terminate:
         reconciled = backend_utils._maybe_reconcile_stalled_kubernetes_autodown(
@@ -164,8 +164,8 @@ def test_old_transition_uses_declared_down_hook_grace():
                            return_value=None), \
          mock.patch.object(
              backend_utils.global_user_state,
-             'get_last_status_change_times',
-             return_value={'cluster-hash': transitioned_at}), \
+             'get_first_status_change_time_since',
+             return_value=transitioned_at) as anchor, \
          mock.patch.object(backend_utils.provision_lib,
                            'terminate_instances') as terminate:
         reconciled = backend_utils._maybe_reconcile_stalled_kubernetes_autodown(
@@ -174,6 +174,10 @@ def test_old_transition_uses_declared_down_hook_grace():
     assert reconciled
     assert backend_utils._kubernetes_autodown_reconciliation_grace_seconds(
         handle) == grace
+    # The lookback must be scoped to the current launch generation.
+    anchor.assert_called_once_with('cluster-hash',
+                                   status_lib.ClusterStatus.AUTOSTOPPING,
+                                   record['launched_at'])
     terminate.assert_called_once()
 
 
