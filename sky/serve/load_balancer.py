@@ -2211,7 +2211,8 @@ class SkyServeLoadBalancer:
         outcome = (_ASYNC_TERMINAL_OUTCOMES.get(status) if isinstance(
             status, str) else None)
         duration_ms = payload.get('processing_time_ms')
-        if (not isinstance(request_id, str) or not request_id or
+        if (not isinstance(request_id, str) or not request_id or len(request_id)
+                > constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS or
                 outcome is None or not isinstance(duration_ms, (int, float)) or
                 isinstance(duration_ms, bool)):
             return False
@@ -2238,7 +2239,10 @@ class SkyServeLoadBalancer:
             return False
         try:
             payload = json.loads(body)
-        except (UnicodeDecodeError, ValueError, TypeError):
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            # This runs on the live proxy path, so a replica returning deeply
+            # nested JSON must degrade to "not recorded" instead of escaping
+            # into the inference response.
             return False
         return self._record_async_prediction_payload(payload)
 
@@ -2273,7 +2277,10 @@ class SkyServeLoadBalancer:
             body.extend(chunk)
         try:
             payload = json.loads(body)
-        except (UnicodeDecodeError, ValueError, TypeError):
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            # Deeply nested JSON raises RecursionError, which is a RuntimeError
+            # rather than a ValueError: an under-cap malformed body has to stay
+            # a client error instead of surfacing as a server error.
             raise fastapi.HTTPException(
                 status_code=422,
                 detail='Invalid prediction completion payload.') from None

@@ -581,6 +581,94 @@ def test_prediction_completion_callback_rejects_unsupported_encoding(
     assert response.status_code == 415
 
 
+def test_prediction_completion_callback_rejects_overlong_request_id(
+        monkeypatch):
+    """The dedup map must stay byte-bounded, not just entry-bounded.
+
+    ``LB_ASYNC_PREDICTION_DEDUP_CAP`` bounds how many ids are retained, so an
+    unbounded id length lets one authenticated caller choose the retained size.
+    """
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    client = _client_with_routes(lb)
+    overlong = 'x' * (constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS + 1)
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers=_edge_auth('s3cret'),
+                           json={
+                               'request_id': overlong,
+                               'status': 'SUCCEEDED',
+                               'processing_time_ms': 5000,
+                           })
+
+    assert response.status_code == 422
+    assert overlong not in lb._completed_async_prediction_ids
+
+
+def test_completed_prediction_ids_stay_byte_bounded(monkeypatch):
+    """Worst-case retention must fit the load balancer memory limit."""
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    client = _client_with_routes(lb)
+    at_cap = 'y' * constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers=_edge_auth('s3cret'),
+                           json={
+                               'request_id': at_cap,
+                               'status': 'SUCCEEDED',
+                               'processing_time_ms': 5000,
+                           })
+
+    assert response.status_code == 204
+    assert all(
+        len(key) <= constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS
+        for key in lb._completed_async_prediction_ids)
+    worst_case_bytes = (constants.LB_ASYNC_PREDICTION_DEDUP_CAP *
+                        constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS)
+    assert worst_case_bytes <= 64 * 1024 * 1024
+
+
+def test_prediction_completion_callback_rejects_deeply_nested_body(monkeypatch):
+    """A malformed under-cap body is a client error, not a server error."""
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    client = _client_with_routes(_make_lb())
+    body = b'[' * 4000
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers={
+                               **_edge_auth('s3cret'),
+                               'Content-Type': 'application/json',
+                           },
+                           content=body)
+
+    assert len(body) <= constants.LB_PREDICTION_COMPLETION_BODY_MAX_BYTES
+    assert response.status_code == 422
+
+
+def test_async_status_path_also_bounds_request_id():
+    """The proxy-side observation path shares the same retention bound."""
+    lb = _make_lb()
+    overlong = 'z' * (constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS + 1)
+
+    recorded = lb._record_async_prediction_status(
+        json.dumps({
+            'request_id': overlong,
+            'status': 'SUCCEEDED',
+            'processing_time_ms': 5000,
+        }).encode('utf-8'), '')
+
+    assert not recorded
+    assert overlong not in lb._completed_async_prediction_ids
+
+
+def test_async_status_path_survives_deeply_nested_replica_body():
+    """A replica body that cannot be parsed must not escape the proxy path."""
+    lb = _make_lb()
+
+    assert not lb._record_async_prediction_status(b'[' * 4000, '')
+
+
 def test_stack_consumes_edge_auth_but_preserves_replica_auth(monkeypatch):
     monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 'edge-secret')
     lb = _make_lb()

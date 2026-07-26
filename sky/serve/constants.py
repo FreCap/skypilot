@@ -284,6 +284,12 @@ LB_PREDICTION_COMPLETION_BODY_MAX_BYTES = 16 * 1024
 # Bound process-local terminal request deduplication independently from request
 # rate and the model runtime's own completed-job cache.
 LB_ASYNC_PREDICTION_DEDUP_CAP = 100_000
+# The dedup cap bounds how many ids are retained, not how large they are, so
+# the id length has to be bounded too: without this the body cap above is the
+# only ceiling and one caller chooses the retained size (cap * 16 KiB is far
+# past the load balancer memory limit). Real ids are UUID-shaped; this is a
+# generous ceiling that keeps worst-case retention within a few tens of MiB.
+LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS = 256
 
 # [boltz fork] Compatibility time budget for controllers predating the
 # commit-then-reconcile update protocol. Their handler can wait on the

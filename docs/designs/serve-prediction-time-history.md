@@ -76,7 +76,11 @@ Known asynchronous actions are `async_predict`, `async_status`,
   unknown status values produce no sample.
 
 The active load balancer keeps a bounded least-recently-used set of terminal
-request IDs and records each ID once per process. Normal clients stop polling
+request IDs and records each ID once per process. The set is bounded in both
+dimensions: the entry cap limits how many IDs are retained, and a maximum ID
+length limits how large each one is. Capping only the entry count would leave
+the request-body cap as the sole ceiling on retained bytes, letting one
+reporter choose a total far above the load balancer memory limit. Normal clients stop polling
 after the first terminal result, so duplicate terminal polls are already rare.
 A response-loss plus load-balancer failover can still duplicate one async
 sample across reporter sessions. Avoiding that rare approximation would
@@ -245,7 +249,9 @@ larger bodies are never parsed for observability. After classification, a
 synchronous terminal upstream response performs two monotonic-clock reads, a
 fixed-bound lookup, and one integer increment. Async terminal parsing and
 completion callbacks copy at most a small bounded JSON object and maintain a
-bounded request-ID set. No model input, result, exact duration, route, or
+request-ID set bounded in both entry count and per-ID length. A body that
+cannot be parsed, including one nested deeply enough to exhaust the decoder's
+recursion limit, is rejected as a client error and never recorded. No model input, result, exact duration, route, or
 identifier is persisted.
 
 At steady state, an active load balancer sends one changed minute on each
