@@ -1,0 +1,69 @@
+name: Terraform Infra Tests
+
+# Enforces the "Required verification" for the managed container-image
+# distribution Terraform modules: fmt-check, validate, and the
+# `terraform test -test-directory=terraform-tests` suites that pin the exact
+# AWS ARN / partition / trust-policy boundaries (PR #907). Without this gate
+# those suites never run in CI, so a loosened validation regex would merge green.
+on:
+  push:
+    branches: [ main, master, improvements ]
+    paths:
+      - 'infra/terraform/**'
+      - '.github/workflows/terraform-infra-tests.yml'
+  pull_request:
+    branches: [ main, master, improvements ]
+    paths:
+      - 'infra/terraform/**'
+      - '.github/workflows/terraform-infra-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform-infra-tests:
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: '1'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: '1.14.8'
+          terraform_wrapper: false
+
+      - name: Terraform fmt (check)
+        run: terraform fmt -check -recursive infra/terraform
+
+      - name: Terraform validate and test each module
+        run: |
+          set -euo pipefail
+          # Download the AWS provider once and reuse it across every module init.
+          export TF_PLUGIN_CACHE_DIR="${RUNNER_TEMP}/tf-plugin-cache"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          shopt -s nullglob
+          modules=(infra/terraform/modules/*/terraform-tests)
+          # The suites live in the non-default `terraform-tests/` directory, so a
+          # bare `terraform test` silently runs zero tests. Fail loudly if the
+          # layout ever changes instead of passing an empty run.
+          if [ ${#modules[@]} -eq 0 ]; then
+            echo "No Terraform test modules found under infra/terraform/modules/*/terraform-tests" >&2
+            exit 1
+          fi
+          for tests_dir in "${modules[@]}"; do
+            module="$(dirname "$tests_dir")"
+            echo "::group::${module}"
+            # -test-directory must be passed to init as well as test: some suites
+            # reference local helper modules (e.g. terraform-tests/modules/empty
+            # for state cleanup), and init only installs test-referenced modules
+            # from the configured test directory.
+            terraform -chdir="$module" init -input=false -test-directory=terraform-tests -no-color
+            terraform -chdir="$module" validate -no-color
+            terraform -chdir="$module" test -test-directory=terraform-tests -no-color
+            echo "::endgroup::"
+          done
