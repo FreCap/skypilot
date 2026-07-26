@@ -39,6 +39,22 @@ _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
 _MAX_CONSECUTIVE_DOWNSCALE_VETOES = 2
 _COST_REBALANCE_STATE_VERSION = 1
 _COST_REBALANCE_STATE_MAX_ENTRIES = 256
+# Converting a modeled work floor back into whole slots divides one float by
+# another, and both sides carry binary-float tails. A retention floor built
+# from n identical utilization-adjusted capacities is the exact case: three
+# 0.7-work floors sum to 2.1, and 2.1 / 0.7 evaluates to 3.0000000000000004,
+# so a bare ceil manufactures a fourth slot out of arithmetic noise. Real
+# demand moves in whole-capacity quanta, never by 1e-9, so tolerate a
+# sub-epsilon remainder here exactly as the compatibility allocator's
+# demand_epsilon already does.
+_SLOT_CONVERSION_EPSILON = 1e-9
+
+
+def _work_to_slots(work: float, capacity: float) -> int:
+    """Whole slots needed for `work`, ignoring sub-epsilon float remainders."""
+    if capacity <= 0:
+        return 0
+    return math.ceil(work / capacity - _SLOT_CONVERSION_EPSILON)
 
 
 class AutoscalerDecisionOperator(enum.Enum):
@@ -5695,7 +5711,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             use_existing_supply=use_existing_supply)
         if attribution_complete:
             self.warm_retention_target_by_accelerator = {
-                card: math.ceil(work / capacity_per_card[card])
+                card: _work_to_slots(work, capacity_per_card[card])
                 for card, work in retention_fixed.items()
                 if work > 0 and capacity_per_card[card] > 0
             }
@@ -6002,7 +6018,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         outstanding = self._outstanding_work(replica_infos)
         if self.replica_unit == 'logical':
-            raw_target_num = math.ceil(outstanding / best_capacity)
+            raw_target_num = _work_to_slots(outstanding, best_capacity)
             arrival_work = self._arrival_work()
             self._arrival_floor_target = self._clip_target_num_replicas(
                 math.ceil(arrival_work / best_capacity))

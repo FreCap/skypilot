@@ -131,6 +131,15 @@ the materialized slots without adding utilization headroom a second time.
 Known in-flight, queued, and rejected work retains the normal utilization
 margin. Physical-backend mode keeps its existing raw-capacity semantics.
 
+That cancellation is exact in real arithmetic but not in binary floating
+point, and normalizing the summed floor alone does not close it: three
+0.7-work floors sum to 2.1, yet 2.1 / 0.7 evaluates to 3.0000000000000004.
+Converting a work floor back into whole slots therefore tolerates a
+sub-epsilon remainder, matching the tolerance the compatibility allocator
+already applies. Real demand only ever moves by a whole capacity quantum, so
+the tolerance cannot mask a genuine slot. Both the aggregate target and the
+per-card warm-retention target use that shared conversion.
+
 This total-capacity adoption flag is armed only by autoscaler construction. An
 ordinary in-process version update still resets the replacement target to its
 cold baseline and enters through the configured scale-up wave.
@@ -252,6 +261,8 @@ Unit regressions cover:
 - a handoff snapshot that marks the whole logical fleet occupancy-unknown
   retains exactly that fleet and does not manufacture a utilization-driven
   scale-up, while known queued work still receives normal headroom;
+- that retention holds for utilization settings whose capacity does not divide
+  the fleet exactly in binary floating point, at single- and multi-GPU widths;
 - production wave settings do not reduce the recovered target from 50 to 10;
 - exact-card shaping completes an already adopted target instead of returning
   an empty map, while the manager launches only the separately authorized

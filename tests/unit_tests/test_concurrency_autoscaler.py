@@ -442,6 +442,53 @@ class TestTargetMath(unittest.TestCase):
                          {'L4': 10})
         self.assertFalse(any(d.operator == _SCALE_UP for d in decisions))
 
+    def test_logical_unknown_fleet_holds_across_utilization_settings(self):
+        # The retention contract must hold for every legal utilization, not
+        # only the ones whose capacity divides the fleet exactly in binary
+        # floating point. ten 0.9-work floors sum to exactly 9.0, but three
+        # 0.7-work floors sum to 2.1 and 2.1 / 0.7 is 3.0000000000000004, so
+        # a bare ceil turns an all-unknown handoff report into the phantom
+        # scale-up this retention floor exists to prevent.
+        for utilization, fleet_size in ((70, 3), (95, 3), (97, 3), (85, 13),
+                                        (60, 7), (70, 7)):
+            with self.subTest(utilization=utilization, fleet=fleet_size):
+                autoscaler = _make_autoscaler(
+                    knob=1.0,
+                    max_replicas=200,
+                    replica_unit='logical',
+                    target_utilization_percentage=utilization,
+                )
+                ids = range(1, fleet_size + 1)
+                replicas = [_replica(replica_id) for replica_id in ids]
+                _report(autoscaler,
+                        in_flight={replica_id: 0 for replica_id in ids},
+                        unknown=ids)
+
+                decisions = _decisions(autoscaler, replicas)
+
+                self.assertEqual(autoscaler.target_num_replicas, fleet_size)
+                self.assertFalse(any(
+                    d.operator == _SCALE_UP for d in decisions))
+
+    def test_logical_unknown_multi_gpu_fleet_holds_materialized_slots(self):
+        # The same tail appears once the per-replica width is above one, and
+        # it must not inflate a six-slot fleet into a seventh slot.
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            max_replicas=200,
+            replica_unit='logical',
+            target_utilization_percentage=70,
+        )
+        replicas = [
+            _replica(replica_id, gpu_count=2) for replica_id in (1, 2, 3)
+        ]
+        _report(autoscaler, in_flight={1: 0, 2: 0, 3: 0}, unknown=(1, 2, 3))
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas, 6)
+        self.assertFalse(any(d.operator == _SCALE_UP for d in decisions))
+
     def test_logical_unknown_floor_keeps_headroom_for_observed_work(self):
         autoscaler = _make_autoscaler(
             knob=1.0,
