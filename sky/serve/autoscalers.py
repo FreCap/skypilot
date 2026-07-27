@@ -4899,9 +4899,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         Accepted-arrival profiles and the current queued gauge are used only
         as compatibility/priority distribution evidence, so retries cannot
         inflate total work here. The queued gauge covers requests that cannot
-        be admitted until a compatible card exists. Both sources are converted
-        to work units before they are mixed, so neither outweighs the other
-        merely because it is counted over a different interval.
+        be admitted until a compatible card exists. Both sources stay in
+        request-count units because they shape the same offered-arrival counter:
+        every request is recorded there before admission.
         """
         arrival_gap = max(0.0, arrival_work - allocator_attributed_work)
         if arrival_gap <= 0:
@@ -4926,22 +4926,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 window_seconds = constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
 
         cutoff = time.time() - window_seconds
-        # The two evidence sources count different things. An accepted-arrival
-        # profile counts arrivals inside window_seconds, which is worth
-        # duration/window_seconds units of concurrent work (the same Little's
-        # law conversion _arrival_work applies). The queued gauge counts
-        # requests holding a slot right now, which is already one work unit
-        # each -- that is how the allocator consumes it directly. Mixing the
-        # raw counts weights every waiting request duration/window_seconds
-        # times too heavily, so a service whose requests outlive the arrival
-        # window hands the queued card a share of the gap its real demand
-        # never justified.
-        arrival_units = (duration / window_seconds if duration is not None and
-                         window_seconds > 0 else 1.0)
         evidence = [
             (int(profile['priority']),
-             tuple(profile['compatible_accelerators']),
-             float(profile['count']) * arrival_units)
+             tuple(profile['compatible_accelerators']), float(profile['count']))
             for profile in self.compatibility_profiles
             if profile['timestamp'] >= cutoff and float(profile['count']) > 0
         ]

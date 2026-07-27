@@ -1065,73 +1065,66 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(dict(target.target_capacity_by_accelerator),
                          {'L40S': 3})
 
-    def _mixed_evidence_autoscaler(self, duration, max_replicas=200):
-        """Ten L4 arrivals per window against ten queued A100 waiters."""
+    def _equal_rate_mixed_evidence_autoscaler(self, duration):
+        """Ten L4 arrivals and ten queued A100 arrivals in one window."""
         autoscaler = _make_autoscaler(
             knob=1,
-            max_replicas=max_replicas,
+            max_replicas=1200,
             replica_unit='logical',
             target_utilization_percentage=100,
             expected_request_duration_seconds=duration,
         )
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100-80GB': 1})
-        replicas = [_replica(i, card='L4', planned_capacity=1) for i in (1, 2)]
+        replicas = [
+            _replica(i, card='L4', planned_capacity=1) for i in range(1, 11)
+        ]
         _report(
             autoscaler,
-            in_flight={
-                1: 1,
-                2: 1
-            },
-            observed_slots={
-                1: 1,
-                2: 1
-            },
+            in_flight={i: 1 for i in range(1, 11)},
+            observed_slots={i: 1 for i in range(1, 11)},
             queue_depth=10,
             queued_profiles=[self._profile(50, ['A100-80GB'], 10)],
             compatibility_profiles=[self._arrival_profile(50, ['L4'], 10)],
             compatibility_complete=True,
-            unique_arrivals_60s=10,
-            unique_arrivals_300s=10,
+            # Offered arrivals are recorded before admission, so the aggregate
+            # contains both the admitted L4 and still-queued A100 requests.
+            unique_arrivals_60s=20,
+            unique_arrivals_300s=20,
             headerless_arrivals_60s=0,
             headerless_arrivals_300s=0,
         )
         return autoscaler, replicas
 
-    def test_arrival_evidence_is_weighted_in_work_units(self):
-        # An accepted-arrival count is arrivals per window; a queued count is
-        # requests already holding a slot. Ten arrivals of hour-long requests
-        # are 600 units of work, not 10, so they must outweigh ten waiters by
-        # duration/window -- not tie with them.
-        autoscaler, _ = self._mixed_evidence_autoscaler(3600)
-        shaped = autoscaler._arrival_compatibility_work(600.0, 12.0)
+    def test_arrival_gap_evidence_uses_offered_arrival_count_units(self):
+        autoscaler, _ = self._equal_rate_mixed_evidence_autoscaler(3600)
+        shaped = autoscaler._arrival_compatibility_work(1200.0, 20.0)
         work_by_card = {}
         for _, compatible, work in shaped:
             work_by_card[compatible] = work_by_card.get(compatible, 0.0) + work
         l4_work = work_by_card[('L4',)]
         a100_work = work_by_card[('A100-80GB',)]
-        self.assertAlmostEqual(l4_work / a100_work, 60.0, places=6)
+        self.assertAlmostEqual(l4_work / a100_work, 1.0, places=6)
 
-    def test_queued_gauge_does_not_outweigh_longer_lived_arrivals(self):
-        # The card carrying ~98% of the demand must keep most of the fleet.
-        autoscaler, replicas = self._mixed_evidence_autoscaler(3600)
+    def test_equal_offered_rates_preserve_blocked_card_share(self):
+        autoscaler, replicas = self._equal_rate_mixed_evidence_autoscaler(3600)
         _decisions(autoscaler, replicas)
-        target = autoscaler.target_num_replicas_by_accelerator
-        self.assertGreater(target.get('L4', 0), target.get('A100-80GB', 0))
-        self.assertLessEqual(target.get('A100-80GB', 0), 40)
+        self.assertEqual(autoscaler._arrival_work(), 1200.0)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 600,
+            'A100-80GB': 600,
+        })
 
-    def test_longer_requests_do_not_shift_the_fleet_to_the_queued_card(self):
-        # Raising the request duration only adds accepted-arrival work on L4;
-        # the queued A100 gauge is unchanged, so its share of the fleet must
-        # not grow.
+    def test_duration_does_not_change_equal_rate_card_share(self):
         shares = []
         for duration in (300, 3600):
-            autoscaler, replicas = self._mixed_evidence_autoscaler(duration)
+            autoscaler, replicas = (
+                self._equal_rate_mixed_evidence_autoscaler(duration))
             _decisions(autoscaler, replicas)
             target = autoscaler.target_num_replicas_by_accelerator
             total = sum(target.values())
             self.assertGreater(total, 0)
             shares.append(target.get('A100-80GB', 0) / total)
-        self.assertLessEqual(shares[1], shares[0])
+        self.assertEqual(shares, [0.5, 0.5])
 
     def test_queued_evidence_keeps_priority_off_the_lower_tier(self):
         # The queued gauge carries the waiter's priority into the
