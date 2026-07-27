@@ -50,9 +50,9 @@ def test_init_with_running_job_waits_for_confirmation():
     for _ in range(threshold - 1):
         assert controller._should_wait_for_cluster_not_up_confirmation(
             status_lib.ClusterStatus.INIT, job_lib.JobStatus.RUNNING, None,
-            debouncer) is True
+            None, debouncer) is True
     assert controller._should_wait_for_cluster_not_up_confirmation(
-        status_lib.ClusterStatus.INIT, job_lib.JobStatus.RUNNING, None,
+        status_lib.ClusterStatus.INIT, job_lib.JobStatus.RUNNING, None, None,
         debouncer) is False
 
 
@@ -61,16 +61,38 @@ def test_init_with_transient_status_fetch_waits_for_confirmation():
     threshold = controller._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
     for _ in range(threshold - 1):
         assert controller._should_wait_for_cluster_not_up_confirmation(
-            status_lib.ClusterStatus.INIT, None, 'transient', debouncer) is True
+            status_lib.ClusterStatus.INIT, None, 'transient', None,
+            debouncer) is True
     assert controller._should_wait_for_cluster_not_up_confirmation(
-        status_lib.ClusterStatus.INIT, None, 'transient', debouncer) is False
+        status_lib.ClusterStatus.INIT, None, 'transient', None,
+        debouncer) is False
+
+
+def test_single_node_transient_init_waits_if_last_status_was_running():
+    debouncer = controller._ClusterNotUpDebouncer(num_nodes=1)
+    threshold = controller._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
+    for _ in range(threshold - 1):
+        assert controller._should_wait_for_cluster_not_up_confirmation(
+            status_lib.ClusterStatus.INIT, None, 'transient',
+            job_lib.JobStatus.RUNNING, debouncer) is True
+    assert controller._should_wait_for_cluster_not_up_confirmation(
+        status_lib.ClusterStatus.INIT, None, 'transient',
+        job_lib.JobStatus.RUNNING, debouncer) is False
+
+
+def test_single_node_transient_init_without_last_status_recovers_immediately():
+    debouncer = controller._ClusterNotUpDebouncer(num_nodes=1)
+    assert controller._should_wait_for_cluster_not_up_confirmation(
+        status_lib.ClusterStatus.INIT, None, 'transient', None,
+        debouncer) is False
 
 
 def test_non_init_statuses_do_not_wait_for_confirmation():
     debouncer = controller._ClusterNotUpDebouncer(num_nodes=4)
     assert controller._should_wait_for_cluster_not_up_confirmation(
-        status_lib.ClusterStatus.STOPPED, None, 'transient', debouncer) is False
+        status_lib.ClusterStatus.STOPPED, None, 'transient', None,
+        debouncer) is False
     assert controller._should_wait_for_cluster_not_up_confirmation(
-        None, None, 'transient', debouncer) is False
+        None, None, 'transient', None, debouncer) is False
     assert controller._should_wait_for_cluster_not_up_confirmation(
-        status_lib.ClusterStatus.INIT, None, None, debouncer) is False
+        status_lib.ClusterStatus.INIT, None, None, None, debouncer) is False
