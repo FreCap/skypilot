@@ -135,7 +135,7 @@ def test_autostopping_patches_record_without_reread(to_down, summary_response,
     node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
 
     autostopping_backend = mock.Mock(spec=backends.CloudVmRayBackend)
-    autostopping_backend.is_definitely_autostopping.return_value = True
+    autostopping_backend.probe_autostopping.return_value = True
 
     external_failure = mock.Mock()
     external_failure.get.return_value = []
@@ -180,7 +180,7 @@ def test_stable_up_refresh_only_advances_status_timestamp():
     node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
 
     backend = mock.Mock(spec=backends.CloudVmRayBackend)
-    backend.is_definitely_autostopping.return_value = False
+    backend.probe_autostopping.return_value = False
     external_failure = mock.Mock()
     external_failure.get.return_value = []
 
@@ -273,7 +273,7 @@ def test_up_transition_keeps_full_writer():
                      status_updated_at=12345)
 
     backend = mock.Mock(spec=backends.CloudVmRayBackend)
-    backend.is_definitely_autostopping.return_value = False
+    backend.probe_autostopping.return_value = False
     external_failure = mock.Mock()
     external_failure.get.return_value = []
 
@@ -376,7 +376,7 @@ def test_stable_init_with_autostop_keeps_full_writer():
     cluster_info = mock.Mock()
     cluster_info.get_head_instance.return_value = object()
     backend = mock.Mock(spec=backends.CloudVmRayBackend)
-    backend.is_definitely_autostopping.return_value = False
+    backend.probe_autostopping.return_value = False
     external_failure = mock.Mock()
     external_failure.get.return_value = []
 
@@ -427,7 +427,7 @@ def test_stable_status_write_failure_does_not_publish_timestamp():
     node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
 
     backend = mock.Mock(spec=backends.CloudVmRayBackend)
-    backend.is_definitely_autostopping.return_value = False
+    backend.probe_autostopping.return_value = False
     external_failure = mock.Mock()
     external_failure.get.return_value = []
 

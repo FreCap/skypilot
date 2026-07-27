@@ -56,7 +56,7 @@ def _run_update(node_status_dict, yaml_reader, autostop=-1):
     cluster_info = mock.Mock()
     cluster_info.get_head_instance.return_value = mock.Mock()
     backend = mock.Mock(spec=backends.CloudVmRayBackend)
-    backend.is_definitely_autostopping.return_value = False
+    backend.probe_autostopping.return_value = False
 
     external_failure = mock.Mock()
     external_failure.get.return_value = None

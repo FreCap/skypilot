@@ -3266,7 +3266,7 @@ def _update_cluster_status(
         # Check if the cluster is in the process of autostopping
         backend = get_backend_from_handle(handle)
         if isinstance(backend, backends.CloudVmRayBackend):
-            if backend.is_definitely_autostopping(handle, stream_logs=False):
+            if _cluster_is_autostopping(backend, handle, record):
                 return _handle_autostopping_cluster(print_newline=False)
 
         if status == status_lib.ClusterStatus.UP:
@@ -3485,8 +3485,8 @@ def _update_cluster_status(
                 # This ensures we detect AUTOSTOPPING even when Ray becomes
                 # unhealthy during hook execution, or if the actual nodes are
                 # partially autostopped but not completely yet.
-                is_autostopping = backend.is_definitely_autostopping(
-                    handle, stream_logs=False)
+                is_autostopping = _cluster_is_autostopping(
+                    backend, handle, record)
 
                 if is_autostopping:
                     logger.debug(
@@ -3660,6 +3660,32 @@ def _update_cluster_status(
         cluster_name,
         include_user_info=include_user_info,
         summary_response=summary_response)
+
+
+def _cluster_is_autostopping(
+    backend: 'backends.CloudVmRayBackend',
+    handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
+    record: dict[str, Any],
+) -> bool:
+    """Whether this refresh should keep treating the cluster as autostopping.
+
+    A failed skylet probe means "unknown", not "not autostopping". Demoting an
+    AUTOSTOPPING cluster to UP on an unknown probe writes a spurious
+    STATUS_CHANGE event, so the next sweep records a *new* AUTOSTOPPING
+    transition. Any deadline measured from that transition -- notably the
+    Kubernetes autodown reconciliation grace period -- is then re-anchored, and
+    a probe that flaps more often than the grace period keeps a stalled
+    autodown alive forever.
+
+    Holding the persisted state is only correct while the autodown intent is
+    still armed; a cancelled autostop (``autostop < 0``) releases the hold on
+    the very next sweep.
+    """
+    probed = backend.probe_autostopping(handle, stream_logs=False)
+    if probed is not None:
+        return probed
+    return (record['status'] == status_lib.ClusterStatus.AUTOSTOPPING and
+            record['autostop'] >= 0)
 
 
 def _kubernetes_autodown_reconciliation_grace_seconds(
