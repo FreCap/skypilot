@@ -182,6 +182,28 @@ def test_get_job_event_task_contexts_uses_one_slim_query(
     assert 'original_user_yaml_path' not in sql
 
 
+def test_get_job_event_task_contexts_keeps_jobs_without_job_info(
+        _mock_managed_jobs_db_conn):
+    """A managed job with no ``job_info`` row still resolves its tasks.
+
+    The LEFT OUTER JOIN is load-bearing: managed jobs created before the
+    ``job_info`` table existed have a ``spot`` row and no ``job_info`` row.
+    Narrowing it to an inner join drops those tasks, and because
+    ``get_job_events`` merges cluster events best-effort -- it swallows every
+    exception and returns the unmerged timeline -- the loss is silent. Pin that
+    the row survives and that a missing ``job_info`` reads as "no pool" rather
+    than as an excluded task.
+    """
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 11, 0, status=ManagedJobStatus.RUNNING)
+
+    assert state.get_job_event_task_contexts(11) == [{
+        'task_id': 0,
+        'task_name': 'task-0',
+        'pool': None,
+    }]
+
+
 @pytest.mark.asyncio
 async def test_image_recovery_generation_tracks_durable_recovery_epoch(
         _mock_managed_jobs_db_conn):
