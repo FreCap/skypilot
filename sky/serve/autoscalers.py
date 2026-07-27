@@ -4852,8 +4852,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """Shape only the offered-arrival work not already attributed.
 
         Offered-arrival counters are the deduplicated magnitude authority.
-        Accepted-arrival profiles are used only as compatibility/priority
-        distribution evidence, so retries cannot inflate total work here.
+        Accepted-arrival profiles and the current queued gauge are used only
+        as compatibility/priority distribution evidence, so retries cannot
+        inflate total work here. The queued gauge covers requests that cannot
+        be admitted until a compatible card exists.
         """
         arrival_gap = max(0.0, arrival_work - allocator_attributed_work)
         if arrival_gap <= 0:
@@ -4884,6 +4886,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             for profile in self.compatibility_profiles
             if profile['timestamp'] >= cutoff and float(profile['count']) > 0
         ]
+        evidence.extend(
+            (int(profile['priority']),
+             tuple(profile['compatible_accelerators']), float(profile['count']))
+            for profile in self.queued_compatibility_profiles
+            if float(profile['count']) > 0)
         evidence_total = sum(work for _, _, work in evidence)
         if evidence_total <= 0:
             # Compatibility-unknown work may hold the aggregate target, but

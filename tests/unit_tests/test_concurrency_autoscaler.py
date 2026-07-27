@@ -1025,6 +1025,46 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
                          {'L4': 40})
 
+    def test_queued_profile_shapes_never_admitted_arrival_gap(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=3,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=3600,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'L40S': 1,
+            'A100-80GB': 1,
+        })
+        l4 = _replica(1, card='L4', planned_capacity=1)
+        _report(
+            autoscaler,
+            in_flight={1: 0},
+            observed_slots={1: 1},
+            queue_depth=1,
+            queued_profiles=[self._profile(50, ['L40S', 'A100-80GB'], 1)],
+            compatibility_complete=True,
+            unique_arrivals_60s=1,
+            unique_arrivals_300s=1,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+        )
+
+        decisions = _decisions(autoscaler, [l4])
+
+        self.assertEqual(autoscaler._arrival_floor_target, 3)
+        self.assertEqual(autoscaler.target_num_replicas, 3)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L40S': 3})
+        scale_ups = _scale_ups(decisions)
+        self.assertEqual(len(scale_ups), 1)
+        target = scale_ups[0].target
+        self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
+        self.assertEqual(dict(target.target_capacity_by_accelerator),
+                         {'L40S': 3})
+
     def test_attributed_work_above_arrivals_adds_no_arrival_gap(self):
         autoscaler = _make_autoscaler(
             knob=1,
