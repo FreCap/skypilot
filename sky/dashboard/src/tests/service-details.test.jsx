@@ -420,6 +420,67 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.serviceData.status).toBe('svc-b-full');
   });
 
+  it('coalesces a manual refresh for a new route while old service data is still visible', async () => {
+    const nextSummary = deferred();
+    const nextFull = deferred();
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc-a', status: 'svc-a-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc-a', status: 'svc-a-full', replicas: ['a0'] }],
+      });
+
+    const { result, rerender } = renderHook(
+      ({ serviceName }) => useServiceDetails({ serviceName }),
+      { initialProps: { serviceName: 'svc-a' } }
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('svc-a-full')
+    );
+
+    dashboardCache.get
+      .mockImplementationOnce(() => nextSummary.promise)
+      .mockImplementationOnce(() => nextFull.promise);
+    rerender({ serviceName: 'svc-b' });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+
+    expect(result.current.serviceData.name).toBe('svc-a');
+    expect(result.current.serviceData.status).toBe('svc-a-full');
+
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshData();
+    });
+
+    // The only visible data still belongs to the previous route target, so a
+    // manual refresh should reuse the in-flight load for svc-b instead of
+    // invalidating caches and starting a duplicate summary/full pair.
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+    await act(async () => {
+      nextSummary.resolve({
+        services: [
+          { name: 'svc-b', status: 'svc-b-summary', summaryOnly: true },
+        ],
+      });
+      nextFull.resolve({
+        services: [{ name: 'svc-b', status: 'svc-b-full', replicas: ['b1'] }],
+      });
+      await refreshPromise;
+    });
+
+    expect(result.current.serviceData.name).toBe('svc-b');
+    expect(result.current.serviceData.status).toBe('svc-b-full');
+    expect(result.current.serviceData.replicas).toEqual(['b1']);
+  });
+
   it('refreshes summary and replicas without overlapping at the polling cadence', async () => {
     jest.useFakeTimers();
     const refreshedSummary = deferred();
