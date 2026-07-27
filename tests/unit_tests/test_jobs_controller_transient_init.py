@@ -10,6 +10,7 @@ import pytest
 
 from sky.jobs import controller as controller_lib
 from sky.jobs.controller import JobController
+from sky.skylet import job_lib
 from sky.utils import status_lib
 
 
@@ -92,6 +93,29 @@ class TestTransientInitConfirmation:
         ] == [controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS
              ] * threshold
         assert get_status.await_count == threshold
+        assert refresh_cluster.call_count == threshold
+        monotonic.assert_not_called()
+        wall_clock.assert_not_called()
+        set_recovering.assert_awaited_once()
+        executor.recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_single_node_transient_init_waits_after_running_status(self):
+        threshold = controller_lib._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
+        results = await self._run_until_recovery(
+            num_nodes=1,
+            statuses=[(job_lib.JobStatus.RUNNING, None)] +
+            [(None, 'transient')] * threshold,
+            refresh_statuses=[status_lib.ClusterStatus.INIT] * threshold,
+        )
+        (sleep, get_status, refresh_cluster, monotonic, wall_clock,
+         set_recovering, executor) = results
+
+        assert [
+            call.args[0] for call in sleep.await_args_list
+        ] == [controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS
+             ] * (threshold + 1)
+        assert get_status.await_count == threshold + 1
         assert refresh_cluster.call_count == threshold
         monotonic.assert_not_called()
         wall_clock.assert_not_called()
@@ -184,6 +208,27 @@ class TestTransientInitConfirmation:
             num_nodes=16,
             statuses=[(None, 'transient')],
             refresh_statuses=[status_lib.ClusterStatus.STOPPED],
+        )
+        (sleep, get_status, refresh_cluster, monotonic, wall_clock,
+         set_recovering, executor) = results
+
+        assert [call.args[0] for call in sleep.await_args_list] == [
+            controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS
+        ]
+        assert get_status.await_count == 1
+        assert refresh_cluster.call_count == 1
+        monotonic.assert_not_called()
+        wall_clock.assert_not_called()
+        set_recovering.assert_awaited_once()
+        executor.recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_single_node_transient_init_without_running_status_recovers_immediately(
+            self):
+        results = await self._run_until_recovery(
+            num_nodes=1,
+            statuses=[(None, 'transient')],
+            refresh_statuses=[status_lib.ClusterStatus.INIT],
         )
         (sleep, get_status, refresh_cluster, monotonic, wall_clock,
          set_recovering, executor) = results

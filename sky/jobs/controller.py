@@ -95,14 +95,17 @@ class _ClusterNotUpDebouncer:
                            if num_nodes > 1 else 1)
         self._consecutive_not_up = 0
 
-    def should_recover_now(self) -> bool:
+    def should_recover_now(self,
+                           required_confirmations: int | None = None) -> bool:
         """Record an ambiguous INIT observation.
 
         Returns True once enough consecutive observations accumulated for
         recovery to proceed.
         """
         self._consecutive_not_up += 1
-        return self._consecutive_not_up >= self._threshold
+        threshold = (self._threshold if required_confirmations is None else
+                     required_confirmations)
+        return self._consecutive_not_up >= threshold
 
     @property
     def observations(self) -> int:
@@ -120,12 +123,15 @@ def _should_wait_for_cluster_not_up_confirmation(
         cluster_status: status_lib.ClusterStatus | None,
         job_status: job_lib.JobStatus | None,
         transient_job_check_error_reason: str | None,
+        last_known_job_status: job_lib.JobStatus | None,
         debouncer: _ClusterNotUpDebouncer) -> bool:
     """Return whether a not-UP cluster verdict needs more confirmation.
 
     ``INIT`` can be a transient health-probe false positive. That same
     control-plane flap can also make the job-status fetch temporarily
-    unavailable, so both cases share the same confirmation gate.
+    unavailable, so both cases share the same confirmation gate. For
+    single-node jobs, require prior healthy evidence before delaying
+    recovery on a transient status-fetch outage.
     """
     if cluster_status != status_lib.ClusterStatus.INIT:
         return False
@@ -134,6 +140,13 @@ def _should_wait_for_cluster_not_up_confirmation(
             return False
     elif transient_job_check_error_reason is None:
         return False
+    else:
+        if debouncer.threshold == 1:
+            if (last_known_job_status is None or
+                    last_known_job_status.is_terminal()):
+                return False
+            return not debouncer.should_recover_now(
+                _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY)
     return not debouncer.should_recover_now()
 
 
@@ -1066,7 +1079,8 @@ class JobController:
                                       f' (status: {cluster_status.value})')
                 if _should_wait_for_cluster_not_up_confirmation(
                         cluster_status, job_status,
-                        transient_job_check_error_reason, not_up_debouncer):
+                        transient_job_check_error_reason, last_known_job_status,
+                        not_up_debouncer):
                     # INIT may be a transient probe false positive. Confirm
                     # over consecutive ticks before tearing the cluster down,
                     # even if the same control-plane flap temporarily hid the
