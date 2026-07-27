@@ -3662,10 +3662,11 @@ def _update_cluster_status(
         summary_response=summary_response)
 
 
-def _cluster_is_autostopping(backend: 'backends.CloudVmRayBackend',
-                             handle: 'cloud_vm_ray_backend.'
-                             'CloudVmRayResourceHandle',
-                             record: dict[str, Any]) -> bool:
+def _cluster_is_autostopping(
+    backend: 'backends.CloudVmRayBackend',
+    handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
+    record: dict[str, Any],
+) -> bool:
     """Whether this refresh should keep treating the cluster as autostopping.
 
     A failed skylet probe means "unknown", not "not autostopping". Demoting an
