@@ -1133,6 +1133,71 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             shares.append(target.get('A100-80GB', 0) / total)
         self.assertLessEqual(shares[1], shares[0])
 
+    def test_queued_evidence_keeps_priority_off_the_lower_tier(self):
+        # The queued gauge carries the waiter's priority into the
+        # arrival-gap split. Dropping it inverts the allocation: a
+        # low-priority A100 waiter would take half the ceiling away from
+        # the high-priority L40S waiter that the gap belongs to.
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=4,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=3600,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'L40S': 1,
+            'A100-80GB': 1,
+        })
+        l4 = _replica(1, card='L4', planned_capacity=1)
+        _report(
+            autoscaler,
+            in_flight={1: 0},
+            observed_slots={1: 1},
+            queue_depth=2,
+            queued_profiles=[
+                self._profile(90, ['L40S'], 1),
+                self._profile(10, ['A100-80GB'], 1),
+            ],
+            compatibility_complete=True,
+            unique_arrivals_60s=2,
+            unique_arrivals_300s=2,
+            headerless_arrivals_60s=0,
+            headerless_arrivals_300s=0,
+        )
+
+        _decisions(autoscaler, [l4])
+
+        self.assertEqual(autoscaler.target_num_replicas, 4)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L40S': 4})
+
+    def test_queued_evidence_shapes_the_gap_without_growing_it(self):
+        # The queued gauge is compatibility/priority evidence only. It
+        # must never add magnitude: the shaped work has to sum back to
+        # exactly the gap it was handed, however deep the queue is.
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=20,
+            replica_unit='logical',
+            target_utilization_percentage=90,
+            expected_request_duration_seconds=3600,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'L40S': 1})
+        autoscaler.compatibility_profiles = [
+            self._arrival_profile(50, ['L4'], 1)
+        ]
+        autoscaler.queued_compatibility_profiles = [{
+            'priority': 50,
+            'compatible_accelerators': ('L40S',),
+            'count': 999,
+        }]
+
+        shaped = autoscaler._arrival_compatibility_work(60.0, 10.0)
+
+        self.assertAlmostEqual(sum(work for _, _, work in shaped), 50.0)
+
     def test_attributed_work_above_arrivals_adds_no_arrival_gap(self):
         autoscaler = _make_autoscaler(
             knob=1,
