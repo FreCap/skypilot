@@ -178,10 +178,12 @@ export function useServiceDetails({ serviceName }) {
     } = {}) => {
       if (!serviceName) return Promise.resolve();
       const inFlight = refreshInFlightRef.current;
+      const hasVisibleCurrentServiceData =
+        visibleServiceDataRef.current?.name === serviceName;
       const shouldReuseInFlight =
         inFlight?.serviceName === serviceName &&
         (!supersede ||
-          visibleServiceDataRef.current === null ||
+          !hasVisibleCurrentServiceData ||
           inFlight.source === 'manual');
       if (shouldReuseInFlight) {
         return inFlight.promise;
