@@ -304,109 +304,127 @@ class StopEvent(SkyletEvent):
             hook_executor.run(event, hooks)
 
     def _stop_cluster(self, autostop_config):
-        if (autostop_config.backend ==
-                cloud_vm_ray_backend.CloudVmRayBackend.NAME):
-            autostop_lib.set_autostopping_started()
+        """Tears the cluster down, un-latching the indicator if it fails.
 
-            config_path = os.path.abspath(
-                os.path.expanduser(cluster_utils.SKY_CLUSTER_YAML_REMOTE_PATH))
-            config = yaml_utils.read_yaml(config_path)
-            provider_name = cluster_utils.get_provider_name(config)
-            cloud = registry.CLOUD_REGISTRY.from_str(provider_name)
-            assert cloud is not None, f'Unknown cloud: {provider_name}'
+        The API server reports AUTOSTOPPING purely from the on-node indicator
+        (backend_utils._cluster_is_autostopping), and the indicator stays
+        valid until the boot time changes. A teardown that raises leaves this
+        node running with the same boot time, so failing to clear the
+        indicator pins the cluster in AUTOSTOPPING for the rest of the boot:
+        `sky launch` waits on it forever, `sky exec` fails, and managed-job
+        and SkyServe recovery skip the cluster. SkyletEvent.run() swallows the
+        exception, so the next tick re-latches and retries if the cluster is
+        still idle and still armed.
+        """
+        if (autostop_config.backend
+                != cloud_vm_ray_backend.CloudVmRayBackend.NAME):
+            raise NotImplementedError
 
+        config_path = os.path.abspath(
+            os.path.expanduser(cluster_utils.SKY_CLUSTER_YAML_REMOTE_PATH))
+        config = yaml_utils.read_yaml(config_path)
+        provider_name = cluster_utils.get_provider_name(config)
+        cloud = registry.CLOUD_REGISTRY.from_str(provider_name)
+        assert cloud is not None, f'Unknown cloud: {provider_name}'
+
+        autostop_lib.set_autostopping_started()
+        try:
             if (cloud.PROVISIONER_VERSION >= clouds.ProvisionerVersion.
                     RAY_PROVISIONER_SKYPILOT_TERMINATOR):
                 logger.info('Using new provisioner to stop the cluster.')
                 self._stop_cluster_with_new_provisioner(autostop_config, config,
                                                         provider_name, cloud)
-                return
-            logger.info('Not using new provisioner to stop the cluster. '
-                        f'Cloud of this cluster: {provider_name}')
+            else:
+                logger.info('Not using new provisioner to stop the cluster. '
+                            f'Cloud of this cluster: {provider_name}')
+                self._stop_cluster_with_legacy_provisioner(
+                    autostop_config, config, config_path)
+        except BaseException:
+            logger.error('Teardown attempt failed; clearing the autostopping '
+                         'indicator so the cluster is not reported as '
+                         'AUTOSTOPPING until the next attempt.')
+            autostop_lib.clear_autostopping_started()
+            raise
 
-            # Execute stop/down event hook if provided (for old provisioner
-            # path). The method claims the `stop` slot when autostop.down is
-            # false and the `down` slot for autodown.
-            self._execute_hook_if_present(autostop_config)
+    def _stop_cluster_with_legacy_provisioner(self, autostop_config, config,
+                                              config_path):
+        # Execute stop/down event hook if provided (for old provisioner
+        # path). The method claims the `stop` slot when autostop.down is
+        # false and the `down` slot for autodown.
+        self._execute_hook_if_present(autostop_config)
 
-            is_cluster_multinode = config['max_workers'] > 0
+        is_cluster_multinode = config['max_workers'] > 0
 
-            # Even for !is_cluster_multinode, we want to call this to replace
-            # cache_stopped_nodes.
-            self._replace_yaml_for_stopping(config_path, autostop_config.down)
+        # Even for !is_cluster_multinode, we want to call this to replace
+        # cache_stopped_nodes.
+        self._replace_yaml_for_stopping(config_path, autostop_config.down)
 
-            # Use environment variables to disable the ray usage collection (to
-            # avoid overheads and potential issues with the usage) as sdk does
-            # not take the argument for disabling the usage collection.
-            #
-            # Also clear any cloud-specific credentials set as env vars (e.g.,
-            # AWS's two env vars). Reason: for single-node AWS SSO clusters, we
-            # have seen a weird bug where user image's /etc/profile.d may
-            # contain the two AWS env vars, and so they take effect in the
-            # bootstrap phase of each of these 3 'ray' commands, throwing a
-            # RuntimeError when some private VPC is not found (since the VPC
-            # only exists in the assumed role, not in the custome principal set
-            # by the env vars).  See #1880 for details.
-            env = dict(os.environ, RAY_USAGE_STATS_ENABLED='0')
-            env.pop('AWS_ACCESS_KEY_ID', None)
-            env.pop('AWS_SECRET_ACCESS_KEY', None)
+        # Use environment variables to disable the ray usage collection (to
+        # avoid overheads and potential issues with the usage) as sdk does
+        # not take the argument for disabling the usage collection.
+        #
+        # Also clear any cloud-specific credentials set as env vars (e.g.,
+        # AWS's two env vars). Reason: for single-node AWS SSO clusters, we
+        # have seen a weird bug where user image's /etc/profile.d may
+        # contain the two AWS env vars, and so they take effect in the
+        # bootstrap phase of each of these 3 'ray' commands, throwing a
+        # RuntimeError when some private VPC is not found (since the VPC
+        # only exists in the assumed role, not in the custome principal set
+        # by the env vars).  See #1880 for details.
+        env = dict(os.environ, RAY_USAGE_STATS_ENABLED='0')
+        env.pop('AWS_ACCESS_KEY_ID', None)
+        env.pop('AWS_SECRET_ACCESS_KEY', None)
 
-            # We do "initial ray up + ray down --workers-only" only for
-            # multinode clusters as they are not needed for single-node.
-            if is_cluster_multinode:
-                # `ray up` is required to reset the upscaling speed and min/max
-                # workers. Otherwise, `ray down --workers-only` will
-                # continuously scale down and up.
-                logger.info('Running ray up.')
-                script = (cloud_vm_ray_backend.
-                          write_ray_up_script_with_patched_launch_hash_fn(
-                              config_path,
-                              ray_up_kwargs={'restart_only': True}))
-                # Passing env inherited from os.environ is technically not
-                # needed, because we call `python <script>` rather than `ray
-                # <cmd>`. We just need the {RAY_USAGE_STATS_ENABLED: 0} part.
-                subprocess.run(f'{constants.SKY_PYTHON_CMD} {script}',
-                               check=True,
-                               shell=True,
-                               env=env)
-
-                logger.info('Running ray down.')
-                # Stop the workers first to avoid orphan workers.
-                subprocess.run(
-                    f'{constants.SKY_RAY_CMD} down -y --workers-only '
-                    f'{config_path}',
-                    check=True,
-                    shell=True,
-                    # We pass env inherited from os.environ due to calling `ray
-                    # <cmd>`.
-                    env=env)
-
-            # Stop the ray autoscaler to avoid scaling up, during
-            # stopping/terminating of the cluster. We do not rely `ray down`
-            # below for stopping ray cluster, as it will not use the correct
-            # ray path.
-            logger.info('Stopping the ray cluster.')
-            subprocess.run(f'{constants.SKY_RAY_CMD} stop',
+        # We do "initial ray up + ray down --workers-only" only for
+        # multinode clusters as they are not needed for single-node.
+        if is_cluster_multinode:
+            # `ray up` is required to reset the upscaling speed and min/max
+            # workers. Otherwise, `ray down --workers-only` will
+            # continuously scale down and up.
+            logger.info('Running ray up.')
+            script = (cloud_vm_ray_backend.
+                      write_ray_up_script_with_patched_launch_hash_fn(
+                          config_path, ray_up_kwargs={'restart_only': True}))
+            # Passing env inherited from os.environ is technically not
+            # needed, because we call `python <script>` rather than `ray
+            # <cmd>`. We just need the {RAY_USAGE_STATS_ENABLED: 0} part.
+            subprocess.run(f'{constants.SKY_PYTHON_CMD} {script}',
+                           check=True,
                            shell=True,
-                           check=True)
+                           env=env)
 
-            logger.info('Running final ray down.')
+            logger.info('Running ray down.')
+            # Stop the workers first to avoid orphan workers.
             subprocess.run(
-                f'{constants.SKY_RAY_CMD} down -y {config_path}',
+                f'{constants.SKY_RAY_CMD} down -y --workers-only '
+                f'{config_path}',
                 check=True,
                 shell=True,
                 # We pass env inherited from os.environ due to calling `ray
                 # <cmd>`.
                 env=env)
-        else:
-            raise NotImplementedError
+
+        # Stop the ray autoscaler to avoid scaling up, during
+        # stopping/terminating of the cluster. We do not rely `ray down`
+        # below for stopping ray cluster, as it will not use the correct
+        # ray path.
+        logger.info('Stopping the ray cluster.')
+        subprocess.run(f'{constants.SKY_RAY_CMD} stop', shell=True, check=True)
+
+        logger.info('Running final ray down.')
+        subprocess.run(
+            f'{constants.SKY_RAY_CMD} down -y {config_path}',
+            check=True,
+            shell=True,
+            # We pass env inherited from os.environ due to calling `ray
+            # <cmd>`.
+            env=env)
 
     def _stop_cluster_with_new_provisioner(self, autostop_config,
                                            cluster_config, provider_name,
                                            cloud):
         # pylint: disable=import-outside-toplevel
         from sky import provision as provision_lib
-        autostop_lib.set_autostopping_started()
 
         # Execute stop/down event hook if provided. The method claims the
         # `stop` slot when autostop.down is false and the `down` slot for

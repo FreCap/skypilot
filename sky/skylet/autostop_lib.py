@@ -227,6 +227,13 @@ def set_autostop(idle_minutes: int,
     # Reset timer whenever an autostop setting is submitted, i.e. the idle
     # time will be counted from now.
     set_last_active_time_to_now()
+    # Submitting a setting means the next teardown is at least a full idle
+    # period away (or cancelled outright), so no teardown is in flight. Drop
+    # any stale indicator: this is the operator escape hatch for a cluster
+    # left latched by a teardown that failed under an older skylet, since
+    # `sky autostop`/`sky autostop --cancel` are allowed on an AUTOSTOPPING
+    # cluster (see backend_utils.check_cluster_available).
+    clear_autostopping_started()
 
 
 def set_autostopping_started() -> None:
@@ -237,9 +244,32 @@ def set_autostopping_started() -> None:
     as an autostop indicator, which is used for checking whether the cluster
     is in the process of autostopping. The indicator is valid only when the
     machine has the same boot time as the one stored in the indicator.
+
+    A successful teardown never needs to clear the indicator: the node either
+    goes away (autodown) or reboots with a different boot time (autostop). An
+    *unsuccessful* teardown leaves this node running with the boot time
+    unchanged, so it must call `clear_autostopping_started()` -- otherwise
+    the indicator stays valid for the rest of this boot and the API server
+    reports the cluster as AUTOSTOPPING forever.
     """
     logger.debug('Setting is_autostopping.')
     configs.set_config(_AUTOSTOP_INDICATOR, str(psutil.boot_time()))
+
+
+def clear_autostopping_started() -> None:
+    """Clears the autostop indicator set by `set_autostopping_started()`.
+
+    Call this when a teardown attempt failed and the node is still running,
+    so the cluster stops being reported as AUTOSTOPPING. The idle timer is
+    untouched, so a still-idle, still-armed cluster re-latches on the next
+    StopEvent tick and retries the teardown.
+
+    We write an empty string rather than deleting the row because the configs
+    store is insert-or-replace only; `get_is_autostopping()` compares against
+    `str(psutil.boot_time())`, which is never empty.
+    """
+    logger.debug('Clearing is_autostopping.')
+    configs.set_config(_AUTOSTOP_INDICATOR, '')
 
 
 def get_is_autostopping() -> bool:
