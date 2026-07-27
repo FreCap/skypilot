@@ -1198,6 +1198,145 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
 
         self.assertAlmostEqual(sum(work for _, _, work in shaped), 50.0)
 
+    def test_downscale_hold_preserves_exact_card_for_capacity_retry(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=1500,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            max_scale_up_rate_percentage=20,
+            scale_up_rate_min_replicas=1,
+            scale_up_rate_period_seconds=60,
+            downscale_delay_seconds=900,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'L40S': 1,
+            'A100-80GB': 1,
+        })
+        profile = self._profile(0, ['L40S', 'A100-80GB'], 1)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            _report(autoscaler,
+                    in_flight={},
+                    queue_depth=1,
+                    queued_profiles=[profile],
+                    compatibility_complete=True,
+                    generation=1)
+            first = _decisions(autoscaler, [])
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=161.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=161.0):
+            _report(autoscaler,
+                    in_flight={},
+                    queue_depth=0,
+                    queued_profiles=[],
+                    compatibility_complete=True,
+                    generation=2)
+            retry = _decisions(autoscaler, [])
+
+        self.assertEqual(
+            dict(_scale_ups(first)[0].target.target_capacity_by_accelerator),
+            {'L40S': 1})
+        self.assertEqual(autoscaler._raw_target_num_replicas, 0)
+        self.assertEqual(autoscaler.target_num_replicas, 1)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L40S': 1})
+        self.assertEqual(
+            dict(_scale_ups(retry)[0].target.target_capacity_by_accelerator),
+            {'L40S': 1})
+
+    def test_smaller_fresh_demand_reassigns_only_nonheld_slots(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=10,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=900,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'L40S': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {'L40S': 3}
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(0, ['L4'], 1)],
+                compatibility_complete=True)
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1)
+        self.assertEqual(autoscaler.target_num_replicas, 3)
+        self.assertEqual(
+            dict(
+                _scale_ups(decisions)[0].target.target_capacity_by_accelerator),
+            {
+                'L4': 1,
+                'L40S': 2,
+            })
+
+    def test_rate_limited_downscale_keeps_remaining_exact_card(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=10,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=20,
+            max_scale_down_rate_percentage=33,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'L40S': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {'L40S': 3}
+        autoscaler._snap_target_on_next_recompute = False
+        replicas = [_replica(i, card='L40S') for i in range(1, 4)]
+        idle = {replica.replica_id: 0 for replica in replicas}
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            _report(autoscaler,
+                    in_flight=idle,
+                    queue_depth=0,
+                    queued_profiles=[],
+                    compatibility_complete=True,
+                    generation=1)
+            _decisions(autoscaler, replicas)
+
+        with mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=111.0):
+            _report(autoscaler,
+                    in_flight=idle,
+                    queue_depth=0,
+                    queued_profiles=[],
+                    compatibility_complete=True,
+                    generation=2)
+            _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 0)
+        self.assertEqual(autoscaler.target_num_replicas, 2)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L40S': 2})
+
     def test_attributed_work_above_arrivals_adds_no_arrival_gap(self):
         autoscaler = _make_autoscaler(
             knob=1,

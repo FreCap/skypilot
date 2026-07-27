@@ -2661,6 +2661,46 @@ def _replica_is_retiring_card_supply(
             getattr(status, 'preempted', False) is True)
 
 
+def _merge_fresh_target_into_downscale_hold(
+    *,
+    adopted_target: dict[str, int],
+    fresh_target: dict[str, int],
+    configured_cards: list[str],
+    replacement_order: list[str],
+    target_total: int,
+) -> dict[str, int]:
+    """Replace only the held slots required by current exact-card demand."""
+    fresh_total = sum(fresh_target.values())
+    if fresh_total > target_total:
+        return {}
+    if (set(adopted_target) - set(configured_cards) or
+            set(fresh_target) - set(configured_cards)):
+        return {}
+    target = {
+        card: max(0, int(adopted_target.get(card, 0)))
+        for card in configured_cards
+    }
+    for card in configured_cards:
+        target[card] = max(target[card], int(fresh_target.get(card, 0)))
+    excess = sum(target.values()) - target_total
+    removal_order = list(dict.fromkeys(replacement_order + configured_cards))
+    for card in removal_order:
+        removable = max(0, target.get(card, 0) - fresh_target.get(card, 0))
+        removed = min(excess, removable)
+        target[card] -= removed
+        excess -= removed
+        if excess == 0:
+            break
+    if excess != 0:
+        return {}
+    result = {card: count for card, count in target.items() if count > 0}
+    if (sum(result.values()) != target_total or any(
+            result.get(card, 0) < count
+            for card, count in fresh_target.items())):
+        return {}
+    return result
+
+
 def _revalidate_actuation_target(
     *,
     adopted_target: dict[str, int],
@@ -2669,6 +2709,7 @@ def _revalidate_actuation_target(
     configured_cards: list[str],
     final_target: int,
     allow_adopted_reassignment: bool = True,
+    allow_unbacked_adopted_reassignment: bool = True,
 ) -> dict[str, int]:
     """Build a supply-aware actuator without bypassing target adoption.
 
@@ -2676,7 +2717,9 @@ def _revalidate_actuation_target(
     wave limits. Actuation may immediately move an adopted unit when its card
     is no longer backed, or when the fresh placement can move that unit onto
     compatible supply that already exists. It must not cold-launch additional
-    units for a not-yet-adopted compatibility migration.
+    units for a not-yet-adopted compatibility migration. During an aggregate
+    downscale hold, unbacked adopted units remain on their exact cards, while
+    materialized compatible supply may still replace them.
     """
     if sum(desired_target.values()) != final_target:
         return {}
@@ -2717,16 +2760,17 @@ def _revalidate_actuation_target(
     # First replace adopted capacity that is disappearing. This is allowed to
     # create a cold shortage, because retaining the old card would otherwise
     # turn a retirement or preemption into an accidental same-card relaunch.
-    reassigned = 0
-    for card in configured_cards:
-        unbacked = max(
-            0, target[card] - max(0, int(nonretiring_supply.get(card, 0))))
-        removable = min(unbacked,
-                        max(0, target[card] - desired_target.get(card, 0)))
-        target[card] -= removable
-        reassigned += removable
-    if fill_toward_desired(reassigned, require_backing=False) != 0:
-        return {}
+    if allow_unbacked_adopted_reassignment:
+        reassigned = 0
+        for card in configured_cards:
+            unbacked = max(
+                0, target[card] - max(0, int(nonretiring_supply.get(card, 0))))
+            removable = min(unbacked,
+                            max(0, target[card] - desired_target.get(card, 0)))
+            target[card] -= removable
+            reassigned += removable
+        if fill_toward_desired(reassigned, require_backing=False) != 0:
+            return {}
 
     # Then let already-existing compatible supply replace backed capacity.
     # This lets reserved A100s serve flexible L4-attributed demand and retire
@@ -5921,7 +5965,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             final_target=final_target,
             allow_adopted_reassignment=not any(
                 not info.is_terminal and info.version != self.latest_version
-                for info in replica_infos))
+                for info in replica_infos),
+            allow_unbacked_adopted_reassignment=(self._raw_target_num_replicas
+                                                 >= self.target_num_replicas))
         if not target and final_target > 0:
             self._logical_card_transition_pending = False
             return {}, False
@@ -6212,11 +6258,25 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         if ((apply_target or apply_card_transition) and
                 candidate_covers_raw_target):
-            adopted_map, attribution_complete = (
-                self._calculate_concurrency_target_by_accelerator(
-                    replica_infos,
-                    target_ceiling=self.target_num_replicas,
-                    min_replicas_override=self.target_num_replicas))
+            if (self._raw_target_num_replicas < self.target_num_replicas):
+                fresh_map, attribution_complete = (
+                    self._calculate_concurrency_target_by_accelerator(
+                        replica_infos,
+                        target_ceiling=self._raw_target_num_replicas,
+                        min_replicas_override=self._raw_target_num_replicas))
+                adopted_map = _merge_fresh_target_into_downscale_hold(
+                    adopted_target=old_target_by_accelerator,
+                    fresh_target=fresh_map,
+                    configured_cards=self._configured_cards_from_profiles(),
+                    replacement_order=self._cold_paid_card_order(
+                        self._configured_cards_from_profiles()),
+                    target_total=self.target_num_replicas)
+            else:
+                adopted_map, attribution_complete = (
+                    self._calculate_concurrency_target_by_accelerator(
+                        replica_infos,
+                        target_ceiling=self.target_num_replicas,
+                        min_replicas_override=self.target_num_replicas))
             if (attribution_complete and
                     sum(adopted_map.values()) == self.target_num_replicas):
                 self.target_num_replicas_by_accelerator = adopted_map
