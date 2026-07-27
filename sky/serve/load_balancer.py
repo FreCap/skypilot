@@ -2034,16 +2034,62 @@ class SkyServeLoadBalancer:
                 unknown_urls.append(url)
         return in_flight, routing_urls, unknown_urls, sampled_urls
 
+    @staticmethod
+    def _reject_entry_seen(entry: Any) -> float:
+        """Last-seen stamp of a reject entry, tolerating the legacy float."""
+        return entry[0] if isinstance(entry, tuple) else entry
+
+    def _reject_window_for_write(self) -> dict[str, tuple[float, int]]:
+        """Expire reject entries for a WRITE, in O(expired) not O(entries).
+
+        _prune_reject_window rebuilds the whole dict. That is the right
+        cost on the controller-sync read cadence, but _record_rejection
+        runs on the REQUEST cadence: one rebuild per terminal 503 turns a
+        rejection storm into O(entries) synchronous work per request. A
+        service whose replicas are all unservable rejects every arrival,
+        so entries and rejections/second rise together and the LB spends
+        seconds of event-loop time per burst -- long enough to starve the
+        1s liveness probe and get the Pod killed out of its own Service,
+        which is a full data-plane outage rather than a slow gauge.
+
+        Writers append (and re-insert on refresh) under a monotonic
+        clock, so live entries stay in non-decreasing last-seen order and
+        the oldest is always at the front: evicting from the front is
+        O(expired). If that ordering is ever violated -- a dict injected
+        directly, say -- front eviction stops early and leaves an expired
+        entry resident, which costs a little memory but never a wrong
+        gauge: every read goes through _prune_reject_window, which drops
+        expired entries regardless of position.
+        """
+        current = self._reject_last_seen
+        if current is None:
+            current = {}
+            self._reject_last_seen = current
+        cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
+        profiles = self._reject_compatibility_by_key
+        while current:
+            key = next(iter(current))
+            if self._reject_entry_seen(current[key]) > cutoff:
+                break
+            del current[key]
+            if profiles is not None:
+                profiles.pop(key, None)
+        return current
+
     def _prune_reject_window(self) -> dict[str, tuple[float, int]]:
         """Drop reject entries older than the window; return the live dict.
 
-        Called on every access (record + read) rather than on a timer:
-        the dict is bounded by unique keys seen in one window, so an
-        O(entries) rebuild on the sync/capacity cadence is cheap, and
-        lazy pruning means no extra task to keep alive. Always assigns a
-        fresh instance dict (materializing it from the None class
-        default on first touch), so the class default stays immutable
-        and cannot leak state across instances.
+        The READ funnel: every gauge read goes through here, on the
+        controller sync/capacity cadence, where an O(entries) rebuild is
+        cheap and lazy pruning means no extra task to keep alive. It also
+        normalizes legacy float entries, and it drops every expired entry
+        regardless of position, so the gauges stay exact even when the
+        write path's front-eviction ordering does not hold (the rebuild
+        preserves the existing order, it does not re-sort). Writes must
+        NOT come through here -- see _reject_window_for_write.
+        Always assigns a fresh instance dict (materializing it from the
+        None class default on first touch), so the class default stays
+        immutable and cannot leak state across instances.
         """
         cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
         current = self._reject_last_seen
@@ -2084,7 +2130,12 @@ class SkyServeLoadBalancer:
                            constants.LB_REQUEST_PRIORITY_MIN)
         if not isinstance(priority, int) or isinstance(priority, bool):
             priority = constants.LB_REQUEST_PRIORITY_MIN
-        self._prune_reject_window()[key] = (time.monotonic(), priority)
+        window = self._reject_window_for_write()
+        # Re-insert rather than assign in place: refreshing an existing key
+        # keeps its old position in a dict, and the front-eviction in
+        # _reject_window_for_write needs the oldest entry to stay at the front.
+        window.pop(key, None)
+        window[key] = (time.monotonic(), priority)
         configured = self._configured_accelerators
         compatible = getattr(request, _REQUEST_ACCELERATORS_ATTR, None)
         if compatible is None:
@@ -2108,7 +2159,7 @@ class SkyServeLoadBalancer:
         """Release stale backlog pressure once the same stable job lands."""
         key = request.headers.get(constants.LB_JOB_ID_HEADER)
         if key is not None:
-            self._prune_reject_window().pop(key, None)
+            self._reject_window_for_write().pop(key, None)
             profiles = self._reject_compatibility_by_key
             if profiles is not None:
                 profiles.pop(key, None)
@@ -2455,6 +2506,43 @@ class SkyServeLoadBalancer:
             str(priority): count for priority, count in sorted(counts.items())
         }
 
+    def _offered_arrivals_for_write(
+            self,
+            now: float) -> tuple[dict[str, float], collections.deque[float]]:
+        """Expire arrival entries for a WRITE, in O(expired) not O(entries).
+
+        _record_offered_arrival runs on EVERY request, so rebuilding the
+        job dict there costs O(entries) per request. The tracker is sized
+        by LB_OFFERED_ARRIVAL_CAP (100k), which bounds memory but turns
+        into a CPU cliff: the busier the LB, the more entries are
+        resident and the more every single request costs. At the cap that
+        is milliseconds of synchronous event-loop time per request, so
+        the LB stops answering its own liveness probe and Kubernetes
+        evicts it -- load-induced collapse exactly where the cap was
+        meant to protect. Front eviction keeps the write path O(expired);
+        _prune_offered_arrivals remains the exact reader.
+        """
+        cutoff = now - constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
+        jobs = self._offered_arrivals_by_job
+        if jobs is None:
+            jobs = {}
+            self._offered_arrivals_by_job = jobs
+        while jobs:
+            key = next(iter(jobs))
+            if jobs[key] > cutoff:
+                break
+            del jobs[key]
+        headerless = self._headerless_offered_arrivals
+        if headerless is None:
+            headerless = collections.deque()
+            self._headerless_offered_arrivals = headerless
+        while headerless and headerless[0] <= cutoff:
+            headerless.popleft()
+        saturated_until = self._offered_arrival_saturated_until
+        if saturated_until is not None and now >= saturated_until:
+            self._offered_arrival_saturated_until = None
+        return jobs, headerless
+
     def _prune_offered_arrivals(
         self,
         now: float | None = None
@@ -2478,7 +2566,7 @@ class SkyServeLoadBalancer:
 
     def _record_offered_arrival(self, request: fastapi.Request) -> None:
         now = time.monotonic()
-        jobs, headerless = self._prune_offered_arrivals(now)
+        jobs, headerless = self._offered_arrivals_for_write(now)
         if self._offered_arrival_saturated_until is not None:
             self._offered_arrival_saturated_until = (
                 now + constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS)
@@ -2490,6 +2578,9 @@ class SkyServeLoadBalancer:
         if job_id is not None:
             key = hashlib.sha256(job_id.encode('utf-8')).hexdigest()
             if key in jobs:
+                # Re-insert so the refreshed entry moves to the back and the
+                # oldest arrival stays at the front for O(expired) eviction.
+                del jobs[key]
                 jobs[key] = now
                 return
         if len(jobs) + len(headerless) >= constants.LB_OFFERED_ARRIVAL_CAP:

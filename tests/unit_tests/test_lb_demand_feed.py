@@ -7,6 +7,7 @@ controller's capacity_hint for /_lb/capacity readers.
 """
 # pylint: disable=protected-access,use-implicit-booleaness-not-comparison
 import asyncio
+import hashlib
 import time
 from unittest import mock
 
@@ -1266,3 +1267,131 @@ def test_stale_pre_retirement_occupancy_zero_reads_unknown():
     in_flight, _, unknown_urls, _ = lb._in_flight_with_draining()
     assert in_flight == {'http://gone:8080': 0}
     assert not unknown_urls
+
+
+# --- request-cadence cost of the demand windows ---
+#
+# Both windows are pruned by rebuilding the whole mapping. That is cheap on
+# the controller-sync READ cadence, but _record_rejection and
+# _record_offered_arrival run on the REQUEST cadence, so a rebuild there costs
+# O(resident entries) per request. Resident entries and request rate rise
+# together under load, so the LB gets quadratically slower exactly when it is
+# busiest, stops answering its 1s liveness probe, and is evicted from its own
+# Service. These pin the write paths to O(expired), not O(entries).
+
+
+class _VisitCountingDict(dict):
+    """Counts how many entries an operation walks over."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.visits = 0
+
+    def __iter__(self):
+        for key in super().__iter__():
+            self.visits += 1
+            yield key
+
+    def items(self):
+        for pair in super().items():
+            self.visits += 1
+            yield pair
+
+
+_RESIDENT = 5000
+_WRITES = 200
+
+
+def test_reject_window_write_does_not_scan_resident_entries():
+    lb = _make_lb()
+    now = time.monotonic()
+    window = _VisitCountingDict({f'job-{i}': (now, 0) for i in range(_RESIDENT)})
+    lb._reject_last_seen = window
+    lb._reject_compatibility_by_key = {}
+    for i in range(_WRITES):
+        lb._record_rejection(_request(job_id=f'new-{i}'))
+    # A rebuild walks every resident entry; front-eviction walks O(expired),
+    # which is zero here because the whole window is live.
+    assert window.visits <= 2 * _WRITES
+    # Nothing was dropped: every entry is inside the window.
+    assert len(lb._reject_last_seen) == _RESIDENT + _WRITES
+
+
+def test_offered_arrival_write_does_not_scan_resident_entries():
+    lb = _make_lb()
+    now = time.monotonic()
+    jobs = _VisitCountingDict({f'k{i}': now for i in range(_RESIDENT)})
+    lb._offered_arrivals_by_job = jobs
+    for i in range(_WRITES):
+        lb._record_offered_arrival(_request(job_id=f'new-{i}'))
+    assert jobs.visits <= 2 * _WRITES
+
+
+def test_saturated_offered_arrival_write_does_not_scan_resident_entries():
+    # The cap bounds memory, so saturation is the state the tracker is
+    # designed to reach -- and it is where a per-request rebuild is most
+    # expensive. The early return must not sit behind an O(entries) prune.
+    lb = _make_lb()
+    now = time.monotonic()
+    jobs = _VisitCountingDict({f'k{i}': now for i in range(_RESIDENT)})
+    lb._offered_arrivals_by_job = jobs
+    lb._offered_arrival_saturated_until = now + 300
+    for i in range(_WRITES):
+        lb._record_offered_arrival(_request(job_id=f'new-{i}'))
+    assert jobs.visits <= 2 * _WRITES
+
+
+def test_reject_window_write_evicts_expired_without_a_reader():
+    # Front-eviction must still bound the window on its own: gauges are read
+    # on the controller sync cadence, which a controller outage can stop.
+    lb = _make_lb()
+    stale = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS - 1
+    lb._reject_last_seen = {f'old-{i}': (stale, 0) for i in range(50)}
+    lb._reject_compatibility_by_key = {
+        f'old-{i}': (0, ('L4',)) for i in range(50)
+    }
+    lb._record_rejection(_request(job_id='fresh'))
+    assert list(lb._reject_last_seen) == ['fresh']
+    # The parallel compatibility map must not outlive the entries it keys.
+    assert lb._reject_compatibility_by_key == {}
+
+
+def test_offered_arrival_write_evicts_expired_without_a_reader():
+    lb = _make_lb()
+    stale = time.monotonic() - constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS - 1
+    lb._offered_arrivals_by_job = {f'k{i}': stale for i in range(50)}
+    lb._headerless_offered_arrivals.append(stale)
+    lb._record_offered_arrival(_request(job_id='fresh'))
+    assert len(lb._offered_arrivals_by_job) == 1
+    assert not lb._headerless_offered_arrivals
+
+
+def test_refreshing_an_entry_moves_it_behind_older_ones():
+    # Front-eviction is only correct while the oldest live entry stays at the
+    # front. Refreshing a key in place would leave a fresh entry there and
+    # stop eviction dead, so refreshes must re-insert at the back.
+    lb = _make_lb()
+    lb._record_rejection(_request(job_id='a'))
+    lb._record_rejection(_request(job_id='b'))
+    lb._record_rejection(_request(job_id='a'))
+    assert list(lb._reject_last_seen) == ['b', 'a']
+
+    lb2 = _make_lb()
+    lb2._record_offered_arrival(_request(job_id='a'))
+    lb2._record_offered_arrival(_request(job_id='b'))
+    lb2._record_offered_arrival(_request(job_id='a'))
+    key_a = hashlib.sha256(b'a').hexdigest()
+    assert list(lb2._offered_arrivals_by_job)[-1] == key_a
+
+
+def test_reads_stay_exact_when_the_write_ordering_is_violated():
+    # A directly-injected window need not be ordered by last-seen, so front
+    # eviction can stop early and strand an expired entry. That costs a
+    # little memory, never a wrong gauge: the reader drops expired entries
+    # wherever they sit.
+    lb = _make_lb()
+    now = time.monotonic()
+    stale = now - constants.LB_REJECT_WINDOW_SECONDS - 1
+    lb._reject_last_seen = {'fresh': (now, 0), 'stale': (stale, 0)}
+    assert lb._rejected_in_window() == 1
+    assert list(lb._reject_last_seen) == ['fresh']
