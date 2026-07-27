@@ -1,6 +1,6 @@
 # SkyServe exact-accelerator compatibility, priority, and per-card capacity plan
 
-_Created: 2026-07-19. Updated: 2026-07-23._
+_Created: 2026-07-19. Updated: 2026-07-27._
 
 ## Decision summary
 
@@ -93,6 +93,7 @@ not evidence that the behavior is active in production.
 | `1.1.703` | PR #863, response-time history | Added full HTTP completion history without changing placement. | Included in deployed `1.1.704`; later superseded by prediction-time history. |
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
 | `1.1.721` | PR #877, reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Included in deployed `1.1.726`. Production then exposed a separate catalog-ordering edge case when a zero-cost-only A100 preceded paid L4. |
+| Unreleased | Preserve exact cards during downscale-held retries | Keeps the held part of an adopted exact-card target on its prior cards while the request queue is briefly empty. Fresh remaining demand may still change its own card assignment, but the held portion cannot turn an L40S retry into an L4 cold launch. | Required after the 2026-07-27 `clin-structure-eval-6f51471-l40s-v8` acceptance run selected L4 while reporting an exact `{"L40S": 1}` target. |
 | Unreleased | Reserved-only card paid fallback | Excludes cards whose every successfully priced location is zero-cost from flexible cold-paid ordering. Paid-capable and unpriced cards keep the all-or-nothing service-order fallback, while exact demand can still target a reserved-only card. | Required before the next `opendde-10c200s-v4` rollout so default-all demand selects paid L4 instead of waiting on the reserved-only A100 location. |
 | Unreleased | Centralized placement catalog | Materializes every exact location and nominal cost once per immutable service version, persists the complete catalog in PostgreSQL, backfills legacy versions before controller-child spawn, and removes the old partial-cache accessors and fallback feasibility resolver. | Supersedes the bounded partial-cache fix for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures. The canonical subdesign is `docs/designs/serve-central-placement-catalog.md`. |
 
@@ -369,6 +370,48 @@ multi-card service must use an ordered accelerator resource list before
 advertising compatibility. An unordered `resources.any_of` service keeps
 legacy aggregate behavior rather than turning transient availability or hash
 iteration into a cold-card policy.
+
+#### Downscale-held exact-card retries
+
+Aggregate downscale delay retains capacity while a request temporarily leaves
+the live queue, including the gap between a timed-out HTTP connection and a
+deduplicated client retry. That retained capacity keeps its adopted exact-card
+assignment. Recomputing the held portion as default-all demand would allow the
+actuator to replace a constrained L40S target with the cheaper L4 even though
+no new compatibility evidence authorized that change.
+
+Fresh demand remains independently reassignable. If an adopted three-slot L40S
+target is held while one new L4-only request is visible, the actuation target
+may become one L4 plus two held L40S slots. It must not reinterpret all three
+slots as L4. Generic overprovision continues to follow the fresh desired map
+because it is outside the adopted traffic target. Already-running compatible
+GPU supply may still replace a held slot; only a new cold launch is forbidden
+from silently changing the held slot's card.
+
+The live failure was observed on 2026-07-27 with service
+`clin-structure-eval-6f51471-l40s-v8`. One queued request produced aggregate
+target 1 and exact target `{"L40S": 1}`. After two L40S Spot locations failed
+for capacity (`g6e.xlarge` in `ap-south-1a`, then `us-east-2a`), the queue was
+briefly empty while the 900-second downscale delay held target 1. The next
+replica selected L4 (`gr6.4xlarge` in `eu-north-1a`) despite the controller
+still reporting `{"L40S": 1}`. The dispatcher and service were stopped
+immediately; the Kubernetes Job, pod, service, and replica cluster were
+confirmed absent.
+
+Regression coverage must reproduce the two reports without cloud resources:
+first one L40S-constrained queued request, then a complete empty report before
+downscale delay expires. Both scale-up decisions must remain exactly one L40S.
+Coverage must also show that a smaller fresh target can change only its own
+slots while the remainder preserves the adopted exact-card mix, that a
+rate-limited downscale preserves the cards of the remaining slots, and that
+already-running compatible supply remains reusable.
+
+Local verification on 2026-07-27 ran all 241 concurrency-autoscaler unit tests
+after rebasing onto current `improvements`.
+The production-shape reproduction changed from
+`retry_actuation={"L4": 1}` before the fix to
+`retry_actuation={"L40S": 1}` after it, with raw target 0 and held target 1.
+The touched Python files pass pinned YAPF 0.43.0 and Pylint 4.0.4 at 10/10.
 
 Nominal cost ordering is all-or-nothing across cards that may have paid
 capacity. If any such card has an unavailable catalog price or no cataloged
