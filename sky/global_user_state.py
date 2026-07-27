@@ -2018,12 +2018,18 @@ def remove_cluster(cluster_name: str,
         usage_intervals = _get_cluster_usage_intervals(cluster_hash,
                                                        session=session)
 
-        # usage_intervals is not None and not empty
-        if usage_intervals:
+        # Close the currently-open interval, if there is one. An interval that
+        # is already closed must never be reopened and re-closed at "now": the
+        # status-refresh daemon reaches this function on every sweep of an
+        # already-STOPPED cluster (all nodes report STOPPED, so
+        # backend_utils calls post_teardown_cleanup again), and extending the
+        # last interval each time would accrue uptime for the whole period the
+        # cluster sits stopped. This mirrors add_or_update_cluster, which only
+        # appends a new open interval when the last one is closed.
+        if usage_intervals and usage_intervals[-1][1] is None:
             assert cluster_hash is not None, cluster_name
-            start_time = usage_intervals.pop()[0]
-            end_time = int(time.time())
-            usage_intervals.append((start_time, end_time))
+            start_time = usage_intervals[-1][0]
+            usage_intervals[-1] = (start_time, int(time.time()))
             _set_cluster_usage_intervals(cluster_hash,
                                          usage_intervals,
                                          session=session)

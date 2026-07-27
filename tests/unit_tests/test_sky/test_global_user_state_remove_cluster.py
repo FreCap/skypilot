@@ -143,3 +143,93 @@ def test_usage_interval_closed_on_remove(tmp_path, monkeypatch):
     intervals = global_user_state._get_cluster_usage_intervals(cluster_hash)
     assert intervals, 'usage intervals must survive removal'
     assert intervals[-1][1] is not None, 'last interval must be closed'
+
+
+def _cluster_hash(name: str) -> str:
+    engine = global_user_state._db_manager.get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(
+            sqlalchemy.text(
+                'SELECT cluster_hash FROM clusters WHERE name = :n'), {
+                    'n': name
+                }).fetchone()
+    return row[0]
+
+
+def _install_clock(monkeypatch, start: int) -> dict:
+    """Freeze global_user_state's clock so elapsed time is explicit."""
+    clock = {'now': start}
+    monkeypatch.setattr(global_user_state.time, 'time', lambda: clock['now'])
+    return clock
+
+
+def test_repeated_stop_does_not_extend_a_closed_interval(tmp_path, monkeypatch):
+    """A stopped cluster must not accrue uptime while it sits stopped.
+
+    The status-refresh daemon reaches remove_cluster on every sweep of an
+    already-STOPPED cluster (all nodes report STOPPED, so backend_utils calls
+    post_teardown_cleanup again). Re-closing the last interval at "now" on
+    each sweep would bill the whole stopped period.
+    """
+    _fresh_db(tmp_path, monkeypatch)
+    clock = _install_clock(monkeypatch, 1_000_000)
+    _add_cluster('c')
+    cluster_hash = _cluster_hash('c')
+
+    # One hour of real uptime, then the cluster stops.
+    clock['now'] += 3600
+    global_user_state.remove_cluster('c', terminate=False)
+    after_stop = global_user_state._get_cluster_usage_intervals(cluster_hash)
+    assert after_stop[-1][1] == 1_003_600
+
+    # Ten days of daemon sweeps against the already-stopped cluster.
+    for _ in range(10):
+        clock['now'] += 86400
+        global_user_state.remove_cluster('c', terminate=False)
+
+    assert (global_user_state._get_cluster_usage_intervals(cluster_hash) ==
+            after_stop)
+
+
+def test_terminate_after_stop_does_not_extend_a_closed_interval(
+        tmp_path, monkeypatch):
+    """`sky down` on a long-stopped cluster must not bill the stopped time."""
+    _fresh_db(tmp_path, monkeypatch)
+    clock = _install_clock(monkeypatch, 1_000_000)
+    _add_cluster('c')
+    cluster_hash = _cluster_hash('c')
+
+    clock['now'] += 3600
+    global_user_state.remove_cluster('c', terminate=False)
+    after_stop = global_user_state._get_cluster_usage_intervals(cluster_hash)
+
+    # Terminated 30 days later.
+    clock['now'] += 30 * 86400
+    global_user_state.remove_cluster('c', terminate=True)
+
+    assert (global_user_state._get_cluster_usage_intervals(cluster_hash) ==
+            after_stop)
+
+
+def test_restart_appends_a_new_interval_and_stop_closes_it(
+        tmp_path, monkeypatch):
+    """Stop/start must still record each separate run, and only each run."""
+    _fresh_db(tmp_path, monkeypatch)
+    clock = _install_clock(monkeypatch, 1_000_000)
+    _add_cluster('c')
+    cluster_hash = _cluster_hash('c')
+
+    clock['now'] += 3600
+    global_user_state.remove_cluster('c', terminate=False)
+
+    # Idle while stopped, then relaunched and stopped again an hour later.
+    clock['now'] += 7 * 86400
+    _add_cluster('c')
+    clock['now'] += 3600
+    global_user_state.remove_cluster('c', terminate=False)
+
+    intervals = global_user_state._get_cluster_usage_intervals(cluster_hash)
+    assert len(intervals) == 2, intervals
+    assert all(end is not None for _, end in intervals)
+    billed = sum(end - start for start, end in intervals)
+    assert billed == 2 * 3600, intervals
