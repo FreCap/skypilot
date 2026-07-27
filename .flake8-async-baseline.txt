@@ -1,11 +1,11 @@
 sky/client/interactive_utils.py:86:30: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:92:31: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:108:24: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:1652:13: ASYNC120 checkpoint inside except on line 1650 will discard the active exception if cancelled.
-sky/jobs/controller.py:1817:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:1868:13: ASYNC120 checkpoint inside except on line 1866 will discard the active exception if cancelled.
-sky/jobs/controller.py:1869:13: ASYNC120 checkpoint inside except on line 1866 will discard the active exception if cancelled.
-sky/jobs/controller.py:1928:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/jobs/controller.py:1655:13: ASYNC120 checkpoint inside except on line 1653 will discard the active exception if cancelled.
+sky/jobs/controller.py:1820:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/jobs/controller.py:1871:13: ASYNC120 checkpoint inside except on line 1869 will discard the active exception if cancelled.
+sky/jobs/controller.py:1872:13: ASYNC120 checkpoint inside except on line 1869 will discard the active exception if cancelled.
+sky/jobs/controller.py:1931:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/requests/executor.py:1150:9: ASYNC120 checkpoint inside except on line 1145 will discard the active exception if cancelled.
 sky/server/requests/process.py:110:12: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
 sky/server/requests/threads.py:54:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.

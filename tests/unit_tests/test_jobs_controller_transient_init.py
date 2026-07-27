@@ -19,6 +19,9 @@ class TestTransientInitConfirmation:
     class ExpectedRecovery(Exception):
         """Stops the monitor immediately after it enters recovery."""
 
+    class NoRecovery(Exception):
+        """Raised when the monitor loops without ever reaching recovery."""
+
     @staticmethod
     def _make_controller() -> JobController:
         controller = JobController.__new__(JobController)
@@ -94,6 +97,86 @@ class TestTransientInitConfirmation:
         wall_clock.assert_not_called()
         set_recovering.assert_awaited_once()
         executor.recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_flapping_cluster_still_recovers_within_the_budget(self):
+        # A cluster that alternates UP/INIT resets the confirmation streak on
+        # every UP tick, so the wall-clock status-fetch budget is the only
+        # backstop left. Clearing that budget on each not-UP tick restarts the
+        # clock forever: the job then never recovers and never fails.
+        threshold = controller_lib._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
+        for period in range(2, threshold + 4):
+            refreshes = await self._run_flapping_until_recovery(period=period)
+            budget = (controller_lib.managed_job_utils.
+                      JOB_STATUS_FETCH_TOTAL_TIMEOUT_SECONDS)
+            gap = (
+                controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS)
+            # Recovery must arrive on the budget, not on the streak.
+            assert refreshes <= budget / gap + threshold, (
+                f'no recovery within the budget for INIT every {period} '
+                f'refreshes: took {refreshes}')
+
+    async def _run_flapping_until_recovery(self, *, period, max_refreshes=400):
+        """Drive the monitor with a flapping cluster and a dead status fetch."""
+        controller = self._make_controller()
+        task = MagicMock(name='task')
+        task.num_nodes = 16
+        executor = MagicMock()
+        executor.recover = AsyncMock(side_effect=self.ExpectedRecovery)
+
+        clock = {'now': 1000.0}
+        refreshes = {'count': 0}
+
+        async def advancing_sleep(seconds, *args, **kwargs):
+            del args, kwargs
+            clock['now'] += float(seconds)
+
+        def flapping_refresh(*args, **kwargs):
+            del args, kwargs
+            refreshes['count'] += 1
+            if refreshes['count'] > max_refreshes:
+                raise self.NoRecovery(
+                    f'no recovery after {max_refreshes} refreshes '
+                    f'({clock["now"] - 1000.0:.0f}s simulated)')
+            handle = MagicMock(launched_resources=MagicMock(
+                need_cleanup_after_preemption_or_failure=lambda: False))
+            status = (status_lib.ClusterStatus.INIT if refreshes['count'] %
+                      period == 0 else status_lib.ClusterStatus.UP)
+            return (status, handle)
+
+        fake_time = SimpleNamespace(monotonic=lambda: clock['now'],
+                                    time=lambda: clock['now'])
+
+        with patch.object(controller_lib, 'time', fake_time), patch.object(
+                controller_lib.asyncio,
+                'sleep',
+                new=AsyncMock(side_effect=advancing_sleep)), patch.object(
+                    controller_lib.backend_utils,
+                    'async_check_network_connection',
+                    new=AsyncMock()), patch.object(
+                        controller_lib.managed_job_utils,
+                        'get_job_status',
+                        new=AsyncMock(
+                            return_value=(None, 'transient'))), patch.object(
+                                controller_lib.global_user_state,
+                                'get_cluster_events',
+                                return_value=[]), patch.object(
+                                    controller_lib.backend_utils,
+                                    'refresh_cluster_status_handle',
+                                    new=flapping_refresh), patch.object(
+                                        controller_lib.managed_job_state,
+                                        'set_recovering_async',
+                                        new=AsyncMock()), pytest.raises(
+                                            self.ExpectedRecovery):
+            await controller._monitor_one_task(
+                task_id=0,
+                task=task,
+                cluster_name='test-cluster',
+                executor=executor,
+                callback_func=AsyncMock(),
+            )
+
+        return refreshes['count']
 
     @pytest.mark.asyncio
     async def test_transient_stopped_cluster_recovers_immediately(self):
