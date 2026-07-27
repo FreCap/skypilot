@@ -1049,11 +1049,14 @@ class JobController:
             external_failures: list[ExternalClusterFailure] | None = None
             cluster_event_reason = None
             if cluster_status != status_lib.ClusterStatus.UP:
-                # The status-fetch retry window only applies when the cluster
-                # itself is confirmed UP. A not-UP verdict switches to the
-                # cluster confirmation/recovery path and starts a fresh retry
-                # budget once the cluster reports UP again.
-                transient_job_check_retry = None
+                # NOTE: the status-fetch retry budget is deliberately NOT
+                # cleared here. A flapping cluster alternates UP/INIT, and the
+                # INIT confirmation streak resets on every UP tick, so the
+                # budget is the only wall-clock backstop that still forces
+                # recovery. Clearing it on each not-UP tick restarts that
+                # clock forever and the job never recovers and never fails.
+                # It is cleared where it is actually satisfied: on a
+                # successful job-status fetch, and after recovery.
                 healthy_cluster_hold_logged = False
                 # The cluster is (partially) preempted or failed. It can be
                 # down, INIT or STOPPED, based on the interruption behavior of
