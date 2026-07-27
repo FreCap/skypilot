@@ -449,7 +449,12 @@ async def scheduled_launch(
     # exceeded.
     while True:
         async with starting_lock:
-            if len(starting) < controller_utils.LAUNCHES_PER_WORKER:
+            # ControllerManager preclaims the initial slot before handing the
+            # job to its background coroutine. Honor that ownership even when
+            # this job fills the cap; later launches must still atomically
+            # claim genuinely free capacity.
+            if (job_id in starting or
+                    len(starting) < controller_utils.LAUNCHES_PER_WORKER):
                 starting.add(job_id)
                 break
             logger.info('Too many jobs starting, waiting for a slot')

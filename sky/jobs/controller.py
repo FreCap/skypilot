@@ -383,6 +383,15 @@ class JobController:
             self._file_mounts_blob_id = blob_id
         return typing.cast(str | None, blob_id)
 
+    @asyncio_utils.shield
+    async def _release_initial_launch_slot(self) -> None:
+        """Release manager-owned launch admission and wake one waiter."""
+        async with self.starting_lock:
+            if self._job_id not in self.starting:
+                return
+            self.starting.remove(self._job_id)
+            self.starting_signal.notify()
+
     def download_log_and_stream(
         self,
         task_id: int | None,
@@ -702,17 +711,7 @@ class JobController:
                 start_time=remote_job_submitted_at,
                 callback_func=callback_func)
 
-        async with self.starting_lock:
-            try:
-                self.starting.remove(self._job_id)
-                # its fine if we notify again, better to wake someone up
-                # and have them go to sleep again, then have some stuck
-                # sleeping.
-                # ps. this shouldn't actually happen because if its been
-                # removed from the set then we would get a key error.
-                self.starting_signal.notify()
-            except KeyError:
-                pass
+        await self._release_initial_launch_slot()
 
         # NOTE: if we are resuming from a controller failure, we only keep
         # monitoring if the job is in RUNNING state. For all other cases,
@@ -796,6 +795,7 @@ class JobController:
             if (prev_status is not None and prev_status.is_terminal()):
                 logger.info(f'Batch task {task_id} already in terminal status '
                             f'{prev_status.value}, skipping.')
+                await self._release_initial_launch_slot()
                 return prev_status == (
                     managed_job_state.ManagedJobStatus.SUCCEEDED)
             if prev_status == managed_job_state.ManagedJobStatus.CANCELLING:
@@ -837,6 +837,8 @@ class JobController:
                 task_id=task_id,
                 start_time=time.time(),
                 callback_func=callback_func)
+
+        await self._release_initial_launch_slot()
 
         try:
             await asyncio.to_thread(coordinator.run)
@@ -1613,6 +1615,7 @@ class JobController:
             all_succeeded = all(task_resume_info[tid][0] ==
                                 managed_job_state.ManagedJobStatus.SUCCEEDED
                                 for tid in range(len(tasks)))
+            await self._release_initial_launch_slot()
             return all_succeeded
 
         # Phase 1: Launch clusters for tasks that need launching
@@ -1706,6 +1709,8 @@ class JobController:
                         callback_func=callback_func))
         if start_coros:
             await asyncio.gather(*start_coros)
+
+        await self._release_initial_launch_slot()
 
         # Phase 3: Set up networking
         logger.info('Phase 3: Setting up JobGroup networking...')

@@ -98,6 +98,45 @@ async def test_scheduled_launch_records_backoff_and_releases_slot():
     set_alive.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_scheduled_launch_uses_preclaimed_slot_at_capacity():
+    starting = {7}
+    starting_lock = asyncio.Lock()
+    starting_signal = asyncio.Condition(starting_lock)
+    body_entered = asyncio.Event()
+
+    async def launch():
+        async with scheduler.scheduled_launch(7, starting, starting_lock,
+                                              starting_signal):
+            body_entered.set()
+
+    with mock.patch.object(
+            scheduler.state,
+            'get_pool_and_execution_from_job_id_async',
+            new_callable=mock.AsyncMock,
+            return_value=(None, None)), mock.patch.object(
+                scheduler.state,
+                'scheduler_set_launching_async',
+                new_callable=mock.AsyncMock) as set_launching, \
+            mock.patch.object(
+                scheduler.state,
+                'scheduler_set_alive_async',
+                new_callable=mock.AsyncMock) as set_alive, \
+            mock.patch.object(scheduler.controller_utils,
+                              'LAUNCHES_PER_WORKER', 1):
+        launch_task = asyncio.create_task(launch())
+        try:
+            await asyncio.wait_for(body_entered.wait(), timeout=1)
+            await asyncio.wait_for(launch_task, timeout=1)
+        finally:
+            launch_task.cancel()
+            await asyncio.gather(launch_task, return_exceptions=True)
+
+    assert starting == set()
+    set_launching.assert_awaited_once_with(7)
+    set_alive.assert_awaited_once_with(7)
+
+
 class _YieldingLock(asyncio.Lock):
     """Lock whose acquire always yields to the event loop first.
 
