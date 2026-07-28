@@ -33,13 +33,15 @@ def test_set_service_status_from_replica_prefers_controller_owner_lookup():
     set_st.assert_called_once()
 
 
-def test_missing_service_row_raises_after_compatibility_fallback():
+def test_missing_service_row_raises_without_joined_fallback():
     with mock.patch.object(serve_state,
                            'get_service_controller_owner',
                            return_value=None), \
          mock.patch.object(serve_state,
                            'get_service_from_name',
-                           return_value=None) as full_read, \
+                           side_effect=AssertionError(
+                               'missing rows should fail from the owner '
+                               'snapshot alone')), \
          mock.patch.object(
              serve_state,
              'set_service_status_and_active_versions_if_owner') as set_st:
@@ -51,29 +53,23 @@ def test_missing_service_row_raises_after_compatibility_fallback():
             raised = True
 
     assert raised
-    full_read.assert_called_once_with('svc')
     set_st.assert_not_called()
 
 
 def test_versionless_nonnull_hash_row_is_rejected():
-    # Interrupted pre-atomic registration can leave a versionless row with a
-    # durable hash, so hash presence alone cannot identify a valid service.
-    record = {
-        'status': serve_state.ServiceStatus.READY,
-        'hash': 'orphan',
-        'controller_pid': 123,
-        'controller_ip': '10.0.0.1',
-    }
 
     def owner_lookup(unused_name, require_version=False):
-        return None if require_version else record
+        assert require_version
+        return None
 
     with mock.patch.object(serve_state,
                            'get_service_controller_owner',
                            side_effect=owner_lookup), \
          mock.patch.object(serve_state,
                            'get_service_from_name',
-                           return_value=None) as full_read, \
+                           side_effect=AssertionError(
+                               'versionless rows should not trigger a full '
+                               'service reread')), \
          mock.patch.object(
              serve_state,
              'set_service_status_and_active_versions_if_owner') as set_st:
@@ -81,7 +77,6 @@ def test_versionless_nonnull_hash_row_is_rejected():
             serve_utils.set_service_status_and_active_versions_from_replica(
                 'svc', [], serve_utils.UpdateMode.ROLLING)
 
-    full_read.assert_called_once_with('svc')
     set_st.assert_not_called()
 
 

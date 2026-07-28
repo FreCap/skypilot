@@ -230,7 +230,7 @@ class TestReplicaWriterGuard:
     def test_does_not_overwrite_controller_failed(self):
         with mock.patch.object(
                 serve_utils.serve_state,
-                'get_service_from_name',
+                'get_service_controller_owner',
                 return_value=_record(
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
