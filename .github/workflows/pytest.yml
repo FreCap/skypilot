@@ -52,7 +52,7 @@ jobs:
               tests/unit_tests/test_serve_load_balancer_sync_spec.py
               tests/unit_tests/test_sky/storage/test_storage_utils.py
             test-name: "Resource Lifetime"
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-4x8
     name: "Python Tests - ${{ matrix.test-name }}"
     steps:
       - name: Checkout repository
@@ -68,7 +68,7 @@ jobs:
   limited-deps-test:
     # Test with limited dependencies to ensure cloud module imports don't break
     # basic functionality (e.g., importing IBM shouldn't break AWS support)
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     strategy:
       matrix:
         python-version: ["3.14"]
@@ -138,7 +138,7 @@ jobs:
 
   failover-test:
     # Test failover functionality
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     strategy:
       matrix:
         # Keep failover coverage on the production interpreter.

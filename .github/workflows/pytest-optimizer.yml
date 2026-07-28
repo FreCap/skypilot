@@ -33,7 +33,7 @@ jobs:
             test-name: "Optimizer Dryruns Part 3"
           - test-path: tests/test_optimizer_random_dag.py
             test-name: "Optimizer Random DAG Tests"
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-4x8
     name: "Python Tests - ${{ matrix.test-name }}"
     steps:
       - name: Checkout repository

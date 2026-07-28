@@ -17,7 +17,7 @@ on:
 
 jobs:
   ruff:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     strategy:
       matrix:
         python-version: ["3.14"]
@@ -83,7 +83,7 @@ jobs:
             | xargs ruff check --select RUF012
 
   basedpyright:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
       - name: Install the latest version of uv
@@ -101,7 +101,7 @@ jobs:
             --baselinefile .basedpyright-baseline.json
 
   stub-runtime-contracts:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
       - name: Install the latest version of uv
@@ -122,7 +122,7 @@ jobs:
             --mypy-config-file .stubtest.ini
 
   async-lifecycle:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
       - name: Install the latest version of uv
@@ -153,7 +153,7 @@ jobs:
             /tmp/flake8-async-current.txt
 
   import-linter:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     strategy:
       matrix:
         python-version: ["3.14"]
@@ -179,7 +179,7 @@ jobs:
   # imports on that worker floor. Delete it when the remote runtime
   # (SKY_REMOTE_RAY_VERSION + remote --python pin) moves to 3.14.
   worker-floor-import:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
       - name: Install the latest version of uv
@@ -203,7 +203,7 @@ jobs:
           python -m compileall -q -x 'schemas/generated' sky
 
   actionlint:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
       - name: Run actionlint on workflow files

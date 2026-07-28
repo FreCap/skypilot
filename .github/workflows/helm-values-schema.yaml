@@ -15,7 +15,7 @@ on:
 
 jobs:
   helm-values-schema:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     
     steps:
     - name: Checkout code

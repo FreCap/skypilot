@@ -16,7 +16,7 @@ jobs:
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/build-docs')
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     steps:
       - name: Check authorization
         id: check-auth
@@ -241,7 +241,7 @@ jobs:
       github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       contains(github.event.pull_request.labels.*.name, 'rtd-preview')
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     steps:
       - name: Deactivate ReadTheDocs preview
         env:

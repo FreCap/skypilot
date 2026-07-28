@@ -16,7 +16,7 @@ on:
 
 jobs:
   check-date:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     outputs:
       should_run: ${{ steps.compute_should_run.outputs.should_run }}
     steps:
@@ -39,7 +39,7 @@ jobs:
           fi
 
   gate-tests:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     needs: [check-date]
     outputs:
       run_tests: ${{ steps.compute_gate.outputs.run_tests }}
@@ -73,7 +73,7 @@ jobs:
           fi
 
   nightly-build-pypi:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     needs: check-date
     if: ${{ needs.check-date.outputs.should_run != 'false' }}
     outputs:
@@ -306,7 +306,7 @@ jobs:
   # can react without polling PyPI. Fail-loud: a missing secret, bad App creds,
   # or a non-204 turns the run red rather than silently skipping.
   notify-downstream:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     needs: [check-date, nightly-build-pypi, publish-and-validate-both]
     if: ${{ always() && needs.publish-and-validate-both.result == 'success' }}
     steps:
@@ -361,7 +361,7 @@ jobs:
           echo "Dispatch accepted."
 
   summary:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     needs: [check-date, nightly-build-pypi, smoke-tests-aws, smoke-tests-kubernetes-resource-heavy, smoke-tests-kubernetes-no-resource-heavy, smoke-tests-kubernetes-no-resource-heavy-limit-deps, smoke-tests-remote-server-kubernetes, smoke-tests-kubernetes-jobs-consolidation, smoke-tests-shared-gke-api-server, smoke-tests-slurm-minimal, backward-compat-test-nightly, backward-compat-test-stable]
     if: always()
     steps:
@@ -429,7 +429,7 @@ jobs:
           fi
 
   notify-slack-failure:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     needs: [check-date, nightly-build-pypi, smoke-tests-aws, smoke-tests-kubernetes-resource-heavy, smoke-tests-kubernetes-no-resource-heavy, smoke-tests-kubernetes-no-resource-heavy-limit-deps, smoke-tests-remote-server-kubernetes, smoke-tests-kubernetes-jobs-consolidation, smoke-tests-shared-gke-api-server, smoke-tests-slurm-minimal, backward-compat-test-nightly, backward-compat-test-stable, publish-and-validate-both, trigger-docker-and-helm-release]
     # Only run this job if any of the previous jobs failed
     if: failure()
