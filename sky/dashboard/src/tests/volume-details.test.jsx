@@ -25,7 +25,7 @@ function deferred() {
 
 describe('useVolumeDetails request ownership', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
   });
 
   afterEach(() => {
@@ -122,6 +122,42 @@ describe('useVolumeDetails request ownership', () => {
     expect(result.current.loading).toBe(false);
     expect(errorSpy).not.toHaveBeenCalled();
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces a manual refresh with an in-flight route load for the new volume', async () => {
+    const volumeB = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'volume-a', status: 'READY-A' }])
+      .mockImplementationOnce(() => volumeB.promise)
+      .mockResolvedValueOnce([{ name: 'volume-b', status: 'DUPLICATE' }]);
+
+    const { result, rerender } = renderHook(
+      ({ volumeName }) => useVolumeDetails({ volumeName }),
+      { initialProps: { volumeName: 'volume-a' } }
+    );
+    await waitFor(() =>
+      expect(result.current.volumeData?.status).toBe('READY-A')
+    );
+
+    rerender({ volumeName: 'volume-b' });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshData();
+    });
+
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+    expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      volumeB.resolve([{ name: 'volume-b', status: 'READY-B' }]);
+      await refreshPromise;
+    });
+
+    expect(result.current.volumeData?.status).toBe('READY-B');
+    expect(result.current.loading).toBe(false);
   });
 
   it('scopes duplicate manual refresh invalidation to the current volume key', async () => {

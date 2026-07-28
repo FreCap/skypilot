@@ -29,29 +29,56 @@ export function useVolumeDetails({ volumeName }) {
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
 
-  const fetchData = useCallback(async () => {
-    if (!volumeName) return;
-    const requestVersion = requestVersionRef.current + 1;
-    requestVersionRef.current = requestVersion;
-    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
-    setLoading(true);
-    setVolumeData((current) => (current?.name === volumeName ? current : null));
-    try {
-      const volumes = await dashboardCache.get(getVolumes, [
-        { name: volumeName },
-      ]);
-      if (!isCurrentRequest()) return;
-      setVolumeData(volumes[0] || null);
-    } catch (error) {
-      if (!isCurrentRequest()) return;
-      console.error('Failed to fetch volume details:', error);
-      setVolumeData(null);
-    } finally {
-      if (isCurrentRequest()) {
-        setLoading(false);
+  const fetchData = useCallback(
+    ({ invalidate = false } = {}) => {
+      if (!volumeName) return Promise.resolve();
+
+      const inFlight = refreshInFlightRef.current;
+      if (inFlight?.volumeName === volumeName) {
+        return inFlight.promise;
       }
-    }
-  }, [volumeName]);
+
+      if (invalidate) {
+        dashboardCache.invalidate(getVolumes, [{ name: volumeName }]);
+      }
+
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
+      setLoading(true);
+      setVolumeData((current) =>
+        current?.name === volumeName ? current : null
+      );
+
+      let refreshPromise;
+      refreshPromise = (async () => {
+        try {
+          const volumes = await dashboardCache.get(getVolumes, [
+            { name: volumeName },
+          ]);
+          if (!isCurrentRequest()) return;
+          setVolumeData(volumes[0] || null);
+        } catch (error) {
+          if (!isCurrentRequest()) return;
+          console.error('Failed to fetch volume details:', error);
+          setVolumeData(null);
+        } finally {
+          if (isCurrentRequest()) {
+            setLoading(false);
+          }
+        }
+      })().finally(() => {
+        if (refreshInFlightRef.current?.promise === refreshPromise) {
+          refreshInFlightRef.current = null;
+        }
+      });
+
+      refreshInFlightRef.current = { volumeName, promise: refreshPromise };
+      return refreshPromise;
+    },
+    [volumeName]
+  );
 
   useEffect(() => {
     fetchData();
@@ -67,23 +94,7 @@ export function useVolumeDetails({ volumeName }) {
     if (!volumeName) {
       return Promise.resolve();
     }
-
-    const inFlight = refreshInFlightRef.current;
-    if (inFlight?.volumeName === volumeName) {
-      return inFlight.promise;
-    }
-
-    const refreshPromise = (async () => {
-      dashboardCache.invalidate(getVolumes, [{ name: volumeName }]);
-      await fetchData();
-    })().finally(() => {
-      if (refreshInFlightRef.current?.promise === refreshPromise) {
-        refreshInFlightRef.current = null;
-      }
-    });
-
-    refreshInFlightRef.current = { volumeName, promise: refreshPromise };
-    return refreshPromise;
+    return fetchData({ invalidate: true });
   }, [fetchData, volumeName]);
 
   return { volumeData, loading, refreshData };
