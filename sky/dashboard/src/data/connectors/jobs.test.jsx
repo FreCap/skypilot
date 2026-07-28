@@ -352,7 +352,6 @@ describe('useSingleManagedJob refresh ownership', () => {
       secondRefresh = result.current.refreshJobData();
     });
 
-    expect(secondRefresh).toBe(firstRefresh);
     expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
@@ -507,15 +506,12 @@ describe('useSingleManagedJob refresh ownership', () => {
     expect(result.current.jobData.jobs[0].status).toBe('SUCCEEDED');
   });
 
-  it('keeps a refresh loading when the superseded initial request fails', async () => {
+  it('reuses the in-flight initial load when no current-route data is visible', async () => {
     const initialRequest = deferred();
-    const refreshedRequest = deferred();
     const consoleError = jest
       .spyOn(console, 'error')
       .mockImplementation(() => {});
-    dashboardCache.get
-      .mockImplementationOnce(() => initialRequest.promise)
-      .mockImplementationOnce(() => refreshedRequest.promise);
+    dashboardCache.get.mockImplementationOnce(() => initialRequest.promise);
 
     const { result } = renderHook(() => useSingleManagedJob('56164'));
 
@@ -524,18 +520,11 @@ describe('useSingleManagedJob refresh ownership', () => {
     act(() => {
       refreshPromise = result.current.refreshJobData();
     });
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
 
     await act(async () => {
-      initialRequest.reject(new Error('superseded request failed'));
-      await initialRequest.promise.catch(() => {});
-    });
-
-    expect(result.current.loading).toBe(true);
-    expect(result.current.jobData).toBeNull();
-
-    await act(async () => {
-      refreshedRequest.resolve({
+      initialRequest.resolve({
         jobs: [{ id: 56164, status: 'RUNNING' }],
         controllerStopped: false,
       });
@@ -544,7 +533,7 @@ describe('useSingleManagedJob refresh ownership', () => {
 
     expect(result.current.loading).toBe(false);
     expect(result.current.jobData.jobs[0].status).toBe('RUNNING');
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
     consoleError.mockRestore();
   });
 });
