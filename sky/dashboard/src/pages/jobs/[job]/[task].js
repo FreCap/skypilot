@@ -41,7 +41,6 @@ function TaskDetails() {
   const { jobData, loading, refreshJobData } = useSingleManagedJob(jobId);
   const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
   const [refreshLogsFlag, setRefreshLogsFlag] = useState(0);
   const [isLogsExpanded, setIsLogsExpanded] = useState(true);
@@ -50,13 +49,6 @@ function TaskDetails() {
   // GPU metrics state
   const [isGrafanaAvailable, setIsGrafanaAvailable] = useState(false);
   const [telemetryRefreshTrigger, setTelemetryRefreshTrigger] = useState(0);
-
-  // Update isInitialLoad when data is first loaded
-  React.useEffect(() => {
-    if (!loading && isInitialLoad) {
-      setIsInitialLoad(false);
-    }
-  }, [loading, isInitialLoad]);
 
   // Check Grafana availability on mount
   useEffect(() => {
@@ -97,6 +89,7 @@ function TaskDetails() {
   const taskIndexNum = parseInt(taskIndex, 10);
   const taskData = allTasks[taskIndexNum] || null;
   const jobName = allTasks.length > 0 ? allTasks[0].name : '';
+  const isRouteLoading = loading && taskData === null;
 
   const title = taskData
     ? `Task ${taskIndex}: ${taskData.task || 'Unnamed'} | Job ${jobId} | SkyPilot Dashboard`
@@ -149,7 +142,7 @@ function TaskDetails() {
           </div>
         </div>
 
-        {loading && isInitialLoad ? (
+        {isRouteLoading ? (
           <div className="flex items-center justify-center py-32">
             <CircularProgress size={20} className="mr-2" />
             <span>Loading...</span>
