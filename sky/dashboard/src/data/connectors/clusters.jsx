@@ -649,12 +649,18 @@ export function useClusterDetails({ cluster }) {
     };
   }, [cluster, fetchData]);
 
+  // Effects run after render. On a route change, do not expose the previous
+  // route's details, jobs, or idle loading flags during the render before the
+  // effect above advances ownership and clears its state.
+  const ownsRouteState = activeClusterRef.current === cluster;
+
   return {
-    clusterData,
-    clusterJobData,
-    loading: clusterDetailsLoading, // Only cluster details loading for initial page render
-    clusterDetailsLoading,
-    clusterJobsLoading,
+    clusterData: ownsRouteState ? clusterData : null,
+    clusterJobData: ownsRouteState ? clusterJobData : null,
+    // Only cluster details loading for initial page render.
+    loading: !ownsRouteState || clusterDetailsLoading,
+    clusterDetailsLoading: !ownsRouteState || clusterDetailsLoading,
+    clusterJobsLoading: !ownsRouteState || clusterJobsLoading,
     refreshData,
     refreshClusterJobsOnly,
   };
