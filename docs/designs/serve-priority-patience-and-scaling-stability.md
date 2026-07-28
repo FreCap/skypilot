@@ -252,6 +252,12 @@ than 60 seconds; the retained floor uses profiles newer than 300 seconds. The
 profile counts are distribution evidence, not a second arrival counter: the
 allocator normalizes the profiles from whichever aggregate window produced
 `arrival_work` to the exact missing work defined below.
+Keep accepted-arrival and live queued-profile evidence in request-count units
+when they share that normalization. The load balancer records each offered
+request before admission, then reports it as accepted or currently queued;
+`arrival_work` applies the duration/window conversion to their aggregate once.
+Applying that conversion to only the accepted profile before normalization
+would apply duration twice on that side and distort equal offered rates.
 
 ```text
 allocator_attributed_work = sum(fixed_running_and_unknown_work_by_card)
