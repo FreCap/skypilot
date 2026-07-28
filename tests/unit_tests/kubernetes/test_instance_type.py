@@ -2,9 +2,13 @@
 
 Tests verify correct instance type parsing and formatting.
 """
+import pickle
+
 import pytest
 
 from sky.clouds import kubernetes as kubernetes_cloud
+from sky.provision.kubernetes import instance_type as instance_type_lib
+from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes.utils import KubernetesInstanceType
 
 
@@ -96,6 +100,60 @@ def test_gpu_name_underscore_preservation():
         assert original_name in instance.name, (
             f"Instance type string '{instance.name}' should contain "
             f"original accelerator name '{original_name}'")
+
+
+def test_instance_type_facade_and_pickle_identity():
+    assert KubernetesInstanceType is instance_type_lib.KubernetesInstanceType
+    assert KubernetesInstanceType is kubernetes_utils.KubernetesInstanceType
+    assert KubernetesInstanceType.__module__ == (
+        'sky.provision.kubernetes.utils')
+
+    instance_type = KubernetesInstanceType.from_resources(cpus=2,
+                                                          memory=8,
+                                                          accelerator_count=1,
+                                                          accelerator_type='L4')
+    restored = pickle.loads(pickle.dumps(instance_type))
+
+    assert type(restored) is KubernetesInstanceType
+    assert restored.name == '2CPU--8GB--L4:1'
+
+
+def test_instance_type_dependency_patch_seams(monkeypatch):
+    format_calls = []
+    ceil_calls = []
+    compile_calls = []
+    original_compile = kubernetes_utils.re.compile
+
+    def record_format(value):
+        format_calls.append(value)
+        return f'formatted-{value}'
+
+    def record_ceil(value):
+        ceil_calls.append(value)
+        return 3
+
+    def record_compile(pattern, *args, **kwargs):
+        compile_calls.append(pattern)
+        return original_compile(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(kubernetes_utils.common_utils, 'format_float',
+                        record_format)
+    monkeypatch.setattr(kubernetes_utils.math, 'ceil', record_ceil)
+    monkeypatch.setattr(kubernetes_utils.re, 'compile', record_compile)
+
+    instance_type = KubernetesInstanceType(cpus=2,
+                                           memory=8,
+                                           accelerator_count=1,
+                                           accelerator_type='L4')
+    assert instance_type.name == ('formatted-2CPU--formatted-8GB--L4:1')
+    from_resources = KubernetesInstanceType.from_resources(
+        cpus=2, memory=8, accelerator_count=1.2, accelerator_type='L4')
+    assert from_resources.accelerator_count == 3
+    assert KubernetesInstanceType.is_valid_instance_type('2CPU--8GB')
+
+    assert format_calls == [2, 8]
+    assert ceil_calls == [1.2]
+    assert len(compile_calls) == 1
 
 
 def test_get_vcpus_mem_suppresses_internal_traceback():
