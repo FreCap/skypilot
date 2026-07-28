@@ -167,6 +167,43 @@ class TestStreamLogsByIdLifecycle:
         assert backend.status_calls == expected_tail_calls
         if expected_tail_calls:
             assert backend.tail_kwargs['job_id'] == expected_pool_job_id
-            sleep.assert_not_called()
+            sleep.assert_called_once_with(1)
         else:
-            assert sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS
+            assert (
+                sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS + 1)
+
+    def test_terminal_task_filter_reuses_initial_snapshot(self, monkeypatch):
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        task_rows = [(1, 'eval', managed_job_state.ManagedJobStatus.SUCCEEDED,
+                      None, None)]
+        latest_status_read = mock.Mock(
+            return_value=(1, managed_job_state.ManagedJobStatus.SUCCEEDED))
+        status_read = mock.Mock(
+            side_effect=AssertionError('scalar status poll used'))
+        get_num_tasks = mock.Mock(return_value=1)
+        task_info_read = mock.Mock(side_effect=[task_rows, []])
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks', get_num_tasks)
+        monkeypatch.setattr(managed_job_state,
+                            'get_all_task_ids_names_statuses_logs',
+                            task_info_read)
+        monkeypatch.setattr(managed_job_state, 'get_status', status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
+                            latest_status_read)
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42,
+                                                          follow=False,
+                                                          task='eval')
+
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        assert 'No task found matching' not in message
+        get_num_tasks.assert_not_called()
+        status_read.assert_not_called()
+        task_info_read.assert_called_once_with(42)
+        latest_status_read.assert_called_once_with(42)
