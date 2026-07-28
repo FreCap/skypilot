@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -433,6 +434,104 @@ it('preserves controller-log expansion and download behavior', async () => {
       jobStatus: 'RUNNING',
     });
   });
+});
+
+it('owns duplicate controller-log downloads until the request settles', async () => {
+  const firstDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => firstDownload.promise)
+    .mockResolvedValueOnce(undefined);
+  render(<JobDetails />);
+
+  const section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  const [, downloadButton] = within(section).getAllByRole('button');
+
+  act(() => {
+    fireEvent.click(downloadButton);
+    fireEvent.click(downloadButton);
+  });
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(1);
+
+  firstDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeEnabled());
+
+  fireEvent.click(downloadButton);
+  await waitFor(() => expect(downloadManagedJobLogs).toHaveBeenCalledTimes(2));
+});
+
+it('releases controller-log download ownership after failure', async () => {
+  const failedDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => failedDownload.promise)
+    .mockResolvedValueOnce(undefined);
+  render(<JobDetails />);
+
+  const section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  const [, downloadButton] = within(section).getAllByRole('button');
+
+  fireEvent.click(downloadButton);
+  expect(downloadButton).toBeDisabled();
+
+  failedDownload.reject(new Error('archive failed'));
+  await waitFor(() => expect(downloadButton).toBeEnabled());
+
+  fireEvent.click(downloadButton);
+  await waitFor(() => expect(downloadManagedJobLogs).toHaveBeenCalledTimes(2));
+});
+
+it('fences controller-log download cleanup across job routes', async () => {
+  const firstDownload = deferred();
+  const secondDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => firstDownload.promise)
+    .mockImplementationOnce(() => secondDownload.promise);
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: {
+      jobs: [
+        {
+          ...job,
+          id: Number(jobId),
+          name: `training-${jobId}`,
+        },
+      ],
+    },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+
+  const { rerender } = render(<JobDetails />);
+  let section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  let [, downloadButton] = within(section).getAllByRole('button');
+  fireEvent.click(downloadButton);
+  expect(downloadButton).toBeDisabled();
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+  section = document.querySelector('#controller-logs-section');
+  [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeEnabled();
+  fireEvent.click(downloadButton);
+  expect(downloadManagedJobLogs).toHaveBeenNthCalledWith(2, {
+    jobId: 43,
+    controller: true,
+    jobStatus: 'RUNNING',
+  });
+  expect(downloadButton).toBeDisabled();
+
+  firstDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeDisabled());
+
+  secondDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeEnabled());
 });
 
 it('leaves streaming and log-line extraction to a logs-slot plugin', async () => {
