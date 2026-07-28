@@ -399,6 +399,55 @@ describe('useSingleManagedJob refresh ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
+  it('hides data owned by the previous route on the first navigation render', async () => {
+    const secondRequest = deferred();
+    const routeSnapshots = [];
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        jobs: [{ id: 56164, status: 'SUCCEEDED' }],
+        controllerStopped: false,
+      })
+      .mockImplementationOnce(() => secondRequest.promise);
+
+    const { result, rerender } = renderHook(
+      ({ id }) => {
+        const details = useSingleManagedJob(id);
+        routeSnapshots.push({
+          id,
+          jobData: details.jobData,
+          loading: details.loading,
+        });
+        return details;
+      },
+      { initialProps: { id: '56164' } }
+    );
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.jobData.jobs[0].id).toBe(56164);
+
+    routeSnapshots.length = 0;
+    rerender({ id: '56165' });
+
+    expect(routeSnapshots[0]).toEqual({
+      id: '56165',
+      jobData: null,
+      loading: true,
+    });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      secondRequest.resolve({
+        jobs: [{ id: 56165, status: 'RUNNING' }],
+        controllerStopped: false,
+      });
+      await secondRequest.promise;
+    });
+
+    expect(result.current.jobData.jobs[0].id).toBe(56165);
+    expect(result.current.loading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
   it('does not reuse an old refresh after leaving and returning to a job', async () => {
     const oldRefresh = deferred();
     const newRefresh = deferred();

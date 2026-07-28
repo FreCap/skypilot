@@ -612,9 +612,8 @@ export function useSingleManagedJob(jobId) {
   const [jobData, setJobData] = useState(null);
   const [loadingJobData, setLoadingJobData] = useState(true);
   const requestVersionRef = useRef(0);
+  const activeJobIdRef = useRef(jobId);
   const refreshInFlightRef = useRef(null);
-
-  const loading = loadingJobData;
 
   const fetchJobData = useCallback(
     async ({ forceRefresh = false } = {}) => {
@@ -687,6 +686,10 @@ export function useSingleManagedJob(jobId) {
   }, [fetchJobData, jobId]);
 
   useEffect(() => {
+    if (activeJobIdRef.current !== jobId) {
+      activeJobIdRef.current = jobId;
+      setJobData(null);
+    }
     fetchJobData();
     return () => {
       requestVersionRef.current += 1;
@@ -696,7 +699,15 @@ export function useSingleManagedJob(jobId) {
     };
   }, [fetchJobData, jobId]);
 
-  return { jobData, loading, refreshJobData };
+  // Effects run after render. On a route change, do not expose the previous
+  // job's tasks or settled loading state before the effect advances ownership.
+  const ownsRouteState = activeJobIdRef.current === jobId;
+
+  return {
+    jobData: ownsRouteState ? jobData : null,
+    loading: !ownsRouteState || loadingJobData,
+    refreshJobData,
+  };
 }
 
 export {
