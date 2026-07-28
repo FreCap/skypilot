@@ -1136,10 +1136,13 @@ class TestStreamLogsByIdTaskFiltering:
         # Task filter is int 1, should match task_id=1 (eval)
         # We need to verify the filter finds the right task by checking
         # that it doesn't return NOT_FOUND
-        # Mock get_status to return a terminal status so we exit early
+        # Return a terminal latest-task snapshot so we exit early.
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_latest_task_id_status',
+            lambda jid: (2, managed_job_state.ManagedJobStatus.SUCCEEDED))
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
-            lambda jid: managed_job_state.ManagedJobStatus.SUCCEEDED)
+            mock.Mock(side_effect=AssertionError('scalar status poll used')))
 
         # The function will try to stream logs, but we just want to verify
         # task filtering works. If it returns NOT_FOUND, the filter failed.
@@ -1165,8 +1168,11 @@ class TestStreamLogsByIdTaskFiltering:
             lambda jid: task_info,
         )
         monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_latest_task_id_status',
+            lambda jid: (2, managed_job_state.ManagedJobStatus.SUCCEEDED))
+        monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
-            lambda jid: managed_job_state.ManagedJobStatus.SUCCEEDED)
+            mock.Mock(side_effect=AssertionError('scalar status poll used')))
 
         # Task filter is str 'eval', should match task_name='eval'
         msg, exit_code = jobs_utils.stream_logs_by_id(job_id,
@@ -1285,8 +1291,11 @@ class TestStreamLogsByIdTaskFiltering:
             lambda jid: task_info,
         )
         monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_latest_task_id_status',
+            lambda jid: (1, managed_job_state.ManagedJobStatus.SUCCEEDED))
+        monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
-            lambda jid: managed_job_state.ManagedJobStatus.SUCCEEDED)
+            mock.Mock(side_effect=AssertionError('scalar status poll used')))
 
         # Task filter is None, should not filter
         msg, exit_code = jobs_utils.stream_logs_by_id(job_id,

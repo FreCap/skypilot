@@ -105,6 +105,7 @@ class TestStreamLogsByIdLifecycle:
             (0, managed_job_state.ManagedJobStatus.RUNNING),
             (0, managed_job_state.ManagedJobStatus.FAILED),
         ])
+        num_tasks_read = mock.Mock(return_value=2)
         sleep = mock.Mock()
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
@@ -117,8 +118,7 @@ class TestStreamLogsByIdLifecycle:
                             mock.Mock(return_value=([], [], [])))
         monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
                             mock.Mock(return_value=status_display))
-        monkeypatch.setattr(managed_job_state, 'get_num_tasks',
-                            mock.Mock(return_value=2))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks', num_tasks_read)
         monkeypatch.setattr(managed_job_state, 'get_status', status_read)
         monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
                             latest_status_read)
@@ -154,6 +154,8 @@ class TestStreamLogsByIdLifecycle:
         assert exit_code == exceptions.JobExitCode.from_managed_job_status(
             managed_job_state.ManagedJobStatus.FAILED)
         assert latest_status_read.call_count == 2
+        num_tasks_read.assert_called_once_with(42)
+        assert status_read.call_count == 2
         context_read.assert_called_once_with(42, 0)
         if expected_cluster is None:
             handle_lookup.assert_not_called()
@@ -173,17 +175,24 @@ class TestStreamLogsByIdLifecycle:
             assert (
                 sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS + 1)
 
-    def test_terminal_task_filter_reuses_initial_snapshot(self, monkeypatch):
+    def test_terminal_task_filter_refreshes_immediately_stale_snapshot(
+            self, monkeypatch, tmp_path):
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
-        task_rows = [(1, 'eval', managed_job_state.ManagedJobStatus.SUCCEEDED,
-                      None, None)]
+        log_path = tmp_path / 'task.log'
+        log_path.write_text('waiting\n')
+        initial_rows = [(1, 'eval', managed_job_state.ManagedJobStatus.RUNNING,
+                         '', None)]
+        terminal_rows = [(1, 'eval',
+                          managed_job_state.ManagedJobStatus.SUCCEEDED,
+                          str(log_path), None)]
         latest_status_read = mock.Mock(
             return_value=(1, managed_job_state.ManagedJobStatus.SUCCEEDED))
         status_read = mock.Mock(
             side_effect=AssertionError('scalar status poll used'))
         get_num_tasks = mock.Mock(return_value=1)
-        task_info_read = mock.Mock(side_effect=[task_rows, []])
+        task_info_read = mock.Mock(side_effect=[initial_rows, terminal_rows])
+        sleep = mock.Mock()
 
         monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
         monkeypatch.setattr(jobs_utils.select, 'select',
@@ -197,17 +206,19 @@ class TestStreamLogsByIdLifecycle:
         monkeypatch.setattr(managed_job_state, 'get_status', status_read)
         monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
                             latest_status_read)
+        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42,
                                                           follow=False,
                                                           task='eval')
 
+        assert message == ''
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
-        assert 'No task found matching' not in message
         get_num_tasks.assert_not_called()
         status_read.assert_not_called()
-        task_info_read.assert_called_once_with(42)
+        assert task_info_read.call_args_list == [mock.call(42), mock.call(42)]
         latest_status_read.assert_called_once_with(42)
+        sleep.assert_not_called()
 
     def test_terminal_task_filter_refreshes_snapshot_after_wait(
             self, monkeypatch, tmp_path):
