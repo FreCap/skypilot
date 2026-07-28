@@ -1668,7 +1668,8 @@ async def test_batch_cleanup_runs_after_durable_success(monkeypatch):
         'batch_input_format': {},
         'batch_output_formats': [],
     }
-    controller_instance = types.SimpleNamespace(_job_id=1)
+    controller_instance = types.SimpleNamespace(
+        _job_id=1, _release_initial_launch_slot=mock.AsyncMock())
 
     succeeded = await jobs_controller.JobController._run_batch_coordinator_task(
         controller_instance,
@@ -1679,6 +1680,116 @@ async def test_batch_cleanup_runs_after_durable_success(monkeypatch):
 
     assert succeeded
     assert events == ['run', 'succeeded', 'cleanup']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('is_resume', [False, True])
+async def test_batch_releases_launch_slot_before_coordinator_loop(
+        is_resume, monkeypatch):
+    run_started = threading.Event()
+    finish_run = threading.Event()
+    slot_present_during_run = []
+    batch_coordinator = mock.Mock()
+
+    controller_instance = jobs_controller.JobController.__new__(
+        jobs_controller.JobController)
+    controller_instance._job_id = 1
+    controller_instance._backend = mock.Mock(
+        run_timestamp='run-2026-07-27-00-00-00-000000')
+    controller_instance.starting = {1}
+    controller_instance.starting_lock = asyncio.Lock()
+    controller_instance.starting_signal = asyncio.Condition(
+        controller_instance.starting_lock)
+
+    def run():
+        slot_present_during_run.append(1 in controller_instance.starting)
+        run_started.set()
+        assert finish_run.wait(timeout=2)
+
+    batch_coordinator.run.side_effect = run
+    monkeypatch.setattr(jobs_controller.batch_coordinator, 'BatchCoordinator',
+                        mock.Mock(return_value=batch_coordinator))
+    monkeypatch.setattr(
+        jobs_controller.managed_job_state, 'get_latest_task_id_status_async',
+        mock.AsyncMock(return_value=(0, state.ManagedJobStatus.RUNNING)))
+    set_starting = mock.AsyncMock()
+    set_started = mock.AsyncMock()
+    monkeypatch.setattr(jobs_controller.managed_job_state, 'set_starting_async',
+                        set_starting)
+    monkeypatch.setattr(jobs_controller.managed_job_state, 'set_started_async',
+                        set_started)
+
+    task = mock.Mock()
+    task.metadata = {
+        'batch_dataset_path': 's3://bucket/input.jsonl',
+        'batch_output_path': 's3://bucket/output.jsonl',
+        'batch_size': 4,
+        'batch_pool_name': 'pool',
+        'batch_serialized_fn': 'serialized',
+        'batch_input_format': {},
+        'batch_output_formats': [],
+    }
+
+    async def wait_for_slot():
+        async with controller_instance.starting_signal:
+            await controller_instance.starting_signal.wait_for(
+                lambda: 1 not in controller_instance.starting)
+
+    waiter = asyncio.create_task(wait_for_slot())
+    await asyncio.sleep(0)
+    run_task = asyncio.create_task(
+        controller_instance._run_batch_coordinator_task(
+            task_id=0,
+            task=task,
+            callback_func=mock.AsyncMock(),
+            is_resume=is_resume))
+    try:
+        assert await asyncio.to_thread(run_started.wait, 1)
+        await asyncio.wait_for(asyncio.shield(waiter), timeout=1)
+        assert not run_task.done()
+        assert slot_present_during_run == [False]
+    finally:
+        finish_run.set()
+        await asyncio.gather(run_task, return_exceptions=True)
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+    if is_resume:
+        set_starting.assert_not_awaited()
+        set_started.assert_not_awaited()
+    else:
+        set_starting.assert_awaited_once()
+        set_started.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_batch_releases_launch_slot_without_coordinator(
+        monkeypatch):
+    controller_instance = jobs_controller.JobController.__new__(
+        jobs_controller.JobController)
+    controller_instance._job_id = 1
+    controller_instance.starting = {1}
+    controller_instance.starting_lock = asyncio.Lock()
+    controller_instance.starting_signal = asyncio.Condition(
+        controller_instance.starting_lock)
+
+    monkeypatch.setattr(
+        jobs_controller.managed_job_state, 'get_latest_task_id_status_async',
+        mock.AsyncMock(return_value=(0, state.ManagedJobStatus.SUCCEEDED)))
+    coordinator_factory = mock.Mock(
+        side_effect=AssertionError('terminal batch built a coordinator'))
+    monkeypatch.setattr(jobs_controller.batch_coordinator, 'BatchCoordinator',
+                        coordinator_factory)
+
+    result = await controller_instance._run_batch_coordinator_task(
+        task_id=0,
+        task=mock.Mock(),
+        callback_func=mock.AsyncMock(),
+        is_resume=True)
+
+    assert result
+    assert controller_instance.starting == set()
+    coordinator_factory.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1702,7 +1813,8 @@ async def test_superseded_coordinator_never_marks_batch_failed(monkeypatch):
         'batch_input_format': {},
         'batch_output_formats': [],
     }
-    controller_instance = types.SimpleNamespace(_job_id=1)
+    controller_instance = types.SimpleNamespace(
+        _job_id=1, _release_initial_launch_slot=mock.AsyncMock())
 
     with pytest.raises(coordinator.SupersededCoordinator):
         await jobs_controller.JobController._run_batch_coordinator_task(
@@ -1755,7 +1867,8 @@ async def test_supersession_cleanup_preserves_owner_signal_under_cancellation(
         'batch_input_format': {},
         'batch_output_formats': [],
     }
-    controller_instance = types.SimpleNamespace(_job_id=1)
+    controller_instance = types.SimpleNamespace(
+        _job_id=1, _release_initial_launch_slot=mock.AsyncMock())
 
     run_task = asyncio.create_task(
         jobs_controller.JobController._run_batch_coordinator_task(

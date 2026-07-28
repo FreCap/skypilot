@@ -30,6 +30,7 @@ from sky.jobs.controller import ControllerManager
 from sky.jobs.controller import JobController
 from sky.skylet import constants
 from sky.skylet import job_lib
+from sky.utils import asyncio_utils
 from sky.utils import common
 from sky.utils import status_lib
 
@@ -702,6 +703,10 @@ class TestJobGroupRecovery:
         job_controller._job_id = 42
         job_controller._pool = None
         job_controller._dag = mock_dag
+        job_controller.starting = set()
+        job_controller.starting_lock = asyncio.Lock()
+        job_controller.starting_signal = asyncio.Condition(
+            job_controller.starting_lock)
         return job_controller
 
     @pytest.mark.asyncio
@@ -1031,6 +1036,83 @@ class TestJobGroupRecovery:
             ['cluster-0', 'cluster-1', 'cluster-2', None])
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('fresh_launch', [True, False])
+    async def test_job_group_releases_launch_slot_before_networking(
+            self, mock_dag, fresh_launch):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:1]
+        mock_dag.primary_tasks = []
+        job_controller.starting = {42}
+        job_controller.starting_lock = asyncio.Lock()
+        job_controller.starting_signal = asyncio.Condition(
+            job_controller.starting_lock)
+
+        executor = MagicMock()
+        executor.launch = AsyncMock()
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            return_value=('cluster-0', executor))
+        job_controller._monitor_job_group_task = AsyncMock(return_value=True)
+        job_controller._cleanup_job_group_clusters = AsyncMock()
+
+        statuses = [] if fresh_launch else [
+            (0, managed_job_state.ManagedJobStatus.RUNNING)
+        ]
+        set_started = AsyncMock()
+        networking_started = asyncio.Event()
+        finish_networking = asyncio.Event()
+
+        async def setup_networking(*_args):
+            networking_started.set()
+            await finish_networking.wait()
+            return True
+
+        async def wait_for_slot():
+            async with job_controller.starting_signal:
+                await job_controller.starting_signal.wait_for(
+                    lambda: 42 not in job_controller.starting)
+
+        waiter = asyncio.create_task(wait_for_slot())
+        await asyncio.sleep(0)
+        with patch.object(
+                controller_lib.managed_job_runtime,
+                'is_registered',
+                return_value=False), patch.object(
+                    controller_lib.managed_job_state,
+                    'get_all_task_ids_statuses_async',
+                    new=AsyncMock(return_value=statuses)), patch.object(
+                        controller_lib.managed_job_state,
+                        'set_started_async',
+                        new=set_started), patch.object(
+                            controller_lib.global_user_state,
+                            'get_handles_from_cluster_names',
+                            return_value={'cluster-0': MagicMock()}), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task',
+                    return_value=None), patch.object(
+                        controller_lib.job_group_networking,
+                        'setup_job_group_networking',
+                        side_effect=setup_networking):
+            run_task = asyncio.create_task(job_controller._run_job_group())
+            try:
+                await asyncio.wait_for(networking_started.wait(), timeout=1)
+                await asyncio.wait_for(asyncio.shield(waiter), timeout=1)
+                assert not run_task.done()
+                assert 42 not in job_controller.starting
+            finally:
+                finish_networking.set()
+                await asyncio.gather(run_task, return_exceptions=True)
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+        if fresh_launch:
+            executor.launch.assert_awaited_once_with()
+            set_started.assert_awaited_once()
+        else:
+            executor.launch.assert_not_awaited()
+            set_started.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_job_group_barrier_snapshot_failure_fences_state(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)
@@ -1221,6 +1303,7 @@ class TestJobGroupRecovery:
     async def test_recovery_reads_one_terminal_status_snapshot(
             self, mock_dag, statuses, expected):
         job_controller = self._make_controller(mock_dag)
+        job_controller.starting = {42}
         status_snapshot = AsyncMock(return_value=list(enumerate(statuses)))
         per_task_status = AsyncMock(
             side_effect=AssertionError('per-task status read'))
@@ -1234,6 +1317,7 @@ class TestJobGroupRecovery:
             result = await job_controller._run_job_group()
 
         assert result is expected
+        assert job_controller.starting == set()
         status_snapshot.assert_awaited_once_with(42)
         per_task_status.assert_not_awaited()
 
@@ -2846,6 +2930,73 @@ class TestControllerManagerMonitorLoop:
 
         sleep.assert_not_awaited()
         manager.start_job.assert_awaited_once_with(2, None)
+
+
+class TestInitialLaunchSlotOwnership:
+    """The per-job controller releases bypassed initial launch admission."""
+
+    @staticmethod
+    def _make_controller():
+        controller = JobController.__new__(JobController)
+        controller._job_id = 3
+        controller.starting = {3}
+        controller.starting_lock = asyncio.Lock()
+        controller.starting_signal = asyncio.Condition(controller.starting_lock)
+        return controller
+
+    @pytest.mark.asyncio
+    async def test_release_is_idempotent_and_notifies_once(self):
+        controller = self._make_controller()
+
+        class CountingCondition(asyncio.Condition):
+
+            def __init__(self, lock):
+                super().__init__(lock)
+                self.notify_count = 0
+
+            def notify(self, n=1):
+                self.notify_count += n
+                return super().notify(n)
+
+        controller.starting_signal = CountingCondition(controller.starting_lock)
+
+        await controller._release_initial_launch_slot()
+        await controller._release_initial_launch_slot()
+
+        assert controller.starting == set()
+        assert controller.starting_signal.notify_count == 1
+
+    @pytest.mark.asyncio
+    async def test_release_finishes_after_repeated_cancellation(self):
+        controller = self._make_controller()
+        cleanup_waiting = asyncio.Event()
+        original_acquire = controller.starting_lock.acquire
+        background_before = set(asyncio_utils._background_tasks)
+
+        async def track_cleanup_waiter():
+            cleanup_waiting.set()
+            return await original_acquire()
+
+        await original_acquire()
+        try:
+            with patch.object(controller.starting_lock,
+                              'acquire',
+                              side_effect=track_cleanup_waiter):
+                release_task = asyncio.create_task(
+                    controller._release_initial_launch_slot())
+                await cleanup_waiting.wait()
+                release_task.cancel()
+                release_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await release_task
+                cleanup_tasks = (asyncio_utils._background_tasks -
+                                 background_before)
+                assert len(cleanup_tasks) == 1
+        finally:
+            controller.starting_lock.release()
+
+        await asyncio.gather(*cleanup_tasks)
+        assert controller.starting == set()
 
 
 class TestRunJobLoopOwnershipCleanup:
