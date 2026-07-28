@@ -2229,6 +2229,7 @@ async def get_file_mounts_blob_id_async(job_id: int) -> str | None:
         return row[0]
 
 
+@db_retries.retry_async
 async def get_latest_task_id_status_async(
         job_id: int) -> tuple[int | None, ManagedJobStatus | None]:
     """Returns the (task id, status) of the latest task of a job."""

@@ -502,6 +502,37 @@ async def test_get_latest_task_id_status_async_uses_one_latest_row(
     assert observed_rows == [1, 1, 0], observed_rows
 
 
+@pytest.mark.asyncio
+async def test_get_latest_task_id_status_async_retries_transient_db_error(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 1, 0, status=ManagedJobStatus.RUNNING)
+
+    attempts = 0
+    original_execute = state.sql_async.AsyncSession.execute
+
+    async def _fail_once(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlalchemy.exc.OperationalError(
+                statement='SELECT latest task',
+                params={},
+                orig=ConnectionError('transient disconnect'),
+            )
+        return await original_execute(self, *args, **kwargs)
+
+    async def _no_backoff(_delay):
+        return None
+
+    monkeypatch.setattr(state.sql_async.AsyncSession, 'execute', _fail_once)
+    monkeypatch.setattr(state.db_retries.asyncio, 'sleep', _no_backoff)
+
+    assert await state.get_latest_task_id_status_async(1) == (
+        0, ManagedJobStatus.RUNNING)
+    assert attempts == 2
+
+
 def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
 
