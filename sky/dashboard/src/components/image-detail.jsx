@@ -44,6 +44,7 @@ const ARTIFACT_COLLECTIONS = [
   'publications',
   'demands',
 ];
+const IMAGE_DETAIL_POLL_MS = 5000;
 
 function initialCollectionCursorStacks() {
   return Object.fromEntries(
@@ -194,7 +195,8 @@ export function ImageDetail() {
   const [collectionErrors, setCollectionErrors] = useState({});
   const [collectionNotices, setCollectionNotices] = useState({});
   const generation = useRef(0);
-  const requestController = useRef(null);
+  const requestOwner = useRef(null);
+  const lastRequestStart = useRef(null);
   const collectionControllers = useRef({});
   const loadedScope = useRef(null);
   const requestScopeRef = useRef(requestScope);
@@ -209,119 +211,139 @@ export function ImageDetail() {
   const error = requestStateIsCurrent ? requestState.error : null;
   const oldServer = requestStateIsCurrent ? requestState.oldServer : false;
 
-  const load = useCallback(async () => {
-    if (!imageId) return undefined;
-    const scope = requestScope;
-    const scopeChanged = loadedScope.current !== scope;
-    loadedScope.current = scope;
-    requestController.current?.abort();
-    Object.values(collectionControllers.current).forEach((controller) =>
-      controller.abort()
-    );
-    collectionControllers.current = {};
-    setCollectionLoading({});
-    if (scopeChanged) {
-      setActiveTab('overview');
-      setPrepareOpen(false);
-      setRetry(null);
-      setCollectionCursorStacks(initialCollectionCursorStacks());
-      setCollectionErrors({});
-      setCollectionNotices({});
-    }
-    const controller = new AbortController();
-    requestController.current = controller;
-    const currentGeneration = ++generation.current;
-    setRequestState((current) => ({
-      scope,
-      workspace:
-        current.scope === scope ? current.workspace : requestedWorkspace,
-      detail: current.scope === scope ? current.detail : null,
-      capabilities: current.scope === scope ? current.capabilities : null,
-      loading: true,
-      error: null,
-      oldServer: false,
-    }));
-    let capabilitiesLoaded = false;
-    try {
-      const nextCapabilities = await getImageCapabilities(
-        requestedWorkspace,
-        controller.signal
+  const startLoad = useCallback(
+    (source) => {
+      if (!imageId) return Promise.resolve();
+      const scope = requestScope;
+      const scopeChanged = loadedScope.current !== scope;
+      loadedScope.current = scope;
+      const previousOwner = requestOwner.current;
+      if (previousOwner !== null) {
+        previousOwner.revoked = true;
+        previousOwner.controller.abort();
+      }
+      Object.values(collectionControllers.current).forEach((controller) =>
+        controller.abort()
       );
-      capabilitiesLoaded = true;
-      if (
-        generation.current !== currentGeneration ||
-        requestScopeRef.current !== scope
-      )
-        return;
-      const nextDetail = await getImageArtifactDetail(
-        imageId,
-        nextCapabilities.workspace,
-        controller.signal
-      );
-      if (
-        generation.current !== currentGeneration ||
-        requestScopeRef.current !== scope
-      )
-        return;
-      setRequestState({
+      collectionControllers.current = {};
+      setCollectionLoading({});
+      if (scopeChanged) {
+        setActiveTab('overview');
+        setPrepareOpen(false);
+        setRetry(null);
+        setCollectionCursorStacks(initialCollectionCursorStacks());
+        setCollectionErrors({});
+        setCollectionNotices({});
+      }
+      const controller = new AbortController();
+      const currentGeneration = ++generation.current;
+      const owner = {
         scope,
-        workspace: nextCapabilities.workspace,
-        detail: nextDetail,
-        capabilities: nextCapabilities,
-        loading: false,
+        source,
+        startedAt: performance.now(),
+        controller,
+        promise: null,
+        revoked: false,
+      };
+      requestOwner.current = owner;
+      lastRequestStart.current = {
+        scope,
+        startedAt: owner.startedAt,
+      };
+      const isCurrentRequest = () =>
+        !owner.revoked &&
+        requestOwner.current === owner &&
+        generation.current === currentGeneration &&
+        requestScopeRef.current === scope;
+      setRequestState((current) => ({
+        scope,
+        workspace:
+          current.scope === scope ? current.workspace : requestedWorkspace,
+        detail: current.scope === scope ? current.detail : null,
+        capabilities: current.scope === scope ? current.capabilities : null,
+        loading: true,
         error: null,
         oldServer: false,
-      });
-      setCollectionCursorStacks(initialCollectionCursorStacks());
-      setCollectionErrors({});
-      setCollectionNotices({});
-    } catch (requestError) {
-      if (
-        requestError.name !== 'AbortError' &&
-        generation.current === currentGeneration &&
-        requestScopeRef.current === scope
-      ) {
-        const isOldServer =
-          !capabilitiesLoaded &&
-          (requestError.status === 404 || requestError.status === 426);
-        setRequestState((current) =>
-          current.scope === scope
-            ? {
-                ...current,
-                loading: false,
-                error: requestError.code || requestError.message,
-                oldServer: isOldServer,
-              }
-            : current
-        );
-      }
-    } finally {
-      if (
-        generation.current === currentGeneration &&
-        requestScopeRef.current === scope
-      ) {
-        setRequestState((current) =>
-          current.scope === scope ? { ...current, loading: false } : current
-        );
-      }
-      if (requestController.current === controller) {
-        requestController.current = null;
-      }
-    }
-  }, [imageId, requestedWorkspace, requestScope]);
+      }));
+      let capabilitiesLoaded = false;
+      owner.promise = (async () => {
+        try {
+          const nextCapabilities = await getImageCapabilities(
+            requestedWorkspace,
+            controller.signal
+          );
+          capabilitiesLoaded = true;
+          if (!isCurrentRequest()) return;
+          const nextDetail = await getImageArtifactDetail(
+            imageId,
+            nextCapabilities.workspace,
+            controller.signal
+          );
+          if (!isCurrentRequest()) return;
+          setRequestState({
+            scope,
+            workspace: nextCapabilities.workspace,
+            detail: nextDetail,
+            capabilities: nextCapabilities,
+            loading: false,
+            error: null,
+            oldServer: false,
+          });
+          setCollectionCursorStacks(initialCollectionCursorStacks());
+          setCollectionErrors({});
+          setCollectionNotices({});
+        } catch (requestError) {
+          if (requestError.name !== 'AbortError' && isCurrentRequest()) {
+            const isOldServer =
+              !capabilitiesLoaded &&
+              (requestError.status === 404 || requestError.status === 426);
+            setRequestState((current) =>
+              current.scope === scope
+                ? {
+                    ...current,
+                    loading: false,
+                    error: requestError.code || requestError.message,
+                    oldServer: isOldServer,
+                  }
+                : current
+            );
+          }
+        } finally {
+          if (
+            requestOwner.current === owner &&
+            generation.current === currentGeneration &&
+            requestScopeRef.current === scope
+          ) {
+            setRequestState((current) =>
+              current.scope === scope ? { ...current, loading: false } : current
+            );
+            requestOwner.current = null;
+          }
+        }
+      })();
+      return owner.promise;
+    },
+    [imageId, requestedWorkspace, requestScope]
+  );
+
+  const load = useCallback(() => startLoad('manual'), [startLoad]);
 
   useEffect(() => {
-    load();
+    void startLoad('initial');
     return () => {
       generation.current += 1;
-      requestController.current?.abort();
-      requestController.current = null;
+      const owner = requestOwner.current;
+      if (owner !== null) {
+        owner.revoked = true;
+        owner.controller.abort();
+        requestOwner.current = null;
+      }
       Object.values(collectionControllers.current).forEach((controller) =>
         controller.abort()
       );
       collectionControllers.current = {};
     };
-  }, [load]);
+  }, [startLoad]);
 
   const pageArtifactCollection = useCallback(
     async (collection, direction) => {
@@ -488,9 +510,48 @@ export function ImageDetail() {
 
   useEffect(() => {
     if (!hasNonterminal || !viewingFirstCollectionPages) return undefined;
-    const timer = setInterval(load, 5000);
-    return () => clearInterval(timer);
-  }, [hasNonterminal, load, viewingFirstCollectionPages]);
+    let active = true;
+    let timer = null;
+
+    const schedule = () => {
+      if (!active) return;
+      const lastStart = lastRequestStart.current;
+      const elapsed =
+        lastStart?.scope === requestScope
+          ? performance.now() - lastStart.startedAt
+          : IMAGE_DETAIL_POLL_MS;
+      timer = setTimeout(run, Math.max(0, IMAGE_DETAIL_POLL_MS - elapsed));
+    };
+
+    const run = async () => {
+      if (!active) return;
+      const lastStart = lastRequestStart.current;
+      if (lastStart?.scope === requestScope) {
+        const remaining =
+          IMAGE_DETAIL_POLL_MS - (performance.now() - lastStart.startedAt);
+        if (remaining > 0) {
+          timer = setTimeout(run, remaining);
+          return;
+        }
+      }
+      const owner = requestOwner.current;
+      const request =
+        owner?.scope === requestScope ? owner.promise : startLoad('poll');
+      await request;
+      schedule();
+    };
+
+    timer = setTimeout(run, IMAGE_DETAIL_POLL_MS);
+    return () => {
+      active = false;
+      if (timer !== null) clearTimeout(timer);
+      const owner = requestOwner.current;
+      if (owner?.scope === requestScope && owner.source === 'poll') {
+        owner.revoked = true;
+        owner.controller.abort();
+      }
+    };
+  }, [hasNonterminal, requestScope, startLoad, viewingFirstCollectionPages]);
 
   if (loading && !detail) {
     return (
