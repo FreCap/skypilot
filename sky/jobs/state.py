@@ -1145,17 +1145,26 @@ def _latest_task_status_query(
         terminal_status_values: list[str]) -> sqlalchemy.sql.Selectable:
     """Select the latest-task status row for each requested job."""
     latest_task_ids = _latest_task_ids_subquery(job_ids, terminal_status_values)
+    selected_status = sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+        sqlalchemy.func.min(
+            sqlalchemy.case((~spot_table.c.status.in_(terminal_status_values),
+                             spot_table.c.status),
+                            else_=None)),
+        sqlalchemy.func.max(spot_table.c.status),
+    ).label('status')
     return sqlalchemy.select(
         latest_task_ids.c.spot_job_id,
         latest_task_ids.c.task_id,
-        spot_table.c.status,
+        selected_status,
     ).select_from(
         latest_task_ids.join(
             spot_table,
             sqlalchemy.and_(
                 spot_table.c.spot_job_id == latest_task_ids.c.spot_job_id,
-                spot_table.c.task_id == latest_task_ids.c.task_id))).order_by(
-                    latest_task_ids.c.spot_job_id.asc())
+                spot_table.c.task_id == latest_task_ids.c.task_id))).group_by(
+                    latest_task_ids.c.spot_job_id,
+                    latest_task_ids.c.task_id).order_by(
+                        latest_task_ids.c.spot_job_id.asc())
 
 
 def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
