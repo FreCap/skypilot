@@ -357,6 +357,57 @@ async def test_get_statuses_async_materializes_one_row_per_job(
     assert observed_row_counts == [2], observed_row_counts
 
 
+@pytest.mark.asyncio
+async def test_latest_task_status_queries_preserve_duplicate_nonterminal(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': 1,
+            'task_id': 0,
+            'task_name': 'active-first',
+            'status': ManagedJobStatus.PENDING.value,
+        }, {
+            'spot_job_id': 1,
+            'task_id': 0,
+            'task_name': 'terminal-last',
+            'status': ManagedJobStatus.SUCCEEDED.value,
+        }, {
+            'spot_job_id': 2,
+            'task_id': 0,
+            'task_name': 'terminal-first',
+            'status': ManagedJobStatus.FAILED.value,
+        }, {
+            'spot_job_id': 2,
+            'task_id': 0,
+            'task_name': 'active-last',
+            'status': ManagedJobStatus.RECOVERING.value,
+        }, {
+            'spot_job_id': 3,
+            'task_id': 0,
+            'task_name': 'terminal-old',
+            'status': ManagedJobStatus.SUCCEEDED.value,
+        }, {
+            'spot_job_id': 3,
+            'task_id': 0,
+            'task_name': 'terminal-new',
+            'status': ManagedJobStatus.FAILED.value,
+        }])
+
+    expected = {
+        1: ManagedJobStatus.PENDING,
+        2: ManagedJobStatus.RECOVERING,
+        3: ManagedJobStatus.FAILED,
+    }
+    assert state.get_latest_task_id_status(1) == (0, expected[1])
+    assert state.get_latest_task_id_status(2) == (0, expected[2])
+    assert state.get_latest_task_id_status(3) == (0, expected[3])
+    assert await state.get_latest_task_id_status_async(1) == (0, expected[1])
+    assert await state.get_latest_task_id_status_async(2) == (0, expected[2])
+    assert await state.get_latest_task_id_status_async(3) == (0, expected[3])
+    assert await state.get_statuses_async([1, 2, 3]) == expected
+
+
 def test_get_latest_task_id_status_uses_one_latest_row(
         _mock_managed_jobs_db_conn, monkeypatch):
     engine = _mock_managed_jobs_db_conn

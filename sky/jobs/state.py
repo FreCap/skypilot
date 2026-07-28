@@ -1145,6 +1145,9 @@ def _latest_task_status_query(
         terminal_status_values: list[str]) -> sqlalchemy.sql.Selectable:
     """Select the latest-task status row for each requested job."""
     latest_task_ids = _latest_task_ids_subquery(job_ids, terminal_status_values)
+    is_terminal = spot_table.c.status.in_(terminal_status_values)
+    duplicate_order = sqlalchemy.case((is_terminal, -spot_table.c.job_id),
+                                      else_=spot_table.c.job_id)
     return sqlalchemy.select(
         latest_task_ids.c.spot_job_id,
         latest_task_ids.c.task_id,
@@ -1155,7 +1158,8 @@ def _latest_task_status_query(
             sqlalchemy.and_(
                 spot_table.c.spot_job_id == latest_task_ids.c.spot_job_id,
                 spot_table.c.task_id == latest_task_ids.c.task_id))).order_by(
-                    latest_task_ids.c.spot_job_id.asc())
+                    latest_task_ids.c.spot_job_id.asc(), is_terminal.asc(),
+                    duplicate_order.asc())
 
 
 def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
@@ -2257,6 +2261,8 @@ async def get_statuses_async(
             result = await session.execute(
                 _latest_task_status_query(chunk, terminal_status_values))
             for job_id, _, status in result.fetchall():
+                if statuses[job_id] is not None:
+                    continue
                 statuses[job_id] = ManagedJobStatus(status)
 
     return statuses
