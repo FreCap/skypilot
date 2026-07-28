@@ -614,10 +614,34 @@ export function useSingleManagedJob(jobId) {
   const requestVersionRef = useRef(0);
   const activeJobIdRef = useRef(jobId);
   const refreshInFlightRef = useRef(null);
+  const visibleJobDataRef = useRef(null);
+
+  useEffect(() => {
+    visibleJobDataRef.current = jobData;
+  }, [jobData]);
 
   const fetchJobData = useCallback(
-    async ({ forceRefresh = false } = {}) => {
+    async ({
+      forceRefresh = false,
+      source = 'refresh',
+      supersede = false,
+    } = {}) => {
       if (!jobId) return;
+      const inFlight = refreshInFlightRef.current;
+      const hasVisibleCurrentJobData = Boolean(
+        visibleJobDataRef.current?.jobs?.some(
+          (job) => String(job.id) === String(jobId)
+        )
+      );
+      const shouldReuseInFlight =
+        inFlight?.jobId === jobId &&
+        (!supersede ||
+          !hasVisibleCurrentJobData ||
+          inFlight.source === 'manual');
+      if (shouldReuseInFlight) {
+        return inFlight.promise;
+      }
+
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
       const isCurrentRequest = () =>
@@ -671,17 +695,20 @@ export function useSingleManagedJob(jobId) {
   );
 
   const refreshJobData = useCallback(() => {
-    const inFlight = refreshInFlightRef.current;
-    if (inFlight?.jobId === jobId) {
-      return inFlight.promise;
-    }
-
-    const refreshPromise = fetchJobData({ forceRefresh: true }).finally(() => {
+    const refreshPromise = fetchJobData({
+      forceRefresh: true,
+      source: 'manual',
+      supersede: true,
+    }).finally(() => {
       if (refreshInFlightRef.current?.promise === refreshPromise) {
         refreshInFlightRef.current = null;
       }
     });
-    refreshInFlightRef.current = { jobId, promise: refreshPromise };
+    refreshInFlightRef.current = {
+      jobId,
+      promise: refreshPromise,
+      source: 'manual',
+    };
     return refreshPromise;
   }, [fetchJobData, jobId]);
 
@@ -690,7 +717,18 @@ export function useSingleManagedJob(jobId) {
       activeJobIdRef.current = jobId;
       setJobData(null);
     }
-    fetchJobData();
+    const loadPromise = fetchJobData({
+      source: 'initial',
+    }).finally(() => {
+      if (refreshInFlightRef.current?.promise === loadPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = {
+      jobId,
+      promise: loadPromise,
+      source: 'initial',
+    };
     return () => {
       requestVersionRef.current += 1;
       if (refreshInFlightRef.current?.jobId === jobId) {
