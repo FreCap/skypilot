@@ -1109,6 +1109,28 @@ def get_job_cancellation_states(
     return snapshots
 
 
+def _latest_task_ids_subquery(
+        job_ids: list[int],
+        terminal_status_values: list[str]) -> sqlalchemy.sql.Selectable:
+    """Select one latest-task identity per requested job.
+
+    This follows ``get_latest_task_id_from_statuses`` exactly: choose the first
+    non-terminal task if one exists, otherwise the last terminal task.
+    """
+    return sqlalchemy.select(
+        spot_table.c.spot_job_id.label('spot_job_id'),
+        sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+            sqlalchemy.func.min(
+                sqlalchemy.case(
+                    (~spot_table.c.status.in_(terminal_status_values),
+                     spot_table.c.task_id),
+                    else_=None)),
+            sqlalchemy.func.max(spot_table.c.task_id),
+        ).label('task_id')).where(
+            spot_table.c.spot_job_id.in_(job_ids)).group_by(
+                spot_table.c.spot_job_id).subquery()
+
+
 def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
     """Fetch one cancellation-driving task row per requested job.
 
@@ -1127,18 +1149,8 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
     ]
     for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
         chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-        latest_task_ids = sqlalchemy.select(
-            spot_table.c.spot_job_id.label('spot_job_id'),
-            sqlalchemy.func.coalesce(  # pylint: disable=not-callable
-                sqlalchemy.func.min(
-                    sqlalchemy.case(
-                        (~spot_table.c.status.in_(terminal_status_values),
-                         spot_table.c.task_id),
-                        else_=None)),
-                sqlalchemy.func.max(spot_table.c.task_id),
-            ).label('task_id')).where(
-                spot_table.c.spot_job_id.in_(chunk)).group_by(
-                    spot_table.c.spot_job_id).subquery()
+        latest_task_ids = _latest_task_ids_subquery(chunk,
+                                                    terminal_status_values)
         query = sqlalchemy.select(
             latest_task_ids.c.spot_job_id,
             latest_task_ids.c.task_id,
@@ -2199,26 +2211,29 @@ async def get_statuses_async(
     statuses: dict[int, ManagedJobStatus | None] = {
         job_id: None for job_id in unique_job_ids
     }
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
         for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
             chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-            task_statuses: dict[int, list[tuple[int, ManagedJobStatus]]] = {
-                job_id: [] for job_id in chunk
-            }
+            latest_task_ids = _latest_task_ids_subquery(chunk,
+                                                        terminal_status_values)
             result = await session.execute(
                 sqlalchemy.select(
                     spot_table.c.spot_job_id,
-                    spot_table.c.task_id,
                     spot_table.c.status,
-                ).where(spot_table.c.spot_job_id.in_(chunk)).order_by(
-                    spot_table.c.spot_job_id.asc(), spot_table.c.task_id.asc()))
-            for job_id, task_id, status in result.fetchall():
-                task_statuses[job_id].append(
-                    (task_id, ManagedJobStatus(status)))
-            for job_id, job_statuses in task_statuses.items():
-                statuses[job_id] = get_latest_task_id_from_statuses(
-                    job_statuses)[1]
+                ).select_from(
+                    latest_task_ids.join(
+                        spot_table,
+                        sqlalchemy.and_(
+                            spot_table.c.spot_job_id ==
+                            latest_task_ids.c.spot_job_id, spot_table.c.task_id
+                            == latest_task_ids.c.task_id))).order_by(
+                                spot_table.c.spot_job_id.asc()))
+            for job_id, status in result.fetchall():
+                statuses[job_id] = ManagedJobStatus(status)
 
     return statuses
 
