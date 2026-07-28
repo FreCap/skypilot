@@ -1355,6 +1355,17 @@ def _wait_for_next_task(
         time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
 
 
+def _wait_for_initial_task_status(
+        job_id: int) -> tuple[int | None, managed_job_state.ManagedJobStatus]:
+    """Wait until the latest-task status is initialized for log following."""
+    while True:
+        latest_task_id, status = (
+            managed_job_state.get_latest_task_id_status(job_id))
+        if status is not None:
+            return latest_task_id, status
+        time.sleep(1)
+
+
 def stream_logs_by_id(job_id: int,
                       follow: bool = True,
                       tail: int | None = None,
@@ -1469,7 +1480,14 @@ def stream_logs_by_id(job_id: int,
                                              provision_str='',
                                              job_id=job_id)
     status_display = rich_utils.safe_status(msg)
-    num_tasks = managed_job_state.get_num_tasks(job_id)
+    task_info: list[tuple[int, str, managed_job_state.ManagedJobStatus, str,
+                          float | None]] | None = None
+    if task is not None:
+        task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
+            job_id)
+        num_tasks = len(task_info)
+    else:
+        num_tasks = managed_job_state.get_num_tasks(job_id)
 
     # Check if job exists - if num_tasks is 0, the job doesn't exist
     if num_tasks == 0:
@@ -1479,8 +1497,7 @@ def stream_logs_by_id(job_id: int,
     # This is used for running jobs to stream logs from the correct task
     filtered_task_id: int | None = None
     if task is not None:
-        task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
-            job_id)
+        assert task_info is not None, task
         for t_id, t_name, _, _, _ in task_info:
             if matches_task_filter(t_id, t_name, task):
                 filtered_task_id = t_id
@@ -1508,9 +1525,11 @@ def stream_logs_by_id(job_id: int,
 
     with status_display:
         prev_msg = msg
-        while (managed_job_status :=
-               managed_job_state.get_status(job_id)) is None:
-            time.sleep(1)
+        latest_task_id, managed_job_status = _wait_for_initial_task_status(
+            job_id)
+        managed_job_status: managed_job_state.ManagedJobStatus | None = (
+            managed_job_status)
+        assert managed_job_status is not None, job_id
 
         # Show hint about per-task filtering when there are multiple tasks
         if num_tasks > 1 and task is None:
@@ -1525,24 +1544,25 @@ def stream_logs_by_id(job_id: int,
                 job_msg = ('\nFailure reason: '
                            f'{managed_job_state.get_failure_reason(job_id)}')
             log_file_ever_existed = False
-            task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
-                job_id)
-            total_tasks = len(task_info)
+            terminal_task_info = (
+                managed_job_state.get_all_task_ids_names_statuses_logs(job_id))
+            assert terminal_task_info is not None, job_id
+            total_tasks = len(terminal_task_info)
             # Filter tasks if task filter is specified
             if task is not None:
-                task_info = [
-                    t for t in task_info
+                terminal_task_info = [
+                    t for t in terminal_task_info
                     if matches_task_filter(t[0], t[1], task)
                 ]
-                if not task_info:
+                if not terminal_task_info:
                     valid_range = (f'0-{total_tasks - 1}'
                                    if total_tasks > 1 else '0')
                     return (f'No task found matching {task!r} in job {job_id}. '
                             f'Valid task IDs are {valid_range}.',
                             exceptions.JobExitCode.NOT_FOUND)
-            num_tasks = len(task_info)
+            num_tasks = len(terminal_task_info)
             for (task_id, task_name, task_status, log_file,
-                 logs_cleaned_at) in task_info:
+                 logs_cleaned_at) in terminal_task_info:
                 if log_file:
                     log_file_ever_existed = True
                     if logs_cleaned_at is not None:
@@ -1629,8 +1649,6 @@ def stream_logs_by_id(job_id: int,
                                tail_offset=tail_offset)
 
         backend = backends.CloudVmRayBackend()
-        latest_task_id, managed_job_status = (
-            managed_job_state.get_latest_task_id_status(job_id))
 
         # If a task filter was specified, use the filtered task_id instead of
         # the latest task_id. This allows viewing logs for a specific task in
