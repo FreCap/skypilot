@@ -357,6 +357,105 @@ async def test_get_statuses_async_materializes_one_row_per_job(
     assert observed_row_counts == [2], observed_row_counts
 
 
+def test_get_latest_task_id_status_uses_one_latest_row(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 1, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, 1, 1, status=ManagedJobStatus.RUNNING)
+    _insert_task(engine, 1, 2, status=ManagedJobStatus.PENDING)
+    _insert_task(engine, 2, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, 2, 1, status=ManagedJobStatus.FAILED)
+
+    monkeypatch.setattr(
+        state, '_get_all_task_ids_statuses', lambda *_args, **_kwargs:
+        (_ for _ in
+         ()).throw(AssertionError('full task snapshot must not run')))
+
+    observed_rows = []
+    original_execute = state.orm.Session.execute
+
+    def _record_fetchone(self, *args, **kwargs):
+        result = original_execute(self, *args, **kwargs)
+
+        class _ResultProxy:
+            """Capture bounded latest-task row reads."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def fetchone(self):
+                row = self._inner.fetchone()
+                observed_rows.append(0 if row is None else 1)
+                return row
+
+            def fetchall(self):
+                raise AssertionError('latest-task lookup must stay bounded')
+
+        return _ResultProxy(result)
+
+    monkeypatch.setattr(state.orm.Session, 'execute', _record_fetchone)
+
+    assert state.get_latest_task_id_status(1) == (1, ManagedJobStatus.RUNNING)
+    assert state.get_latest_task_id_status(2) == (1, ManagedJobStatus.FAILED)
+    assert state.get_latest_task_id_status(3) == (None, None)
+    assert observed_rows == [1, 1, 0], observed_rows
+
+
+@pytest.mark.asyncio
+async def test_get_latest_task_id_status_async_uses_one_latest_row(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 1, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, 1, 1, status=ManagedJobStatus.RUNNING)
+    _insert_task(engine, 1, 2, status=ManagedJobStatus.PENDING)
+    _insert_task(engine, 2, 0, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, 2, 1, status=ManagedJobStatus.FAILED)
+
+    async def _no_full_snapshot(*_args, **_kwargs):
+        raise AssertionError('full task snapshot must not run')
+
+    monkeypatch.setattr(state, 'get_all_task_ids_statuses_async',
+                        _no_full_snapshot)
+
+    observed_rows = []
+    original_execute = state.sql_async.AsyncSession.execute
+
+    async def _record_fetchone(self, *args, **kwargs):
+        result = await original_execute(self, *args, **kwargs)
+
+        class _ResultProxy:
+            """Capture bounded latest-task row reads."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def fetchone(self):
+                row = self._inner.fetchone()
+                observed_rows.append(0 if row is None else 1)
+                return row
+
+            def fetchall(self):
+                raise AssertionError('latest-task lookup must stay bounded')
+
+        return _ResultProxy(result)
+
+    monkeypatch.setattr(state.sql_async.AsyncSession, 'execute',
+                        _record_fetchone)
+
+    assert await state.get_latest_task_id_status_async(1) == (
+        1, ManagedJobStatus.RUNNING)
+    assert await state.get_latest_task_id_status_async(2) == (
+        1, ManagedJobStatus.FAILED)
+    assert await state.get_latest_task_id_status_async(3) == (None, None)
+    assert observed_rows == [1, 1, 0], observed_rows
+
+
 def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
 
