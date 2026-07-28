@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { CircularProgress } from '@mui/material';
 import {
   ChevronDownIcon,
@@ -26,19 +26,44 @@ export function ControllerLogsSection({
   const CONTROLLER_LOGS_EXPANDED_KEY = 'skypilot-controller-logs-expanded';
   const controllerLogsSlotHasPlugin =
     usePluginComponents('jobs.detail.controllerlogs').length > 0;
-  const [downloading, setDownloading] = useState(false);
-  const downloadControllerZip = async () => {
-    if (downloading) return;
-    setDownloading(true);
-    try {
-      await downloadManagedJobLogs({
-        jobId: parseInt(Array.isArray(jobId) ? jobId[0] : jobId),
-        controller: true,
-        jobStatus: detailJobData?.status,
-      });
-    } finally {
-      setDownloading(false);
+  const normalizedJobId = Array.isArray(jobId) ? jobId[0] : jobId;
+  const jobRouteKey = String(normalizedJobId);
+  const [pluginDownloading, setPluginDownloading] = useState(false);
+  const [downloadOwnerRouteKey, setDownloadOwnerRouteKey] = useState(null);
+  const downloadOwnerRef = useRef(null);
+  const downloading =
+    pluginDownloading || downloadOwnerRouteKey === jobRouteKey;
+
+  useEffect(
+    () => () => {
+      downloadOwnerRef.current = null;
+    },
+    []
+  );
+
+  const downloadControllerZip = () => {
+    const currentOwner = downloadOwnerRef.current;
+    if (currentOwner?.routeKey === jobRouteKey) {
+      return currentOwner.promise;
     }
+
+    const promise = downloadManagedJobLogs({
+      jobId: parseInt(normalizedJobId),
+      controller: true,
+      jobStatus: detailJobData?.status,
+    });
+    const owner = { routeKey: jobRouteKey, promise };
+    downloadOwnerRef.current = owner;
+    setDownloadOwnerRouteKey(jobRouteKey);
+
+    const releaseOwner = () => {
+      if (downloadOwnerRef.current === owner) {
+        downloadOwnerRef.current = null;
+        setDownloadOwnerRouteKey(null);
+      }
+    };
+    void promise.then(releaseOwner, releaseOwner);
+    return promise;
   };
 
   // Initialize state from localStorage
@@ -91,7 +116,7 @@ export function ControllerLogsSection({
                   controller: true,
                   jobStatus: detailJobData?.status,
                   downloading,
-                  onDownloadingChange: setDownloading,
+                  onDownloadingChange: setPluginDownloading,
                 }}
                 fallback={
                   <Tooltip
