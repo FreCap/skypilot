@@ -481,6 +481,83 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.serviceData.replicas).toEqual(['b1']);
   });
 
+  it('retries a failed new-route summary while the full read is pending', async () => {
+    const nextSummary = deferred();
+    const nextFull = deferred();
+    const retriedSummary = deferred();
+    const retriedFull = deferred();
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc-a', status: 'svc-a-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc-a', status: 'svc-a-full', replicas: ['a0'] }],
+      });
+
+    const { result, rerender } = renderHook(
+      ({ serviceName }) => useServiceDetails({ serviceName }),
+      { initialProps: { serviceName: 'svc-a' } }
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('svc-a-full')
+    );
+
+    dashboardCache.get
+      .mockImplementationOnce(() => nextSummary.promise)
+      .mockImplementationOnce(() => nextFull.promise)
+      .mockImplementationOnce(() => retriedSummary.promise)
+      .mockImplementationOnce(() => retriedFull.promise);
+    rerender({ serviceName: 'svc-b' });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+
+    await act(async () => {
+      nextSummary.reject(new Error('summary unavailable'));
+      await Promise.resolve();
+    });
+    expect(result.current.serviceData.name).toBe('svc-a');
+    expect(result.current.loading).toBe(false);
+
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshData();
+    });
+
+    expect(dashboardCache.invalidate.mock.calls).toEqual([
+      [getServices, detailSummaryArgs('svc-b')],
+      [getServices, detailFullArgs('svc-b')],
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(6);
+
+    await act(async () => {
+      retriedSummary.resolve({
+        services: [
+          { name: 'svc-b', status: 'retried-summary', summaryOnly: true },
+        ],
+      });
+      retriedFull.resolve({
+        services: [{ name: 'svc-b', status: 'retried-full', replicas: ['b1'] }],
+      });
+      await refreshPromise;
+    });
+
+    await act(async () => {
+      nextFull.resolve({
+        services: [
+          { name: 'svc-b', status: 'stale-first-full', replicas: ['b0'] },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('retried-full');
+    expect(result.current.serviceData.replicas).toEqual(['b1']);
+  });
+
   it('refreshes summary and replicas without overlapping at the polling cadence', async () => {
     jest.useFakeTimers();
     const refreshedSummary = deferred();
