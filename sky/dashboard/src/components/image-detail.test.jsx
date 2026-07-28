@@ -94,6 +94,17 @@ function detailFor(workspace, imageId, digestCharacter) {
   };
 }
 
+function nonterminalDetailFor(
+  workspace = 'research',
+  imageId = 'image-1',
+  digestCharacter = 'a'
+) {
+  const detail = detailFor(workspace, imageId, digestCharacter);
+  detail.locations[0].state = 'COPYING';
+  detail.locations[0].error_code = null;
+  return detail;
+}
+
 describe('Image artifact detail', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -102,6 +113,10 @@ describe('Image artifact detail', () => {
       items: [],
       next_cursor: null,
     });
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   it('shows the API 62 callout on an old-server deep link', async () => {
@@ -372,6 +387,253 @@ describe('Image artifact detail', () => {
     expect(screen.getAllByText('linux/amd64').length).toBeGreaterThan(0);
     expect(screen.queryByText('public')).toBeNull();
     expect(screen.queryByText(/binding/)).toBeNull();
+  });
+
+  it('keeps one poll owner while a slow detail refresh is pending', async () => {
+    jest.useFakeTimers();
+    const slowCapabilities = deferred();
+    getImageCapabilities
+      .mockResolvedValueOnce({ workspace: 'research', publish: false })
+      .mockReturnValueOnce(slowCapabilities.promise)
+      .mockResolvedValue({ workspace: 'research', publish: false });
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Image artifact')).toBeVisible();
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    const slowSignal = getImageCapabilities.mock.calls[1][1];
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    expect(slowSignal.aborted).toBe(false);
+
+    await act(async () => {
+      slowCapabilities.resolve({ workspace: 'research', publish: false });
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(0);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(3);
+
+    view.unmount();
+  });
+
+  it('preserves the five-second start cadence after a fast poll', async () => {
+    jest.useFakeTimers();
+    getImageCapabilities.mockResolvedValue({
+      workspace: 'research',
+      publish: false,
+    });
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Image artifact')).toBeVisible();
+
+    await act(async () => {
+      jest.advanceTimersByTime(4999);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(4999);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(3);
+
+    view.unmount();
+  });
+
+  it('waits one interval before polling after a slow initial load', async () => {
+    jest.useFakeTimers();
+    const initialCapabilities = deferred();
+    getImageCapabilities
+      .mockReturnValueOnce(initialCapabilities.promise)
+      .mockResolvedValue({ workspace: 'research', publish: false });
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    await act(async () => {
+      jest.advanceTimersByTime(6000);
+      initialCapabilities.resolve({
+        workspace: 'research',
+        publish: false,
+      });
+    });
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+    expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(4999);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+  });
+
+  it('does not let the poll timer abort a recent manual refresh', async () => {
+    jest.useFakeTimers();
+    const manualCapabilities = deferred();
+    getImageCapabilities
+      .mockResolvedValueOnce({ workspace: 'research', publish: false })
+      .mockReturnValueOnce(manualCapabilities.promise)
+      .mockResolvedValue({ workspace: 'research', publish: false });
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+
+    await act(async () => {
+      jest.advanceTimersByTime(4999);
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    const manualSignal = getImageCapabilities.mock.calls[1][1];
+
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    expect(manualSignal.aborted).toBe(false);
+
+    view.unmount();
+  });
+
+  it('retries a failed poll and stops after a terminal refresh', async () => {
+    jest.useFakeTimers();
+    const failure = new Error('temporary detail failure');
+    failure.code = 'DETAIL_RETRY';
+    const terminal = detailFor('research', 'image-1', 'a');
+    terminal.locations[0].state = 'READY';
+    terminal.locations[0].error_code = null;
+    getImageCapabilities.mockResolvedValue({
+      workspace: 'research',
+      publish: false,
+    });
+    getImageArtifactDetail
+      .mockResolvedValueOnce(nonterminalDetailFor())
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValueOnce(terminal);
+
+    const view = render(<ImageDetail />);
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent('DETAIL_RETRY');
+    expect(getImageArtifactDetail).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+    });
+    expect(getImageArtifactDetail).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      jest.advanceTimersByTime(10_000);
+    });
+    expect(getImageArtifactDetail).toHaveBeenCalledTimes(3);
+
+    view.unmount();
+  });
+
+  it('aborts poll-owned work when collection paging disables polling', async () => {
+    jest.useFakeTimers();
+    const pollCapabilities = deferred();
+    const initialDetail = nonterminalDetailFor();
+    initialDetail.next_cursors.locations = 'locations-next';
+    initialDetail.truncated = true;
+    getImageCapabilities
+      .mockResolvedValueOnce({ workspace: 'research', publish: false })
+      .mockReturnValueOnce(pollCapabilities.promise);
+    getImageArtifactDetail.mockResolvedValue(initialDetail);
+    getImageArtifactCollection.mockResolvedValue({
+      items: initialDetail.locations,
+      next_cursor: null,
+    });
+
+    const view = render(<ImageDetail />);
+    expect(
+      await screen.findByRole('button', { name: 'Next locations page' })
+    ).toBeEnabled();
+
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    const pollSignal = getImageCapabilities.mock.calls[1][1];
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Next locations page' })
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getImageArtifactCollection).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole('button', { name: 'Previous locations page' })
+    ).toBeEnabled();
+    expect(pollSignal.aborted).toBe(true);
+    await act(async () => {
+      pollCapabilities.resolve({ workspace: 'research', publish: false });
+      await pollCapabilities.promise;
+    });
+    expect(getImageArtifactDetail).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole('button', { name: 'Previous locations page' })
+    ).toBeEnabled();
+
+    view.unmount();
+  });
+
+  it('aborts the poll owner and timer when the detail unmounts', async () => {
+    jest.useFakeTimers();
+    const pollCapabilities = deferred();
+    getImageCapabilities
+      .mockResolvedValueOnce({ workspace: 'research', publish: false })
+      .mockReturnValueOnce(pollCapabilities.promise);
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+    await act(async () => {
+      jest.advanceTimersByTime(5000);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    const pollSignal = getImageCapabilities.mock.calls[1][1];
+
+    view.unmount();
+    expect(pollSignal.aborted).toBe(true);
+    await act(async () => {
+      jest.advanceTimersByTime(10_000);
+    });
+    expect(getImageCapabilities).toHaveBeenCalledTimes(2);
   });
 
   it('hides the previous compound route scope before replacement detail loads', async () => {
