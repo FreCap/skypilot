@@ -1881,9 +1881,6 @@ def set_service_status_and_active_versions_from_replica(
     record = serve_state.get_service_controller_owner(service_name,
                                                       require_version=True)
     if record is None:
-        # Preserve the old joined-read behavior for legacy/versionless rows.
-        record = serve_state.get_service_from_name(service_name)
-    if record is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 'The service is up-ed in an old version and does not '

@@ -64,6 +64,21 @@ def _insert_version_spec(engine, service_name: str, version: int,
         session.commit()
 
 
+def _insert_orphan_service_row(engine, name: str) -> None:
+    """Insert a services row with no version row."""
+    with orm.Session(engine) as session:
+        session.execute(serve_state.services_table.insert().values(
+            name=name,
+            controller_job_id=1,
+            status=serve_state.ServiceStatus.CONTROLLER_INIT.value,
+            requested_resources_str='1x[CPU:1+]',
+            pool=0,
+            controller_pid=12345,
+            hash='orphan',
+            entrypoint='entry'))
+        session.commit()
+
+
 def test_lifecycle_lock_detection_failure_is_fail_closed():
     with mock.patch.object(serve_utils.global_user_state,
                            'initialize_and_get_db',
@@ -2614,6 +2629,17 @@ def test_stale_controller_cannot_authenticate_status_as_replacement_owner():
             expected_service_hash='incarnation-a',
             expected_controller_owner=(100, '10.0.0.1'))
     set_st.assert_not_called()
+
+
+def test_versionless_status_writer_rejects_orphan_in_one_query(_mock_serve_db):
+    _insert_orphan_service_row(_mock_serve_db, 'svc-orphan')
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        with pytest.raises(ValueError, match='old version'):
+            serve_utils.set_service_status_and_active_versions_from_replica(
+                'svc-orphan', [], serve_utils.UpdateMode.ROLLING)
+
+    assert counts['n'] == 1, counts
 
 
 def test_replica_status_writer_cannot_erase_interleaved_shutdown():
