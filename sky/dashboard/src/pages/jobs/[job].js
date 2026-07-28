@@ -46,7 +46,6 @@ function JobDetails() {
   const { jobData, loading, refreshJobData } = useSingleManagedJob(jobId);
   const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
   const [isLoadingControllerLogs, setIsLoadingControllerLogs] = useState(false);
   const [scrollExecuted, setScrollExecuted] = useState(false);
@@ -91,13 +90,6 @@ function JobDetails() {
   // Telemetry task selection for job groups
   const [telemetryTaskIndex, setTelemetryTaskIndex] = useState(0);
   const TELEMETRY_EXPANDED_KEY = 'skypilot-jobs-telemetry-expanded';
-
-  // Update isInitialLoad when data is first loaded
-  React.useEffect(() => {
-    if (!loading && isInitialLoad) {
-      setIsInitialLoad(false);
-    }
-  }, [loading, isInitialLoad]);
 
   // Check Grafana availability on mount
   useEffect(() => {
@@ -241,6 +233,7 @@ function JobDetails() {
   // Use the first task for main details display
   const detailJobData = allTasks.length > 0 ? allTasks[0] : null;
   const isMultiTask = allTasks.length > 1;
+  const isRouteLoading = loading && detailJobData === null;
 
   // For multi-task jobs, find fields from any task (they may only be on one task)
   const jobYaml =
@@ -326,7 +319,7 @@ function JobDetails() {
           </div>
         </div>
 
-        {loading && isInitialLoad ? (
+        {isRouteLoading ? (
           <div className="flex items-center justify-center py-32">
             <CircularProgress size={20} className="mr-2" />
             <span>Loading...</span>

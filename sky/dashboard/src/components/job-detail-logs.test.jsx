@@ -207,6 +207,114 @@ it('owns the task-detail refresh button until the data refresh settles', async (
   await waitFor(() => expect(refreshButton).toBeEnabled());
 });
 
+it('keeps the job route in loading instead of not-found while a new route is fetching', async () => {
+  const refresh42 = jest.fn().mockResolvedValue(undefined);
+  const refresh43 = jest.fn().mockResolvedValue(undefined);
+  let job43Loading = true;
+  useSingleManagedJob.mockImplementation((jobId) => {
+    if (String(jobId) === '42') {
+      return {
+        jobData: { jobs: [job] },
+        loading: false,
+        refreshJobData: refresh42,
+      };
+    }
+    return {
+      jobData: null,
+      loading: job43Loading,
+      refreshJobData: refresh43,
+    };
+  });
+
+  const { rerender } = render(<JobDetails />);
+  await screen.findByText('Managed Jobs');
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(2);
+  expect(refresh42).not.toHaveBeenCalled();
+  expect(refresh43).not.toHaveBeenCalled();
+
+  job43Loading = false;
+  rerender(<JobDetails />);
+  await screen.findByText('Job not found');
+});
+
+it('keeps the task route in loading instead of not-found while a new route is fetching', async () => {
+  const refresh42 = jest.fn().mockResolvedValue(undefined);
+  const refresh43 = jest.fn().mockResolvedValue(undefined);
+  let job43Loading = true;
+  useSingleManagedJob.mockImplementation((jobId) => {
+    if (String(jobId) === '42') {
+      return {
+        jobData: { jobs: [job] },
+        loading: false,
+        refreshJobData: refresh42,
+      };
+    }
+    return {
+      jobData: null,
+      loading: job43Loading,
+      refreshJobData: refresh43,
+    };
+  });
+
+  router.query = { job: '42', task: '0' };
+  const { rerender } = render(<TaskDetails />);
+  await screen.findByText('Task 0');
+
+  router.query = { job: '43', task: '0' };
+  rerender(<TaskDetails />);
+
+  expect(screen.queryByText('Task not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(2);
+  expect(refresh42).not.toHaveBeenCalled();
+  expect(refresh43).not.toHaveBeenCalled();
+
+  job43Loading = false;
+  rerender(<TaskDetails />);
+  await screen.findByText('Task not found');
+});
+
+it('keeps matching job detail visible during background loading', async () => {
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: [job] },
+    loading: true,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  });
+
+  render(<JobDetails />);
+
+  expect(await screen.findByText('Job ID (Name)')).toBeInTheDocument();
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+});
+
+it('keeps matching task detail visible during background loading', async () => {
+  router.query = { job: '42', task: '0' };
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: [job] },
+    loading: true,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  });
+
+  render(<TaskDetails />);
+
+  expect(await screen.findByText('Task Details')).toBeInTheDocument();
+  expect(screen.queryByText('Task not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+});
+
+it('settles an invalid task index to not-found', async () => {
+  router.query = { job: '42', task: '1' };
+
+  render(<TaskDetails />);
+
+  expect(await screen.findByText('Task not found')).toBeInTheDocument();
+});
+
 it('advances job telemetry once for an accepted manual refresh', async () => {
   const refresh = deferred();
   const refreshJobData = jest.fn(() => refresh.promise);
