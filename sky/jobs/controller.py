@@ -70,14 +70,13 @@ logger = sky_logging.init_logger('sky.jobs.controller')
 _background_tasks: set[asyncio.Task] = set()
 
 # How many consecutive monitor ticks must observe a non-UP cluster while the
-# job itself still reports a non-terminal status before recovery is triggered
-# for a multi-node job. The cluster health probe is all-or-nothing (every node
-# must appear in `ray status`), so at large node counts a single transiently
-# lagging raylet or a probe-timing hiccup flags the whole cluster while the
-# job is in fact still running — and recovery tears down and relaunches the
-# entire cluster. Requiring consecutive INIT confirmations (~30s at the 15s
-# tick) protects running status and transient status-fetch gaps; confirmed
-# STOPPED/missing clusters and unrecoverable fetch failures recover immediately.
+# job itself still reports a non-terminal status, or its status is temporarily
+# unavailable after a confirmed healthy observation. The cluster health probe
+# is all-or-nothing (every node must appear in `ray status`), so a transiently
+# lagging raylet or probe-timing hiccup can flag a healthy cluster and recovery
+# then tears it down. Requiring consecutive INIT confirmations (~30s at the 15s
+# tick) protects the ambiguous path; confirmed STOPPED/missing clusters and
+# failures without prior healthy evidence recover immediately.
 _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
 _FILE_MOUNTS_BLOB_ID_UNSET = object()
 
@@ -85,14 +84,16 @@ _FILE_MOUNTS_BLOB_ID_UNSET = object()
 class _ClusterNotUpDebouncer:
     """Debounce ambiguous INIT observations for a possibly running job.
 
-    Only multi-node jobs debounce: single-node jobs skip the cluster status
-    check entirely while their job is running, and when the job is dead
-    there is nothing to protect from a spurious teardown.
+    Multi-node jobs use the configured threshold for every ambiguous INIT.
+    Single-node jobs normally recover on the first observation, but prior
+    healthy status can raise the effective threshold for a transient fetch
+    outage. The current effective threshold is retained for diagnostics.
     """
 
     def __init__(self, num_nodes: int) -> None:
         self._threshold = (_NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
                            if num_nodes > 1 else 1)
+        self._required_confirmations = self._threshold
         self._consecutive_not_up = 0
 
     def should_recover_now(self,
@@ -103,9 +104,10 @@ class _ClusterNotUpDebouncer:
         recovery to proceed.
         """
         self._consecutive_not_up += 1
-        threshold = (self._threshold if required_confirmations is None else
-                     required_confirmations)
-        return self._consecutive_not_up >= threshold
+        self._required_confirmations = (self._threshold
+                                        if required_confirmations is None else
+                                        required_confirmations)
+        return self._consecutive_not_up >= self._required_confirmations
 
     @property
     def observations(self) -> int:
@@ -115,7 +117,12 @@ class _ClusterNotUpDebouncer:
     def threshold(self) -> int:
         return self._threshold
 
+    @property
+    def required_confirmations(self) -> int:
+        return self._required_confirmations
+
     def reset(self) -> None:
+        self._required_confirmations = self._threshold
         self._consecutive_not_up = 0
 
 
@@ -1043,6 +1050,7 @@ class JobController:
             # status.
             if (job_status is not None and not job_status.is_terminal() and
                     task.num_nodes == 1):
+                not_up_debouncer.reset()
                 continue
 
             if job_status in job_lib.JobStatus.user_code_failure_states():
@@ -1094,7 +1102,7 @@ class JobController:
                         f'{job_status_str}; waiting for confirmation before '
                         'recovery '
                         f'({not_up_debouncer.observations}/'
-                        f'{not_up_debouncer.threshold} consecutive '
+                        f'{not_up_debouncer.required_confirmations} consecutive '
                         'observations).')
                     continue
                 logger.info(

@@ -102,21 +102,67 @@ class TestTransientInitConfirmation:
     @pytest.mark.asyncio
     async def test_single_node_transient_init_waits_after_running_status(self):
         threshold = controller_lib._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
-        results = await self._run_until_recovery(
-            num_nodes=1,
-            statuses=[(job_lib.JobStatus.RUNNING, None)] +
-            [(None, 'transient')] * threshold,
-            refresh_statuses=[status_lib.ClusterStatus.INIT] * threshold,
-        )
+        with patch.object(controller_lib.logger, 'info') as log:
+            results = await self._run_until_recovery(
+                num_nodes=1,
+                statuses=[(job_lib.JobStatus.RUNNING, None)] +
+                [(None, 'transient')] * threshold,
+                refresh_statuses=[status_lib.ClusterStatus.INIT] * threshold,
+            )
         (sleep, get_status, refresh_cluster, monotonic, wall_clock,
          set_recovering, executor) = results
 
+        confirmation_logs = [
+            call.args[0]
+            for call in log.call_args_list
+            if 'waiting for confirmation' in call.args[0]
+        ]
+        assert len(confirmation_logs) == threshold - 1
+        for observation, message in enumerate(confirmation_logs, start=1):
+            assert (f'({observation}/{threshold} consecutive observations)'
+                    in message)
         assert [
             call.args[0] for call in sleep.await_args_list
         ] == [controller_lib.managed_job_utils.JOB_STATUS_CHECK_GAP_SECONDS
              ] * (threshold + 1)
         assert get_status.await_count == threshold + 1
         assert refresh_cluster.call_count == threshold
+        monotonic.assert_not_called()
+        wall_clock.assert_not_called()
+        set_recovering.assert_awaited_once()
+        executor.recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_single_node_running_status_resets_init_confirmation(self):
+        threshold = controller_lib._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
+        statuses = ([(job_lib.JobStatus.RUNNING, None), (None, 'transient'),
+                     (job_lib.JobStatus.RUNNING, None)] +
+                    [(None, 'transient')] * threshold)
+        with patch.object(controller_lib.logger, 'info') as log:
+            results = await self._run_until_recovery(
+                num_nodes=1,
+                statuses=statuses,
+                refresh_statuses=[status_lib.ClusterStatus.INIT] *
+                (threshold + 1),
+            )
+        (sleep, get_status, refresh_cluster, monotonic, wall_clock,
+         set_recovering, executor) = results
+
+        confirmation_logs = [
+            call.args[0]
+            for call in log.call_args_list
+            if 'waiting for confirmation' in call.args[0]
+        ]
+        expected_observations = [1] + list(range(1, threshold))
+        assert len(confirmation_logs) == len(expected_observations)
+        for observation, message in zip(expected_observations,
+                                        confirmation_logs,
+                                        strict=True):
+            assert (f'({observation}/{threshold} consecutive observations)'
+                    in message)
+        assert sleep.await_count == len(statuses)
+        assert get_status.await_count == len(statuses)
+        assert refresh_cluster.call_count == threshold + 1
         monotonic.assert_not_called()
         wall_clock.assert_not_called()
         set_recovering.assert_awaited_once()

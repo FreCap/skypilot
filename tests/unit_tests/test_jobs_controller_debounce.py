@@ -44,6 +44,19 @@ def test_reset_clears_accumulated_observations():
     assert debouncer.should_recover_now() is True
 
 
+def test_reset_restores_single_node_default_threshold():
+    debouncer = controller._ClusterNotUpDebouncer(num_nodes=1)
+    threshold = controller._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
+    assert debouncer.should_recover_now(threshold) is False
+    assert debouncer.required_confirmations == threshold
+
+    debouncer.reset()
+
+    assert debouncer.observations == 0
+    assert debouncer.required_confirmations == 1
+    assert debouncer.should_recover_now() is True
+
+
 def test_init_with_running_job_waits_for_confirmation():
     debouncer = controller._ClusterNotUpDebouncer(num_nodes=4)
     threshold = controller._NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
