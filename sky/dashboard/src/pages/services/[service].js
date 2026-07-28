@@ -183,7 +183,7 @@ export function useServiceDetails({ serviceName }) {
       const shouldReuseInFlight =
         inFlight?.serviceName === serviceName &&
         (!supersede ||
-          !hasVisibleCurrentServiceData ||
+          (!hasVisibleCurrentServiceData && inFlight.summaryPending) ||
           inFlight.source === 'manual');
       if (shouldReuseInFlight) {
         return inFlight.promise;
@@ -239,6 +239,9 @@ export function useServiceDetails({ serviceName }) {
             }
           })
           .finally(() => {
+            if (refreshInFlightRef.current?.promise === refreshPromise) {
+              refreshInFlightRef.current.summaryPending = false;
+            }
             if (isCurrentRequest()) {
               setLoading(false);
               setHistoryLoading(false);
@@ -272,6 +275,7 @@ export function useServiceDetails({ serviceName }) {
         serviceName,
         promise: refreshPromise,
         source,
+        summaryPending: true,
       };
       return refreshPromise;
     },
