@@ -1356,13 +1356,16 @@ def _wait_for_next_task(
 
 
 def _wait_for_initial_task_status(
-        job_id: int) -> tuple[int | None, managed_job_state.ManagedJobStatus]:
+        job_id: int
+) -> tuple[int | None, managed_job_state.ManagedJobStatus, bool]:
     """Wait until the latest-task status is initialized for log following."""
+    waited = False
     while True:
         latest_task_id, status = (
             managed_job_state.get_latest_task_id_status(job_id))
         if status is not None:
-            return latest_task_id, status
+            return latest_task_id, status, waited
+        waited = True
         time.sleep(1)
 
 
@@ -1525,8 +1528,8 @@ def stream_logs_by_id(job_id: int,
 
     with status_display:
         prev_msg = msg
-        latest_task_id, managed_job_status = _wait_for_initial_task_status(
-            job_id)
+        (latest_task_id, managed_job_status,
+         waited_for_initial_status) = _wait_for_initial_task_status(job_id)
         managed_job_status: managed_job_state.ManagedJobStatus | None = (
             managed_job_status)
         assert managed_job_status is not None, job_id
@@ -1545,7 +1548,7 @@ def stream_logs_by_id(job_id: int,
                            f'{managed_job_state.get_failure_reason(job_id)}')
             log_file_ever_existed = False
             terminal_task_info = task_info
-            if terminal_task_info is None:
+            if terminal_task_info is None or waited_for_initial_status:
                 terminal_task_info = (
                     managed_job_state.get_all_task_ids_names_statuses_logs(
                         job_id))

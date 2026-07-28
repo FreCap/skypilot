@@ -166,6 +166,7 @@ class TestStreamLogsByIdLifecycle:
         assert backend.tail_calls == expected_tail_calls
         assert backend.status_calls == expected_tail_calls
         if expected_tail_calls:
+            assert backend.tail_kwargs is not None
             assert backend.tail_kwargs['job_id'] == expected_pool_job_id
             sleep.assert_called_once_with(1)
         else:
@@ -207,3 +208,52 @@ class TestStreamLogsByIdLifecycle:
         status_read.assert_not_called()
         task_info_read.assert_called_once_with(42)
         latest_status_read.assert_called_once_with(42)
+
+    def test_terminal_task_filter_refreshes_snapshot_after_wait(
+            self, monkeypatch, tmp_path):
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        log_path = tmp_path / 'task.log'
+        log_path.write_text('waiting\n')
+        initial_rows = [(1, 'eval', managed_job_state.ManagedJobStatus.RUNNING,
+                         '', None)]
+        terminal_rows = [(1, 'eval',
+                          managed_job_state.ManagedJobStatus.SUCCEEDED,
+                          str(log_path), None)]
+        latest_status_read = mock.Mock(side_effect=[
+            (1, None),
+            (1, managed_job_state.ManagedJobStatus.SUCCEEDED),
+        ])
+        status_read = mock.Mock(
+            side_effect=AssertionError('scalar status poll used'))
+        get_num_tasks = mock.Mock(return_value=1)
+        task_info_read = mock.Mock(side_effect=[initial_rows, terminal_rows])
+        sleep = mock.Mock()
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks', get_num_tasks)
+        monkeypatch.setattr(managed_job_state,
+                            'get_all_task_ids_names_statuses_logs',
+                            task_info_read)
+        monkeypatch.setattr(managed_job_state, 'get_status', status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
+                            latest_status_read)
+        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42,
+                                                          follow=False,
+                                                          task='eval')
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        get_num_tasks.assert_not_called()
+        status_read.assert_not_called()
+        assert task_info_read.call_args_list == [mock.call(42), mock.call(42)]
+        assert latest_status_read.call_args_list == [
+            mock.call(42), mock.call(42)
+        ]
+        sleep.assert_called_once_with(1)
