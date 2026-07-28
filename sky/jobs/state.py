@@ -684,8 +684,17 @@ def get_latest_task_id_status(
 
     If the job_id does not exist, (None, None) will be returned.
     """
-    id_statuses = _get_all_task_ids_statuses(job_id)
-    return get_latest_task_id_from_statuses(id_statuses)
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            _latest_task_status_query([job_id],
+                                      terminal_status_values)).fetchone()
+    if row is None:
+        return None, None
+    return row[1], ManagedJobStatus(row[2])
 
 
 def get_job_controller_processes(
@@ -1129,6 +1138,24 @@ def _latest_task_ids_subquery(
         ).label('task_id')).where(
             spot_table.c.spot_job_id.in_(job_ids)).group_by(
                 spot_table.c.spot_job_id).subquery()
+
+
+def _latest_task_status_query(
+        job_ids: list[int],
+        terminal_status_values: list[str]) -> sqlalchemy.sql.Selectable:
+    """Select the latest-task status row for each requested job."""
+    latest_task_ids = _latest_task_ids_subquery(job_ids, terminal_status_values)
+    return sqlalchemy.select(
+        latest_task_ids.c.spot_job_id,
+        latest_task_ids.c.task_id,
+        spot_table.c.status,
+    ).select_from(
+        latest_task_ids.join(
+            spot_table,
+            sqlalchemy.and_(
+                spot_table.c.spot_job_id == latest_task_ids.c.spot_job_id,
+                spot_table.c.task_id == latest_task_ids.c.task_id))).order_by(
+                    latest_task_ids.c.spot_job_id.asc())
 
 
 def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
@@ -2196,8 +2223,17 @@ async def get_file_mounts_blob_id_async(job_id: int) -> str | None:
 async def get_latest_task_id_status_async(
         job_id: int) -> tuple[int | None, ManagedJobStatus | None]:
     """Returns the (task id, status) of the latest task of a job."""
-    id_statuses = await get_all_task_ids_statuses_async(job_id)
-    return get_latest_task_id_from_statuses(id_statuses)
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        row = (await session.execute(
+            _latest_task_status_query([job_id],
+                                      terminal_status_values))).fetchone()
+    if row is None:
+        return None, None
+    return row[1], ManagedJobStatus(row[2])
 
 
 @db_retries.retry_async
@@ -2218,21 +2254,9 @@ async def get_statuses_async(
     async with sql_async.AsyncSession(engine) as session:
         for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
             chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-            latest_task_ids = _latest_task_ids_subquery(chunk,
-                                                        terminal_status_values)
             result = await session.execute(
-                sqlalchemy.select(
-                    spot_table.c.spot_job_id,
-                    spot_table.c.status,
-                ).select_from(
-                    latest_task_ids.join(
-                        spot_table,
-                        sqlalchemy.and_(
-                            spot_table.c.spot_job_id ==
-                            latest_task_ids.c.spot_job_id, spot_table.c.task_id
-                            == latest_task_ids.c.task_id))).order_by(
-                                spot_table.c.spot_job_id.asc()))
-            for job_id, status in result.fetchall():
+                _latest_task_status_query(chunk, terminal_status_values))
+            for job_id, _, status in result.fetchall():
                 statuses[job_id] = ManagedJobStatus(status)
 
     return statuses
