@@ -534,6 +534,10 @@ export function ImageDetail() {
           return;
         }
       }
+      if (Object.keys(collectionControllers.current).length > 0) {
+        timer = setTimeout(run, IMAGE_DETAIL_POLL_MS);
+        return;
+      }
       const owner = requestOwner.current;
       const request =
         owner?.scope === requestScope ? owner.promise : startLoad('poll');

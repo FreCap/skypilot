@@ -27,6 +27,7 @@ For one compound image/workspace route scope:
    collection pages revokes poll ownership.
 6. Route changes and unmount abort old work, and stale completions cannot
    publish into the new scope.
+7. Collection paging already in progress takes precedence over a due poll.
 
 No new backend calls, scans, render-state updates, worker threads, or background
 tasks are introduced. Coordination stays O(1).
@@ -63,7 +64,9 @@ The loop uses one timeout instead of a fixed interval. Its cleanup revokes the
 loop generation and clears the timeout. When polling is disabled because the
 user pages away from the first collection pages, cleanup aborts only a
 poll-owned primary request. Initial, manual, and route loads retain their
-existing lifecycle.
+existing lifecycle. A due poll that observes active collection paging defers
+one interval, allowing the page request to establish that boundary instead of
+aborting it.
 
 ## Alternatives considered
 
@@ -97,6 +100,8 @@ deferred promises to prove:
 - manual refresh supersedes a poll and the timer reuses the manual owner;
 - leaving first collection pages aborts poll-owned work and prevents a late
   reset;
+- a due poll does not abort collection paging that started first;
+- a failed collection page releases the deferred poll on the next interval;
 - route changes and unmount abort and revoke old owners.
 
 The dashboard workflow must explicitly run this test file. Local gates are the
