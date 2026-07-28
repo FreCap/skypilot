@@ -85,19 +85,45 @@ describe('useClusterDetails request ownership', () => {
 
   it('hides data owned by the previous route while the new cluster loads', async () => {
     const secondCluster = deferred();
+    const routeSnapshots = [];
     dashboardCache.get
       .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
       .mockResolvedValueOnce([{ id: 1, cluster: 'cluster-a' }])
       .mockImplementationOnce(() => secondCluster.promise);
 
     const { result, rerender } = renderHook(
-      ({ cluster }) => useClusterDetails({ cluster }),
+      ({ cluster }) => {
+        const details = useClusterDetails({ cluster });
+        routeSnapshots.push({
+          cluster,
+          clusterData: details.clusterData,
+          clusterJobData: details.clusterJobData,
+          loading: details.loading,
+          clusterDetailsLoading: details.clusterDetailsLoading,
+          clusterJobsLoading: details.clusterJobsLoading,
+        });
+        return details;
+      },
       { initialProps: { cluster: 'cluster-a' } }
     );
     await waitFor(() => expect(result.current.clusterJobsLoading).toBe(false));
     expect(result.current.clusterData.name).toBe('cluster-a');
 
+    routeSnapshots.length = 0;
     rerender({ cluster: 'cluster-b' });
+
+    // The first render for the new route is the commit boundary. Cleanup in a
+    // later effect is too late: the page could paint cluster A's actions,
+    // jobs, and external links under cluster B's URL.
+    expect(routeSnapshots[0]).toEqual({
+      cluster: 'cluster-b',
+      clusterData: null,
+      clusterJobData: null,
+      loading: true,
+      clusterDetailsLoading: true,
+      clusterJobsLoading: true,
+    });
+
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
 
     expect(result.current.clusterData).toBeNull();
