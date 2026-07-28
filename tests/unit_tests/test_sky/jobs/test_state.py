@@ -310,6 +310,53 @@ async def test_get_statuses_async_bounds_chunk_queries_and_empty_input(
     assert counts['n'] == 0, counts
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_async_materializes_one_row_per_job(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    for task_id in range(1000):
+        _insert_task(engine,
+                     11,
+                     task_id,
+                     status=(ManagedJobStatus.RUNNING
+                             if task_id == 999 else ManagedJobStatus.SUCCEEDED))
+    for task_id in range(800):
+        _insert_task(engine, 12, task_id, status=ManagedJobStatus.SUCCEEDED)
+
+    observed_row_counts = []
+    original_execute = state.sql_async.AsyncSession.execute
+
+    async def _record_fetchall(self, *args, **kwargs):
+        result = await original_execute(self, *args, **kwargs)
+
+        class _ResultProxy:
+            """Record the fetched row count without changing result behavior."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def fetchall(self):
+                rows = self._inner.fetchall()
+                observed_row_counts.append(len(rows))
+                return rows
+
+        return _ResultProxy(result)
+
+    monkeypatch.setattr(state.sql_async.AsyncSession, 'execute',
+                        _record_fetchall)
+
+    statuses = await state.get_statuses_async([11, 12])
+
+    assert statuses == {
+        11: ManagedJobStatus.RUNNING,
+        12: ManagedJobStatus.SUCCEEDED,
+    }
+    assert observed_row_counts == [2], observed_row_counts
+
+
 def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
 
