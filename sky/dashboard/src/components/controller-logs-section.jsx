@@ -29,21 +29,21 @@ export function ControllerLogsSection({
   const normalizedJobId = Array.isArray(jobId) ? jobId[0] : jobId;
   const jobRouteKey = String(normalizedJobId);
   const [pluginDownloading, setPluginDownloading] = useState(false);
-  const [downloadOwnerRouteKey, setDownloadOwnerRouteKey] = useState(null);
-  const downloadOwnerRef = useRef(null);
+  const [, setDownloadOwnerVersion] = useState(0);
+  const downloadOwnersRef = useRef(new Map());
   const downloading =
-    pluginDownloading || downloadOwnerRouteKey === jobRouteKey;
+    pluginDownloading || downloadOwnersRef.current.has(jobRouteKey);
 
   useEffect(
     () => () => {
-      downloadOwnerRef.current = null;
+      downloadOwnersRef.current.clear();
     },
     []
   );
 
   const downloadControllerZip = () => {
-    const currentOwner = downloadOwnerRef.current;
-    if (currentOwner?.routeKey === jobRouteKey) {
+    const currentOwner = downloadOwnersRef.current.get(jobRouteKey);
+    if (currentOwner != null) {
       return currentOwner.promise;
     }
 
@@ -53,13 +53,13 @@ export function ControllerLogsSection({
       jobStatus: detailJobData?.status,
     });
     const owner = { routeKey: jobRouteKey, promise };
-    downloadOwnerRef.current = owner;
-    setDownloadOwnerRouteKey(jobRouteKey);
+    downloadOwnersRef.current.set(jobRouteKey, owner);
+    setDownloadOwnerVersion((version) => version + 1);
 
     const releaseOwner = () => {
-      if (downloadOwnerRef.current === owner) {
-        downloadOwnerRef.current = null;
-        setDownloadOwnerRouteKey(null);
+      if (downloadOwnersRef.current.get(jobRouteKey) === owner) {
+        downloadOwnersRef.current.delete(jobRouteKey);
+        setDownloadOwnerVersion((version) => version + 1);
       }
     };
     void promise.then(releaseOwner, releaseOwner);

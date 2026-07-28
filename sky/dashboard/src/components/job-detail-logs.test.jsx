@@ -534,6 +534,113 @@ it('fences controller-log download cleanup across job routes', async () => {
   await waitFor(() => expect(downloadButton).toBeEnabled());
 });
 
+it('retains controller-log ownership across an A-B-A route cycle', async () => {
+  const firstJobDownload = deferred();
+  const secondJobDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => firstJobDownload.promise)
+    .mockImplementationOnce(() => secondJobDownload.promise);
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: {
+      jobs: [
+        {
+          ...job,
+          id: Number(jobId),
+          name: `training-${jobId}`,
+        },
+      ],
+    },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+
+  const { rerender } = render(<JobDetails />);
+  let section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  let [, downloadButton] = within(section).getAllByRole('button');
+  fireEvent.click(downloadButton);
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+  section = document.querySelector('#controller-logs-section');
+  [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeEnabled();
+  fireEvent.click(downloadButton);
+
+  router.query = { job: '42' };
+  rerender(<JobDetails />);
+  section = document.querySelector('#controller-logs-section');
+  [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeDisabled();
+  fireEvent.click(downloadButton);
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(2);
+
+  secondJobDownload.resolve();
+  await act(async () => {});
+  expect(downloadButton).toBeDisabled();
+
+  firstJobDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeEnabled());
+});
+
+it('retains 100 pending route owners without duplicate downloads', async () => {
+  const routeCount = 100;
+  const firstJobId = 100;
+  const downloads = Array.from({ length: routeCount }, deferred);
+  downloadManagedJobLogs.mockImplementation(({ jobId }) => {
+    return downloads[jobId - firstJobId].promise;
+  });
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: {
+      jobs: [
+        {
+          ...job,
+          id: Number(jobId),
+          name: `training-${jobId}`,
+        },
+      ],
+    },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+
+  router.query = { job: String(firstJobId) };
+  const { rerender } = render(<JobDetails />);
+  let section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+
+  for (let offset = 0; offset < routeCount; offset += 1) {
+    router.query = { job: String(firstJobId + offset) };
+    rerender(<JobDetails />);
+    section = document.querySelector('#controller-logs-section');
+    const [, downloadButton] = within(section).getAllByRole('button');
+    expect(downloadButton).toBeEnabled();
+    fireEvent.click(downloadButton);
+  }
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(routeCount);
+
+  for (let offset = routeCount - 1; offset >= 0; offset -= 1) {
+    router.query = { job: String(firstJobId + offset) };
+    rerender(<JobDetails />);
+    section = document.querySelector('#controller-logs-section');
+    const [, downloadButton] = within(section).getAllByRole('button');
+    expect(downloadButton).toBeDisabled();
+    fireEvent.click(downloadButton);
+  }
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(routeCount);
+
+  await act(async () => {
+    downloads.forEach(({ resolve }) => resolve());
+    await Promise.all(downloads.map(({ promise }) => promise));
+  });
+  const [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeEnabled();
+});
+
 it('leaves streaming and log-line extraction to a logs-slot plugin', async () => {
   usePluginComponents.mockImplementation((slot) =>
     slot === 'jobs.detail.logs' ? [{ id: 'custom-logs' }] : []

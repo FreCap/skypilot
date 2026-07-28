@@ -21,11 +21,12 @@ The two requests then race to clear the shared loading state.
 
 ## Implementation
 
-Keep the fallback download promise in a ref for synchronous ownership and keep
-only its route key in state for rendering. Cleanup compares owner identity
-before clearing either ref or state, so an older request cannot release a newer
-owner. The existing boolean state remains dedicated to plugin-controlled
-downloads.
+Keep fallback download promises in a ref keyed by route for synchronous
+ownership, and bump a scalar state version when the registry changes so React
+renders the current route's ownership. Cleanup compares the owner identity
+stored for that route before clearing the registry, so another route's request
+cannot replace or release it. The existing boolean state remains dedicated to
+plugin-controlled downloads.
 
 This adds constant-time coordination only. It does not add requests, polling,
 timers, scans, or cache invalidations. Under duplicate activation, connector
@@ -44,6 +45,6 @@ calls fall from two to one.
 
 No migration or compatibility rollout is required. Focused dashboard tests
 cover duplicate activation, success and failure release, route supersession,
-old-completion fencing, and the existing plugin contract. The dashboard CI
-workflow directly executes the focused test file, lint, formatting, and the
-production build.
+an A-B-A route cycle, 100 concurrent route owners, old-completion fencing, and
+the existing plugin contract. The dashboard CI workflow directly executes the
+focused test file, lint, formatting, and the production build.
