@@ -42,6 +42,8 @@ from test_reserved_fill_broker import clock  # noqa: F401
 import test_reserved_fill_broker as sqlite_suite
 
 from sky import clouds
+from sky import estimated_spend
+from sky import global_user_state
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
@@ -3833,6 +3835,65 @@ class TestServeStatusHistoryPG:
             table_limit=50,
             chart_limit=1)
         assert summary['total_request_count'] == 20
+
+    def test_estimated_spend_joins_daily_service_cost_and_requests(
+            self, history_engine, monkeypatch):
+        global_user_state.estimated_spend_daily_table.create(history_engine)
+        global_user_state.estimated_spend_state_table.create(history_engine)
+        monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                            mock.Mock(return_value=history_engine))
+        day = datetime.datetime(2026, 7, 29, tzinfo=datetime.timezone.utc)
+        day_start = int(day.timestamp())
+        observed_at = day + datetime.timedelta(hours=1)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_history.serve_request_activity_daily_table).values(
+                        day_start=day,
+                        service_name='svc',
+                        service_hash='hash-a',
+                        first_bucket_start=day,
+                        last_bucket_start=day + datetime.timedelta(minutes=59),
+                        request_count=4,
+                        observed_at=observed_at,
+                    ))
+            connection.execute(
+                sqlalchemy.insert(
+                    global_user_state.estimated_spend_daily_table).values(
+                        day_start_utc=day_start,
+                        cluster_hash='svc-replica-1',
+                        cluster_name='svc-1',
+                        workload_type='service',
+                        workload_id='svc',
+                        cloud='AWS',
+                        use_spot=False,
+                        machine_seconds=3600,
+                        catalog_hourly_rate=2.0,
+                        estimated_cost=2.0,
+                        updated_at=int(observed_at.timestamp()),
+                    ))
+            connection.execute(
+                sqlalchemy.insert(
+                    global_user_state.estimated_spend_state_table).values(
+                        singleton_id=1,
+                        last_success_at=int(observed_at.timestamp()),
+                        backfill_complete=True,
+                        coverage_start_utc=day_start,
+                    ))
+        monkeypatch.setattr(estimated_spend.time, 'time',
+                            mock.Mock(return_value=observed_at.timestamp()))
+
+        response = estimated_spend.get_estimated_spend(days=1)
+
+        service = response['service_requests']['services'][0]
+        assert service['service_name'] == 'svc'
+        assert service['request_count'] == 4
+        assert service['ratio_request_count'] == 4
+        assert service['estimated_cost'] == 2.0
+        assert service['estimated_cost_per_request'] == 0.5
+        assert service['cost_coverage'] == 'complete'
+        assert response['service_requests']['series'][0][
+            'estimated_cost_per_request_by_day'] == [0.5]
 
     def test_prediction_time_history_is_idempotent_and_reporter_additive(
             self, history_engine):

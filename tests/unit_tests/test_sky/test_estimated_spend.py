@@ -656,6 +656,186 @@ def test_exact_date_range_filters_all_aggregates(tmp_path, monkeypatch):
            ] == [1.0, 2.5]
 
 
+def test_service_cost_per_request_aligns_complete_request_days():
+    day = 1_700_006_400
+    days = [{
+        'day_start_utc': day
+    }, {
+        'day_start_utc': day + estimated_spend.SECONDS_PER_DAY
+    }, {
+        'day_start_utc': day + 2 * estimated_spend.SECONDS_PER_DAY
+    }]
+    service_requests = {
+        'available': True,
+        'coverage_start_utc': day + 60,
+        'services': [
+            {
+                'service_name': 'complete',
+                'request_count': 21,
+            },
+            {
+                'service_name': 'partial',
+                'request_count': 3,
+            },
+            {
+                'service_name': 'unavailable',
+                'request_count': 2,
+            },
+        ],
+        'series': [{
+            'service_name': 'complete',
+            'request_count_by_day': [1, 4, 16],
+        }, {
+            'service_name': 'partial',
+            'request_count_by_day': [0, 1, 2],
+        }, {
+            'service_name': 'unavailable',
+            'request_count_by_day': [0, 1, 1],
+        }, {
+            'is_other': True,
+            'request_count_by_day': [3, 0, 0],
+        }],
+    }
+    request_rows = [
+        mock.Mock(service_name='complete',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day + offset * estimated_spend.SECONDS_PER_DAY,
+                      datetime.timezone.utc),
+                  request_count=count)
+        for offset, count in enumerate((1, 4, 16))
+    ]
+    request_rows.extend([
+        mock.Mock(service_name='partial',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day + estimated_spend.SECONDS_PER_DAY,
+                      datetime.timezone.utc),
+                  request_count=1),
+        mock.Mock(service_name='partial',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day + 2 * estimated_spend.SECONDS_PER_DAY,
+                      datetime.timezone.utc),
+                  request_count=2),
+        mock.Mock(service_name='unavailable',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day + estimated_spend.SECONDS_PER_DAY,
+                      datetime.timezone.utc),
+                  request_count=1),
+        mock.Mock(service_name='unavailable',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day + 2 * estimated_spend.SECONDS_PER_DAY,
+                      datetime.timezone.utc),
+                  request_count=1),
+    ])
+    cost_rows = [
+        mock.Mock(service_name='complete',
+                  day_start_utc=day + offset * estimated_spend.SECONDS_PER_DAY,
+                  estimated_cost=cost,
+                  priced_machine_seconds=3600,
+                  excluded_machine_seconds=0)
+        for offset, cost in enumerate((10.0, 8.0, 12.0))
+    ]
+    cost_rows.extend([
+        mock.Mock(service_name='partial',
+                  day_start_utc=day + estimated_spend.SECONDS_PER_DAY,
+                  estimated_cost=2.0,
+                  priced_machine_seconds=3600,
+                  excluded_machine_seconds=0),
+        mock.Mock(service_name='partial',
+                  day_start_utc=day + 2 * estimated_spend.SECONDS_PER_DAY,
+                  estimated_cost=3.0,
+                  priced_machine_seconds=3600,
+                  excluded_machine_seconds=1800),
+    ])
+
+    estimated_spend._enrich_service_requests_with_costs(service_requests, days,
+                                                        request_rows, cost_rows,
+                                                        day)
+
+    services = {
+        service['service_name']: service
+        for service in service_requests['services']
+    }
+    complete = services['complete']
+    assert complete['ratio_coverage_start_utc'] == (
+        day + estimated_spend.SECONDS_PER_DAY)
+    assert complete['ratio_request_count'] == 20
+    assert complete['estimated_cost'] == 20.0
+    assert complete['estimated_cost_per_request'] == 1.0
+    assert complete['cost_coverage'] == 'complete'
+
+    partial = services['partial']
+    assert partial['ratio_request_count'] == 3
+    assert partial['estimated_cost'] == 5.0
+    assert partial['estimated_cost_per_request'] is None
+    assert partial['cost_coverage'] == 'partial'
+    assert partial['excluded_machine_seconds'] == 1800
+
+    unavailable = services['unavailable']
+    assert unavailable['ratio_request_count'] == 2
+    assert unavailable['estimated_cost_per_request'] is None
+    assert unavailable['cost_coverage'] == 'unavailable'
+
+    complete_series = service_requests['series'][0]
+    assert complete_series['estimated_cost_by_day'] == [10.0, 8.0, 12.0]
+    assert complete_series['estimated_cost_per_request_by_day'] == [
+        None, 2.0, 0.75
+    ]
+    assert 'estimated_cost_by_day' not in service_requests['series'][-1]
+
+
+def test_service_cost_per_request_includes_midnight_coverage_day():
+    day = 1_700_006_400
+    assert estimated_spend._first_complete_coverage_day(day) == day
+    assert estimated_spend._first_complete_coverage_day(day + 1) == (
+        day + estimated_spend.SECONDS_PER_DAY)
+    assert estimated_spend._first_complete_coverage_day(None) is None
+
+
+def test_service_cost_per_request_waits_for_spend_backfill():
+    day = 1_700_006_400
+    service_requests = {
+        'available': True,
+        'coverage_start_utc': day,
+        'services': [{
+            'service_name': 'service',
+            'request_count': 2,
+        }],
+        'series': [{
+            'service_name': 'service',
+            'request_count_by_day': [2],
+        }],
+    }
+    request_rows = [
+        mock.Mock(service_name='service',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day, datetime.timezone.utc),
+                  request_count=2)
+    ]
+    cost_rows = [
+        mock.Mock(service_name='service',
+                  day_start_utc=day,
+                  estimated_cost=4.0,
+                  priced_machine_seconds=3600,
+                  excluded_machine_seconds=0)
+    ]
+
+    estimated_spend._enrich_service_requests_with_costs(
+        service_requests, [{
+            'day_start_utc': day
+        }],
+        request_rows,
+        cost_rows,
+        spend_coverage_start_utc=None)
+
+    service = service_requests['services'][0]
+    assert service['ratio_coverage_start_utc'] is None
+    assert service['ratio_request_count'] == 0
+    assert service['estimated_cost_per_request'] is None
+    assert service['cost_coverage'] == 'unavailable'
+    assert service_requests['series'][0][
+        'estimated_cost_per_request_by_day'] == [None]
+
+
 @pytest.mark.parametrize(('start_offset', 'end_offset', 'message'), [
     (None, 0, 'provided together'),
     (0, None, 'provided together'),

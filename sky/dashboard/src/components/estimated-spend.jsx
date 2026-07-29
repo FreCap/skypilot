@@ -91,6 +91,20 @@ export function formatCurrency(value) {
   })}`;
 }
 
+export function formatCostPerRequest(value) {
+  if (value === null || value === undefined) return 'N/A';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 'N/A';
+  if (number > 0 && number < 0.0001) return '<$0.0001';
+  if (number < 0.01) {
+    return `$${number.toLocaleString(undefined, {
+      minimumFractionDigits: 4,
+      maximumFractionDigits: 4,
+    })}`;
+  }
+  return formatCurrency(number);
+}
+
 export function utcDateString(date = new Date()) {
   return date.toISOString().slice(0, 10);
 }
@@ -262,6 +276,11 @@ function ServiceRequestsCard({
     serviceRequests?.coverage_start_utc &&
     serviceRequests.coverage_start_utc >
       Date.parse(`${startDate}T00:00:00Z`) / 1000;
+  const ratioCoverageStartUtc =
+    serviceRequests?.services?.[0]?.ratio_coverage_start_utc;
+  const ratioCoveragePartial =
+    ratioCoverageStartUtc &&
+    ratioCoverageStartUtc > Date.parse(`${startDate}T00:00:00Z`) / 1000;
   const chartData = useMemo(() => {
     const series = serviceRequests?.series || [];
     return {
@@ -279,6 +298,10 @@ function ServiceRequestsCard({
         return {
           label: service.is_other ? 'Other' : service.service_name,
           data: service.request_count_by_day || [],
+          isOther: Boolean(service.is_other),
+          estimatedCostByDay: service.estimated_cost_by_day || [],
+          estimatedCostPerRequestByDay:
+            service.estimated_cost_per_request_by_day || [],
           backgroundColor,
           borderColor,
           borderWidth: 1,
@@ -302,10 +325,33 @@ function ServiceRequestsCard({
         tooltip: {
           filter: (context) => Number(context.parsed.y) > 0,
           callbacks: {
-            label: (context) =>
-              `${context.dataset.label}: ${formatRequestCount(
-                context.parsed.y
-              )}`,
+            label: (context) => {
+              const labels = [
+                `${context.dataset.label}: ${formatRequestCount(
+                  context.parsed.y
+                )} requests`,
+              ];
+              if (context.dataset.isOther) return labels;
+              const estimatedCost =
+                context.dataset.estimatedCostByDay?.[context.dataIndex];
+              const costPerRequest =
+                context.dataset.estimatedCostPerRequestByDay?.[
+                  context.dataIndex
+                ];
+              labels.push(
+                `Est. compute: ${
+                  Number(estimatedCost) > 0
+                    ? formatCurrency(estimatedCost)
+                    : 'N/A'
+                }`
+              );
+              labels.push(
+                `Est. compute cost / request: ${formatCostPerRequest(
+                  costPerRequest
+                )}`
+              );
+              return labels;
+            },
           },
         },
       },
@@ -336,7 +382,9 @@ function ServiceRequestsCard({
             <CardDescription className="mt-1">
               One admitted or capacity-rejected inbound request counts once.
               Internal replica retries do not add requests; client retries are
-              separate requests.{' '}
+              separate requests. Cost/request is estimated catalog-priced
+              replica compute and is unavailable when pricing coverage is
+              incomplete.{' '}
               {endDate === todayUtc && 'The current UTC day is partial.'}
             </CardDescription>
           </div>
@@ -372,6 +420,20 @@ function ServiceRequestsCard({
                 data.
               </div>
             )}
+            {ratioCoveragePartial && (
+              <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
+                Cost/request uses complete request-history days beginning{' '}
+                {new Date(ratioCoverageStartUtc * 1000).toLocaleDateString(
+                  undefined,
+                  {
+                    timeZone: 'UTC',
+                    timeZoneName: 'short',
+                  }
+                )}
+                . Its request denominator can be smaller than the selected-range
+                request total.
+              </div>
+            )}
             {totalRequestCount === 0 ? (
               <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
                 No service requests recorded in this range.
@@ -387,6 +449,9 @@ function ServiceRequestsCard({
                   <TableRow>
                     <TableHead>Service</TableHead>
                     <TableHead className="text-right">Requests</TableHead>
+                    <TableHead className="text-right">
+                      Est. compute cost / request
+                    </TableHead>
                     <TableHead className="text-right">Share</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -394,7 +459,7 @@ function ServiceRequestsCard({
                   {(serviceRequests.services || []).length === 0 ? (
                     <TableRow>
                       <TableCell
-                        colSpan={3}
+                        colSpan={4}
                         className="py-8 text-center text-muted-foreground"
                       >
                         No services with request activity in this range.
@@ -414,6 +479,28 @@ function ServiceRequestsCard({
                           </TableCell>
                           <TableCell className="text-right font-medium">
                             {formatRequestCount(count)}
+                          </TableCell>
+                          <TableCell className="text-right font-medium">
+                            <div>
+                              {formatCostPerRequest(
+                                service.estimated_cost_per_request
+                              )}
+                            </div>
+                            {service.cost_coverage === 'partial' && (
+                              <div className="text-xs font-normal text-muted-foreground">
+                                unpriced capacity
+                              </div>
+                            )}
+                            {Number(service.ratio_request_count) > 0 &&
+                              Number(service.ratio_request_count) !== count && (
+                                <div className="text-xs font-normal text-muted-foreground">
+                                  based on{' '}
+                                  {formatRequestCount(
+                                    service.ratio_request_count
+                                  )}{' '}
+                                  requests
+                                </div>
+                              )}
                           </TableCell>
                           <TableCell className="text-right text-muted-foreground">
                             {share.toFixed(1)}%
