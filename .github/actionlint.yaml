@@ -3,3 +3,4 @@ self-hosted-runner:
     - namespace-profile-ci-1x2
     - namespace-profile-ci-2x4
     - namespace-profile-ci-4x8
+    - namespace-profile-ci-4x16
