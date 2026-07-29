@@ -106,10 +106,18 @@ function VolumeDetails() {
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const activeVolumeNameRef = useRef(volumeName);
   const isMobile = useMobile();
   const { volumeData, loading, refreshData } = useVolumeDetails({
     volumeName,
   });
+
+  useEffect(() => {
+    if (activeVolumeNameRef.current !== volumeName) {
+      activeVolumeNameRef.current = volumeName;
+      setIsInitialLoad(true);
+    }
+  }, [volumeName]);
 
   useEffect(() => {
     if (!loading && isInitialLoad) {
@@ -117,15 +125,20 @@ function VolumeDetails() {
     }
   }, [loading, isInitialLoad]);
 
+  // Effects run after render. On a route change, do not expose the previous
+  // volume's snapshot or a false settled/not-found state before the new route
+  // owns the page and lands its first matching response.
+  const ownsRouteState = activeVolumeNameRef.current === volumeName;
+  const currentVolumeData =
+    ownsRouteState && volumeData?.name === volumeName ? volumeData : null;
+  const isRouteLoading =
+    !router.isReady || !ownsRouteState || (isInitialLoad && !currentVolumeData);
+
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
     await refreshData();
     setIsRefreshing(false);
   };
-
-  if (!router.isReady) {
-    return <div>Loading...</div>;
-  }
 
   const title = volumeName
     ? `Volume: ${volumeName} | SkyPilot Dashboard`
@@ -158,7 +171,7 @@ function VolumeDetails() {
                 <span className="ml-2 text-gray-500">Loading...</span>
               </div>
             )}
-            {volumeData && (
+            {currentVolumeData && (
               <Tooltip
                 content="Refresh"
                 className="text-sm text-muted-foreground"
@@ -176,13 +189,13 @@ function VolumeDetails() {
           </div>
         </div>
 
-        {loading && isInitialLoad ? (
+        {isRouteLoading ? (
           <div className="flex justify-center items-center py-12">
             <CircularProgress size={24} className="mr-2" />
             <span className="text-gray-500">Loading volume details...</span>
           </div>
-        ) : volumeData ? (
-          <VolumeDetailCard volumeData={volumeData} />
+        ) : currentVolumeData ? (
+          <VolumeDetailCard volumeData={currentVolumeData} />
         ) : (
           <div className="flex justify-center items-center py-12">
             <span className="text-gray-500">Volume not found.</span>

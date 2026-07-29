@@ -1,4 +1,10 @@
-import { act, renderHook, waitFor } from '@testing-library/react';
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
@@ -9,9 +15,19 @@ jest.mock('@/lib/cache', () => ({
   },
 }));
 
+const mockUseRouter = jest.fn();
+
+jest.mock('next/router', () => ({
+  useRouter: () => mockUseRouter(),
+}));
+
+jest.mock('@/hooks/useMobile', () => ({
+  useMobile: () => false,
+}));
+
 import dashboardCache from '@/lib/cache';
 import { getVolumes } from '@/data/connectors/volumes';
-import { useVolumeDetails } from '@/pages/volumes/[volume]';
+import VolumeDetailsPage, { useVolumeDetails } from '@/pages/volumes/[volume]';
 
 function deferred() {
   let resolve;
@@ -340,5 +356,51 @@ describe('useVolumeDetails request ownership', () => {
     });
 
     expect(result.current.volumeData.status).toBe('volume-a-new');
+  });
+});
+
+describe('VolumeDetails route ownership rendering', () => {
+  beforeEach(() => {
+    jest.resetAllMocks();
+  });
+
+  it('keeps the page in loading state instead of flashing not found on a route change', async () => {
+    const nextVolume = deferred();
+    const routerState = {
+      isReady: true,
+      query: { volume: 'volume-a' },
+    };
+    mockUseRouter.mockImplementation(() => routerState);
+
+    dashboardCache.get.mockResolvedValueOnce([
+      { name: 'volume-a', status: 'READY', user_name: 'alice' },
+    ]);
+
+    const { rerender } = render(<VolumeDetailsPage />);
+
+    await waitFor(() =>
+      expect(screen.getAllByText('volume-a')).not.toHaveLength(0)
+    );
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    dashboardCache.get.mockImplementationOnce(() => nextVolume.promise);
+    routerState.query = { volume: 'volume-b' };
+    rerender(<VolumeDetailsPage />);
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    expect(screen.getByText('Loading volume details...')).toBeInTheDocument();
+    expect(screen.queryByText('Volume not found.')).not.toBeInTheDocument();
+    expect(screen.queryByText('volume-a')).not.toBeInTheDocument();
+
+    await act(async () => {
+      nextVolume.resolve([
+        { name: 'volume-b', status: 'READY', user_name: 'bob' },
+      ]);
+      await nextVolume.promise;
+    });
+
+    expect(screen.getAllByText('volume-b')).not.toHaveLength(0);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 });
