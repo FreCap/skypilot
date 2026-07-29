@@ -13,7 +13,8 @@ from sky.provision.aws import instance
 aws_regions = ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2']
 
 
-def test_aws_adaptor_resources_memory_leakage():
+def test_aws_adaptor_resources_memory_leakage(monkeypatch):
+    monkeypatch.setenv('AWS_EC2_METADATA_DISABLED', 'true')
     memory_usage_before = memory_profiler.memory_usage(os.getpid(),
                                                        interval=0.1,
                                                        timeout=1)[0]
