@@ -1119,7 +1119,10 @@ def test_stale_cleanup_reuses_one_queue_snapshot_per_cluster(
     batch_coordinator._worker_token = 'owner-c'
     batch_coordinator._stale_attempt_leases_drained = True
 
-    queue = mock.Mock(side_effect=['queue-worker-a', 'queue-worker-b'])
+    def _queue(cluster_name, **_):
+        return f'queue-{cluster_name}'
+
+    queue = mock.Mock(side_effect=_queue)
     queued = {
         'queue-worker-a': [
             types.SimpleNamespace(job_id=17, job_name='batch-worker-3-owner-a'),
