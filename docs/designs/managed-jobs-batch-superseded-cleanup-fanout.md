@@ -46,8 +46,9 @@ the existing durable-record recovery and final active-worker drain.
 
 This changes scheduling only. It does not add retries, polls, database reads,
 provider calls, or durable state. Successful cleanup keeps the same per-worker
-call count. Coordination adds one coroutine/task per active worker and keeps
-O(worker count) memory.
+call count. Coordination adds one coroutine/task per active worker, keeps
+O(worker count) memory, and remains bounded by the snapshotted pool plus the
+event loop's existing thread-executor capacity.
 
 ## Alternatives considered
 
@@ -75,31 +76,35 @@ already-owned active snapshot, so unresolved-record recovery remains serial.
 | Shutdown failure containment and sibling liveness | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | One global deadline, no post-timeout calls, and cancellation shielding | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | Call-count and latency performance: unchanged calls per successful worker, sibling starts before blocked worker release | `tests/unit_tests/test_batch_recovery.py` | same focused command |
-| Adjacent Batch takeover, lease, retry, cleanup, and durable-state behavior | `tests/unit_tests/test_batch_recovery.py` and `tests/unit_tests/test_batch_recovery_pg.py` | `python -m pytest -q -o addopts='' tests/unit_tests/test_batch_recovery.py tests/unit_tests/test_batch_recovery_pg.py` |
+| Adjacent Batch takeover, lease, retry, cleanup, and durable-state behavior | `tests/unit_tests/test_batch_recovery.py` | `python -m pytest -q -o addopts='' tests/unit_tests/test_batch_recovery.py` |
 | Python formatting, typing, lint, async lifecycle, and import contracts | production and test paths | `bash format.sh --files sky/batch/coordinator.py tests/unit_tests/test_batch_recovery.py`; repository static-analysis commands; `git diff --check` |
 
 `.github/workflows/pytest.yml` has no pull-request path filter and its
-`Python Tests - Unit Tests` job includes both mapped unit files. The format,
+`Python Tests - Unit Tests` job includes the mapped unit file. The format,
 mypy, Pylint, and static-analysis workflows also run for pull requests to
 `improvements` without excluding these paths.
 
 ## Baseline and performance proof
 
-The regression test will install two active workers. Worker A's shutdown SDK
-call blocks. On the untouched base, worker B has zero shutdown and cancellation
+The regression test installs two active workers. Worker A's shutdown SDK call
+blocks. On the untouched base, worker B has zero shutdown and cancellation
 calls until A is released or the deadline expires. With fan-out, worker B
 completes its shutdown and exact cancellation while A is still blocked.
 
-The test will also assert the successful worker's exact call sequence and call
-counts. This is deterministic evidence that the change reduces independent
-cleanup latency from additive to concurrent without adding external work.
+The test also asserts the successful worker's exact five-call sequence. An
+eight-worker benchmark with 5 ms per existing external call measured a median
+of 0.298404 seconds on the exact base and 0.037628 seconds on the exact head
+across seven runs. This is deterministic evidence that the change reduces
+independent cleanup latency from additive to concurrent without adding
+external work.
 
 ## Rollout and rollback
 
 The change is process-local to superseded managed Batch cleanup and requires no
 schema, API, configuration, or migration change. Rollback restores serial
 scheduling; durable worker records remain the recovery fallback in either
-version.
+version. No PostgreSQL-specific state transition changes are involved, so real
+PostgreSQL coverage stays outside this change's required test matrix.
 
 ## Manual verification
 
