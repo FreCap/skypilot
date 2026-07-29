@@ -444,18 +444,14 @@ def test_get_clusters_launch_refresh(monkeypatch):
         return []
 
     def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
-                        summary_response):
+                        summary_response, cluster_status_lock_timeout):
+        assert cluster_status_lock_timeout == 0
         if cluster_name == 'up-cluster':
             return _mock_cluster(False)
         elif cluster_name == 'launch-cluster':
             return _mock_cluster(True)
         else:
             return None
-
-    def get_request_tasks(*args, **kwargs):
-        magic_mock = mock.MagicMock()
-        magic_mock.cluster_name = 'launch-cluster'
-        return [magic_mock]
 
     monkeypatch.setattr('sky.global_user_state.get_clusters', get_clusters_mock)
     monkeypatch.setattr('sky.utils.resources_utils.get_readable_resources_repr',
@@ -465,8 +461,10 @@ def test_get_clusters_launch_refresh(monkeypatch):
         ssh_credentials_from_handles)
     monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
                         refresh_cluster)
-    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
-                        get_request_tasks)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.get_request_tasks',
+        mock.Mock(side_effect=AssertionError(
+            'cluster refresh must not query request tasks')))
 
     assert len(
         backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE)) == 2
@@ -494,9 +492,11 @@ def test_get_clusters_honors_include_handle_for_incomplete_record(
     monkeypatch.setattr('sky.utils.resources_utils.get_readable_resources_repr',
                         get_resources_repr)
 
-    launch_request = mock.MagicMock()
-    launch_request.cluster_name = 'launch-cluster'
-    get_request_tasks = mock.Mock(return_value=[launch_request])
+    refresh_cluster = mock.Mock(return_value=record)
+    monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
+                        refresh_cluster)
+    get_request_tasks = mock.Mock(side_effect=AssertionError(
+        'cluster refresh must not query request tasks'))
     monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
                         get_request_tasks)
 
@@ -510,9 +510,12 @@ def test_get_clusters_honors_include_handle_for_incomplete_record(
     get_clusters.assert_called_once()
     get_resources_repr.assert_called_once_with(handle, simplified_only=False)
     if refresh == common.StatusRefreshMode.FORCE:
-        get_request_tasks.assert_called_once()
+        refresh_cluster.assert_called_once()
+        assert refresh_cluster.call_args.kwargs[
+            'cluster_status_lock_timeout'] == 0
     else:
-        get_request_tasks.assert_not_called()
+        refresh_cluster.assert_not_called()
+    get_request_tasks.assert_not_called()
 
 
 def test_get_glob_clusters_batches_patterns(monkeypatch):
@@ -575,20 +578,19 @@ def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
         return cloud_name, f'{cloud_name}-full'
 
     def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
-                        summary_response):
+                        summary_response, cluster_status_lock_timeout):
         del force_refresh_statuses, include_user_info, summary_response
+        assert cluster_status_lock_timeout == 0
         if cluster_name == 'up-cluster':
             return _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
                                  'up-cluster-fresh-cloud')
+        if cluster_name == 'launch-cluster':
+            return _mock_cluster('launch-cluster',
+                                 status_lib.ClusterStatus.INIT,
+                                 'launch-cluster-cloud')
         if cluster_name == 'gone-cluster':
             return None
         raise AssertionError(f'unexpected refresh for {cluster_name!r}')
-
-    def get_request_tasks(*args, **kwargs):
-        del args, kwargs
-        launch_request = mock.MagicMock()
-        launch_request.cluster_name = 'launch-cluster'
-        return [launch_request]
 
     monkeypatch.setattr('sky.global_user_state.get_clusters',
                         lambda *args, **kwargs: cached_records)
@@ -599,8 +601,10 @@ def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
         lambda handles: [{} for _ in handles])
     monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
                         refresh_cluster)
-    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
-                        get_request_tasks)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.get_request_tasks',
+        mock.Mock(side_effect=AssertionError(
+            'cluster refresh must not query request tasks')))
 
     records = backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE)
 
@@ -656,20 +660,19 @@ def test_get_clusters_refresh_credentials_only_final_handles(monkeypatch):
         return [{} for _ in handles]
 
     def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
-                        summary_response):
+                        summary_response, cluster_status_lock_timeout):
         del force_refresh_statuses, include_user_info, summary_response
+        assert cluster_status_lock_timeout == 0
         if cluster_name == 'up-cluster':
             return _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
                                  'up-cluster-fresh-cloud')
+        if cluster_name == 'launch-cluster':
+            return _mock_cluster('launch-cluster',
+                                 status_lib.ClusterStatus.INIT,
+                                 'launch-cluster-cloud')
         if cluster_name == 'gone-cluster':
             return None
         raise AssertionError(f'unexpected refresh for {cluster_name!r}')
-
-    def get_request_tasks(*args, **kwargs):
-        del args, kwargs
-        launch_request = mock.MagicMock()
-        launch_request.cluster_name = 'launch-cluster'
-        return [launch_request]
 
     monkeypatch.setattr('sky.global_user_state.get_clusters',
                         lambda *args, **kwargs: cached_records)
@@ -680,8 +683,10 @@ def test_get_clusters_refresh_credentials_only_final_handles(monkeypatch):
         ssh_credentials_from_handles)
     monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
                         refresh_cluster)
-    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
-                        get_request_tasks)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.get_request_tasks',
+        mock.Mock(side_effect=AssertionError(
+            'cluster refresh must not query request tasks')))
     monkeypatch.setattr('sky.backends.backend_utils._caller_is_viewer',
                         lambda: False)
 

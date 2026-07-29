@@ -8,6 +8,7 @@ import pytest
 
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
+from sky.utils import status_lib
 
 
 class _StopTest(RuntimeError):
@@ -183,6 +184,106 @@ def test_status_refresh_skips_update_when_resource_lock_is_held(monkeypatch):
         include_user_info=False,
         summary_response=True,
         resource_lock_already_held=False)
+
+    assert result is record
+    resource_lock.acquire.assert_called_once_with(blocking=False)
+    update_cluster_status.assert_not_called()
+
+
+def test_forced_incomplete_refresh_returns_cached_without_locking(monkeypatch):
+    record = {
+        'status': status_lib.ClusterStatus.INIT,
+        'handle': mock.MagicMock(launched_resources=None),
+    }
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name',
+                        mock.MagicMock(return_value=record))
+    check_owner = mock.MagicMock()
+    monkeypatch.setattr(backend_utils, '_check_owner_identity_with_record',
+                        check_owner)
+    get_lock = mock.MagicMock()
+    monkeypatch.setattr(backend_utils.locks, 'get_lock', get_lock)
+    update_cluster_status = mock.MagicMock()
+    monkeypatch.setattr(backend_utils, '_update_cluster_status',
+                        update_cluster_status)
+
+    result = backend_utils.refresh_cluster_record(
+        'test-cluster',
+        force_refresh_statuses={status_lib.ClusterStatus.INIT},
+        cluster_status_lock_timeout=0,
+        include_user_info=False,
+        summary_response=True)
+
+    assert result is record
+    check_owner.assert_not_called()
+    get_lock.assert_not_called()
+    update_cluster_status.assert_not_called()
+
+
+def test_forced_refresh_does_not_wait_for_contended_status_lock(monkeypatch):
+    record = {
+        'status': status_lib.ClusterStatus.INIT,
+        'handle':
+            mock.MagicMock(launched_resources=mock.MagicMock(use_spot=False)),
+        'autostop': -1,
+        'status_updated_at': None,
+    }
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name',
+                        mock.MagicMock(return_value=record))
+    monkeypatch.setattr(backend_utils, '_check_owner_identity_with_record',
+                        mock.MagicMock())
+    status_lock = mock.MagicMock()
+    status_lock.acquire.side_effect = backend_utils.locks.LockTimeout
+    monkeypatch.setattr(backend_utils.locks, 'get_lock',
+                        mock.MagicMock(return_value=status_lock))
+    monkeypatch.setattr(
+        backend_utils.time, 'sleep',
+        mock.MagicMock(side_effect=AssertionError(
+            'opportunistic refresh must not wait for the status lock')))
+    update_cluster_status = mock.MagicMock()
+    monkeypatch.setattr(backend_utils, '_update_cluster_status',
+                        update_cluster_status)
+
+    result = backend_utils.refresh_cluster_record(
+        'test-cluster',
+        force_refresh_statuses={status_lib.ClusterStatus.INIT},
+        cluster_status_lock_timeout=0,
+        include_user_info=False,
+        summary_response=True)
+
+    assert result is record
+    status_lock.acquire.assert_called_once_with(blocking=False)
+    update_cluster_status.assert_not_called()
+
+
+def test_forced_refresh_returns_cached_when_resource_lock_is_held(monkeypatch):
+    record = {
+        'status': status_lib.ClusterStatus.INIT,
+        'handle':
+            mock.MagicMock(launched_resources=mock.MagicMock(use_spot=False)),
+        'autostop': -1,
+        'status_updated_at': None,
+    }
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name',
+                        mock.MagicMock(return_value=record))
+    monkeypatch.setattr(backend_utils, '_check_owner_identity_with_record',
+                        mock.MagicMock())
+    resource_lock = mock.MagicMock()
+    resource_lock.acquire.side_effect = backend_utils.locks.LockTimeout
+    monkeypatch.setattr(backend_utils.locks, 'get_lock',
+                        mock.MagicMock(return_value=resource_lock))
+    update_cluster_status = mock.MagicMock()
+    monkeypatch.setattr(backend_utils, '_update_cluster_status',
+                        update_cluster_status)
+
+    result = backend_utils.refresh_cluster_record(
+        'test-cluster',
+        force_refresh_statuses={status_lib.ClusterStatus.INIT},
+        cluster_lock_already_held=True,
+        include_user_info=False,
+        summary_response=True)
 
     assert result is record
     resource_lock.acquire.assert_called_once_with(blocking=False)
