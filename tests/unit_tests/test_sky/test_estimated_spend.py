@@ -583,6 +583,14 @@ def test_rollup_is_idempotent_and_query_returns_daily_breakdown(
 
     monkeypatch.setattr(estimated_spend.time, 'time', lambda: as_of)
     response = estimated_spend.get_estimated_spend(days=3)
+    assert response['service_requests'] == {
+        'available': False,
+        'definition': 'admitted_inbound_requests',
+        'coverage_start_utc': None,
+        'total_request_count': 0,
+        'services': [],
+        'series': [],
+    }
     assert response['stale'] is False
     assert response['backfill_complete'] is True
     assert response['totals']['estimated_cost'] == 24.0

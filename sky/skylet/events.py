@@ -167,6 +167,15 @@ class ServiceStatusHistoryEvent(SkyletEvent):
         bucket = int(timestamp // serve_history.BUCKET_SECONDS)
         if bucket == self._last_bucket:
             return
+        try:
+            rolled_up = serve_history.rollup_request_activity_daily(
+                timestamp=timestamp)
+            logger.debug(
+                f'Rolled up {rolled_up} daily Serve request history rows.')
+        except Exception:  # pylint: disable=broad-except
+            # Daily request reporting is best effort. It must not block status
+            # snapshots or the hourly pruning of bounded raw history.
+            logger.exception('Failed to roll up daily Serve request history.')
         written = serve_history.record_status_snapshot(timestamp=timestamp)
         # Advance only after a successful write so a transient failure is
         # retried on the next daemon iteration within the same minute.

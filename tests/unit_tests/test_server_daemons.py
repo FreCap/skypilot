@@ -78,7 +78,10 @@ def test_non_postgres_lock_skips_session_probe():
 
 def test_serve_history_event_uses_wall_clock_minutes_and_retries(monkeypatch):
     record = mock.Mock(return_value=2)
+    rollup = mock.Mock(return_value=1)
     monkeypatch.setattr(events.serve_history, 'record_status_snapshot', record)
+    monkeypatch.setattr(events.serve_history, 'rollup_request_activity_daily',
+                        rollup)
     timestamps = iter([120.1, 140.1, 180.1, 240.1, 240.2])
     event = events.ServiceStatusHistoryEvent(time_fn=lambda: next(timestamps))
 
@@ -89,9 +92,27 @@ def test_serve_history_event_uses_wall_clock_minutes_and_retries(monkeypatch):
         mock.call(timestamp=120.1),
         mock.call(timestamp=180.1),
     ]
+    assert rollup.call_args_list == [
+        mock.call(timestamp=120.1),
+        mock.call(timestamp=180.1),
+    ]
 
     record.side_effect = RuntimeError('transient database failure')
     event.run()
     record.side_effect = None
     event.run()
     assert record.call_args_list[-1] == mock.call(timestamp=240.2)
+
+
+def test_serve_history_rollup_failure_does_not_block_snapshot(monkeypatch):
+    rollup = mock.Mock(side_effect=RuntimeError('rollup failed'))
+    record = mock.Mock(return_value=2)
+    monkeypatch.setattr(events.serve_history, 'rollup_request_activity_daily',
+                        rollup)
+    monkeypatch.setattr(events.serve_history, 'record_status_snapshot', record)
+    event = events.ServiceStatusHistoryEvent(time_fn=lambda: 120.1)
+
+    event.run()
+
+    rollup.assert_called_once_with(timestamp=120.1)
+    record.assert_called_once_with(timestamp=120.1)

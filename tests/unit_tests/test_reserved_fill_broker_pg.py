@@ -2572,6 +2572,7 @@ class TestMigrationChainPG:
                     'demand_capacity_observations',
                     'serve_replica_status_history',
                     'serve_request_activity_history',
+                    'serve_request_activity_daily',
                     'serve_response_time_history',
                     'serve_prediction_time_history',
                     'serve_autoscaler_history',
@@ -2743,6 +2744,44 @@ class TestMigrationChainPG:
                         "FROM services WHERE name = 'restart-safe'")).one()
             assert row[0] == {'version': 1, 'benches': []}
             assert row[1] == {'version': 1, 'candidates': []}
+        finally:
+            engine.dispose()
+
+    def test_revision_031_daily_history_survives_rollback_and_reupgrade(
+            self, pg_server):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+            daily = serve_history.serve_request_activity_daily_table
+            day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.insert(daily).values(day_start=day,
+                                                    service_name='svc',
+                                                    service_hash='hash-a',
+                                                    first_bucket_start=day,
+                                                    last_bucket_start=day,
+                                                    request_count=7,
+                                                    observed_at=day))
+
+            config = migration_utils.get_alembic_config(
+                engine, migration_utils.SERVE_DB_NAME)
+            alembic_command.downgrade(config, '030')
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            with engine.connect() as connection:
+                assert connection.execute(
+                    sqlalchemy.select(daily.c.request_count)).scalar_one() == 7
+                revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert revision == migration_utils.SERVE_VERSION
         finally:
             engine.dispose()
 
@@ -3677,6 +3716,123 @@ class TestServeStatusHistoryPG:
         assert current['service_hash'] == 'hash-b'
         assert not current['request_samples']
         assert current['requests_last_hour'] == 0
+
+    def test_daily_request_rollup_is_monotonic_and_groups_incarnations(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
+        request_table = serve_history.serve_request_activity_history_table
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.insert(request_table), [{
+                'service_name': 'svc',
+                'service_hash': 'hash-a',
+                'reporter_session_id': 'reporter-a',
+                'bucket_start': day + datetime.timedelta(minutes=1),
+                'observed_at': day + datetime.timedelta(minutes=2),
+                'request_count': 3,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'svc',
+                'service_hash': 'hash-a',
+                'reporter_session_id': 'reporter-b',
+                'bucket_start': day + datetime.timedelta(minutes=1),
+                'observed_at': day + datetime.timedelta(minutes=2),
+                'request_count': 4,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'svc',
+                'service_hash': 'hash-b',
+                'reporter_session_id': 'reporter-c',
+                'bucket_start': day + datetime.timedelta(minutes=2),
+                'observed_at': day + datetime.timedelta(minutes=3),
+                'request_count': 2,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'other',
+                'service_hash': 'hash-other',
+                'reporter_session_id': 'reporter-d',
+                'bucket_start': day + datetime.timedelta(minutes=3),
+                'observed_at': day + datetime.timedelta(minutes=4),
+                'request_count': 1,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'svc',
+                'service_hash': 'hash-b',
+                'reporter_session_id': 'reporter-c',
+                'bucket_start': day + datetime.timedelta(days=1, minutes=1),
+                'observed_at': day + datetime.timedelta(days=1, minutes=2),
+                'request_count': 5,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }])
+            # UTC grouping must not depend on the database session timezone.
+            connection.execute(
+                sqlalchemy.text("SET TIME ZONE 'America/Los_Angeles'"))
+
+        timestamp = (day + datetime.timedelta(days=1, minutes=5)).timestamp()
+        assert serve_history.rollup_request_activity_daily(timestamp) == 4
+        days = [{
+            'day_start_utc': int(day.timestamp())
+        }, {
+            'day_start_utc': int((day + datetime.timedelta(days=1)).timestamp())
+        }]
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            int(day.timestamp()),
+            int((day + datetime.timedelta(days=1)).timestamp()),
+            days,
+            table_limit=50,
+            chart_limit=1)
+        assert summary['available']
+        assert summary['coverage_start_utc'] == int(
+            (day + datetime.timedelta(minutes=1)).timestamp())
+        assert summary['total_request_count'] == 15
+        assert summary['services'] == [{
+            'service_name': 'svc',
+            'request_count': 14,
+        }, {
+            'service_name': 'other',
+            'request_count': 1,
+        }]
+        assert summary['series'] == [{
+            'service_name': 'svc',
+            'request_count_by_day': [9, 5],
+        }, {
+            'is_other': True,
+            'request_count_by_day': [1, 0],
+        }]
+
+        # A late cumulative update increases the daily rollup.
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_table).where(
+                    request_table.c.reporter_session_id == 'reporter-a').values(
+                        request_count=8))
+        serve_history.rollup_request_activity_daily(timestamp + 60)
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            int(day.timestamp()),
+            int((day + datetime.timedelta(days=1)).timestamp()),
+            days,
+            table_limit=50,
+            chart_limit=1)
+        assert summary['total_request_count'] == 20
+
+        # Pruning the raw source cannot decrement durable daily totals.
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.delete(request_table))
+        assert serve_history.rollup_request_activity_daily(timestamp + 120) == 0
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            int(day.timestamp()),
+            int((day + datetime.timedelta(days=1)).timestamp()),
+            days,
+            table_limit=50,
+            chart_limit=1)
+        assert summary['total_request_count'] == 20
 
     def test_prediction_time_history_is_idempotent_and_reporter_additive(
             self, history_engine):

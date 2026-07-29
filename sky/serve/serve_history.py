@@ -7,10 +7,13 @@ import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
+from sky import sky_logging
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.utils import common_utils
 from sky.utils.db import db_utils
+
+logger = sky_logging.init_logger(__name__)
 
 DEFAULT_HISTORY_HOURS = 12
 RETENTION_HOURS = 72
@@ -138,6 +141,33 @@ sqlalchemy.Index('serve_request_activity_history_lookup_idx',
                  serve_request_activity_history_table.c.bucket_start.desc())
 sqlalchemy.Index('serve_request_activity_history_bucket_idx',
                  serve_request_activity_history_table.c.bucket_start)
+
+serve_request_activity_daily_table = sqlalchemy.Table(
+    'serve_request_activity_daily',
+    metadata,
+    sqlalchemy.Column('day_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      primary_key=True),
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('first_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('last_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('request_count', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('observed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.CheckConstraint('request_count >= 0',
+                               name='serve_request_activity_daily_nonnegative'),
+)
+sqlalchemy.Index('serve_request_activity_daily_day_idx',
+                 serve_request_activity_daily_table.c.day_start)
+sqlalchemy.Index('serve_request_activity_daily_service_day_idx',
+                 serve_request_activity_daily_table.c.service_name,
+                 serve_request_activity_daily_table.c.day_start)
 
 _RESPONSE_TIME_ARRAY_COLUMNS = tuple(
     sqlalchemy.Column(f'status_{status_class}_counts',
@@ -472,6 +502,203 @@ def record_status_snapshot(timestamp: float | None = None) -> int:
                 sqlalchemy.delete(serve_autoscaler_history_table).where(
                     serve_autoscaler_history_table.c.bucket_start < cutoff))
     return len(history_rows)
+
+
+def rollup_request_activity_daily(timestamp: float | None = None) -> int:
+    """Monotonically materialize available minute counters into UTC days.
+
+    The caller intentionally runs this before hourly raw-history pruning and
+    isolates failures from status snapshots. Recomputing all retained raw rows
+    provides a bounded initial backfill and incorporates late counter updates.
+    """
+    engine = _postgres_engine()
+    if engine is None:
+        return 0
+    observed_at = _utc_datetime(timestamp)
+    request_history = serve_request_activity_history_table
+    daily = serve_request_activity_daily_table
+    utc_bucket_start = sqlalchemy.func.timezone('UTC',
+                                                request_history.c.bucket_start)
+    day_start = sqlalchemy.func.timezone(
+        'UTC', sqlalchemy.func.date_trunc('day',
+                                          utc_bucket_start)).label('day_start')
+    query = (sqlalchemy.select(
+        day_start,
+        request_history.c.service_name,
+        request_history.c.service_hash,
+        sqlalchemy.func.min(
+            request_history.c.bucket_start).label('first_bucket_start'),
+        sqlalchemy.func.max(
+            request_history.c.bucket_start).label('last_bucket_start'),
+        sqlalchemy.func.sum(
+            sqlalchemy.cast(request_history.c.request_count,
+                            sqlalchemy.BigInteger)).label('request_count'),
+    ).group_by(day_start, request_history.c.service_name,
+               request_history.c.service_hash))
+
+    with engine.begin() as connection:
+        has_daily_rows = connection.execute(
+            sqlalchemy.select(sqlalchemy.literal(1)).select_from(daily).limit(
+                1)).first() is not None
+        # The first run backfills all retained raw data. Hourly full passes run
+        # before raw pruning. Between them, only the current day needs
+        # recomputation, except during UTC midnight's one-hour late-report
+        # window when the complete previous day is still mutable.
+        if has_daily_rows and observed_at.minute != 0:
+            current_day = observed_at.replace(hour=0,
+                                              minute=0,
+                                              second=0,
+                                              microsecond=0)
+            cutoff = (current_day - datetime.timedelta(days=1)
+                      if observed_at.hour == 0 else current_day)
+            query = query.where(request_history.c.bucket_start >= cutoff)
+        rows = connection.execute(query).mappings().all()
+        if not rows:
+            return 0
+        values = [{
+            **dict(row),
+            'request_count': int(row['request_count']),
+            'observed_at': observed_at,
+        } for row in rows]
+        insert = postgresql.insert(serve_request_activity_daily_table).values(
+            values)
+        excluded = insert.excluded
+        connection.execute(
+            insert.on_conflict_do_update(
+                index_elements=[
+                    daily.c.day_start,
+                    daily.c.service_name,
+                    daily.c.service_hash,
+                ],
+                set_={
+                    'first_bucket_start': sqlalchemy.func.least(
+                        daily.c.first_bucket_start,
+                        excluded.first_bucket_start),
+                    'last_bucket_start': sqlalchemy.func.greatest(
+                        daily.c.last_bucket_start, excluded.last_bucket_start),
+                    'request_count': sqlalchemy.func.greatest(
+                        daily.c.request_count, excluded.request_count),
+                    'observed_at': sqlalchemy.func.greatest(
+                        daily.c.observed_at, excluded.observed_at),
+                }))
+    return len(values)
+
+
+def get_daily_request_summary(
+    engine: sqlalchemy.engine.Engine,
+    first_day_start: int,
+    last_day_start: int,
+    days: list[dict[str, Any]],
+    table_limit: int,
+    chart_limit: int,
+) -> dict[str, Any]:
+    """Return bounded daily service request aggregates for a UTC range."""
+    empty = {
+        'available': False,
+        'definition': 'admitted_inbound_requests',
+        'coverage_start_utc': None,
+        'total_request_count': 0,
+        'services': [],
+        'series': [],
+    }
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return empty
+
+    daily = serve_request_activity_daily_table
+    first_day = datetime.datetime.fromtimestamp(first_day_start,
+                                                datetime.timezone.utc)
+    end_exclusive = datetime.datetime.fromtimestamp(
+        last_day_start + 24 * 60 * 60, datetime.timezone.utc)
+    base_filter = sqlalchemy.and_(daily.c.day_start >= first_day,
+                                  daily.c.day_start < end_exclusive)
+    count_sum = sqlalchemy.func.sum(daily.c.request_count)
+    try:
+        with engine.connect() as connection:
+            coverage_start = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.min(
+                        daily.c.first_bucket_start))).scalar_one_or_none()
+            service_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.service_name,
+                    count_sum.label('request_count'),
+                ).where(base_filter).group_by(daily.c.service_name).order_by(
+                    sqlalchemy.desc('request_count'),
+                    daily.c.service_name.asc()).limit(table_limit)).fetchall()
+            top_service_names = [
+                row.service_name for row in service_rows[:chart_limit]
+            ]
+            total_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.day_start,
+                    count_sum.label('request_count'),
+                ).where(base_filter).group_by(daily.c.day_start)).fetchall()
+            daily_service_rows = []
+            if top_service_names:
+                daily_service_rows = connection.execute(
+                    sqlalchemy.select(
+                        daily.c.day_start,
+                        daily.c.service_name,
+                        count_sum.label('request_count'),
+                    ).where(
+                        sqlalchemy.and_(
+                            base_filter,
+                            daily.c.service_name.in_(
+                                top_service_names))).group_by(
+                                    daily.c.day_start,
+                                    daily.c.service_name)).fetchall()
+    except sqlalchemy.exc.SQLAlchemyError:
+        # During a rolling API-server upgrade the reader may briefly run
+        # before the Serve migration has created the optional table.
+        logger.exception('Failed to read daily Serve request history.')
+        return empty
+
+    day_starts = [int(day['day_start_utc']) for day in days]
+    totals_by_day = {
+        int(row.day_start.timestamp()): int(row.request_count or 0)
+        for row in total_rows
+    }
+    counts_by_service_day = {
+        (row.service_name, int(row.day_start.timestamp())): int(
+            row.request_count or 0) for row in daily_service_rows
+    }
+    displayed_by_day = dict.fromkeys(day_starts, 0)
+    series = []
+    for service_name in top_service_names:
+        request_count_by_day = []
+        for day_start_epoch in day_starts:
+            count = counts_by_service_day.get((service_name, day_start_epoch),
+                                              0)
+            request_count_by_day.append(count)
+            displayed_by_day[day_start_epoch] += count
+        series.append({
+            'service_name': service_name,
+            'request_count_by_day': request_count_by_day,
+        })
+    other_by_day = [
+        max(
+            0,
+            totals_by_day.get(day_start_epoch, 0) -
+            displayed_by_day[day_start_epoch]) for day_start_epoch in day_starts
+    ]
+    if any(other_by_day):
+        series.append({
+            'is_other': True,
+            'request_count_by_day': other_by_day,
+        })
+
+    return {
+        'available': True,
+        'definition': 'admitted_inbound_requests',
+        'coverage_start_utc': int(coverage_start.timestamp())
+                              if coverage_start else None,
+        'total_request_count': sum(totals_by_day.values()),
+        'services': [{
+            'service_name': row.service_name,
+            'request_count': int(row.request_count or 0),
+        } for row in service_rows],
+        'series': series,
+    }
 
 
 def _request_history_rows(
