@@ -1838,9 +1838,14 @@ class TestStreamReplicaLogsZeroByteFallback:
     """
 
     def _patch_healthy(self):
-        # _check_service_status_healthy returns None → continue past gate.
-        return mock.patch('sky.serve.serve_utils._check_service_status_healthy',
-                          return_value=None)
+        # Provide the slim owner snapshot expected by the log-stream entrypoint.
+        return mock.patch(
+            'sky.serve.serve_utils._get_healthy_service_log_owner_record',
+            return_value=({
+                'pool': True,
+                'resource_scope': None,
+                'status': serve_state.ServiceStatus.READY,
+            }, None))
 
     def test_zero_byte_main_log_falls_through_to_launch_log(
             self, tmp_path, capsys):
