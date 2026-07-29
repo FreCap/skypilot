@@ -814,6 +814,7 @@ class StopOrDownBody(RequestBody):
 class StatusBody(RequestBody):
     """The request body for the status endpoint."""
     cluster_names: list[str] | None = None
+    workspaces_filter: list[str] | None = None
     refresh: common_lib.StatusRefreshMode = common_lib.StatusRefreshMode.NONE
     all_users: bool = True
     # TODO (kyuds): default to False post 0.12.0

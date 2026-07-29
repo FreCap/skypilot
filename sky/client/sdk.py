@@ -1826,6 +1826,7 @@ def status(
     refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE,
     all_users: bool = False,
     *,
+    workspaces_filter: list[str] | None = None,
     _include_credentials: bool = False,
     _summary_response: bool = False,
 ) -> server_common.RequestId[list[responses.StatusResponse]]:
@@ -1872,6 +1873,8 @@ def status(
     Args:
         cluster_names: a list of cluster names to query. If not
             provided, all clusters will be queried.
+        workspaces_filter: if provided, only clusters in these workspaces
+            will be queried.
         refresh: whether to query the latest cluster statuses from the cloud
             provider(s).
         all_users: whether to include all users' clusters. By default, only
@@ -1910,6 +1913,7 @@ def status(
     # user, due to the rich progress implementation.
     body = payloads.StatusBody(
         cluster_names=cluster_names,
+        workspaces_filter=workspaces_filter,
         refresh=refresh,
         all_users=all_users,
         include_credentials=_include_credentials,

@@ -76,10 +76,14 @@ const clusterStatusMap = {
   null: 'TERMINATED',
 };
 
-export async function getClusters({ clusterNames = null } = {}) {
+export async function getClusters({
+  clusterNames = null,
+  workspaces = null,
+} = {}) {
   try {
     const clusters = await apiClient.fetch('/status', {
       cluster_names: clusterNames,
+      workspaces_filter: workspaces,
       all_users: true,
       include_credentials: false,
       include_handle: false,

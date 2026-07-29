@@ -12,7 +12,16 @@ jest.mock('@/lib/cache', () => ({
   },
 }));
 
+jest.mock('@/data/connectors/client', () => ({
+  apiClient: { fetch: jest.fn() },
+}));
+
+jest.mock('@/plugins/dataEnhancement', () => ({
+  applyEnhancements: jest.fn(async (data) => data),
+}));
+
 import dashboardCache from '@/lib/cache';
+import { apiClient } from '@/data/connectors/client';
 import {
   getClusterJobs,
   getClusters,
@@ -29,6 +38,46 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+describe('getClusters request shape', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('passes workspace filters through to /status', async () => {
+    apiClient.fetch.mockResolvedValue([
+      {
+        name: 'cluster-a',
+        status: 'UP',
+        cloud: 'AWS',
+        region: 'us-east-1',
+        cpus: 4,
+        memory: 16,
+        accelerators: null,
+        resources_str: '4 CPUs',
+        resources_str_full: '4 CPUs',
+        launched_at: 1,
+        nodes: 1,
+        workspace: 'alpha',
+        autostop: 0,
+        last_event: null,
+        to_down: false,
+        labels: {},
+      },
+    ]);
+
+    await getClusters({ workspaces: ['alpha'] });
+
+    expect(apiClient.fetch).toHaveBeenCalledWith('/status', {
+      cluster_names: null,
+      workspaces_filter: ['alpha'],
+      all_users: true,
+      include_credentials: false,
+      include_handle: false,
+      summary_response: true,
+    });
+  });
+});
 
 describe('useClusterDetails request ownership', () => {
   beforeEach(() => {
