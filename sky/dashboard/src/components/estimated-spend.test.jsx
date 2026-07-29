@@ -18,10 +18,20 @@ jest.mock('chart.js', () => ({
 }));
 jest.mock('react-chartjs-2', () => ({
   Bar: ({ data, options }) => {
-    const positiveContext = {
-      dataset: { label: 'Cluster alpha' },
-      parsed: { y: 1.25 },
-    };
+    const serviceDataset = data.datasets.find((dataset) =>
+      Object.prototype.hasOwnProperty.call(dataset, 'estimatedCostByDay')
+    );
+    const positiveContext = serviceDataset
+      ? {
+          dataset: serviceDataset,
+          dataIndex: 0,
+          parsed: { y: serviceDataset.data[0] },
+        }
+      : {
+          dataset: { label: 'Cluster alpha' },
+          dataIndex: 0,
+          parsed: { y: 1.25 },
+        };
     const zeroContext = {
       dataset: { label: 'Cluster zero' },
       parsed: { y: 0 },
@@ -56,6 +66,7 @@ import { getCurrentUserRole } from '@/data/connectors/client';
 import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
 import {
   EstimatedSpend,
+  formatCostPerRequest,
   shiftUtcDate,
   utcDateString,
 } from '@/components/estimated-spend';
@@ -97,6 +108,13 @@ function rollingRange(days, endOffset = 0) {
     endDate,
   };
 }
+
+test('formats sub-cent compute cost per request without losing precision', () => {
+  expect(formatCostPerRequest(0.00321)).toBe('$0.0032');
+  expect(formatCostPerRequest(0.00001)).toBe('<$0.0001');
+  expect(formatCostPerRequest(0.25)).toBe('$0.25');
+  expect(formatCostPerRequest(null)).toBe('N/A');
+});
 
 test('keeps the newest range when an older request finishes last', async () => {
   const requests = new Map();
@@ -419,12 +437,42 @@ test('renders daily per-service request volume and counting semantics', async ()
     coverage_start_utc: Date.parse('2023-11-14T00:01:00Z') / 1000,
     total_request_count: 20,
     services: [
-      { service_name: 'service-a', request_count: 15 },
-      { service_name: 'service-b', request_count: 5 },
+      {
+        service_name: 'service-a',
+        request_count: 15,
+        estimated_cost: 0.0288,
+        estimated_cost_per_request: 0.0032,
+        ratio_request_count: 9,
+        ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+        priced_machine_seconds: 3600,
+        excluded_machine_seconds: 0,
+        cost_coverage: 'complete',
+      },
+      {
+        service_name: 'service-b',
+        request_count: 5,
+        estimated_cost: 0.01,
+        estimated_cost_per_request: null,
+        ratio_request_count: 3,
+        ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+        priced_machine_seconds: 3600,
+        excluded_machine_seconds: 1800,
+        cost_coverage: 'partial',
+      },
     ],
     series: [
-      { service_name: 'service-a', request_count_by_day: [6, 9] },
-      { service_name: 'service-b', request_count_by_day: [2, 3] },
+      {
+        service_name: 'service-a',
+        request_count_by_day: [6, 9],
+        estimated_cost_by_day: [0.0192, 0.0288],
+        estimated_cost_per_request_by_day: [0.0032, 0.0032],
+      },
+      {
+        service_name: 'service-b',
+        request_count_by_day: [2, 3],
+        estimated_cost_by_day: [0, 0.01],
+        estimated_cost_per_request_by_day: [null, null],
+      },
     ],
   };
   getEstimatedSpend.mockResolvedValue(estimate);
@@ -440,8 +488,20 @@ test('renders daily per-service request volume and counting semantics', async ()
   ).toBeTruthy();
   expect(screen.getByText('service-a')).toBeTruthy();
   expect(screen.getByText('75.0%')).toBeTruthy();
+  expect(
+    screen.getByRole('columnheader', {
+      name: 'Est. compute cost / request',
+    })
+  ).toBeTruthy();
+  expect(screen.getByText('$0.0032')).toBeTruthy();
+  expect(screen.getByText('unpriced capacity')).toBeTruthy();
+  expect(screen.getByText('based on 9 requests')).toBeTruthy();
   expect(screen.getAllByTestId('chart')[1].textContent).toContain(
     'service-a:6,9|service-b:2,3'
+  );
+  expect(screen.getAllByTestId('chart')[1]).toHaveAttribute(
+    'data-tooltip-label',
+    'service-a: 6 requests,Est. compute: $0.02,Est. compute cost / request: $0.0032'
   );
 });
 

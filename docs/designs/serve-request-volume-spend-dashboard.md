@@ -23,7 +23,8 @@ service data after deletion or same-name recreation, and avoid making dashboard
 reads scan raw minute history.
 
 The page should show stacked daily request volume for the busiest services and
-a totals table that makes their selected-range volume and share easy to compare.
+a totals table that makes their selected-range volume, share, and estimated
+compute cost per inbound request easy to compare.
 
 ## Background
 
@@ -125,13 +126,77 @@ Reuse the spend page's active UTC date range. Add a section after the spend
 breakdown with:
 
 - a stacked bar chart titled `Daily requests by service`;
-- a top-services table with `Service`, `Requests`, and `Share` columns;
+- a top-services table with `Service`, `Requests`,
+  `Est. compute cost / request`, and `Share` columns;
 - selected-range total request volume;
 - empty, unavailable, partial-coverage, and current-day-partial states.
 
 Copy explains the counting contract: one admitted or capacity-rejected inbound
 request counts once, internal replica retries do not add requests, and client
 retries are separate requests.
+
+### Estimated compute cost per request
+
+Daily spend rows attribute replica compute to
+`workload_type == "service"` and the canonical service name in `workload_id`.
+Join them to request history by UTC day and `service_name == workload_id`.
+This keeps the cost numerator aligned with the request denominator without
+changing request-path telemetry or introducing another rollup.
+
+Extend each `service_requests.services` row with:
+
+```text
+estimated_cost: float
+estimated_cost_per_request: float or null
+ratio_request_count: integer
+ratio_coverage_start_utc: epoch seconds or null
+priced_machine_seconds: integer
+excluded_machine_seconds: integer
+cost_coverage: complete, partial, or unavailable
+```
+
+Extend each named chart series with aligned arrays:
+
+```text
+estimated_cost_by_day: float[]
+estimated_cost_per_request_by_day: (float or null)[]
+```
+
+The selected-range value is a weighted ratio:
+
+```text
+sum(estimated service compute cost on aligned covered UTC days)
+/
+sum(inbound requests on those UTC days)
+```
+
+Never average daily ratios. The first historical UTC day is excluded from the
+selected-range ratio when `coverage_start_utc` is after that day's midnight,
+because its request numerator is incomplete while the spend row covers the
+whole day. The current UTC day remains included as an accrued partial day, with
+the existing partial-day notice. `ratio_request_count` makes the aligned
+denominator explicit when it differs from the table's request total, and
+`ratio_coverage_start_utc` identifies the first included UTC day.
+
+Return a null ratio when the aligned request count is zero, no priced service
+cost exists, or any aligned service machine time is excluded from pricing.
+Kubernetes and unknown-price time must not silently appear as zero cost. An
+available zero-cost ratio is not expected under the catalog pricing basis, so
+absence of priced service time is treated as unavailable. The ratio also
+remains unavailable until the spend rollup's historical backfill is complete;
+otherwise active rows could understate the selected range's cost.
+
+The metric is explicitly labeled estimated compute cost per request. It is not
+an invoice or total service cost: Kubernetes, shared API-server and
+load-balancer infrastructure, and reservation adjustments are excluded. The
+denominator is inbound attempts, including capacity rejections and client
+retries, rather than successful or unique model operations.
+
+Keep the chart axis as request count. The tooltip adds the hovered service's
+estimated compute cost and cost per request, but the ratio is not plotted or
+stacked because ratios are non-additive and use a different scale. Format
+positive sub-cent ratios to four decimal places, with values below `$0.0001`
+shown as `<$0.0001`; the existing two-decimal spend formatter remains unchanged.
 
 ## Data flow
 
@@ -172,10 +237,13 @@ rows are keyed by compute cluster, while a service request is independent of
 which replica or cluster eventually serves it. Joining those ownership models
 would duplicate or misattribute traffic.
 
-Adding cost per request is deferred. It requires an explicit policy for
-unpriced Kubernetes capacity, shared or reserved capacity, partial days, and
-zero-request spend. The first version exposes trustworthy independent measures
-without inventing unit economics.
+Requests per dollar was rejected as the primary metric because it is the
+reciprocal efficiency measure, not average cost per request. It can be added
+later under its own label if operators need it.
+
+Calculating the ratio from the browser's existing workload table was rejected
+because those rows can cover days without request telemetry, are limited and
+grouped for another UI, and cannot correctly surface unpriced service time.
 
 ## Implementation
 
@@ -188,7 +256,9 @@ Expected implementation areas:
 - `sky/dashboard/src/components/estimated-spend.jsx`
 - focused Serve history, estimated-spend, connector, and component tests
 
-No load-balancer request-path code changes are planned.
+The cost-per-request extension does not need a new migration or request-path
+change. Its response fields are additive within `service_requests`, so it does
+not require another API-version bump.
 
 ## Rollout
 
@@ -221,6 +291,11 @@ date-range behavior, and prove old response consumers remain valid.
 Dashboard tests cover chart and table rendering, shared date controls, totals
 and shares, empty and unavailable states, partial-day copy, a missing
 `service_requests` field, refresh behavior, and stale-request fencing.
+
+Cost-per-request tests cover canonical service attribution, daily alignment,
+weighted selected-range ratios, zero requests, no attributed cost, excluded
+machine time, an incomplete first history day, current-day partial values,
+sub-cent formatting, unavailable table values, and daily tooltip content.
 
 Run focused Python and Jest tests, `bash format.sh --files` on changed Python
 files, dashboard lint and production build, static checks, and
