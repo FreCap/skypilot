@@ -268,7 +268,8 @@ class BatchCoordinator:
                     worker_job_id=worker_job_id)
             return within_deadline
 
-        for cluster_name, worker_job_id in workers_snapshot:
+        async def _cleanup_active_worker(cluster_name: str,
+                                         worker_job_id: int) -> bool:
             shutdown_code = self._generate_shutdown_code()
             shutdown_task = sky.Task(
                 name=(f'batch-shutdown-{self._managed_job_id}-'
@@ -280,15 +281,20 @@ class BatchCoordinator:
                 shutdown_task,
                 cluster_name=cluster_name)
             if not within_deadline:
-                return
+                return False
             if succeeded:
                 within_deadline, _, _ = await _run_call('shutdown completion',
                                                         sdk.get, request_id)
                 if not within_deadline:
-                    return
-            if not await _cancel_exact(cluster_name, worker_job_id,
-                                       self._worker_token):
-                return
+                    return False
+            return await _cancel_exact(cluster_name, worker_job_id,
+                                       self._worker_token)
+
+        active_cleanup_results = await asyncio.gather(
+            *(_cleanup_active_worker(cluster_name, worker_job_id)
+              for cluster_name, worker_job_id in workers_snapshot))
+        if not all(active_cleanup_results):
+            return
 
         within_deadline, succeeded, records = await _run_call(
             'worker record read', managed_job_state.get_batch_worker_records,
