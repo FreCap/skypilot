@@ -2475,6 +2475,75 @@ class TestCancelSignalScan:
                 await scan
 
     @pytest.mark.asyncio
+    async def test_blocked_owned_cancel_does_not_delay_another(
+            self, signal_dir):
+        """Independent owned signals must not form one serial lock convoy."""
+        manager = self._make_manager()
+        first_task = MagicMock()
+        second_task = MagicMock()
+        second_delivered = asyncio.Event()
+        second_task.cancel.side_effect = second_delivered.set
+        manager.job_tasks.update({1: first_task, 2: second_task})
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def consume_signal(job_id):
+            if job_id == 1:
+                first_started.set()
+                await release_first.wait()
+            return ''
+
+        list_signals = patch('sky.jobs.controller.os.listdir',
+                             return_value=['1', '2'])
+        consume_signals = patch.object(manager,
+                                       '_consume_signal_file',
+                                       side_effect=consume_signal)
+        with list_signals, consume_signals:
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            try:
+                await asyncio.wait_for(second_delivered.wait(), timeout=2)
+            finally:
+                release_first.set()
+                await scan
+
+        first_task.cancel.assert_called_once_with()
+        second_task.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_owned_cancel_failure_does_not_abort_other_delivery(
+            self, signal_dir):
+        """A per-job failure is isolated so later signals progress now."""
+        manager = self._make_manager()
+        failed_task = MagicMock()
+        delivered_task = MagicMock()
+        manager.job_tasks.update({1: failed_task, 2: delivered_task})
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        async def consume_signal(job_id):
+            if job_id == 1:
+                raise OSError('lock unavailable')
+            return ''
+
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1', '2']), patch.object(
+                       manager,
+                       '_consume_signal_file',
+                       side_effect=consume_signal), patch(
+                           'sky.jobs.controller.logger.error') as log_error:
+            await manager._process_cancel_signals()
+
+        failed_task.cancel.assert_not_called()
+        delivered_task.cancel.assert_called_once_with()
+        log_error.assert_called_once()
+        assert 'job 1' in log_error.call_args.args[0]
+        assert 'lock unavailable' in log_error.call_args.args[0]
+
+    @pytest.mark.asyncio
     async def test_orphan_statuses_use_one_batch_snapshot(self, signal_dir):
         manager = self._make_manager()
         task = MagicMock()

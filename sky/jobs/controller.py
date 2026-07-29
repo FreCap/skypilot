@@ -2731,9 +2731,8 @@ class ControllerManager:
             job_id for job_id in cancel_job_ids if job_id not in owned_job_ids
         ]
 
-        for job_id, task in owned_tasks:
-            logger.info(f'Cancelling job {job_id}')
-            await self._consume_and_cancel_task(job_id, task)
+        await asyncio.gather(*(self._deliver_owned_cancel(job_id, task)
+                               for job_id, task in owned_tasks))
 
         if not orphan_job_ids:
             return
@@ -2742,6 +2741,16 @@ class ControllerManager:
         for job_id in orphan_job_ids:
             await self._reap_orphan_cancel_signal(job_id,
                                                   orphan_statuses[job_id])
+
+    async def _deliver_owned_cancel(self, job_id: int,
+                                    task: asyncio.Task) -> None:
+        """Deliver one owned cancellation without aborting sibling work."""
+        logger.info(f'Cancelling job {job_id}')
+        try:
+            await self._consume_and_cancel_task(job_id, task)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Failed to cancel job {job_id}: '
+                         f'{common_utils.format_exception(e)}')
 
     @asyncio_utils.shield
     async def _consume_and_cancel_task(self, job_id: int,
