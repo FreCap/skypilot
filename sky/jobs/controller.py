@@ -2738,9 +2738,20 @@ class ControllerManager:
             return
         orphan_statuses = await managed_job_state.get_statuses_async(
             orphan_job_ids)
-        for job_id in orphan_job_ids:
-            await self._reap_orphan_cancel_signal(job_id,
-                                                  orphan_statuses[job_id])
+        reap_job_ids = [
+            job_id for job_id in orphan_job_ids
+            if orphan_statuses[job_id] is None or
+            orphan_statuses[job_id].is_terminal()
+        ]
+        reap_job_ids_iter = iter(reap_job_ids)
+
+        async def reap_signals() -> None:
+            for job_id in reap_job_ids_iter:
+                await self._reap_orphan_cancel_signal(job_id)
+
+        worker_count = min(len(reap_job_ids),
+                           controller_utils.LAUNCHES_PER_WORKER)
+        await asyncio.gather(*(reap_signals() for _ in range(worker_count)))
 
     async def _deliver_owned_cancel(self, job_id: int,
                                     task: asyncio.Task) -> None:
@@ -2807,25 +2818,24 @@ class ControllerManager:
         """Consume a job's cancel signal file, tolerating a lost race."""
         await ControllerManager._consume_signal_file(job_id)
 
-    async def _reap_orphan_cancel_signal(
-            self, job_id: int,
-            status: managed_job_state.ManagedJobStatus | None) -> None:
-        """Remove a cancel signal that no consumer will ever pick up.
+    @asyncio_utils.shield
+    async def _reap_orphan_cancel_signal(self, job_id: int) -> None:
+        """Remove one eligible orphan signal and its local bookkeeping.
 
         A signal file is normally consumed either by the owning job task
         in this process, or at claim time while the job is still PENDING.
         If the job reaches a terminal state in between (e.g. it finished
         right as the cancellation landed), neither consumer ever runs
         again for it, and the file would be re-listed by every scan of
-        every controller process forever. Only reap when the DB says the
-        job is terminal (or gone): a non-terminal job is either owned by
-        another controller process or will be handled at claim time.
+        every controller process forever. The caller only schedules jobs
+        whose batched status snapshot is terminal or absent.
+
+        Shield removal together with cancel-info cleanup so scan cancellation
+        cannot consume the durable signal but leave stale local bookkeeping.
         """
-        if status is not None and not status.is_terminal():
-            return
         try:
             await self._remove_signal_file(job_id)
-        except OSError as e:
+        except Exception as e:  # pylint: disable=broad-except
             logger.debug(f'Failed to reap cancel signal for job {job_id}: '
                          f'{common_utils.format_exception(e)}')
             return

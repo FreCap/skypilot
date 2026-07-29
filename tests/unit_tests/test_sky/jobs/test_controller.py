@@ -2577,6 +2577,163 @@ class TestCancelSignalScan:
         assert (signal_dir / '8').exists()
 
     @pytest.mark.asyncio
+    async def test_blocked_orphan_reap_does_not_delay_another(self, signal_dir):
+        """Independent orphan locks must not form one serial convoy."""
+        manager = self._make_manager()
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_reaped = asyncio.Event()
+
+        async def remove_signal(job_id):
+            if job_id == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_reaped.set()
+
+        statuses = {
+            job_id: managed_job_state.ManagedJobStatus.SUCCEEDED
+            for job_id in (1, 2)
+        }
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1', '2']), patch.object(
+                       managed_job_state,
+                       'get_statuses_async',
+                       new=AsyncMock(return_value=statuses)), patch.object(
+                           manager,
+                           '_remove_signal_file',
+                           side_effect=remove_signal):
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            try:
+                await asyncio.wait_for(second_reaped.wait(), timeout=2)
+            finally:
+                release_first.set()
+                await scan
+
+    @pytest.mark.asyncio
+    async def test_orphan_reap_failure_does_not_abort_sibling(self, signal_dir):
+        manager = self._make_manager()
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        removed_job_ids = []
+
+        async def remove_signal(job_id):
+            if job_id == 1:
+                raise RuntimeError('lock backend unavailable')
+            removed_job_ids.append(job_id)
+
+        statuses = {
+            job_id: managed_job_state.ManagedJobStatus.SUCCEEDED
+            for job_id in (1, 2)
+        }
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1', '2']), patch.object(
+                       managed_job_state,
+                       'get_statuses_async',
+                       new=AsyncMock(return_value=statuses)), patch.object(
+                           manager,
+                           '_remove_signal_file',
+                           side_effect=remove_signal), patch(
+                               'sky.jobs.controller.logger.debug') as log_debug:
+            await manager._process_cancel_signals()
+
+        assert removed_job_ids == [2]
+        log_debug.assert_called_once()
+        assert 'job 1' in log_debug.call_args.args[0]
+        assert 'lock backend unavailable' in log_debug.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_scan_finishes_started_orphan_reap(
+            self, signal_dir):
+        manager = self._make_manager()
+        manager._cancel_info[1] = (False, None)
+        (signal_dir / '1').touch()
+
+        removal_started = asyncio.Event()
+        release_removal = asyncio.Event()
+        removal_finished = asyncio.Event()
+
+        async def remove_signal(_job_id):
+            removal_started.set()
+            await release_removal.wait()
+            removal_finished.set()
+
+        statuses = {1: managed_job_state.ManagedJobStatus.SUCCEEDED}
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1']), patch.object(
+                       managed_job_state,
+                       'get_statuses_async',
+                       new=AsyncMock(return_value=statuses)), patch.object(
+                           manager,
+                           '_remove_signal_file',
+                           side_effect=remove_signal):
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(removal_started.wait(), timeout=2)
+            scan.cancel()
+            result = await asyncio.gather(scan, return_exceptions=True)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert not removal_finished.is_set()
+
+            release_removal.set()
+            await asyncio.wait_for(removal_finished.wait(), timeout=2)
+            for _ in range(10):
+                if 1 not in manager._cancel_info:
+                    break
+                await asyncio.sleep(0)
+
+        assert 1 not in manager._cancel_info
+
+    @pytest.mark.asyncio
+    async def test_orphan_reap_fanout_uses_controller_worker_bound(
+            self, signal_dir):
+        manager = self._make_manager()
+        limit = controller_lib.controller_utils.LAUNCHES_PER_WORKER
+        job_ids = list(range(limit + 1))
+
+        started_job_ids = []
+        limit_reached = asyncio.Event()
+        release_removals = asyncio.Event()
+
+        async def remove_signal(job_id):
+            started_job_ids.append(job_id)
+            if len(started_job_ids) == limit:
+                limit_reached.set()
+            await release_removals.wait()
+
+        statuses = {
+            job_id: managed_job_state.ManagedJobStatus.SUCCEEDED
+            for job_id in job_ids
+        }
+        with patch(
+                'sky.jobs.controller.os.listdir',
+                return_value=[str(job_id) for job_id in job_ids]), patch.object(
+                    managed_job_state,
+                    'get_statuses_async',
+                    new=AsyncMock(
+                        return_value=statuses)) as batch_status, patch.object(
+                            manager,
+                            '_remove_signal_file',
+                            side_effect=remove_signal) as remove:
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(limit_reached.wait(), timeout=2)
+            try:
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert len(started_job_ids) == limit
+            finally:
+                release_removals.set()
+                await scan
+
+        assert sorted(started_job_ids) == job_ids
+        assert remove.await_count == len(job_ids)
+        batch_status.assert_awaited_once_with(job_ids)
+
+    @pytest.mark.asyncio
     async def test_signal_lock_contention_does_not_block_event_loop(
             self, signal_dir):
         manager = self._make_manager()
