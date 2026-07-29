@@ -97,10 +97,8 @@ class TestStreamLogsByIdLifecycle:
             self, monkeypatch, context, expected_cluster, expected_pool_job_id,
             expected_tail_calls):
         backend = _FakeBackend()
-        status_read = mock.Mock(side_effect=[
-            managed_job_state.ManagedJobStatus.RUNNING,
-            managed_job_state.ManagedJobStatus.FAILED,
-        ])
+        status_read = mock.Mock(
+            side_effect=AssertionError('scalar status poll used'))
         latest_status_read = mock.Mock(side_effect=[
             (0, managed_job_state.ManagedJobStatus.RUNNING),
             (0, managed_job_state.ManagedJobStatus.FAILED),
@@ -155,7 +153,7 @@ class TestStreamLogsByIdLifecycle:
             managed_job_state.ManagedJobStatus.FAILED)
         assert latest_status_read.call_count == 2
         num_tasks_read.assert_called_once_with(42)
-        assert status_read.call_count == 2
+        status_read.assert_not_called()
         context_read.assert_called_once_with(42, 0)
         if expected_cluster is None:
             handle_lookup.assert_not_called()
@@ -170,10 +168,9 @@ class TestStreamLogsByIdLifecycle:
         if expected_tail_calls:
             assert backend.tail_kwargs is not None
             assert backend.tail_kwargs['job_id'] == expected_pool_job_id
-            sleep.assert_called_once_with(1)
+            sleep.assert_not_called()
         else:
-            assert (
-                sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS + 1)
+            assert (sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS)
 
     def test_terminal_task_filter_refreshes_immediately_stale_snapshot(
             self, monkeypatch, tmp_path):

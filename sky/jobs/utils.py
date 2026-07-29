@@ -1874,18 +1874,23 @@ def stream_logs_by_id(job_id: int,
             managed_job_status = managed_job_state.get_status(job_id)
             assert managed_job_status is not None, (job_id, managed_job_status)
 
-    # The managed_job_status may not be in terminal status yet, since the
-    # controller has not updated the managed job state yet. We wait for a while,
-    # until the managed job state is updated.
-    wait_seconds = 0
-    managed_job_status = managed_job_state.get_status(job_id)
-    assert managed_job_status is not None, job_id
-    while (_should_keep_logging(managed_job_status) and follow and
-           wait_seconds < _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS):
-        time.sleep(1)
-        wait_seconds += 1
+    # Preserve a terminal latest-task verdict we already observed. A fresh
+    # scalar status poll can lag behind that transition by one refresh tick and
+    # needlessly reintroduce RUNNING, which adds an extra DB read and sleep
+    # before we return the terminal result.
+    if not managed_job_status.is_terminal():
+        # The managed_job_status may not be in terminal status yet, since the
+        # controller has not updated the managed job state yet. We wait for a
+        # while, until the managed job state is updated.
+        wait_seconds = 0
         managed_job_status = managed_job_state.get_status(job_id)
         assert managed_job_status is not None, job_id
+        while (_should_keep_logging(managed_job_status) and follow and
+               wait_seconds < _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS):
+            time.sleep(1)
+            wait_seconds += 1
+            managed_job_status = managed_job_state.get_status(job_id)
+            assert managed_job_status is not None, job_id
 
     if not follow and not managed_job_status.is_terminal():
         # The job is not in terminal state and we are not following,
