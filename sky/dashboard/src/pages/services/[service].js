@@ -326,6 +326,7 @@ function ServiceDetails() {
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const activeServiceNameRef = useRef(serviceName);
   const isMobile = useMobile();
   const {
     serviceData,
@@ -337,20 +338,34 @@ function ServiceDetails() {
   } = useServiceDetails({ serviceName });
 
   useEffect(() => {
+    if (activeServiceNameRef.current !== serviceName) {
+      activeServiceNameRef.current = serviceName;
+      setIsInitialLoad(true);
+    }
+  }, [serviceName]);
+
+  useEffect(() => {
     if (!loading && isInitialLoad) {
       setIsInitialLoad(false);
     }
   }, [loading, isInitialLoad]);
+
+  // Effects run after render. On a route change, do not expose the previous
+  // service's snapshot or a false settled state before the new route owns the
+  // page and lands its first matching response.
+  const ownsRouteState = activeServiceNameRef.current === serviceName;
+  const currentServiceData =
+    ownsRouteState && serviceData?.name === serviceName ? serviceData : null;
+  const isRouteLoading =
+    !router.isReady ||
+    !ownsRouteState ||
+    (isInitialLoad && !currentServiceData);
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
     await refreshData();
     setIsRefreshing(false);
   };
-
-  if (!router.isReady) {
-    return <div>Loading...</div>;
-  }
 
   const title = serviceName
     ? `Service: ${serviceName} | SkyPilot Dashboard`
@@ -383,7 +398,7 @@ function ServiceDetails() {
                 <span className="ml-2 text-gray-500">Loading...</span>
               </div>
             )}
-            {serviceData && activeTab !== 'placement' && (
+            {currentServiceData && activeTab !== 'placement' && (
               <Tooltip
                 content="Refresh"
                 className="text-sm text-muted-foreground"
@@ -401,7 +416,7 @@ function ServiceDetails() {
           </div>
         </div>
 
-        {serviceData && (
+        {currentServiceData && (
           <div className="mb-4 flex border-b text-sm" role="tablist">
             {[
               { id: 'overview', label: 'Overview', suffix: '' },
@@ -430,12 +445,12 @@ function ServiceDetails() {
           </div>
         )}
 
-        {loading && isInitialLoad ? (
+        {isRouteLoading ? (
           <div className="flex justify-center items-center py-12">
             <CircularProgress size={24} className="mr-2" />
             <span className="text-gray-500">Loading service details...</span>
           </div>
-        ) : serviceData ? (
+        ) : currentServiceData ? (
           activeTab === 'versions' ? (
             <ServiceVersionHistory
               serviceName={serviceName}
@@ -446,23 +461,25 @@ function ServiceDetails() {
           ) : (
             <>
               <ServiceDetailCard
-                serviceData={serviceData}
+                serviceData={currentServiceData}
                 requestHistory={replicaHistory}
-                pricingLoading={replicasLoading && serviceData.summaryOnly}
+                pricingLoading={
+                  replicasLoading && currentServiceData.summaryOnly
+                }
               />
-              <AcceleratorCapacityCard serviceData={serviceData} />
+              <AcceleratorCapacityCard serviceData={currentServiceData} />
               <ServeHistorySection
                 key={serviceName}
                 history={replicaHistory}
                 loading={historyLoading}
               />
               <ReplicaPlacementCard
-                replicas={serviceData.replicas}
-                loading={replicasLoading && serviceData.summaryOnly}
+                replicas={currentServiceData.replicas}
+                loading={replicasLoading && currentServiceData.summaryOnly}
               />
               <ReplicasCard
-                replicas={serviceData.replicas}
-                loading={replicasLoading && serviceData.summaryOnly}
+                replicas={currentServiceData.replicas}
+                loading={replicasLoading && currentServiceData.summaryOnly}
               />
             </>
           )

@@ -20,9 +20,31 @@ jest.mock('@/lib/cache', () => ({
   },
 }));
 
+const mockUseRouter = jest.fn();
+
+jest.mock('next/router', () => ({
+  useRouter: () => mockUseRouter(),
+}));
+
+jest.mock('@/hooks/useMobile', () => ({
+  useMobile: () => false,
+}));
+
+jest.mock('@/components/serve-history', () => ({
+  ServeHistorySection: () => <div data-testid="serve-history-section" />,
+}));
+
+jest.mock('@/components/service-version-history', () => ({
+  ServiceVersionHistory: () => <div data-testid="service-version-history" />,
+}));
+
+jest.mock('@/components/service-placement', () => ({
+  ServicePlacement: () => <div data-testid="service-placement" />,
+}));
+
 import dashboardCache from '@/lib/cache';
 import { getServices } from '@/data/connectors/services';
-import {
+import ServiceDetailsPage, {
   AcceleratorCapacityCard,
   getReplicaPlacementBreakdown,
   ReplicaPlacementCard,
@@ -900,6 +922,71 @@ describe('useServiceDetails stale-response fencing', () => {
     ]);
     expect(dashboardCache.get).toHaveBeenCalledTimes(4);
     expect(result.current.serviceData.status).toBe('refreshed-full');
+  });
+});
+
+describe('ServiceDetails route ownership rendering', () => {
+  beforeEach(() => {
+    jest.resetAllMocks();
+  });
+
+  it('shows route loading instead of the previous service while a new route is in flight', async () => {
+    const nextSummary = deferred();
+    const nextFull = deferred();
+    const routerState = {
+      isReady: true,
+      query: { service: 'svc-a' },
+    };
+    mockUseRouter.mockImplementation(() => routerState);
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc-a', status: 'READY', summaryOnly: true, replicas: [] },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc-a', status: 'READY', replicas: [] }],
+      });
+
+    const { rerender } = render(<ServiceDetailsPage />);
+
+    await waitFor(() =>
+      expect(screen.getAllByText('svc-a')).not.toHaveLength(0)
+    );
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    dashboardCache.get
+      .mockImplementationOnce(() => nextSummary.promise)
+      .mockImplementationOnce(() => nextFull.promise);
+    routerState.query = { service: 'svc-b' };
+    rerender(<ServiceDetailsPage />);
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+
+    expect(screen.getByText('Loading service details...')).toBeInTheDocument();
+    expect(screen.queryByText('Service not found.')).not.toBeInTheDocument();
+    expect(screen.queryByText('svc-a')).not.toBeInTheDocument();
+
+    await act(async () => {
+      nextSummary.resolve({
+        services: [
+          {
+            name: 'svc-b',
+            status: 'STARTING',
+            summaryOnly: true,
+            replicas: [],
+          },
+        ],
+      });
+      nextFull.resolve({
+        services: [{ name: 'svc-b', status: 'READY', replicas: [] }],
+      });
+      await Promise.all([nextSummary.promise, nextFull.promise]);
+    });
+
+    expect(screen.getAllByText('svc-b')).not.toHaveLength(0);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
   });
 });
 
