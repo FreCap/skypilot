@@ -4601,6 +4601,7 @@ def _update_records_with_handle_info(records_with_handle: list[dict[str, Any]],
 def get_clusters(
     refresh: common.StatusRefreshMode,
     cluster_names: str | list[str] | None = None,
+    workspaces_filter: list[str] | set[str] | None = None,
     all_users: bool = True,
     include_credentials: bool = False,
     summary_response: bool = False,
@@ -4621,6 +4622,9 @@ def get_clusters(
             set the status to STOPPED if the cluster cannot be pinged.)
         cluster_names: If provided, only return records for the given cluster
             names.
+        workspaces_filter: If provided, further restrict records to these
+            workspaces. This can only narrow the caller's accessible-workspace
+            view, never widen it.
         all_users: If True, return clusters from all users. If False, only
             return clusters from the current user.
         include_credentials: If True, include cluster ssh credentials in the
@@ -4633,6 +4637,10 @@ def get_clusters(
         terminated, the record will be omitted from the returned list.
     """
     accessible_workspaces = workspaces_core.get_accessible_workspace_names()
+    effective_workspaces_filter = accessible_workspaces
+    if workspaces_filter is not None:
+        effective_workspaces_filter = accessible_workspaces.intersection(
+            workspaces_filter)
 
     # Defense-in-depth: even if some caller bypasses the HTTP layer's
     # role_filter shim and reaches here with include_credentials=True
@@ -4660,7 +4668,8 @@ def get_clusters(
         cluster_names = non_glob_cluster_names
         if glob_cluster_names:
             cluster_names += _get_glob_clusters(
-                glob_cluster_names, workspaces_filter=accessible_workspaces)
+                glob_cluster_names,
+                workspaces_filter=effective_workspaces_filter)
 
     exclude_managed_clusters = False
     if not (_include_is_managed or env_options.Options.SHOW_DEBUG_INFO.get()):
@@ -4671,7 +4680,7 @@ def get_clusters(
     records = global_user_state.get_clusters(
         exclude_managed_clusters=exclude_managed_clusters,
         user_hashes_filter=user_hashes_filter,
-        workspaces_filter=accessible_workspaces,
+        workspaces_filter=effective_workspaces_filter,
         cluster_names=cluster_names,
         summary_response=summary_response)
 

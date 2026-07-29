@@ -134,6 +134,12 @@ describe('WorkspacePage request lifecycle', () => {
       )
     );
     expect(screen.getByText('1 / 1')).toBeInTheDocument();
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(1, getClusters, [
+      { workspaces: ['alpha'] },
+    ]);
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(4, getClusters, [
+      { workspaces: ['beta'] },
+    ]);
 
     await act(async () => {
       alphaConfig.resolve({

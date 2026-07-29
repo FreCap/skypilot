@@ -534,6 +534,22 @@ def test_get_glob_clusters_batches_patterns(monkeypatch):
                                                    workspaces_filter=workspaces)
 
 
+def test_get_clusters_intersects_requested_workspaces_with_accessible_ones(
+        monkeypatch):
+    monkeypatch.setattr('sky.workspaces.core.get_accessible_workspace_names',
+                        mock.Mock(return_value={'alpha', 'beta'}))
+    monkeypatch.setattr('sky.backends.backend_utils._caller_is_viewer',
+                        mock.Mock(return_value=False))
+    get_clusters = mock.Mock(return_value=[])
+    monkeypatch.setattr('sky.global_user_state.get_clusters', get_clusters)
+
+    backend_utils.get_clusters(refresh=common.StatusRefreshMode.NONE,
+                               workspaces_filter=['beta', 'gamma'])
+
+    get_clusters.assert_called_once()
+    assert get_clusters.call_args.kwargs['workspaces_filter'] == {'beta'}
+
+
 def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
     """Refreshed clusters should be enriched from their final records once."""
 

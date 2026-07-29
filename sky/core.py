@@ -111,6 +111,7 @@ def optimize(
 @usage_lib.entrypoint
 def status(
     cluster_names: str | list[str] | None = None,
+    workspaces_filter: list[str] | None = None,
     refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE,
     all_users: bool = False,
     include_credentials: bool = False,
@@ -181,6 +182,8 @@ def status(
     Args:
         cluster_names: a list of cluster names to query. If not
             provided, all clusters will be queried.
+        workspaces_filter: if provided, only clusters in these workspaces
+            will be queried.
         refresh: whether to query the latest cluster statuses from the cloud
             provider(s).
         include_credentials: whether to fetch ssh credentials for cluster
@@ -194,6 +197,7 @@ def status(
     clusters = backend_utils.get_clusters(
         refresh=refresh,
         cluster_names=cluster_names,
+        workspaces_filter=workspaces_filter,
         all_users=all_users,
         include_credentials=include_credentials,
         summary_response=summary_response,
