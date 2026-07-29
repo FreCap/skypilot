@@ -3765,15 +3765,23 @@ def _get_service_log_owner_record(service_name: str,
     return record
 
 
-def _check_service_status_healthy(service_name: str, pool: bool) -> str | None:
+def _get_healthy_service_log_owner_record(
+        service_name: str,
+        pool: bool) -> tuple[dict[str, Any] | None, str | None]:
+    """Return one slim owner snapshot or the user-facing health error."""
     service_record = _get_service_log_owner_record(service_name, pool)
     capnoun = 'Service' if not pool else 'Pool'
     if service_record is None:
-        return f'{capnoun} {service_name!r} does not exist.'
+        return None, f'{capnoun} {service_name!r} does not exist.'
     if service_record['status'] == serve_state.ServiceStatus.CONTROLLER_INIT:
-        return (f'{capnoun} {service_name!r} is still initializing its '
+        return (None, f'{capnoun} {service_name!r} is still initializing its '
                 'controller. Please try again later.')
-    return None
+    return service_record, None
+
+
+def _check_service_status_healthy(service_name: str, pool: bool) -> str | None:
+    _, msg = _get_healthy_service_log_owner_record(service_name, pool)
+    return msg
 
 
 def get_latest_version_with_min_replicas(
@@ -3949,15 +3957,15 @@ def _capped_follow_logs_with_provision_expanding(
 
 def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
                         tail: int | None, pool: bool) -> str:
-    msg = _check_service_status_healthy(service_name, pool=pool)
+    record, msg = _get_healthy_service_log_owner_record(service_name, pool=pool)
     if msg is not None:
         return msg
+    assert record is not None
     repnoun = 'worker' if pool else 'replica'
     caprepnoun = repnoun.capitalize()
     print(f'{colorama.Fore.YELLOW}Start streaming logs for launching process '
           f'of {repnoun} {replica_id}.{colorama.Style.RESET_ALL}')
-    record = _get_service_log_owner_record(service_name, pool)
-    resource_scope = record.get('resource_scope') if record else None
+    resource_scope = record.get('resource_scope')
     log_file_name = generate_replica_log_file_name(service_name, replica_id,
                                                    resource_scope)
     # The replica_<id>.log file is the post-mortem archive: it's only
@@ -4091,9 +4099,10 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
 def stream_serve_process_logs(service_name: str, stream_controller: bool,
                               follow: bool, tail: int | None,
                               pool: bool) -> str:
-    msg = _check_service_status_healthy(service_name, pool)
+    record, msg = _get_healthy_service_log_owner_record(service_name, pool)
     if msg is not None:
         return msg
+    assert record is not None
     if not stream_controller:
         if pool:
             return 'Pools do not have a load balancer.'
@@ -4102,8 +4111,7 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
         # legacy controller-local load_balancer.log file.
         from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
         return lb_k8s.stream_lb_logs(service_name, follow, tail)
-    record = _get_service_log_owner_record(service_name, pool)
-    resource_scope = record.get('resource_scope') if record else None
+    resource_scope = record.get('resource_scope')
     log_file = generate_remote_controller_log_file_name(service_name,
                                                         resource_scope)
 
