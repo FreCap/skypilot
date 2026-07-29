@@ -203,7 +203,19 @@ export function useServiceDetails({ serviceName }) {
       }
       const isCurrentRequest = () =>
         requestVersionRef.current === requestVersion;
+      let summarySettled = false;
       let fullLanded = false;
+      let fullSettled = false;
+      const finishLoadingIfReady = (hasRenderableData = false) => {
+        if (!isCurrentRequest()) return;
+        if (
+          hasRenderableData ||
+          visibleServiceDataRef.current !== null ||
+          (summarySettled && fullSettled)
+        ) {
+          setLoading(false);
+        }
+      };
       let refreshPromise;
       refreshPromise = (async () => {
         const summaryPromise = dashboardCache
@@ -232,6 +244,7 @@ export function useServiceDetails({ serviceName }) {
                 summaryOnly: false,
               };
             });
+            finishLoadingIfReady(Boolean(found));
           })
           .catch((error) => {
             if (isCurrentRequest()) {
@@ -239,11 +252,12 @@ export function useServiceDetails({ serviceName }) {
             }
           })
           .finally(() => {
+            summarySettled = true;
             if (refreshInFlightRef.current?.promise === refreshPromise) {
               refreshInFlightRef.current.summaryPending = false;
             }
             if (isCurrentRequest()) {
-              setLoading(false);
+              finishLoadingIfReady();
               setHistoryLoading(false);
             }
           });
@@ -254,6 +268,7 @@ export function useServiceDetails({ serviceName }) {
             const found = (services || []).find((s) => s.name === serviceName);
             fullLanded = true;
             setServiceData(found || null);
+            finishLoadingIfReady(Boolean(found));
           })
           .catch((error) => {
             if (isCurrentRequest()) {
@@ -261,7 +276,9 @@ export function useServiceDetails({ serviceName }) {
             }
           })
           .finally(() => {
+            fullSettled = true;
             if (isCurrentRequest()) {
+              finishLoadingIfReady();
               setReplicasLoading(false);
             }
           });
