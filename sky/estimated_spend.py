@@ -39,6 +39,10 @@ _STATE_ID = 1
 _HASH_END_SENTINEL = '\uffff'
 GROUP_TABLE_LIMIT = 50
 GROUP_CHART_LIMIT = 8
+# Serve's placement catalog values Kubernetes locations as reserved or
+# already-paid capacity. Keep this exception scoped to the service ratio:
+# global spend continues to report Kubernetes time as excluded.
+_SERVICE_ZERO_COST_EXCLUSION_REASONS = ('kubernetes',)
 
 
 class GroupBy(str, enum.Enum):
@@ -434,14 +438,23 @@ def _sum_expression(column: Any) -> Any:
     return sqlalchemy.func.coalesce(sqlalchemy.func.sum(column), 0)
 
 
-def _aggregate_columns(daily: Any) -> list[Any]:
-    priced_seconds = sqlalchemy.case((sqlalchemy.and_(
-        daily.c.exclusion_reason.is_(None),
-        daily.c.estimated_cost.is_not(None)), daily.c.machine_seconds),
-                                     else_=0)
+def _aggregate_columns(
+        daily: Any,
+        zero_cost_exclusion_reasons: tuple[str, ...] = (),
+) -> list[Any]:
+    covered_condition = sqlalchemy.and_(daily.c.exclusion_reason.is_(None),
+                                        daily.c.estimated_cost.is_not(None))
+    excluded_condition = daily.c.exclusion_reason.is_not(None)
+    if zero_cost_exclusion_reasons:
+        known_zero_cost = daily.c.exclusion_reason.in_(
+            zero_cost_exclusion_reasons)
+        covered_condition = sqlalchemy.or_(covered_condition, known_zero_cost)
+        excluded_condition = sqlalchemy.and_(excluded_condition,
+                                             sqlalchemy.not_(known_zero_cost))
+    priced_seconds = sqlalchemy.case(
+        (covered_condition, daily.c.machine_seconds), else_=0)
     excluded_seconds = sqlalchemy.case(
-        (daily.c.exclusion_reason.is_not(None), daily.c.machine_seconds),
-        else_=0)
+        (excluded_condition, daily.c.machine_seconds), else_=0)
     spot_cost = sqlalchemy.case(
         (daily.c.use_spot.is_(True), daily.c.estimated_cost), else_=0)
     on_demand_cost = sqlalchemy.case(
@@ -638,7 +651,9 @@ def _get_service_request_and_cost_rows(
         sqlalchemy.select(
             spend_daily.c.day_start_utc,
             spend_daily.c.workload_id.label('service_name'),
-            *_aggregate_columns(spend_daily),
+            *_aggregate_columns(spend_daily,
+                                zero_cost_exclusion_reasons=(
+                                    _SERVICE_ZERO_COST_EXCLUSION_REASONS)),
         ).where(
             sqlalchemy.and_(
                 spend_filter,
@@ -717,7 +732,7 @@ def _enrich_service_requests_with_costs(
         if excluded_machine_seconds > 0:
             cost_coverage = 'partial'
         elif (ratio_coverage_start is None or ratio_request_count <= 0 or
-              priced_machine_seconds <= 0 or estimated_cost <= 0):
+              priced_machine_seconds <= 0):
             cost_coverage = 'unavailable'
         else:
             cost_coverage = 'complete'
@@ -749,8 +764,8 @@ def _enrich_service_requests_with_costs(
             daily_costs.append(estimated_cost)
             ratio_available = (ratio_coverage_start is not None and
                                day_start >= ratio_coverage_start and
-                               request_count > 0 and estimated_cost > 0 and
-                               priced_seconds > 0 and excluded_seconds == 0)
+                               request_count > 0 and priced_seconds > 0 and
+                               excluded_seconds == 0)
             daily_ratios.append(estimated_cost /
                                 request_count if ratio_available else None)
         series['estimated_cost_by_day'] = daily_costs

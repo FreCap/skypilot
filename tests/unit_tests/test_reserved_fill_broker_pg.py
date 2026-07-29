@@ -3848,30 +3848,87 @@ class TestServeStatusHistoryPG:
         with history_engine.begin() as connection:
             connection.execute(
                 sqlalchemy.insert(
-                    serve_history.serve_request_activity_daily_table).values(
-                        day_start=day,
-                        service_name='svc',
-                        service_hash='hash-a',
-                        first_bucket_start=day,
-                        last_bucket_start=day + datetime.timedelta(minutes=59),
-                        request_count=4,
-                        observed_at=observed_at,
-                    ))
+                    serve_history.serve_request_activity_daily_table),
+                [{
+                    'day_start': day,
+                    'service_name': 'svc',
+                    'service_hash': 'hash-a',
+                    'first_bucket_start': day,
+                    'last_bucket_start': day + datetime.timedelta(minutes=59),
+                    'request_count': 4,
+                    'observed_at': observed_at,
+                }, {
+                    'day_start': day,
+                    'service_name': 'zero-svc',
+                    'service_hash': 'hash-b',
+                    'first_bucket_start': day,
+                    'last_bucket_start': day + datetime.timedelta(minutes=59),
+                    'request_count': 2,
+                    'observed_at': observed_at,
+                }, {
+                    'day_start': day,
+                    'service_name': 'unknown-svc',
+                    'service_hash': 'hash-c',
+                    'first_bucket_start': day,
+                    'last_bucket_start': day + datetime.timedelta(minutes=59),
+                    'request_count': 1,
+                    'observed_at': observed_at,
+                }])
             connection.execute(
                 sqlalchemy.insert(
-                    global_user_state.estimated_spend_daily_table).values(
-                        day_start_utc=day_start,
-                        cluster_hash='svc-replica-1',
-                        cluster_name='svc-1',
-                        workload_type='service',
-                        workload_id='svc',
-                        cloud='AWS',
-                        use_spot=False,
-                        machine_seconds=3600,
-                        catalog_hourly_rate=2.0,
-                        estimated_cost=2.0,
-                        updated_at=int(observed_at.timestamp()),
-                    ))
+                    global_user_state.estimated_spend_daily_table), [{
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'svc-replica-1',
+                        'cluster_name': 'svc-1',
+                        'workload_type': 'service',
+                        'workload_id': 'svc',
+                        'cloud': 'AWS',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': 2.0,
+                        'estimated_cost': 2.0,
+                        'exclusion_reason': None,
+                        'updated_at': int(observed_at.timestamp()),
+                    }, {
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'svc-replica-2',
+                        'cluster_name': 'svc-2',
+                        'workload_type': 'service',
+                        'workload_id': 'svc',
+                        'cloud': 'Kubernetes',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': None,
+                        'estimated_cost': None,
+                        'exclusion_reason': 'kubernetes',
+                        'updated_at': int(observed_at.timestamp()),
+                    }, {
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'zero-svc-replica-1',
+                        'cluster_name': 'zero-svc-1',
+                        'workload_type': 'service',
+                        'workload_id': 'zero-svc',
+                        'cloud': 'Kubernetes',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': None,
+                        'estimated_cost': None,
+                        'exclusion_reason': 'kubernetes',
+                        'updated_at': int(observed_at.timestamp()),
+                    }, {
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'unknown-svc-replica-1',
+                        'cluster_name': 'unknown-svc-1',
+                        'workload_type': 'service',
+                        'workload_id': 'unknown-svc',
+                        'cloud': 'AWS',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': None,
+                        'estimated_cost': None,
+                        'exclusion_reason': 'unknown_price',
+                        'updated_at': int(observed_at.timestamp()),
+                    }])
             connection.execute(
                 sqlalchemy.insert(
                     global_user_state.estimated_spend_state_table).values(
@@ -3885,15 +3942,32 @@ class TestServeStatusHistoryPG:
 
         response = estimated_spend.get_estimated_spend(days=1)
 
-        service = response['service_requests']['services'][0]
+        services = {
+            service['service_name']: service
+            for service in response['service_requests']['services']
+        }
+        service = services['svc']
         assert service['service_name'] == 'svc'
         assert service['request_count'] == 4
         assert service['ratio_request_count'] == 4
         assert service['estimated_cost'] == 2.0
         assert service['estimated_cost_per_request'] == 0.5
         assert service['cost_coverage'] == 'complete'
+        assert service['priced_machine_seconds'] == 7200
+        assert service['excluded_machine_seconds'] == 0
         assert response['service_requests']['series'][0][
             'estimated_cost_per_request_by_day'] == [0.5]
+        zero_service = services['zero-svc']
+        assert zero_service['estimated_cost'] == 0
+        assert zero_service['estimated_cost_per_request'] == 0
+        assert zero_service['cost_coverage'] == 'complete'
+        assert zero_service['priced_machine_seconds'] == 3600
+        assert zero_service['excluded_machine_seconds'] == 0
+        unknown_service = services['unknown-svc']
+        assert unknown_service['estimated_cost_per_request'] is None
+        assert unknown_service['cost_coverage'] == 'partial'
+        assert unknown_service['priced_machine_seconds'] == 0
+        assert unknown_service['excluded_machine_seconds'] == 3600
 
     def test_prediction_time_history_is_idempotent_and_reporter_additive(
             self, history_engine):

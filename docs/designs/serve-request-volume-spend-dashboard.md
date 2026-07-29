@@ -178,25 +178,30 @@ the existing partial-day notice. `ratio_request_count` makes the aligned
 denominator explicit when it differs from the table's request total, and
 `ratio_coverage_start_utc` identifies the first included UTC day.
 
-Return a null ratio when the aligned request count is zero, no priced service
-cost exists, or any aligned service machine time is excluded from pricing.
-Kubernetes and unknown-price time must not silently appear as zero cost. An
-available zero-cost ratio is not expected under the catalog pricing basis, so
-absence of priced service time is treated as unavailable. The ratio also
-remains unavailable until the spend rollup's historical backfill is complete;
-otherwise active rows could understate the selected range's cost.
+Return a null ratio when the aligned request count is zero, no covered service
+machine time exists, or any aligned service machine time has genuinely unknown
+pricing. For this service-only ratio, Kubernetes machine time is covered at
+zero cost because the Serve placement catalog defines Kubernetes locations as
+reserved or already-paid zero-cost capacity. This exception does not change
+the global spend estimate, where Kubernetes remains excluded. A service backed
+only by covered Kubernetes capacity therefore reports `$0.0000` per request
+instead of N/A. The ratio also remains unavailable until the spend rollup's
+historical backfill is complete; otherwise active rows could understate the
+selected range's cost.
 
 The metric is explicitly labeled estimated compute cost per request. It is not
-an invoice or total service cost: Kubernetes, shared API-server and
-load-balancer infrastructure, and reservation adjustments are excluded. The
-denominator is inbound attempts, including capacity rejections and client
-retries, rather than successful or unique model operations.
+an invoice or total service cost: reserved Kubernetes service capacity is
+valued at zero, while shared API-server and load-balancer infrastructure and
+other reservation adjustments are excluded. The denominator is inbound
+attempts, including capacity rejections and client retries, rather than
+successful or unique model operations.
 
 Keep the chart axis as request count. The tooltip adds the hovered service's
 estimated compute cost and cost per request, but the ratio is not plotted or
-stacked because ratios are non-additive and use a different scale. Format
-positive sub-cent ratios to four decimal places, with values below `$0.0001`
-shown as `<$0.0001`; the existing two-decimal spend formatter remains unchanged.
+stacked because ratios are non-additive and use a different scale. Format every
+available ratio with four decimal places, including `$0.0000` for covered
+zero-cost capacity, with positive values below `$0.0001` shown as `<$0.0001`;
+the existing two-decimal spend formatter remains unchanged.
 
 ## Data flow
 
@@ -293,9 +298,10 @@ and shares, empty and unavailable states, partial-day copy, a missing
 `service_requests` field, refresh behavior, and stale-request fencing.
 
 Cost-per-request tests cover canonical service attribution, daily alignment,
-weighted selected-range ratios, zero requests, no attributed cost, excluded
-machine time, an incomplete first history day, current-day partial values,
-sub-cent formatting, unavailable table values, and daily tooltip content.
+weighted selected-range ratios, zero requests, zero-cost Kubernetes reservation
+coverage, genuinely unknown pricing, an incomplete first history day,
+current-day partial values, fixed four-decimal formatting, unavailable table
+values, and daily tooltip content.
 
 Run focused Python and Jest tests, `bash format.sh --files` on changed Python
 files, dashboard lint and production build, static checks, and

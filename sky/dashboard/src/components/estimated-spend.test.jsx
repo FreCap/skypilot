@@ -71,6 +71,10 @@ import {
   utcDateString,
 } from '@/components/estimated-spend';
 
+afterEach(() => {
+  jest.clearAllMocks();
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((resolvePromise) => {
@@ -109,11 +113,55 @@ function rollingRange(days, endOffset = 0) {
   };
 }
 
-test('formats sub-cent compute cost per request without losing precision', () => {
+test('formats compute cost per request with four decimal places', () => {
+  expect(formatCostPerRequest(0)).toBe('$0.0000');
   expect(formatCostPerRequest(0.00321)).toBe('$0.0032');
   expect(formatCostPerRequest(0.00001)).toBe('<$0.0001');
-  expect(formatCostPerRequest(0.25)).toBe('$0.25');
+  expect(formatCostPerRequest(0.25)).toBe('$0.2500');
   expect(formatCostPerRequest(null)).toBe('N/A');
+});
+
+test('renders reserved zero-cost service capacity as available', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  const estimate = response(1, 0);
+  estimate.service_requests = {
+    available: true,
+    definition: 'admitted_inbound_requests',
+    coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+    total_request_count: 4,
+    services: [
+      {
+        service_name: 'reserved-service',
+        request_count: 4,
+        estimated_cost: 0,
+        estimated_cost_per_request: 0,
+        ratio_request_count: 4,
+        ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+        priced_machine_seconds: 3600,
+        excluded_machine_seconds: 0,
+        cost_coverage: 'complete',
+      },
+    ],
+    series: [
+      {
+        service_name: 'reserved-service',
+        request_count_by_day: [4],
+        estimated_cost_by_day: [0],
+        estimated_cost_per_request_by_day: [0],
+      },
+    ],
+  };
+  getEstimatedSpend.mockResolvedValue(estimate);
+
+  render(<EstimatedSpend />);
+
+  expect(await screen.findByText('reserved-service')).toBeTruthy();
+  expect(screen.getByText('$0.0000')).toBeTruthy();
+  expect(screen.queryByText('unpriced capacity')).not.toBeTruthy();
+  expect(screen.getAllByTestId('chart')[1]).toHaveAttribute(
+    'data-tooltip-label',
+    'reserved-service: 4 requests,Est. compute: $0.00,Est. compute cost / request: $0.0000'
+  );
 });
 
 test('keeps the newest range when an older request finishes last', async () => {

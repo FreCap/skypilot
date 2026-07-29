@@ -681,6 +681,10 @@ def test_service_cost_per_request_aligns_complete_request_days():
                 'service_name': 'unavailable',
                 'request_count': 2,
             },
+            {
+                'service_name': 'zero-cost',
+                'request_count': 5,
+            },
         ],
         'series': [{
             'service_name': 'complete',
@@ -691,6 +695,9 @@ def test_service_cost_per_request_aligns_complete_request_days():
         }, {
             'service_name': 'unavailable',
             'request_count_by_day': [0, 1, 1],
+        }, {
+            'service_name': 'zero-cost',
+            'request_count_by_day': [0, 2, 3],
         }, {
             'is_other': True,
             'request_count_by_day': [3, 0, 0],
@@ -725,6 +732,16 @@ def test_service_cost_per_request_aligns_complete_request_days():
                       day + 2 * estimated_spend.SECONDS_PER_DAY,
                       datetime.timezone.utc),
                   request_count=1),
+        mock.Mock(service_name='zero-cost',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day + estimated_spend.SECONDS_PER_DAY,
+                      datetime.timezone.utc),
+                  request_count=2),
+        mock.Mock(service_name='zero-cost',
+                  day_start=datetime.datetime.fromtimestamp(
+                      day + 2 * estimated_spend.SECONDS_PER_DAY,
+                      datetime.timezone.utc),
+                  request_count=3),
     ])
     cost_rows = [
         mock.Mock(service_name='complete',
@@ -745,6 +762,16 @@ def test_service_cost_per_request_aligns_complete_request_days():
                   estimated_cost=3.0,
                   priced_machine_seconds=3600,
                   excluded_machine_seconds=1800),
+        mock.Mock(service_name='zero-cost',
+                  day_start_utc=day + estimated_spend.SECONDS_PER_DAY,
+                  estimated_cost=0.0,
+                  priced_machine_seconds=3600,
+                  excluded_machine_seconds=0),
+        mock.Mock(service_name='zero-cost',
+                  day_start_utc=day + 2 * estimated_spend.SECONDS_PER_DAY,
+                  estimated_cost=0.0,
+                  priced_machine_seconds=3600,
+                  excluded_machine_seconds=0),
     ])
 
     estimated_spend._enrich_service_requests_with_costs(service_requests, days,
@@ -775,10 +802,20 @@ def test_service_cost_per_request_aligns_complete_request_days():
     assert unavailable['estimated_cost_per_request'] is None
     assert unavailable['cost_coverage'] == 'unavailable'
 
+    zero_cost = services['zero-cost']
+    assert zero_cost['ratio_request_count'] == 5
+    assert zero_cost['estimated_cost'] == 0
+    assert zero_cost['estimated_cost_per_request'] == 0
+    assert zero_cost['cost_coverage'] == 'complete'
+
     complete_series = service_requests['series'][0]
     assert complete_series['estimated_cost_by_day'] == [10.0, 8.0, 12.0]
     assert complete_series['estimated_cost_per_request_by_day'] == [
         None, 2.0, 0.75
+    ]
+    zero_cost_series = service_requests['series'][3]
+    assert zero_cost_series['estimated_cost_per_request_by_day'] == [
+        None, 0.0, 0.0
     ]
     assert 'estimated_cost_by_day' not in service_requests['series'][-1]
 
