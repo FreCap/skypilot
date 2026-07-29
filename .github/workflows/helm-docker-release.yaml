@@ -30,7 +30,7 @@ on:
 
 jobs:
   set-package:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     outputs:
       package_name: ${{ inputs.package_name }}
     steps:

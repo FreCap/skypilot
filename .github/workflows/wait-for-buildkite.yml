@@ -36,7 +36,7 @@ on:
 
 jobs:
   wait:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     outputs:
       build_status: ${{ steps.wait_buildkite.outputs.build_status }}
     steps:

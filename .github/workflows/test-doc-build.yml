@@ -15,7 +15,7 @@ on:
 
 jobs:
   doc-build:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     strategy:
       matrix:
         python-version: ["3.14"]

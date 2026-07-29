@@ -27,7 +27,7 @@ on:
 
 jobs:
   release-build:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-2x4
     outputs:
       test_branch: ${{ steps.create_test_branch.outputs.test_branch }}
       release_branch: ${{ steps.create_release_branch.outputs.release_branch }}
@@ -350,7 +350,7 @@ jobs:
   create-pr:
     needs: [release-build, smoke-tests, quicktest-core, quicktest-core-previous-minor, smoke-tests-remote-server-kubernetes, smoke-tests-kubernetes-jobs-consolidation, release-tests]
     if: always() && needs.release-build.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     steps:
       - name: Checkout repository
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0

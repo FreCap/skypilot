@@ -59,7 +59,7 @@ on:
 
 jobs:
   trigger-buildkite:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-ci-1x2
     outputs:
       json: ${{ steps.trigger_buildkite.outputs.json }}
     steps:
