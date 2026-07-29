@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 62  # Managed container image catalog and preparation API
+API_VERSION = 63  # Daily per-service request volume in estimated spend
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -94,6 +94,10 @@ MIN_ESTIMATED_SPEND_BREAKDOWNS_API_VERSION = 58
 # Minimum server API version that supports exact start/end UTC dates on the
 # estimated-spend endpoint.
 MIN_ESTIMATED_SPEND_DATE_RANGE_API_VERSION = 59
+
+# Minimum server API version that adds durable daily service request volume to
+# the estimated-spend response.
+MIN_ESTIMATED_SPEND_SERVICE_REQUESTS_API_VERSION = 63
 
 # Minimum server API version exposing the managed image catalog.
 MIN_CONTAINER_IMAGES_API_VERSION = 62

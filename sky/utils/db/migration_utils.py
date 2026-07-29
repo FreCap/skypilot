@@ -51,7 +51,7 @@ SPOT_JOBS_VERSION = '025'  # exact managed-job task identity lookups
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '030'  # reserved-fill utilization signal and release state
+SERVE_VERSION = '031'  # durable daily SkyServe request activity
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'

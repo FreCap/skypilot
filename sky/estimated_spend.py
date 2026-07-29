@@ -16,6 +16,7 @@ from sqlalchemy.dialects import sqlite
 from sky import estimated_spend_cost
 from sky import global_user_state
 from sky import sky_logging
+from sky.serve import serve_history
 from sky.utils import locks
 from sky.utils.db import db_utils
 
@@ -702,6 +703,14 @@ def get_estimated_spend(
         day['priced_machine_seconds'] for day in days_response)
     total_excluded_seconds = sum(
         day['excluded_machine_seconds'] for day in days_response)
+    service_requests = serve_history.get_daily_request_summary(
+        engine=engine,
+        first_day_start=first_day,
+        last_day_start=last_day,
+        days=days_response,
+        table_limit=GROUP_TABLE_LIMIT,
+        chart_limit=GROUP_CHART_LIMIT,
+    )
     return {
         'currency': 'USD',
         'basis': 'skypilot_catalog_payg_equivalent',
@@ -736,6 +745,7 @@ def get_estimated_spend(
         ],
         'series': _build_series(normalized_group_by, top_group_rows,
                                 daily_group_rows, days_response),
+        'service_requests': service_requests,
         'excluded_by_reason': {
             str(row.exclusion_reason): int(row.machine_seconds or 0)
             for row in reason_rows

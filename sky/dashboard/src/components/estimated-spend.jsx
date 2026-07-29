@@ -18,6 +18,7 @@ import {
 } from 'chart.js';
 import { Bar } from 'react-chartjs-2';
 import {
+  Activity,
   AlertTriangle,
   Clock3,
   DollarSign,
@@ -161,6 +162,12 @@ export function formatHours(seconds) {
   })} h`;
 }
 
+export function formatRequestCount(value) {
+  return Number(value || 0).toLocaleString(undefined, {
+    maximumFractionDigits: 0,
+  });
+}
+
 export function workloadLabel(workload) {
   const type = workload.workload_type || 'cluster';
   const id = workload.workload_id || 'unattributed';
@@ -242,6 +249,196 @@ function EmptyEstimate() {
     </Card>
   );
 }
+
+function ServiceRequestsCard({
+  serviceRequests,
+  days,
+  startDate,
+  endDate,
+  todayUtc,
+}) {
+  const totalRequestCount = Number(serviceRequests?.total_request_count || 0);
+  const coveragePartial =
+    serviceRequests?.coverage_start_utc &&
+    serviceRequests.coverage_start_utc >
+      Date.parse(`${startDate}T00:00:00Z`) / 1000;
+  const chartData = useMemo(() => {
+    const series = serviceRequests?.series || [];
+    return {
+      labels: days.map((day) =>
+        new Date(`${day.date}T00:00:00Z`).toLocaleDateString(undefined, {
+          month: 'short',
+          day: 'numeric',
+          timeZone: 'UTC',
+        })
+      ),
+      datasets: series.map((service, index) => {
+        const [backgroundColor, borderColor] = service.is_other
+          ? OTHER_COLOR
+          : SERIES_COLORS[index % SERIES_COLORS.length];
+        return {
+          label: service.is_other ? 'Other' : service.service_name,
+          data: service.request_count_by_day || [],
+          backgroundColor,
+          borderColor,
+          borderWidth: 1,
+          borderRadius: 3,
+          maxBarThickness: 36,
+          stack: 'service-requests',
+        };
+      }),
+    };
+  }, [days, serviceRequests]);
+  const chartOptions = useMemo(
+    () => ({
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: {
+          display: chartData.datasets.length > 1,
+          position: 'bottom',
+        },
+        tooltip: {
+          filter: (context) => Number(context.parsed.y) > 0,
+          callbacks: {
+            label: (context) =>
+              `${context.dataset.label}: ${formatRequestCount(
+                context.parsed.y
+              )}`,
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false }, stacked: true },
+        y: {
+          beginAtZero: true,
+          stacked: true,
+          ticks: {
+            precision: 0,
+            callback: (value) => formatRequestCount(value),
+          },
+        },
+      },
+    }),
+    [chartData.datasets.length]
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-2 text-lg">
+              <Activity className="h-5 w-5 text-blue-600" />
+              Daily requests by service
+            </CardTitle>
+            <CardDescription className="mt-1">
+              One admitted or capacity-rejected inbound request counts once.
+              Internal replica retries do not add requests; client retries are
+              separate requests.{' '}
+              {endDate === todayUtc && 'The current UTC day is partial.'}
+            </CardDescription>
+          </div>
+          {serviceRequests.available && (
+            <div className="sm:text-right">
+              <p className="text-2xl font-semibold tracking-tight">
+                {formatRequestCount(totalRequestCount)}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Requests in selected range
+              </p>
+            </div>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        {!serviceRequests.available ? (
+          <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+            Daily service request history is unavailable on this server.
+          </div>
+        ) : (
+          <>
+            {coveragePartial && (
+              <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
+                Request history begins{' '}
+                {new Date(
+                  serviceRequests.coverage_start_utc * 1000
+                ).toLocaleString(undefined, {
+                  timeZone: 'UTC',
+                  timeZoneName: 'short',
+                })}
+                . The earlier portion of this range has no retained request
+                data.
+              </div>
+            )}
+            {totalRequestCount === 0 ? (
+              <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+                No service requests recorded in this range.
+              </div>
+            ) : (
+              <div className="h-80">
+                <Bar data={chartData} options={chartOptions} />
+              </div>
+            )}
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Service</TableHead>
+                    <TableHead className="text-right">Requests</TableHead>
+                    <TableHead className="text-right">Share</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(serviceRequests.services || []).length === 0 ? (
+                    <TableRow>
+                      <TableCell
+                        colSpan={3}
+                        className="py-8 text-center text-muted-foreground"
+                      >
+                        No services with request activity in this range.
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    serviceRequests.services.map((service) => {
+                      const count = Number(service.request_count || 0);
+                      const share =
+                        totalRequestCount > 0
+                          ? (count / totalRequestCount) * 100
+                          : 0;
+                      return (
+                        <TableRow key={service.service_name}>
+                          <TableCell className="font-medium">
+                            {service.service_name}
+                          </TableCell>
+                          <TableCell className="text-right font-medium">
+                            {formatRequestCount(count)}
+                          </TableCell>
+                          <TableCell className="text-right text-muted-foreground">
+                            {share.toFixed(1)}%
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+ServiceRequestsCard.propTypes = {
+  serviceRequests: PropTypes.object.isRequired,
+  days: PropTypes.arrayOf(PropTypes.object).isRequired,
+  startDate: PropTypes.string.isRequired,
+  endDate: PropTypes.string.isRequired,
+  todayUtc: PropTypes.string.isRequired,
+};
 
 export function EstimatedSpend() {
   const [dateRange, setDateRange] = useState(() =>
@@ -465,6 +662,7 @@ export function EstimatedSpend() {
     supportsBreakdowns && displayedGroupBy !== 'purchase_option';
   const clouds = data?.clouds || [];
   const totalCost = Number(totals.estimated_cost || 0);
+  const serviceRequests = data?.service_requests;
   const todayUtc = utcDateString();
   const earliestDate = shiftUtcDate(todayUtc, -(MAX_RANGE_DAYS - 1));
   const selectedRangeDetail = `${formatUtcDate(dateRange.startDate, {
@@ -808,6 +1006,16 @@ export function EstimatedSpend() {
             </Card>
           </div>
         </>
+      )}
+
+      {serviceRequests && (
+        <ServiceRequestsCard
+          serviceRequests={serviceRequests}
+          days={data?.days || []}
+          startDate={dateRange.startDate}
+          endDate={dateRange.endDate}
+          todayUtc={todayUtc}
+        />
       )}
 
       <div className="flex flex-col gap-1 border-t pt-4 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">

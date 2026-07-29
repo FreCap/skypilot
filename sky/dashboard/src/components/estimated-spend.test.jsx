@@ -405,3 +405,64 @@ test('does not invent purchase-option costs for a legacy server response', async
     screen.queryByRole('columnheader', { name: 'On-demand' })
   ).not.toBeTruthy();
 });
+
+test('renders daily per-service request volume and counting semantics', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  const estimate = response(2, 10);
+  estimate.days = [
+    { date: '2023-11-14', estimated_cost: 4 },
+    { date: '2023-11-15', estimated_cost: 6 },
+  ];
+  estimate.service_requests = {
+    available: true,
+    definition: 'admitted_inbound_requests',
+    coverage_start_utc: Date.parse('2023-11-14T00:01:00Z') / 1000,
+    total_request_count: 20,
+    services: [
+      { service_name: 'service-a', request_count: 15 },
+      { service_name: 'service-b', request_count: 5 },
+    ],
+    series: [
+      { service_name: 'service-a', request_count_by_day: [6, 9] },
+      { service_name: 'service-b', request_count_by_day: [2, 3] },
+    ],
+  };
+  getEstimatedSpend.mockResolvedValue(estimate);
+
+  render(<EstimatedSpend />);
+
+  expect(await screen.findByText('Daily requests by service')).toBeTruthy();
+  expect(screen.getByText('Requests in selected range')).toBeTruthy();
+  expect(
+    screen.getByText('Internal replica retries do not add requests;', {
+      exact: false,
+    })
+  ).toBeTruthy();
+  expect(screen.getByText('service-a')).toBeTruthy();
+  expect(screen.getByText('75.0%')).toBeTruthy();
+  expect(screen.getAllByTestId('chart')[1].textContent).toContain(
+    'service-a:6,9|service-b:2,3'
+  );
+});
+
+test('shows request volume while the first spend estimate is pending', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  const estimate = response(1, 0);
+  estimate.as_of = null;
+  estimate.last_successful_refresh_at = null;
+  estimate.service_requests = {
+    available: true,
+    definition: 'admitted_inbound_requests',
+    coverage_start_utc: Date.parse('2023-11-15T00:01:00Z') / 1000,
+    total_request_count: 3,
+    services: [{ service_name: 'service-a', request_count: 3 }],
+    series: [{ service_name: 'service-a', request_count_by_day: [3] }],
+  };
+  getEstimatedSpend.mockResolvedValue(estimate);
+
+  render(<EstimatedSpend />);
+
+  expect(await screen.findByText('Preparing the first estimate')).toBeTruthy();
+  expect(screen.getByText('Daily requests by service')).toBeTruthy();
+  expect(screen.getByText('service-a')).toBeTruthy();
+});
