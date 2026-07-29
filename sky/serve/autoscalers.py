@@ -2746,6 +2746,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         self._qps_dict_by_version: dict[int, dict[str, float]] = {
             version: spec.target_qps_per_replica
         }
+        # Missing or failed historical-spec reads fall back for one decision
+        # tick. Keep that fallback out of the durable live-version cache so a
+        # later tick retries and can heal.
+        self._qps_dict_unavailable_versions_for_tick: set[int] | None = None
         self.compatibility_profiles: list[dict[str, Any]] = []
         # Outstanding queue demand is a last-writer-wins gauge. Unlike arrival
         # profiles, it must be replaced on every authoritative LB report rather
@@ -3000,10 +3004,12 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         shape_handles = self._resolve_gpu_shape_handles(replica_infos)
         with self._instance_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._qps_dict_unavailable_versions_for_tick = set()
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
             finally:
+                self._qps_dict_unavailable_versions_for_tick = None
                 self._gpu_shape_handles_for_tick = None
 
     def _generate_scaling_decisions_locked(
@@ -3587,11 +3593,17 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         rehydrate from the durable per-version spec so old-version
         replicas keep their real capacity. Falls back to the latest dict
         when the version's spec is unavailable; misses are not memoized
-        so a transient DB error can heal on the next tick.
+        across ticks so a transient DB error can heal on the next tick.
         """
         cached = self._qps_dict_by_version.get(version)
         if cached is not None:
             return cached
+        unavailable_versions = self._qps_dict_unavailable_versions_for_tick
+        if (unavailable_versions is not None and
+                version in unavailable_versions):
+            assert isinstance(self.target_qps_per_replica, dict), \
+                'Expected dict for instance-aware logic'
+            return self.target_qps_per_replica
         qps_dict = None
         try:
             spec = serve_state.get_spec(self._service_name, version)
@@ -3601,6 +3613,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             logger.warning('Failed to load spec for version '
                            f'{version}: {common_utils.format_exception(e)}')
         if not isinstance(qps_dict, dict):
+            if unavailable_versions is not None:
+                unavailable_versions.add(version)
             assert isinstance(self.target_qps_per_replica, dict), \
                 'Expected dict for instance-aware logic'
             return self.target_qps_per_replica
@@ -4006,6 +4020,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._knob_by_version: dict[int, float] = {
             version: float(target_concurrency)
         }
+        # See the request-rate autoscaler's matching tick-local memo. A failed
+        # historical knob read is shared only within one decision tick.
+        self._knob_unavailable_versions_for_tick: set[int] | None = None
         # One-shot hysteresis bypass, armed by update_version AND at
         # construction, same as the instance-aware autoscaler: the target
         # can only be recomputed on a tick (it needs replica shapes), and
@@ -4590,11 +4607,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         rehydrate from the durable per-version spec so old-version
         replicas keep their real capacity. Falls back to the latest knob
         when the version's spec is unavailable; misses are not memoized
-        so a transient DB error can heal on the next tick.
+        across ticks so a transient DB error can heal on the next tick.
         """
         cached = self._knob_by_version.get(version)
         if cached is not None:
             return cached
+        unavailable_versions = self._knob_unavailable_versions_for_tick
+        if (unavailable_versions is not None and
+                version in unavailable_versions):
+            return self.target_concurrency_per_replica
         knob = None
         try:
             spec = serve_state.get_spec(self._service_name, version)
@@ -4604,6 +4625,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             logger.warning('Failed to load spec for version '
                            f'{version}: {common_utils.format_exception(e)}')
         if knob is None:
+            if unavailable_versions is not None:
+                unavailable_versions.add(version)
             return self.target_concurrency_per_replica
         self._knob_by_version[version] = float(knob)
         return float(knob)
@@ -6189,10 +6212,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         shape_handles = self._resolve_gpu_shape_handles(replica_infos)
         with self._logical_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._knob_unavailable_versions_for_tick = set()
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
             finally:
+                self._knob_unavailable_versions_for_tick = None
                 self._gpu_shape_handles_for_tick = None
 
     def _generate_scaling_decisions_locked(

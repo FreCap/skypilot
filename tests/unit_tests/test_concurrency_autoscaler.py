@@ -5856,6 +5856,36 @@ class TestUpdateVersion(unittest.TestCase):
                                return_value=None):
             self.assertEqual(autoscaler._replica_capacity(old), 2.0)
 
+    def test_version_fallback_read_once_per_tick_and_retries(self):
+        autoscaler = autoscalers.ConcurrencyAutoscaler('svc',
+                                                       _spec(knob=2.0),
+                                                       version=2)
+        old = _replica(1, gpu_count=1, version=1)
+        state = {'recovered': False}
+
+        def _get_spec(*_args):
+            if not state['recovered']:
+                raise RuntimeError('state store unavailable')
+            return _spec(knob=0.5)
+
+        def _resolve_repeatedly(*_args):
+            return [autoscaler._replica_capacity(old) for _ in range(3)]
+
+        with mock.patch.object(autoscalers.serve_state,
+                               'get_spec',
+                               side_effect=_get_spec) as mock_get, \
+             mock.patch.object(autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               side_effect=_resolve_repeatedly):
+            self.assertEqual(autoscaler.generate_scaling_decisions([], [2]),
+                             [2.0, 2.0, 2.0])
+            mock_get.assert_called_once_with('svc', 1)
+
+            state['recovered'] = True
+            self.assertEqual(autoscaler.generate_scaling_decisions([], [2]),
+                             [0.5, 0.5, 0.5])
+            self.assertEqual(mock_get.call_count, 2)
+
 
 class TestDynamicStates(unittest.TestCase):
     """The in-process autoscaler swap must carry the demand report."""
