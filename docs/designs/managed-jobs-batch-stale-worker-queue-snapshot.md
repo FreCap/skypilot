@@ -18,8 +18,9 @@ cancellations, so one logical cleanup pass does not use one discovery boundary.
   cluster, shared across every stale coordinator generation.
 - Different worker clusters use different snapshots.
 - Durable job IDs and successful launch-request results still bypass the queue.
-- Queue acquisition failure is not cached. Existing strict and best-effort
-  failure handling can retry the cluster from a later stale generation or pass.
+- Queue acquisition or parsing failure is not cached. Existing strict and
+  best-effort failure handling can retry the cluster from a later stale
+  generation or pass.
 - Duplicate-name ambiguity still refuses cancellation. Every successful cleanup
   still targets one exact job ID and retires its durable record only after the
   cancellation completes.
@@ -29,8 +30,10 @@ cancellations, so one logical cleanup pass does not use one discovery boundary.
 
 Create a pass-local dictionary in `_cleanup_stale_worker_services()` and thread
 it through the token and record cleanup helpers. `_resolve_worker_job_id()`
-stores only a successfully returned queue result, normalizing `None` to an empty
-list, and reuses that list for later records on the same cluster.
+stores a queue result only after the matching helper parses it successfully,
+and reuses that list for later records on the same cluster. An invalid response
+therefore retains the existing fail-closed strict behavior and remains
+retryable during best-effort cleanup.
 
 Extract the queue-record matching loop into a stateless helper so cached and
 uncached resolution have one exact-name and exact-ID contract. Direct cleanup

@@ -1022,11 +1022,12 @@ class BatchCoordinator:
             if queued_jobs is None:
                 queue_request_id = sdk.queue(cluster_name, skip_finished=True)
                 queued_jobs = sdk.get(queue_request_id)
-                if queued_jobs is None:
-                    queued_jobs = []
-                if queue_jobs_by_cluster is not None:
-                    queue_jobs_by_cluster[cluster_name] = queued_jobs
+            if queued_jobs is None:
+                raise TypeError(
+                    f'Queue snapshot for {cluster_name} returned None')
             matching_ids = self._matching_worker_job_ids(record, queued_jobs)
+            if queue_jobs_by_cluster is not None:
+                queue_jobs_by_cluster[cluster_name] = queued_jobs
             if len(matching_ids) > 1:
                 logger.error(
                     'Refusing ambiguous Batch worker cleanup for %s on %s: '
