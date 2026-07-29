@@ -1177,8 +1177,10 @@ def test_stale_cleanup_retries_invalid_queue_snapshot(batch_state_db,
     batch_coordinator = _make_coordinator(job_id=4)
     batch_coordinator._worker_token = 'owner-c'
     batch_coordinator._stale_attempt_leases_drained = True
-    queue = mock.Mock(side_effect=['queue-owner-a', 'queue-owner-b'])
+    queue = mock.Mock(
+        side_effect=['queue-strict', 'queue-owner-a', 'queue-owner-b'])
     get = mock.Mock(side_effect=[
+        None,
         None,
         [types.SimpleNamespace(job_id=18, job_name='batch-worker-4-owner-b')],
         None,
@@ -1188,9 +1190,12 @@ def test_stale_cleanup_retries_invalid_queue_snapshot(batch_state_db,
     monkeypatch.setattr(coordinator.sdk, 'get', get)
     monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
 
+    with pytest.raises(TypeError,
+                       match='Queue snapshot for worker-a returned None'):
+        batch_coordinator._cleanup_stale_worker_services(strict=True)
     batch_coordinator._cleanup_stale_worker_services()
 
-    assert queue.call_count == 2
+    assert queue.call_count == 3
     cancel.assert_called_once_with('worker-a', job_ids=[18])
     records = state.get_batch_worker_records(4)
     assert [(record['coordinator_token'], record['worker_job_id'])
