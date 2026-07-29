@@ -2421,8 +2421,31 @@ class ControllerManager:
                            log_file: str,
                            pool: str | None = None):
         """Run one job while owning its controller-manager bookkeeping."""
+        job_loop_task = asyncio.create_task(
+            self._run_job_loop(job_id, log_file, pool))
+        owner_cancelled = False
+        cancellation_delivered = False
         try:
-            await self._run_job_loop(job_id, log_file, pool)
+            while True:
+                try:
+                    await asyncio.shield(job_loop_task)
+                    break
+                except asyncio.CancelledError:  # noqa: ASYNC103
+                    owner_cancelled = True
+                    if job_loop_task.done():
+                        break  # noqa: ASYNC104
+                    if not cancellation_delivered:
+                        # The first request starts inner cancellation
+                        # finalization. Later requests must not interrupt it.
+                        cancellation_delivered = True
+                        job_loop_task.cancel()
+
+            # Preserve an inner failure over owner cancellation. If the inner
+            # task suppressed cancellation, the owner still reports its
+            # cancellation after finalization completes.
+            job_loop_task.result()
+            if owner_cancelled:
+                raise asyncio.CancelledError()
         finally:
             # Own launch admission at the outermost scope. Initialization can
             # fail before _run_job_loop reaches its durable-cleanup try/finally;

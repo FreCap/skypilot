@@ -3235,6 +3235,69 @@ class TestRunJobLoopOwnershipCleanup:
     """
 
     @pytest.mark.asyncio
+    async def test_repeated_cancellation_waits_for_inner_finalization(self):
+        manager = ControllerManager('test-uuid')
+        inner_started = asyncio.Event()
+        inner_finalizing = asyncio.Event()
+        finish_finalization = asyncio.Event()
+        events = []
+        cancellation_deliveries = 0
+        created_tasks = []
+
+        async def inner_job_loop(*_args):
+            nonlocal cancellation_deliveries
+            events.append('started')
+            inner_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_deliveries += 1
+                events.append('finalizing')
+                inner_finalizing.set()
+                await finish_finalization.wait()
+                events.append('finalized')
+                raise
+
+        async def release_ownership(_job_id):
+            assert events[-1] == 'finalized'
+            events.append('released')
+
+        original_create_task = asyncio.create_task
+
+        def track_create_task(coro):
+            task = original_create_task(coro)
+            created_tasks.append(task)
+            return task
+
+        manager._run_job_loop = inner_job_loop
+        manager._release_job_loop_ownership = AsyncMock(
+            side_effect=release_ownership)
+        loop = asyncio.get_running_loop()
+        with patch('sky.jobs.controller.asyncio.create_task',
+                   side_effect=track_create_task):
+            owner = loop.create_task(
+                ControllerManager.run_job_loop.__wrapped__(
+                    manager, 3, '/dev/null'))
+            await inner_started.wait()
+            owner.cancel()
+            await inner_finalizing.wait()
+            owner.cancel()
+            owner.cancel()
+            await asyncio.sleep(0)
+
+            assert not owner.done()
+            assert events == ['started', 'finalizing']
+
+            finish_finalization.set()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+
+        assert events == ['started', 'finalizing', 'finalized', 'released']
+        assert cancellation_deliveries == 1
+        assert len(created_tasks) == 1
+        manager._release_job_loop_ownership.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
     async def test_start_job_hands_off_slot_without_cancellation_gap(
             self, tmp_path):
         manager = ControllerManager('test-uuid')
