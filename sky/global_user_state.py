@@ -2965,7 +2965,7 @@ def get_clusters(
                 # clusters that have a null user_hash.
                 query = query.filter(
                     cluster_table.c.user_hash.in_(user_hashes_filter) |
-                    (cluster_table.c.user_hash is None))
+                    cluster_table.c.user_hash.is_(None))
             else:
                 query = query.filter(
                     cluster_table.c.user_hash.in_(user_hashes_filter))
