@@ -304,9 +304,9 @@ class SkyServeLoadBalancer:
         self._ha_runtime_stats = lb_ha_obs.LbHaRuntimeStats()
         self._armed_generation: int | None = None
         self._routing_version: int | None = None
-        # Strong references to fire-and-forget startup tasks (the event loop
-        # only holds weak references to tasks).
-        self._background_tasks: list[asyncio.Task] = []
+        # Strong references to owned background tasks (the event loop only
+        # holds weak references to tasks).
+        self._background_tasks: set[asyncio.Task] = set()
         # Use the registry to create the load balancing policy. Track the
         # resolved policy name so a sync only rebuilds the policy object when
         # the name actually changes (a policy swap is rare -- only on an
@@ -1595,16 +1595,32 @@ class SkyServeLoadBalancer:
                     'request queue.'))
 
     def _retain_background_task(self, task: asyncio.Task) -> None:
-        """Keep a fire-and-forget task alive and consume its final result."""
-        self._background_tasks.append(task)
+        """Own a background task until completion and report failures."""
+        self._background_tasks.add(task)
 
         def _forget(done: asyncio.Task) -> None:
-            with contextlib.suppress(ValueError):
-                self._background_tasks.remove(done)
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                done.result()
+            self._background_tasks.discard(done)
+            if done.cancelled():
+                return
+            exception = done.exception()
+            if exception is not None:
+                done.get_loop().call_exception_handler({
+                    'message': 'SkyServe load balancer background task failed',
+                    'exception': exception,
+                    'task': done,
+                })
 
         task.add_done_callback(_forget)
+
+    def _start_background_loops(self) -> None:
+        """Start and own the load balancer's process-lifetime loops."""
+        background_loops = (
+            self._sync_with_controller,
+            self._sync_role_with_controller,
+            self._probe_occupancy_loop,
+        )
+        for background_loop in background_loops:
+            self._retain_background_task(asyncio.create_task(background_loop()))
 
     async def _cleanup_request_queue_waiter(
             self, waiter: _RequestQueueWaiter) -> None:
@@ -4707,18 +4723,7 @@ class SkyServeLoadBalancer:
             for handler in uvicorn_access_logger.handlers:
                 handler.setFormatter(sky_logging.FORMATTER)
 
-            # Keep strong references: the loop only holds weak refs to
-            # tasks, so an unreferenced background task can be GC'd
-            # mid-flight.
-            # Register controller synchronization task
-            self._background_tasks.append(
-                asyncio.create_task(self._sync_with_controller()))
-            self._background_tasks.append(
-                asyncio.create_task(self._sync_role_with_controller()))
-            # [boltz fork] Register the async-occupancy prober (no-op task
-            # when disabled via env).
-            self._background_tasks.append(
-                asyncio.create_task(self._probe_occupancy_loop()))
+            self._start_background_loops()
 
         logger.info('SkyServe Load Balancer started on '
                     f'http://0.0.0.0:{self._load_balancer_port}. '
