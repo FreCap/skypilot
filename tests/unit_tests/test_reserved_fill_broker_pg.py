@@ -4542,15 +4542,27 @@ def test_advisory_lock_does_not_consume_ordinary_pool(pg_server, monkeypatch):
         with pytest.raises(locks.LockTimeout):
             contender.acquire(blocking=False)
         assert engine.pool.checkedout() == 0
-        with engine.connect() as observer:
-            lock_sessions = observer.execute(
-                sqlalchemy.text('SELECT count(*) FROM pg_stat_activity '
-                                'WHERE datname = current_database() '
-                                'AND application_name = :application_name'), {
-                                    'application_name': 'skypilot-advisory-lock'
-                                }).scalar_one()
-        # Only the two acquired locks retain sessions; the failed contender
-        # commits and disconnects before returning LockTimeout.
+
+        # Only the two acquired locks may retain sessions; the failed contender
+        # commits and disconnects before returning LockTimeout. Closing the
+        # client socket does not synchronously remove the row from
+        # pg_stat_activity, though -- PostgreSQL reaps the backend process on
+        # its own schedule -- so poll for the contender to drain instead of
+        # racing the reaper. A contender that really leaked its session keeps
+        # the count at three for the whole window and still fails the assert.
+        deadline = time.monotonic() + 10
+        while True:
+            with engine.connect() as observer:
+                lock_sessions = observer.execute(
+                    sqlalchemy.text('SELECT count(*) FROM pg_stat_activity '
+                                    'WHERE datname = current_database() '
+                                    'AND application_name = :application_name'),
+                    {
+                        'application_name': 'skypilot-advisory-lock'
+                    }).scalar_one()
+            if lock_sessions <= 2 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
         assert lock_sessions == 2
 
         lock.release()
