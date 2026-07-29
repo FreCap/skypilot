@@ -96,13 +96,10 @@ export function formatCostPerRequest(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 'N/A';
   if (number > 0 && number < 0.0001) return '<$0.0001';
-  if (number < 0.01) {
-    return `$${number.toLocaleString(undefined, {
-      minimumFractionDigits: 4,
-      maximumFractionDigits: 4,
-    })}`;
-  }
-  return formatCurrency(number);
+  return `$${number.toLocaleString(undefined, {
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
+  })}`;
 }
 
 export function utcDateString(date = new Date()) {
@@ -340,7 +337,7 @@ function ServiceRequestsCard({
                 ];
               labels.push(
                 `Est. compute: ${
-                  Number(estimatedCost) > 0
+                  costPerRequest !== null && costPerRequest !== undefined
                     ? formatCurrency(estimatedCost)
                     : 'N/A'
                 }`
@@ -382,9 +379,9 @@ function ServiceRequestsCard({
             <CardDescription className="mt-1">
               One admitted or capacity-rejected inbound request counts once.
               Internal replica retries do not add requests; client retries are
-              separate requests. Cost/request is estimated catalog-priced
-              replica compute and is unavailable when pricing coverage is
-              incomplete.{' '}
+              separate requests. Cost/request is estimated replica compute, with
+              reserved Kubernetes capacity valued at zero; genuinely unknown
+              pricing remains unavailable.{' '}
               {endDate === todayUtc && 'The current UTC day is partial.'}
             </CardDescription>
           </div>
@@ -868,9 +865,10 @@ export function EstimatedSpend() {
       )}
 
       <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-        Kubernetes usage and reservation, Savings Plan, or committed-use
-        adjustments are not included. Storage, network, credits, and taxes are
-        also outside this estimate.
+        Kubernetes usage is not included in spend totals. Service cost/request
+        separately values reserved Kubernetes capacity at zero. Other
+        reservation, Savings Plan, or committed-use adjustments, plus storage,
+        network, credits, and taxes, are outside this estimate.
       </div>
 
       {error && (
