@@ -1102,6 +1102,106 @@ def test_unresolved_duplicate_worker_names_are_never_bulk_cancelled(
     assert state.get_batch_worker_records(2)[0]['worker_job_id'] is None
 
 
+def test_stale_cleanup_reuses_one_queue_snapshot_per_cluster(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(3, 'owner-a')
+    assert state.register_batch_worker_launch(3, 'owner-a', 'worker-a',
+                                              'batch-worker-3-owner-a')
+    assert state.register_batch_worker_launch(3, 'owner-a', 'worker-b',
+                                              'batch-worker-3-owner-a')
+    assert state.acquire_batch_coordinator(3, 'owner-b') == 'owner-a'
+    assert state.register_batch_worker_launch(3, 'owner-b', 'worker-a',
+                                              'batch-worker-3-owner-b')
+    assert state.acquire_batch_coordinator(3, 'owner-c') == 'owner-b'
+
+    batch_coordinator = _make_coordinator(job_id=3)
+    batch_coordinator._worker_token = 'owner-c'
+    batch_coordinator._stale_attempt_leases_drained = True
+
+    def _queue(cluster_name, **_):
+        return f'queue-{cluster_name}'
+
+    queue = mock.Mock(side_effect=_queue)
+    queued = {
+        'queue-worker-a': [
+            types.SimpleNamespace(job_id=17, job_name='batch-worker-3-owner-a'),
+            types.SimpleNamespace(job_id=18, job_name='batch-worker-3-owner-b'),
+        ],
+        'queue-worker-b': [
+            types.SimpleNamespace(job_id=19, job_name='batch-worker-3-owner-a'),
+        ],
+    }
+    get = mock.Mock(side_effect=queued.get)
+    cancel = mock.Mock(side_effect=[
+        'cancel-owner-a-worker-a',
+        'cancel-owner-a-worker-b',
+        'cancel-owner-b-worker-a',
+    ])
+    monkeypatch.setattr(coordinator.sdk, 'queue', queue)
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+
+    batch_coordinator._cleanup_stale_worker_services(strict=True)
+
+    assert queue.call_args_list == [
+        mock.call('worker-a', skip_finished=True),
+        mock.call('worker-b', skip_finished=True),
+    ]
+    assert get.call_args_list == [
+        mock.call('queue-worker-a'),
+        mock.call('cancel-owner-a-worker-a'),
+        mock.call('queue-worker-b'),
+        mock.call('cancel-owner-a-worker-b'),
+        mock.call('cancel-owner-b-worker-a'),
+    ]
+    assert cancel.call_args_list == [
+        mock.call('worker-a', job_ids=[17]),
+        mock.call('worker-b', job_ids=[19]),
+        mock.call('worker-a', job_ids=[18]),
+    ]
+    assert state.get_batch_worker_records(3) == []
+
+
+def test_stale_cleanup_retries_invalid_queue_snapshot(batch_state_db,
+                                                      monkeypatch):
+    del batch_state_db
+    _create_batch_job(4, 'owner-a')
+    assert state.register_batch_worker_launch(4, 'owner-a', 'worker-a',
+                                              'batch-worker-4-owner-a')
+    assert state.acquire_batch_coordinator(4, 'owner-b') == 'owner-a'
+    assert state.register_batch_worker_launch(4, 'owner-b', 'worker-a',
+                                              'batch-worker-4-owner-b')
+    assert state.acquire_batch_coordinator(4, 'owner-c') == 'owner-b'
+
+    batch_coordinator = _make_coordinator(job_id=4)
+    batch_coordinator._worker_token = 'owner-c'
+    batch_coordinator._stale_attempt_leases_drained = True
+    queue = mock.Mock(
+        side_effect=['queue-strict', 'queue-owner-a', 'queue-owner-b'])
+    get = mock.Mock(side_effect=[
+        None,
+        None,
+        [types.SimpleNamespace(job_id=18, job_name='batch-worker-4-owner-b')],
+        None,
+    ])
+    cancel = mock.Mock(return_value='cancel-owner-b')
+    monkeypatch.setattr(coordinator.sdk, 'queue', queue)
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+
+    with pytest.raises(TypeError,
+                       match='Queue snapshot for worker-a returned None'):
+        batch_coordinator._cleanup_stale_worker_services(strict=True)
+    batch_coordinator._cleanup_stale_worker_services()
+
+    assert queue.call_count == 3
+    cancel.assert_called_once_with('worker-a', job_ids=[18])
+    records = state.get_batch_worker_records(4)
+    assert [(record['coordinator_token'], record['worker_job_id'])
+            for record in records] == [('owner-a', None)]
+
+
 def test_takeover_waits_for_old_lease_before_exact_cleanup(monkeypatch):
     batch_coordinator = _make_coordinator(job_id=1)
     batch_coordinator._worker_token = 'new-token'
@@ -1128,10 +1228,11 @@ def test_takeover_waits_for_old_lease_before_exact_cleanup(monkeypatch):
     monkeypatch.setattr(coordinator.time, 'time', lambda: 100)
     monkeypatch.setattr(coordinator.time, 'sleep',
                         lambda seconds: events.append(('sleep', seconds)))
-    monkeypatch.setattr(batch_coordinator,
-                        '_cleanup_worker_services_for_token',
-                        lambda token, workers=None: events.append(
-                            ('cancel', workers, token)))
+    monkeypatch.setattr(
+        batch_coordinator,
+        '_cleanup_worker_services_for_token',
+        lambda token, workers=None, queue_jobs_by_cluster=None: events.append(
+            ('cancel', workers, token)))
 
     batch_coordinator._wait_for_stale_attempt_leases()
 

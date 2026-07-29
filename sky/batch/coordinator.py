@@ -971,8 +971,34 @@ class BatchCoordinator:
                                'attempt leases are drained')
         self._cleanup_worker_services_for_token(worker_token, [cluster_name])
 
-    def _resolve_worker_job_id(self, record: dict[str, Any]) -> int | None:
-        """Resolve one launch intent without guessing among duplicate names."""
+    @staticmethod
+    def _matching_worker_job_ids(record: dict[str, Any],
+                                 queued_jobs: list[Any]) -> list[int]:
+        """Return exact queue job IDs matching one durable worker record."""
+        matching_ids = []
+        for queued_job in queued_jobs:
+            if isinstance(queued_job, dict):
+                name = queued_job.get('job_name')
+                queued_job_id = queued_job.get('job_id')
+            else:
+                name = queued_job.job_name
+                queued_job_id = queued_job.job_id
+            if (name == record['worker_job_name'] and
+                    queued_job_id is not None):
+                matching_ids.append(int(queued_job_id))
+        return sorted(set(matching_ids))
+
+    def _resolve_worker_job_id(
+        self,
+        record: dict[str, Any],
+        queue_jobs_by_cluster: dict[str, list[Any]] | None = None
+    ) -> int | None:
+        """Resolve one launch intent without guessing among duplicate names.
+
+        ``queue_jobs_by_cluster`` memoizes one ``sdk.queue`` snapshot per
+        worker cluster so repeated stale generations on the same cluster are
+        judged against one queue view instead of one request per record.
+        """
         worker_job_id = record.get('worker_job_id')
         if worker_job_id is not None:
             return int(worker_job_id)
@@ -990,21 +1016,18 @@ class BatchCoordinator:
                                request_id, e)
 
         if worker_job_id is None:
-            queue_request_id = sdk.queue(record['worker_cluster'],
-                                         skip_finished=True)
-            queued_jobs = sdk.get(queue_request_id)
-            matching_ids = []
-            for queued_job in queued_jobs:
-                if isinstance(queued_job, dict):
-                    name = queued_job.get('job_name')
-                    queued_job_id = queued_job.get('job_id')
-                else:
-                    name = queued_job.job_name
-                    queued_job_id = queued_job.job_id
-                if (name == record['worker_job_name'] and
-                        queued_job_id is not None):
-                    matching_ids.append(int(queued_job_id))
-            matching_ids = sorted(set(matching_ids))
+            cluster_name = record['worker_cluster']
+            queued_jobs = (None if queue_jobs_by_cluster is None else
+                           queue_jobs_by_cluster.get(cluster_name))
+            if queued_jobs is None:
+                queue_request_id = sdk.queue(cluster_name, skip_finished=True)
+                queued_jobs = sdk.get(queue_request_id)
+            if queued_jobs is None:
+                raise TypeError(
+                    f'Queue snapshot for {cluster_name} returned None')
+            matching_ids = self._matching_worker_job_ids(record, queued_jobs)
+            if queue_jobs_by_cluster is not None:
+                queue_jobs_by_cluster[cluster_name] = queued_jobs
             if len(matching_ids) > 1:
                 logger.error(
                     'Refusing ambiguous Batch worker cleanup for %s on %s: '
@@ -1023,9 +1046,13 @@ class BatchCoordinator:
             record['worker_cluster'], worker_job_id)
         return worker_job_id
 
-    def _cancel_worker_record(self, record: dict[str, Any]) -> None:
+    def _cancel_worker_record(
+            self,
+            record: dict[str, Any],
+            queue_jobs_by_cluster: dict[str, list[Any]] | None = None) -> None:
         """Cancel one durable worker record by exactly one external job ID."""
-        worker_job_id = self._resolve_worker_job_id(record)
+        worker_job_id = self._resolve_worker_job_id(record,
+                                                    queue_jobs_by_cluster)
         if worker_job_id is None:
             return
         self._cancel_worker_job_by_id(record['worker_cluster'], worker_job_id,
@@ -1034,10 +1061,11 @@ class BatchCoordinator:
                     worker_job_id, record['coordinator_token'],
                     record['worker_cluster'])
 
-    def _cleanup_worker_services_for_token(self,
-                                           worker_token: str,
-                                           workers: list[str] | None = None
-                                          ) -> None:
+    def _cleanup_worker_services_for_token(
+            self,
+            worker_token: str,
+            workers: list[str] | None = None,
+            queue_jobs_by_cluster: dict[str, list[Any]] | None = None) -> None:
         """Clean durable records for one token, one exact job ID at a time."""
         worker_filter = set(workers) if workers is not None else None
         for record in managed_job_state.get_batch_worker_records(
@@ -1047,7 +1075,7 @@ class BatchCoordinator:
             if (worker_filter is not None and
                     record['worker_cluster'] not in worker_filter):
                 continue
-            self._cancel_worker_record(record)
+            self._cancel_worker_record(record, queue_jobs_by_cluster)
 
     def _cleanup_stale_worker_services(self,
                                        workers: list[str] | None = None,
@@ -1059,9 +1087,11 @@ class BatchCoordinator:
         if not self._stale_attempt_leases_drained:
             raise RuntimeError('cannot clean stale Batch workers before old '
                                'attempt leases are drained')
+        queue_jobs_by_cluster: dict[str, list[Any]] = {}
         for worker_token in sorted(self._stale_worker_tokens):
             try:
-                self._cleanup_worker_services_for_token(worker_token, workers)
+                self._cleanup_worker_services_for_token(worker_token, workers,
+                                                        queue_jobs_by_cluster)
             except Exception as e:  # pylint: disable=broad-except
                 if strict:
                     raise
