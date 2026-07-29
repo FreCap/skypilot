@@ -72,6 +72,129 @@ def test_begin_draining_flushes_pending_request_history_once():
     asyncio.run(_scenario())
 
 
+def test_background_loops_are_owned_until_completion():
+
+    async def _scenario():
+        lb = _make_lb()
+        release = asyncio.Event()
+
+        async def _loop():
+            await release.wait()
+
+        with mock.patch.object(lb,
+                               '_sync_with_controller',
+                               side_effect=_loop) as sync, \
+             mock.patch.object(lb,
+                               '_sync_role_with_controller',
+                               side_effect=_loop) as role, \
+             mock.patch.object(lb,
+                               '_probe_occupancy_loop',
+                               side_effect=_loop) as occupancy:
+            lb._start_background_loops()
+            await asyncio.sleep(0)
+            assert len(lb._background_tasks) == 3
+            release.set()
+            await asyncio.gather(*tuple(lb._background_tasks))
+            await asyncio.sleep(0)
+
+        assert not lb._background_tasks
+        sync.assert_awaited_once_with()
+        role.assert_awaited_once_with()
+        occupancy.assert_awaited_once_with()
+
+    asyncio.run(_scenario())
+
+
+def test_background_loop_failure_is_reported_and_released():
+
+    async def _scenario():
+        lb = _make_lb()
+        reported = asyncio.Event()
+        contexts = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+
+        def _handle_exception(_loop, context):
+            contexts.append(context)
+            reported.set()
+
+        async def _fail():
+            raise RuntimeError('controller sync loop stopped')
+
+        async def _finish():
+            return
+
+        loop.set_exception_handler(_handle_exception)
+        try:
+            with mock.patch.object(lb,
+                                   '_sync_with_controller',
+                                   side_effect=_fail), \
+                 mock.patch.object(lb,
+                                   '_sync_role_with_controller',
+                                   side_effect=_finish), \
+                 mock.patch.object(lb,
+                                   '_probe_occupancy_loop',
+                                   side_effect=_finish):
+                lb._start_background_loops()
+                await asyncio.wait_for(reported.wait(), timeout=1)
+                await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert not lb._background_tasks
+        assert len(contexts) == 1
+        assert contexts[0]['message'] == (
+            'SkyServe load balancer background task failed')
+        assert isinstance(contexts[0]['exception'], RuntimeError)
+        assert str(contexts[0]['exception']) == ('controller sync loop stopped')
+
+    asyncio.run(_scenario())
+
+
+def test_background_loop_cancellation_is_quiet_and_released():
+
+    async def _scenario():
+        lb = _make_lb()
+        started = asyncio.Event()
+        reported = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+
+        def _handle_exception(_loop, context):
+            reported.append(context)
+
+        async def _loop():
+            started.set()
+            await asyncio.Event().wait()
+
+        loop.set_exception_handler(_handle_exception)
+        try:
+            with mock.patch.object(lb,
+                                   '_sync_with_controller',
+                                   side_effect=_loop), \
+                 mock.patch.object(lb,
+                                   '_sync_role_with_controller',
+                                   side_effect=_loop), \
+                 mock.patch.object(lb,
+                                   '_probe_occupancy_loop',
+                                   side_effect=_loop):
+                lb._start_background_loops()
+                await asyncio.wait_for(started.wait(), timeout=1)
+                tasks = tuple(lb._background_tasks)
+                assert len(tasks) == 3
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert not lb._background_tasks
+        assert not reported
+
+    asyncio.run(_scenario())
+
+
 def test_draining_rejects_new_inference_requests():
     lb = _make_lb()
     lb._begin_draining()
