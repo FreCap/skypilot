@@ -319,6 +319,94 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
+  it('unblocks the initial load as soon as full detail lands', async () => {
+    const initialSummary = deferred();
+    const initialFull = deferred();
+
+    dashboardCache.get
+      .mockImplementationOnce(() => initialSummary.promise)
+      .mockImplementationOnce(() => initialFull.promise);
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initialFull.resolve({
+        services: [{ name: 'svc', status: 'initial-full', replicas: ['r1'] }],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-full');
+    expect(result.current.serviceData.replicas).toEqual(['r1']);
+    expect(result.current.loading).toBe(false);
+    expect(result.current.replicasLoading).toBe(false);
+    expect(result.current.historyLoading).toBe(true);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      initialSummary.resolve({
+        services: [
+          {
+            name: 'svc',
+            status: 'initial-summary',
+            summaryOnly: true,
+            replicaHistory: { currentReadyReplicas: 1 },
+          },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-full');
+    expect(result.current.replicaHistory).toEqual({
+      currentReadyReplicas: 1,
+    });
+    expect(result.current.historyLoading).toBe(false);
+  });
+
+  it('keeps the initial load fenced while summary fails and full is pending', async () => {
+    const initialSummary = deferred();
+    const initialFull = deferred();
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    dashboardCache.get
+      .mockImplementationOnce(() => initialSummary.promise)
+      .mockImplementationOnce(() => initialFull.promise);
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initialSummary.reject(new Error('summary unavailable'));
+      await Promise.resolve();
+    });
+
+    expect(result.current.loading).toBe(true);
+    expect(result.current.historyLoading).toBe(false);
+    expect(result.current.replicasLoading).toBe(true);
+    expect(result.current.serviceData).toBe(null);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      initialFull.resolve({
+        services: [{ name: 'svc', status: 'initial-full', replicas: ['r1'] }],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-full');
+    expect(result.current.serviceData.replicas).toEqual(['r1']);
+    expect(result.current.loading).toBe(false);
+    expect(result.current.replicasLoading).toBe(false);
+  });
+
   it('lets a manual refresh supersede a pending full-detail read once summary data is visible', async () => {
     const initialSummary = deferred();
     const initialFull = deferred();
@@ -542,7 +630,7 @@ describe('useServiceDetails stale-response fencing', () => {
       await Promise.resolve();
     });
     expect(result.current.serviceData.name).toBe('svc-a');
-    expect(result.current.loading).toBe(false);
+    expect(result.current.loading).toBe(true);
 
     let refreshPromise;
     act(() => {
