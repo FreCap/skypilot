@@ -630,7 +630,7 @@ describe('useServiceDetails stale-response fencing', () => {
       await Promise.resolve();
     });
     expect(result.current.serviceData.name).toBe('svc-a');
-    expect(result.current.loading).toBe(false);
+    expect(result.current.loading).toBe(true);
 
     let refreshPromise;
     act(() => {

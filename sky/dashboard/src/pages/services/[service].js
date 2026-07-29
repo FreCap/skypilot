@@ -210,7 +210,7 @@ export function useServiceDetails({ serviceName }) {
         if (!isCurrentRequest()) return;
         if (
           hasRenderableData ||
-          visibleServiceDataRef.current !== null ||
+          visibleServiceDataRef.current?.name === serviceName ||
           (summarySettled && fullSettled)
         ) {
           setLoading(false);
