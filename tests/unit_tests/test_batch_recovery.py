@@ -1108,6 +1108,8 @@ def test_stale_cleanup_reuses_one_queue_snapshot_per_cluster(
     _create_batch_job(3, 'owner-a')
     assert state.register_batch_worker_launch(3, 'owner-a', 'worker-a',
                                               'batch-worker-3-owner-a')
+    assert state.register_batch_worker_launch(3, 'owner-a', 'worker-b',
+                                              'batch-worker-3-owner-a')
     assert state.acquire_batch_coordinator(3, 'owner-b') == 'owner-a'
     assert state.register_batch_worker_launch(3, 'owner-b', 'worker-a',
                                               'batch-worker-3-owner-b')
@@ -1117,28 +1119,42 @@ def test_stale_cleanup_reuses_one_queue_snapshot_per_cluster(
     batch_coordinator._worker_token = 'owner-c'
     batch_coordinator._stale_attempt_leases_drained = True
 
-    queue = mock.Mock(return_value='queue-request')
-    queued = [
-        types.SimpleNamespace(job_id=17, job_name='batch-worker-3-owner-a'),
-        types.SimpleNamespace(job_id=18, job_name='batch-worker-3-owner-b'),
-    ]
-    get = mock.Mock(side_effect=lambda request_id: queued
-                    if request_id == 'queue-request' else None)
-    cancel = mock.Mock(side_effect=['cancel-owner-a', 'cancel-owner-b'])
+    queue = mock.Mock(side_effect=['queue-worker-a', 'queue-worker-b'])
+    queued = {
+        'queue-worker-a': [
+            types.SimpleNamespace(job_id=17, job_name='batch-worker-3-owner-a'),
+            types.SimpleNamespace(job_id=18, job_name='batch-worker-3-owner-b'),
+        ],
+        'queue-worker-b': [
+            types.SimpleNamespace(job_id=19, job_name='batch-worker-3-owner-a'),
+        ],
+    }
+    get = mock.Mock(side_effect=queued.get)
+    cancel = mock.Mock(side_effect=[
+        'cancel-owner-a-worker-a',
+        'cancel-owner-a-worker-b',
+        'cancel-owner-b-worker-a',
+    ])
     monkeypatch.setattr(coordinator.sdk, 'queue', queue)
     monkeypatch.setattr(coordinator.sdk, 'get', get)
     monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
 
     batch_coordinator._cleanup_stale_worker_services(strict=True)
 
-    queue.assert_called_once_with('worker-a', skip_finished=True)
+    assert queue.call_args_list == [
+        mock.call('worker-a', skip_finished=True),
+        mock.call('worker-b', skip_finished=True),
+    ]
     assert get.call_args_list == [
-        mock.call('queue-request'),
-        mock.call('cancel-owner-a'),
-        mock.call('cancel-owner-b'),
+        mock.call('queue-worker-a'),
+        mock.call('cancel-owner-a-worker-a'),
+        mock.call('queue-worker-b'),
+        mock.call('cancel-owner-a-worker-b'),
+        mock.call('cancel-owner-b-worker-a'),
     ]
     assert cancel.call_args_list == [
         mock.call('worker-a', job_ids=[17]),
+        mock.call('worker-b', job_ids=[19]),
         mock.call('worker-a', job_ids=[18]),
     ]
     assert state.get_batch_worker_records(3) == []
