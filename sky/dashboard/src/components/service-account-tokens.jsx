@@ -90,10 +90,11 @@ export function ServiceAccountTokensView({
   const mountedRef = useRef(false);
 
   // Server-side pagination state (used only when the pagination plugin
-  // exposes window.__skyServiceAccountTokensPaginationFetch). Defer the
-  // window check to a mount effect so that the statically-exported
-  // initial render and the post-hydration render agree.
-  const [serverPaginated, setServerPaginated] = useState(false);
+  // exposes window.__skyServiceAccountTokensPaginationFetch). Keep the
+  // initial server render and the first client render aligned by resolving
+  // the mode in an effect, then start the first fetch only after that mode
+  // is known.
+  const [serverPaginated, setServerPaginated] = useState(null);
   useEffect(() => {
     setServerPaginated(isServiceAccountTokensPaginationAvailable());
   }, []);
@@ -119,6 +120,9 @@ export function ServiceAccountTokensView({
   // Fetch tokens and related data
   const fetchTokensAndCounts = useCallback(
     async (forceRefresh = false) => {
+      if (serverPaginated === null) {
+        return;
+      }
       const refreshId = ++refreshIdRef.current;
       const ownsRefresh = () => refreshId === refreshIdRef.current;
       try {
@@ -220,12 +224,14 @@ export function ServiceAccountTokensView({
 
   useEffect(() => {
     mountedRef.current = true;
-    fetchTokensAndCounts();
+    if (serverPaginated !== null) {
+      fetchTokensAndCounts();
+    }
     return () => {
       mountedRef.current = false;
       refreshIdRef.current += 1;
     };
-  }, [fetchTokensAndCounts]);
+  }, [fetchTokensAndCounts, serverPaginated]);
 
   // Role editing functions
   const handleEditClick = async (tokenId, currentRole) => {

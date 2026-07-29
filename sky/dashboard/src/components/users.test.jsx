@@ -856,15 +856,10 @@ describe('ServiceAccountTokensView', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
   });
 
-  it('keeps the paginated refresh when the initial refresh finishes later', async () => {
+  it('skips the legacy token sweep when paginated mode is available', async () => {
     isServiceAccountTokensPaginationAvailable.mockReturnValue(true);
-    const initialTokens = deferred();
-    const staleToken = { ...baseToken, token_name: 'stale-bot' };
     const pagedToken = { ...baseToken, token_name: 'paged-bot' };
     dashboardCache.get.mockImplementation((fetcher) => {
-      if (fetcher === getServiceAccountTokens) return initialTokens.promise;
-      if (fetcher === getClusters) return Promise.resolve([]);
-      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
       if (fetcher === getServiceAccountTokensPaginated) {
         return Promise.resolve({
           items: [pagedToken],
@@ -878,17 +873,34 @@ describe('ServiceAccountTokensView', () => {
     });
 
     renderView();
-    expect(await screen.findByText('paged-bot')).toBeInTheDocument();
-
-    await act(async () => {
-      initialTokens.resolve([staleToken]);
-      await initialTokens.promise;
-    });
+    const row = (await screen.findByText('paged-bot')).closest('tr');
+    expect(row).not.toBeNull();
+    expect(
+      within(row).getAllByTitle('Counts hidden in server-paginated view')
+    ).toHaveLength(3);
 
     await waitFor(() => {
-      expect(screen.getByText('paged-bot')).toBeInTheDocument();
-      expect(screen.queryByText('stale-bot')).not.toBeInTheDocument();
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+      expect(dashboardCache.get).toHaveBeenCalledWith(
+        getServiceAccountTokensPaginated,
+        [
+          {
+            page: 1,
+            limit: 20,
+            search: '',
+            sortBy: 'created_at',
+            sortOrder: 'desc',
+          },
+        ]
+      );
     });
+    expect(dashboardCache.get).not.toHaveBeenCalledWith(
+      getServiceAccountTokens
+    );
+    expect(dashboardCache.get).not.toHaveBeenCalledWith(getClusters);
+    expect(dashboardCache.get).not.toHaveBeenCalledWith(getManagedJobs, [
+      { allUsers: true, skipFinished: true },
+    ]);
   });
 
   it('keeps the current page when an older mutation finishes later', async () => {
@@ -1003,13 +1015,10 @@ describe('ServiceAccountTokensView', () => {
     expect(dashboardCache.get).not.toHaveBeenCalled();
   });
 
-  it('switches to the server-paginated token projection without changing call counts', async () => {
+  it('uses only the paginated token projection on first load', async () => {
     isServiceAccountTokensPaginationAvailable.mockReturnValue(true);
     const pagedToken = { ...baseToken, token_name: 'paged-bot' };
     dashboardCache.get.mockImplementation(async (fetcher) => {
-      if (fetcher === getServiceAccountTokens) return [];
-      if (fetcher === getClusters) return [];
-      if (fetcher === getManagedJobs) return { jobs: [] };
       if (fetcher === getServiceAccountTokensPaginated) {
         await new Promise((resolve) => setTimeout(resolve, 10));
         return {
@@ -1035,16 +1044,7 @@ describe('ServiceAccountTokensView', () => {
       const requestedFetchers = dashboardCache.get.mock.calls.map(
         ([fetcher]) => fetcher
       );
-      for (const fetcher of [
-        getServiceAccountTokens,
-        getClusters,
-        getManagedJobs,
-        getServiceAccountTokensPaginated,
-      ]) {
-        expect(
-          requestedFetchers.filter((item) => item === fetcher)
-        ).toHaveLength(1);
-      }
+      expect(requestedFetchers).toEqual([getServiceAccountTokensPaginated]);
     });
   });
 });
