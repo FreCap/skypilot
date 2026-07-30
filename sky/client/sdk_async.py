@@ -26,6 +26,7 @@ from sky import sky_logging
 from sky.client import common as client_common
 from sky.client import interactive_utils
 from sky.client import sdk
+from sky.events import api_models as event_api_models
 from sky.schemas.api import responses
 from sky.server import common as server_common
 from sky.server import rest
@@ -656,6 +657,13 @@ async def cost_report(
         return await _stream_and_get(request_id, stream_logs)
     else:
         return await get(request_id)
+
+
+@usage_lib.entrypoint
+@annotations.client_api
+async def list_events(**kwargs) -> event_api_models.EventsPage:
+    """Async version of list_events()."""
+    return await asyncio.to_thread(sdk.list_events, **kwargs)
 
 
 @usage_lib.entrypoint

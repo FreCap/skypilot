@@ -387,8 +387,12 @@ class PermissionService:
         enforcer = self._ensure_enforcer()
         return enforcer.get_users_for_role(role)
 
-    def get_accessible_workspace_names(self, user_id: str,
-                                       workspace_names: set[str]) -> set[str]:
+    def get_accessible_workspace_names(
+            self,
+            user_id: str,
+            workspace_names: set[str],
+            *,
+            roles: list[str] | None = None) -> set[str]:
         """Return workspace names the user can access (batch, O(1) enforcer).
 
         Use instead of check_workspace_permission in a loop when filtering
@@ -396,7 +400,8 @@ class PermissionService:
         """
         if os.getenv(constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
             return workspace_names
-        roles = self.get_user_roles(user_id)
+        if roles is None:
+            roles = self.get_user_roles(user_id)
         if rbac.RoleName.ADMIN.value in roles:
             return workspace_names
         enforcer = self._ensure_enforcer()

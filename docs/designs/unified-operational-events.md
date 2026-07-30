@@ -6,9 +6,10 @@ Status: accepted for implementation
 
 SkyPilot will add a PostgreSQL-backed operational event plane for user-visible
 resource lifecycle actions. The first end-to-end slice records terminal
-cluster `launch`, `start`, `stop`, `down`, and `autostop` outcomes with a
-durable actor snapshot, authoritative workspace, request correlation, stable
-machine codes, safe messages, and resource targets.
+cluster `launch`, `start`, `stop`, `down`, and `autostop` outcomes after a
+request reaches its authoritative workspace gate, with a durable actor
+snapshot, request correlation, stable machine codes, safe messages, and
+resource targets.
 
 The event plane is a product history and debugging surface. It does not replace
 Datadog metrics, logs, traces, existing cluster status-transition events,
@@ -80,7 +81,8 @@ The first slice recognizes these request names and event kinds:
 | `sky.down` | `cluster.down` | cluster |
 | `sky.autostop` | `cluster.autostop` | cluster |
 
-Only an active-to-terminal request transition emits:
+Only an active-to-terminal request transition with a complete authoritative
+event context emits:
 
 - `SUCCEEDED` becomes outcome `succeeded`;
 - `FAILED` becomes outcome `failed`;
@@ -90,6 +92,13 @@ Transitions to `PENDING`, `WAITING`, or `RUNNING` do not emit. In particular,
 replayable controller handoff, executor lease recovery, broken worker-pool
 retry, and `ExecutionRetryableError` do not emit until the live execution
 generation reaches a terminal state.
+
+A request that terminates before workspace resolution and RBAC, such as a
+first-attempt queue precondition failure or dispatcher failure, has no
+authoritative workspace and emits no event. This is a product history of
+authorized lifecycle execution, not a record of every rejected API attempt.
+The same cause can emit on a later execution generation whose workspace
+context was already completed before a retry.
 
 Each event also carries a closed terminal cause. Initial causes are:
 
@@ -146,11 +155,12 @@ An event requires an authoritative workspace. Request preparation creates a
 closed, server-owned event context, but the worker persists the workspace only
 after preferred/default workspace resolution and the normal RBAC check.
 Failure to persist that context prevents an opted-in audited mutation from
-starting.
+starting. Unrelated requests do not perform an event-context database write.
 
 A terminal request with no complete event context, such as an old request
-created during a rolling upgrade, terminates normally and emits no fabricated
-event. This is safer than trusting a client-supplied workspace.
+created during a rolling upgrade or a new request rejected before workspace
+resolution, terminates normally and emits no fabricated event. This is safer
+than trusting a client-supplied workspace.
 
 The initial target has:
 
@@ -162,7 +172,11 @@ The initial target has:
 Target IDs are nullable because a failed first launch may never create a
 cluster hash. Target names and workspaces remain queryable after teardown.
 There are no foreign keys from events to users, workspaces, requests, or
-resources.
+resources. Launch captures the generation after its handler runs so a relaunch
+cannot retain the generation it replaced. Start, stop, down, and autostop
+capture before and after the handler so teardown retains the deleted
+generation and a failed operation can retain any generation it created.
+Requests outside this lifecycle set perform no target lookup.
 
 ## Data model
 
@@ -183,6 +197,7 @@ identity, or query list from becoming unbounded indexed event data.
 | Column | Type | Contract |
 | --- | --- | --- |
 | `event_id` | UUID | application-generated primary key |
+| `event_sequence` | BIGINT | unique transactional commit-order cursor key |
 | `occurred_at` | TIMESTAMPTZ | database `clock_timestamp()` |
 | `workspace` | TEXT | non-null authorization snapshot |
 | `kind` | TEXT | stable machine code |
@@ -198,10 +213,11 @@ identity, or query list from becoming unbounded indexed event data.
 
 The table has:
 
+- a unique constraint on `event_sequence`;
 - a unique constraint on
   `(source_request_id, source_execution_generation, phase)`;
-- an index on `(workspace, occurred_at DESC, event_id DESC)`;
-- an index on `(workspace, actor_id, occurred_at DESC, event_id DESC)`;
+- an index on `(workspace, event_sequence)`;
+- an index on `(workspace, actor_id, event_sequence)`;
 - an index on `(source_request_id)`;
 - a retention index on `occurred_at`.
 
@@ -221,10 +237,25 @@ The primary key is `(event_id, position)`. Target lookup indexes cover
 
 ### Cursor authority
 
-Migration `004` writes one random authority UUID under a namespaced key in
-`api_request_store_metadata`. Every replica derives the same HMAC key from
-that value and an event-specific salt. The authority is not exposed through
-the API.
+Migration `004` writes one random authority UUID and `event_sequence: 0` under
+a namespaced key in `api_request_store_metadata`. Every replica derives the
+same HMAC key from the authority and an event-specific salt. The authority and
+sequence are not exposed through the API.
+
+Every emitting transaction locks this metadata row with `FOR UPDATE`,
+increments `event_sequence`, and inserts the event with that value. PostgreSQL
+holds the row lock until commit or rollback. A later emitter therefore cannot
+allocate its sequence until the earlier transaction has committed, while a
+rolled-back allocation is reused. Sequence order is consequently committed
+event order, not merely insert or wall-clock order.
+
+The counter is a deliberate serialization point only for the five opted-in
+terminal lifecycle commits, not for request creation, execution, or unrelated
+terminal requests. Allocation happens after the generic request and queue
+updates, leaving only event/target inserts and any caller-specific reservation
+update before commit. Rollout monitoring includes metadata-row lock wait time;
+expanding events to high-volume resources requires sharding this ordering
+domain or adopting a durable outbox rather than silently reusing one counter.
 
 ## Transactional emission
 
@@ -239,9 +270,9 @@ _terminalize_locked_request(
     *,
     status,
     cause,
-    request_updates,
+    values,
     extra_predicates=(),
-    controller_action_state=None,
+    delete_queue=True,
 ) -> bool
 ```
 
@@ -249,13 +280,14 @@ The caller owns `SELECT ... FOR UPDATE` inside `engine.begin()`. The helper:
 
 1. verifies an active-to-terminal transition;
 2. performs the guarded request update;
-3. inserts the event and its targets when a complete opted-in context exists;
-4. deletes durable queue delivery when appropriate;
-5. updates controller action reservation state when appropriate;
-6. returns true only if the guarded terminal transition occurred.
+3. deletes durable queue delivery when appropriate;
+4. inserts the event and its targets when a complete opted-in context exists;
+5. returns true only if the guarded terminal transition occurred.
 
-The request transition, event insert, queue deletion, and reservation update
-commit or roll back together. Claim predicates remain caller-specific:
+Callers update controller action reservation state in the same transaction
+when appropriate. The request transition, event insert, queue deletion, and
+reservation update therefore commit or roll back together. Claim predicates
+remain caller-specific:
 
 - normal executor completion retains generation, claim-token, instance, lease,
   and controller-generation fences;
@@ -275,11 +307,17 @@ The implementation routes these current writers through the helper:
 9. precondition failure before claim;
 10. controller action reservation conflict.
 
+All ten paths share the atomic helper. They insert an event only when the
+request had already crossed the authoritative workspace gate. Pre-execution
+terminal paths still benefit from one guarded request/queue transaction but do
+not invent an event workspace.
+
 PostgreSQL `update_status_async()` rejects terminal statuses. Generic
-`update_request()` contexts reject an active-to-terminal mutation, forcing new
-terminal writers to choose a cause-aware path. Default implementations on the
-abstract request backend preserve plugin and SQLite compatibility without
-event emission.
+`update_request()` contexts reject an active-to-terminal mutation unless the
+caller supplies a closed transient terminal cause, forcing new terminal
+writers to choose a cause-aware path. Default implementations on the abstract
+request backend preserve plugin and SQLite compatibility without event
+emission.
 
 `cutover.import_legacy_requests()` remains a data import, not a live terminal
 transition. Existing terminal rows and imported `RUNNING` rows converted to
@@ -307,9 +345,8 @@ parameters are:
 - `limit`, default 50, minimum 1, maximum 100;
 - opaque `cursor`.
 
-`older` results are ordered by `(occurred_at DESC, event_id DESC)`. `newer`
-results are ordered by `(occurred_at ASC, event_id ASC)`. Both directions fetch
-`limit + 1` and return:
+`older` results are ordered by `event_sequence DESC`. `newer` results are
+ordered by `event_sequence ASC`. Both directions fetch `limit + 1` and return:
 
 ```json
 {
@@ -352,27 +389,39 @@ The HMAC cursor binds:
 - sorted effective workspace set;
 - normalized filters;
 - traversal direction;
-- the last `(occurred_at, event_id)` key.
+- the last event sequence position;
+- the committed high-watermark for that page snapshot.
 
 The server recomputes authorization on every page. A changed principal,
 permission set, or query returns HTTP 409 with
 `STALE_OPERATIONAL_EVENT_CURSOR`. Malformed filters return 422. Cursors cannot
 be shared across users or widened into another query.
 
-`next_cursor` continues in the requested direction. `poll_cursor` is always a
-`newer` cursor anchored to the newest row returned. If the initial result is
-empty, it is anchored to the database's current timestamp, so a watcher can
-start without a list-then-poll race. A `newer` caller drains pages while
-`has_more` is true, then retains the last `poll_cursor` for its next poll.
-This is the sole watch primitive; clients do not poll by rounded timestamps or
-maintain an unbounded de-duplication set.
+At the start of a page set, the reader obtains the last committed sequence
+from the metadata row without taking its writer lock. An in-flight allocation
+is invisible under PostgreSQL MVCC, so the observed value is a safe
+high-watermark. Every query in that page set is bounded to
+`event_sequence <= high_watermark`.
+
+`next_cursor` continues in the requested direction while retaining the same
+high-watermark. `poll_cursor` is always a `newer` cursor positioned at the
+page-set high-watermark, including when no matching rows were returned. On the
+next poll the server reads a new committed high-watermark; a newer-page cursor
+whose position is still below its bound is recognized as a continuation and
+retains the old bound until `has_more` is false. A transaction that was
+in-flight during the prior read receives a strictly later committed sequence
+and is therefore returned on a subsequent poll. This is the sole watch
+primitive; clients do not poll by rounded timestamps or maintain an unbounded
+de-duplication set.
 
 ### Authorization
 
 For authenticated non-admin callers, the server computes accessible
 workspaces once and intersects them with requested workspace filters. The SQL
 query always includes `workspace IN effective_workspaces`; filtering never
-happens after retrieval. An unauthorized or nonexistent requested workspace
+happens after retrieval. The handler performs one explicit Casbin policy
+reload, then reuses the resulting role set for workspace calculation instead
+of reloading policy twice. An unauthorized or nonexistent requested workspace
 produces an empty intersection rather than revealing its existence.
 
 Admins can read all event workspaces. Authentication-disabled single-user
@@ -470,8 +519,13 @@ affects request execution or event reads.
 - The existing request, cluster-event, job-event, and dashboard contracts are
   not changed.
 - Downgrade drops the event tables and request context only after verifying
-  there are no event rows. Normal operational rollback leaves revision `004`
-  in place and rolls back the binary.
+  there are no event rows while locking sequence metadata and the event table
+  in writer order. Normal operational rollback leaves revision `004` in place
+  and rolls back the binary.
+- Event completeness is enabled only after every API, executor, and controller
+  pod reports the version-64 image. A version-63 executor may legally complete
+  a version-64 request without understanding its new context during the mixed
+  rolling window, so canaries begin only after the exact-image gate.
 
 ## Rollout
 
@@ -499,7 +553,8 @@ longer depend on it.
 
 - closed kind, outcome, cause, actor, target, and cursor validation;
 - safe message rendering contains no arbitrary error or payload value;
-- HMAC cursor tamper, principal, workspace, permission, and filter binding;
+- HMAC cursor tamper, principal, workspace, permission, filter, position, and
+  high-watermark binding;
 - API version gate and typed response parsing;
 - CLI filters, table/JSON output, watch de-duplication, and Ctrl-C;
 - dashboard loading, empty, error, pagination, stale-navigation, and plugin
@@ -507,8 +562,8 @@ longer depend on it.
 
 ### Real PostgreSQL tests
 
-- migration creates the context column, tables, constraints, indexes, and
-  cursor authority;
+- migration creates the context column, tables, constraints, indexes, cursor
+  authority, and transactional sequence state;
 - normal success and failure commit request, queue/reservation changes, event,
   and target exactly once;
 - injected event-insert failure rolls the transaction back;
@@ -516,11 +571,14 @@ longer depend on it.
 - explicit, coroutine, and graceful-shutdown cancellation carry distinct
   causes;
 - compatibility restart, expired lease, controller handoff, precondition
-  failure, and reservation conflict emit exactly once;
+  failure, and reservation conflict emit exactly once when the request already
+  has complete event context, and emit nothing before the workspace gate;
 - replayable lease/controller recovery returns to `WAITING` without an event;
 - null-context rolling-upgrade rows and cutover imports emit nothing;
 - user, service-account, system, and unknown actor snapshots survive deletion;
 - SQL-side workspace isolation and admin behavior;
+- an event inserted before a read but committed after it is returned by the
+  next poll rather than skipped;
 - request GC does not delete events;
 - retention deletes only rows older than the cutoff and cascades targets.
 

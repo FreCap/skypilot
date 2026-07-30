@@ -41,6 +41,7 @@ from sky import models
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import kubernetes as kubernetes_adaptor
+from sky.events import api_models as event_api_models
 from sky.metrics import utils as metrics_utils
 from sky.serve import placement_history
 from sky.server import clean_env as clean_env_module
@@ -52,6 +53,7 @@ from sky.server import metrics as metrics_lib
 from sky.server import plugins
 from sky.server import versions
 from sky.server import watchdog
+from sky.server.events import models as event_models
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import process
@@ -342,8 +344,11 @@ class RequestWorker:
             if request_element is not None else None)
         try:
             api_requests.set_exception_stacktrace(e)
-            request_storage.get_request_backend().set_request_finished(
-                request_id, api_requests.RequestStatus.FAILED, error=e)
+            request_storage.get_request_backend().transition_request_terminal(
+                request_id,
+                api_requests.RequestStatus.FAILED,
+                'dispatcher_submit_failed',
+                error=e)
         except (Exception, SystemExit) as recovery_e:  # pylint: disable=broad-except
             # Never let the recovery itself crash the dispatcher thread.
             logger.error(
@@ -784,6 +789,14 @@ def override_request_env_and_config(
                             f'{request_id} permission denied to workspace: '
                             f'{skypilot_config.get_active_workspace()}: {e}')
                         raise e
+                    if event_models.request_kind(request_name) is not None:
+                        if not api_requests.set_event_workspace(
+                                request_id,
+                                skypilot_config.get_active_workspace()):
+                            raise RuntimeError(
+                                'The request lost its execution fence before '
+                                'its operational event workspace was '
+                                'persisted.')
                     logger.debug(f'{request_id} permission granted to '
                                  f'{request_name} request')
                     yield
@@ -864,6 +877,43 @@ def _gated_sigterm_handler(signum: int,
         os.write(2, b'SIGTERM received while worker idle; ignored.\n')
     except Exception:  # pylint: disable=broad-except
         pass
+
+
+def _enrich_event_target_id(request_id: str, cluster_name: str | None) -> None:
+    """Best-effort capture of the cluster generation for an event."""
+    if cluster_name is None:
+        return
+    try:
+        cluster_hash = global_user_state.get_cluster_hash_for_name(cluster_name)
+        if cluster_hash is not None:
+            api_requests.set_event_target_id(request_id, cluster_hash)
+    except Exception as e:  # pylint: disable=broad-except
+        # Event target enrichment is observability. The authoritative request
+        # result must never depend on this optional identity lookup.
+        logger.warning(
+            f'Failed to enrich operational event target for {request_id}: '
+            f'{common_utils.format_exception(e)}')
+
+
+@contextlib.contextmanager
+def _capture_event_target(
+        request_id: str, request_name: str,
+        cluster_name: str | None) -> Generator[None, None, None]:
+    """Capture the stable cluster generation around an opted-in operation."""
+    event_kind = event_models.request_kind(request_name)
+    if event_kind is None:
+        yield
+        return
+    # A launch can replace an existing cluster generation, so only capture its
+    # target after the handler has run. Other lifecycle operations capture
+    # before and after: teardown removes the authoritative cluster record,
+    # while a failed operation may still create or replace it.
+    if event_kind != event_api_models.EventKind.CLUSTER_LAUNCH:
+        _enrich_event_target_id(request_id, cluster_name)
+    try:
+        yield
+    finally:
+        _enrich_event_target_id(request_id, cluster_name)
 
 
 def _request_execution_wrapper(request_id: str,
@@ -953,6 +1003,7 @@ def _request_execution_wrapper(request_id: str,
         func = request_task.entrypoint
         request_body = request_task.request_body
         request_name = request_task.name
+        request_cluster_name = request_task.cluster_name
         controller_generation = request_task.controller_generation
         controller_instance_id = request_task.worker_instance_id
         del request_task
@@ -990,7 +1041,9 @@ def _request_execution_wrapper(request_id: str,
                 (metrics_utils.SKY_APISERVER_PROCESS_EXECUTION_START_TOTAL.
                  labels(request=request_name, pid=pid).inc())
                 with metrics_utils.time_it(name=request_name,
-                                           group='request_execution'):
+                                           group='request_execution'), \
+                        _capture_event_target(
+                            request_id, request_name, request_cluster_name):
                     return_value = func(**request_body.to_kwargs())
                 f.flush()
     except KeyboardInterrupt:
@@ -1315,12 +1368,21 @@ async def prepare_request_async(
         # Fallback to legacy environment variable based identity if no
         # authentication is set.
         user_id = request_body.env_vars[constants.USER_ID_ENV_VAR]
+    actor_type: str | None
     if is_skypilot_system:
         user_id = constants.SKYPILOT_SYSTEM_USER_ID
+        actor_name = user_id
+        actor_type = models.UserType.SYSTEM.value
         global_user_state.add_or_update_user(
             models.User(id=user_id,
                         name=user_id,
                         user_type=models.UserType.SYSTEM.value))
+    elif auth_user is not None:
+        actor_name = auth_user.name or auth_user.id
+        actor_type = auth_user.user_type
+    else:
+        actor_name = request_body.env_vars.get(constants.USER_ENV_VAR, user_id)
+        actor_type = None
     # Capture the client's API version from the FastAPI dispatch context
     # into the request body so it survives the process boundary into the
     # worker that runs the request. APIVersionMiddleware set the
@@ -1352,6 +1414,12 @@ async def prepare_request_async(
                               if durable_precondition is not None else None),
         precondition_deadline=(durable_precondition.deadline
                                if durable_precondition is not None else None),
+        event_context=event_models.initial_context(
+            request_name,
+            actor_name=actor_name,
+            actor_type=actor_type,
+            cluster_name=request_cluster_name,
+        ),
     )
 
     if not await api_requests.create_if_not_exists_async(request):

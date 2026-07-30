@@ -283,6 +283,7 @@ class Server(uvicorn.Server):
             req.status = requests_lib.RequestStatus.CANCELLED
             req.finished_at = time.time()
             req.should_retry = True
+            req.terminal_cause = 'graceful_shutdown_retry'
         logger.info(
             f'Request {request_id} interrupted and will be retried by client.')
 

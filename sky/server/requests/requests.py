@@ -354,6 +354,13 @@ class Request:
     cancel_requested_at: float | None = None
     cancel_acknowledged_at: float | None = None
     interrupted_reason: str | None = None
+    # PostgreSQL-only, server-owned context for actor-aware operational
+    # events. It is intentionally absent from the client RequestPayload and
+    # legacy SQLite row shape.
+    event_context: dict[str, Any] | None = None
+    # In-memory cause required when a generic update context performs a
+    # terminal transition. Never persisted or exposed to clients.
+    terminal_cause: str | None = None
     # Queue intent is set only while creating a newly scheduled request.
     # Durable backends consume it in the same transaction as request creation;
     # it is not exposed on the client wire format.
@@ -453,6 +460,7 @@ class Request:
             'cancel_requested_at': self.cancel_requested_at,
             'cancel_acknowledged_at': self.cancel_acknowledged_at,
             'interrupted_reason': self.interrupted_reason,
+            'event_context': self.event_context,
         }
 
     @classmethod
@@ -513,6 +521,7 @@ class Request:
             cancel_requested_at=values.get('cancel_requested_at'),
             cancel_acknowledged_at=values.get('cancel_acknowledged_at'),
             interrupted_reason=values.get('interrupted_reason'),
+            event_context=values.get('event_context'),
         )
 
     def get_return_value(self) -> Any:
@@ -1430,6 +1439,18 @@ async def update_status_msg_async(request_id: str, status_msg: str) -> None:
         request_id, status_msg)
 
 
+def set_event_workspace(request_id: str, workspace: str) -> bool:
+    """Persist the authoritative workspace for an opted-in event request."""
+    return request_storage.get_request_backend().set_event_workspace(
+        request_id, workspace)
+
+
+def set_event_target_id(request_id: str, target_id: str) -> bool:
+    """Enrich the primary operational event target identity."""
+    return request_storage.get_request_backend().set_event_target_id(
+        request_id, target_id)
+
+
 def _get_request_no_lock(request_id: str,
                          fields: list[str] | None = None) -> Request | None:
     """Get a SkyPilot API request."""
@@ -1870,8 +1891,11 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
         _set_value_free_exception_stacktrace(e)
     else:
         set_exception_stacktrace(e)
-    transitioned = request_storage.get_request_backend().set_request_finished(
-        request_id, RequestStatus.FAILED, error=e)
+    transitioned = request_storage.get_request_backend(
+    ).transition_request_terminal(request_id,
+                                  RequestStatus.FAILED,
+                                  'handler_failed',
+                                  error=e)
     # Older plugin backends may still return None from this internal hook.
     if transitioned is not False:
         _mark_container_image_request_terminal(request_id)
@@ -1891,7 +1915,10 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     else:
         set_exception_stacktrace(e)
     transitioned = await request_storage.get_request_backend(
-    ).set_request_finished_async(request_id, RequestStatus.FAILED, error=e)
+    ).transition_request_terminal_async(request_id,
+                                        RequestStatus.FAILED,
+                                        'handler_failed',
+                                        error=e)
     if transitioned is not False:
         await asyncio.to_thread(_mark_container_image_request_terminal,
                                 request_id)
@@ -1899,8 +1926,11 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
 
 def set_request_succeeded(request_id: str, result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
-    transitioned = request_storage.get_request_backend().set_request_finished(
-        request_id, RequestStatus.SUCCEEDED, result=result)
+    transitioned = request_storage.get_request_backend(
+    ).transition_request_terminal(request_id,
+                                  RequestStatus.SUCCEEDED,
+                                  'handler_succeeded',
+                                  result=result)
     if transitioned is not False:
         _mark_container_image_request_terminal(request_id)
 
@@ -1911,9 +1941,10 @@ async def set_request_succeeded_async(request_id: str,
                                       result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
     transitioned = await request_storage.get_request_backend(
-    ).set_request_finished_async(request_id,
-                                 RequestStatus.SUCCEEDED,
-                                 result=result)
+    ).transition_request_terminal_async(request_id,
+                                        RequestStatus.SUCCEEDED,
+                                        'handler_succeeded',
+                                        result=result)
     if transitioned is not False:
         await asyncio.to_thread(_mark_container_image_request_terminal,
                                 request_id)
@@ -1931,6 +1962,7 @@ async def set_request_cancelled_async(request_id: str) -> None:
             return
         request_task.finished_at = time.time()
         request_task.status = RequestStatus.CANCELLED
+        request_task.terminal_cause = 'coroutine_disconnected'
     await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 

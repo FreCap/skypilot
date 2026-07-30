@@ -869,6 +869,16 @@ class APINotSupportedError(RuntimeError):
     pass
 
 
+class OperationalEventsUnavailableError(RuntimeError):
+    """Raised when the API server has no PostgreSQL event plane."""
+    pass
+
+
+class StaleOperationalEventCursorError(RuntimeError):
+    """Raised when an event cursor no longer matches its authorized query."""
+    pass
+
+
 class JobExitCode(enum.IntEnum):
     """Job exit code enum.
 

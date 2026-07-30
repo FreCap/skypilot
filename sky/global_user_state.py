@@ -2521,6 +2521,11 @@ def _get_hash_for_existing_cluster(cluster_name: str) -> str | None:
     return row.cluster_hash
 
 
+def get_cluster_hash_for_name(cluster_name: str) -> str | None:
+    """Return the stable generation ID for a live cluster, if present."""
+    return _get_hash_for_existing_cluster(cluster_name)
+
+
 def _resolve_cluster_hash(cluster_hash: str | None = None,
                           cluster_name: str | None = None) -> str | None:
     """Resolve cluster_hash from either cluster_hash or cluster_name.
