@@ -112,6 +112,129 @@ def _aggregate_error(*codes: str) -> provision_common.ProvisionerError:
     return error
 
 
+def _gcp_launchable_resources() -> resources_lib.Resources:
+    return resources_lib.Resources(
+        cloud=clouds.GCP(),
+        instance_type='n1-standard-4',
+        region='us-central1',
+        zone='us-central1-a',
+    )
+
+
+def test_failover_blocklist_skips_already_covered_resources():
+    launchable = _gcp_launchable_resources()
+    blocked = {launchable.copy(region=None, zone=None)}
+
+    backend._add_to_blocked_resources(blocked, launchable)
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region is None
+    assert blocked_resource.zone is None
+
+    blocked.clear()
+    backend._add_to_blocked_resources(blocked, launchable)
+    backend._add_to_blocked_resources(blocked, launchable)
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region == 'us-central1'
+    assert blocked_resource.zone == 'us-central1-a'
+
+
+def test_failover_v1_known_errors_preserve_order_and_stripping():
+    errors = backend.FailoverCloudErrorHandlerV1._handle_errors(
+        '  ERR first  \nignored',
+        'PANIC second\nignored',
+        lambda line: line.startswith(('ERR', 'PANIC')),
+    )
+    assert errors == ['ERR first', 'PANIC second']
+
+
+def test_failover_v1_rsync_error_preserves_detailed_reason():
+    with pytest.raises(RuntimeError,
+                       match='`rsync` command is not found') as exc_info:
+        backend.FailoverCloudErrorHandlerV1._handle_errors(
+            'launch output',
+            'bash: rsync: command not found',
+            lambda _: False,
+        )
+
+    assert exc_info.value.detailed_reason == (
+        'stdout: launch output\n'
+        'stderr: bash: rsync: command not found')
+
+
+def test_failover_v1_gang_failure_blocks_each_zone():
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+    zones = [clouds.Zone('us-central1-a'), clouds.Zone('us-central1-b')]
+
+    definitely_no_nodes_launched = (
+        backend.FailoverCloudErrorHandlerV1.update_blocklist_on_error(
+            blocked,
+            launchable,
+            clouds.Region('us-central1'),
+            zones,
+            None,
+            None,
+        ))
+
+    assert not definitely_no_nodes_launched
+    assert {resource.zone for resource in blocked} == {
+        'us-central1-a',
+        'us-central1-b',
+    }
+
+
+@pytest.mark.parametrize(
+    ('code', 'message', 'expected_region', 'expected_zone'),
+    [
+        ('ZONE_RESOURCE_POOL_EXHAUSTED', 'capacity', 'us-central1',
+         'us-central1-a'),
+        ('QUOTA_EXCEEDED', 'regional quota', 'us-central1', None),
+        ('QUOTA_EXCEEDED', "'GPUS_ALL_REGIONS' exceeded", None, None),
+        ('IAM_PERMISSION_DENIED', 'permission', None, None),
+    ],
+)
+def test_failover_v2_gcp_error_block_width(code, message, expected_region,
+                                           expected_zone):
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+    error = provision_common.ProvisionerError('provision failed')
+    error.errors = [{'code': code, 'message': message}]
+
+    backend.FailoverCloudErrorHandlerV2._gcp_handler(
+        blocked,
+        launchable,
+        clouds.Region('us-central1'),
+        [clouds.Zone('us-central1-a')],
+        error,
+    )
+
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region == expected_region
+    assert blocked_resource.zone == expected_zone
+
+
+def test_failover_v2_default_handler_blocks_each_zone():
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+
+    backend.FailoverCloudErrorHandlerV2._default_handler(
+        blocked,
+        launchable,
+        clouds.Region('us-central1'),
+        [clouds.Zone('us-central1-a'),
+         clouds.Zone('us-central1-b')],
+        RuntimeError('unparsed'),
+    )
+
+    assert {resource.zone for resource in blocked} == {
+        'us-central1-a',
+        'us-central1-b',
+    }
+
+
 @pytest.mark.parametrize('code', [
     'VcpuLimitExceeded',
     'MaxSpotInstanceCountExceeded',
