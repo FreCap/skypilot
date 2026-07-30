@@ -39,52 +39,156 @@ class TestWaitForNextTask:
     """Checks the lifecycle and polling boundaries between JobGroup tasks."""
 
     def test_terminal_status_ends_wait_without_sleep(self, monkeypatch):
-        status_read = mock.Mock(
-            return_value=(0, managed_job_state.ManagedJobStatus.FAILED))
+        terminal_snapshot = managed_job_state.JobLogStreamSnapshot(
+            0, managed_job_state.ManagedJobStatus.FAILED, None, None, None,
+            None)
+        snapshot_read = mock.Mock(return_value=terminal_snapshot)
         sleep = mock.Mock()
-        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
-                            status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
         monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
 
         result = jobs_utils._wait_for_next_task(job_id=42, current_task_id=0)
 
-        assert result == (0, managed_job_state.ManagedJobStatus.FAILED)
-        status_read.assert_called_once_with(42)
+        assert result == terminal_snapshot
+        snapshot_read.assert_called_once_with(42)
         sleep.assert_not_called()
 
     def test_cancelling_status_ends_wait_without_sleep(self, monkeypatch):
-        status_read = mock.Mock(
-            return_value=(0, managed_job_state.ManagedJobStatus.CANCELLING))
+        cancelling_snapshot = managed_job_state.JobLogStreamSnapshot(
+            0, managed_job_state.ManagedJobStatus.CANCELLING, None, None, None,
+            None)
+        snapshot_read = mock.Mock(return_value=cancelling_snapshot)
         sleep = mock.Mock()
-        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
-                            status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
         monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
 
         result = jobs_utils._wait_for_next_task(job_id=42, current_task_id=0)
 
-        assert result == (0, managed_job_state.ManagedJobStatus.CANCELLING)
-        status_read.assert_called_once_with(42)
+        assert result == cancelling_snapshot
+        snapshot_read.assert_called_once_with(42)
         sleep.assert_not_called()
 
     def test_running_status_waits_for_next_task(self, monkeypatch):
-        status_read = mock.Mock(side_effect=[
-            (0, managed_job_state.ManagedJobStatus.RUNNING),
-            (1, managed_job_state.ManagedJobStatus.RUNNING),
+        current_snapshot = managed_job_state.JobLogStreamSnapshot(
+            0, managed_job_state.ManagedJobStatus.RUNNING, None, None, None,
+            'first')
+        next_snapshot = managed_job_state.JobLogStreamSnapshot(
+            1, managed_job_state.ManagedJobStatus.RUNNING, 'pool-a',
+            'pool-cluster', 73, 'second')
+        snapshot_read = mock.Mock(side_effect=[
+            current_snapshot,
+            next_snapshot,
         ])
         sleep = mock.Mock()
-        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
-                            status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
         monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
 
         result = jobs_utils._wait_for_next_task(job_id=42, current_task_id=0)
 
-        assert result == (1, managed_job_state.ManagedJobStatus.RUNNING)
-        assert status_read.call_args_list == [mock.call(42), mock.call(42)]
+        assert result == next_snapshot
+        assert snapshot_read.call_args_list == [mock.call(42), mock.call(42)]
         sleep.assert_called_once_with(jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS)
 
 
 class TestStreamLogsByIdLifecycle:
     """Checks integration with the full managed-job log follower."""
+
+    def test_next_task_handoff_reuses_detecting_snapshot(self, monkeypatch):
+        backend = _FakeBackend()
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        cancelling = managed_job_state.ManagedJobStatus.CANCELLING
+        current_task = {'id': 0}
+        snapshot_reads = mock.Mock()
+
+        def snapshot_read(
+                job_id: int) -> managed_job_state.JobLogStreamSnapshot:
+            assert job_id == 42
+            snapshot_reads()
+            task_id = current_task['id']
+            snapshot = managed_job_state.JobLogStreamSnapshot(
+                task_id, running, 'pool-a', f'pool-cluster-{task_id}',
+                70 + task_id, f'task-{task_id}')
+            if task_id == 1:
+                # Model a fast following transition after task 1 was observed.
+                # The detecting snapshot must still own task 1's log handoff.
+                current_task['id'] = 2
+            return snapshot
+
+        latest_status_reads = mock.Mock()
+
+        def latest_status_read(job_id: int):
+            assert job_id == 42
+            latest_status_reads()
+            task_id = current_task['id']
+            if latest_status_reads.call_count > 1:
+                # The old split-read handoff detects task 1 here, then a
+                # separate routing read sees task 2 and skips task 1's logs.
+                current_task['id'] = 2
+            return task_id, running
+
+        tailed_job_ids = []
+
+        def tail_logs(*args, **kwargs):
+            del args
+            tailed_job_ids.append(kwargs['job_id'])
+            if len(tailed_job_ids) == 1:
+                current_task['id'] = 1
+            return exceptions.JobExitCode.SUCCEEDED.value
+
+        backend.tail_logs = tail_logs
+        backend.get_job_status = mock.Mock(side_effect=[
+            {
+                1: jobs_utils.job_lib.JobStatus.SUCCEEDED
+            },
+            {
+                1: jobs_utils.job_lib.JobStatus.CANCELLED
+            },
+        ])
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        handle_lookup = mock.Mock(return_value=_FakeHandle())
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks',
+                            mock.Mock(return_value=3))
+        monkeypatch.setattr(managed_job_state, 'get_status',
+                            mock.Mock(return_value=cancelling))
+        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
+                            latest_status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', handle_lookup)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayResourceHandle',
+                            _FakeHandle)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils.time, 'sleep', mock.Mock())
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42, follow=True)
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.from_managed_job_status(
+            cancelling)
+        assert tailed_job_ids == [70, 71]
+        assert latest_status_reads.call_count == 1
+        assert snapshot_reads.call_count == 2
+        assert (latest_status_reads.call_count + snapshot_reads.call_count) == 3
+        assert handle_lookup.call_args_list == [
+            mock.call('pool-cluster-0'),
+            mock.call('pool-cluster-1'),
+        ]
 
     def test_recovered_target_reuses_post_wait_snapshot(self, monkeypatch):
         backend = _FakeBackend()
@@ -229,10 +333,8 @@ class TestStreamLogsByIdLifecycle:
         assert message == ''
         assert exit_code == exceptions.JobExitCode.from_managed_job_status(
             terminal_status)
-        expected_latest_status_calls = 2 if expected_tail_calls else 1
-        assert latest_status_read.call_count == expected_latest_status_calls
-        expected_snapshot_reads = 1 if expected_tail_calls else 2
-        assert snapshot_read.call_count == expected_snapshot_reads
+        latest_status_read.assert_called_once_with(42)
+        assert snapshot_read.call_count == 2
         num_tasks_read.assert_called_once_with(42)
         status_read.assert_not_called()
         context_read.assert_not_called()
