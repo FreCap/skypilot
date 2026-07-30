@@ -71,6 +71,11 @@ MIN_BATCH_REPLICA_INFO_VERSION = 6
 # depend on per-user preferred workspace when talking to such servers.
 MIN_PREFERRED_WORKSPACE_API_VERSION = 53
 
+# Minimum server API version that supports filtering cluster status by
+# workspace. Servers below this version ignore the request-body field, which
+# would otherwise silently return clusters outside the requested workspaces.
+MIN_STATUS_WORKSPACE_FILTER_API_VERSION = 63
+
 # Minimum server API version that supports filtering the managed jobs queue by
 # submission time (submitted_after / submitted_before, surfaced as the CLI
 # --since / --after / --before flags). Older servers silently ignore these
