@@ -981,6 +981,30 @@ This is negative evidence, not M4 acceptance. The templates now distinguish a
 missing reused-value key from the explicit empty-string opt-out, and the full
 sequence must repeat with a new exact image.
 
+The second live attempt used commit
+`af919839b549e45059ad22022e94395d0a2cb5f4` and exact image digest
+`sha256:e3e09c656d952412296dda6cc4a4c4c95d504e3e0fcef4dd5e6911f0a5c73c3e`.
+Revision 19 rendered all three topology constraints, completed its migration
+hook one second before target pod creation, and rolled under 4,974 raw health,
+310 submit and get, and 309 stream successes with zero failures. Immediately
+afterward, Karpenter began evicting one API replica for underutilization while
+the harness used a raw Pod delete on the other. A raw delete bypasses the
+Eviction API and therefore did not atomically consume the PodDisruptionBudget
+before the concurrent autoscaler eviction. Both replicas terminated and the
+existing one-hertz API canary recorded 70 transport failures before
+replacements became ready.
+
+The deleted target's retained PostgreSQL row proves the runtime path worked:
+`ready=false`, `draining=true`, phase `draining`, with a heartbeat at
+13:43:25 UTC. The harness nevertheless reported `WAIT` because its probe
+subprocess did not set the server database-selection marker and it searched
+only ready API pods after both APIs were unavailable. This is negative
+conformance evidence, not a runtime heartbeat failure. Graceful test
+disruptions now use the Kubernetes Eviction API with PDB-aware retry, so a
+manual test eviction and Karpenter eviction serialize atomically. Durable row
+queries may run through any ready API, executor, or controller pod and
+explicitly initialize server database selection.
+
 Deployment:
 
 1. Render and server-side dry-run the guarded chart, including the hook,

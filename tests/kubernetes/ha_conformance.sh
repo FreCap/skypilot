@@ -421,10 +421,11 @@ verify_role_image() {
 
 drain_row_state() {
   local instance_id="$1"
+  local role_selector="app in (${RELEASE}-api,${RELEASE}-executor,${RELEASE}-controller)"
   local query_pod output
   query_pod="$(
     kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pods \
-      -l "app=${RELEASE}-api" -o json | jq -r '
+      -l "${role_selector}" -o json | jq -r '
       [.items[]
        | select(.metadata.deletionTimestamp == null)
        | select(
@@ -442,10 +443,13 @@ drain_row_state() {
   output="$(
     kubectl --context "${CONTEXT}" -n "${NAMESPACE}" exec "${query_pod}" -- \
       python -c '
+import os
 import sys
 import uuid
 
 import sqlalchemy
+
+os.environ["IS_SKYPILOT_SERVER"] = "true"
 
 from sky.server.requests import postgres as request_postgres
 
@@ -474,6 +478,75 @@ print(
   tail -n 1 <<<"${output}"
 }
 
+evict_pod() {
+  local role="$1"
+  local pod="$2"
+  local pdb="${RELEASE}-${role}"
+  local deadline=$((SECONDS + 600))
+  local output allowed_before expected_allowed
+
+  while true; do
+    if ! kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pod "${pod}" \
+      >/dev/null 2>&1; then
+      echo "target pod ${pod} disappeared before its controlled eviction" >&2
+      return 1
+    fi
+    allowed_before="$(
+      kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pdb "${pdb}" \
+        -o jsonpath='{.status.disruptionsAllowed}'
+    )"
+    if [[ -z "${allowed_before}" || "${allowed_before}" -lt 1 ]]; then
+      if ((SECONDS >= deadline)); then
+        echo "PDB ${pdb} did not expose an eviction budget for ${pod}" >&2
+        return 1
+      fi
+      sleep 2
+      continue
+    fi
+    if output="$(
+      kubectl --context "${CONTEXT}" create --raw \
+        "/api/v1/namespaces/${NAMESPACE}/pods/${pod}/eviction" -f - \
+        2>&1 <<EOF
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "${pod}",
+    "namespace": "${NAMESPACE}"
+  }
+}
+EOF
+    )"; then
+      break
+    fi
+    if [[ "${output}" != *"TooManyRequests"* &&
+          "${output}" != *"disruption budget"* ]]; then
+      echo "failed to evict ${pod}: ${output}" >&2
+      return 1
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "timed out waiting for PDB ${pdb} to admit ${pod}: ${output}" >&2
+      return 1
+    fi
+    sleep 2
+  done
+
+  expected_allowed=$((allowed_before - 1))
+  local reservation_deadline=$((SECONDS + 15))
+  while ! kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pdb "${pdb}" \
+    -o json | jq -e --arg pod "${pod}" \
+      --argjson allowed "${expected_allowed}" \
+      '((.status.disruptedPods // {}) | has($pod)) and
+       ((.status.disruptionsAllowed // 0) <= $allowed)' >/dev/null; do
+    if ((SECONDS >= reservation_deadline)); then
+      echo "PDB ${pdb} did not record the accepted eviction for ${pod}" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "eviction ${pod}: PDB ${pdb} reserved its disruption budget"
+}
+
 delete_original_role_pods() {
   local role="$1"
   local selector="app=${RELEASE}-${role}"
@@ -481,7 +554,11 @@ delete_original_role_pods() {
   pods="$(
     kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pods \
       -l "${selector}" -o json | jq -r \
-      '[.items[] | select(.metadata.deletionTimestamp == null)]
+      '[.items[]
+       | select(.metadata.deletionTimestamp == null)
+       | select(
+           any(.status.conditions[]?;
+               .type == "Ready" and .status == "True"))]
        | sort_by(.metadata.name)[] | .metadata.name'
   )"
   if [[ "$(wc -w <<<"${pods}" | tr -d ' ')" -lt 2 ]]; then
@@ -519,8 +596,7 @@ delete_original_role_pods() {
       probe_host="[${probe_host}]"
     fi
 
-    kubectl --context "${CONTEXT}" -n "${NAMESPACE}" delete pod "${pod}" \
-      --wait=false
+    evict_pod "${role}" "${pod}"
     local endpoint_seen=false
     local lease_seen=false
     local pod_condition_seen=false
