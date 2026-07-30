@@ -366,7 +366,9 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
   useEffect(() => {
     if (!serviceName) return undefined;
     const interval = setInterval(() => {
-      fetchData({ invalidate: true, source: 'poll' });
+      if (window.document.visibilityState === 'visible') {
+        fetchData({ invalidate: true, source: 'poll' });
+      }
     }, 60 * 1000);
     return () => {
       clearInterval(interval);
