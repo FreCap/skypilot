@@ -1176,6 +1176,147 @@ def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
     }
 
 
+def _controller_snapshot_conditions(
+    job_id: int,
+    schedule_state: ManagedJobScheduleState,
+    controller_pid: int | None,
+    controller_pid_started_at: float | None,
+    controller_instance_id: str | None,
+    controller_generation: int | None,
+) -> list[sqlalchemy.ColumnElement[bool]]:
+    """Build the exact job-info snapshot used by destructive refresh writes."""
+    return [
+        job_info_table.c.spot_job_id == job_id,
+        job_info_table.c.schedule_state == schedule_state.value,
+        job_info_table.c.controller_pid == controller_pid,
+        job_info_table.c.controller_pid_started_at == controller_pid_started_at,
+        job_info_table.c.controller_instance_id == controller_instance_id,
+        job_info_table.c.controller_generation == controller_generation,
+    ]
+
+
+def set_failed_controller_if_current_snapshot(
+    job_id: int,
+    *,
+    schedule_state: ManagedJobScheduleState,
+    controller_pid: int | None,
+    controller_pid_started_at: float | None,
+    controller_instance_id: str | None,
+    controller_generation: int | None,
+    failure_reason: str,
+) -> bool:
+    """Terminalize an exact dead-controller snapshot before provider cleanup.
+
+    The job's schedule state intentionally remains non-DONE. If this process
+    exits during cleanup, a replacement leader sees terminal tasks, retries the
+    idempotent teardown, and completes the schedule state instead of recovering
+    the workload.
+    """
+    owner = get_current_controller_owner()
+    recorded_owner = (controller_instance_id, controller_generation)
+    if owner is not None and recorded_owner != owner:
+        return False
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if owner is not None:
+            _lock_current_controller_owner(session, owner)
+        conditions = _controller_snapshot_conditions(job_id, schedule_state,
+                                                     controller_pid,
+                                                     controller_pid_started_at,
+                                                     controller_instance_id,
+                                                     controller_generation)
+        job_row = session.execute(
+            sqlalchemy.select(job_info_table.c.spot_job_id).where(
+                sqlalchemy.and_(*conditions)).with_for_update()).first()
+        if job_row is None:
+            session.rollback()
+            return False
+
+        task_rows = session.execute(
+            sqlalchemy.select(spot_table.c.status, spot_table.c.failure_reason).
+            where(spot_table.c.spot_job_id == job_id).with_for_update()).all()
+        if not task_rows or all(
+                ManagedJobStatus(row.status).is_terminal()
+                for row in task_rows):
+            session.rollback()
+            return False
+
+        existing_reason = next(
+            (row.failure_reason for row in task_rows if row.failure_reason),
+            None)
+        persisted_reason = failure_reason
+        if existing_reason:
+            persisted_reason += f'. Previously: {existing_reason}'
+        end_time = time.time()
+        result = session.execute(
+            sqlalchemy.update(spot_table).where(
+                spot_table.c.spot_job_id == job_id).values({
+                    spot_table.c.status:
+                        ManagedJobStatus.FAILED_CONTROLLER.value,
+                    spot_table.c.failure_reason: persisted_reason,
+                    spot_table.c.last_recovered_at: sqlalchemy.case(
+                        (spot_table.c.status
+                         == ManagedJobStatus.RECOVERING.value, end_time),
+                        else_=spot_table.c.last_recovered_at),
+                    spot_table.c.end_at: sqlalchemy.func.coalesce(
+                        spot_table.c.end_at, end_time),
+                }))
+        session.commit()
+        return result.rowcount > 0
+
+
+def finish_controller_cleanup_if_current_snapshot(
+    job_id: int,
+    *,
+    schedule_state: ManagedJobScheduleState,
+    controller_pid: int | None,
+    controller_pid_started_at: float | None,
+    controller_instance_id: str | None,
+    controller_generation: int | None,
+) -> bool:
+    """Mark an exactly rechecked terminal job DONE after provider cleanup.
+
+    A current leader may finish terminal cleanup left by a stale generation.
+    It proves its own outer fence, compare-and-swaps the recorded snapshot, and
+    stamps the completing generation on the durable row.
+    """
+    owner = get_current_controller_owner()
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if owner is not None:
+            _lock_current_controller_owner(session, owner)
+        conditions = _controller_snapshot_conditions(job_id, schedule_state,
+                                                     controller_pid,
+                                                     controller_pid_started_at,
+                                                     controller_instance_id,
+                                                     controller_generation)
+        job_row = session.execute(
+            sqlalchemy.select(job_info_table.c.spot_job_id).where(
+                sqlalchemy.and_(*conditions)).with_for_update()).first()
+        if job_row is None:
+            session.rollback()
+            return False
+        task_statuses = session.execute(
+            sqlalchemy.select(spot_table.c.status).where(
+                spot_table.c.spot_job_id ==
+                job_id).with_for_update()).scalars().all()
+        if (not task_statuses or any(not ManagedJobStatus(status).is_terminal()
+                                     for status in task_statuses)):
+            session.rollback()
+            return False
+
+        values: dict[sqlalchemy.Column, Any] = {
+            job_info_table.c.schedule_state: ManagedJobScheduleState.DONE.value,
+        }
+        values.update(_controller_owner_values(owner))
+        result = session.execute(
+            sqlalchemy.update(job_info_table).where(
+                sqlalchemy.and_(*conditions)).values(values))
+        session.commit()
+        return result.rowcount == 1
+
+
 def get_job_cancellation_states(
         job_ids: list[int]) -> dict[int, JobCancellationState]:
     """Return slim, batched snapshots for managed-job cancellation.
@@ -3046,6 +3187,13 @@ def set_job_info(job_id: int,
 def reset_jobs_for_recovery() -> None:
     """Remove controller PIDs for live jobs, allowing them to be recovered."""
     engine = _db_manager.get_engine()
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    has_nonterminal_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+            spot_table.c.status.not_in(terminal_status_values)))
     with orm.Session(engine) as session:
         session.query(job_info_table).filter(
             # PID should be set.
@@ -3056,6 +3204,7 @@ def reset_jobs_for_recovery() -> None:
              != ManagedJobScheduleState.WAITING.value),
             (job_info_table.c.schedule_state
              != ManagedJobScheduleState.DONE.value),
+            has_nonterminal_task,
         ).update({
             job_info_table.c.controller_pid: None,
             job_info_table.c.controller_pid_started_at: None,
@@ -3079,6 +3228,13 @@ def reset_stale_jobs_for_current_controller() -> int:
         return 0
 
     engine = _db_manager.get_engine()
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    has_nonterminal_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+            spot_table.c.status.not_in(terminal_status_values)))
     with orm.Session(engine) as session:
         _lock_current_controller_owner(session, owner)
         stale_owner = sqlalchemy.or_(
@@ -3094,6 +3250,7 @@ def reset_stale_jobs_for_current_controller() -> int:
                         ManagedJobScheduleState.INACTIVE.value,
                         ManagedJobScheduleState.DONE.value,
                     ]),
+                    has_nonterminal_task,
                     stale_owner,
                 )).values({
                     job_info_table.c.controller_pid: None,
@@ -3111,6 +3268,13 @@ def reset_job_for_recovery_if_stale(job_id: int, owner: tuple[str,
                                                               int]) -> bool:
     """Reset one stale-generation job without clobbering a fresh reclaim."""
     engine = _db_manager.get_engine()
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    has_nonterminal_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+            spot_table.c.status.not_in(terminal_status_values)))
     with orm.Session(engine) as session:
         _lock_current_controller_owner(session, owner)
         stale_owner = sqlalchemy.or_(
@@ -3127,6 +3291,7 @@ def reset_job_for_recovery_if_stale(job_id: int, owner: tuple[str,
                         ManagedJobScheduleState.INACTIVE.value,
                         ManagedJobScheduleState.DONE.value,
                     ]),
+                    has_nonterminal_task,
                     stale_owner,
                 )).values({
                     job_info_table.c.controller_pid: None,

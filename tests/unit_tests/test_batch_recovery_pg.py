@@ -464,3 +464,57 @@ def test_postgres_cancel_and_claim_cannot_both_win(postgres_engine,
             assert state.get_status(4102) == state.ManagedJobStatus.PENDING
     finally:
         asyncio.run(async_engine.dispose())
+
+
+def test_postgres_controller_failure_decision_uses_live_generation(
+        postgres_engine, monkeypatch):
+    """Terminalization and DONE compose with the real dual-lock fence."""
+    monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
+    instance_id = '96d9d1f6-8ba4-402b-85f5-27db321fd504'
+    generation = 72
+    job_id = 4172
+    with postgres_engine.begin() as connection:
+        connection.execute(state.job_info_table.insert().values(
+            spot_job_id=job_id,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            controller_pid=7777,
+            controller_pid_started_at=1.0,
+            controller_instance_id=instance_id,
+            controller_generation=generation))
+        connection.execute(state.spot_table.insert().values(
+            spot_job_id=job_id,
+            task_id=0,
+            job_name='generation-fenced-cleanup',
+            status=state.ManagedJobStatus.RUNNING.value))
+
+    monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'controller')
+    monkeypatch.setenv(request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
+                       instance_id)
+    monkeypatch.setenv(request_postgres.CONTROLLER_GENERATION_ENV_VAR,
+                       str(generation))
+    snapshot = {
+        'schedule_state': state.ManagedJobScheduleState.ALIVE,
+        'controller_pid': 7777,
+        'controller_pid_started_at': 1.0,
+        'controller_instance_id': instance_id,
+        'controller_generation': generation,
+    }
+    try:
+        with _live_controller_generation(postgres_engine, instance_id,
+                                         generation):
+            assert state.set_failed_controller_if_current_snapshot(
+                job_id, **snapshot, failure_reason='controller process died')
+            assert state.get_status(job_id) == (
+                state.ManagedJobStatus.FAILED_CONTROLLER)
+            assert state.get_job_schedule_state(job_id) == (
+                state.ManagedJobScheduleState.ALIVE)
+            assert state.finish_controller_cleanup_if_current_snapshot(
+                job_id, **snapshot)
+            assert state.get_job_schedule_state(job_id) == (
+                state.ManagedJobScheduleState.DONE)
+    finally:
+        with postgres_engine.begin() as connection:
+            connection.execute(state.spot_table.delete().where(
+                state.spot_table.c.spot_job_id == job_id))
+            connection.execute(state.job_info_table.delete().where(
+                state.job_info_table.c.spot_job_id == job_id))

@@ -644,6 +644,47 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             return None
         return '; '.join(error_msgs)
 
+    def _snapshot_kwargs(snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'schedule_state': snapshot['schedule_state'],
+            'controller_pid': snapshot['controller_pid'],
+            'controller_pid_started_at': snapshot['controller_pid_started_at'],
+            'controller_instance_id': snapshot.get('controller_instance_id'),
+            'controller_generation': snapshot.get('controller_generation'),
+        }
+
+    def _snapshot_is_unchanged(info: dict[str, Any],
+                               fresh_info: dict[str, Any] | None) -> bool:
+        return (fresh_info is not None and
+                fresh_info['schedule_state'] == info['schedule_state'] and
+                fresh_info['controller_pid'] == info['controller_pid'] and
+                fresh_info['controller_pid_started_at']
+                == info['controller_pid_started_at'] and
+                fresh_info.get('controller_instance_id')
+                == info.get('controller_instance_id') and
+                fresh_info.get('controller_generation')
+                == info.get('controller_generation'))
+
+    def _finish_terminal_cleanup(job_id: int, tasks: list[dict[str, Any]],
+                                 pool: str | None, snapshot: dict[str,
+                                                                  Any]) -> None:
+        """Clean a terminal job, then finish its exact durable snapshot."""
+        if _controller_is_restarting():
+            logger.info(f'Controller restart in progress for terminal job '
+                        f'{job_id}; deferring cleanup/finalization to the next '
+                        'status update cycle.')
+            return
+        cleanup_error = _cleanup_job_clusters(job_id, tasks, pool)
+        if cleanup_error:
+            logger.error(cleanup_error)
+            return
+        finished = (
+            managed_job_state.finish_controller_cleanup_if_current_snapshot(
+                job_id, **_snapshot_kwargs(snapshot)))
+        if not finished:
+            logger.info(f'Job {job_id} changed while terminal cleanup was in '
+                        'progress; deferring DONE to the next status update.')
+
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
@@ -664,6 +705,21 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
         # Handle jobs with schedule state (non-legacy jobs):
         pid = info['controller_pid']
         pid_started_at = info['controller_pid_started_at']
+        snapshot_all_tasks_terminal = all(
+            task['status'].is_terminal() for task in tasks)
+        if snapshot_all_tasks_terminal:
+            fresh_info = managed_job_state.get_job_status_check_state(job_id)
+            if not _snapshot_is_unchanged(info, fresh_info):
+                logger.info(f'Job {job_id} changed since the terminal status '
+                            'snapshot; deferring cleanup.')
+                continue
+            assert fresh_info is not None
+            if not fresh_info['all_tasks_terminal']:
+                logger.info(f'Job {job_id} is no longer terminal; deferring '
+                            'cleanup.')
+                continue
+            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
+            continue
         if current_controller_owner is not None:
             recorded_owner = (info.get('controller_instance_id'),
                               info.get('controller_generation'))
@@ -761,18 +817,12 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             # The controller marked the job done and exited between the batched
             # snapshot and the destructive path. This is fine.
             continue
-        if (fresh_info is None or
-                fresh_info['schedule_state'] != schedule_state or
-                fresh_info['controller_pid'] != pid or
-                fresh_info['controller_pid_started_at'] != pid_started_at or
-                fresh_info.get('controller_instance_id')
-                != info.get('controller_instance_id') or
-                fresh_info.get('controller_generation')
-                != info.get('controller_generation')):
+        if not _snapshot_is_unchanged(info, fresh_info):
             logger.info(f'Job {job_id} schedule state or controller pid '
                         'changed since the status snapshot was taken; '
                         'deferring to the next status update cycle.')
             continue
+        assert fresh_info is not None
 
         # The controller can also die AFTER all tasks are already terminal but
         # BEFORE it flips schedule_state to DONE, e.g. during log streaming or
@@ -783,15 +833,7 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             logger.info(f'Job {job_id} already reached terminal task status; '
                         'finalizing schedule state without rewriting the job '
                         'to FAILED_CONTROLLER.')
-            if _controller_is_restarting():
-                logger.info(f'Controller restart in progress for terminal job '
-                            f'{job_id}; deferring cleanup/finalization to the '
-                            'next status update cycle.')
-                continue
-            cleanup_error = _cleanup_job_clusters(job_id, tasks, info['pool'])
-            if cleanup_error:
-                logger.error(cleanup_error)
-            scheduler.job_done(job_id, idempotent=True)
+            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
             continue
 
         # The controller process for this managed job is not running: it must
@@ -813,47 +855,24 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
                 f'for job {job_id} (will re-check on the next status update).')
             continue
 
-        # Cleanup clusters and capture any errors.
-        cleanup_error = _cleanup_job_clusters(job_id, tasks, info['pool'])
-        cleanup_error_msg = ''
-        if cleanup_error:
-            cleanup_error_msg = f'Also, cleanup failed: {cleanup_error}. '
-
-        # Cluster teardown can take minutes, so a restart can begin while it
-        # runs. The cluster is gone either way, but the terminal set_failed
-        # below is what makes the job unrecoverable -- defer it so a restarted
-        # controller can resume the job (recovery relaunches the cluster).
-        if _controller_is_restarting():
-            logger.info(
-                f'Controller restart began during cluster cleanup; deferring '
-                f'FAILED_CONTROLLER for job {job_id} (will re-check on the '
-                f'next status update).')
+        failure_message = (
+            f'Controller process has exited abnormally ({failure_reason}). '
+            f'For more details, run: sky jobs logs --controller {job_id}')
+        terminalized = (
+            managed_job_state.set_failed_controller_if_current_snapshot(
+                job_id,
+                **_snapshot_kwargs(fresh_info),
+                failure_reason=failure_message))
+        if not terminalized:
+            logger.info(f'Job {job_id} changed before FAILED_CONTROLLER could '
+                        'be committed; deferring cleanup.')
             continue
 
-        # Set all tasks to FAILED_CONTROLLER, regardless of current status.
-        # This may change a job from SUCCEEDED or another terminal state to
-        # FAILED_CONTROLLER. This is what we want - we are sure that this
-        # controller process crashed, so we want to capture that even if the
-        # underlying job succeeded.
-        # Note: 2+ invocations of update_managed_jobs_statuses could be running
-        # at the same time, so this could override the FAILED_CONTROLLER status
-        # set by another invocation of update_managed_jobs_statuses. That should
-        # be okay. The only difference could be that one process failed to clean
-        # up the cluster while the other succeeds. No matter which
-        # failure_reason ends up in the database, the outcome is acceptable.
-        # We assume that no other code path outside the controller process will
-        # update the job status.
-        managed_job_state.set_failed(
-            job_id,
-            task_id=None,
-            failure_type=managed_job_state.ManagedJobStatus.FAILED_CONTROLLER,
-            failure_reason=
-            f'Controller process has exited abnormally ({failure_reason}). '
-            f'{cleanup_error_msg}'
-            f'For more details, run: sky jobs logs --controller {job_id}',
-            override_terminal=True)
-
-        scheduler.job_done(job_id, idempotent=True)
+        # Terminal task state is the durable no-recovery decision. Provider
+        # cleanup follows it so a handoff can retry teardown but cannot relaunch
+        # the workload underneath an old generation's destructive request.
+        logger.info(failure_message)
+        _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
 
 
 def get_job_timestamp(backend: 'backends.CloudVmRayBackend',

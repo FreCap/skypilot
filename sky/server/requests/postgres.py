@@ -22,6 +22,7 @@ from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 import sky
 from sky import sky_logging
+from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server.requests import preconditions
 from sky.server.requests import registry as request_registry
@@ -38,8 +39,9 @@ REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 POSTGRES_REQUEST_BACKEND = 'postgres'
 SERVER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_API_SERVER_INSTANCE_ID'
 SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
-CONTROLLER_GENERATION_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_GENERATION'
-CONTROLLER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'
+CONTROLLER_GENERATION_ENV_VAR = (server_constants.CONTROLLER_GENERATION_ENV_VAR)
+CONTROLLER_INSTANCE_ID_ENV_VAR = (
+    server_constants.CONTROLLER_INSTANCE_ID_ENV_VAR)
 ROLE_DRAIN_MARKER_PATH = '/var/run/skypilot/draining'
 
 _CLAIM_LEASE_SECONDS = 30

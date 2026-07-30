@@ -73,6 +73,77 @@ def test_request_store_cutover_blocks_new_submissions_but_not_control_api():
     assert control.status_code == 200
 
 
+def test_controller_generation_admission_accepts_only_current_owner():
+    app = _make_app(server.ControllerGenerationMiddleware)
+    instance_id = '96d9d1f6-8ba4-402b-85f5-27db321fd504'
+    headers = {
+        server.server_constants.CONTROLLER_INSTANCE_ID_HEADER: instance_id,
+        server.server_constants.CONTROLLER_GENERATION_HEADER: '22',
+    }
+    with mock.patch.dict('os.environ',
+                         {'SKYPILOT_API_REQUEST_BACKEND': 'postgres'}), \
+         mock.patch(
+             'sky.server.requests.postgres.controller_leadership_is_current',
+             side_effect=[True, False]) as is_current:
+        with TestClient(app) as client:
+            accepted = client.get('/route', headers=headers)
+            fenced = client.get('/route', headers=headers)
+
+    assert accepted.status_code == 200
+    assert fenced.status_code == 409
+    assert fenced.json() == {
+        'detail': 'Controller generation is no longer current.'
+    }
+    assert is_current.call_args_list == [
+        mock.call(instance_id, 22),
+        mock.call(instance_id, 22),
+    ]
+
+
+def test_controller_generation_admission_rejects_partial_or_malformed_origin():
+    app = _make_app(server.ControllerGenerationMiddleware)
+    with TestClient(app) as client:
+        partial = client.get(
+            '/route',
+            headers={
+                server.server_constants.CONTROLLER_GENERATION_HEADER: '22'
+            })
+        malformed = client.get(
+            '/route',
+            headers={
+                server.server_constants.CONTROLLER_INSTANCE_ID_HEADER: 'not-a-uuid',
+                server.server_constants.CONTROLLER_GENERATION_HEADER: '22',
+            })
+
+    assert partial.status_code == 400
+    assert malformed.status_code == 400
+
+
+def test_controller_generation_admission_fails_closed_without_database_proof():
+    app = _make_app(server.ControllerGenerationMiddleware)
+    headers = {
+        server.server_constants.CONTROLLER_INSTANCE_ID_HEADER: '96d9d1f6-8ba4-402b-85f5-27db321fd504',
+        server.server_constants.CONTROLLER_GENERATION_HEADER: '22',
+    }
+    with TestClient(app) as client:
+        with mock.patch.dict('os.environ',
+                             {'SKYPILOT_API_REQUEST_BACKEND': 'sqlite'}):
+            wrong_backend = client.get('/route', headers=headers)
+        with mock.patch.dict('os.environ',
+                             {'SKYPILOT_API_REQUEST_BACKEND': 'postgres'}), \
+             mock.patch(
+                 'sky.server.requests.postgres.'
+                 'controller_leadership_is_current',
+                 side_effect=RuntimeError('database unavailable')):
+            unavailable = client.get('/route', headers=headers)
+
+    assert wrong_backend.status_code == 409
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {
+        'detail': 'Could not verify controller generation: RuntimeError.'
+    }
+
+
 def test_api_version_middleware_preserves_context_and_headers():
     app = _make_app(server.APIVersionMiddleware)
     version_info = types.SimpleNamespace(api_version=42,
@@ -106,12 +177,14 @@ def test_core_middleware_order_is_characterized():
             server.RequestIDMiddleware,
             server.SecurityHeadersMiddleware,
             server.GracefulShutdownMiddleware,
+            server.ControllerGenerationMiddleware,
             server.APIVersionMiddleware,
         }
     ]
     assert core_classes == [
         server.SecurityHeadersMiddleware,
         server.RequestIDMiddleware,
+        server.ControllerGenerationMiddleware,
         server.GracefulShutdownMiddleware,
         server.APIVersionMiddleware,
     ]
@@ -122,6 +195,7 @@ def test_server_facade_preserves_core_middleware_identity():
             'RequestIDMiddleware',
             'SecurityHeadersMiddleware',
             'GracefulShutdownMiddleware',
+            'ControllerGenerationMiddleware',
             'APIVersionMiddleware',
     ):
         server_class = getattr(server, name)

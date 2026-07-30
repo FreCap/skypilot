@@ -201,6 +201,13 @@ replica-independent and keeps each migration milestone deployable.
   the current generation. A child controller receives the generation at
   startup and must revalidate it before every durable state transition or new
   provider-side action.
+- Controller-owned SDK calls carry the server-owned controller instance and
+  generation as admission metadata. The API replica proves that exact
+  generation still owns both advisory locks before accepting the nested
+  request. This check is the admission linearization point: work admitted
+  before handoff remains durable, while a fenced child cannot submit fresh
+  provider work through the replacement leader. Ordinary clients carry no
+  controller metadata; partial, malformed, and stale metadata fail closed.
 - A managed-job scheduler claim stores the outer controller instance and
   generation beside its pod-local PID. The claim transaction takes a shared
   lock on the exact live `api_controller_leadership` row, so generation
@@ -832,10 +839,18 @@ wait is only a drain aid; correctness comes from the transactional generation
 fence.
 
 Status refresh reads PID, instance, and generation from one snapshot and
-rechecks the same fields immediately before cleanup or terminalization. A row
-owned by another generation is recovery work, never evidence that the current
-leader's local controller crashed. This distinction is required because PIDs
-are meaningful only inside their owning pod.
+rechecks the same fields immediately before terminalization. For a
+nonterminal job whose local controller died, it first commits
+`FAILED_CONTROLLER` under the exact live outer generation and snapshot, then
+performs provider cleanup, and only then marks the schedule state `DONE`.
+Terminal task state is therefore the durable no-recovery decision before any
+destructive provider request. If leadership changes after that decision, the
+replacement leader treats the terminal job as cleanup work rather than
+resetting it for recovery, may safely repeat the idempotent teardown, and
+finishes `DONE` under its own generation. A nonterminal row owned by another
+generation remains recovery work, never evidence that the current leader's
+local controller crashed. This distinction is required because PIDs are
+meaningful only inside their owning pod.
 
 After a scheduler reclaims a job whose durable task status is already
 `RUNNING`, the resumed controller changes the schedule state from `LAUNCHING`
@@ -1182,7 +1197,13 @@ by HA mode.
   recovery resets stale ownership before a replacement scheduler starts.
 - Managed-job refresh tests prove a stale-generation PID is never interpreted
   as a current local crash and cannot cause cluster teardown or
-  `FAILED_CONTROLLER`.
+  `FAILED_CONTROLLER`. They also prove terminalization commits before provider
+  cleanup, a stale owner cannot terminalize, and a replacement generation can
+  finish cleanup for a terminal job without resetting it for recovery.
+- Nested controller admission tests prove current controller metadata is
+  attached to authenticated SDK requests, partial or malformed metadata is
+  rejected, and a generation whose advisory-lock proof is gone cannot submit
+  new API work.
 - Managed-job resume tests prove an already-running task restores schedule
   state to `ALIVE` under the reclaimed generation without launching a second
   workload.
@@ -1649,3 +1670,26 @@ collection of best-effort defaults. It confirmed four gates:
   chart's default cookie.
 
 The chart validation and conformance harness now enforce those gates.
+
+### Review 10: PURSUE
+
+The exact-head review found a remaining handoff window in managed-job status
+refresh. The refresh thread could decide that a local controller died, begin a
+provider teardown, and only afterward attempt the generation-fenced terminal
+write. If the outer lock session disappeared between those operations, the
+replacement generation could recover the job while the old thread was still
+tearing its workload down. The same stale child could also submit a fresh
+nested SDK mutation through the stable API Service because admission did not
+carry the originating controller generation.
+
+Holding a database transaction across a minutes-long provider call was
+rejected because connection loss would silently discard the fence and the row
+lock would delay promotion. Marking `DONE` before cleanup was also rejected
+because a crash would permanently hide leaked resources from retry. The
+revised ordering commits the exact-snapshot terminal task decision first,
+keeps the schedule state eligible for cleanup retry, performs idempotent
+teardown, and marks `DONE` last. A replacement generation adopts terminal
+cleanup but never recovers the workload. Controller-origin admission metadata
+closes the independent stale-child submission path at the API boundary. This
+uses the existing generation and task state, adds no schema, and preserves the
+compatibility `all` role.

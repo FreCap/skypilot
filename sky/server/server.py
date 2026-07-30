@@ -168,6 +168,8 @@ for _dashboard_symbol in (
 RequestIDMiddleware = core_middleware.RequestIDMiddleware
 SecurityHeadersMiddleware = core_middleware.SecurityHeadersMiddleware
 GracefulShutdownMiddleware = core_middleware.GracefulShutdownMiddleware
+ControllerGenerationMiddleware = (
+    core_middleware.ControllerGenerationMiddleware)
 APIVersionMiddleware = core_middleware.APIVersionMiddleware
 
 # Preserve historical import and pickle identities for the stable server
@@ -176,6 +178,7 @@ for _core_middleware_symbol in (
         RequestIDMiddleware,
         SecurityHeadersMiddleware,
         GracefulShutdownMiddleware,
+        ControllerGenerationMiddleware,
         APIVersionMiddleware,
 ):
     _core_middleware_symbol.__module__ = __name__
@@ -328,6 +331,7 @@ app.add_middleware(APIVersionMiddleware)
 app.add_middleware(RBACMiddleware)
 app.add_middleware(InternalDashboardPrefixMiddleware)
 app.add_middleware(GracefulShutdownMiddleware)
+app.add_middleware(ControllerGenerationMiddleware)
 app.add_middleware(PathCleanMiddleware)
 app.add_middleware(CacheControlStaticMiddleware)
 app.add_middleware(
