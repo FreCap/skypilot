@@ -105,6 +105,11 @@ _REQUEST_THREAD_EXECUTOR_LOCK = threading.Lock()
 _REQUEST_THREAD_EXECUTOR: threads.OnDemandThreadExecutor | None = None
 
 
+def api_process_execution_enabled() -> bool:
+    """Whether HTTP handlers may use the legacy in-process execution path."""
+    return os.environ.get('SKYPILOT_API_SERVER_ROLE', 'all') != 'api'
+
+
 def get_request_thread_executor() -> threads.OnDemandThreadExecutor:
     """Lazy init and return the request thread executor for current process."""
     global _REQUEST_THREAD_EXECUTOR
@@ -375,6 +380,11 @@ class RequestWorker:
                 while not heartbeat_stop.is_set():
                     try:
                         if not backend.heartbeat_claim(claim):
+                            if backend.interrupt_cancelled_claim(claim):
+                                logger.info(f'Acknowledged cancellation for '
+                                            f'{claim.request_id} generation '
+                                            f'{claim.execution_generation}.')
+                                return
                             logger.warning(
                                 f'Execution claim for {claim.request_id} '
                                 'became stale; subsequent writes are fenced.')
@@ -1416,6 +1426,12 @@ async def schedule_prepared_request(request_task: api_requests.Request,
 
     durable_queue = (request_storage.get_request_backend().uses_durable_queue
                      is True)
+    if durable_queue:
+        # The PostgreSQL backend inserted the request and queue delivery in one
+        # transaction. An API-only process deliberately has no local queue
+        # factory, and a second put would only re-read the row it just wrote.
+        logger.info(f'Durably queued request: {request_task.request_id}')
+        return
     if precondition is not None and not durable_queue:
         # Schedule precondition wait as a background task so the caller
         # returns immediately.  The task reference is stored in a

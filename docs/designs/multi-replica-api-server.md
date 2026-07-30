@@ -542,11 +542,141 @@ Deployment:
 - Move request GC to a distributed singleton execution.
 - Add role health and instance heartbeats.
 
+Implementation status: the M2 candidate has explicit `api` and `executor`
+supervisors. API pods start Uvicorn only and enqueue every request, including
+short log streams and Jobs wait operations, through PostgreSQL. Executor pods
+start the durable short and long worker pools, publish PostgreSQL-backed
+readiness leases, and own the temporary M2 controller compatibility paths.
+API shutdown no longer inspects or interrupts fleet-wide executor work.
+Cancellation intent is delivered to the exact worker instance, claim token,
+and execution generation through the durable heartbeat path.
+
+Schema revision `002` adds the role-instance table and advertised handler and
+payload compatibility. Periodic maintenance loops use dedicated PostgreSQL
+advisory-lock sessions so two executor replicas elect one active owner and
+promote a standby after session loss. First-writer initialization of the
+server identity is now atomic, and the shared config bootstrap stages complete
+files before an atomic rename so concurrent pods cannot expose partial state.
+HA mode also renders independent API and executor PodDisruptionBudgets with
+`minAvailable: 1`. These are part of M2's role split, not optional rollout
+polish: an autoscaler eviction of the only remaining ready API during a
+graceful replica deletion otherwise defeats the availability contract even
+when durable request delivery is correct.
+
+The M2 compatibility boundary is explicit. Until M3, executor replicas may
+claim both normal and controller execution classes, and the existing
+leader-elected managed-jobs refresh thread plus durable SkyServe daemons remain
+inside the executor lifecycle. M3 must remove that routing exception and those
+controller ownership paths from executors. The complete deletion targets
+remain enumerated in the Legacy Code Removal Map.
+
+Local acceptance is complete. It includes the complete serial
+real-PostgreSQL request suite, including cross-process migration locking and
+the one-slot ordinary-pool saturation regression; role-isolation, shutdown,
+request-executor, server, Uvicorn-loop, database utility, migration utility,
+global-system-config, and connection-pool tests; schema generation; Helm lint;
+and all 219 Helm unit tests. The default and HA Helm renders and server-side
+dry runs also pass. Formatting, mypy across 770 files, Pylint at 10/10, and
+dashboard lint and formatting pass for the changed files.
+
+The first revision 7 failure injection used commit
+`c6c6ac28c04d93b983690abc57999d24e3176ab7` and image digest
+`sha256:69df023f83983cae8baca665ddcbef76c0c04947a14cf04f25619bb2ccc13cca`.
+The first API deletion completed with 14,333 raw health requests and 111
+authenticated durable submit-and-get probes at zero failures. During the
+second deletion, Karpenter independently evicted the sole remaining ready API
+as underutilized. The final sample recorded 26,330 health calls with 415
+failures and 241 durable probes with 36 submit and 36 lookup failures. This is
+negative evidence, not acceptance. It moved the role-scoped disruption budgets
+from M4 into M2; the exact amended image must repeat the full zero-failure gate.
+
+Revision 8 then exposed a separate control-plane isolation defect during the
+deliberately blocked mutation test. The executor supervisor, durable request
+store, and ordinary central-database work all resolved to the same
+process-local `QueuePool(pool_size=1)`. A queue precondition blocked on the
+locked `clusters` table and held that one ordinary connection, so unrelated
+instance and execution-claim heartbeats timed out even though PostgreSQL and
+the durable request tables remained healthy. Fencing still prevented duplicate
+execution, but liveness must not depend on an unrelated workload transaction.
+
+M2 therefore gives the PostgreSQL request store a named, process-local engine
+namespace distinct from the ordinary central-database engine. The namespace
+retains the same strict one-connection pool policy, so this is isolation rather
+than unbounded pool growth. Queue metadata, role leases, claim heartbeats, and
+cancellation acknowledgements use the request-control namespace. Preconditions
+and workload handlers continue to use the ordinary central-database namespace.
+The connection budget already reserves capacity outside the one ordinary
+connection per process for advisory-lock sessions, asynchronous calls, and
+role traffic; the one lazy request-control connection per process is now an
+explicit member of that reserve. A regression test must hold the ordinary
+one-slot pool while proving a role heartbeat and execution-claim heartbeat
+complete through the request-control pool. Live acceptance must repeat the
+blocked-mutation test and show no request-control pool timeout or stale daemon
+claim.
+
+Fresh request-schema bootstrap must also work with that strict one-slot pool.
+The existing distributed Alembic session lock re-entered the same pool for its
+post-lock revision check, which can self-deadlock before any migration runs.
+All PostgreSQL Alembic session locks therefore use the existing dedicated
+`NullPool` advisory-lock engine, release nonwinning probe sessions before
+sleeping, and keep the winning session only for the migration lifetime. The
+schema work continues through the bounded request-control pool. The
+real-PostgreSQL regression starts from an empty schema, so it covers both this
+fresh-bootstrap ordering and the later heartbeat isolation.
+
+Revision 8, with digest
+`sha256:0e9122cac657351dc12eef7ecce05ee1cb8630979b153ee318ee7b7004588a00`,
+proved the role and failure semantics before the pool-isolation correction.
+Two API deletions completed under continuous traffic with 48,884 raw health
+checks and no health or submission failures. The PodDisruptionBudget rejected
+eviction of the only remaining ready API with HTTP 429. Request
+`3760f57e-a75d-4b5e-9855-3c1ffce9fc9b` was submitted through one API, executed
+by an executor, and fetched through the other API in generation 1. Remote
+cancellation of request `732d850c-ba28-4300-93bf-5bd311fd2c3a` was executed by
+a different executor and acknowledged in about 3.86 seconds. Hard-killing the
+owner of mutating request `efdf2e90-f71a-41c9-b5b2-95098d853e0c` fenced the
+generation, terminalized it as an ambiguous interrupted outcome, and created
+no cluster row. An idle-executor deletion and a bounded read-only recovery
+also passed.
+
+Revision 9 used the M2 runtime tree at
+`5fef35ad19e32932c971edd053a0575b4f213c7a` and exact image digest
+`sha256:dbdb605934a0d159535b1b051c25262ec16914de4fa8737b285f86ad79f7c809`.
+The migration hook completed on that digest and schema revision `002`; two API
+and two executor replicas then became ready with zero restarts. During an
+`ACCESS EXCLUSIVE` lock on the ordinary `clusters` table, claimed request
+`a4de37f6-e567-48a1-996e-64966e1c266c` advanced its heartbeat from
+07:53:28.099 to 07:53:48.110 UTC and its lease from 07:53:58.099 to
+07:54:18.110 UTC while all four role leases remained fresh. Cancellation
+request `00ccb040-f304-4a56-9839-e0f23c9c4970` ran on the other executor and
+terminalized the target without waiting for the ordinary pool. The queue row
+was removed, no matching cluster existed, and current role logs contained no
+QueuePool timeout or failed-heartbeat error. The owner's later stale-claim log
+is the expected post-cancellation write fence.
+
+The same revision passed live singleton and API failover. Evicting the
+singleton owner moved all nine PostgreSQL advisory locks to the survivor in
+about two seconds; all five daemon request generations advanced once and
+remained freshly heartbeating while the replacement became ready. Evicting an
+API replica also produced the required HTTP 429 rejection while one protected
+replica was at risk, then rolled to a ready replacement. Across the final
+sample the in-cluster canary recorded 120,375 health successes, zero health
+failures, 583 authenticated submissions, zero submission failures, and 557
+successful result lookups. Thirteen of its 25 bounded result timeouts were the
+revision 8 baseline while old executors drained during the revision 9 rollout;
+the remaining 12 occurred while the test intentionally locked the `clusters`
+workload table. The revision 9 executors resumed successful lookups after each
+unlock, and every recent request reconciled to a terminal state. Both role
+PodDisruptionBudgets report `minAvailable: 1` and one currently allowed
+disruption, both roles have two fresh ready leases, and all four current role
+pods run the exact revision 9 digest with zero restarts.
+
 Deployment:
 
 1. Deploy two API replicas and two executor replicas.
-2. Run an in-cluster ClusterIP canary and continuous authenticated traffic
-   while deleting each API pod.
+2. Verify both role-scoped PodDisruptionBudgets report one healthy protected
+   replica, then run an in-cluster ClusterIP canary and continuous
+   authenticated traffic while deleting each API pod.
 3. Prove follow-up request lookup and logs work through a different API pod.
 4. Delete an idle executor and prove new work continues.
 5. Delete a busy executor and prove ambiguous mutating work is interrupted,
@@ -575,7 +705,8 @@ Deployment:
 ### M4: Migration ordering, disruption safety, and stateless routing
 
 - Make the migration Job a blocking Helm hook.
-- Add PDBs, topology spread, and role-specific readiness.
+- Extend disruption budgets to controller replicas, add topology spread, and
+  complete readiness-first termination for every role.
 - Disable sticky sessions in HA mode.
 - Add an HA conformance script that drives traffic during pod deletion and
   rolling upgrades.

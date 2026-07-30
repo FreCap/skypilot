@@ -98,17 +98,28 @@ async def queue_v2(
 @router.post('/wait')
 async def wait(request: fastapi.Request,
                jobs_wait_body: payloads.JobsWaitBody) -> None:
-    executor.check_request_thread_executor_available()
-    request_task = await executor.prepare_request_async(
-        request_id=request.state.request_id,
-        request_name=request_names.RequestName.JOBS_WAIT,
-        request_body=jobs_wait_body,
-        func=core.wait,
-        schedule_type=api_requests.ScheduleType.LONG,
-        request_cluster_name=common.JOB_CONTROLLER_NAME,
-        auth_user=request.state.auth_user,
-    )
-    executor.execute_request_in_coroutine(request_task)
+    if executor.api_process_execution_enabled():
+        executor.check_request_thread_executor_available()
+        request_task = await executor.prepare_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.JOBS_WAIT,
+            request_body=jobs_wait_body,
+            func=core.wait,
+            schedule_type=api_requests.ScheduleType.LONG,
+            request_cluster_name=common.JOB_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
+        executor.execute_request_in_coroutine(request_task)
+    else:
+        await executor.schedule_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.JOBS_WAIT,
+            request_body=jobs_wait_body,
+            func=core.wait,
+            schedule_type=api_requests.ScheduleType.LONG,
+            request_cluster_name=common.JOB_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
 
 
 @router.post('/cancel')
@@ -138,10 +149,12 @@ async def logs(
         # When refresh is specified, the job controller might be restarted,
         # which takes longer time to finish. We schedule it to long executor.
         schedule_type = api_requests.ScheduleType.LONG
-    if schedule_type == api_requests.ScheduleType.SHORT:
+    if (schedule_type == api_requests.ScheduleType.SHORT and
+            executor.api_process_execution_enabled()):
         executor.check_request_thread_executor_available()
     kill_request_on_disconnect = False
-    if schedule_type == api_requests.ScheduleType.SHORT:
+    if (schedule_type == api_requests.ScheduleType.SHORT and
+            executor.api_process_execution_enabled()):
         request_task = await executor.prepare_request_async(
             request_id=request.state.request_id,
             request_name=request_names.RequestName.JOBS_LOGS,
@@ -169,8 +182,8 @@ async def logs(
         request_task = await api_requests.get_request_async(
             request.state.request_id)
         assert request_task is not None
-        # When runs in long executor process, we should kill the request on
-        # disconnect to cancel the running routine.
+        # A role-split API also uses a worker for short streams, so the owning
+        # executor must observe durable cancellation on disconnect.
         kill_request_on_disconnect = True
 
     return stream_utils.stream_response_for_long_request(

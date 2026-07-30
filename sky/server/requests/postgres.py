@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from collections.abc import Callable
+from collections.abc import Coroutine
 from collections.abc import Generator
 import contextlib
 import datetime
 import os
 import signal
+import threading
 import time
 from typing import Any
 import uuid
@@ -17,6 +20,7 @@ import sqlalchemy
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
+import sky
 from sky import sky_logging
 from sky.server import daemons
 from sky.server.requests import preconditions
@@ -32,10 +36,14 @@ logger = sky_logging.init_logger(__name__)
 REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 POSTGRES_REQUEST_BACKEND = 'postgres'
 SERVER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_API_SERVER_INSTANCE_ID'
+SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 
 _CLAIM_LEASE_SECONDS = 30
 _CLAIM_HEARTBEAT_INTERVAL_SECONDS = 10
 _MAX_EXPIRED_CLAIMS_PER_SWEEP = 100
+_INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
+_INSTANCE_STALE_AFTER_SECONDS = 20
+_VALID_SERVER_ROLES = frozenset({'all', 'api', 'executor', 'controller'})
 
 _METADATA = sqlalchemy.MetaData()
 REQUESTS = sqlalchemy.Table(
@@ -126,6 +134,35 @@ STORE_METADATA = sqlalchemy.Table(
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
 )
+SERVER_INSTANCES = sqlalchemy.Table(
+    'api_server_instances',
+    _METADATA,
+    sqlalchemy.Column('instance_id',
+                      postgresql.UUID(as_uuid=True),
+                      primary_key=True),
+    sqlalchemy.Column('role', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pod_name', sqlalchemy.Text),
+    sqlalchemy.Column('pod_uid', sqlalchemy.Text),
+    sqlalchemy.Column('pod_ip', sqlalchemy.Text),
+    sqlalchemy.Column('version', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('started_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('heartbeat_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('draining_at', sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.Column('ready', sqlalchemy.Boolean, nullable=False),
+    sqlalchemy.Column('health_detail',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('supported_handlers',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('supported_payload_versions',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+)
 
 _DATETIME_FIELDS = frozenset({
     'created_at',
@@ -149,6 +186,205 @@ def ensure_server_instance_id() -> str:
         raise ValueError(
             f'{SERVER_INSTANCE_ID_ENV_VAR} must be a UUID, got {value!r}.'
         ) from e
+
+
+def _validate_server_role(role: str) -> str:
+    if role not in _VALID_SERVER_ROLES:
+        raise ValueError(f'Invalid API server role {role!r}; expected one of '
+                         f'{sorted(_VALID_SERVER_ROLES)}.')
+    return role
+
+
+def _supported_handlers(role: str) -> list[str]:
+    registrations = request_registry.registered_handlers()
+    if role == 'api':
+        return []
+    if role == 'controller':
+        return sorted(registration.name
+                      for registration in registrations
+                      if registration.execution_class is
+                      request_registry.ExecutionClass.CONTROLLER)
+    # M2's executor role is the compatibility consumer for both execution
+    # classes. M3 narrows it to NORMAL when the controller role is available.
+    return sorted(registration.name for registration in registrations)
+
+
+def _supported_payload_versions() -> dict[str, dict[str, int]]:
+    return {
+        requests_lib.DURABLE_PAYLOAD_FORMAT: {
+            'minimum': requests_lib.DURABLE_PAYLOAD_VERSION,
+            'maximum': requests_lib.DURABLE_PAYLOAD_VERSION,
+        }
+    }
+
+
+class ServerInstanceLease:
+    """PostgreSQL-backed liveness and readiness for one role supervisor."""
+
+    def __init__(
+        self,
+        role: str,
+        *,
+        heartbeat_interval_seconds: float = (
+            _INSTANCE_HEARTBEAT_INTERVAL_SECONDS),
+        stale_after_seconds: float = _INSTANCE_STALE_AFTER_SECONDS,
+    ) -> None:
+        self.role = _validate_server_role(role)
+        self.instance_id = ensure_server_instance_id()
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._stale_after_seconds = stale_after_seconds
+        self._ready = False
+        self._draining = False
+        self._health_detail: dict[str, Any] = {'phase': 'initializing'}
+        self._last_success_monotonic: float | None = None
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._heartbeat_lock = threading.Lock()
+
+    def _values(self, *, include_started_at: bool) -> dict[str, Any]:
+        now = sqlalchemy.func.clock_timestamp()
+        with self._state_lock:
+            ready = self._ready
+            draining = self._draining
+            health_detail = dict(self._health_detail)
+        values: dict[str, Any] = {
+            'instance_id': uuid.UUID(self.instance_id),
+            'role': self.role,
+            'pod_name': os.environ.get('HOSTNAME'),
+            'pod_uid': os.environ.get('SKYPILOT_POD_UID'),
+            'pod_ip': os.environ.get('POD_IP'),
+            'version': sky.__version__,
+            'heartbeat_at': now,
+            'draining_at': now if draining else None,
+            'ready': ready and not draining,
+            'health_detail': health_detail,
+            'supported_handlers': _supported_handlers(self.role),
+            'supported_payload_versions': _supported_payload_versions(),
+        }
+        if include_started_at:
+            values['started_at'] = now
+        return values
+
+    def _record_heartbeat_success(self) -> None:
+        with self._state_lock:
+            self._last_success_monotonic = time.monotonic()
+
+    def _register_unlocked(self) -> None:
+        engine = initialize_and_get_db()
+        values = self._values(include_started_at=True)
+        update_values = dict(values)
+        update_values.pop('instance_id')
+        with engine.begin() as connection:
+            connection.execute(
+                postgresql.insert(SERVER_INSTANCES).values(
+                    **values).on_conflict_do_update(
+                        index_elements=[SERVER_INSTANCES.c.instance_id],
+                        set_=update_values))
+        self._record_heartbeat_success()
+
+    def _register(self) -> None:
+        with self._heartbeat_lock:
+            self._register_unlocked()
+
+    def _heartbeat(self, *, lock_timeout: float | None = None) -> bool:
+        if lock_timeout is None:
+            acquired = self._heartbeat_lock.acquire()
+        else:
+            acquired = self._heartbeat_lock.acquire(timeout=lock_timeout)
+        if not acquired:
+            return False
+        try:
+            engine = initialize_and_get_db()
+            values = self._values(include_started_at=False)
+            values.pop('instance_id')
+            with engine.begin() as connection:
+                result = connection.execute(
+                    sqlalchemy.update(SERVER_INSTANCES).where(
+                        SERVER_INSTANCES.c.instance_id == uuid.UUID(
+                            self.instance_id)).values(**values))
+            if result.rowcount != 1:
+                self._register_unlocked()
+                return True
+            self._record_heartbeat_success()
+            return True
+        finally:
+            self._heartbeat_lock.release()
+
+    def start(self) -> None:
+        """Register the instance and begin heartbeating."""
+        self._register()
+        if self._thread is not None:
+            return
+
+        def heartbeat_loop() -> None:
+            while not self._stop_event.wait(self._heartbeat_interval_seconds):
+                try:
+                    self._heartbeat()
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(f'Failed to heartbeat {self.role} instance '
+                                   f'{self.instance_id}: {e}')
+
+        self._thread = threading.Thread(
+            target=heartbeat_loop,
+            name=f'skypilot-{self.role}-instance-heartbeat',
+            daemon=True)
+        self._thread.start()
+
+    def set_ready(self,
+                  ready: bool,
+                  *,
+                  health_detail: dict[str, Any] | None = None) -> None:
+        """Publish an immediate readiness transition."""
+        with self._state_lock:
+            self._ready = ready
+            if health_detail is not None:
+                self._health_detail = health_detail
+        self._heartbeat()
+
+    def is_locally_ready(self) -> bool:
+        """Return readiness using the latest successful database heartbeat."""
+        with self._state_lock:
+            last_success = self._last_success_monotonic
+            return (self._ready and not self._draining and
+                    last_success is not None and time.monotonic() - last_success
+                    <= self._stale_after_seconds)
+
+    def stop(self) -> None:
+        """Mark the instance draining before stopping its heartbeat."""
+        with self._state_lock:
+            self._draining = True
+            self._ready = False
+            self._health_detail = {'phase': 'draining'}
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1, self._heartbeat_interval_seconds *
+                                          2))
+        try:
+            if not self._heartbeat(lock_timeout=1):
+                logger.warning(f'Timed out marking {self.role} instance '
+                               f'{self.instance_id} draining.')
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Failed to mark {self.role} instance '
+                           f'{self.instance_id} draining: {e}')
+
+
+def current_instance_is_ready() -> bool:
+    """Check the current supervisor's durable readiness using the DB clock."""
+    instance_id = uuid.UUID(ensure_server_instance_id())
+    engine = initialize_and_get_db()
+    with engine.connect() as connection:
+        return bool(
+            connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(SERVER_INSTANCES).where(
+                    SERVER_INSTANCES.c.instance_id == instance_id,
+                    SERVER_INSTANCES.c.ready,
+                    SERVER_INSTANCES.c.draining_at.is_(None),
+                    SERVER_INSTANCES.c.heartbeat_at
+                    >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                        seconds=_INSTANCE_STALE_AFTER_SECONDS))).scalar_one())
 
 
 def _utc_datetime(timestamp: float | None) -> datetime.datetime | None:
@@ -193,7 +429,9 @@ def _initialize_schema(engine: sqlalchemy.engine.Engine) -> None:
         mode=migration_utils.configured_migration_mode())
 
 
-_DB_MANAGER = db_utils.DatabaseManager('api_requests', _initialize_schema)
+_DB_MANAGER = db_utils.DatabaseManager('api_requests',
+                                       _initialize_schema,
+                                       engine_namespace='api-requests-control')
 
 
 def initialize_and_get_db() -> sqlalchemy.engine.Engine:
@@ -203,6 +441,70 @@ def initialize_and_get_db() -> sqlalchemy.engine.Engine:
 
 async def _get_async_engine() -> sqlalchemy_async.AsyncEngine:
     return await _DB_MANAGER.get_async_engine()
+
+
+async def run_distributed_singleton(
+    lock_name: str,
+    task_factory: Callable[[], Coroutine[Any, Any, None]],
+    *,
+    retry_interval_seconds: float = 5,
+    connection_check_interval_seconds: float = 5,
+) -> None:
+    """Run one coroutine while this process owns a PostgreSQL session lock.
+
+    The dedicated connection is also the failure detector. If the session
+    becomes unusable, the owned task is cancelled before another process can
+    acquire the released lock and start a replacement.
+    """
+    lock_statement = sqlalchemy.text(
+        'SELECT pg_try_advisory_lock('
+        'hashtextextended(CAST(:lock_name AS text), 0))')
+    unlock_statement = sqlalchemy.text(
+        'SELECT pg_advisory_unlock('
+        'hashtextextended(CAST(:lock_name AS text), 0))')
+    while True:
+        owned_task: asyncio.Task | None = None
+        try:
+            engine = await _get_async_engine()
+            async with engine.connect() as connection:
+                acquired = bool(
+                    (await
+                     connection.execute(lock_statement,
+                                        {'lock_name': lock_name})).scalar_one())
+                if not acquired:
+                    await asyncio.sleep(retry_interval_seconds)
+                    continue
+                logger.info(f'Acquired distributed singleton {lock_name}.')
+                owned_task = asyncio.create_task(task_factory())
+                try:
+                    while not owned_task.done():
+                        done, _ = await asyncio.wait(
+                            {owned_task},
+                            timeout=connection_check_interval_seconds)
+                        if done:
+                            await owned_task
+                            return
+                        await connection.execute(sqlalchemy.text('SELECT 1'))
+                finally:
+                    if owned_task is not None and not owned_task.done():
+                        owned_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await owned_task
+                    with contextlib.suppress(Exception):
+                        await connection.execute(unlock_statement,
+                                                 {'lock_name': lock_name})
+                    logger.info(f'Released distributed singleton {lock_name}.')
+        except asyncio.CancelledError:
+            if owned_task is not None and not owned_task.done():
+                owned_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await owned_task
+            raise
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                f'Distributed singleton {lock_name} lost its PostgreSQL '
+                f'session: {e}')
+            await asyncio.sleep(retry_interval_seconds)
 
 
 def _queue_values(request: requests_lib.Request) -> dict[str, Any]:
@@ -582,6 +884,53 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                 updated_at=now)
         with engine.begin() as connection:
             result = connection.execute(statement)
+        return result.rowcount == 1
+
+    def interrupt_cancelled_claim(
+            self, claim: request_storage.ExecutionClaim) -> bool:
+        """Deliver durable cancellation intent to this owning executor."""
+        engine = initialize_and_get_db()
+        claim_token = uuid.UUID(claim.claim_token)
+        with engine.begin() as connection:
+            row = connection.execute(
+                sqlalchemy.select(REQUESTS.c.pid).where(
+                    REQUESTS.c.request_id == claim.request_id,
+                    REQUESTS.c.execution_generation ==
+                    claim.execution_generation,
+                    REQUESTS.c.claim_token == claim_token,
+                    REQUESTS.c.worker_instance_id == uuid.UUID(
+                        self._instance_id), REQUESTS.c.status ==
+                    requests_lib.RequestStatus.CANCELLED.value,
+                    REQUESTS.c.cancel_requested_at.is_not(None),
+                    REQUESTS.c.cancel_acknowledged_at.is_(None),
+                    REQUESTS.c.lease_expires_at > sqlalchemy.func.
+                    clock_timestamp()).with_for_update()).first()
+            if row is None or row.pid is None:
+                return False
+            pid = int(row.pid)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # The process already observed an equivalent termination event.
+            pass
+        except OSError as e:
+            logger.warning(
+                f'Failed to interrupt cancelled request {claim.request_id} '
+                f'owned by {self._instance_id}: {e}')
+            return False
+        with engine.begin() as connection:
+            result = connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == claim.request_id,
+                    REQUESTS.c.execution_generation ==
+                    claim.execution_generation,
+                    REQUESTS.c.claim_token == claim_token,
+                    REQUESTS.c.worker_instance_id == uuid.UUID(
+                        self._instance_id),
+                    REQUESTS.c.cancel_requested_at.is_not(None)).values(
+                        cancel_acknowledged_at=(
+                            sqlalchemy.func.clock_timestamp()),
+                        updated_at=sqlalchemy.func.clock_timestamp()))
         return result.rowcount == 1
 
     def set_request_finished(self,

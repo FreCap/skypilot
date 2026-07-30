@@ -20,6 +20,7 @@ from sqlalchemy.ext import asyncio as sqlalchemy_async
 from sky import core
 from sky.server import daemons
 from sky.server.requests import cutover
+from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import preconditions
@@ -27,6 +28,8 @@ from sky.server.requests import registry
 from sky.server.requests import requests
 from sky.server.requests import storage
 from sky.server.requests.queues import base as queue_base
+from sky.skylet import constants
+from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
@@ -123,13 +126,156 @@ def _claim(backend: request_postgres.PostgresRequestBackend,
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '001'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '002'
     inspector = sqlalchemy.inspect(engine)
-    assert {'api_requests', 'api_request_queue',
-            'api_request_store_metadata'}.issubset(inspector.get_table_names())
+    assert {
+        'api_requests', 'api_request_queue', 'api_server_instances',
+        'api_request_store_metadata'
+    }.issubset(inspector.get_table_names())
     sqlite_engine = sqlalchemy.create_engine('sqlite://')
     with pytest.raises(RuntimeError, match='requires PostgreSQL'):
         request_postgres._initialize_schema(sqlite_engine)
+
+
+def test_server_instance_lease_publishes_ready_and_draining(
+        request_database, monkeypatch):
+    engine, _ = request_database
+    instance_id = str(uuid.uuid4())
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR, instance_id)
+    monkeypatch.setenv('HOSTNAME', 'executor-pod')
+    monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-uid')
+    monkeypatch.setenv('POD_IP', '10.0.0.1')
+    lease = request_postgres.ServerInstanceLease('executor',
+                                                 heartbeat_interval_seconds=60)
+    lease.start()
+    lease.set_ready(True, health_detail={'phase': 'claiming'})
+    assert lease.is_locally_ready()
+    assert request_postgres.current_instance_is_ready()
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id == uuid.UUID(
+                    instance_id))).mappings().one()
+    assert row['role'] == 'executor'
+    assert row['pod_name'] == 'executor-pod'
+    assert row['pod_uid'] == 'pod-uid'
+    assert row['ready']
+    assert row['draining_at'] is None
+    assert row['health_detail'] == {'phase': 'claiming'}
+    assert row['supported_handlers']
+    lease.stop()
+    assert not lease.is_locally_ready()
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id == uuid.UUID(
+                    instance_id))).mappings().one()
+    assert not row['ready']
+    assert row['draining_at'] is not None
+
+
+def test_request_control_pool_survives_saturated_ordinary_pool(
+        postgres_engine, monkeypatch):
+    """Ordinary DB work cannot starve request and role heartbeats."""
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+
+    connection_url = postgres_engine.url.render_as_string(hide_password=False)
+    monkeypatch.setenv(constants.ENV_VAR_IS_SKYPILOT_SERVER, 'true')
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI, connection_url)
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
+                       str(uuid.uuid4()))
+    isolated_cache = {}
+    isolated_lock_cache = {}
+    monkeypatch.setattr(db_utils, '_postgres_engine_cache', isolated_cache)
+    monkeypatch.setattr(db_utils, '_postgres_lock_engine_cache',
+                        isolated_lock_cache)
+    monkeypatch.setattr(db_utils, '_max_connections', 1)
+    monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine', None)
+    monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine_async', None)
+
+    ordinary_engine = db_utils.get_engine('state')
+    control_engine = request_postgres.initialize_and_get_db()
+    assert ordinary_engine is not control_engine
+    assert ordinary_engine.pool.size() == 1
+    assert control_engine.pool.size() == 1
+
+    request = _request('isolated-control-heartbeat')
+    with control_engine.begin() as connection:
+        connection.execute(request_postgres.REQUESTS.insert().values(
+            **request_postgres._request_values_for_db(request)))
+        connection.execute(request_postgres.QUEUE.insert().values(
+            **request_postgres._queue_values(request)))
+    backend = request_postgres.PostgresRequestBackend()
+    item = _claim(backend, request.request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token)
+    lease = request_postgres.ServerInstanceLease('executor',
+                                                 heartbeat_interval_seconds=60)
+    lease.start()
+    lease.set_ready(True, health_detail={'phase': 'claiming'})
+
+    ordinary_checkout = ordinary_engine.connect()
+    try:
+        assert ordinary_engine.pool.checkedout() == 1
+        assert lease._heartbeat()
+        assert backend.heartbeat_claim(claim)
+        assert lease.is_locally_ready()
+    finally:
+        ordinary_checkout.close()
+        lease.stop()
+        for engine in isolated_cache.values():
+            engine.dispose()
+        for engine in isolated_lock_cache.values():
+            engine.dispose()
+
+
+def test_distributed_singleton_promotes_one_standby(request_database):
+    del request_database
+
+    async def exercise() -> None:
+        started: asyncio.Queue[str] = asyncio.Queue()
+        release = {
+            'first': asyncio.Event(),
+            'second': asyncio.Event(),
+        }
+
+        def factory(name: str):
+
+            async def owned() -> None:
+                await started.put(name)
+                await release[name].wait()
+
+            return owned
+
+        first = asyncio.create_task(
+            request_postgres.run_distributed_singleton(
+                'test-singleton-promotion',
+                factory('first'),
+                retry_interval_seconds=0.05,
+                connection_check_interval_seconds=0.05))
+        second = asyncio.create_task(
+            request_postgres.run_distributed_singleton(
+                'test-singleton-promotion',
+                factory('second'),
+                retry_interval_seconds=0.05,
+                connection_check_interval_seconds=0.05))
+        winner = await asyncio.wait_for(started.get(), timeout=5)
+        await asyncio.sleep(0.15)
+        assert started.empty()
+        winner_task = first if winner == 'first' else second
+        standby_task = second if winner == 'first' else first
+        winner_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await winner_task
+        assert await asyncio.wait_for(started.get(), timeout=5) != winner
+        standby_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await standby_task
+
+    asyncio.run(exercise())
 
 
 def test_create_round_trip_and_atomic_enqueue(request_database):
@@ -168,6 +314,17 @@ def test_concurrent_creation_has_one_winner(request_database):
     results = asyncio.run(create_all())
     assert results.count(True) == 1
     assert results.count(False) == 7
+
+
+def test_api_only_durable_schedule_needs_no_local_queue(request_database,
+                                                        monkeypatch):
+    _, backend = request_database
+    monkeypatch.setattr(storage, '_storage_backend', backend)
+    monkeypatch.setattr(executor, '_queue_factory', None)
+    request = _request('api-only-enqueue')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    asyncio.run(executor.schedule_prepared_request(request))
+    assert request_postgres.PostgresQueueBackend('short').qsize() == 1
 
 
 def test_concurrent_claims_deliver_once(request_database):
@@ -397,6 +554,38 @@ def test_cancel_never_signals_a_different_instance(request_database,
     assert restored.status is requests.RequestStatus.CANCELLED
     assert restored.cancel_requested_at is not None
     assert item.claim_token is not None
+
+
+def test_remote_cancel_is_acknowledged_by_owning_executor(
+        request_database, monkeypatch):
+    engine, executor_backend = request_database
+    executor_instance_id = executor_backend.instance_id
+    assert asyncio.run(
+        executor_backend.create_if_not_exists_async(_request('remote-cancel')))
+    item = _claim(executor_backend, 'remote-cancel')
+    assert item.claim_token is not None
+
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
+                       str(uuid.uuid4()))
+    api_backend = request_postgres.PostgresRequestBackend()
+    kill = mock.Mock()
+    monkeypatch.setattr(request_postgres.os, 'kill', kill)
+    assert api_backend.kill_requests(['remote-cancel']) == ['remote-cancel']
+    kill.assert_not_called()
+
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
+                       executor_instance_id)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token)
+    assert executor_backend.interrupt_cancelled_claim(claim)
+    kill.assert_called_once_with(1234, request_postgres.signal.SIGTERM)
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.cancel_acknowledged_at).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    'remote-cancel')).one()
+    assert row.cancel_acknowledged_at is not None
 
 
 def test_cancel_never_signals_an_expired_local_claim(request_database,

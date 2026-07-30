@@ -15,6 +15,7 @@ import sqlalchemy
 
 from sky import sky_logging
 from sky.skylet import constants
+from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
 
@@ -67,7 +68,7 @@ RECIPES_VERSION = '001'
 RECIPES_LOCK_PATH = f'~/.sky/locks/.{RECIPES_DB_NAME}.lock'
 
 API_REQUESTS_DB_NAME = 'api_requests_db'
-API_REQUESTS_VERSION = '001'
+API_REQUESTS_VERSION = '002'
 API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
 
 
@@ -192,21 +193,26 @@ def _distributed_migration_lock(engine: sqlalchemy.engine.Engine, section: str):
     # blocking pg_advisory_lock statement still owns a transaction while it
     # waits, which can deadlock with CREATE INDEX CONCURRENTLY running under
     # the current lock owner.
-    with engine.connect().execution_options(
-            isolation_level='AUTOCOMMIT') as connection:
-        lock_query = sqlalchemy.text(
-            'SELECT pg_try_advisory_lock(hashtext(:name))')
-        while not bool(
+    lock_engine = db_utils.get_postgres_lock_engine(engine)
+    lock_query = sqlalchemy.text('SELECT pg_try_advisory_lock(hashtext(:name))')
+    while True:
+        with lock_engine.connect().execution_options(
+                isolation_level='AUTOCOMMIT') as connection:
+            acquired = bool(
                 connection.execute(lock_query, {
                     'name': lock_name
-                }).scalar_one()):
-            time.sleep(_DISTRIBUTED_MIGRATION_LOCK_POLL_SECONDS)
-        try:
-            yield
-        finally:
-            connection.execute(
-                sqlalchemy.text('SELECT pg_advisory_unlock(hashtext(:name))'),
-                {'name': lock_name})
+                }).scalar_one())
+            if acquired:
+                try:
+                    yield
+                finally:
+                    connection.execute(
+                        sqlalchemy.text(
+                            'SELECT pg_advisory_unlock(hashtext(:name))'),
+                        {'name': lock_name})
+                return
+        # Do not retain a nonwinning PostgreSQL session while waiting.
+        time.sleep(_DISTRIBUTED_MIGRATION_LOCK_POLL_SECONDS)
 
 
 def _validate_global_user_state_upgrade_start(

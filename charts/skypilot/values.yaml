@@ -19,8 +19,14 @@ apiService:
   # Docker image to use for the API server. The default value will be updated by the release pipeline to be consistent with the SkyPilot release or nightly build.
   # Refer to https://docs.skypilot.co/en/latest/reference/api-server/helm-values-spec.html#helm-values-apiservice-image for more details.
   image: berkeleyskypilot/skypilot-nightly:latest
-  # Number of replicas to deploy - replicas > 1 is not well tested.
+  # Number of stateless API replicas. highAvailability.enabled requires at
+  # least two.
   replicas: 1
+  highAvailability:
+    # Split public API serving from durable request execution. Requires
+    # PostgreSQL, ReadWriteMany storage, RollingUpdate, and executorService.
+    # @schema type: [boolean]
+    enabled: false
   preDeployHook: |-
     # Run commands before deploying the API server, e.g. installing an admin policy.
     # Refer to https://docs.skypilot.co/en/latest/cloud-setup/policy.html for more details about admin policy.
@@ -97,7 +103,7 @@ apiService:
   # @schema type: [object, null]
   readinessProbe:
     httpGet:
-      path: /api/health
+      path: /api/health/ready
       port: 46580
     failureThreshold: 3
     periodSeconds: 5
@@ -264,6 +270,43 @@ apiService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: null
 
+# Active-active workers that claim durable requests from PostgreSQL. This
+# Deployment is rendered only when apiService.highAvailability.enabled=true.
+executorService:
+  # HA mode requires at least two, enforced contextually by the template.
+  # @schema type: [integer]; minimum: 0
+  replicas: 2
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Dependency-free liveness and readiness port.
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 46581
+  # @schema type: [integer]; minimum: 1
+  terminationGracePeriodSeconds: 60
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  # @schema type: [array, null]; item: object
+  extraVolumes: null
+  # @schema type: [array, null]; item: object
+  extraVolumeMounts: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # @schema type: [string, null]
+  topologySpreadTopologyKey: null
+
 # Environment and files required by every central PostgreSQL client. Use these
 # for private CA bundles, client certificates, or shared libpq settings instead
 # of apiService.extra* so the migration Job and managed image workers receive
@@ -280,10 +323,10 @@ databaseConnection:
 # explicit compatibility milestone: it is production-safe for one all-role
 # pod, while role-split multi-replica mode is enabled by later milestones.
 requestStore:
-  # @schema enum: [sqlite, postgres]
+  # @schema enum: [sqlite, postgres]; required: true
   backend: sqlite
   # Shared maintenance gate used by the one-way SQLite cutover command.
-  # @schema type: string
+  # @schema type: string; minLength: 1; required: true
   cutoverGatePath: /root/.sky/api-request-cutover.json
 
 # Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.

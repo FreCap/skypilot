@@ -229,6 +229,17 @@ class RequestBackend(abc.ABC):
         del claim
         return True
 
+    def interrupt_cancelled_claim(self, claim: ExecutionClaim) -> bool:
+        """Signal a cancelled claim owned by this backend instance.
+
+        Distributed backends override this so an API process can record
+        cancellation intent and the remote owning executor can acknowledge
+        and deliver it. Returns True only when a matching local generation was
+        signalled or its process had already exited.
+        """
+        del claim
+        return False
+
     def set_request_finished(self,
                              request_id: str,
                              status: RequestStatus,

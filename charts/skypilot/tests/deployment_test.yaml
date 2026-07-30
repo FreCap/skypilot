@@ -180,6 +180,102 @@ tests:
             name: SKYPILOT_API_REQUEST_BACKEND
             value: postgres
 
+  - it: should render stateless API replicas for role-split HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      executorService.replicas: 2
+      # Simulate an upgrade whose reused values still contain the pre-HA
+      # readiness endpoint. HA must force the role-specific readiness gate.
+      apiService.readinessProbe.httpGet.path: /api/health
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_ROLE
+            value: api
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_INSTANCE_ID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /api/health/ready
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: state-volume
+            mountPath: /root/.sky
+            subPath: .sky
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: sky-ephemeral
+            emptyDir: {}
+
+  - it: should reject HA without the PostgreSQL request store
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires requestStore.backend=postgres"
+
+  - it: should reject HA with fewer than two API replicas
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 1
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.replicas>=2"
+
+  - it: should reject HA with fewer than two executor replicas
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      executorService.replicas: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires executorService.replicas>=2"
+
+  - it: should reject HA without shared RWX storage
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteOnce
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany"
+
   - it: should reject the PostgreSQL request store without an external database
     set:
       requestStore.backend: postgres
@@ -1232,7 +1328,7 @@ tests:
             name: logrotate
 
   # Tests for the apiService.livenessProbe / readinessProbe / startupProbe values
-  - it: should render the default probe specs that match the historical chart output
+  - it: should render the default liveness, readiness, and startup probes
     asserts:
       # Liveness — historical defaults: httpGet only, periodSeconds 30,
       # timeoutSeconds 1. failureThreshold and initialDelaySeconds were
@@ -1253,11 +1349,10 @@ tests:
           path: spec.template.spec.containers[0].livenessProbe.failureThreshold
       - notExists:
           path: spec.template.spec.containers[0].livenessProbe.initialDelaySeconds
-      # Readiness — historical defaults plus successThreshold injected
-      # based on upgradeStrategy (RollingUpdate=3 by default; Recreate=1).
+      # Readiness additionally verifies that a durable executor is available.
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet.path
-          value: /api/health
+          value: /api/health/ready
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet.port
           value: 46580
@@ -1464,12 +1559,11 @@ tests:
           content:
             name: SOME_OTHER_ENV
             value: "x"
-      # Total env count = baseline (11, including POD_NAMESPACE and the
-      # explicit external-LB capability flag, with chart POD_IP suppressed:
-      # 10) + 2 user-provided = 12. A duplicate would push it to 13.
+      # The four HA role and identity variables extend the prior baseline.
+      # A duplicate POD_IP would push the count to 19.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 14
+          count: 18
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -1479,11 +1573,11 @@ tests:
             fieldRef:
               fieldPath: status.podIP
     asserts:
-      # Baseline (11, including POD_NAMESPACE and the external-LB capability)
-      # - chart POD_IP (10) + user POD_IP (1) = 11.
+      # The four HA role and identity variables extend the prior baseline.
+      # A duplicate POD_IP would push the count to 18.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 13
+          count: 17
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:
