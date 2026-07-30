@@ -186,8 +186,8 @@ cover the new production module and the façade.
   at 10.00, dashboard ESLint, and Prettier. Ruff, import-linter, compileall,
   both staged and unstaged `git diff --check`, and an isolated
   BasedPyright 1.39.9 run all pass.
-- Eight alternating fresh-process import samples measured a 0.982875-second
-  baseline median and 0.991230-second extracted median, a 0.850% increase.
+- Eight alternating fresh-process import samples measured a 0.979283-second
+  baseline median and 0.976104-second extracted median, a 0.325% improvement.
   Direct aliases add no wrapper frame, and AST equivalence proves no provider,
   database, cache-query, copy, loop, or retry change in the moved bodies.
 
