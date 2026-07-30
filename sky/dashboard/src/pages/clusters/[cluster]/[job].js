@@ -96,11 +96,12 @@ export function JobDetailPage() {
 
   const PENDING_STATUSES = useMemo(() => ['INIT', 'PENDING', 'SETTING_UP'], []);
 
-  const isPending = useMemo(() => {
-    if (!clusterJobData || !job) return true;
-    const jobData = clusterJobData.find((j) => j.id == job);
-    return jobData && PENDING_STATUSES.includes(jobData.status);
-  }, [clusterJobData, job, PENDING_STATUSES]);
+  const selectedJob = useMemo(() => {
+    if (!clusterJobData || !job) return null;
+    return clusterJobData.find((candidate) => candidate.id == job) ?? null;
+  }, [clusterJobData, job]);
+  const isPending =
+    !selectedJob || PENDING_STATUSES.includes(selectedJob.status);
 
   // Update isInitialLoad when both cluster and job data are first loaded
   useEffect(() => {
@@ -125,7 +126,7 @@ export function JobDetailPage() {
   const { lines: displayLines, isLoading: isLoadingLogs } = useLogStreamer({
     streamFn: streamClusterJobLogs,
     streamArgs: logStreamArgs,
-    enabled: Boolean(cluster && job) && !isPending,
+    enabled: Boolean(cluster && job && selectedJob) && !isPending,
     refreshTrigger: logsRefreshToken,
     onError: handleStreamError,
   });
@@ -165,17 +166,14 @@ export function JobDetailPage() {
     id: job,
   };
 
-  if (clusterData && clusterJobData) {
-    const foundJob = clusterJobData.find((j) => j.id == job);
-    if (foundJob) {
-      jobData = {
-        ...foundJob,
-        infra: clusterData.infra,
-        cluster: clusterData.cluster,
-        user: clusterData.user,
-        user_hash: clusterData.user_hash,
-      };
-    }
+  if (clusterData && selectedJob) {
+    jobData = {
+      ...selectedJob,
+      infra: clusterData.infra,
+      cluster: clusterData.cluster,
+      user: clusterData.user,
+      user_hash: clusterData.user_hash,
+    };
   }
 
   const title =

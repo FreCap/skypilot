@@ -28,6 +28,23 @@ describe('useLogStreamer progress ownership', () => {
     jest.useRealTimers();
   });
 
+  it('does not call the stream function while disabled', () => {
+    const stream = deferredStream();
+    const { result, unmount } = renderHook(() =>
+      useLogStreamer({
+        streamFn: stream.streamFn,
+        streamArgs: STREAM_ARGS,
+        enabled: false,
+      })
+    );
+
+    expect(stream.streamFn).not.toHaveBeenCalled();
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.lines).toEqual([]);
+    expect(jest.getTimerCount()).toBe(0);
+    unmount();
+  });
+
   it('keeps only the newest process progress lines within the render budget', async () => {
     const stream = deferredStream();
     const { result, unmount } = renderHook(() =>

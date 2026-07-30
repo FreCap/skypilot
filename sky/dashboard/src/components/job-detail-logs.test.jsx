@@ -9,6 +9,7 @@ import {
 
 import JobDetails from '@/pages/jobs/[job]';
 import TaskDetails from '@/pages/jobs/[job]/[task]';
+import ClusterJobDetails from '@/pages/clusters/[cluster]/[job]';
 import {
   computeJobGroupStatus,
   downloadManagedJobLogs,
@@ -16,6 +17,10 @@ import {
   useManagedJobPools,
   useSingleManagedJob,
 } from '@/data/connectors/jobs';
+import {
+  streamClusterJobLogs,
+  useClusterDetails,
+} from '@/data/connectors/clusters';
 import { useLogStreamer } from '@/hooks/useLogStreamer';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { usePluginComponents } from '@/plugins/PluginProvider';
@@ -41,6 +46,12 @@ jest.mock('@/data/connectors/jobs', () => ({
   useManagedJobPools: jest.fn(() => []),
 }));
 
+jest.mock('@/data/connectors/clusters', () => ({
+  downloadJobLogs: jest.fn(),
+  streamClusterJobLogs: jest.fn(),
+  useClusterDetails: jest.fn(),
+}));
+
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
   default: {
@@ -58,6 +69,10 @@ jest.mock('@/plugins/PluginProvider', () => ({
 
 jest.mock('@/plugins/PluginSlot', () => ({
   PluginSlot: jest.fn(({ fallback = null }) => fallback),
+}));
+
+jest.mock('@/components/elements/UserDisplay', () => ({
+  UserDisplay: () => null,
 }));
 
 jest.mock('@/utils/grafana', () => ({
@@ -121,6 +136,12 @@ function latestEnabledStreamCall(controller) {
     )?.[0];
 }
 
+function latestClusterStreamCall() {
+  return [...useLogStreamer.mock.calls]
+    .reverse()
+    .find(([options]) => options.streamFn === streamClusterJobLogs)?.[0];
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   router.query = { job: '42' };
@@ -137,11 +158,91 @@ beforeEach(() => {
     refreshJobData: jest.fn().mockResolvedValue(undefined),
   });
   useManagedJobPools.mockReturnValue([]);
+  useClusterDetails.mockReturnValue({
+    clusterData: null,
+    clusterJobData: null,
+    loading: true,
+    clusterJobsLoading: true,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
   useLogStreamer.mockImplementation(({ streamArgs }) => ({
     lines: streamArgs.controller ? controllerLines : workerLines,
     isLoading: false,
     hasReceivedFirstChunk: true,
   }));
+});
+
+it('streams one confirmed runnable cluster job but not a pending job', () => {
+  router.query = { cluster: 'cluster-a', job: '7' };
+  const refreshData = jest.fn().mockResolvedValue(undefined);
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-a', workspace: 'workspace-a' },
+    clusterJobData: [{ id: 7, status: 'PENDING', job: 'queued' }],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData,
+  });
+
+  const view = render(<ClusterJobDetails />);
+  expect(latestClusterStreamCall().enabled).toBe(false);
+
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-a', workspace: 'workspace-a' },
+    clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training' }],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData,
+  });
+  view.rerender(<ClusterJobDetails />);
+
+  expect(latestClusterStreamCall()).toMatchObject({
+    streamFn: streamClusterJobLogs,
+    streamArgs: {
+      clusterName: 'cluster-a',
+      jobId: '7',
+      workspace: 'workspace-a',
+    },
+    enabled: true,
+  });
+});
+
+it('does not start a mismatched stream across cluster-job route changes', () => {
+  router.query = { cluster: 'cluster-a', job: '7' };
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-a', workspace: 'workspace-a' },
+    clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training' }],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
+  const view = render(<ClusterJobDetails />);
+  expect(latestClusterStreamCall().enabled).toBe(true);
+
+  router.query = { cluster: 'cluster-b', job: '8' };
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-b', workspace: 'workspace-b' },
+    clusterJobData: [],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
+  view.rerender(<ClusterJobDetails />);
+
+  expect(latestClusterStreamCall()).toMatchObject({
+    streamArgs: {
+      clusterName: 'cluster-b',
+      jobId: '8',
+      workspace: 'workspace-b',
+    },
+    enabled: false,
+  });
+  expect(
+    useLogStreamer.mock.calls.some(
+      ([options]) =>
+        options.enabled === true &&
+        options.streamArgs.clusterName === 'cluster-b'
+    )
+  ).toBe(false);
 });
 
 it('uses the current job rows for its pool-link snapshot', async () => {
