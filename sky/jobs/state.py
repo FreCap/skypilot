@@ -931,13 +931,20 @@ def _collect_status_check_snapshot(
     job_ids: list[int] | None, fetch_chunk: Callable[[list[int] | None],
                                                      list[Any]]
 ) -> dict[int, dict[str, Any]]:
-    """Chunk ``job_ids`` and merge the fetched rows into one snapshot."""
+    """Chunk ``job_ids`` and merge the fetched rows into one snapshot.
+
+    Explicit job-id callers may repeat the same job across retry, cancel, or
+    refresh selection paths. Deduping before chunking keeps the snapshot
+    stable and avoids re-fetching/re-merging the same task rows when a repeated
+    id would otherwise spill into a later chunk.
+    """
     result: dict[int, dict[str, Any]] = {}
     if job_ids is None:
         _merge_jobs_status_check_rows(result, fetch_chunk(None))
         return result
-    for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-        chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
         _merge_jobs_status_check_rows(result, fetch_chunk(chunk))
     return result
 

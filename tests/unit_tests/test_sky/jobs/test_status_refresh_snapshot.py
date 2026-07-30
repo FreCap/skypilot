@@ -96,6 +96,57 @@ class TestGetJobsToCheckStatusInfo:
         batched = state.get_jobs_to_check_status_info(job_ids)
         assert batched == full
 
+    def test_status_check_helper_dedupes_duplicate_job_ids(
+            self, _mock_managed_jobs_db_conn, _seed_test_jobs, monkeypatch):
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+        job_id = _seed_test_jobs['job_id1']
+        expected = state.get_jobs_status_check_info([job_id])[job_id]
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            info = state.get_jobs_status_check_info([job_id, job_id])
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert info == {job_id: expected}
+        assert select_count == 1
+
+    def test_duplicate_job_ids_do_not_duplicate_tasks_or_queries(
+            self, _mock_managed_jobs_db_conn, _seed_test_jobs, monkeypatch):
+        full = state.get_jobs_to_check_status_info()
+        job_id = next(iter(full))
+        expected = full[job_id]
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            info = state.get_jobs_to_check_status_info([job_id, job_id])
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert info == {job_id: expected}
+        assert select_count == 1
+
     def test_refresh_snapshot_issues_single_select(self,
                                                    _mock_managed_jobs_db_conn,
                                                    _seed_test_jobs):
