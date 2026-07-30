@@ -96,6 +96,38 @@ def test_terminate_cluster_handles_concurrent_cluster_removal(
 
 
 @pytest.mark.asyncio
+async def test_event_callback_pool_job_uses_one_context_helper():
+    task = mock.MagicMock()
+    task.event_callback = 'echo callback'
+    task.envs = {}
+    task.name = 'pool-task'
+
+    with mock.patch(
+            'sky.jobs.utils.managed_job_state.get_pool_and_current_cluster_name',
+            return_value=('pool-a', 'replica-a')) as get_context, \
+         mock.patch('sky.jobs.utils.managed_job_state.get_pool_from_job_id',
+                    side_effect=AssertionError('stale point pool read')), \
+         mock.patch('sky.jobs.utils.managed_job_state.get_pool_submit_info',
+                    side_effect=AssertionError('stale point submit read')), \
+         mock.patch('sky.jobs.utils.generate_managed_job_cluster_name',
+                    side_effect=AssertionError('pool jobs must not use task '
+                                               'cluster fallback')), \
+         mock.patch('sky.jobs.utils.log_lib.run_bash_command_with_log',
+                    return_value=0) as run:
+        callback = utils.event_callback_func(job_id=42, task_id=0, task=task)
+        await callback('RUNNING')
+
+    get_context.assert_called_once_with(42)
+    run.assert_called_once()
+    env_vars = run.call_args.kwargs['env_vars']
+    assert env_vars['JOB_ID'] == '42'
+    assert env_vars['JOB_STATUS'] == 'RUNNING'
+    assert env_vars['CLUSTER_NAME'] == 'replica-a'
+    assert env_vars['TASK_NAME'] == 'pool-task'
+    assert env_vars['EVENT_TYPE'] == 'Spot'
+
+
+@pytest.mark.asyncio
 @mock.patch('sky.jobs.utils.logger')
 @mock.patch('sky.global_user_state.get_handle_from_cluster_name')
 async def test_get_job_status_timeout(mock_get_handle, mock_logger):

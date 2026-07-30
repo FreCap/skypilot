@@ -1480,6 +1480,22 @@ def get_pool_from_job_id(job_id: int) -> str | None:
         return pool[0] if pool else None
 
 
+@db_retries.retry
+def get_pool_and_current_cluster_name(
+        job_id: int) -> tuple[str | None, str | None]:
+    """Read the pool binding and current pool worker from one job row."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        info = session.execute(
+            sqlalchemy.select(
+                job_info_table.c.pool,
+                job_info_table.c.current_cluster_name).where(
+                    job_info_table.c.spot_job_id == job_id)).fetchone()
+        if info is None:
+            return None, None
+        return info[0], info[1]
+
+
 @db_retries.retry_async
 async def get_pool_and_execution_from_job_id_async(
         job_id: int) -> tuple[str | None, str | None]:

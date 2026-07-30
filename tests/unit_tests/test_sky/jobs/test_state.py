@@ -767,6 +767,44 @@ def test_get_log_stream_context_keeps_task_without_job_info(
     assert counts['n'] == 1, counts
 
 
+def test_get_pool_and_current_cluster_name_reads_one_row(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        context = state.get_pool_and_current_cluster_name(job_id)
+
+    assert context == ('pool-a', 'replica-a')
+    assert counts['n'] == 1, counts
+
+    state.set_current_cluster_name(job_id, 'replica-b')
+    with _count_sql_statements(engine) as counts:
+        refreshed_context = state.get_pool_and_current_cluster_name(job_id)
+
+    assert refreshed_context == ('pool-a', 'replica-b')
+    assert counts['n'] == 1, counts
+
+
+def test_get_pool_and_current_cluster_name_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        context = state.get_pool_and_current_cluster_name(999999)
+
+    assert context == (None, None)
+    assert counts['n'] == 1, counts
+
+
 def test_get_job_cancellation_states_batches_lifecycle_snapshot(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
