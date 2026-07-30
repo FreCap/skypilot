@@ -559,7 +559,7 @@ evict_pod() {
   local pod="$2"
   local pdb="${RELEASE}-${role}"
   local deadline=$((SECONDS + 600))
-  local output allowed_before expected_allowed pod_json
+  local output allowed_before admission_code pod_json
 
   while true; do
     if ! pod_json="$(
@@ -600,6 +600,16 @@ evict_pod() {
 }
 EOF
     )"; then
+      if ! jq -e '
+        .kind == "Status" and
+        .status == "Success" and
+        (.code // 0) >= 200 and
+        (.code // 0) < 300
+      ' <<<"${output}" >/dev/null; then
+        echo "Eviction API returned an unexpected response for ${pod}: ${output}" >&2
+        return 1
+      fi
+      admission_code="$(jq -r '.code' <<<"${output}")"
       break
     fi
     if [[ "${output}" == *"NotFound"* ]]; then
@@ -618,20 +628,7 @@ EOF
     sleep 2
   done
 
-  expected_allowed=$((allowed_before - 1))
-  local reservation_deadline=$((SECONDS + 15))
-  while ! kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pdb "${pdb}" \
-    -o json | jq -e --arg pod "${pod}" \
-      --argjson allowed "${expected_allowed}" \
-      '((.status.disruptedPods // {}) | has($pod)) and
-       ((.status.disruptionsAllowed // 0) <= $allowed)' >/dev/null; do
-    if ((SECONDS >= reservation_deadline)); then
-      echo "PDB ${pdb} did not record the accepted eviction for ${pod}" >&2
-      return 1
-    fi
-    sleep 1
-  done
-  echo "eviction ${pod}: PDB ${pdb} reserved its disruption budget"
+  echo "eviction ${pod}: Eviction API admitted code=${admission_code} with PDB ${pdb} allowed_before=${allowed_before}"
 }
 
 drain_role_replicas() {

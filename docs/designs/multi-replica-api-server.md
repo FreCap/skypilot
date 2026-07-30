@@ -1043,6 +1043,24 @@ state, selects one current ready target, and retries selection if an external
 eviction wins the race. It still requires two fully observed controlled drains
 per role; external evictions cannot satisfy that count.
 
+The fifth live attempt used commit `b66d67acc2` and revision 22. Its migration
+hook completed at 14:09:36 UTC, one second before the first target pod. All
+roles rolled to the exact digest while 3,624 health probes and 223 complete
+durable request cycles remained error-free. The harness waited through
+additional Karpenter disruptions, submitted a controlled Eviction for API pod
+`skypilot-ha-api-server-6b9574f8fd-2zfd9`, and the API accepted it. Kubernetes
+then began termination and the readiness probe returned 503, but the harness
+stopped before its drain observations because it did not see that pod in the
+PDB's `disruptedPods` map during its 15-second polling window.
+
+This is negative harness evidence, not M4 acceptance. `disruptedPods` is
+controller bookkeeping, not the admission interface; the PDB controller may
+remove the entry as soon as it observes the admitted pod terminating or
+unready. The successful Eviction subresource response is the atomic PDB
+admission result. The harness now validates that response as a Kubernetes
+`Status` with a successful 2xx code, then proceeds directly to the durable
+lease, readiness endpoint, and Pod-condition drain proofs.
+
 Deployment:
 
 1. Render and server-side dry-run the guarded chart, including the hook,
