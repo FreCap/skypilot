@@ -1795,10 +1795,14 @@ def test_override_env_rejects_server_owned_client_values(
     server_prefixed = f'{constants.SKYPILOT_SERVER_ENV_VAR_PREFIX}TEST_ONLY'
     role = 'SKYPILOT_API_SERVER_ROLE'
     pod_uid = 'SKYPILOT_POD_UID'
+    endpoint = constants.SKY_API_SERVER_URL_ENV_VAR
+    service_account_token = constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR
     monkeypatch.setenv(capability, 'true')
     monkeypatch.setenv(server_prefixed, 'server-value')
     monkeypatch.setenv(role, 'controller')
     monkeypatch.setenv(pod_uid, 'current-pod')
+    monkeypatch.setenv(endpoint, 'http://stable-api-service')
+    monkeypatch.setenv(service_account_token, 'sky_server_token')
 
     body = payloads.RequestBody(
         env_vars={
@@ -1806,6 +1810,8 @@ def test_override_env_rejects_server_owned_client_values(
             server_prefixed: 'client-value',
             role: 'api',
             pod_uid: 'stale-pod',
+            endpoint: 'http://client-controlled-endpoint',
+            service_account_token: 'sky_client_token',
             constants.USER_ID_ENV_VAR: 'client-user-id',
             constants.USER_ENV_VAR: 'client-user',
         })
@@ -1816,11 +1822,15 @@ def test_override_env_rejects_server_owned_client_values(
         assert os.environ[server_prefixed] == 'server-value'
         assert os.environ[role] == 'controller'
         assert os.environ[pod_uid] == 'current-pod'
+        assert os.environ[endpoint] == 'http://stable-api-service'
+        assert os.environ[service_account_token] == 'sky_server_token'
 
     assert capability not in body.env_vars
     assert server_prefixed not in body.env_vars
     assert role not in body.env_vars
     assert pod_uid not in body.env_vars
+    assert endpoint not in body.env_vars
+    assert service_account_token not in body.env_vars
 
 
 def test_controller_execution_environment_uses_claim_fence(monkeypatch):

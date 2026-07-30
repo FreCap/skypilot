@@ -39,6 +39,11 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_SERVER_ENDPOINT
+            value: http://RELEASE-NAME-api-service.NAMESPACE.svc
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_API_SERVER_INSTANCE_ID
             valueFrom:
               fieldRef:
@@ -63,6 +68,16 @@ tests:
             name: state-volume
             mountPath: /root/.sky
             subPath: .sky
+
+  - it: should reject a custom executor API endpoint
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.extraEnvs:
+        - name: SKYPILOT_API_SERVER_ENDPOINT
+          value: http://client-controlled-endpoint
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_SERVER_ENDPOINT" is duplicated or reserved by the chart'
 
   - it: should share database and explicit executor pod extensions
     set:

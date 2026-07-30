@@ -738,6 +738,27 @@ subsystem child. An active leader continuously rechecks the same condition and
 becomes unready, fences its children, releases leadership, and exits if a
 legacy consumer reappears during rollback.
 
+Controller-owned subsystems still contain nested SDK calls that submit normal
+work back through the HTTP API. Loopback is not a valid target after the
+controller moves out of the API pod. In HA mode, Helm therefore injects
+`SKYPILOT_API_SERVER_ENDPOINT` into every non-API role with the stable
+ClusterIP API Service URL. The endpoint is deployment-owned: request payloads
+cannot replace it, and the clean server environment propagated to consolidated
+managed-jobs and SkyServe children retains it. A controller role health-checks
+that existing remote endpoint and must never call `sky api start` or bind a
+local API listener. The compatibility `all` role keeps the old behavior of
+clearing a client endpoint and starting its colocated API server until that
+role is removed.
+
+The stable Service route does not bypass API authentication. An installation
+that requires bearer authentication on direct ClusterIP traffic supplies
+`SKYPILOT_SERVICE_ACCOUNT_TOKEN` from a Secret through the controller and
+executor `extraEnvs`; both that credential and the internal endpoint are
+removed from persisted request environments. The service-account identity must
+have the same permissions that controller-owned nested actions require. OAuth
+proxy deployments that authenticate only at ingress continue to use the
+private ClusterIP path without an added token.
+
 Every non-replayable controller-class request reserves its stable logical
 action before its handler starts. Reservation ownership includes the
 controller instance and generation; only that generation may advance the
@@ -832,6 +853,10 @@ by HA mode.
 - Executor-role tests assert no public listener starts.
 - Controller-role tests assert standby, promotion, lock-session loss, child
   fencing, and re-acquisition.
+- Non-API role tests assert nested SDK work resolves the stable API Service,
+  never starts a loopback API listener, and cannot inherit a client-supplied
+  endpoint or service-account token through the request envelope. Compatibility
+  `all`-role tests retain the local-server bootstrap contract.
 - Normal executors reject controller-class rows. Only a current controller
   leader may claim them, and a stale generation cannot reserve a new external
   mutation.
@@ -1030,6 +1055,17 @@ The controller generation, dual advisory-lock proof, durable action
 reservations, and stale-write predicates are steady-state safety mechanisms
 and must remain.
 
+### Colocated controller API bootstrap
+
+- The `all`-role branch in managed-jobs recovery that clears
+  `SKYPILOT_API_SERVER_ENDPOINT` and calls `sky api start`
+- Tests whose only contract is that a consolidated controller starts a
+  loopback API server in its own process namespace
+
+Delete these with the `all` role. Explicit controller and executor roles must
+continue to use the stable API Service endpoint; that routing is steady-state
+behavior, not a migration guard.
+
 ### Pod-local artifact lifecycle
 
 - `LocalFilesystemBlobStorage.reset_on_startup()` destructive client-state
@@ -1186,3 +1222,21 @@ the election-lock session and proves both exact lock keys through `pg_locks`.
 This immediately invalidates the old generation when its session disappears.
 The bounded extra lock-manager and predicate cost applies only to
 controller-owned work and is preferable to a time-based split-brain window.
+
+### Review 5: PURSUE
+
+Live managed-job and SkyServe launches exposed a role-separation gap: their
+controller subprocesses still submit nested SDK requests to a loopback API
+server that no longer shares their pod. Restoring an API sidecar would
+reintroduce the lifecycle and state coupling this design removes, while
+rewriting every nested action as direct controller logic would be a much
+larger compatibility surface.
+
+The stable private API Service is the smallest durable boundary. Explicit
+non-API roles fail closed if that endpoint is local or unhealthy and never
+start a listener; only the compatibility `all` role retains local bootstrap.
+The endpoint is reserved in Helm, and both it and an optional operator-supplied
+service-account credential are stripped from persisted request environments.
+This keeps mixed-version rollback schema-neutral, prevents client endpoint or
+credential injection, and preserves authenticated installations without
+adding a second routing or identity system.

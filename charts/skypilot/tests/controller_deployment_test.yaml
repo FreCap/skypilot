@@ -40,6 +40,11 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_SERVER_ENDPOINT
+            value: http://RELEASE-NAME-api-service.NAMESPACE.svc
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS
             value: "85"
       - contains:
@@ -69,6 +74,16 @@ tests:
             name: state-volume
             mountPath: /root/.sky
             subPath: .sky
+
+  - it: should reject a custom controller API endpoint
+    set:
+      apiService.highAvailability.enabled: true
+      controllerService.extraEnvs:
+        - name: SKYPILOT_API_SERVER_ENDPOINT
+          value: http://client-controlled-endpoint
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_SERVER_ENDPOINT" is duplicated or reserved by the chart'
 
   - it: should share database and explicit controller pod extensions
     set:

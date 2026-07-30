@@ -80,6 +80,44 @@ ENV_VARS_TO_CLEAR = [
     constants.SKY_API_SERVER_URL_ENV_VAR,
 ]
 
+_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
+
+
+def _clear_server_url_caches() -> None:
+    """Invalidate endpoint-derived state after a compatibility env change."""
+    server_common.get_server_url.cache_clear()
+    server_common.is_api_server_local.cache_clear()
+
+
+def _ensure_api_server_for_nested_request() -> None:
+    """Make nested SDK requests safe for split and compatibility roles."""
+    role = os.environ.get(_SERVER_ROLE_ENV_VAR, 'all')
+    if role != 'all':
+        endpoint = server_common.get_server_url()
+        if server_common.is_api_server_local(endpoint):
+            raise RuntimeError(
+                f'Explicit API server role {role!r} requires a non-local '
+                f'{constants.SKY_API_SERVER_URL_ENV_VAR}.')
+        server_common.check_server_healthy(endpoint)
+        logger.info(f'API server service is healthy at {endpoint}.')
+        return
+
+    vars_to_restore = {}
+    try:
+        for env_var in ENV_VARS_TO_CLEAR:
+            vars_to_restore[env_var] = os.environ.pop(env_var, None)
+            logger.debug(f'Cleared env var: {env_var}')
+        _clear_server_url_caches()
+        logger.debug('Environment prepared for local API server bootstrap.')
+        sdk.api_start()
+        logger.info('API server started.')
+    finally:
+        for env_var, value in vars_to_restore.items():
+            if value is not None:
+                logger.debug(f'Restored env var: {env_var}')
+                os.environ[env_var] = value
+        _clear_server_url_caches()
+
 
 class StrategyExecutor:
     """Handle the launching, recovery and termination of managed job clusters"""
@@ -615,28 +653,11 @@ class StrategyExecutor:
                         if self.pool is None:
                             assert self.cluster_name is not None
 
-                            # sdk.launch will implicitly start the API server,
-                            # but then the API server will inherit the current
-                            # env vars/user, which we may not want.
-                            # Instead, clear env vars here and call api_start
-                            # explicitly.
-                            vars_to_restore = {}
-                            try:
-                                for env_var in ENV_VARS_TO_CLEAR:
-                                    vars_to_restore[env_var] = os.environ.pop(
-                                        env_var, None)
-                                    logger.debug('Cleared env var: '
-                                                 f'{env_var}')
-                                logger.debug('Env vars for api_start: '
-                                             f'{os.environ}')
-                                await asyncio.to_thread(sdk.api_start)
-                                logger.info('API server started.')
-                            finally:
-                                for env_var, value in vars_to_restore.items():
-                                    if value is not None:
-                                        logger.debug('Restored env var: '
-                                                     f'{env_var}: {value}')
-                                        os.environ[env_var] = value
+                            # Explicit controller roles submit nested work
+                            # through the stable API Service. Compatibility
+                            # mode still bootstraps its colocated API server.
+                            await asyncio.to_thread(
+                                _ensure_api_server_for_nested_request)
 
                             # HA failover may land the controller on new hosts,
                             # ensure blob extraction on the current host
