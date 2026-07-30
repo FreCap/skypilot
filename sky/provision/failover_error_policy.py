@@ -428,6 +428,9 @@ for _handler_class in (FailoverCloudErrorHandlerV1,
     _handler_class.__module__ = _HISTORICAL_MODULE
 del _handler_class
 
+# These private methods are intentionally enumerated to preserve their
+# historical reflection and pickle identities through the backend facade.
+# pylint: disable=protected-access
 for _handler_symbol in (
         _add_to_blocked_resources,
         FailoverCloudErrorHandlerV1._handle_errors,
@@ -442,4 +445,5 @@ for _handler_symbol in (
         FailoverCloudErrorHandlerV2.update_blocklist_on_error,
 ):
     _handler_symbol.__module__ = _HISTORICAL_MODULE
+# pylint: enable=protected-access
 del _handler_symbol
