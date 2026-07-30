@@ -14,6 +14,7 @@ from sky.backends import cloud_vm_ray_backend as backend
 from sky.provision import capacity_cache
 from sky.provision import capacity_policy
 from sky.provision import common as provision_common
+from sky.provision import failover_error_policy
 from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
@@ -35,6 +36,20 @@ _CAPACITY_POLICY_SIGNATURES = {
     '_failure_requested_full_demand': '(error, num_nodes)',
     '_placement_error_code': '(error)',
     '_placement_outcome': '(error, capacity_reason=None)',
+}
+
+_FAILOVER_ERROR_POLICY_SIGNATURES = {
+    '_add_to_blocked_resources': '(blocked_resources, resources)',
+    'FailoverCloudErrorHandlerV1._handle_errors': '(stdout, stderr, is_error_str_known)',
+    'FailoverCloudErrorHandlerV1._ibm_handler': '(blocked_resources, launchable_resources, region, zones, stdout, stderr)',
+    'FailoverCloudErrorHandlerV1.update_blocklist_on_error': '(blocked_resources, launchable_resources, region, zones, stdout, stderr)',
+    'FailoverCloudErrorHandlerV2._azure_handler': '(blocked_resources, launchable_resources, region, zones, err)',
+    'FailoverCloudErrorHandlerV2._gcp_handler': '(blocked_resources, launchable_resources, region, zones, err)',
+    'FailoverCloudErrorHandlerV2._lambda_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._aws_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._scp_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._default_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2.update_blocklist_on_error': '(blocked_resources, launchable_resources, region, zones, error)',
 }
 
 
@@ -59,6 +74,40 @@ def test_capacity_policy_historical_contract():
         assert pickle.loads(pickle.dumps(symbol)) is symbol
 
 
+def _resolve_backend_symbol(path: str):
+    symbol = backend
+    for name in path.split('.'):
+        symbol = getattr(symbol, name)
+    return symbol
+
+
+def _resolve_failover_policy_symbol(path: str):
+    symbol = failover_error_policy
+    for name in path.split('.'):
+        symbol = getattr(symbol, name)
+    return symbol
+
+
+def test_failover_error_policy_historical_contract():
+    assert (backend._RSYNC_NOT_FOUND_MESSAGE
+            is failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)
+    for handler_name in ('FailoverCloudErrorHandlerV1',
+                         'FailoverCloudErrorHandlerV2'):
+        handler = getattr(backend, handler_name)
+        assert getattr(failover_error_policy, handler_name) is handler
+        assert handler.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert handler.__qualname__ == handler_name
+        assert pickle.loads(pickle.dumps(handler)) is handler
+
+    for path, signature in _FAILOVER_ERROR_POLICY_SIGNATURES.items():
+        symbol = _resolve_backend_symbol(path)
+        assert _resolve_failover_policy_symbol(path) is symbol
+        assert _call_signature(symbol) == signature
+        assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert symbol.__qualname__ == path
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
+
+
 class _FakeClientError(Exception):
 
     def __init__(self, code: str):
@@ -75,6 +124,129 @@ def _aggregate_error(*codes: str) -> provision_common.ProvisionerError:
     if codes:
         error.__cause__ = _FakeClientError(codes[-1])
     return error
+
+
+def _gcp_launchable_resources() -> resources_lib.Resources:
+    return resources_lib.Resources(
+        cloud=clouds.GCP(),
+        instance_type='n1-standard-4',
+        region='us-central1',
+        zone='us-central1-a',
+    )
+
+
+def test_failover_blocklist_skips_already_covered_resources():
+    launchable = _gcp_launchable_resources()
+    blocked = {launchable.copy(region=None, zone=None)}
+
+    backend._add_to_blocked_resources(blocked, launchable)
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region is None
+    assert blocked_resource.zone is None
+
+    blocked.clear()
+    backend._add_to_blocked_resources(blocked, launchable)
+    backend._add_to_blocked_resources(blocked, launchable)
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region == 'us-central1'
+    assert blocked_resource.zone == 'us-central1-a'
+
+
+def test_failover_v1_known_errors_preserve_order_and_stripping():
+    errors = backend.FailoverCloudErrorHandlerV1._handle_errors(
+        '  ERR first  \nignored',
+        'PANIC second\nignored',
+        lambda line: line.startswith(('ERR', 'PANIC')),
+    )
+    assert errors == ['ERR first', 'PANIC second']
+
+
+def test_failover_v1_rsync_error_preserves_detailed_reason():
+    with pytest.raises(RuntimeError,
+                       match='`rsync` command is not found') as exc_info:
+        backend.FailoverCloudErrorHandlerV1._handle_errors(
+            'launch output',
+            'bash: rsync: command not found',
+            lambda _: False,
+        )
+
+    assert exc_info.value.detailed_reason == (
+        'stdout: launch output\n'
+        'stderr: bash: rsync: command not found')
+
+
+def test_failover_v1_gang_failure_blocks_each_zone():
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+    zones = [clouds.Zone('us-central1-a'), clouds.Zone('us-central1-b')]
+
+    definitely_no_nodes_launched = (
+        backend.FailoverCloudErrorHandlerV1.update_blocklist_on_error(
+            blocked,
+            launchable,
+            clouds.Region('us-central1'),
+            zones,
+            None,
+            None,
+        ))
+
+    assert not definitely_no_nodes_launched
+    assert {resource.zone for resource in blocked} == {
+        'us-central1-a',
+        'us-central1-b',
+    }
+
+
+@pytest.mark.parametrize(
+    ('code', 'message', 'expected_region', 'expected_zone'),
+    [
+        ('ZONE_RESOURCE_POOL_EXHAUSTED', 'capacity', 'us-central1',
+         'us-central1-a'),
+        ('QUOTA_EXCEEDED', 'regional quota', 'us-central1', None),
+        ('QUOTA_EXCEEDED', "'GPUS_ALL_REGIONS' exceeded", None, None),
+        ('IAM_PERMISSION_DENIED', 'permission', None, None),
+    ],
+)
+def test_failover_v2_gcp_error_block_width(code, message, expected_region,
+                                           expected_zone):
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+    error = provision_common.ProvisionerError('provision failed')
+    error.errors = [{'code': code, 'message': message}]
+
+    backend.FailoverCloudErrorHandlerV2._gcp_handler(
+        blocked,
+        launchable,
+        clouds.Region('us-central1'),
+        [clouds.Zone('us-central1-a')],
+        error,
+    )
+
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region == expected_region
+    assert blocked_resource.zone == expected_zone
+
+
+def test_failover_v2_default_handler_blocks_each_zone():
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+
+    backend.FailoverCloudErrorHandlerV2._default_handler(
+        blocked,
+        launchable,
+        clouds.Region('us-central1'),
+        [clouds.Zone('us-central1-a'),
+         clouds.Zone('us-central1-b')],
+        RuntimeError('unparsed'),
+    )
+
+    assert {resource.zone for resource in blocked} == {
+        'us-central1-a',
+        'us-central1-b',
+    }
 
 
 @pytest.mark.parametrize('code', [
