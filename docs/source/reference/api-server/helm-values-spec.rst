@@ -445,7 +445,12 @@ Default: ``"Recreate"``
 ``apiService.replicas``
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-Number of replicas to deploy for the API server. Replicas > 1 is not well tested and requires a PVC that supports ReadWriteMany.
+Number of API replicas. In compatibility mode
+(``apiService.highAvailability.enabled=false``), deployments with more than one
+replica remain experimental and require a PVC that supports ReadWriteMany.
+Guarded high availability requires at least two stateless API replicas and
+enforces PostgreSQL, RollingUpdate, ReadWriteMany storage, and separate executor
+and controller replicas. See :ref:`api-server-ha`.
 
 Default: ``1``
 
