@@ -1,0 +1,22 @@
+# Client-only development environment settings. This section is stripped
+# before the ordinary SkyPilot Task is sent to the API server.
+dev:
+  version: 1
+  name: my-dev
+  ide: vscode
+  remote_path: ~/sky_workdir
+
+# Sync the current project on every `sky dev up`.
+workdir: .
+
+resources:
+  cpus: 4+
+  memory: 8+
+  autostop:
+    idle_minutes: 120
+    down: true
+
+# Put repeatable environment initialization here. `sky dev up --reconfigure`
+# reruns setup on an already-UP ordinary VM or Kubernetes cluster.
+setup: |
+  echo "Development environment ready."
