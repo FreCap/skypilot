@@ -1341,16 +1341,15 @@ def _should_keep_logging(status: managed_job_state.ManagedJobStatus) -> bool:
 
 def _wait_for_next_task(
         job_id: int,
-        current_task_id: int) -> tuple[int, managed_job_state.ManagedJobStatus]:
-    """Wait until the next task starts or the job stops being followable."""
+        current_task_id: int) -> managed_job_state.JobLogStreamSnapshot:
+    """Wait for and return the next task's log-target snapshot."""
     while True:
-        latest_task_id, status = (
-            managed_job_state.get_latest_task_id_status(job_id))
-        assert status is not None, (job_id, latest_task_id, status)
-        assert latest_task_id is not None, (job_id, latest_task_id)
-        if (latest_task_id != current_task_id or
-                not _should_keep_logging(status)):
-            return latest_task_id, status
+        snapshot = managed_job_state.get_latest_log_stream_snapshot(job_id)
+        assert snapshot.status is not None, (job_id, snapshot)
+        assert snapshot.task_id is not None, (job_id, snapshot)
+        if (snapshot.task_id != current_task_id or
+                not _should_keep_logging(snapshot.status)):
+            return snapshot
         time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
 
 
@@ -1851,8 +1850,9 @@ def stream_logs_by_id(job_id: int,
                         ux_utils.spinner_message(
                             f'Waiting for the next task: {task_id + 1}'))
                     status_display.start()
-                    task_id, managed_job_status = _wait_for_next_task(
-                        job_id, task_id)
+                    snapshot = _wait_for_next_task(job_id, task_id)
+                    managed_job_status = snapshot.status
+                    assert managed_job_status is not None, (job_id, snapshot)
                     continue
 
                 # The job can be cancelled by the user or the controller (when

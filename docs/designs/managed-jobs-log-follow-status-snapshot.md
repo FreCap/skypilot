@@ -15,6 +15,12 @@ interval and reads one new combined snapshot. That post-wait snapshot is
 carried into the next loop iteration. It must not be discarded and immediately
 reread before target selection.
 
+When an active JobGroup task finishes, the follower waits for the next task by
+polling the same combined snapshot. The snapshot that first observes a new task
+is carried into the next loop iteration. Task detection and log-target
+selection must not be split across two reads because a fast subsequent task can
+otherwise replace the detected task before its logs are tailed.
+
 When a task filter is present, the follower first reads the task inventory so
 an invalid task can fail immediately without waiting for job initialization.
 The inventory also supplies the task count and avoids a separate count query.
@@ -36,8 +42,9 @@ existing `_should_keep_logging()` policy. A terminal status observed by the
 post-wait snapshot stops before handle lookup or remote tailing. A recovered
 runnable target observed by that snapshot is used directly on the next
 iteration. The remote-log loop continues to refresh scalar status after each
-tail attempt. Active JobGroup transitions continue to use
-`_wait_for_next_task()` and the existing managed-job polling interval.
+tail attempt. Active JobGroup transitions use the existing managed-job polling
+interval, and cancellation or terminal snapshots stop without an additional
+routing read.
 
 Filtered and unfiltered terminal jobs preserve the existing final log and exit
 code behavior. A terminal transition that occurs before, during, or after the
@@ -53,6 +60,12 @@ target-selection iteration, so each poll cycle performs one combined database
 read instead of two back-to-back reads. Initial status discovery, task counts,
 filtered-task reads, polling cadence, and scalar status refreshes after remote
 tail attempts are unchanged.
+
+Waiting for the next JobGroup task performs one combined database read per poll
+cycle. The successful handoff reuses that read for routing, reducing the
+transition from N scalar polls plus one combined routing read to N combined
+polls. The query count therefore falls by one at every observed task handoff,
+while polling cadence and asymptotic work remain unchanged.
 
 Terminal paths perform at most one final inventory refresh. Filtered terminal
 paths still avoid the separate task-count read. Polling cadence, asymptotic
@@ -85,3 +98,10 @@ surface. Pull-request CI runs both under `Python Tests - Unit Tests`;
 `Python Tests - Limited Deps - Jobs, Serve & CLI (3.14)` cover the broader
 managed-jobs interface. Formatting, mypy, Pylint, and static-analysis workflows
 cover the changed Python paths.
+
+## Changed-path-to-test matrix
+
+| Changed path | Invariants | Concrete tests and commands |
+| --- | --- | --- |
+| `sky/jobs/utils.py` | The next JobGroup task and its log target come from one recovery snapshot; terminal and cancelling snapshots stop without handle lookup; same-task snapshots keep the existing polling cadence; a fast following transition cannot replace the detected task; each wait poll is one SQL-backed snapshot and the handoff adds no extra read. | `tests/unit_tests/test_sky/jobs/test_log_follow_lifecycle.py`, especially `TestWaitForNextTask` and the fast-transition regression; run the focused lifecycle file, then `pytest -n 0 --dist no tests/unit_tests/test_sky/jobs/`. |
+| `docs/designs/managed-jobs-log-follow-status-snapshot.md` | The lifecycle, failure, concurrency, and performance contracts remain synchronized with the implementation. | The lifecycle tests above plus the one-SQL snapshot assertions in `tests/unit_tests/test_sky/jobs/test_state.py`; run both files together before the component suite. |
