@@ -84,6 +84,14 @@ job_info_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_pid_started_at',
                       sqlalchemy.Float,
                       server_default=None),
+    # Durable owner of the API controller generation that assigned the
+    # pod-local controller PID. NULL is the compatibility all-role format.
+    sqlalchemy.Column('controller_instance_id',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('controller_generation',
+                      sqlalchemy.BigInteger,
+                      server_default=None),
     sqlalchemy.Column('dag_yaml_path', sqlalchemy.Text),
     sqlalchemy.Column('env_file_path', sqlalchemy.Text),
     sqlalchemy.Column('dag_yaml_content', sqlalchemy.Text, server_default=None),

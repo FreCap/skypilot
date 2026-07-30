@@ -3576,3 +3576,31 @@ class TestApiAccessTokenCleanup:
             manager._cleanup_api_server_access_token(9)
 
         delete.assert_called_once_with('shared-token')
+
+
+class TestOuterControllerGenerationWatchdog:
+    """Detached scheduler processes fail closed after outer handoff."""
+
+    @pytest.mark.asyncio
+    async def test_generation_mismatch_exits_controller(self):
+        owner = ('73ebc1a8-d2ae-4ca4-b9a5-53d0b10990af', 13)
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new=AsyncMock()), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'controller_owner_is_current',
+                      return_value=False):
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError,
+                               match='no longer current'):
+                await controller_lib._watch_outer_controller_generation(owner)
+
+    @pytest.mark.asyncio
+    async def test_database_proof_error_exits_controller(self):
+        owner = ('4c0382a3-5905-4d3b-b696-a05e43063c30', 14)
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new=AsyncMock()), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'controller_owner_is_current',
+                      side_effect=OSError('database unavailable')):
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError,
+                               match='Could not prove'):
+                await controller_lib._watch_outer_controller_generation(owner)

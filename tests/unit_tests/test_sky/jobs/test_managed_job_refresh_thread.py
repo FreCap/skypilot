@@ -546,6 +546,25 @@ class TestBecomeLeaderOrdering:
         assert signal_file.exists()
 
 
+def test_recovery_fences_stale_jobs_before_scheduler_start(
+        tmp_path, monkeypatch):
+    """Replacement scheduler startup must be the last recovery operation."""
+    order = []
+    monkeypatch.setattr(mjrt.constants, 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                        str(tmp_path / '{}recovery.log'))
+    monkeypatch.setattr(mjrt.managed_job_state,
+                        'reset_stale_jobs_for_current_controller',
+                        lambda: order.append('reset-stale') or 1)
+    monkeypatch.setattr(mjrt.managed_job_state, 'get_managed_jobs_with_filters',
+                        lambda fields: ([], None))
+    monkeypatch.setattr(mjrt.managed_job_scheduler, 'maybe_start_controllers',
+                        lambda: order.append('start-scheduler'))
+
+    mjrt.managed_job_utils.ha_recovery_for_consolidation_mode()
+
+    assert order == ['reset-stale', 'start-scheduler']
+
+
 class TestStart:
     """`start_managed_job_refresh_daemon` honors consolidation mode."""
 

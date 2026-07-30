@@ -28,6 +28,21 @@ class TestGetJobsStatusCheckInfoLaunchIdentity:
         task_names = [t['task_name'] for t in info[pipeline_id]['tasks']]
         assert task_names == ['extract', 'transform']
 
+    def test_snapshot_keeps_outer_controller_owner(self, _seed_test_jobs,
+                                                   _mock_managed_jobs_db_conn):
+        job_id = _seed_test_jobs['job_id1']
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    controller_instance_id='controller-a',
+                    controller_generation=19))
+            session.commit()
+
+        info = state.get_jobs_status_check_info([job_id])[job_id]
+
+        assert info['controller_instance_id'] == 'controller-a'
+        assert info['controller_generation'] == 19
+
 
 class TestGetJobStatusCheckState:
     """Coverage for the one-row destructive recheck helper."""
@@ -44,6 +59,10 @@ class TestGetJobStatusCheckState:
             assert info['controller_pid'] == tasks[0]['controller_pid']
             assert info['controller_pid_started_at'] == tasks[0].get(
                 'controller_pid_started_at')
+            assert info['controller_instance_id'] == tasks[0].get(
+                'controller_instance_id')
+            assert info['controller_generation'] == tasks[0].get(
+                'controller_generation')
             assert info['all_tasks_terminal'] == all(
                 task['status'].is_terminal() for task in tasks)
 
@@ -85,8 +104,8 @@ class TestHasJobsRequiringRecoveryGraceWait:
 
         assert state.has_jobs_requiring_recovery_grace_wait() is True
 
-    def test_pending_only_backlog_returns_false(self,
-                                                _mock_managed_jobs_db_conn):
+    def test_pending_only_backlog_returns_true_during_rollback_window(
+            self, _mock_managed_jobs_db_conn):
         job_id = state.set_job_info_without_job_id(name='pending-only',
                                                    workspace='ws1',
                                                    entrypoint='ep',
@@ -97,7 +116,10 @@ class TestHasJobsRequiringRecoveryGraceWait:
         state.scheduler_set_waiting([job_id], '/tmp/dag.yaml', '/tmp/user.yaml',
                                     '/tmp/env', None, 100)
 
-        assert state.has_jobs_requiring_recovery_grace_wait() is False
+        # A detached scheduler from an adjacent image may claim this WAITING
+        # row after the snapshot without recording an outer generation. Keep
+        # the bounded drain until that compatibility image is unsupported.
+        assert state.has_jobs_requiring_recovery_grace_wait() is True
 
     def test_waiting_job_with_controller_claim_returns_true(
             self, _mock_managed_jobs_db_conn):

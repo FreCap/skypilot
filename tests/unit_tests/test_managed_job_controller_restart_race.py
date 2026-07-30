@@ -258,6 +258,45 @@ def test_defers_when_job_reset_for_recovery_midcycle(monkeypatch):
     assert not job_done_calls
 
 
+def test_stale_outer_generation_is_recovered_not_failed(monkeypatch):
+    """A PID from another controller pod is never a local crash verdict."""
+    info = _make_status_check_info()
+    info[1]['controller_instance_id'] = 'old-instance'
+    info[1]['controller_generation'] = 12
+    current_owner = ('new-instance', 13)
+    resets = []
+    set_failed_calls = []
+    job_done_calls = []
+
+    _forbid_split_snapshot_helpers(monkeypatch)
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: info)
+    monkeypatch.setattr(managed_job_state, 'get_current_controller_owner',
+                        lambda: current_owner)
+    monkeypatch.setattr(
+        managed_job_state, 'reset_job_for_recovery_if_stale',
+        lambda job_id, owner: resets.append((job_id, owner)) or True)
+    monkeypatch.setattr(
+        utils, 'controller_process_alive', lambda record:
+        (_ for _ in
+         ()).throw(AssertionError('a foreign pod PID must never be inspected')))
+    monkeypatch.setattr(
+        utils, 'terminate_cluster', lambda name: (_ for _ in ()).throw(
+            AssertionError('stale ownership must not tear down the workload')))
+    monkeypatch.setattr(managed_job_state, 'set_failed',
+                        lambda *a, **k: set_failed_calls.append((a, k)))
+    monkeypatch.setattr(utils.scheduler, 'job_done',
+                        lambda *a, **k: job_done_calls.append((a, k)))
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+
+    utils.update_managed_jobs_statuses(job_ids=[1])
+
+    assert resets == [(1, current_owner)]
+    assert not set_failed_calls
+    assert not job_done_calls
+
+
 def _make_pending_status_check_info(schedule_state):
     """A pending job whose controller process has not started (pid is None)."""
     return {

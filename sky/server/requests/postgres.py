@@ -565,6 +565,16 @@ def _controller_owner_from_environment() -> tuple[str, int] | None:
     return instance_id, parsed_generation
 
 
+def controller_owner_from_environment() -> tuple[str, int] | None:
+    """Return the current split-role controller identity, if one is active.
+
+    This public seam lets controller-owned subsystems persist the same outer
+    generation without duplicating environment parsing or treating a
+    pod-local PID as a durable owner.
+    """
+    return _controller_owner_from_environment()
+
+
 def _pg_advisory_lock_key(
     lock: sqlalchemy.sql.Alias,) -> sqlalchemy.ColumnElement[int]:
     """Reconstruct an int8 advisory key from one ``pg_locks`` row."""
@@ -628,6 +638,24 @@ def _current_controller_leadership_statement(
         # observes the replacement generation and fails closed.
         statement = statement.with_for_update(read=True)
     return statement
+
+
+def current_controller_leadership_statement(
+    instance_id: str,
+    generation: int,
+    *,
+    lock: bool = False,
+) -> sqlalchemy.sql.Select:
+    """Build the live controller ownership lookup for a caller transaction.
+
+    With ``lock=True`` the caller holds a shared lock on the singleton
+    leadership row until its transaction commits. Generation advancement uses
+    an update of that row, so a subsystem claim and a handoff have one
+    serialization point even when they use different SQLAlchemy engines.
+    """
+    return _current_controller_leadership_statement(instance_id,
+                                                    generation,
+                                                    lock=lock)
 
 
 def _lock_current_controller_leadership(

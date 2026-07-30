@@ -79,6 +79,27 @@ _background_tasks: set[asyncio.Task] = set()
 # failures without prior healthy evidence recover immediately.
 _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
 _FILE_MOUNTS_BLOB_ID_UNSET = object()
+_OUTER_CONTROLLER_PROBE_SECONDS = 2
+
+
+async def _watch_outer_controller_generation(owner: tuple[str, int]) -> None:
+    """Exit the detached scheduler when its outer generation is fenced."""
+    instance_id, generation = owner
+    while True:
+        await asyncio.sleep(_OUTER_CONTROLLER_PROBE_SECONDS)
+        try:
+            is_current = await asyncio.to_thread(
+                managed_job_state.controller_owner_is_current, owner)
+        except Exception as e:  # pylint: disable=broad-except
+            raise managed_job_state.ControllerLeadershipLostError(
+                'Could not prove managed-job outer controller generation '
+                f'{generation} for instance {instance_id}: '
+                f'{common_utils.format_exception(e)}') from e
+        if not is_current:
+            raise managed_job_state.ControllerLeadershipLostError(
+                'Managed-job outer controller generation '
+                f'{generation} for instance {instance_id} is no longer '
+                'current.')
 
 
 class _ClusterNotUpDebouncer:
@@ -3011,12 +3032,18 @@ async def main(controller_uuid: str):
     # Will loop forever, do it in the background
     cancel_job_task = asyncio.create_task(controller.cancel_job())
     monitor_loop_task = asyncio.create_task(controller.monitor_loop())
+    controller_tasks = [cancel_job_task, monitor_loop_task]
+    outer_owner = managed_job_state.get_current_controller_owner()
+    if outer_owner is not None:
+        controller_tasks.append(
+            asyncio.create_task(
+                _watch_outer_controller_generation(outer_owner)))
     # Run the garbage collector in a dedicated daemon thread to avoid affecting
     # the main event loop.
     gc_thread = threading.Thread(target=log_gc.elect_for_log_gc, daemon=True)
     gc_thread.start()
     try:
-        await asyncio.gather(cancel_job_task, monitor_loop_task)
+        await asyncio.gather(*controller_tasks)
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Controller server crashed: {e}')
         sys.exit(1)

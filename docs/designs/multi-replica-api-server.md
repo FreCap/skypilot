@@ -200,6 +200,16 @@ replica-independent and keeps each migration milestone deployable.
   the current generation. A child controller receives the generation at
   startup and must revalidate it before every durable state transition or new
   provider-side action.
+- A managed-job scheduler claim stores the outer controller instance and
+  generation beside its pod-local PID. The claim transaction takes a shared
+  lock on the exact live `api_controller_leadership` row, so generation
+  advancement either waits for the old claim to commit or fences it before it
+  can write. A stale scheduler cannot claim a `WAITING` job after handoff.
+- Before a replacement managed-job scheduler starts, recovery waits for old
+  detached controllers to drain, resets every nonterminal job owned by another
+  generation, and only then launches scheduler processes. Status refresh never
+  interprets a PID from another generation as a local controller failure and
+  therefore cannot terminalize or tear down that job.
 - A newly elected leader may coexist briefly with an isolated old process, but
   the old generation cannot reserve or commit new work. An action whose
   provider-side result became ambiguous during lock-session loss is reconciled
@@ -700,19 +710,24 @@ Deployment:
 - Persist worker instance and controller generation ownership.
 - Reconstruct Serve control files from durable version state during recovery.
 
-M3 uses schema revision `003`. It adds the controller-leadership and
+M3 uses API-request schema revision `003` and managed-job schema revision
+`026`. API revision `003` adds the controller-leadership and
 controller-action-reservation tables described above plus a nullable
-`controller_generation` on each request. A controller acquires its advisory
-leader lock through a dedicated PostgreSQL session and advances the durable
-generation, takes a generation-specific advisory lock, and records that
-session's backend PID and generation-lock key on the same session before it
-can claim work. Every claim heartbeat, RUNNING transition, result write,
-retry, and terminal write for a controller-class request must match the
-request claim, current unreleased leadership row, and live `pg_locks` entries
-for that PID, the election-lock key, and the generation-lock key. Losing the
-leader session therefore fences the old generation immediately, even before
-a standby advances the generation and while another database connection in
-the stale pod remains usable.
+`controller_generation` on each request. Managed-job revision `026` adds
+nullable `controller_instance_id` and `controller_generation` ownership to
+`job_info`; null remains the compatibility representation for jobs created by
+the all-role server.
+
+A controller acquires its advisory leader lock through a dedicated PostgreSQL
+session and advances the durable generation, takes a generation-specific
+advisory lock, and records that session's backend PID and generation-lock key
+on the same session before it can claim work. Every claim heartbeat, RUNNING
+transition, result write, retry, and terminal write for a controller-class
+request must match the request claim, current unreleased leadership row, and
+live `pg_locks` entries for that PID, the election-lock key, and the
+generation-lock key. Losing the leader session therefore fences the old
+generation immediately, even before a standby advances the generation and
+while another database connection in the stale pod remains usable.
 
 PostgreSQL queue consumers receive an immutable set of allowed execution
 classes. Explicit executor roles claim only `normal`; only the current
@@ -770,6 +785,30 @@ records, while SkyServe retains service lifecycle epochs, incarnation-scoped
 resource identities, and exact controller PID/IP ownership. These inner fences
 remain authoritative before individual provider-side actions, rather than
 adding a second parallel implementation for every cloud operation.
+
+Managed-job scheduler ownership composes with that request fence. Each
+`WAITING` to `LAUNCHING` transition records the current outer instance and
+generation and, in the same managed-job database transaction, takes a shared
+row lock on the leadership record after proving its two advisory locks are
+live. Generation advancement takes the conflicting row write lock. Thus an
+old claim either commits before handoff and is identified as stale by the new
+leader, or observes the new generation and fails closed.
+
+The managed-job recovery gate remains present from before the inner
+consolidation lock acquisition until recovery is complete. Whenever any
+nonterminal managed job exists, the new leader pays the bounded post-acquire
+drain interval, including when the row happens to be `WAITING` with no PID.
+Recovery then resets stale-generation ownership before it starts any
+replacement scheduler. Detached scheduler processes also probe the exact
+outer generation and exit on mismatch or loss of database proof. The timing
+wait is only a drain aid; correctness comes from the transactional generation
+fence.
+
+Status refresh reads PID, instance, and generation from one snapshot and
+rechecks the same fields immediately before cleanup or terminalization. A row
+owned by another generation is recovery work, never evidence that the current
+leader's local controller crashed. This distinction is required because PIDs
+are meaningful only inside their owning pod.
 
 Standbys publish Ready with `phase=standby`. A leader publishes its generation
 and continuously probes and heartbeats the lock-owning session. On SIGTERM it
@@ -853,6 +892,15 @@ by HA mode.
 - Executor-role tests assert no public listener starts.
 - Controller-role tests assert standby, promotion, lock-session loss, child
   fencing, and re-acquisition.
+- Managed-job PostgreSQL tests prove a stale outer generation cannot claim a
+  waiting job, generation advancement serializes with an in-flight claim, and
+  recovery resets stale ownership before a replacement scheduler starts.
+- Managed-job refresh tests prove a stale-generation PID is never interpreted
+  as a current local crash and cannot cause cluster teardown or
+  `FAILED_CONTROLLER`.
+- Detached managed-job controller tests prove the process exits when its outer
+  generation loses either advisory-lock proof, while all-role local mode keeps
+  its compatibility behavior.
 - Non-API role tests assert nested SDK work resolves the stable API Service,
   never starts a loopback API listener, and cannot inherit a client-supplied
   endpoint or service-account token through the request envelope. Compatibility
@@ -885,6 +933,9 @@ by HA mode.
 - Delete standby and active controller pods.
 - Delete idle and busy executor pods.
 - Terminate the active controller advisory-lock database session.
+- During both controller failure modes, keep a long-running managed job active
+  and prove its task remains nonterminal, its workload identity is not torn
+  down, ownership advances to the promoted generation, and progress continues.
 - Roll image A to B and B to A.
 - Queue requests produced by both A and B while executor versions overlap and
   prove compatible workers claim each row.
@@ -1240,3 +1291,22 @@ service-account credential are stripped from persisted request environments.
 This keeps mixed-version rollback schema-neutral, prevents client endpoint or
 credential injection, and preserves authenticated installations without
 adding a second routing or identity system.
+
+### Review 6: PURSUE
+
+The live generation 12 to 13 database-session failure test exposed a
+managed-job race that the request-level fence did not cover. A job was briefly
+`WAITING` with no PID, so recovery skipped its drain wait. A detached scheduler
+from the old pod then reclaimed it and wrote a pod-local PID after the new
+leader's snapshot. Status refresh treated that soon-dead foreign PID as a
+current local crash, tore down the workload, and marked the job
+`FAILED_CONTROLLER`.
+
+An unconditional timing delay or a shared-file check in the scheduler would
+reduce the observed window but would not establish ownership after a session
+loss or network partition. The additive managed-job generation columns and
+same-transaction leadership row lock reuse the existing outer fence without a
+second election system. Ordered stale-owner recovery and a detached-controller
+watchdog close both sides of the race. The permanent cost is two nullable
+columns, one claim predicate, and one ownership probe; that is justified by
+the otherwise destructive false terminalization seen in the live test.

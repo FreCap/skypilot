@@ -353,17 +353,26 @@ def ha_recovery_for_consolidation_mode() -> None:
     updates. This also should ensure correct operation during a rolling update.
     """
     # No setup recovery is needed in consolidation mode, as the API server
-    # already has all runtime installed. Directly start jobs recovery here.
+    # already has all runtime installed. Reset stale outer-generation
+    # ownership before any replacement scheduler process can claim work.
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
-    scheduler.maybe_start_controllers()
+    stale_owner_count = (
+        managed_job_state.reset_stale_jobs_for_current_controller())
     with open(constants.HA_PERSISTENT_RECOVERY_LOG_PATH.format('jobs_'),
               'a',
               encoding='utf-8') as f:
         start = time.time()
         f.write(f'Starting HA recovery at {datetime.now()}\n')
+        if stale_owner_count:
+            message = (
+                f'Reset {stale_owner_count} managed job(s) owned by a stale '
+                'outer controller generation.\n')
+            logger.info(message.rstrip())
+            f.write(message)
         jobs, _ = managed_job_state.get_managed_jobs_with_filters(fields=[
             'job_id', 'controller_pid', 'controller_pid_started_at',
-            'schedule_state', 'status'
+            'controller_instance_id', 'controller_generation', 'schedule_state',
+            'status'
         ])
         for job in jobs:
             job_id = job['job_id']
@@ -410,6 +419,11 @@ def ha_recovery_for_consolidation_mode() -> None:
                            f'{datetime.now()}\n')
                 logger.info(message)
                 f.write(message)
+        # Start schedulers only after every stale or dead PID has been reset.
+        # Starting them before the scan lets a replacement claim race the
+        # recovery writes and can stamp a PID that recovery immediately
+        # invalidates.
+        scheduler.maybe_start_controllers()
         f.write(f'HA recovery completed at {datetime.now()}\n')
         f.write(f'Total recovery time: {time.time() - start} seconds\n')
 
@@ -583,6 +597,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
     # restart of last controller process that fully occupied the controller VM.
     if _controller_is_restarting():
         return
+    current_controller_owner = (
+        managed_job_state.get_current_controller_owner())
 
     def _cleanup_job_clusters(job_id: int, tasks: list[dict[str, Any]],
                               pool: str | None) -> str | None:
@@ -648,6 +664,21 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
         # Handle jobs with schedule state (non-legacy jobs):
         pid = info['controller_pid']
         pid_started_at = info['controller_pid_started_at']
+        if current_controller_owner is not None:
+            recorded_owner = (info.get('controller_instance_id'),
+                              info.get('controller_generation'))
+            pure_backlog = (pid is None and schedule_state in [
+                managed_job_state.ManagedJobScheduleState.INACTIVE,
+                managed_job_state.ManagedJobScheduleState.WAITING,
+            ])
+            if not pure_backlog and recorded_owner != current_controller_owner:
+                reset = managed_job_state.reset_job_for_recovery_if_stale(
+                    job_id, current_controller_owner)
+                recovery_result = ('resetting it for recovery' if reset else
+                                   'its owner changed before recovery')
+                logger.info(f'Job {job_id} belongs to stale outer controller '
+                            f'{recorded_owner}; {recovery_result}.')
+                continue
         if schedule_state == managed_job_state.ManagedJobScheduleState.DONE:
             # There are two cases where we could get a job that is DONE.
             # 1. At snapshot time (get_jobs_to_check_status_info), the job was
@@ -733,7 +764,11 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
         if (fresh_info is None or
                 fresh_info['schedule_state'] != schedule_state or
                 fresh_info['controller_pid'] != pid or
-                fresh_info['controller_pid_started_at'] != pid_started_at):
+                fresh_info['controller_pid_started_at'] != pid_started_at or
+                fresh_info.get('controller_instance_id')
+                != info.get('controller_instance_id') or
+                fresh_info.get('controller_generation')
+                != info.get('controller_generation')):
             logger.info(f'Job {job_id} schedule state or controller pid '
                         'changed since the status snapshot was taken; '
                         'deferring to the next status update cycle.')
