@@ -6,7 +6,7 @@ sky/jobs/controller.py:1890:28: ASYNC103 asyncio.exceptions.CancelledError block
 sky/jobs/controller.py:1941:13: ASYNC120 checkpoint inside except on line 1939 will discard the active exception if cancelled.
 sky/jobs/controller.py:1942:13: ASYNC120 checkpoint inside except on line 1939 will discard the active exception if cancelled.
 sky/jobs/controller.py:2001:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/server/requests/executor.py:1271:9: ASYNC120 checkpoint inside except on line 1266 will discard the active exception if cancelled.
+sky/server/requests/executor.py:1324:9: ASYNC120 checkpoint inside except on line 1319 will discard the active exception if cancelled.
 sky/server/requests/process.py:110:12: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
 sky/server/requests/threads.py:54:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/ssh_proxy.py:425:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
