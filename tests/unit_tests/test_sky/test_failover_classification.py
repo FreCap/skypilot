@@ -854,8 +854,6 @@ def test_retry_zones_preserves_structured_provider_failure(
                         lambda *_: mock.MagicMock())
     monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
                         lambda resources, **_: resources)
-    monkeypatch.setattr(backend.provision_lib, 'get_registered_provisioner',
-                        lambda *_: None)
     monkeypatch.setattr(backend, '_get_cluster_config_template',
                         lambda *_: '/tmp/template')
     monkeypatch.setattr(
@@ -892,6 +890,94 @@ def test_retry_zones_preserves_structured_provider_failure(
     assert exc_info.value.failover_history == [provider_error]
     assert backend.classify_resources_unavailable_error(
         clouds.AWS(), exc_info.value) == 'capacity'
+
+
+def test_retry_zones_passes_template_override_to_config_writer(
+        tmp_path, monkeypatch):
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._local_wheel_path = None
+    provisioner._wheel_hash = None
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = {'source': 'test'}
+    provisioner._is_launched_by_jobs_controller = False
+    to_provision = _to_provision()
+    provider_error = _aggregate_error('InsufficientInstanceCapacity')
+    provider_error.requested_count = 1
+    template_override = mock.Mock(return_value=backend.provision_lib.
+                                  TemplateSpec('/tmp/plugin-template', {
+                                      'plugin_value': 'yes',
+                                  }))
+    write_cluster_config = mock.Mock(return_value={
+        'ray': '/tmp/cluster.yaml',
+        'cluster_name_on_cloud': 'test-cluster',
+    })
+
+    monkeypatch.setattr(backend.provision_lib, '_registered_provisioners', {})
+    monkeypatch.setattr(backend.provision_lib,
+                        '_registered_provisioner_bundles', {})
+    monkeypatch.setattr(backend.provision_lib,
+                        '_legacy_mixed_owner_diagnostics', set())
+    backend.provision_lib.register_provisioner(
+        'aws',
+        mock.Mock(spec=[]),
+        template_override=template_override,
+    )
+    monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-east-1a')]]))
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(
+        backend,
+        '_get_cluster_config_template',
+        mock.Mock(side_effect=AssertionError('unexpected default template')),
+    )
+    monkeypatch.setattr(backend.backend_utils, 'write_cluster_config',
+                        write_cluster_config)
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_: None)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        mock.Mock(side_effect=provider_error))
+    monkeypatch.setattr(backend.CloudVmRayBackend, 'post_teardown_cleanup',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.FailoverCloudErrorHandlerV2,
+                        'update_blocklist_on_error', lambda *_, **__: None)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.capacity_cache, 'mark_exhausted',
+                        lambda *_, **__: None)
+
+    with pytest.raises(exceptions.ResourcesUnavailableError):
+        _call_retry_zones(provisioner, to_provision)
+
+    template_override.assert_called_once_with(
+        None,
+        to_provision,
+        _extra_launch_context={'source': 'test'},
+        _is_launched_by_jobs_controller=False,
+    )
+    write_cluster_config.assert_called_once()
+    config_args, config_kwargs = write_cluster_config.call_args
+    assert config_args[2] == '/tmp/plugin-template'
+    assert config_kwargs['extra_template_variables'] == {
+        'plugin_value': 'yes',
+    }
 
 
 def test_provision_with_retries_preserves_nested_terminal_failure(
