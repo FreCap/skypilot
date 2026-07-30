@@ -1,6 +1,7 @@
 # Production-Grade Multi-Replica API Server
 
-Status: accepted and in implementation as Step 2 of the dstack maturity port
+Status: M0-M4 implemented and live-accepted on the isolated deployment; merge
+and production rollout pending, with M5 compatibility cleanup fleet-gated
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
@@ -956,15 +957,16 @@ Deployment:
 - Update administrator documentation and remove the experimental warning only
   for the guarded HA configuration.
 
-Implementation status: the local M4 candidate is complete. Chart schema
-generation, chart lint, all 236 Helm unit tests, guarded live-value
+Implementation status: M4 is complete and live-accepted on the isolated
+deployment. Chart schema generation, chart lint, all 239 Helm unit tests,
+guarded live-value
 server-side dry-run, shell syntax and ShellCheck for the conformance harness,
 targeted role-runtime tests, formatting, mypy, Pylint, dashboard checks, and a
 warning-as-error Sphinx build pass. The fast drain-marker unit test proves
 readiness fails without opening PostgreSQL. The Docker-backed PostgreSQL lease
 test could not start its disposable `postgres:16` container in the local
-testcontainers environment; the live isolated deployment must therefore prove
-the marker-driven heartbeat transition before M4 acceptance.
+testcontainers environment; the completed conformance run and its six retained
+PostgreSQL drain rows provide the corresponding live proof.
 
 The first live M4 attempt used commit
 `ca47898533a904f89ce5a40b821cb1274966989c` and exact image digest
@@ -1060,6 +1062,37 @@ unready. The successful Eviction subresource response is the atomic PDB
 admission result. The harness now validates that response as a Kubernetes
 `Status` with a successful 2xx code, then proceeds directly to the durable
 lease, readiness endpoint, and Pod-condition drain proofs.
+
+The sixth live attempt used commit `fe17783c5c` and exact image
+`m4f-fe17783c5c@sha256:e3e09c656d952412296dda6cc4a4c4c95d504e3e0fcef4dd5e6911f0a5c73c3e`.
+It upgraded image A at revision 22 to image B at revision 23, rolled back
+through revision 24, and finished on image B at revision 25. Revision 23's
+migration completed at 14:19:16 UTC before the first target pod at 14:19:17;
+revision 25's migration completed at 14:33:19 before its first target pod at
+14:33:20.
+
+All six controlled Evictions returned successful code 201 admissions. Both
+replicas of the API, executor, and controller roles independently returned 503
+from their pod-local readiness endpoints, published `ready=false`,
+`draining=true`, and phase `draining` in PostgreSQL, and changed their
+Kubernetes Ready condition to false before termination. The six retained rows
+record drain heartbeats from 14:24:40 through 14:29:50 UTC.
+
+The preserved canary log contains 9,529 health probes, 592 authenticated
+submissions, 591 completed durable lookups, and 591 stream fetches with zero
+bad status codes; one final submission was still in flight when cleanup
+captured the log. The balanced final assertion itself contained 9,445 health
+probes and 586 complete submit, lookup, and stream cycles with zero failures.
+Over the same run window the independent API and Serve canaries recorded 1,075
+and 1,123 successful probes respectively, with zero failures. Managed job 3
+remained `RUNNING` with recovery count 2. The service remained `READY` with two
+ready replicas, both load balancer Deployments remained ready, and all three
+workload pods were ready with zero restarts.
+
+Final revision 25 has two ready, zero-restart replicas for every role, the
+three role PDBs each allow one disruption, and all conformance Jobs, the
+temporary canary, and its PDB were removed. This satisfies the M4 acceptance
+gate on the isolated deployment.
 
 Deployment:
 
