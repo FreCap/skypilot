@@ -278,6 +278,24 @@ def test_submit_jobs_returns_before_file_reads_when_every_controller_is_live(
     start_controllers.assert_not_called()
 
 
+def test_submit_jobs_empty_input_returns_without_work(tmp_path):
+    missing = tmp_path / 'must-not-be-read'
+
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_controller_processes',
+            side_effect=AssertionError('controller lookup used')), \
+            mock.patch.object(
+                scheduler.state,
+                'scheduler_set_waiting',
+                side_effect=AssertionError('state transition used')), \
+            mock.patch.object(
+                scheduler,
+                'maybe_start_controllers',
+                side_effect=AssertionError('controller start used')):
+        scheduler.submit_jobs([], str(missing), str(missing), str(missing), 50)
+
+
 def test_submit_jobs_deduplicates_ids_before_controller_checks_and_submit(
         tmp_path):
     dag, user, env = _submission_files(tmp_path)

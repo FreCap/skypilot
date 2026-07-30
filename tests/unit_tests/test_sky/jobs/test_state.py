@@ -699,6 +699,17 @@ def test_get_job_controller_processes_empty_input_uses_no_query(
     assert counts['n'] == 0, counts
 
 
+def test_scheduler_set_waiting_empty_input_uses_no_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        state.scheduler_set_waiting([], '/tmp/dag.yaml', '/tmp/user.yaml',
+                                    '/tmp/env', None, 100)
+
+    assert counts['n'] == 0, counts
+
+
 def test_scheduler_set_waiting_deduplicates_repeated_job_ids(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
