@@ -6,7 +6,7 @@ Start a Development Cluster
 
 SkyPilot makes interactive development easy on Kubernetes or cloud VMs. It helps you:
 
-#. :ref:`Launch <dev-launch>`: Quickly get a cluster with GPUs or other resources with a single command.
+#. :ref:`Create or reconcile <dev-lifecycle>`: Sync a project and provision its environment with a single command.
 #. :ref:`Autostop <dev-autostop>`: Automatically stop the cluster after some idle time for cost savings.
 #. :ref:`Connect <dev-connect>`: Easily connect to the cluster using the cluster name:
 
@@ -15,12 +15,74 @@ SkyPilot makes interactive development easy on Kubernetes or cloud VMs. It helps
    - :ref:`Jupyter Notebooks <dev-notebooks>`
    - :ref:`marimo Notebooks <marimo-notebooks>`
 
+.. _dev-lifecycle:
+
+First-class development lifecycle
+---------------------------------
+
+Define a development environment next to your project:
+
+.. code-block:: yaml
+
+  # dev.yaml
+  dev:
+    version: 1
+    name: dev
+    ide: vscode
+    remote_path: ~/sky_workdir
+
+  workdir: .
+  resources:
+    accelerators: L4:1
+    autostop:
+      idle_minutes: 300
+      down: true
+
+  setup: |
+    uv sync
+
+The ``dev`` section is client-only. SkyPilot removes it before validating and
+sending the remaining ordinary Task to the API server. Development manifests
+are single-node and use ``setup`` for repeatable initialization; they do not
+accept ``run``, services, pools, or DAGs.
+
+Provision the environment, sync the workdir, and print SSH and editor links:
+
+.. code-block:: bash
+
+  sky dev up -f dev.yaml
+
+Running the command again resynchronizes the workdir. For an already-UP
+ordinary VM or Kubernetes cluster, it skips unnecessary provisioning and
+setup. Use ``--reconfigure`` when setup should run again:
+
+.. code-block:: bash
+
+  sky dev up -f dev.yaml --reconfigure
+
+Use the lifecycle group without remembering separate cluster commands:
+
+.. code-block:: bash
+
+  sky dev status dev
+  sky dev open dev
+  sky dev ssh dev
+  sky dev stop dev
+  sky dev down dev
+
+``sky dev`` uses an ordinary named SkyPilot cluster. Existing workspace,
+resource, volume, optimizer, RBAC, autostop, SSH, and lifecycle behavior
+therefore remains available. See the copyable
+`examples/dev.yaml <https://github.com/skypilot-org/skypilot/blob/master/examples/dev.yaml>`__
+for a complete CPU example.
+
 .. _dev-launch:
 
-Launch
-------
+Launch directly
+---------------
 
-To launch a cluster with a cheap GPU for development:
+The lower-level cluster workflow remains available. To launch a cluster with a
+cheap GPU for development:
 
 .. code-block:: bash
 
@@ -94,6 +156,12 @@ SkyPilot will automatically configure the SSH setting for a cluster, so that use
 
 .. code-block:: bash
 
+  sky dev ssh dev
+
+Or use the generated SSH alias directly:
+
+.. code-block:: bash
+
   ssh dev
 
 
@@ -102,8 +170,17 @@ SkyPilot will automatically configure the SSH setting for a cluster, so that use
 VSCode
 ~~~~~~
 
-A common use case for interactive development is to connect a local IDE to a remote cluster and directly edit code that lives on the cluster.
-This is supported by simply connecting VSCode to the cluster with the cluster name:
+A common use case for interactive development is to connect a local IDE to a
+remote cluster and directly edit code that lives on the cluster. Open the
+configured editor directly:
+
+.. code-block:: bash
+
+  sky dev open dev
+
+Use ``--print-only`` to print the safely encoded URI without invoking a local
+application. VS Code, Cursor, Windsurf, and Zed are supported. You can also
+connect VS Code manually with the cluster name:
 
 #. Click on the top bar, type: :code:`> remote-ssh`, and select :code:`Remote-SSH: Connect Current Window to Host...`
 #. Select the cluster name (e.g., ``dev``) from the list of hosts.

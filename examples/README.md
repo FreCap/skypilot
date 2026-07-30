@@ -38,6 +38,9 @@ Machine learning examples:
 
 General examples:
 
+- [**`dev.yaml`**](./dev.yaml): Provision, synchronize, and connect to a
+  single-node interactive environment with `sky dev up -f examples/dev.yaml`.
+
 - [**`detectron2_docker.yaml`**](./detectron2_docker.yaml): Using Docker to run Detectron2 on GPUs.
 
 - [**`using_file_mounts.yaml`**](./using_file_mounts.yaml): Using `file_mounts` to upload local/cloud paths to a cluster.
