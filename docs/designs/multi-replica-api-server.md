@@ -1,7 +1,7 @@
 # Production-Grade Multi-Replica API Server
 
-Status: M0-M4 implemented and live-accepted on the isolated deployment; merge
-and production rollout pending, with M5 compatibility cleanup fleet-gated
+Status: M0-M4 merged in PR #1070 and live-accepted on the isolated deployment;
+production fleet rollout and M5 compatibility cleanup remain fleet-gated
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
