@@ -1,5 +1,7 @@
 """Tests for AWS capacity classification and cache scoping."""
 # pylint: disable=protected-access
+import inspect
+import pickle
 import unittest.mock as mock
 
 import botocore.exceptions
@@ -14,6 +16,51 @@ from sky.provision import common as provision_common
 from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
+
+
+_CAPACITY_POLICY_SIGNATURES = {
+    '_iter_error_chain':
+        '(error: BaseException) -> collections.abc.Iterable[BaseException]',
+    '_provider_error_codes': '(error: BaseException) -> list[str]',
+    '_classify_capacity_error':
+        "(cloud: 'clouds.Cloud', error: BaseException) -> str | None",
+    'classify_resources_unavailable_error':
+        "(cloud: 'clouds.Cloud', "
+        "error: sky.exceptions.ResourcesUnavailableError) -> str | None",
+    '_is_quota_error': '(error: BaseException) -> bool',
+    '_canonical_accelerators':
+        "(to_provision: 'resources_lib.Resources') -> str",
+    '_capacity_cache_cloud_name':
+        "(to_provision: 'resources_lib.Resources') -> str | None",
+    '_capacity_cache_account':
+        "(cloud: Optional[ForwardRef('clouds.Cloud')], "
+        'cloud_user_identity: list[str] | None) -> str | None',
+    '_capacity_cache_key':
+        "(to_provision: 'resources_lib.Resources', region: 'clouds.Region', "
+        "zones: list['clouds.Zone'] | None, num_nodes: int, "
+        "account: str | None) -> "
+        "Optional[ForwardRef('capacity_cache.ResourceKey')]",
+    '_quota_cooldown_key':
+        "(to_provision: 'resources_lib.Resources', region: 'clouds.Region', "
+        "num_nodes: int, account: str | None) -> "
+        "Optional[ForwardRef('capacity_cache.QuotaCooldownKey')]",
+    '_fully_created_fresh_demand':
+        "(provision_record: 'provision_common.ProvisionRecord', "
+        'num_nodes: int, cluster_exists: bool) -> bool',
+    '_failure_requested_full_demand':
+        '(error: BaseException, num_nodes: int) -> bool',
+    '_placement_error_code': '(error: BaseException) -> str | None',
+    '_placement_outcome':
+        '(error: Exception, capacity_reason: str | None = None) -> str',
+}
+
+
+def test_capacity_policy_historical_contract():
+    for name, signature in _CAPACITY_POLICY_SIGNATURES.items():
+        symbol = getattr(backend, name)
+        assert str(inspect.signature(symbol)) == signature
+        assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
 
 
 class _FakeClientError(Exception):
