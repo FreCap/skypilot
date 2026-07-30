@@ -120,6 +120,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/users/service-account-tokens/rotate', 'POST'),
     # --- Admin-only estimates ---
     ('/estimated_spend', 'GET'),
+    ('/estimated_spend/drilldown', 'GET'),
     # --- Operator notifications ---
     ('/notifications', 'GET'),
     ('/notifications/read', 'POST'),
