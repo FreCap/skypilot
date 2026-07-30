@@ -16,7 +16,7 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 
 
-def _source_hash(obj) -> str:
+def _runtime_source_hash(obj) -> str:
     source = Path(obj.__init__.__code__.co_filename).read_text(encoding='utf-8')
     tree = ast.parse(source)
     class_node = next(
@@ -24,6 +24,10 @@ def _source_hash(obj) -> str:
         if isinstance(node, ast.ClassDef) and node.name == obj.__name__)
     class_source = ast.get_source_segment(source, class_node)
     assert class_source is not None
+    # The extracted dynamic proxy needs an explicit return type at its new
+    # path for basedpyright. Ignore that type-only annotation while pinning
+    # the unchanged runtime implementation.
+    class_source = class_source.replace(' -> Callable[..., Any]:', ':')
     return hashlib.sha256(class_source.encode()).hexdigest()
 
 
@@ -59,10 +63,10 @@ def test_historical_pickle_resolves_in_clean_process():
 
 
 def test_gateway_implementation_fingerprints():
-    assert _source_hash(
+    assert _runtime_source_hash(
         cloud_vm_ray_backend._CancelAwareStub  # pylint: disable=protected-access
     ) == '0471f7f7f6e26ce328d8fc2806c2c0aea3189d1c7dc932479724025954463f25'
-    assert _source_hash(
+    assert _runtime_source_hash(
         cloud_vm_ray_backend.SkyletClient
     ) == 'f4688ab7a4f5c1b9791905d32872b78b0d91659fe2621874db4d55ad3e6bde6f'
 

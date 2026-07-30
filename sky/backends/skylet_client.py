@@ -1,4 +1,5 @@
 """Typed client gateway for Skylet gRPC services."""
+from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Sequence
 import typing
@@ -50,7 +51,7 @@ class _CancelAwareStub:
         self._stub = stub
         self._streaming = frozenset(streaming_methods)
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Callable[..., Any]:
         method = getattr(self._stub, name)
         if name in self._streaming:
 
