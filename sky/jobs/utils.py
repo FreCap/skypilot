@@ -907,10 +907,9 @@ def event_callback_func(
         if event_callback is None or task is None:
             return
         event_callback = event_callback.strip()
-        pool = managed_job_state.get_pool_from_job_id(job_id)
-        if pool is not None:
-            cluster_name, _ = (managed_job_state.get_pool_submit_info(job_id))
-        else:
+        pool, cluster_name = (
+            managed_job_state.get_pool_and_current_cluster_name(job_id))
+        if pool is None:
             cluster_name = generate_managed_job_cluster_name(
                 task.name, job_id) if task.name else None
         logger.info(f'=== START: event callback for {status!r} ===')
