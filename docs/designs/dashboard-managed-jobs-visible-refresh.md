@@ -31,10 +31,11 @@ each existing owner when the document becomes visible again.
 
 ## Solution
 
-Use one private `useVisibleRefreshInterval` helper inside `jobs.jsx`. It owns a
-single interval and `visibilitychange` listener, reads the current callback
-through a ref so callback updates do not recreate the timer, and forwards the
-trigger source to the existing refresh owner.
+Use the shared `useVisibleRefreshInterval` dashboard hook. It owns a single
+interval and `visibilitychange` listener, reads the current callback through a
+ref so callback updates do not recreate the timer, and forwards the trigger
+source to the existing refresh owner. The service list now reuses the same
+lifecycle instead of duplicating it.
 
 The helper records a visibility-triggered refresh timestamp. If the existing
 periodic timer fires within the same interval window, it skips that one tick to
@@ -54,11 +55,11 @@ returns to inspect it.
 
 ## Changed-Path-to-Test Matrix
 
-| Changed path | Invariant | Test and command |
-| --- | --- | --- |
+| Changed path                            | Invariant                                                                                                                                                    | Test and command                                                                                                            |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | `sky/dashboard/src/components/jobs.jsx` | Hidden pool ticks do no work; visibility restore refreshes once; an adjacent interval does not duplicate the refresh; unmount removes the listener and timer | `sky/dashboard/src/components/jobs.test.jsx`; `npm --prefix sky/dashboard test -- --runInBand src/components/jobs.test.jsx` |
-| `sky/dashboard/src/components/jobs.jsx` | Hidden job ticks do no work; visibility restore refreshes once through the existing automatic owner | `sky/dashboard/src/components/jobs.test.jsx`; same command |
-| `sky/dashboard/src/components/jobs.jsx` | Initial/manual ownership, stale pool and job response fencing, dynamic batch intervals, cache reuse, and automatic refresh serialization remain intact | Existing lifecycle cases in `sky/dashboard/src/components/jobs.test.jsx`; same command |
+| `sky/dashboard/src/components/jobs.jsx` | Hidden job ticks do no work; visibility restore refreshes once through the existing automatic owner                                                          | `sky/dashboard/src/components/jobs.test.jsx`; same command                                                                  |
+| `sky/dashboard/src/components/jobs.jsx` | Initial/manual ownership, stale pool and job response fencing, dynamic batch intervals, cache reuse, and automatic refresh serialization remain intact       | Existing lifecycle cases in `sky/dashboard/src/components/jobs.test.jsx`; same command                                      |
 
 ## Performance Evidence
 

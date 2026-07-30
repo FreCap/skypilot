@@ -23,6 +23,7 @@ import { REFRESH_INTERVALS } from '@/lib/config';
 import { sortData } from '@/data/utils';
 import { RotateCwIcon, CopyIcon, CheckIcon } from 'lucide-react';
 import { useMobile } from '@/hooks/useMobile';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import { Card } from '@/components/ui/card';
 import Link from 'next/link';
 import {
@@ -34,6 +35,7 @@ import { StatusBadge } from '@/components/elements/StatusBadge';
 import dashboardCache from '@/lib/cache';
 
 const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
+const SERVICE_SUMMARY_ARGS = [{ summaryOnly: true }];
 
 export function formatUptime(uptime) {
   // `uptime` is the epoch timestamp of when the service first became
@@ -184,9 +186,10 @@ export function ServicesTable({
         // The list view only needs per-service aggregates: use the cheap
         // summary query (the full one serializes every replica and takes
         // tens of seconds at fleet scale).
-        const servicesResponse = await dashboardCache.get(getServices, [
-          { summaryOnly: true },
-        ]);
+        const servicesResponse = await dashboardCache.get(
+          getServices,
+          SERVICE_SUMMARY_ARGS
+        );
         if (!isCurrentRequest()) {
           return;
         }
@@ -212,17 +215,25 @@ export function ServicesTable({
   );
 
   const fetchData = useCallback(
-    ({ supersede = false } = {}) => {
-      if (activeRequestRef.current !== null && !supersede) {
-        return activeRequestRef.current;
+    ({ kind = 'automatic' } = {}) => {
+      const activeRequest = activeRequestRef.current;
+      if (activeRequest !== null) {
+        const shouldReuse =
+          kind === 'automatic' ||
+          activeRequest.kind === kind ||
+          (kind === 'visibility' && activeRequest.kind === 'manual');
+        if (shouldReuse) {
+          return activeRequest.promise;
+        }
       }
 
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
       const request = runFetch(requestVersion);
-      activeRequestRef.current = request;
+      const owner = { kind, promise: request };
+      activeRequestRef.current = owner;
       return request.finally(() => {
-        if (activeRequestRef.current === request) {
+        if (activeRequestRef.current === owner) {
           activeRequestRef.current = null;
         }
       });
@@ -237,7 +248,7 @@ export function ServicesTable({
   // Expose fetchData to parent component
   useEffect(() => {
     if (refreshDataRef) {
-      const refresh = () => fetchData({ supersede: true });
+      const refresh = () => fetchData({ kind: 'manual' });
       refreshDataRef.current = refresh;
       return () => {
         if (refreshDataRef.current === refresh) {
@@ -248,24 +259,35 @@ export function ServicesTable({
     return undefined;
   }, [refreshDataRef, fetchData]);
 
-  useEffect(() => {
-    let isCurrent = true;
-
-    fetchData();
-
-    const interval = setInterval(() => {
-      if (isCurrent && window.document.visibilityState === 'visible') {
-        fetchData();
+  const refreshWhenVisible = useCallback(
+    (source) => {
+      if (source === 'visibilitychange') {
+        const activeKind = activeRequestRef.current?.kind;
+        if (activeKind === 'manual' || activeKind === 'visibility') {
+          return;
+        }
+        dashboardCache.invalidate(getServices, SERVICE_SUMMARY_ARGS);
+        void fetchData({ kind: 'visibility' });
+        return;
       }
-    }, refreshInterval);
+      void fetchData();
+    },
+    [fetchData]
+  );
 
+  useVisibleRefreshInterval(
+    Boolean(refreshInterval),
+    refreshInterval,
+    refreshWhenVisible
+  );
+
+  useEffect(() => {
+    void fetchData();
     return () => {
-      isCurrent = false;
       requestVersionRef.current += 1;
       activeRequestRef.current = null;
-      clearInterval(interval);
     };
-  }, [refreshInterval, fetchData]);
+  }, [fetchData]);
 
   // Reset to first page when data changes
   useEffect(() => {
