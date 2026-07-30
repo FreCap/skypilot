@@ -256,8 +256,11 @@ the eight highest-cost groups plus `Other`. Job and user rows include spot and
 on-demand subtotals. The route is denied to default users and viewers by RBAC
 and also checks the admin role directly before querying.
 
-Future versions may add workspace, cloud, workload, or job filters and
-pagination. Those filters must apply RBAC before querying the rollup table.
+The paginated owner, workload, task, and physical-attempt hierarchy is
+specified in `docs/designs/spend-attribution-hierarchy.md`. It remains
+admin-only, applies the same bounded date range, and reads the rollup table
+without changing the estimate semantics above. Future workspace or cloud
+filters must likewise apply RBAC before querying the rollup table.
 
 Example response:
 

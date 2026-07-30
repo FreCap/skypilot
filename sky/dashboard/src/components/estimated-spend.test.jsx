@@ -60,16 +60,31 @@ jest.mock('@/data/connectors/client', () => ({
 }));
 jest.mock('@/data/connectors/estimated_spend', () => ({
   getEstimatedSpend: jest.fn(),
+  getEstimatedSpendDrilldown: jest.fn(),
 }));
 
 import { getCurrentUserRole } from '@/data/connectors/client';
-import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
+import {
+  getEstimatedSpend,
+  getEstimatedSpendDrilldown,
+} from '@/data/connectors/estimated_spend';
 import {
   EstimatedSpend,
   formatCostPerRequest,
   shiftUtcDate,
   utcDateString,
 } from '@/components/estimated-spend';
+
+beforeEach(() => {
+  getEstimatedSpendDrilldown.mockResolvedValue({
+    level: 'owner',
+    rows: [],
+    total: 0,
+    offset: 0,
+    limit: 50,
+    has_more: false,
+  });
+});
 
 afterEach(() => {
   jest.clearAllMocks();
@@ -97,7 +112,7 @@ function response(days, estimatedCost) {
     days: [{ date: '2023-11-15', estimated_cost: estimatedCost }],
     workloads: [],
     clouds: [],
-    group_by: 'job',
+    group_by: 'user',
     groups: [],
     series: [],
     excluded_by_reason: {},
@@ -174,18 +189,18 @@ test('keeps the newest range when an older request finishes last', async () => {
   });
 
   render(<EstimatedSpend />);
-  await waitFor(() => expect(requests.has('30:job')).toBe(true));
+  await waitFor(() => expect(requests.has('30:user')).toBe(true));
 
   fireEvent.click(screen.getByRole('button', { name: '90d' }));
-  await waitFor(() => expect(requests.has('90:job')).toBe(true));
+  await waitFor(() => expect(requests.has('90:user')).toBe(true));
 
   await act(async () => {
-    requests.get('90:job').resolve(response(90, 90));
+    requests.get('90:user').resolve(response(90, 90));
   });
   expect(await screen.findAllByText('$90.00')).toHaveLength(2);
 
   await act(async () => {
-    requests.get('30:job').resolve(response(30, 30));
+    requests.get('30:user').resolve(response(30, 30));
   });
   expect(screen.getAllByText('$90.00')).toHaveLength(2);
   expect(screen.queryAllByText('$30.00')).toHaveLength(0);
@@ -230,8 +245,29 @@ test('coalesces interval refreshes while the same request is pending', async () 
   jest.useRealTimers();
 });
 
-test('groups the chart and table by user with purchase-option costs', async () => {
+test('defaults to owner hierarchy with purchase-option costs', async () => {
   getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpendDrilldown.mockResolvedValue({
+    level: 'owner',
+    rows: [
+      {
+        user_hash: 'user-1',
+        user_name: 'Alice',
+        owner_unknown: false,
+        workload_count: 2,
+        cluster_count: 3,
+        estimated_cost: 10,
+        spot_estimated_cost: 4,
+        on_demand_estimated_cost: 6,
+        priced_machine_seconds: 7200,
+        excluded_machine_seconds: 0,
+      },
+    ],
+    total: 1,
+    offset: 0,
+    limit: 50,
+    has_more: false,
+  });
   getEstimatedSpend.mockImplementation(async (days, groupBy) => {
     if (groupBy === 'user') {
       return {
@@ -262,13 +298,6 @@ test('groups the chart and table by user with purchase-option costs', async () =
 
   render(<EstimatedSpend />);
   await waitFor(() =>
-    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'job', rollingRange(30))
-  );
-
-  fireEvent.change(screen.getByLabelText('Group spend by'), {
-    target: { value: 'user' },
-  });
-  await waitFor(() =>
     expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'user', rollingRange(30))
   );
 
@@ -278,6 +307,7 @@ test('groups the chart and table by user with purchase-option costs', async () =
   expect(within(aliceRow).getByText('$6.00')).toBeTruthy();
   expect(screen.getByRole('columnheader', { name: 'Spot' })).toBeTruthy();
   expect(screen.getByRole('columnheader', { name: 'On-demand' })).toBeTruthy();
+  expect(screen.getByText('2 workloads · 3 attempts')).toBeTruthy();
   expect(screen.getByTestId('chart')).toHaveTextContent('Alice:10');
   expect(screen.getByTestId('chart')).toHaveAttribute('data-x-stacked', 'true');
   expect(screen.getByTestId('chart')).toHaveAttribute('data-y-stacked', 'true');
@@ -344,26 +374,26 @@ test('selects today and yesterday as exact UTC ranges', async () => {
 
   render(<EstimatedSpend />);
   await waitFor(() =>
-    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'job', rollingRange(30))
+    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'user', rollingRange(30))
   );
 
   fireEvent.click(screen.getByRole('button', { name: 'Today' }));
   await waitFor(() =>
-    expect(getEstimatedSpend).toHaveBeenCalledWith(1, 'job', rollingRange(1))
+    expect(getEstimatedSpend).toHaveBeenCalledWith(1, 'user', rollingRange(1))
   );
 
   fireEvent.click(screen.getByRole('button', { name: 'Yesterday' }));
   await waitFor(() =>
     expect(getEstimatedSpend).toHaveBeenCalledWith(
       1,
-      'job',
+      'user',
       rollingRange(1, -1)
     )
   );
   expect(await screen.findByText('Yesterday estimate (UTC)')).toBeTruthy();
 });
 
-test('applies an arbitrary inclusive UTC date range', async () => {
+test('applies an arbitrary inclusive UTC date range for the owner view', async () => {
   getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   getEstimatedSpend.mockResolvedValue(response(3, 10));
   const startDate = shiftUtcDate(utcDateString(), -4);
@@ -382,7 +412,7 @@ test('applies an arbitrary inclusive UTC date range', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
 
   await waitFor(() =>
-    expect(getEstimatedSpend).toHaveBeenCalledWith(3, 'job', {
+    expect(getEstimatedSpend).toHaveBeenCalledWith(3, 'user', {
       startDate,
       endDate,
     })
@@ -422,6 +452,34 @@ test('names tooltip entries and hides zero-valued series', async () => {
   const chart = await screen.findByTestId('chart');
   expect(chart).toHaveAttribute('data-tooltip-label', 'Cluster alpha: $1.25');
   expect(chart).toHaveAttribute('data-tooltip-shows-zero', 'false');
+});
+
+test('makes the chart-only Other remainder inspectable', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  const estimate = response(30, 10);
+  estimate.series = [
+    {
+      user_hash: 'user-1',
+      user_name: 'Alice',
+      estimated_cost_by_day: [6],
+    },
+    {
+      is_other: true,
+      estimated_cost_by_day: [4],
+    },
+  ];
+  getEstimatedSpend.mockResolvedValue(estimate);
+
+  render(<EstimatedSpend />);
+
+  expect(
+    await screen.findByRole('button', { name: 'Inspect Other' })
+  ).toBeTruthy();
+  expect(
+    screen.getByText('Other is the chart-only remainder', { exact: false })
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Inspect Other' }));
+  expect(screen.getByLabelText('Group spend by')).toHaveValue('user');
 });
 
 test('treats a failed role lookup as an error, not a permission denial', async () => {
