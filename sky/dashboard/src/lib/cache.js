@@ -101,6 +101,16 @@ class DashboardCache {
       return this.pendingRequests.get(key);
     }
 
+    // A background refresh can outlive the cache entry's TTL. Reuse that
+    // generation's owner instead of starting a second connector call while
+    // the first is still in flight.
+    if (this.backgroundJobs.has(key)) {
+      this._debug(
+        `Request deduplication: Reusing background refresh for ${functionName}`
+      );
+      return cachedItem.data;
+    }
+
     // Keep connector invocation eager while normalizing a synchronous throw
     // into the same rejected-promise path as an asynchronous failure.
     const fetchResultPromise = invokeAsPromise(fetchFunction, args);
