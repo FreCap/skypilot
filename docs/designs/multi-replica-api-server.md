@@ -1094,6 +1094,23 @@ three role PDBs each allow one disruption, and all conformance Jobs, the
 temporary canary, and its PDB were removed. This satisfies the M4 acceptance
 gate on the isolated deployment.
 
+Post-acceptance cleanup cancelled managed job 3 and brought down
+`ha-m3e-fail-stop-serve` through the authenticated API before removing test
+fixtures. Both requests succeeded, all three workload pods terminated, both
+cloud LoadBalancer Services completed their finalizers, and AWS reported no
+remaining load balancers with the test prefix. Revision 26 then disabled the
+test-only external Serve load balancer mode and cleared all six authentication
+Secret and key values. Its migration and three-role rollout completed under
+139 additional API health probes with zero failures.
+
+The dedicated workload namespace, M2/M3 canaries, migration Job, test Secrets,
+and namespace, system, and cluster RBAC fixtures were then deleted. The
+retained isolated release consists only of the two ready, zero-restart replicas
+for each role, their PDBs and API Service, PostgreSQL, RWX state, and declared
+service account and Helm metadata. Both API pods reach the shared health
+endpoint, revision 26 is deployed, and no M2/M3 workload or cloud load balancer
+residue remains.
+
 Deployment:
 
 1. Render and server-side dry-run the guarded chart, including the hook,
