@@ -6,7 +6,7 @@ Implemented.
 
 ## Context
 
-`sky/backends/cloud_vm_ray_backend.py` is 7,142 lines and contains the Cloud VM
+`sky/backends/cloud_vm_ray_backend.py` is 7,331 lines and contains the Cloud VM
 provisioning retry orchestrator, resource-handle state, task execution,
 teardown, log transport, and a low-state family of provider-capacity policy
 helpers. File size is only a prioritization signal. This design extracts the
@@ -168,7 +168,7 @@ cover the new production module and the façade.
 
 ## Validation evidence
 
-- The characterization test passed before extraction and now proves 14
+- The characterization test passed before extraction and now proves 16
   historical call signatures, direct new-module/façade identity, historical
   `__module__`, and pickle round trips. Signature comparison strips annotation
   rendering because Python 3.14 represents `Optional[ForwardRef(...)]` as a
@@ -176,6 +176,8 @@ cover the new production module and the façade.
 - All 16 moved function bodies are AST-equivalent to the
   `7b5f87c0a9ea5b90809c2582648df0d4283b32d4` baseline when source locations
   are ignored.
+- The extraction reduces `cloud_vm_ray_backend.py` from 7,331 to 7,002 lines
+  while keeping the 394-line policy leaf behind the historical façade.
 - The final formatted state passes 465 focused unit tests:
   54 failover-classification, 2 capacity-storm, 331 Serve replica-manager,
   66 Cloud VM backend, and 12 placement-history cases.

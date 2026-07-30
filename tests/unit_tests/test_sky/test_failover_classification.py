@@ -22,6 +22,8 @@ _CAPACITY_POLICY_SIGNATURES = {
     '_iter_error_chain': '(error)',
     '_provider_error_codes': '(error)',
     '_classify_capacity_error': '(cloud, error)',
+    '_terminal_failover_leaves': '(error)',
+    '_terminal_leaf_cause_nodes': '(failure, *, history_depth, remaining_nodes)',
     'classify_resources_unavailable_error': '(cloud, error)',
     '_is_quota_error': '(error)',
     '_canonical_accelerators': '(to_provision)',
