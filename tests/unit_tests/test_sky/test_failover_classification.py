@@ -14,6 +14,7 @@ from sky.backends import cloud_vm_ray_backend as backend
 from sky.provision import capacity_cache
 from sky.provision import capacity_policy
 from sky.provision import common as provision_common
+from sky.provision import failover_error_policy
 from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
@@ -80,17 +81,30 @@ def _resolve_backend_symbol(path: str):
     return symbol
 
 
+def _resolve_failover_policy_symbol(path: str):
+    symbol = failover_error_policy
+    for name in path.split('.'):
+        symbol = getattr(symbol, name)
+    return symbol
+
+
 def test_failover_error_policy_historical_contract():
+    assert (backend._RSYNC_NOT_FOUND_MESSAGE
+            is failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)
     for handler_name in ('FailoverCloudErrorHandlerV1',
                          'FailoverCloudErrorHandlerV2'):
         handler = getattr(backend, handler_name)
+        assert getattr(failover_error_policy, handler_name) is handler
         assert handler.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert handler.__qualname__ == handler_name
         assert pickle.loads(pickle.dumps(handler)) is handler
 
     for path, signature in _FAILOVER_ERROR_POLICY_SIGNATURES.items():
         symbol = _resolve_backend_symbol(path)
+        assert _resolve_failover_policy_symbol(path) is symbol
         assert _call_signature(symbol) == signature
         assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert symbol.__qualname__ == path
         assert pickle.loads(pickle.dumps(symbol)) is symbol
 
 
