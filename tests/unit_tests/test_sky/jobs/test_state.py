@@ -859,6 +859,51 @@ def test_get_latest_log_stream_snapshot_keeps_task_without_job_info(
     assert counts['n'] == 1, counts
 
 
+def test_get_task_log_stream_snapshot_reads_one_task_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 2, status=ManagedJobStatus.RUNNING)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                    job_id_on_pool_cluster=41,
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        snapshot = state.get_task_log_stream_snapshot(job_id, 2)
+
+    assert snapshot == state.JobLogStreamSnapshot(2, ManagedJobStatus.RUNNING,
+                                                  'pool-a', 'replica-a', 41,
+                                                  'task-2')
+    assert counts['n'] == 1, counts
+
+    state.set_current_cluster_name(job_id, 'replica-b')
+    with _count_sql_statements(engine) as counts:
+        recovered_snapshot = state.get_task_log_stream_snapshot(job_id, 2)
+
+    assert recovered_snapshot == state.JobLogStreamSnapshot(
+        2, ManagedJobStatus.RUNNING, 'pool-a', 'replica-b', 41, 'task-2')
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_log_stream_snapshot_missing_task_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+
+    with _count_sql_statements(engine) as counts:
+        snapshot = state.get_task_log_stream_snapshot(job_id, 999)
+
+    assert snapshot == state.JobLogStreamSnapshot(None, None, None, None, None,
+                                                  None)
+    assert counts['n'] == 1, counts
+
+
 def test_get_pool_and_current_cluster_name_reads_one_row(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn

@@ -1274,7 +1274,7 @@ def get_active_file_mounts_blob_ids() -> set[str]:
                     spot_table.c.status.in_(terminal_status_values)),
             )).distinct())
     query = sqlalchemy.select(
-        job_info_table.c.file_mounts_blob_id.distinct()).where(
+        job_info_table.c.file_mounts_blob_id).distinct().where(
             sqlalchemy.and_(
                 job_info_table.c.file_mounts_blob_id.is_not(None),
                 job_info_table.c.spot_job_id.in_(non_terminal_job_ids_subquery),
@@ -1359,6 +1359,46 @@ def get_log_stream_context(
     if context is None:
         return None, None, None, None
     return context[0], context[1], context[2], context[3]
+
+
+@db_retries.retry
+def get_task_log_stream_snapshot(job_id: int,
+                                 task_id: int) -> JobLogStreamSnapshot:
+    """Return one task-specific status and routing snapshot for log following.
+
+    When callers follow a specific task in a JobGroup, the task status and its
+    routing context must come from the same database snapshot. Otherwise a
+    later task can advance the job-level latest-task status between the two
+    reads and make the follower wait on the wrong lifecycle.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                spot_table.c.task_id,
+                spot_table.c.status,
+                job_info_table.c.pool,
+                job_info_table.c.current_cluster_name,
+                job_info_table.c.job_id_on_pool_cluster,
+                spot_table.c.task_name,
+            ).select_from(
+                spot_table.outerjoin(
+                    job_info_table, job_info_table.c.spot_job_id ==
+                    spot_table.c.spot_job_id)).where(
+                        sqlalchemy.and_(
+                            spot_table.c.spot_job_id == job_id,
+                            spot_table.c.task_id == task_id,
+                        ))).fetchone()
+    if row is None:
+        return JobLogStreamSnapshot(None, None, None, None, None, None)
+    return JobLogStreamSnapshot(
+        row.task_id,
+        ManagedJobStatus(row.status),
+        row.pool,
+        row.current_cluster_name,
+        row.job_id_on_pool_cluster,
+        row.task_name,
+    )
 
 
 @db_retries.retry
@@ -1898,7 +1938,7 @@ def get_nonterminal_job_ids_by_pool(pool: str,
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         query = sqlalchemy.select(
-            spot_table.c.spot_job_id.distinct()).select_from(
+            spot_table.c.spot_job_id).distinct().select_from(
                 spot_table.outerjoin(
                     job_info_table,
                     spot_table.c.spot_job_id == job_info_table.c.spot_job_id))

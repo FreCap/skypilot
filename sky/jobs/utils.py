@@ -1509,13 +1509,8 @@ def stream_logs_by_id(job_id: int,
     def get_stream_target_snapshot() -> managed_job_state.JobLogStreamSnapshot:
         if filtered_task_id is None:
             return managed_job_state.get_latest_log_stream_snapshot(job_id)
-
-        _, status = managed_job_state.get_latest_task_id_status(job_id)
-        pool, cluster_name, job_id_to_tail, task_name = (
-            managed_job_state.get_log_stream_context(job_id, filtered_task_id))
-        return managed_job_state.JobLogStreamSnapshot(filtered_task_id, status,
-                                                      pool, cluster_name,
-                                                      job_id_to_tail, task_name)
+        return managed_job_state.get_task_log_stream_snapshot(
+            job_id, filtered_task_id)
 
     # Follow the jobs controller log during provisioning so the user sees the
     # same spinner messages that `sky launch` shows. The controller relays the

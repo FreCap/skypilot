@@ -243,6 +243,57 @@ class TestStreamLogsByIdLifecycle:
         assert backend.status_calls == 1
         assert sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS
 
+    def test_filtered_task_snapshot_stops_on_requested_task_terminal_state(
+            self, monkeypatch):
+        backend = _FakeBackend()
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        latest_status_read = mock.Mock(return_value=(1, running))
+        filtered_snapshot_read = mock.Mock(
+            return_value=managed_job_state.JobLogStreamSnapshot(
+                0, succeeded, None, None, None, 'first'))
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(
+            managed_job_state, 'get_all_task_ids_names_statuses_logs',
+            mock.Mock(return_value=[
+                (0, 'first', running, None, None),
+                (1, 'second', running, None, None),
+            ]))
+        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
+                            latest_status_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
+                            filtered_snapshot_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_status',
+            mock.Mock(side_effect=AssertionError('whole-job status poll used')))
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(
+            jobs_utils.time, 'sleep',
+            mock.Mock(side_effect=AssertionError('waited on a later task')))
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42,
+                                                          follow=True,
+                                                          task=0)
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        latest_status_read.assert_called_once_with(42)
+        filtered_snapshot_read.assert_called_once_with(42, 0)
+        assert backend.tail_calls == 0
+        assert backend.status_calls == 0
+
     @pytest.mark.parametrize(
         'terminal_status',
         managed_job_state.ManagedJobStatus.terminal_statuses(),
