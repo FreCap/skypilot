@@ -177,8 +177,8 @@ module and facade.
   zone, region, and cloud block widths, and V2 default multi-zone behavior.
 - All three moved AST nodes, `_add_to_blocked_resources`,
   `FailoverCloudErrorHandlerV1`, and `FailoverCloudErrorHandlerV2`, are
-  identical to exact base
-  `28939af91c53fc8b9f4e80ac1e4af0df7ffe75f7` when source locations are
+  identical to exact rebased base
+  `ccb3890b2ec836206e73e456cb157c0289fb7beb` when source locations are
   ignored.
 - The local credential-independent matrix passed 57 failover-policy and
   capacity tests plus all 66 Cloud VM backend tests. The paid AWS failover
@@ -189,10 +189,10 @@ module and facade.
   Pylint at 10.00, dashboard ESLint, and dashboard formatting. Ruff, Python
   3.14 compileall, BasedPyright 1.39.9 with the locked baseline,
   import-linter, and git diff checks also pass.
-- Ten balanced alternating pairs of fresh-process imports measured a
-  0.790720-second base median and 0.795379-second branch median, a 0.589%
-  delta within cold-import noise. Direct aliases add no wrapper frame, and
-  AST equivalence proves no added resource copy, provider call, dispatch,
+- Twenty balanced alternating pairs of fresh-process imports measured a
+  0.977019-second base median and 0.972457-second branch median, a 0.467%
+  improvement within cold-import noise. Direct aliases add no wrapper frame,
+  and AST equivalence proves no added resource copy, provider call, dispatch,
   loop, or retry in the moved bodies.
 - The deterministic diff report classifies the change as L with 952
   significant changed lines, 1,239 total changed lines, and four files.
