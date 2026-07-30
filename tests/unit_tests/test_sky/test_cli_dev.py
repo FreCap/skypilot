@@ -20,8 +20,10 @@ from sky.utils import status_lib
 def _write_manifest(tmp_path: pathlib.Path,
                     *,
                     ide: str = 'vscode',
-                    remote_path: str = '/home/sky/sky_workdir') -> pathlib.Path:
+                    remote_path: str = '/home/sky/sky_workdir',
+                    setup: str | None = None) -> pathlib.Path:
     manifest_path = tmp_path / 'dev.yaml'
+    setup_yaml = '' if setup is None else f'setup: |\n  {setup}\n'
     manifest_path.write_text(
         f'dev:\n'
         f'  version: 1\n'
@@ -31,7 +33,8 @@ def _write_manifest(tmp_path: pathlib.Path,
         f'resources:\n'
         f'  cpus: 2\n'
         f'  autostop:\n'
-        f'    idle_minutes: 30\n',
+        f'    idle_minutes: 30\n'
+        f'{setup_yaml}',
         encoding='utf-8')
     return manifest_path
 
@@ -86,8 +89,9 @@ def test_dev_up_launches_with_fast_reconcile(tmp_path: pathlib.Path,
     monkeypatch.setattr(command, '_get_cluster_records_and_set_ssh_config',
                         fallback)
     monkeypatch.setattr(command, '_open_dev_editor', opener)
+    usage_update = mock.Mock()
     monkeypatch.setattr(command.usage_lib.messages.usage,
-                        'update_user_task_yaml', mock.Mock())
+                        'update_user_task_yaml', usage_update)
     args = ['-f', str(manifest_path), '--yes']
     if reconfigure:
         args.append('--reconfigure')
@@ -105,6 +109,10 @@ def test_dev_up_launches_with_fast_reconcile(tmp_path: pathlib.Path,
     set_ssh.assert_called_once_with(handle, {'ssh_user': 'sky'})
     fallback.assert_not_called()
     opener.assert_not_called()
+    usage_config = usage_update.call_args.args[0]
+    assert isinstance(usage_config, dict)
+    assert 'dev' not in usage_config
+    assert usage_config['resources']['cpus'] == 2
     assert 'ssh test-dev' in result.output
     assert 'vscode://vscode-remote/ssh-remote+test-dev' in result.output
 
@@ -227,6 +235,65 @@ def test_dev_up_job_id_fails_without_cleanup(
 
     assert result.exit_code != 0
     assert 'unexpectedly submitted a user job' in result.output
+    down.assert_not_called()
+
+
+def test_dev_up_tails_setup_carrier_before_ready(
+        tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest_path = _write_manifest(tmp_path, setup='echo setup')
+    handle = _fake_handle()
+    monkeypatch.setattr(command.sdk, 'launch',
+                        mock.Mock(return_value='request-id'))
+    monkeypatch.setattr(
+        command, '_async_call_or_wait',
+        mock.Mock(return_value=(7, handle, {
+            'ssh_user': 'sky'
+        })))
+    monkeypatch.setattr(command, '_set_ssh_config_from_launch_response',
+                        mock.Mock())
+    monkeypatch.setattr(command.usage_lib.messages.usage,
+                        'update_user_task_yaml', mock.Mock())
+    events = []
+    tail_logs = mock.Mock(
+        side_effect=lambda *args, **kwargs: events.append('tail') or 0)
+    monkeypatch.setattr(command.sdk, 'tail_logs', tail_logs)
+    monkeypatch.setattr(command, '_print_dev_connection_hints',
+                        lambda cluster_name: events.append('ready'))
+
+    result = click_testing.CliRunner().invoke(
+        command.dev_up, ['-f', str(manifest_path), '--yes'])
+
+    assert result.exit_code == 0, result.output
+    tail_logs.assert_called_once_with('test-dev', 7, follow=True)
+    assert events == ['tail', 'ready']
+
+
+def test_dev_up_setup_carrier_failure_preserves_cluster(
+        tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest_path = _write_manifest(tmp_path, setup='false')
+    handle = _fake_handle()
+    monkeypatch.setattr(command.sdk, 'launch',
+                        mock.Mock(return_value='request-id'))
+    monkeypatch.setattr(
+        command, '_async_call_or_wait',
+        mock.Mock(return_value=(9, handle, {
+            'ssh_user': 'sky'
+        })))
+    monkeypatch.setattr(command, '_set_ssh_config_from_launch_response',
+                        mock.Mock())
+    monkeypatch.setattr(command.usage_lib.messages.usage,
+                        'update_user_task_yaml', mock.Mock())
+    monkeypatch.setattr(command.sdk, 'tail_logs', mock.Mock(return_value=23))
+    down = mock.Mock()
+    monkeypatch.setattr(command.sdk, 'down', down)
+
+    result = click_testing.CliRunner().invoke(
+        command.dev_up, ['-f', str(manifest_path), '--yes'])
+
+    assert result.exit_code == 23
+    assert 'setup job 9 failed' in result.output
+    assert 'left running for inspection' in result.output
+    assert 'is ready' not in result.output
     down.assert_not_called()
 
 

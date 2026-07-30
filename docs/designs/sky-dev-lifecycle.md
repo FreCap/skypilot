@@ -190,7 +190,9 @@ development registry.
    bundled and the legacy two-element result from old servers.
 5. Writes the ordinary SkyPilot SSH config entry directly from bundled
    credentials, or falls back to the existing status-with-credentials path.
-6. Verifies that no user job ID was returned.
+6. If the existing detached-setup path returns its setup-carrier job ID, tails
+   that job to a terminal state before reporting readiness. A job ID returned
+   when the Task has no setup is an invariant violation.
 7. Prints `ssh <name>` and the safely encoded editor URI unless `ide: none`.
 8. Invokes the local operating-system URL opener only when `--open` is passed.
 
@@ -311,9 +313,11 @@ policy may modify the Task or reject the request exactly as it can for
   error contract.
 - Editor opening occurs only after a successful launch and SSH-config update.
 - `--open` with `ide: none` fails before launch.
-- A launch response containing a job ID is treated as an invariant violation;
-  the environment is left running and the user receives a diagnostic. It is
-  never canceled or deleted automatically.
+- A launch response containing a job ID without Task setup is treated as an
+  invariant violation. When setup is present, the ID belongs to SkyPilot's
+  existing detached setup carrier and is tailed before readiness. A failed
+  setup carrier leaves the environment running for inspection. It is never
+  canceled or deleted automatically.
 - A URI opener failure does not alter the cluster.
 - `stop` and `down` retain their existing confirmations and failure behavior.
 - No automatic cluster replacement is attempted after a resource mismatch.
@@ -377,7 +381,8 @@ errors, terminal behavior, and tests without quoting or recursion hazards.
    rejects it before launch.
 4. Current three-item launch responses write SSH config directly.
 5. Legacy two-item launch responses use the status credential fallback.
-6. A returned job ID fails closed without deleting the cluster.
+6. A setup-carrier job is tailed before readiness; failure preserves the
+   cluster, while an ID returned without setup fails as an invariant violation.
 7. `open` requires one visible UP cluster and prints before opening.
 8. Home-relative editor paths are resolved by one fixed argv SSH command;
    invalid, failed, oversized, or non-absolute responses fail safely.
@@ -399,14 +404,17 @@ Against an existing API server:
 
 1. Use a low-cost, single-node Kubernetes CPU manifest with an autostop policy
    and a workdir sentinel.
-2. Run `sky dev up` and verify one cluster, no submitted user job, a usable SSH
-   alias, and the expected `open --print-only` URI.
+2. Run `sky dev up` and verify one cluster, a terminal setup-carrier job but no
+   user run workload, a usable SSH alias, and the expected
+   `open --print-only` URI.
 3. Change the sentinel and run `up` again. Verify synchronization and that a
    setup sentinel did not change.
 4. Run `up --reconfigure` and verify the setup sentinel changes.
-5. Run `status`, `stop`, `up`, and `down`.
-6. Confirm no unexpected API, executor, or database errors and clean all
-   canary resources.
+5. Run `status`. On a provider that supports stopped instances, run `stop` and
+   `up`; on Kubernetes, verify the wrapper preserves the established
+   unsupported result without mutation.
+6. Run `down`, confirm no unexpected API, executor, or database errors, and
+   clean all canary resources.
 
 ## Rollout
 
