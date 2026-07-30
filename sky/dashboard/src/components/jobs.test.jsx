@@ -102,6 +102,13 @@ const deferred = () => {
 const countCacheReads = (fetcher) =>
   dashboardCache.get.mock.calls.filter(([fn]) => fn === fetcher).length;
 
+const setDocumentVisibility = (value) => {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+};
+
 describe('managed jobs page initialization', () => {
   afterEach(() => {
     jest.useRealTimers();
@@ -467,6 +474,61 @@ describe('managed jobs page initialization', () => {
 
     unmount();
     jest.useRealTimers();
+  });
+
+  it('refreshes pools immediately when the page becomes visible again', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('hidden');
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [{ name: 'initial-pool' }] })
+      .mockResolvedValueOnce({ pools: [{ name: 'visible-pool' }] });
+
+    const { result, unmount } = renderHook(() => useManagedJobsPageData());
+    let mounted = true;
+
+    try {
+      await waitFor(() => {
+        expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
+      });
+      dashboardCache.get.mockClear();
+
+      act(() => {
+        jest.advanceTimersByTime(REFRESH_INTERVAL * 2);
+      });
+      expect(dashboardCache.get).not.toHaveBeenCalled();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect(result.current.poolsData).toEqual([{ name: 'visible-pool' }]);
+      });
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
   });
 });
 
@@ -837,6 +899,106 @@ describe('managed jobs automatic refresh', () => {
       jest.advanceTimersByTime(5000);
     });
     expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(3);
+  });
+
+  it('refreshes jobs immediately when the page becomes visible again', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('hidden');
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    jobsCacheManager.getPaginatedJobs
+      .mockResolvedValueOnce({
+        jobs: [
+          {
+            id: 1,
+            task_id: 0,
+            task_job_id: '1-0',
+            name: 'initial-job',
+            user: 'alice',
+            user_hash: 'alice-id',
+            status: 'RUNNING',
+          },
+        ],
+        total: 1,
+        totalNoFilter: 1,
+        statusCounts: { RUNNING: 1 },
+        controllerStopped: false,
+        hasNext: false,
+      })
+      .mockResolvedValueOnce({
+        jobs: [
+          {
+            id: 1,
+            task_id: 0,
+            task_job_id: '1-0',
+            name: 'visible-job',
+            user: 'alice',
+            user_hash: 'alice-id',
+            status: 'SUCCEEDED',
+          },
+        ],
+        total: 1,
+        totalNoFilter: 1,
+        statusCounts: { SUCCEEDED: 1 },
+        controllerStopped: false,
+        hasNext: false,
+      });
+
+    const { unmount } = render(
+      <ManagedJobsTable
+        refreshInterval={5000}
+        setLoading={jest.fn()}
+        refreshDataRef={{ current: null }}
+        filters={[]}
+        onUserFilter={jest.fn()}
+        onRefresh={jest.fn()}
+        poolsData={[]}
+        poolsLoading={false}
+        setValueList={jest.fn()}
+        preloadingComplete={true}
+        lastFetchedTime={null}
+      />
+    );
+    let mounted = true;
+
+    try {
+      await screen.findByText('initial-job');
+      jobsCacheManager.getPaginatedJobs.mockClear();
+
+      act(() => {
+        jest.advanceTimersByTime(10000);
+      });
+      expect(jobsCacheManager.getPaginatedJobs).not.toHaveBeenCalled();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+      await screen.findByText('visible-job');
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
   });
 
   it('reuses the cached filter directory across background polls', async () => {
