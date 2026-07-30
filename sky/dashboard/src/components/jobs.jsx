@@ -198,7 +198,7 @@ function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
       if (source === 'visibilitychange') {
         lastVisibilityRefreshAtRef.current = now;
       }
-      onRefreshRef.current();
+      onRefreshRef.current(source);
     };
 
     const handleVisibilityChange = () => {
@@ -315,12 +315,15 @@ export function useManagedJobsPageData() {
     []
   );
 
-  const refreshPoolsWhenVisible = useCallback(() => {
-    void refreshPoolsData({
-      source: 'visibility',
-      forcePoolRefresh: true,
-    });
-  }, [refreshPoolsData]);
+  const refreshPoolsWhenVisible = useCallback(
+    (source) => {
+      void refreshPoolsData({
+        source,
+        forcePoolRefresh: true,
+      });
+    },
+    [refreshPoolsData]
+  );
 
   useVisibleRefreshInterval(true, REFRESH_INTERVAL, refreshPoolsWhenVisible);
 

@@ -497,7 +497,7 @@ describe('managed jobs page initialization', () => {
       dashboardCache.get.mockClear();
 
       act(() => {
-        jest.advanceTimersByTime(REFRESH_INTERVAL * 2);
+        jest.advanceTimersByTime(REFRESH_INTERVAL * 2 - 1);
       });
       expect(dashboardCache.get).not.toHaveBeenCalled();
 
@@ -512,8 +512,19 @@ describe('managed jobs page initialization', () => {
         expect(result.current.poolsData).toEqual([{ name: 'visible-pool' }]);
       });
 
+      act(() => {
+        jest.advanceTimersByTime(1);
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
       unmount();
       mounted = false;
+
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      act(() => {
+        jest.advanceTimersByTime(REFRESH_INTERVAL);
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
     } finally {
       if (mounted) {
         unmount();
