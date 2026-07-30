@@ -34,6 +34,11 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: sqlite
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_STATE_DB_MIGRATION_MODE
             value: upgrade
       - contains:
@@ -57,6 +62,17 @@ tests:
               secretKeyRef:
                 name: RELEASE-NAME-db-connection
                 key: connection_string
+
+  - it: should migrate the durable request schema when PostgreSQL is selected
+    set:
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: postgres
 
   - it: should bootstrap only when fresh-schema isolation is explicit
     set:
@@ -188,6 +204,16 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject an override of the migration request-store selector
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: postgres
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_REQUEST_BACKEND" is duplicated or reserved by the chart'
 
   - it: should reject duplicate shared environment names
     set:

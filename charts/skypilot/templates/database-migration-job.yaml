@@ -1,6 +1,6 @@
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
 {{- if and $databaseConfigured .Values.databaseMigration.enabled }}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $migrationSuffix := printf "-db-migration-%d" .Release.Revision -}}
 {{- $migrationBaseLength := sub 63 (len $migrationSuffix) | int -}}
@@ -56,6 +56,8 @@ spec:
         {{- end }}
         - name: IS_SKYPILOT_SERVER
           value: "true"
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: {{ .Values.requestStore.backend | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema }}
         {{- if .Values.apiService.dbConnectionSecretName }}

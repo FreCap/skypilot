@@ -158,6 +158,71 @@ tests:
       - equal:
           path: spec.strategy.type
           value: Recreate
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: sqlite
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
+            value: /root/.sky/api-request-cutover.json
+
+  - it: should enable the PostgreSQL request store for one compatibility pod
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: postgres
+
+  - it: should reject the PostgreSQL request store without an external database
+    set:
+      requestStore.backend: postgres
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres requires external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString"
+
+  - it: should reject the PostgreSQL request store without migration ownership
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres requires databaseMigration.enabled=true"
+
+  - it: should reject multiple all-role pods with the PostgreSQL request store
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      apiService.replicas: 2
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres supports exactly one all-role API pod until role-split HA is enabled"
+
+  - it: should reject all-role rolling overlap with the PostgreSQL request store
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      apiService.upgradeStrategy: RollingUpdate
+      storage.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres requires apiService.upgradeStrategy=Recreate until role-split HA is enabled"
+
+  - it: should reject an environment override of the request store selector
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: postgres
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_REQUEST_BACKEND" is duplicated or reserved by the chart'
 
   - it: should use RollingUpdate strategy when configured with external database via secret
     set:
@@ -1404,7 +1469,7 @@ tests:
       # 10) + 2 user-provided = 12. A duplicate would push it to 13.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 12
+          count: 14
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -1418,7 +1483,7 @@ tests:
       # - chart POD_IP (10) + user POD_IP (1) = 11.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 11
+          count: 13
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:

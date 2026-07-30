@@ -49,6 +49,7 @@ def _make_server_config(
 
 def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
     monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
 
     assert executor.queue_base.get_registered_queue_backend_factory() is None
     assert isinstance(executor.queue_base.get_queue_backend_factory(),
@@ -61,6 +62,17 @@ def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
     assert (executor.queue_base.get_registered_queue_backend_factory()
             is registered_factory)
     assert executor.queue_base.get_queue_backend_factory() is registered_factory
+
+
+def test_spawned_process_resolves_postgres_queue_from_environment(monkeypatch):
+    from sky.server.requests import postgres as request_postgres
+
+    monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+
+    factory = executor.queue_base.get_queue_backend_factory()
+
+    assert isinstance(factory, request_postgres.PostgresQueueFactory)
 
 
 @pytest.mark.parametrize(
@@ -144,6 +156,43 @@ def test_worker_preserves_executor_construction_error(monkeypatch):
         worker.run()
 
 
+def test_task_monitor_heartbeats_durable_claim(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    heartbeat_seen = threading.Event()
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = 0.01
+
+    def heartbeat(claim):
+        heartbeat_seen.set()
+        return True
+
+    backend.heartbeat_claim.side_effect = heartbeat
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(worker, '_handle_task_result',
+                        lambda *_args: heartbeat_seen.wait(timeout=1))
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    item = executor.queue_base.QueueItem('heartbeat-request',
+                                         False,
+                                         False,
+                                         execution_generation=7,
+                                         claim_token='claim-token')
+
+    worker.handle_task_result(future, item)
+
+    backend.heartbeat_claim.assert_called()
+    claim = backend.heartbeat_claim.call_args.args[0]
+    assert claim.request_id == item.request_id
+    assert claim.execution_generation == item.execution_generation
+    assert claim.claim_token == item.claim_token
+    assert executor.request_storage.active_execution_claim() is None
+
+
 @pytest.fixture()
 def isolated_database(tmp_path):
     """Create an isolated DB and logs directory per-test."""
@@ -157,7 +206,8 @@ def isolated_database(tmp_path):
                         str(temp_log_path)):
             requests_lib._DB = None
             yield
-            requests_lib._DB = None
+            if requests_lib._DB is not None:
+                asyncio.run(requests_lib.close_db_async())
 
 
 @pytest.mark.asyncio

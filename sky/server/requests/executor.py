@@ -58,6 +58,7 @@ from sky.server.requests import process
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.server.requests import role_filter
+from sky.server.requests import storage as request_storage
 from sky.server.requests import threads
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
@@ -127,7 +128,7 @@ class RequestQueue:
     def __init__(self, queue_backend_impl: queue_base.QueueBackend) -> None:
         self._backend = queue_backend_impl
 
-    def put(self, request: tuple[str, bool, bool]) -> None:
+    def put(self, request: queue_base.QueueItemLike) -> None:
         """Put a request to the queue.
 
         Args:
@@ -135,7 +136,7 @@ class RequestQueue:
         """
         self._backend.put(request)
 
-    async def put_async(self, request: tuple[str, bool, bool]) -> None:
+    async def put_async(self, request: queue_base.QueueItemLike) -> None:
         """Put a request to the queue, async.
 
         Args:
@@ -143,7 +144,7 @@ class RequestQueue:
         """
         await self._backend.put_async(request)
 
-    def get(self) -> tuple[str, bool, bool] | None:
+    def get(self) -> queue_base.QueueItem | None:
         """Get a request from the queue.
 
         It is non-blocking if the queue is empty, and returns None.
@@ -151,7 +152,9 @@ class RequestQueue:
         Returns:
             A tuple of request_id, ignore_return_value, and retryable.
         """
-        return self._backend.get()
+        item = self._backend.get()
+        return (queue_base.normalize_queue_item(item)
+                if item is not None else None)
 
     def __len__(self) -> int:
         """Get the length of the queue."""
@@ -247,13 +250,16 @@ class RequestWorker:
     def process_request(self, executor: process.BurstableExecutor,
                         queue: RequestQueue) -> None:
         request_id: str | None = None
+        request_element: queue_base.QueueItem | None = None
         fut: concurrent.futures.Future | None = None
         try:
-            request_element = queue.get()
-            if request_element is None:
+            queued = queue.get()
+            if queued is None:
                 time.sleep(0.1)
                 return
-            request_id, ignore_return_value, _ = request_element
+            request_element = queue_base.normalize_queue_item(queued)
+            request_id = request_element.request_id
+            ignore_return_value = request_element.ignore_return_value
             request = api_requests.get_request(request_id,
                                                fields=['status', 'created_at'])
             if request is None:
@@ -280,7 +286,9 @@ class RequestWorker:
             # the process, such as subprocess_daemon.py.
             fut = executor.submit_until_success(
                 _request_execution_wrapper, request_id, ignore_return_value,
-                self.num_db_connections_per_worker)
+                self.num_db_connections_per_worker,
+                request_element.execution_generation,
+                request_element.claim_token)
             # Decrement the free executor count when a request starts
             if metrics_utils.METRICS_ENABLED:
                 if self.schedule_type == api_requests.ScheduleType.LONG:
@@ -308,25 +316,20 @@ class RequestWorker:
                 # If a future exists, the request was submitted successfully
                 # and may already be RUNNING (or even finished); its lifecycle
                 # is owned by handle_task_result, so only log here.
-                self._fail_stranded_request(request_id, e)
+                self._fail_stranded_request(request_id, e, request_element)
 
-    def _fail_stranded_request(self, request_id: str, e: BaseException) -> None:
+    def _fail_stranded_request(
+            self, request_id: str, e: BaseException,
+            request_element: queue_base.QueueItem | None) -> None:
         """Best-effort: fail a dequeued request that never got submitted."""
+        claim_context_token = request_storage.activate_execution_claim(
+            request_id, request_element.execution_generation
+            if request_element is not None else 0, request_element.claim_token
+            if request_element is not None else None)
         try:
             api_requests.set_exception_stacktrace(e)
-            # Guard and write under a single update_request block (the lock
-            # is held across the read and the write), so a concurrent
-            # cancel/terminal write cannot land between the status check and
-            # the FAILED write and get clobbered.
-            with api_requests.update_request(request_id) as request_task:
-                if request_task is None:
-                    return
-                if request_task.status > api_requests.RequestStatus.RUNNING:
-                    # Already terminal, e.g. cancelled by a concurrent kill.
-                    return
-                request_task.status = api_requests.RequestStatus.FAILED
-                request_task.finished_at = time.time()
-                request_task.set_error(e)
+            request_storage.get_request_backend().set_request_finished(
+                request_id, api_requests.RequestStatus.FAILED, error=e)
         except (Exception, SystemExit) as recovery_e:  # pylint: disable=broad-except
             # Never let the recovery itself crash the dispatcher thread.
             logger.error(
@@ -334,6 +337,8 @@ class RequestWorker:
                 f'failed: '
                 f'{common_utils.format_exception(recovery_e, use_bracket=True)}'
             )
+        finally:
+            request_storage.deactivate_execution_claim(claim_context_token)
 
     def _mark_executor_free(self) -> None:
         """Increment the free-executor gauge for this worker's schedule type.
@@ -350,7 +355,58 @@ class RequestWorker:
             metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.inc()
 
     def handle_task_result(self, fut: concurrent.futures.Future,
-                           request_element: tuple[str, bool, bool]) -> None:
+                           request_element: queue_base.QueueItemLike) -> None:
+        original_request_element = request_element
+        request_element = queue_base.normalize_queue_item(request_element)
+        claim_context_token = request_storage.activate_execution_claim(
+            request_element.request_id, request_element.execution_generation,
+            request_element.claim_token)
+        heartbeat_stop = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
+        backend = request_storage.get_request_backend()
+        interval = backend.claim_heartbeat_interval_seconds
+        if request_element.claim_token is not None and interval is not None:
+            claim = request_storage.ExecutionClaim(
+                request_element.request_id,
+                request_element.execution_generation,
+                request_element.claim_token)
+
+            def heartbeat() -> None:
+                while not heartbeat_stop.is_set():
+                    try:
+                        if not backend.heartbeat_claim(claim):
+                            logger.warning(
+                                f'Execution claim for {claim.request_id} '
+                                'became stale; subsequent writes are fenced.')
+                            return
+                    except Exception as e:  # pylint: disable=broad-except
+                        # A transient database failure must not kill the monitor
+                        # thread. If connectivity is not restored before lease
+                        # expiry, the next heartbeat and every result write are
+                        # rejected by the database-side fence.
+                        logger.warning(
+                            f'Failed to heartbeat execution claim for '
+                            f'{claim.request_id}: '
+                            f'{common_utils.format_exception(e)}')
+                    heartbeat_stop.wait(interval)
+
+            heartbeat_thread = threading.Thread(
+                target=heartbeat,
+                name=f'request-lease-{request_element.request_id}',
+                daemon=True)
+            heartbeat_thread.start()
+        try:
+            self._handle_task_result(fut, original_request_element)
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=interval)
+            request_storage.deactivate_execution_claim(claim_context_token)
+
+    def _handle_task_result(self, fut: concurrent.futures.Future,
+                            request_element: queue_base.QueueItemLike) -> None:
+        requeue_element = request_element
+        request_element = queue_base.normalize_queue_item(request_element)
         try:
             try:
                 fut.result()
@@ -364,7 +420,8 @@ class RequestWorker:
         except concurrent.futures.process.BrokenProcessPool as e:
             # Happens when the worker process dies unexpectedly, e.g. OOM
             # killed.
-            request_id, _, retryable = request_element
+            request_id = request_element.request_id
+            retryable = request_element.retryable
             logger.error(
                 f'Request {request_id} failed to get processed '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
@@ -392,9 +449,9 @@ class RequestWorker:
             # BurstableExecutor replaces the broken guaranteed pool on the
             # next submission, so reschedule immediately.
             queue = _get_queue(self.schedule_type)
-            queue.put(request_element)
+            queue.put(requeue_element)
         except exceptions.ExecutionRetryableError as e:
-            request_id, _, _ = request_element
+            request_id = request_element.request_id
             # Clamp to avoid ValueError from time.sleep() on a negative wait.
             retry_wait_seconds = max(0, e.retry_wait_seconds)
             # A pause (ExecutionPausedError) may carry a continue condition that
@@ -449,7 +506,7 @@ class RequestWorker:
                     not _request_is_gone_or_cancelled(request_id)):
                 # Reschedule the request.
                 queue = _get_queue(self.schedule_type)
-                queue.put(request_element)
+                queue.put(requeue_element)
                 logger.info(f'Rescheduled request {request_id} for retry')
 
     def run(self) -> None:
@@ -757,7 +814,9 @@ def _gated_sigterm_handler(signum: int,
 
 def _request_execution_wrapper(request_id: str,
                                ignore_return_value: bool,
-                               num_db_connections_per_worker: int = 0) -> None:
+                               num_db_connections_per_worker: int = 0,
+                               execution_generation: int = 0,
+                               claim_token: str | None = None) -> None:
     """Wrapper for a request execution.
 
     It wraps the execution of a request to:
@@ -814,6 +873,8 @@ def _request_execution_wrapper(request_id: str,
     # Set _in_request_execution inside the try so `finally` always clears it,
     # even if a SIGTERM lands before any wrapper code runs.
     global _in_request_execution  # pylint: disable=global-statement
+    execution_claim_token = request_storage.activate_execution_claim(
+        request_id, execution_generation, claim_token)
     try:
         _in_request_execution = True
         placement_history.reset_request_buffer()
@@ -827,7 +888,8 @@ def _request_execution_wrapper(request_id: str,
         # takes the per-request FileLock internally so it serializes with
         # the remaining full-row read-modify-write writers (kill paths,
         # interrupt_request_for_retry).
-        if not api_requests.try_mark_running(request_id, pid):
+        if not api_requests.try_mark_running(request_id, pid,
+                                             execution_generation, claim_token):
             logger.warning(f'Request {request_id} is already finished or '
                            'cancelled, skipping execution')
             return
@@ -924,6 +986,7 @@ def _request_execution_wrapper(request_id: str,
         logger.info(f'Request {request_id} finished')
     finally:
         _in_request_execution = False
+        request_storage.deactivate_execution_claim(execution_claim_token)
         _restore_output()
         try:
             placement_history.flush_request_buffer()
@@ -1171,6 +1234,8 @@ async def prepare_request_async(
     auth_user: models.User | None = None,
     ignore_return_value: bool = False,
     retryable: bool = False,
+    should_enqueue: bool = False,
+    precondition: preconditions.Precondition | None = None,
 ) -> api_requests.Request:
     """Prepare a request for execution.
 
@@ -1208,6 +1273,7 @@ async def prepare_request_async(
     # clients (no header) yield None, which the worker-side gate treats
     # as "skip the workspace resolver".
     request_body.client_api_version = versions.get_remote_api_version()
+    durable_precondition = preconditions.serialize(precondition)
     request = api_requests.Request(
         request_id=request_id,
         name=server_constants.REQUEST_NAME_PREFIX + request_name,
@@ -1221,6 +1287,13 @@ async def prepare_request_async(
         file_mounts_blob_id=getattr(request_body, 'file_mounts_blob_id', None),
         ignore_return_value=ignore_return_value,
         retryable=retryable,
+        should_enqueue=should_enqueue,
+        precondition_type=(durable_precondition.type_name
+                           if durable_precondition is not None else None),
+        precondition_payload=(durable_precondition.payload
+                              if durable_precondition is not None else None),
+        precondition_deadline=(durable_precondition.deadline
+                               if durable_precondition is not None else None),
     )
 
     if not await api_requests.create_if_not_exists_async(request):
@@ -1274,7 +1347,9 @@ async def schedule_request_async(request_id: str,
         is_skypilot_system,
         auth_user=auth_user,
         ignore_return_value=ignore_return_value,
-        retryable=retryable)
+        retryable=retryable,
+        should_enqueue=True,
+        precondition=precondition)
     await schedule_prepared_request(request_task, ignore_return_value,
                                     precondition, retryable)
 
@@ -1330,11 +1405,18 @@ async def schedule_prepared_request(request_task: api_requests.Request,
     """
 
     async def enqueue():
-        input_tuple = (request_task.request_id, ignore_return_value, retryable)
+        input_tuple = queue_base.QueueItem(
+            request_task.request_id,
+            ignore_return_value,
+            retryable,
+            execution_generation=request_task.execution_generation,
+            claim_token=request_task.claim_token)
         logger.info(f'Queuing request: {request_task.request_id}')
         await _get_queue(request_task.schedule_type).put_async(input_tuple)
 
-    if precondition is not None:
+    durable_queue = (request_storage.get_request_backend().uses_durable_queue
+                     is True)
+    if precondition is not None and not durable_queue:
         # Schedule precondition wait as a background task so the caller
         # returns immediately.  The task reference is stored in a
         # module-level set to prevent garbage collection.
@@ -1363,6 +1445,12 @@ def start(
     # Explicitly registered plugin backends take precedence over config.
     if factory is not None:
         _queue_factory = factory
+    elif os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
+        # Runtime import avoids loading the PostgreSQL implementation before
+        # plugins have had an opportunity to register a custom queue factory.
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import postgres
+        _queue_factory = postgres.PostgresQueueFactory()
     elif config.queue_backend == server_config.QueueBackend.MULTIPROCESSING:
         _queue_factory = queue_base.MultiprocessingQueueFactory()
     elif config.queue_backend == server_config.QueueBackend.LOCAL:

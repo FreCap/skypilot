@@ -53,6 +53,26 @@ def test_graceful_shutdown_preserves_control_api_access():
     assert control.status_code == 200
 
 
+def test_request_store_cutover_blocks_new_submissions_but_not_control_api():
+    app = _make_app(server.GracefulShutdownMiddleware)
+    with mock.patch.object(server.state,
+                           'get_block_requests',
+                           return_value=False), \
+         mock.patch.object(core_middleware.request_cutover,
+                           'legacy_submissions_blocked',
+                           return_value=True):
+        with TestClient(app) as client:
+            blocked = client.get('/route')
+            control = client.get('/api/route')
+
+    assert blocked.status_code == 503
+    assert blocked.json() == {
+        'detail': ('The API request store is being migrated to PostgreSQL, '
+                   'please try again later.')
+    }
+    assert control.status_code == 200
+
+
 def test_api_version_middleware_preserves_context_and_headers():
     app = _make_app(server.APIVersionMiddleware)
     version_info = types.SimpleNamespace(api_version=42,

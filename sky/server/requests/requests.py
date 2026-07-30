@@ -23,6 +23,7 @@ import colorama
 import filelock
 import orjson
 
+import sky
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
@@ -34,7 +35,9 @@ from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server import versions
 from sky.server.blob import blob_storage as bs
+from sky.server.requests import cutover as request_cutover
 from sky.server.requests import payloads
+from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
 from sky.server.requests import storage as request_storage
 from sky.server.requests.serializers import decoders
@@ -78,6 +81,8 @@ COL_FILE_MOUNTS_BLOB_ID = 'file_mounts_blob_id'
 # never sent to clients.
 COL_IGNORE_RETURN_VALUE = 'ignore_return_value'
 COL_RETRYABLE = 'retryable'
+DURABLE_PAYLOAD_FORMAT = 'pydantic-json'
+DURABLE_PAYLOAD_VERSION = 1
 # Legacy path for backward compatibility - GC will clean up logs from both
 # the new and legacy paths to handle server upgrades gracefully.
 LEGACY_REQUEST_LOG_PATH_PREFIX = '~/sky_logs/api_server/requests'
@@ -332,6 +337,29 @@ class Request:
     # RequestPayload and never sent to clients.
     ignore_return_value: bool = False
     retryable: bool = False
+    # PostgreSQL-only durable execution metadata. SQLite keeps its historical
+    # pickle representation during the migration window.
+    handler_name: str | None = None
+    payload_type: str | None = None
+    payload_format: str = DURABLE_PAYLOAD_FORMAT
+    payload_version: int = DURABLE_PAYLOAD_VERSION
+    producer_version: str = sky.__version__
+    execution_class: str | None = None
+    execution_generation: int = 0
+    claim_token: str | None = None
+    worker_instance_id: str | None = None
+    lease_expires_at: float | None = None
+    heartbeat_at: float | None = None
+    cancel_requested_at: float | None = None
+    cancel_acknowledged_at: float | None = None
+    interrupted_reason: str | None = None
+    # Queue intent is set only while creating a newly scheduled request.
+    # Durable backends consume it in the same transaction as request creation;
+    # it is not exposed on the client wire format.
+    should_enqueue: bool = False
+    precondition_type: str | None = None
+    precondition_payload: dict[str, Any] | None = None
+    precondition_deadline: float | None = None
 
     @property
     def log_path(self) -> pathlib.Path:
@@ -368,6 +396,119 @@ class Request:
         """
         self.return_value = _encoded_return_value(self.name, self.request_id,
                                                   return_value)
+
+    def durable_values(self) -> dict[str, Any]:
+        """Return the non-pickle PostgreSQL representation of this request."""
+        registration = request_registry.registration_for_handler(
+            self.entrypoint)
+        payload_type, payload_json = request_registry.encode_payload(
+            self.request_body)
+        if self.handler_name is not None and self.handler_name not in (
+                registration.name, *registration.aliases):
+            raise ValueError(f'Request {self.request_id} handler changed from '
+                             f'{self.handler_name!r} to {registration.name!r}.')
+        if self.payload_type is not None and self.payload_type != payload_type:
+            raise ValueError(f'Request {self.request_id} payload changed from '
+                             f'{self.payload_type!r} to {payload_type!r}.')
+        if (self.execution_class is not None and
+                self.execution_class != registration.execution_class.value):
+            raise ValueError(
+                f'Request {self.request_id} execution class '
+                f'{self.execution_class!r} does not match handler-owned class '
+                f'{registration.execution_class.value!r}.')
+        self.handler_name = registration.name
+        self.payload_type = payload_type
+        self.execution_class = registration.execution_class.value
+        return {
+            'request_id': self.request_id,
+            'name': self.name,
+            'handler_name': registration.name,
+            'payload_type': payload_type,
+            'payload_format': self.payload_format,
+            'payload_version': self.payload_version,
+            'producer_version': self.producer_version,
+            'payload_json': payload_json,
+            'execution_class': registration.execution_class.value,
+            'status': self.status.value,
+            'return_value': self.return_value,
+            'error': self.error,
+            'pid': self.pid,
+            'created_at': self.created_at,
+            COL_CLUSTER_NAME: self.cluster_name,
+            'schedule_type': self.schedule_type.value,
+            COL_USER_ID: self.user_id,
+            COL_STATUS_MSG: self.status_msg,
+            COL_SHOULD_RETRY: self.should_retry,
+            COL_FINISHED_AT: self.finished_at,
+            COL_FILE_MOUNTS_BLOB_ID: self.file_mounts_blob_id,
+            COL_IGNORE_RETURN_VALUE: self.ignore_return_value,
+            COL_RETRYABLE: self.retryable,
+            'execution_generation': self.execution_generation,
+            'claim_token': self.claim_token,
+            'worker_instance_id': self.worker_instance_id,
+            'lease_expires_at': self.lease_expires_at,
+            'heartbeat_at': self.heartbeat_at,
+            'cancel_requested_at': self.cancel_requested_at,
+            'cancel_acknowledged_at': self.cancel_acknowledged_at,
+            'interrupted_reason': self.interrupted_reason,
+        }
+
+    @classmethod
+    def from_durable_values(cls, values: dict[str, Any]) -> 'Request':
+        """Decode a request row through the closed handler/payload registries."""
+        registration = request_registry.resolve_handler(values['handler_name'])
+        execution_class = values['execution_class']
+        if execution_class != registration.execution_class.value:
+            raise ValueError(
+                f'Durable request {values["request_id"]} has execution class '
+                f'{execution_class!r}, but handler {registration.name!r} owns '
+                f'{registration.execution_class.value!r}.')
+        if values['payload_format'] != DURABLE_PAYLOAD_FORMAT:
+            raise ValueError(f'Unsupported request payload format '
+                             f'{values["payload_format"]!r}.')
+        if int(values['payload_version']) != DURABLE_PAYLOAD_VERSION:
+            raise ValueError(f'Unsupported request payload version '
+                             f'{values["payload_version"]!r}.')
+        request_body = request_registry.decode_payload(values['payload_type'],
+                                                       values['payload_json'])
+        return cls(
+            request_id=values['request_id'],
+            name=values['name'],
+            entrypoint=registration.func,
+            request_body=request_body,
+            status=RequestStatus(values['status']),
+            created_at=float(values['created_at']),
+            user_id=values[COL_USER_ID],
+            return_value=values.get('return_value'),
+            error=values.get('error'),
+            pid=values.get('pid'),
+            schedule_type=ScheduleType(values['schedule_type']),
+            cluster_name=values.get(COL_CLUSTER_NAME),
+            status_msg=values.get(COL_STATUS_MSG),
+            should_retry=bool(values.get(COL_SHOULD_RETRY, False)),
+            finished_at=values.get(COL_FINISHED_AT),
+            file_mounts_blob_id=values.get(COL_FILE_MOUNTS_BLOB_ID),
+            ignore_return_value=bool(values.get(COL_IGNORE_RETURN_VALUE,
+                                                False)),
+            retryable=bool(values.get(COL_RETRYABLE, False)),
+            handler_name=registration.name,
+            payload_type=values['payload_type'],
+            payload_format=values['payload_format'],
+            payload_version=int(values['payload_version']),
+            producer_version=values['producer_version'],
+            execution_class=execution_class,
+            execution_generation=int(values.get('execution_generation', 0)),
+            claim_token=(str(values['claim_token'])
+                         if values.get('claim_token') is not None else None),
+            worker_instance_id=(str(values['worker_instance_id'])
+                                if values.get('worker_instance_id') is not None
+                                else None),
+            lease_expires_at=values.get('lease_expires_at'),
+            heartbeat_at=values.get('heartbeat_at'),
+            cancel_requested_at=values.get('cancel_requested_at'),
+            cancel_acknowledged_at=values.get('cancel_acknowledged_at'),
+            interrupted_reason=values.get('interrupted_reason'),
+        )
 
     def get_return_value(self) -> Any:
         """Get the return value."""
@@ -1045,11 +1186,22 @@ def recover_db_and_logs() -> bool:
         e.g. rows owned by a plugin backend whose ``reset_on_startup`` is a
         no-op -- were never reconciled and must NOT be re-enqueued.
     """
+    backend = request_storage.get_request_backend()
+    if backend.uses_durable_queue is True:
+        if os.environ.get(RESET_REQUESTS_ON_STARTUP_ENV_VAR) == '1':
+            raise RuntimeError(
+                f'{RESET_REQUESTS_ON_STARTUP_ENV_VAR}=1 cannot wipe the '
+                'durable PostgreSQL request store. Use the explicit migration '
+                'or administrative cleanup workflow.')
+        recover = getattr(backend, 'recover_on_startup', None)
+        if not callable(recover):
+            raise RuntimeError(
+                'A durable request backend must implement recover_on_startup.')
+        return bool(recover())  # pylint: disable=not-callable
     if os.environ.get(RESET_REQUESTS_ON_STARTUP_ENV_VAR) == '1':
         reset_db_and_logs()
         return False
-    if not isinstance(request_storage.get_request_backend(),
-                      SqliteRequestBackend):
+    if not isinstance(backend, SqliteRequestBackend):
         # A plugin request backend owns its own restart semantics via
         # reset_on_startup(); the sqlite-level recovery below would not see
         # its rows (and reenqueue_recovered_requests would then replay rows
@@ -1242,7 +1394,10 @@ def update_request(request_id: str) -> Generator[Request | None, None, None]:
 
 
 @metrics_lib.time_me
-def try_mark_running(request_id: str, pid: int | None) -> bool:
+def try_mark_running(request_id: str,
+                     pid: int | None,
+                     execution_generation: int = 0,
+                     claim_token: str | None = None) -> bool:
     """Atomically flip a request to RUNNING if it is still executable.
 
     Returns:
@@ -1251,7 +1406,7 @@ def try_mark_running(request_id: str, pid: int | None) -> bool:
         status_msg cleared.
     """
     return request_storage.get_request_backend().try_mark_running(
-        request_id, pid)
+        request_id, pid, execution_generation, claim_token)
 
 
 @metrics_lib.time_me
@@ -1412,6 +1567,7 @@ def build_internal_daemon_request(
         # Matches the retryable=True used when scheduling daemon requests
         # (executor.schedule_internal_daemon_async).
         retryable=True,
+        should_enqueue=True,
     )
 
 
@@ -1709,9 +1865,11 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
         _set_value_free_exception_stacktrace(e)
     else:
         set_exception_stacktrace(e)
-    request_storage.get_request_backend().set_request_finished(
+    transitioned = request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.FAILED, error=e)
-    _mark_container_image_request_terminal(request_id)
+    # Older plugin backends may still return None from this internal hook.
+    if transitioned is not False:
+        _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
@@ -1727,16 +1885,19 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
         _set_value_free_exception_stacktrace(e)
     else:
         set_exception_stacktrace(e)
-    await request_storage.get_request_backend().set_request_finished_async(
-        request_id, RequestStatus.FAILED, error=e)
-    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
+    transitioned = await request_storage.get_request_backend(
+    ).set_request_finished_async(request_id, RequestStatus.FAILED, error=e)
+    if transitioned is not False:
+        await asyncio.to_thread(_mark_container_image_request_terminal,
+                                request_id)
 
 
 def set_request_succeeded(request_id: str, result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
-    request_storage.get_request_backend().set_request_finished(
+    transitioned = request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.SUCCEEDED, result=result)
-    _mark_container_image_request_terminal(request_id)
+    if transitioned is not False:
+        _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
@@ -1744,9 +1905,13 @@ def set_request_succeeded(request_id: str, result: Any | None) -> None:
 async def set_request_succeeded_async(request_id: str,
                                       result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
-    await request_storage.get_request_backend().set_request_finished_async(
-        request_id, RequestStatus.SUCCEEDED, result=result)
-    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
+    transitioned = await request_storage.get_request_backend(
+    ).set_request_finished_async(request_id,
+                                 RequestStatus.SUCCEEDED,
+                                 result=result)
+    if transitioned is not False:
+        await asyncio.to_thread(_mark_container_image_request_terminal,
+                                request_id)
 
 
 @metrics_lib.time_me_async
@@ -2057,6 +2222,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     @asyncio_utils.shield
     @db_utils.retry_on_sqlite_busy_async
     async def create_if_not_exists_async(self, request: Request) -> bool:
+        request_cutover.require_legacy_submissions_allowed()
         assert _DB is not None
         request_columns = ', '.join(REQUEST_COLUMNS)
         values_str = ', '.join(['?'] * len(REQUEST_COLUMNS))
@@ -2198,7 +2364,12 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db
     @db_utils.retry_on_sqlite_busy
-    def try_mark_running(self, request_id: str, pid: int | None) -> bool:
+    def try_mark_running(self,
+                         request_id: str,
+                         pid: int | None,
+                         execution_generation: int = 0,
+                         claim_token: str | None = None) -> bool:
+        del execution_generation, claim_token
         assert _DB is not None
         # The per-request FileLock is required for composition with
         # update_request()'s full-row read-modify-write writers (kill
@@ -2220,7 +2391,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                              request_id: str,
                              status: RequestStatus,
                              error: BaseException | None = None,
-                             result: Any | None = None) -> None:
+                             result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
         if result is not None:
@@ -2234,7 +2405,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                     (request_id,))
                 row = cursor.fetchone()
             if row is None:
-                return
+                return False
             name = row[0]
         sql, params = _finish_request_update_sql(request_id, status, name,
                                                  error, result)
@@ -2248,6 +2419,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
             with _DB.conn:
                 cursor = _DB.conn.cursor()
                 cursor.execute(sql, params)
+                return cursor.rowcount == 1
 
     @init_db_async
     @asyncio_utils.shield
@@ -2256,7 +2428,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                                          request_id: str,
                                          status: RequestStatus,
                                          error: BaseException | None = None,
-                                         result: Any | None = None) -> None:
+                                         result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
         if result is not None:
@@ -2264,7 +2436,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                     f'SELECT name FROM {REQUEST_TABLE} WHERE request_id = ?',
                 (request_id,)) as rows:
                 if not rows:
-                    return
+                    return False
                 name = rows[0][0]
         sql, params = _finish_request_update_sql(request_id, status, name,
                                                  error, result)
@@ -2273,7 +2445,9 @@ class SqliteRequestBackend(request_storage.RequestBackend):
         # read-modify-write writers; the SQL status guard alone cannot
         # prevent a stale full-row REPLACE from clobbering this write.
         async with filelock.AsyncFileLock(request_lock_path(request_id)):
-            await _DB.execute_and_commit_async(sql, params)
+            row = await _DB.execute_get_returning_value_async(
+                f'{sql} RETURNING request_id', params)
+            return row is not None
 
     @init_db
     def kill_requests(self,

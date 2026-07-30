@@ -276,6 +276,16 @@ databaseConnection:
   # @schema type: [array, null]; item: object
   extraVolumeMounts: null
 
+# Persistence and delivery backend for API request envelopes. PostgreSQL is an
+# explicit compatibility milestone: it is production-safe for one all-role
+# pod, while role-split multi-replica mode is enabled by later milestones.
+requestStore:
+  # @schema enum: [sqlite, postgres]
+  backend: sqlite
+  # Shared maintenance gate used by the one-way SQLite cutover command.
+  # @schema type: string
+  cutoverGatePath: /root/.sky/api-request-cutover.json
+
 # Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.
 # API replicas verify the resulting revision and never execute deployment DDL.
 # The Job is a regular Helm resource, so chart-managed database Secrets exist

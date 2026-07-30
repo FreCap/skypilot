@@ -18,6 +18,7 @@ from sky.utils import yaml_utils
 if typing.TYPE_CHECKING:
     from sky.server.blob import blob_storage as blob_storage_mod
     from sky.server.requests import log_provider as log_provider_mod
+    from sky.server.requests import registry as request_registry_mod
     from sky.server.requests import storage as storage_mod
     from sky.server.requests.queues import base as queue_base_mod
 
@@ -155,6 +156,41 @@ class ExtensionContext:
         # pylint: disable=import-outside-toplevel
         from sky.server.requests.queues import base as qb
         qb.set_queue_backend_factory(factory)
+
+    def register_request_handler(
+            self,
+            func: typing.Callable[..., Any],
+            *,
+            name: str,
+            execution_class: 'request_registry_mod.ExecutionClass',
+            replay_policy: 'request_registry_mod.ReplayPolicy',
+            cancellation_policy: 'request_registry_mod.CancellationPolicy',
+            aliases: tuple[str, ...] = (),
+    ) -> None:
+        """Register a stable plugin handler in every execution context."""
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import registry as request_registry
+        request_registry.register_handler(
+            func,
+            name=name,
+            execution_class=execution_class,
+            replay_policy=replay_policy,
+            cancellation_policy=cancellation_policy,
+            aliases=aliases)
+
+    def register_request_payload_type(
+            self,
+            payload_type: type,
+            *,
+            name: str,
+            aliases: tuple[str, ...] = (),
+    ) -> None:
+        """Register a stable plugin request-body type."""
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import registry as request_registry
+        request_registry.register_payload_type(payload_type,
+                                               name=name,
+                                               aliases=aliases)
 
     def register_blob_storage(
         self,

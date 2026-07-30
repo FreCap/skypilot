@@ -140,24 +140,35 @@ async def logs(
         schedule_type = api_requests.ScheduleType.LONG
     if schedule_type == api_requests.ScheduleType.SHORT:
         executor.check_request_thread_executor_available()
-    request_task = await executor.prepare_request_async(
-        request_id=request.state.request_id,
-        request_name=request_names.RequestName.JOBS_LOGS,
-        request_body=jobs_logs_body,
-        func=core.tail_logs,
-        schedule_type=schedule_type,
-        request_cluster_name=common.JOB_CONTROLLER_NAME,
-        auth_user=request.state.auth_user,
-    )
     kill_request_on_disconnect = False
     if schedule_type == api_requests.ScheduleType.SHORT:
+        request_task = await executor.prepare_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.JOBS_LOGS,
+            request_body=jobs_logs_body,
+            func=core.tail_logs,
+            schedule_type=schedule_type,
+            request_cluster_name=common.JOB_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
         # For short request, run in the coroutine to avoid blocking
         # short workers.
         task = executor.execute_request_in_coroutine(request_task)
         # Cancel the coroutine after the request is done or client disconnects
         background_tasks.add_task(task.cancel)
     else:
-        await executor.schedule_prepared_request(request_task)
+        await executor.schedule_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.JOBS_LOGS,
+            request_body=jobs_logs_body,
+            func=core.tail_logs,
+            schedule_type=schedule_type,
+            request_cluster_name=common.JOB_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
+        request_task = await api_requests.get_request_async(
+            request.state.request_id)
+        assert request_task is not None
         # When runs in long executor process, we should kill the request on
         # disconnect to cancel the running routine.
         kill_request_on_disconnect = True

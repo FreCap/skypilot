@@ -8,6 +8,7 @@ from sky.server import constants as server_constants
 from sky.server import middleware_utils
 from sky.server import state
 from sky.server import versions
+from sky.server.requests import cutover as request_cutover
 from sky.server.requests import requests as requests_lib
 
 
@@ -101,17 +102,19 @@ class GracefulShutdownMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     """Middleware to control requests when server is shutting down."""
 
     async def dispatch(self, request: fastapi.Request, call_next):
-        if state.get_block_requests():
+        shutting_down = state.get_block_requests()
+        cutting_over = request_cutover.legacy_submissions_blocked()
+        if shutting_down or cutting_over:
             # Allow /api/ paths to continue, which are critical to operate
             # on-going requests but will not submit new requests.
             if not request.url.path.startswith('/api/'):
                 # Client will retry on 503 error.
+                detail = ('The API request store is being migrated to '
+                          'PostgreSQL, please try again later.'
+                          if cutting_over else
+                          'Server is shutting down, please try again later.')
                 return fastapi.responses.JSONResponse(
-                    status_code=503,
-                    content={
-                        'detail': 'Server is shutting down, '
-                                  'please try again later.'
-                    })
+                    status_code=503, content={'detail': detail})
 
         return await call_next(request)
 

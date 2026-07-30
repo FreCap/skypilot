@@ -1,6 +1,6 @@
 # Production-Grade Multi-Replica API Server
 
-Status: accepted for implementation as Step 2 of the dstack maturity port
+Status: accepted and in implementation as Step 2 of the dstack maturity port
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
@@ -153,8 +153,10 @@ replica-independent and keeps each migration milestone deployable.
 - On worker loss:
   - Read-only and explicitly replayable requests may return to the queue only
     after request-specific reconciliation.
-  - Mutating requests with an ambiguous outcome become `INTERRUPTED`. They are
-    not automatically executed again.
+  - Mutating requests with an ambiguous outcome become terminal `CANCELLED`
+    rows with `should_retry=true` and a durable `interrupted_reason`. This is
+    the semantic interrupted state without adding a status value that older
+    clients cannot decode. They are not automatically executed again.
   - A launch is replayed only after the existing cluster-state reconciliation
     proves it remains safe.
 - API cancellation first records durable cancellation intent. The owning
@@ -477,8 +479,47 @@ Deployment: none, because documentation does not change runtime state.
   registry and versioned JSON envelope.
 - Persist and evaluate request preconditions in the queue.
 - Implement durable cancellation intent and worker-local acknowledgement.
-- Auto-select PostgreSQL backends when HA mode is enabled.
+- Select the PostgreSQL backend explicitly with
+  `requestStore.backend=postgres`. M2 makes that selector a mandatory HA
+  prerequisite when roles split.
 - Keep the current all-in-one role for this milestone.
+
+Implementation status: M1 passed its isolated `skypilot-ha` acceptance gate.
+The exact candidate image used PostgreSQL for request state and queue delivery
+on RWX storage. Short and long requests, streaming, cancellation
+acknowledgement, terminal history across an API pod restart, and daemon lease
+reacquisition all passed. A configuration-only rollback to SQLite wrote a
+request only to the legacy store, and the release then returned cleanly to the
+PostgreSQL compatibility image. The one-way cutover test refused a live
+`RUNNING` source row without explicit interruption, imported a mixed legacy
+history, queued only eligible rows, converted the interrupted row
+deterministically, and produced the same report on an idempotent rerun.
+Real-PostgreSQL tests also prove that concurrent first importers serialize to
+one fresh import and one idempotent result. The SQLite backend, local queue,
+all-in-one role, and pickled legacy rows are deliberately still present for
+the rollback window and are listed in the Legacy Code Removal Map below.
+
+The first isolated bootstrap attempt exposed one import-order edge: server
+config loading created the config schema before global user state could prove
+that the shared PostgreSQL schema was fresh. Explicit `bootstrap` mode now
+defers only the import-time database config overlay. The migration job
+initializes global user state first and then explicitly initializes the config,
+Serve, managed-jobs, and request schemas. A real-PostgreSQL subprocess test
+starts from an empty schema and covers the same fresh interpreter import path.
+The same live rollout also proved that spawned Uvicorn workers cannot rely on
+the supervisor's module-level queue factory. Every process now resolves the
+PostgreSQL queue from the explicit request-backend environment, while an
+explicitly registered plugin factory retains precedence.
+
+Two additional cutover defects were found by deploying and exercising the
+candidate rather than relying on local mocks. First, a frozen SQLite source
+must be reopened with SQLite read-only URI semantics for idempotent
+verification. Second, interrupting a frozen `RUNNING` row must reuse the
+committed database cutover timestamp, otherwise each rerun changes
+`finished_at` and therefore the logical hash. The importer now uses a
+transaction-scoped PostgreSQL advisory lock for the absent-marker race, the
+database clock for the initial cutover timestamp, and the marker timestamp for
+all reruns.
 
 Deployment:
 

@@ -7,9 +7,11 @@ import pytest
 import sqlalchemy
 
 from sky import global_user_state
+from sky import skypilot_config
 from sky.jobs import state_storage
 from sky.serve import serve_state
 from sky.server import database_migrations
+from sky.server.requests import postgres as request_postgres
 from sky.skylet import constants
 from sky.utils.db import migration_utils
 
@@ -90,19 +92,24 @@ def test_companion_create_table_uses_configured_migration_mode(
 def test_database_migration_entrypoint_forces_upgrade_mode(
         monkeypatch: pytest.MonkeyPatch) -> None:
     initialize = mock.Mock()
+    initialize_config = mock.Mock()
     initialize_serve = mock.Mock()
     initialize_jobs = mock.Mock()
     monkeypatch.setattr(global_user_state, 'initialize_and_get_db', initialize)
+    monkeypatch.setattr(skypilot_config, 'initialize_and_get_db',
+                        initialize_config)
     monkeypatch.setattr(serve_state, 'get_database_engine', initialize_serve)
     monkeypatch.setattr(state_storage, 'initialize_and_get_db', initialize_jobs)
     monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
     monkeypatch.delenv(constants.ENV_VAR_IS_SKYPILOT_SERVER, raising=False)
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
 
     database_migrations.main()
 
     assert os.environ[constants.ENV_VAR_IS_SKYPILOT_SERVER] == 'true'
     assert os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] == 'upgrade'
     initialize.assert_called_once_with()
+    initialize_config.assert_called_once_with()
     initialize_serve.assert_called_once_with()
     initialize_jobs.assert_called_once_with()
 
@@ -110,16 +117,46 @@ def test_database_migration_entrypoint_forces_upgrade_mode(
 def test_database_migration_entrypoint_preserves_explicit_bootstrap_mode(
         monkeypatch: pytest.MonkeyPatch) -> None:
     initialize = mock.Mock()
+    initialize_config = mock.Mock()
     initialize_serve = mock.Mock()
     initialize_jobs = mock.Mock()
     monkeypatch.setattr(global_user_state, 'initialize_and_get_db', initialize)
+    monkeypatch.setattr(skypilot_config, 'initialize_and_get_db',
+                        initialize_config)
     monkeypatch.setattr(serve_state, 'get_database_engine', initialize_serve)
     monkeypatch.setattr(state_storage, 'initialize_and_get_db', initialize_jobs)
     monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'bootstrap')
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
 
     database_migrations.main()
 
     assert os.environ[constants.ENV_VAR_STATE_DB_MIGRATION_MODE] == 'bootstrap'
     initialize.assert_called_once_with()
+    initialize_config.assert_called_once_with()
     initialize_serve.assert_called_once_with()
     initialize_jobs.assert_called_once_with()
+
+
+def test_database_migration_initializes_selected_request_store(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    initialize = mock.Mock()
+    initialize_config = mock.Mock()
+    initialize_serve = mock.Mock()
+    initialize_jobs = mock.Mock()
+    initialize_requests = mock.Mock()
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db', initialize)
+    monkeypatch.setattr(skypilot_config, 'initialize_and_get_db',
+                        initialize_config)
+    monkeypatch.setattr(serve_state, 'get_database_engine', initialize_serve)
+    monkeypatch.setattr(state_storage, 'initialize_and_get_db', initialize_jobs)
+    monkeypatch.setattr(request_postgres, 'initialize_and_get_db',
+                        initialize_requests)
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+
+    database_migrations.initialize_central_databases()
+
+    initialize.assert_called_once_with()
+    initialize_config.assert_called_once_with()
+    initialize_serve.assert_called_once_with()
+    initialize_jobs.assert_called_once_with()
+    initialize_requests.assert_called_once_with()

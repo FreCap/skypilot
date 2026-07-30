@@ -66,6 +66,10 @@ RECIPES_DB_NAME = 'recipes_db'
 RECIPES_VERSION = '001'
 RECIPES_LOCK_PATH = f'~/.sky/locks/.{RECIPES_DB_NAME}.lock'
 
+API_REQUESTS_DB_NAME = 'api_requests_db'
+API_REQUESTS_VERSION = '001'
+API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
+
 
 @contextlib.contextmanager
 def db_lock(db_name: str):

@@ -11156,6 +11156,70 @@ def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
                 f'DROP SCHEMA IF EXISTS {fresh_schema} CASCADE')
 
 
+def test_database_migration_process_bootstraps_before_config_overlay(
+        postgres_engine, tmp_path: Path) -> None:
+    """Proves import-time config loading cannot preempt fresh DB bootstrap."""
+    fresh_schema = f'migration_process_fresh_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {fresh_schema}')
+    fresh_url = postgres_engine.url.update_query_dict(
+        {'options': f'-csearch_path={fresh_schema}'})
+    empty_config = tmp_path / 'config.yaml'
+    empty_config.write_text('', encoding='utf-8')
+    environment = os.environ.copy()
+    environment.update({
+        constants.ENV_VAR_IS_SKYPILOT_SERVER: 'true',
+        constants.ENV_VAR_DB_CONNECTION_URI:
+            fresh_url.render_as_string(hide_password=False),
+        constants.ENV_VAR_STATE_DB_MIGRATION_MODE: 'bootstrap',
+        'SKYPILOT_API_REQUEST_BACKEND': 'postgres',
+        'SKYPILOT_GLOBAL_CONFIG': str(empty_config),
+    })
+    repository_root = Path(__file__).resolve().parents[2]
+    existing_pythonpath = environment.get('PYTHONPATH')
+    environment['PYTHONPATH'] = (
+        str(repository_root) if not existing_pythonpath else
+        f'{repository_root}{os.pathsep}{existing_pythonpath}')
+    try:
+        result = subprocess.run(
+            [sys.executable, '-m', 'sky.server.database_migrations'],
+            cwd=repository_root,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120)
+        assert result.returncode == 0, (f'migration stderr:\n{result.stderr}\n'
+                                        f'migration stdout:\n{result.stdout}')
+
+        with sqlalchemy.create_engine(fresh_url).connect() as connection:
+            revisions = {
+                table: connection.execute(
+                    sqlalchemy.text(f'SELECT version_num FROM {table}')
+                ).scalar_one() for table in (
+                    'alembic_version_state_db',
+                    'alembic_version_sky_config_db',
+                    'alembic_version_serve_state_db',
+                    'alembic_version_spot_jobs_db',
+                    'alembic_version_api_requests_db',
+                )
+            }
+        assert revisions == {
+            'alembic_version_state_db':
+                migration_utils.GLOBAL_USER_STATE_VERSION,
+            'alembic_version_sky_config_db':
+                migration_utils.SKYPILOT_CONFIG_VERSION,
+            'alembic_version_serve_state_db': migration_utils.SERVE_VERSION,
+            'alembic_version_spot_jobs_db': migration_utils.SPOT_JOBS_VERSION,
+            'alembic_version_api_requests_db':
+                migration_utils.API_REQUESTS_VERSION,
+        }
+    finally:
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {fresh_schema} CASCADE')
+
+
 def test_bootstrap_mode_migrates_all_central_schemas_in_one_shared_schema(
         postgres_engine, monkeypatch: pytest.MonkeyPatch) -> None:
     fresh_schema = f'all_central_fresh_{uuid.uuid4().hex}'

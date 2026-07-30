@@ -459,6 +459,26 @@
                 }
             }
         },
+        "requestStore": {
+            "type": "object",
+            "properties": {
+                "backend": {
+                    "type": "string",
+                    "enum": [
+                        "sqlite",
+                        "postgres"
+                    ]
+                },
+                "cutoverGatePath": {
+                    "type": "string",
+                    "minLength": 1
+                }
+            },
+            "required": [
+                "backend",
+                "cutoverGatePath"
+            ]
+        },
         "databaseMigration": {
             "type": "object",
             "properties": {
