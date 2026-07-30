@@ -210,6 +210,18 @@ replica-independent and keeps each migration milestone deployable.
   generation, and only then launches scheduler processes. Status refresh never
   interprets a PID from another generation as a local controller failure and
   therefore cannot terminalize or tear down that job.
+- Stopping a scheduler because its outer controller generation was fenced is a
+  fail-stop process exit, not managed-job cancellation. The outer controller
+  uses non-catchable termination for each entire detached scheduler process
+  tree, not only its recorded parent PID. A scheduler that independently loses
+  database proof of its outer generation terminates its isolated process group
+  immediately without running job finalizers. Neither path may set
+  `CANCELLING`, `CANCELLED`, or `DONE`, revoke the job token, download final
+  logs, or tear down workload resources. The PID and process-start timestamp
+  are revalidated immediately before forced termination so a stale PID record
+  cannot target a reused process. Only the replacement generation may reset
+  stale ownership and resume monitoring. User cancellation remains a separate
+  durable cancel-intent path and retains graceful cleanup semantics.
 - When the replacement scheduler resumes a task that is already `RUNNING`, it
   transitions its outer schedule state from `LAUNCHING` to `ALIVE` before
   entering the monitor loop. Resume deliberately skips the cluster-launch
@@ -820,15 +832,31 @@ to `ALIVE` before monitoring. This is an ownership-state correction, not a new
 cluster launch. The transition retains the same instance and generation
 predicate, so a concurrent handoff fences it like every other scheduler write.
 
+Revision 16 used commit
+`72af110bbcec49411fc33f334f30446bc207d494` and exact image digest
+`sha256:9259b33b6dd0b14ee714a4fb2d5062a17aab02f7233f3c47f969693575db6472`.
+An active-pod deletion advanced controller generation 18 to 19, restored the
+managed-job scheduler to `ALIVE`, retained workload pod UID
+`c34f6580-2743-4e94-bc35-a0229d8fdd6f`, and continued from tick 525 through
+tick 552 with zero workload restarts and zero API or Serve canary failures.
+The subsequent PostgreSQL-session failure injection correctly fenced
+generation 19 and promoted generation 20 in about two seconds, but exposed a
+different child-termination bug. The old outer controller delivered `SIGTERM`
+to its detached scheduler. That scheduler interpreted the signal as user
+cancellation, ran normal finalizers, deleted the workload at tick 552, and
+left outer schedule state `DONE`. This is negative evidence, not M3
+acceptance. The fail-stop contract above is required before repeating both
+failure modes with a fresh long-running job.
+
 Standbys publish Ready with `phase=standby`. A leader publishes its generation
 and continuously probes and heartbeats the lock-owning session. On SIGTERM it
 first becomes unready, stops controller claims, interrupts the specialized
-worker pools and local child controllers, releases its durable leadership row,
-and exits. If the lock session is lost, it follows the same sequence but
-cannot mark the already-lost session released; the new durable generation is
-the fence and the old process exits after local cleanup. Singleton maintenance
-loops start only with leader-owned resources or retain their narrower
-PostgreSQL session locks.
+worker pools, fail-stops local detached schedulers, releases its durable
+leadership row, and exits. If the lock session is lost, it follows the same
+sequence but cannot mark the already-lost session released; the live
+PostgreSQL proof is the immediate fence, and the old process exits without
+running managed-job finalizers. Singleton maintenance loops start only with
+leader-owned resources or retain their narrower PostgreSQL session locks.
 
 The chart renders two controller replicas with a distinct label, role command,
 health port, resources, credentials, shared storage, and PostgreSQL
@@ -912,8 +940,16 @@ by HA mode.
   state to `ALIVE` under the reclaimed generation without launching a second
   workload.
 - Detached managed-job controller tests prove the process exits when its outer
-  generation loses either advisory-lock proof, while all-role local mode keeps
-  its compatibility behavior.
+  generation loses either advisory-lock proof without running cancellation or
+  cleanup finalizers, while all-role local mode keeps its compatibility
+  behavior.
+- Controller-shutdown tests prove detached scheduler termination is
+  non-catchable across the complete scheduler process tree, revalidates the
+  recorded process start time, and cannot enter managed-job cancellation,
+  terminalization, token revocation, or workload teardown. A subprocess
+  sentinel test proves generation-loss exit does not run coroutine finalizers.
+  Durable user cancellation tests continue to prove that the separate
+  cancel-intent path performs those finalizers.
 - Non-API role tests assert nested SDK work resolves the stable API Service,
   never starts a loopback API listener, and cannot inherit a client-supplied
   endpoint or service-account token through the request envelope. Compatibility

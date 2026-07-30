@@ -449,3 +449,82 @@ class TestKillLocalConsolidationControllers:
                 mock.patch.object(scheduler.os, 'kill') as kill_mock:
             scheduler.kill_local_job_controllers(sig=signal.SIGKILL)
         kill_mock.assert_called_once_with(101, signal.SIGKILL)
+
+    def test_fail_stop_kills_validated_process_group_and_descendants(self):
+        recs = [_record(101, 1700000000.0)]
+        process = mock.Mock()
+        process.create_time.return_value = 1700000000.0
+        descendant = mock.Mock()
+        process.children.return_value = [descendant]
+        with mock.patch.object(scheduler,
+                               'get_controller_process_records',
+                               return_value=recs), \
+                mock.patch.object(scheduler.managed_job_utils,
+                                  'controller_process_alive',
+                                  return_value=True), \
+                mock.patch.object(scheduler.psutil,
+                                  'Process',
+                                  return_value=process), \
+                mock.patch.object(scheduler.os,
+                                  'getpgrp',
+                                  return_value=999), \
+                mock.patch.object(scheduler.os,
+                                  'getpgid',
+                                  return_value=700), \
+                mock.patch.object(scheduler.os, 'killpg') as kill_group:
+            n = scheduler.fail_stop_local_job_controllers()
+
+        assert n == 1
+        process.children.assert_called_once_with(recursive=True)
+        kill_group.assert_called_once_with(700, signal.SIGKILL)
+        process.kill.assert_not_called()
+        descendant.kill.assert_called_once_with()
+
+    def test_fail_stop_revalidates_process_start_time(self):
+        recs = [_record(101, 1700000000.0)]
+        process = mock.Mock()
+        process.create_time.return_value = 1700000001.0
+        with mock.patch.object(scheduler,
+                               'get_controller_process_records',
+                               return_value=recs), \
+                mock.patch.object(scheduler.managed_job_utils,
+                                  'controller_process_alive',
+                                  return_value=True), \
+                mock.patch.object(scheduler.psutil,
+                                  'Process',
+                                  return_value=process), \
+                mock.patch.object(scheduler.os, 'getpgid') as get_group, \
+                mock.patch.object(scheduler.os, 'killpg') as kill_group:
+            n = scheduler.fail_stop_local_job_controllers()
+
+        assert n == 0
+        get_group.assert_not_called()
+        kill_group.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_fail_stop_never_kills_supervisor_process_group(self):
+        recs = [_record(101, 1700000000.0)]
+        process = mock.Mock()
+        process.create_time.return_value = 1700000000.0
+        process.children.return_value = []
+        with mock.patch.object(scheduler,
+                               'get_controller_process_records',
+                               return_value=recs), \
+                mock.patch.object(scheduler.managed_job_utils,
+                                  'controller_process_alive',
+                                  return_value=True), \
+                mock.patch.object(scheduler.psutil,
+                                  'Process',
+                                  return_value=process), \
+                mock.patch.object(scheduler.os,
+                                  'getpgrp',
+                                  return_value=700), \
+                mock.patch.object(scheduler.os,
+                                  'getpgid',
+                                  return_value=700), \
+                mock.patch.object(scheduler.os, 'killpg') as kill_group:
+            n = scheduler.fail_stop_local_job_controllers()
+
+        assert n == 1
+        kill_group.assert_not_called()
+        process.kill.assert_called_once_with()

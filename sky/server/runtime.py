@@ -423,15 +423,15 @@ def _stop_queue_server(queue_server: multiprocessing.Process | None) -> None:
 
 
 def _kill_local_controller_children() -> None:
-    """Stop detached and worker-owned controllers before leader handoff."""
+    """Fail-stop detached schedulers before leader handoff."""
     # Managed job controllers use detached process sessions, so use their
     # durable local process records in addition to walking the worker tree.
     # pylint: disable=import-outside-toplevel
     from sky.jobs import scheduler as managed_job_scheduler
     try:
-        managed_job_scheduler.kill_local_job_controllers()
+        managed_job_scheduler.fail_stop_local_job_controllers()
     except Exception:  # pylint: disable=broad-except
-        logger.exception('Failed to stop local managed-job controllers.')
+        logger.exception('Failed to fail-stop local managed-job controllers.')
 
 
 def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:

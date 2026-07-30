@@ -12,7 +12,11 @@ and file mount cleanup in task_cleanup().
 # pylint: disable=protected-access,redefined-outer-name,reimported
 # pylint: disable=unused-argument,unused-variable
 import asyncio
+import os
 import pathlib
+import signal
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -3639,10 +3643,16 @@ class TestOuterControllerGenerationWatchdog:
                    new=AsyncMock()), \
                 patch('sky.jobs.controller.managed_job_state.'
                       'controller_owner_is_current',
-                      return_value=False):
+                      return_value=False), \
+                patch(
+                    'sky.jobs.controller.'
+                    '_fail_stop_outer_controller_process_group',
+                    side_effect=managed_job_state.ControllerLeadershipLostError(
+                        'fail-stop')) as fail_stop:
             with pytest.raises(managed_job_state.ControllerLeadershipLostError,
-                               match='no longer current'):
+                               match='fail-stop'):
                 await controller_lib._watch_outer_controller_generation(owner)
+        assert 'no longer current' in fail_stop.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_database_proof_error_exits_controller(self):
@@ -3651,7 +3661,53 @@ class TestOuterControllerGenerationWatchdog:
                    new=AsyncMock()), \
                 patch('sky.jobs.controller.managed_job_state.'
                       'controller_owner_is_current',
-                      side_effect=OSError('database unavailable')):
+                      side_effect=OSError('database unavailable')), \
+                patch(
+                    'sky.jobs.controller.'
+                    '_fail_stop_outer_controller_process_group',
+                    side_effect=managed_job_state.ControllerLeadershipLostError(
+                        'fail-stop')) as fail_stop:
             with pytest.raises(managed_job_state.ControllerLeadershipLostError,
-                               match='Could not prove'):
+                               match='fail-stop'):
                 await controller_lib._watch_outer_controller_generation(owner)
+        assert 'Could not prove' in fail_stop.call_args.args[0]
+
+    def test_fail_stop_uses_noncatchable_process_group_signal(self):
+        with patch.object(controller_lib.os, 'getpgrp', return_value=321), \
+                patch.object(controller_lib.os, 'killpg') as kill_group, \
+                patch.object(
+                    controller_lib.os,
+                    '_exit',
+                    side_effect=SystemExit(1)) as exit_process:
+            with pytest.raises(SystemExit):
+                controller_lib._fail_stop_outer_controller_process_group(
+                    'generation fenced')
+
+        kill_group.assert_called_once_with(321, signal.SIGKILL)
+        exit_process.assert_called_once_with(1)
+
+    @pytest.mark.skipif(not hasattr(os, 'killpg'),
+                        reason='requires POSIX process groups')
+    def test_fail_stop_does_not_run_coroutine_finalizers(self, tmp_path):
+        sentinel = tmp_path / 'finalizer-ran'
+        script = f"""
+import asyncio
+import pathlib
+from sky.jobs import controller
+
+async def main():
+    try:
+        controller._fail_stop_outer_controller_process_group('test fence')
+    finally:
+        pathlib.Path({str(sentinel)!r}).write_text('unsafe', encoding='utf-8')
+
+asyncio.run(main())
+"""
+        result = subprocess.run([sys.executable, '-c', script],
+                                capture_output=True,
+                                text=True,
+                                start_new_session=True,
+                                check=False)
+
+        assert result.returncode == -signal.SIGKILL, result.stderr
+        assert not sentinel.exists()

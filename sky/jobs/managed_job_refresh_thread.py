@@ -193,9 +193,10 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # brain, e.g. new job controllers might have been launched on the new
         # replica during rolling-update
         try:
-            managed_job_scheduler.kill_local_job_controllers()
+            managed_job_scheduler.fail_stop_local_job_controllers()
         except Exception:  # pylint: disable=broad-except
-            logger.exception('Failed to kill local controllers on lock-loss')
+            logger.exception(
+                'Failed to fail-stop local controllers on lock-loss')
         # SIGTERM to trigger graceful shutdown
         os.kill(os.getpid(), signal.SIGTERM)
 
