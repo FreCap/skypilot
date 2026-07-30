@@ -2,6 +2,10 @@
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $haEnabled := get $haConfig "enabled" | default false -}}
 {{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
+{{- $apiTopologySpreadTopologyKey := get .Values.apiService "topologySpreadTopologyKey" -}}
+{{- if and $haEnabled (not (hasKey .Values.apiService "topologySpreadTopologyKey")) -}}
+{{- $apiTopologySpreadTopologyKey = "kubernetes.io/hostname" -}}
+{{- end -}}
 {{- $executorService := .Values.executorService | default (dict) -}}
 {{- $executorReplicas := dig "replicas" 2 $executorService -}}
 {{- $controllerService := .Values.controllerService | default (dict) -}}
@@ -1249,10 +1253,10 @@ spec:
         emptyDir: {}
       {{- end }}
       {{- include "skypilot.apiPodScheduling" . }}
-      {{- if .Values.apiService.topologySpreadTopologyKey }}
+      {{- if $apiTopologySpreadTopologyKey }}
       topologySpreadConstraints:
         - maxSkew: 1
-          topologyKey: {{ .Values.apiService.topologySpreadTopologyKey }}
+          topologyKey: {{ $apiTopologySpreadTopologyKey }}
           whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels:

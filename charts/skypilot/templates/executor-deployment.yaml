@@ -15,7 +15,10 @@
 {{- $executorNodeSelector := get $executorService "nodeSelector" -}}
 {{- $executorTolerations := get $executorService "tolerations" -}}
 {{- $executorAffinity := get $executorService "affinity" -}}
-{{- $executorTopologySpreadTopologyKey := get $executorService "topologySpreadTopologyKey" -}}
+{{- $executorTopologySpreadTopologyKey := "kubernetes.io/hostname" -}}
+{{- if hasKey $executorService "topologySpreadTopologyKey" -}}
+{{- $executorTopologySpreadTopologyKey = get $executorService "topologySpreadTopologyKey" -}}
+{{- end -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
 {{- $externalLBResources := get $externalLB "resources" | default (dict) -}}

@@ -88,6 +88,14 @@ tests:
             mountPath: /root/.sky
             subPath: .sky
 
+  - it: should allow an explicit executor topology-spread opt-out
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.topologySpreadTopologyKey: ""
+    asserts:
+      - notExists:
+          path: spec.template.spec.topologySpreadConstraints
+
   - it: should reject a custom executor API endpoint
     set:
       apiService.highAvailability.enabled: true

@@ -18,7 +18,10 @@
 {{- $controllerNodeSelector := get $controllerService "nodeSelector" -}}
 {{- $controllerTolerations := get $controllerService "tolerations" -}}
 {{- $controllerAffinity := get $controllerService "affinity" -}}
-{{- $controllerTopologySpreadTopologyKey := get $controllerService "topologySpreadTopologyKey" -}}
+{{- $controllerTopologySpreadTopologyKey := "kubernetes.io/hostname" -}}
+{{- if hasKey $controllerService "topologySpreadTopologyKey" -}}
+{{- $controllerTopologySpreadTopologyKey = get $controllerService "topologySpreadTopologyKey" -}}
+{{- end -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
 {{- $externalLBResources := get $externalLB "resources" | default (dict) -}}

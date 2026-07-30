@@ -270,7 +270,7 @@ apiService:
   affinity: {}
 
   # Spread API server pods across topology domains. The default spreads across
-  # nodes; set topology.kubernetes.io/zone to spread across zones, or null to
+  # nodes; set topology.kubernetes.io/zone to spread across zones, or "" to
   # disable the constraint. When set, a topologySpreadConstraints entry is
   # rendered with
   # maxSkew=1, whenUnsatisfiable=DoNotSchedule, and a labelSelector

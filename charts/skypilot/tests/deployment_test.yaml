@@ -243,6 +243,20 @@ tests:
             name: sky-ephemeral
             emptyDir: {}
 
+  - it: should allow an explicit HA topology-spread opt-out
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      apiService.topologySpreadTopologyKey: ""
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - notExists:
+          path: spec.template.spec.topologySpreadConstraints
+
   - it: should reject a chart-managed database secret in HA mode
     set:
       apiService.highAvailability.enabled: true

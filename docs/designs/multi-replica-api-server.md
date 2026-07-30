@@ -925,7 +925,11 @@ Deployment:
 - Extend disruption budgets to controller replicas. Default API, executor, and
   controller topology spread to `kubernetes.io/hostname` with
   `whenUnsatisfiable=DoNotSchedule`; operators may select a zone topology key
-  or explicitly disable the constraint.
+  or explicitly disable the constraint. Because Helm `--reuse-values` can omit
+  defaults introduced by a newer chart, the templates also apply the hostname
+  default when an older HA release has no topology key. An explicitly present
+  empty string remains the opt-out; YAML null cannot carry that distinction
+  through Helm's value coalescing.
 - Complete readiness-first termination for every role with a pod-local
   `emptyDir` drain marker. A Kubernetes pre-stop hook creates the marker and
   waits for `apiService.highAvailability.readinessDrainSeconds`, which defaults
@@ -961,6 +965,21 @@ readiness fails without opening PostgreSQL. The Docker-backed PostgreSQL lease
 test could not start its disposable `postgres:16` container in the local
 testcontainers environment; the live isolated deployment must therefore prove
 the marker-driven heartbeat transition before M4 acceptance.
+
+The first live M4 attempt used commit
+`ca47898533a904f89ce5a40b821cb1274966989c` and exact image digest
+`sha256:8626e96e446f6994ae3f23f90fa018be843971ae7f35e57a6a4790b30dbf1366`.
+Revision 18's migration hook completed successfully at 13:23:10 UTC, one
+second before the first target-image role pod was created. All three
+Deployments rolled to two ready, zero-restart replicas; at least 3,222
+conformance probes, 4,572 existing API probes, and 1,441 Serve probes remained
+error-free, and all three long-running workload pods retained their UIDs with
+zero restarts. The harness then stopped before deletion and rollback because
+the role Deployments had no topology constraints. `--reuse-values` retained
+the older release's missing keys instead of loading the new chart defaults.
+This is negative evidence, not M4 acceptance. The templates now distinguish a
+missing reused-value key from the explicit empty-string opt-out, and the full
+sequence must repeat with a new exact image.
 
 Deployment:
 
