@@ -3485,7 +3485,8 @@ def dev_up(manifest_path: str, reconfigure: bool, open_editor: bool, yes: bool,
     if config_override:
         manifest.task.set_resources_override(
             {'_cluster_config_overrides': config_override})
-    usage_lib.messages.usage.update_user_task_yaml(manifest.stripped_yaml)
+    stripped_config = yaml_utils.read_yaml_str(manifest.stripped_yaml)
+    usage_lib.messages.usage.update_user_task_yaml(stripped_config)
     if not dev_lib.all_resources_have_autostop(manifest.task):
         click.secho(
             'WARNING: One or more resource alternatives has no enabled '
@@ -3506,9 +3507,18 @@ def dev_up(manifest_path: str, reconfigure: bool, open_editor: bool, yes: bool,
         raise click.ClickException(
             'Development environment launch returned no cluster handle.')
     if job_id is not None:
-        raise click.ClickException(
-            'Development environment launch unexpectedly submitted a user '
-            'job. The cluster was left running for inspection.')
+        if manifest.task.setup is None:
+            raise click.ClickException(
+                'Development environment launch unexpectedly submitted a user '
+                'job. The cluster was left running for inspection.')
+        returncode = sdk.tail_logs(manifest.config.name, job_id, follow=True)
+        if returncode != 0:
+            click.secho(
+                f'Development environment setup job {job_id} failed. The '
+                'cluster was left running for inspection.',
+                fg='red',
+                err=True)
+            raise click.exceptions.Exit(returncode)
 
     _print_dev_connection_hints(manifest.config.name)
     editor_uri = None
