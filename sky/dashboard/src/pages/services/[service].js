@@ -373,10 +373,7 @@ function ServiceDetails() {
   const ownsRouteState = activeServiceNameRef.current === serviceName;
   const currentServiceData =
     ownsRouteState && serviceData?.name === serviceName ? serviceData : null;
-  const isRouteLoading =
-    !router.isReady ||
-    !ownsRouteState ||
-    (isInitialLoad && !currentServiceData);
+  const isRouteLoading = !router.isReady || !ownsRouteState || isInitialLoad;
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
