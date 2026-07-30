@@ -34,8 +34,15 @@ _EXPECTED_AST_SHA256 = {
 def _ast_sha256(symbol) -> str:
     source = inspect.getsource(inspect.unwrap(symbol))
     node = ast.parse(textwrap.dedent(source)).body[0]
-    return hashlib.sha256(ast.dump(
-        node, include_attributes=False).encode()).hexdigest()
+    # Python 3.14 stops rendering empty AST fields by default, while Python
+    # 3.12+ adds an empty type_params field to functions. Render empty fields
+    # when supported, then omit the non-generic parser metadata so the
+    # structural fingerprint is stable across supported Python versions.
+    dump_kwargs = {'include_attributes': False}
+    if 'show_empty' in inspect.signature(ast.dump).parameters:
+        dump_kwargs['show_empty'] = True
+    normalized = ast.dump(node, **dump_kwargs).replace(', type_params=[]', '')
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def test_cutover_repository_structure_and_historical_identity():
