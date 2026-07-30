@@ -37,6 +37,20 @@ _CAPACITY_POLICY_SIGNATURES = {
     '_placement_outcome': '(error, capacity_reason=None)',
 }
 
+_FAILOVER_ERROR_POLICY_SIGNATURES = {
+    '_add_to_blocked_resources': '(blocked_resources, resources)',
+    'FailoverCloudErrorHandlerV1._handle_errors': '(stdout, stderr, is_error_str_known)',
+    'FailoverCloudErrorHandlerV1._ibm_handler': '(blocked_resources, launchable_resources, region, zones, stdout, stderr)',
+    'FailoverCloudErrorHandlerV1.update_blocklist_on_error': '(blocked_resources, launchable_resources, region, zones, stdout, stderr)',
+    'FailoverCloudErrorHandlerV2._azure_handler': '(blocked_resources, launchable_resources, region, zones, err)',
+    'FailoverCloudErrorHandlerV2._gcp_handler': '(blocked_resources, launchable_resources, region, zones, err)',
+    'FailoverCloudErrorHandlerV2._lambda_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._aws_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._scp_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._default_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2.update_blocklist_on_error': '(blocked_resources, launchable_resources, region, zones, error)',
+}
+
 
 def _call_signature(symbol) -> str:
     """Returns the version-stable callable portion of a signature."""
@@ -54,6 +68,27 @@ def test_capacity_policy_historical_contract():
     for name, signature in _CAPACITY_POLICY_SIGNATURES.items():
         symbol = getattr(backend, name)
         assert getattr(capacity_policy, name) is symbol
+        assert _call_signature(symbol) == signature
+        assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
+
+
+def _resolve_backend_symbol(path: str):
+    symbol = backend
+    for name in path.split('.'):
+        symbol = getattr(symbol, name)
+    return symbol
+
+
+def test_failover_error_policy_historical_contract():
+    for handler_name in ('FailoverCloudErrorHandlerV1',
+                         'FailoverCloudErrorHandlerV2'):
+        handler = getattr(backend, handler_name)
+        assert handler.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert pickle.loads(pickle.dumps(handler)) is handler
+
+    for path, signature in _FAILOVER_ERROR_POLICY_SIGNATURES.items():
+        symbol = _resolve_backend_symbol(path)
         assert _call_signature(symbol) == signature
         assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
         assert pickle.loads(pickle.dumps(symbol)) is symbol
