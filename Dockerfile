@@ -65,6 +65,10 @@ RUN --mount=type=cache,id=dashboard-next-cache,target=/skypilot/sky/dashboard/.n
 
 COPY . /skypilot
 
+# The source image keeps the repository metadata, but .dockerignore omits
+# tracked documentation and test trees. Restore only those omitted paths while
+# recording the commit so they do not make every clean image look dirty, then
+# remove them again before the layer is committed.
 RUN cd /skypilot && \
     if [ "$INSTALL_FROM_SOURCE" != "true" ]; then \
         echo "Removing source code (wheel installation)" && \
@@ -72,7 +76,17 @@ RUN cd /skypilot && \
         mv /skypilot/dist /dist.backup && cd .. && rm -rf /skypilot && mkdir /skypilot && mv /dist.backup /skypilot/dist; \
     else \
         echo "Keeping source code and record commit sha (editable installation)" && \
-        python -c "import setup; setup.replace_commit_hash()" && \
+        if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+            git ls-files --deleted -z -- .github docs examples llm tests \
+                > /tmp/skypilot-docker-omitted-files && \
+            git checkout-index --force --stdin -z \
+                < /tmp/skypilot-docker-omitted-files && \
+            python -c "import setup; setup.replace_commit_hash()" && \
+            xargs -0 -r rm -f < /tmp/skypilot-docker-omitted-files && \
+            rm -f /tmp/skypilot-docker-omitted-files; \
+        else \
+            python -c "import setup; setup.replace_commit_hash()"; \
+        fi && \
         # Remove .git dir to reduce the final image size
         rm -rf .git; \
     fi
