@@ -301,6 +301,10 @@ def submit_jobs(job_ids: list[int],
 
     The user hash should be set (e.g. via SKYPILOT_USER_ID) before calling this.
     """
+    job_ids = list(dict.fromkeys(job_ids))
+    if not job_ids:
+        return
+
     controller_processes = state.get_job_controller_processes(job_ids)
     job_ids_without_controller_process = []
     for job_id in job_ids:

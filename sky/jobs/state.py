@@ -1390,6 +1390,10 @@ def scheduler_set_waiting(job_ids: list[int],
                           config_file_content: str | None,
                           priority: int,
                           priority_class: str | None = None) -> None:
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    if not unique_job_ids:
+        return
+
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         updates = {
@@ -1405,11 +1409,11 @@ def scheduler_set_waiting(job_ids: list[int],
         if priority_class is not None:
             updates[job_info_table.c.priority_class] = priority_class
         updated_count = session.query(job_info_table).filter(
-            sqlalchemy.and_(
-                job_info_table.c.spot_job_id.in_(job_ids),)).update(updates)
+            sqlalchemy.and_(job_info_table.c.spot_job_id.in_(unique_job_ids),
+                           )).update(updates)
         session.commit()
-        if updated_count != len(job_ids):
-            raise AssertionError((job_ids, updated_count))
+        if updated_count != len(unique_job_ids):
+            raise AssertionError((unique_job_ids, updated_count))
 
 
 @db_retries.retry
