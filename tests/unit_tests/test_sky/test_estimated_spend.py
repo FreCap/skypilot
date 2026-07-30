@@ -142,6 +142,39 @@ def _insert_daily(connection,
         ))
 
 
+def _insert_drilldown_daily(
+    connection,
+    *,
+    day: int,
+    cluster_hash: str,
+    cluster_name: str,
+    cost: float,
+    user_hash: str | None,
+    workload_type: str,
+    workload_id: str | None,
+    workload_task_id: int | None = None,
+    use_spot: bool = False,
+    workspace: str = 'default',
+):
+    connection.execute(
+        sqlalchemy.insert(global_user_state.estimated_spend_daily_table).values(
+            day_start_utc=day,
+            cluster_hash=cluster_hash,
+            cluster_name=cluster_name,
+            workload_type=workload_type,
+            workload_id=workload_id,
+            workload_task_id=workload_task_id,
+            user_hash=user_hash,
+            workspace=workspace,
+            cloud='AWS',
+            use_spot=use_spot,
+            machine_seconds=3600,
+            catalog_hourly_rate=cost,
+            estimated_cost=cost,
+            updated_at=day + 3600,
+        ))
+
+
 def _utc_date(day_start: int) -> datetime.date:
     return datetime.datetime.fromtimestamp(day_start,
                                            tz=datetime.timezone.utc).date()
@@ -514,6 +547,319 @@ def test_estimated_spend_endpoint_rejects_invalid_date_range():
 
     assert exc_info.value.status_code == 422
     assert exc_info.value.detail == 'invalid UTC range'
+
+
+def test_estimated_spend_drilldown_endpoint_serves_admin_page():
+    request = mock.MagicMock()
+    request.state.auth_user = models.User(id='admin-1', name='Admin')
+    expected = {'level': 'owner', 'rows': [], 'total': 0}
+    start_date = datetime.date(2026, 7, 12)
+    end_date = datetime.date(2026, 7, 13)
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=['admin']), mock.patch.object(
+                               server.estimated_spend_lib,
+                               'get_estimated_spend_drilldown',
+                               return_value=expected) as get_drilldown:
+        response = server.estimated_spend_drilldown(
+            request,
+            level=estimated_spend.SpendDrilldownLevel.OWNER,
+            days=7,
+            start_date=start_date,
+            end_date=end_date,
+            offset=2,
+            limit=25)
+
+    assert response == expected
+    get_drilldown.assert_called_once_with(
+        level=estimated_spend.SpendDrilldownLevel.OWNER,
+        days=7,
+        start_date=start_date,
+        end_date=end_date,
+        owner_user_hash=None,
+        owner_unknown=False,
+        workload_type=None,
+        workload_id=None,
+        workload_task_id=None,
+        offset=2,
+        limit=25)
+
+
+def test_estimated_spend_drilldown_endpoint_rejects_non_admin():
+    request = mock.MagicMock()
+    request.state.auth_user = models.User(id='user-1', name='User')
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=['user']), mock.patch.object(
+                               server.estimated_spend_lib,
+                               'get_estimated_spend_drilldown') as get_page:
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            server.estimated_spend_drilldown(
+                request, level=estimated_spend.SpendDrilldownLevel.OWNER)
+
+    assert exc_info.value.status_code == 403
+    get_page.assert_not_called()
+
+
+def test_estimated_spend_drilldown_endpoint_rejects_invalid_scope():
+    request = mock.MagicMock()
+    request.state.auth_user = models.User(id='admin-1', name='Admin')
+    with mock.patch.object(
+            server.permission.permission_service,
+            'get_user_roles',
+            return_value=['admin']), mock.patch.object(
+                server.estimated_spend_lib,
+                'get_estimated_spend_drilldown',
+                side_effect=estimated_spend.InvalidDrilldownScopeError(
+                    'invalid hierarchy scope')):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            server.estimated_spend_drilldown(
+                request, level=estimated_spend.SpendDrilldownLevel.WORKLOAD)
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == 'invalid hierarchy scope'
+
+
+def test_spend_drilldown_hierarchy_and_pagination(tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    as_of = day + estimated_spend.SECONDS_PER_DAY
+    with engine.begin() as connection:
+        connection.execute(sqlalchemy.insert(global_user_state.user_table), [{
+            'id': 'alice',
+            'name': 'Alice',
+        }, {
+            'id': 'bob',
+            'name': 'Bob',
+        }])
+        _insert_drilldown_daily(connection,
+                                day=day,
+                                cluster_hash='job-42-task-0',
+                                cluster_name='job-42-recovery-a',
+                                cost=4,
+                                user_hash='alice',
+                                workload_type='managed_job',
+                                workload_id='42',
+                                workload_task_id=0,
+                                use_spot=True)
+        _insert_drilldown_daily(connection,
+                                day=day,
+                                cluster_hash='job-42-task-1',
+                                cluster_name='job-42-recovery-b',
+                                cost=6,
+                                user_hash='alice',
+                                workload_type='managed_job',
+                                workload_id='42',
+                                workload_task_id=1)
+        _insert_drilldown_daily(connection,
+                                day=day,
+                                cluster_hash='legacy-a',
+                                cluster_name='legacy-managed-a',
+                                cost=3,
+                                user_hash='alice',
+                                workload_type='managed',
+                                workload_id='legacy-managed-a')
+        _insert_drilldown_daily(connection,
+                                day=day,
+                                cluster_hash='legacy-b',
+                                cluster_name='legacy-managed-b',
+                                cost=2,
+                                user_hash='alice',
+                                workload_type='managed',
+                                workload_id='legacy-managed-b')
+        _insert_drilldown_daily(connection,
+                                day=day,
+                                cluster_hash='standalone',
+                                cluster_name='standalone',
+                                cost=1,
+                                user_hash='alice',
+                                workload_type='cluster',
+                                workload_id='standalone')
+        _insert_drilldown_daily(connection,
+                                day=day,
+                                cluster_hash='unknown-owner',
+                                cluster_name='unknown-owner',
+                                cost=7,
+                                user_hash=None,
+                                workload_type='cluster',
+                                workload_id='unknown-owner')
+        _insert_drilldown_daily(connection,
+                                day=day,
+                                cluster_hash='bob-cluster',
+                                cluster_name='bob-cluster',
+                                cost=2,
+                                user_hash='bob',
+                                workload_type='cluster',
+                                workload_id='bob-cluster')
+        for task_id, cluster_hash in ((0, 'bob-job-task-0'), (1,
+                                                              'bob-job-task-1'),
+                                      (None, 'bob-job-task-unknown')):
+            _insert_drilldown_daily(connection,
+                                    day=day,
+                                    cluster_hash=cluster_hash,
+                                    cluster_name=cluster_hash,
+                                    cost=1,
+                                    user_hash='bob',
+                                    workload_type='managed_job',
+                                    workload_id='99',
+                                    workload_task_id=task_id)
+        _insert_drilldown_daily(connection,
+                                day=day - estimated_spend.SECONDS_PER_DAY,
+                                cluster_hash='outside-range',
+                                cluster_name='outside-range',
+                                cost=100,
+                                user_hash='alice',
+                                workload_type='cluster',
+                                workload_id='outside-range')
+
+    monkeypatch.setattr(estimated_spend.time, 'time', lambda: as_of)
+    selected_date = _utc_date(day)
+    owner_page = estimated_spend.get_estimated_spend_drilldown(
+        'owner', start_date=selected_date, end_date=selected_date, limit=1)
+    assert owner_page['total'] == 3
+    assert owner_page['has_more'] is True
+    assert owner_page['rows'] == [{
+        'user_hash': 'alice',
+        'user_name': 'Alice',
+        'estimated_cost': 16.0,
+        'spot_estimated_cost': 4.0,
+        'on_demand_estimated_cost': 12.0,
+        'priced_machine_seconds': 5 * 3600,
+        'excluded_machine_seconds': 0,
+        'workload_count': 3,
+        'cluster_count': 5,
+        'owner_unknown': False,
+    }]
+    unknown_owner = estimated_spend.get_estimated_spend_drilldown(
+        'owner',
+        start_date=selected_date,
+        end_date=selected_date,
+        offset=1,
+        limit=1)['rows'][0]
+    assert unknown_owner['owner_unknown'] is True
+    assert unknown_owner['estimated_cost'] == 7
+    unknown_workloads = estimated_spend.get_estimated_spend_drilldown(
+        'workload',
+        start_date=selected_date,
+        end_date=selected_date,
+        owner_unknown=True)
+    assert unknown_workloads['total'] == 1
+    assert unknown_workloads['rows'][0]['workload_id'] == 'unknown-owner'
+    assert unknown_workloads['rows'][0]['estimated_cost'] == 7
+
+    workloads = estimated_spend.get_estimated_spend_drilldown(
+        'workload',
+        start_date=selected_date,
+        end_date=selected_date,
+        owner_user_hash='alice',
+        limit=100)
+    assert workloads['total'] == 3
+    assert sum(row['estimated_cost'] for row in workloads['rows']) == 16
+    by_workload_type = {row['workload_type']: row for row in workloads['rows']}
+    managed_job = by_workload_type['managed_job']
+    assert managed_job['workload_id'] == '42'
+    assert managed_job['estimated_cost'] == 10
+    assert managed_job['task_count'] == 2
+    assert managed_job['cluster_count'] == 2
+    legacy = by_workload_type['managed_unattributed']
+    assert legacy['workload_id'] is None
+    assert legacy['estimated_cost'] == 5
+    assert legacy['cluster_count'] == 2
+    assert legacy['unknown_task_cluster_count'] == 2
+    flat_workloads = estimated_spend.get_estimated_spend(
+        start_date=selected_date, end_date=selected_date,
+        group_by='job')['groups']
+    flat_legacy = [
+        row for row in flat_workloads
+        if row['workload_type'] == 'managed_unattributed'
+    ]
+    assert len(flat_legacy) == 1
+    assert flat_legacy[0]['workload_id'] is None
+    assert flat_legacy[0]['estimated_cost'] == 5
+
+    bob_workloads = estimated_spend.get_estimated_spend_drilldown(
+        'workload',
+        start_date=selected_date,
+        end_date=selected_date,
+        owner_user_hash='bob',
+        limit=100)['rows']
+    bob_managed_job = next(
+        row for row in bob_workloads if row['workload_type'] == 'managed_job')
+    assert bob_managed_job['task_count'] == 2
+    assert bob_managed_job['unknown_task_cluster_count'] == 1
+    assert bob_managed_job['cluster_count'] == 3
+
+    tasks = estimated_spend.get_estimated_spend_drilldown(
+        'task',
+        start_date=selected_date,
+        end_date=selected_date,
+        owner_user_hash='alice',
+        workload_type='managed_job',
+        workload_id='42')
+    assert [row['workload_task_id'] for row in tasks['rows']] == [0, 1]
+    assert [row['estimated_cost'] for row in tasks['rows']] == [4, 6]
+    assert sum(row['estimated_cost'] for row in tasks['rows']) == (
+        managed_job['estimated_cost'])
+
+    task_attempts = estimated_spend.get_estimated_spend_drilldown(
+        'cluster',
+        start_date=selected_date,
+        end_date=selected_date,
+        owner_user_hash='alice',
+        workload_type='managed_job',
+        workload_id='42',
+        workload_task_id=1)
+    assert task_attempts['rows'][0]['cluster_name'] == 'job-42-recovery-b'
+    assert task_attempts['rows'][0]['estimated_cost'] == 6
+
+    legacy_attempts = estimated_spend.get_estimated_spend_drilldown(
+        'cluster',
+        start_date=selected_date,
+        end_date=selected_date,
+        owner_user_hash='alice',
+        workload_type='managed_unattributed',
+        limit=100)
+    assert {row['cluster_name'] for row in legacy_attempts['rows']
+           } == {'legacy-managed-a', 'legacy-managed-b'}
+    assert sum(row['estimated_cost']
+               for row in legacy_attempts['rows']) == legacy['estimated_cost']
+
+
+@pytest.mark.parametrize(('kwargs', 'message'), [
+    ({
+        'level': 'workload',
+    }, 'require owner'),
+    ({
+        'level': 'owner',
+        'owner_unknown': True,
+    }, 'does not accept'),
+    ({
+        'level': 'workload',
+        'owner_unknown': True,
+        'owner_user_hash': 'alice',
+    }, 'not both'),
+    ({
+        'level': 'cluster',
+        'owner_user_hash': 'alice',
+        'workload_type': 'managed_job',
+    }, 'require workload_id'),
+    ({
+        'level': 'cluster',
+        'owner_user_hash': 'alice',
+        'workload_type': 'managed_unattributed',
+        'workload_id': 'invented',
+    }, 'must not include workload_id'),
+    ({
+        'level': 'owner',
+        'limit': 101,
+    }, 'limit must be'),
+])
+def test_spend_drilldown_rejects_invalid_scopes(tmp_path, monkeypatch, kwargs,
+                                                message):
+    _fresh_db(tmp_path, monkeypatch)
+    with pytest.raises(estimated_spend.InvalidDrilldownScopeError,
+                       match=message):
+        estimated_spend.get_estimated_spend_drilldown(**kwargs)
 
 
 def test_schema_021_upgrades_existing_sqlite_database(tmp_path):

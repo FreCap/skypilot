@@ -1446,6 +1446,47 @@ def estimated_spend(
         raise fastapi.HTTPException(status_code=422, detail=str(e)) from e
 
 
+@app.get('/estimated_spend/drilldown')
+def estimated_spend_drilldown(
+    request: fastapi.Request,
+    level: estimated_spend_lib.SpendDrilldownLevel,
+    days: int = estimated_spend_lib.DEFAULT_LOOKBACK_DAYS,
+    start_date: datetime.date | None = None,
+    end_date: datetime.date | None = None,
+    owner_user_hash: str | None = None,
+    owner_unknown: bool = False,
+    workload_type: str | None = None,
+    workload_id: str | None = None,
+    workload_task_id: int | None = None,
+    offset: int = 0,
+    limit: int = estimated_spend_lib.DRILLDOWN_DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Returns one materialized spend-attribution page to admins only."""
+    auth_user = request.state.auth_user
+    if auth_user is not None:
+        roles = permission.permission_service.get_user_roles(auth_user.id)
+        if rbac.RoleName.ADMIN.value not in roles:
+            raise fastapi.HTTPException(
+                status_code=403, detail='Only admins can view estimated spend.')
+    try:
+        return estimated_spend_lib.get_estimated_spend_drilldown(
+            level=level,
+            days=days,
+            start_date=start_date,
+            end_date=end_date,
+            owner_user_hash=owner_user_hash,
+            owner_unknown=owner_unknown,
+            workload_type=workload_type,
+            workload_id=workload_id,
+            workload_task_id=workload_task_id,
+            offset=offset,
+            limit=limit,
+        )
+    except (estimated_spend_lib.InvalidDateRangeError,
+            estimated_spend_lib.InvalidDrilldownScopeError) as e:
+        raise fastapi.HTTPException(status_code=422, detail=str(e)) from e
+
+
 def _operator_notification_user_id(request: fastapi.Request) -> str:
     """Return the current admin identity or reject the notification API."""
     auth_user = request.state.auth_user

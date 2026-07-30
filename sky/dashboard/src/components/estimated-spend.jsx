@@ -42,6 +42,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { SpendAttributionTable } from '@/components/spend-attribution-table';
 import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
 import { getCurrentUserRole } from '@/data/connectors/client';
 
@@ -186,7 +187,9 @@ export function workloadLabel(workload) {
   if (type === 'service') return `Service · ${id}`;
   if (type === 'pool') return `Pool · ${id}`;
   if (type === 'controller') return `Platform · ${id}`;
-  if (type === 'managed') return `Managed workload · ${id}`;
+  if (type === 'managed' || type === 'managed_unattributed') {
+    return 'Legacy managed, parent unknown';
+  }
   return `Cluster · ${id}`;
 }
 
@@ -535,7 +538,7 @@ export function EstimatedSpend() {
     () => rangeForPreset(RANGE_OPTIONS[3]).endDate
   );
   const [dateRangeError, setDateRangeError] = useState(null);
-  const [groupBy, setGroupBy] = useState('job');
+  const [groupBy, setGroupBy] = useState('user');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -747,6 +750,7 @@ export function EstimatedSpend() {
   const clouds = data?.clouds || [];
   const totalCost = Number(totals.estimated_cost || 0);
   const serviceRequests = data?.service_requests;
+  const hasOtherSeries = (data?.series || []).some((series) => series.is_other);
   const todayUtc = utcDateString();
   const earliestDate = shiftUtcDate(todayUtc, -(MAX_RANGE_DAYS - 1));
   const selectedRangeDetail = `${formatUtcDate(dateRange.startDate, {
@@ -921,15 +925,43 @@ export function EstimatedSpend() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-lg">
-                Daily estimate by {groupOption?.label.toLowerCase() || 'group'}
-              </CardTitle>
-              <CardDescription>
-                Stacked catalog-priced cost split at UTC midnight.{' '}
-                {dateRange.endDate === todayUtc &&
-                  'The current day is partial; '}
-                lower-cost groups are combined as Other.
-              </CardDescription>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <CardTitle className="text-lg">
+                    Daily estimate by{' '}
+                    {groupOption?.label.toLowerCase() || 'group'}
+                  </CardTitle>
+                  <CardDescription className="mt-1">
+                    Stacked catalog-priced cost split at UTC midnight.{' '}
+                    {dateRange.endDate === todayUtc &&
+                      'The current day is partial; '}
+                    {hasOtherSeries
+                      ? `the top 8 groups are charted individually. Other is the chart-only remainder; ${
+                          displayedGroupBy === 'user'
+                            ? 'use the owner hierarchy below to inspect every paginated workload and attempt.'
+                            : 'switch to User to inspect every paginated workload and attempt.'
+                        }`
+                      : 'all groups in this range fit in the chart.'}
+                  </CardDescription>
+                </div>
+                {hasOtherSeries && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setGroupBy('user');
+                      setTimeout(() => {
+                        document
+                          .getElementById('spend-ownership')
+                          ?.scrollIntoView?.({ behavior: 'smooth' });
+                      }, 0);
+                    }}
+                  >
+                    Inspect Other
+                  </Button>
+                )}
+              </div>
             </CardHeader>
             <CardContent>
               <div className="h-80">
@@ -939,111 +971,125 @@ export function EstimatedSpend() {
           </Card>
 
           <div className="grid gap-6 xl:grid-cols-[2fr_1fr]">
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-lg">
-                  {displayedGroupBy === 'purchase_option'
-                    ? 'Spend'
-                    : 'Top spend'}{' '}
-                  by {groupOption?.label.toLowerCase() || 'group'}
-                </CardTitle>
-                <CardDescription>
-                  {displayedGroupBy === 'job'
-                    ? 'Up to 50 workloads. Managed jobs include provisioning and recovery uptime; shared machines remain attributed to their pool.'
-                    : displayedGroupBy === 'user'
-                      ? 'Up to 50 users. Ownership follows the user recorded when each cluster was launched.'
-                      : 'Catalog-priced compute split between spot and on-demand capacity.'}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>
-                          {displayedGroupBy === 'job'
-                            ? 'Job / workload'
-                            : displayedGroupBy === 'user'
-                              ? 'User'
-                              : 'Purchase option'}
-                        </TableHead>
-                        <TableHead className="text-right">
-                          Machine time
-                        </TableHead>
-                        <TableHead className="text-right">Total</TableHead>
-                        {showPurchaseColumns && (
-                          <>
-                            <TableHead className="text-right">Spot</TableHead>
-                            <TableHead className="text-right">
-                              On-demand
-                            </TableHead>
-                          </>
-                        )}
-                        <TableHead className="text-right">Share</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {groups.length === 0 ? (
+            {displayedGroupBy === 'user' && supportsBreakdowns ? (
+              <SpendAttributionTable
+                dateRange={dateRange}
+                snapshotAt={Number(data?.as_of || 0)}
+                totalCost={totalCost}
+                fallbackGroups={groups}
+                formatCurrency={formatCurrency}
+                formatHours={formatHours}
+                workloadLabel={workloadLabel}
+              />
+            ) : (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-lg">
+                    {displayedGroupBy === 'purchase_option'
+                      ? 'Spend'
+                      : 'Top spend'}{' '}
+                    by {groupOption?.label.toLowerCase() || 'group'}
+                  </CardTitle>
+                  <CardDescription>
+                    {displayedGroupBy === 'job'
+                      ? 'Up to 50 workloads. Managed jobs include provisioning and recovery uptime; shared machines remain attributed to their pool.'
+                      : displayedGroupBy === 'user'
+                        ? 'Up to 50 users. Ownership follows the user recorded when each cluster was launched.'
+                        : 'Catalog-priced compute split between spot and on-demand capacity.'}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <Table>
+                      <TableHeader>
                         <TableRow>
-                          <TableCell
-                            colSpan={showPurchaseColumns ? 6 : 4}
-                            className="py-8 text-center text-muted-foreground"
-                          >
-                            No priced groups in this range.
-                          </TableCell>
+                          <TableHead>
+                            {displayedGroupBy === 'job'
+                              ? 'Job / workload'
+                              : displayedGroupBy === 'user'
+                                ? 'User'
+                                : 'Purchase option'}
+                          </TableHead>
+                          <TableHead className="text-right">
+                            Machine time
+                          </TableHead>
+                          <TableHead className="text-right">Total</TableHead>
+                          {showPurchaseColumns && (
+                            <>
+                              <TableHead className="text-right">Spot</TableHead>
+                              <TableHead className="text-right">
+                                On-demand
+                              </TableHead>
+                            </>
+                          )}
+                          <TableHead className="text-right">Share</TableHead>
                         </TableRow>
-                      ) : (
-                        groups.map((group) => {
-                          const cost = Number(group.estimated_cost || 0);
-                          const share =
-                            totalCost > 0 ? (cost / totalCost) * 100 : 0;
-                          return (
-                            <TableRow
-                              key={breakdownKey(displayedGroupBy, group)}
+                      </TableHeader>
+                      <TableBody>
+                        {groups.length === 0 ? (
+                          <TableRow>
+                            <TableCell
+                              colSpan={showPurchaseColumns ? 6 : 4}
+                              className="py-8 text-center text-muted-foreground"
                             >
-                              <TableCell className="max-w-md truncate font-medium">
-                                {breakdownLabel(displayedGroupBy, group)}
-                              </TableCell>
-                              <TableCell className="text-right text-muted-foreground">
-                                <div>
-                                  {formatHours(group.priced_machine_seconds)}
-                                </div>
-                                {group.excluded_machine_seconds > 0 && (
-                                  <div className="text-xs">
-                                    {formatHours(
-                                      group.excluded_machine_seconds
-                                    )}{' '}
-                                    excluded
+                              No priced groups in this range.
+                            </TableCell>
+                          </TableRow>
+                        ) : (
+                          groups.map((group) => {
+                            const cost = Number(group.estimated_cost || 0);
+                            const share =
+                              totalCost > 0 ? (cost / totalCost) * 100 : 0;
+                            return (
+                              <TableRow
+                                key={breakdownKey(displayedGroupBy, group)}
+                              >
+                                <TableCell className="max-w-md truncate font-medium">
+                                  {breakdownLabel(displayedGroupBy, group)}
+                                </TableCell>
+                                <TableCell className="text-right text-muted-foreground">
+                                  <div>
+                                    {formatHours(group.priced_machine_seconds)}
                                   </div>
+                                  {group.excluded_machine_seconds > 0 && (
+                                    <div className="text-xs">
+                                      {formatHours(
+                                        group.excluded_machine_seconds
+                                      )}{' '}
+                                      excluded
+                                    </div>
+                                  )}
+                                </TableCell>
+                                <TableCell className="text-right font-medium">
+                                  {formatCurrency(cost)}
+                                </TableCell>
+                                {showPurchaseColumns && (
+                                  <>
+                                    <TableCell className="text-right text-emerald-700 dark:text-emerald-300">
+                                      {formatCurrency(
+                                        group.spot_estimated_cost
+                                      )}
+                                    </TableCell>
+                                    <TableCell className="text-right text-sky-700 dark:text-sky-300">
+                                      {formatCurrency(
+                                        group.on_demand_estimated_cost
+                                      )}
+                                    </TableCell>
+                                  </>
                                 )}
-                              </TableCell>
-                              <TableCell className="text-right font-medium">
-                                {formatCurrency(cost)}
-                              </TableCell>
-                              {showPurchaseColumns && (
-                                <>
-                                  <TableCell className="text-right text-emerald-700 dark:text-emerald-300">
-                                    {formatCurrency(group.spot_estimated_cost)}
-                                  </TableCell>
-                                  <TableCell className="text-right text-sky-700 dark:text-sky-300">
-                                    {formatCurrency(
-                                      group.on_demand_estimated_cost
-                                    )}
-                                  </TableCell>
-                                </>
-                              )}
-                              <TableCell className="text-right text-muted-foreground">
-                                {share.toFixed(1)}%
-                              </TableCell>
-                            </TableRow>
-                          );
-                        })
-                      )}
-                    </TableBody>
-                  </Table>
-                </div>
-              </CardContent>
-            </Card>
+                                <TableCell className="text-right text-muted-foreground">
+                                  {share.toFixed(1)}%
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
             <Card>
               <CardHeader>
