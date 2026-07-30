@@ -167,6 +167,65 @@ const normalizeUserDirectory = (usersData) =>
 const normalizeWorkspaceDirectory = (workspacesData) =>
   workspacesData ? Object.keys(workspacesData).sort() : [];
 
+function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
+  const onRefreshRef = useRef(onRefresh);
+  const lastVisibilityRefreshAtRef = useRef(null);
+
+  useEffect(() => {
+    onRefreshRef.current = onRefresh;
+  }, [onRefresh]);
+
+  useEffect(() => {
+    if (!enabled || !intervalMs) {
+      lastVisibilityRefreshAtRef.current = null;
+      return undefined;
+    }
+
+    const maybeRefresh = (source) => {
+      if (window.document.visibilityState !== 'visible') {
+        return;
+      }
+
+      const now = Date.now();
+      if (
+        source === 'interval' &&
+        lastVisibilityRefreshAtRef.current !== null &&
+        now - lastVisibilityRefreshAtRef.current < intervalMs
+      ) {
+        return;
+      }
+
+      if (source === 'visibilitychange') {
+        lastVisibilityRefreshAtRef.current = now;
+      }
+      onRefreshRef.current(source);
+    };
+
+    const handleVisibilityChange = () => {
+      if (window.document.visibilityState === 'visible') {
+        maybeRefresh('visibilitychange');
+      }
+    };
+
+    const interval = setInterval(() => {
+      maybeRefresh('interval');
+    }, intervalMs);
+    window.document.addEventListener(
+      'visibilitychange',
+      handleVisibilityChange
+    );
+
+    return () => {
+      lastVisibilityRefreshAtRef.current = null;
+      window.document.removeEventListener(
+        'visibilitychange',
+        handleVisibilityChange
+      );
+      clearInterval(interval);
+    };
+  }, [enabled, intervalMs]);
+}
+
 export function useManagedJobsPageData() {
   const [, setLoading] = useState(false);
   const [poolsLoading, setPoolsLoading] = useState(true); // Start as true for initial load
@@ -256,24 +315,26 @@ export function useManagedJobsPageData() {
     []
   );
 
+  const refreshPoolsWhenVisible = useCallback(
+    (source) => {
+      void refreshPoolsData({
+        source,
+        forcePoolRefresh: true,
+      });
+    },
+    [refreshPoolsData]
+  );
+
+  useVisibleRefreshInterval(true, REFRESH_INTERVAL, refreshPoolsWhenVisible);
+
   useEffect(() => {
     mountedRef.current = true;
     void refreshPoolsData();
-    const interval = setInterval(() => {
-      if (window.document.visibilityState !== 'visible') {
-        return;
-      }
-      void refreshPoolsData({
-        source: 'interval',
-        forcePoolRefresh: true,
-      });
-    }, REFRESH_INTERVAL);
     return () => {
       mountedRef.current = false;
       requestVersionRef.current += 1;
       jobsRefreshRef.current = null;
       refreshInFlightRef.current = null;
-      clearInterval(interval);
     };
   }, [refreshPoolsData]);
 
@@ -922,43 +983,34 @@ export function ManagedJobsTable({
 
   const effectiveRefreshInterval = hasRunningBatches ? 1000 : refreshInterval;
 
-  // Set up periodic refresh interval only after preloading is complete
-  useEffect(() => {
-    if (!preloadingComplete) {
+  const refreshJobsWhenVisible = React.useCallback(() => {
+    if (!fetchDataRef.current) {
       return;
     }
-
-    const interval = setInterval(() => {
-      if (
-        fetchDataRef.current &&
-        window.document.visibilityState === 'visible'
-      ) {
-        if (automaticRefreshRef.current) {
-          return;
-        }
-        // Invalidate cache for fast refresh so we get fresh data
-        if (hasRunningBatches) {
-          jobsCacheManager.invalidateCache();
-        }
-        const refresh = fetchDataRef.current({
-          includeStatus: !hasRunningBatches,
-        });
-        automaticRefreshRef.current = refresh;
-        const clearRefresh = () => {
-          if (automaticRefreshRef.current === refresh) {
-            automaticRefreshRef.current = null;
-          }
-        };
-        void refresh.then(clearRefresh, clearRefresh);
+    if (automaticRefreshRef.current) {
+      return;
+    }
+    if (hasRunningBatches) {
+      jobsCacheManager.invalidateCache();
+    }
+    const refresh = fetchDataRef.current({
+      includeStatus: !hasRunningBatches,
+    });
+    automaticRefreshRef.current = refresh;
+    const clearRefresh = () => {
+      if (automaticRefreshRef.current === refresh) {
+        automaticRefreshRef.current = null;
       }
-    }, effectiveRefreshInterval);
-
-    return () => {
-      clearInterval(interval);
-      // Don't invalidate cache on component unmount - this causes premature cache invalidation
-      // Cache should only be invalidated on manual refresh or TTL expiration
     };
-  }, [effectiveRefreshInterval, hasRunningBatches, preloadingComplete]);
+    void refresh.then(clearRefresh, clearRefresh);
+  }, [hasRunningBatches]);
+
+  // Set up periodic refresh interval only after preloading is complete
+  useVisibleRefreshInterval(
+    preloadingComplete,
+    effectiveRefreshInterval,
+    refreshJobsWhenVisible
+  );
 
   // Switch ownership scope (My Jobs vs All Jobs). Resets status narrowing
   // so a status chip selected in one scope (e.g. RUNNING in My Jobs)
