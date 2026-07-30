@@ -1304,6 +1304,49 @@ def test_child_only_purge_skips_absent_clusters_with_one_inventory_snapshot():
     remove.assert_called_once_with('orphan', 9)
 
 
+def test_orphaned_service_cluster_fields_require_consolidation():
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_managed_cluster_status_fields') as get_candidates, \
+         mock.patch.object(serve_state,
+                           'get_replica_cluster_names') as get_owners:
+        result = serve_utils.get_orphaned_service_cluster_status_fields()
+
+    assert result == {}
+    get_candidates.assert_not_called()
+    get_owners.assert_not_called()
+
+
+def test_orphaned_service_cluster_fields_use_exact_replica_ownership():
+    candidates = {
+        'predecessor-r1': ('UP', 1),
+        'current-r1': ('UP', 2),
+        'failed-launch-r2': ('INIT', 3),
+    }
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_managed_cluster_status_fields',
+             return_value=candidates) as get_candidates, \
+         mock.patch.object(
+             serve_state,
+             'get_replica_cluster_names',
+             return_value={'current-r1'}) as get_owners:
+        result = serve_utils.get_orphaned_service_cluster_status_fields()
+
+    assert result == {
+        'predecessor-r1': ('UP', 1),
+        'failed-launch-r2': ('INIT', 3),
+    }
+    get_candidates.assert_called_once_with('service')
+    get_owners.assert_called_once_with()
+
+
 def test_child_only_purge_termination_failure_retains_inventory():
     lifecycle_lock = mock.MagicMock(epoch=9)
     replica_infos = [

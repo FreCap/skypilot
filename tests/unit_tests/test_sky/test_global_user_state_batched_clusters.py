@@ -40,13 +40,15 @@ class _MinimalHandle:
 def _add_cluster(name: str,
                  *,
                  is_managed: bool = False,
-                 ready: bool = False) -> None:
+                 ready: bool = False,
+                 workload_type: str | None = None) -> None:
     global_user_state.add_or_update_cluster(
         cluster_name=name,
         cluster_handle=_MinimalHandle(),
         requested_resources=set(),
         ready=ready,
         is_managed=is_managed,
+        workload_type=workload_type,
     )
 
 
@@ -241,6 +243,21 @@ def test_get_cluster_status_fields_all_unmanaged_uses_one_select(
 
     assert set(result) == {'user-a', 'user-b'}
     assert len(select_statements) == 1
+
+
+def test_get_managed_cluster_status_fields_filters_workload_type(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('user-service', workload_type='service')
+    _add_cluster('managed-service', is_managed=True, workload_type='service')
+    _add_cluster('managed-pool', is_managed=True, workload_type='pool')
+    _add_cluster('managed-job', is_managed=True, workload_type='managed_job')
+    _add_cluster('managed-legacy', is_managed=True)
+
+    result = global_user_state.get_managed_cluster_status_fields('service')
+
+    assert set(result) == {'managed-service'}
+    assert result['managed-service'][0] == 'INIT'
 
 
 def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):

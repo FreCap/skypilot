@@ -2453,6 +2453,28 @@ def get_existing_replica_cluster_names(
         global_user_state.get_cluster_status_fields(cluster_names).keys())
 
 
+def get_orphaned_service_cluster_status_fields(
+) -> dict[str, tuple[str | None, int | None]]:
+    """Returns managed service clusters without an exact replica owner.
+
+    Only consolidated SkyServe has both inventories in the API server's
+    central database. Non-consolidated services keep replica authority on
+    their remote controller, so an API-server-side absence is not evidence of
+    orphaned ownership there.
+    """
+    if not is_consolidation_mode():
+        return {}
+    candidates = global_user_state.get_managed_cluster_status_fields('service')
+    if not candidates:
+        return {}
+    owned_cluster_names = serve_state.get_replica_cluster_names()
+    return {
+        cluster_name: status_fields
+        for cluster_name, status_fields in candidates.items()
+        if cluster_name not in owned_cluster_names
+    }
+
+
 def _terminate_failed_services(service_name: str,
                                expected_service_hash: str | None,
                                service_status: serve_state.ServiceStatus | None,
