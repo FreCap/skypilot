@@ -138,6 +138,31 @@ describe('useServiceDetails stale-response fencing', () => {
     jest.restoreAllMocks();
   });
 
+  it('skips the full service read when only summary data is requested', async () => {
+    const unexpectedFull = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'summary-only', summaryOnly: true }],
+      })
+      .mockImplementationOnce(() => unexpectedFull.promise);
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc', loadFull: false })
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('summary-only')
+    );
+
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(
+      1,
+      getServices,
+      detailSummaryArgs('svc')
+    );
+    expect(result.current.replicasLoading).toBe(false);
+  });
+
   it('coalesces concurrent forced refreshes for the same service', async () => {
     const refreshedSummary = deferred();
     const refreshedFull = deferred();
@@ -1166,6 +1191,99 @@ describe('ServiceDetails route ownership rendering', () => {
 
     expect(screen.getByText('FRESH-A')).toBeInTheDocument();
     expect(screen.queryByText('STALE-B')).not.toBeInTheDocument();
+  });
+
+  it('refreshes summary ownership on a placement A-B-A route cycle', async () => {
+    const serviceBSummary = deferred();
+    const freshServiceASummary = deferred();
+    const routerState = {
+      isReady: true,
+      query: { service: 'svc-a', tab: 'placement' },
+    };
+    mockUseRouter.mockImplementation(() => routerState);
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc-a', status: 'STALE-A', summaryOnly: true }],
+      })
+      .mockImplementationOnce(() => serviceBSummary.promise)
+      .mockImplementationOnce(() => freshServiceASummary.promise);
+
+    const { rerender } = render(<ServiceDetailsPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('service-placement')).toBeInTheDocument()
+    );
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    routerState.query = { service: 'svc-b', tab: 'placement' };
+    rerender(<ServiceDetailsPage />);
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    routerState.query = { service: 'svc-a', tab: 'placement' };
+    rerender(<ServiceDetailsPage />);
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
+
+    expect(screen.getByText('Loading service details...')).toBeInTheDocument();
+    expect(screen.queryByTestId('service-placement')).not.toBeInTheDocument();
+
+    await act(async () => {
+      freshServiceASummary.resolve({
+        services: [{ name: 'svc-a', status: 'FRESH-A', summaryOnly: true }],
+      });
+      await freshServiceASummary.promise;
+    });
+
+    expect(screen.getByTestId('service-placement')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Placement' })).toBeInTheDocument();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      serviceBSummary.resolve({
+        services: [{ name: 'svc-b', status: 'STALE-B', summaryOnly: true }],
+      });
+      await serviceBSummary.promise;
+    });
+
+    expect(screen.getByTestId('service-placement')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Placement' })).toBeInTheDocument();
+  });
+
+  it('keeps placement loads summary-only until overview needs replicas', async () => {
+    const routerState = {
+      isReady: true,
+      query: { service: 'svc', tab: 'placement' },
+    };
+    mockUseRouter.mockImplementation(() => routerState);
+
+    dashboardCache.get.mockResolvedValueOnce({
+      services: [{ name: 'svc', status: 'READY', summaryOnly: true }],
+    });
+
+    const { rerender } = render(<ServiceDetailsPage />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('service-placement')).toBeInTheDocument()
+    );
+
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(
+      1,
+      getServices,
+      detailSummaryArgs('svc')
+    );
+
+    dashboardCache.get.mockResolvedValueOnce({
+      services: [{ name: 'svc', status: 'READY', replicas: [] }],
+    });
+    routerState.query = { service: 'svc' };
+    rerender(<ServiceDetailsPage />);
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(
+      2,
+      getServices,
+      detailFullArgs('svc')
+    );
   });
 });
 

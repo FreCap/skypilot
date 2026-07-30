@@ -135,7 +135,7 @@ export function getReplicaPlacementBreakdown(replicas) {
   );
 }
 
-export function useServiceDetails({ serviceName }) {
+export function useServiceDetails({ serviceName, loadFull = true }) {
   const [serviceData, setServiceData] = useState(null);
   const [replicaHistory, setReplicaHistory] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -144,6 +144,7 @@ export function useServiceDetails({ serviceName }) {
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
   const visibleServiceDataRef = useRef(null);
+  const initialLoadServiceNameRef = useRef(null);
   const summaryArgs = useMemo(
     () => [
       {
@@ -175,13 +176,33 @@ export function useServiceDetails({ serviceName }) {
       resetHistory = false,
       source = 'refresh',
       supersede = false,
+      loadFullRequest = loadFull,
+      requireFreshSummary = false,
     } = {}) => {
       if (!serviceName) return Promise.resolve();
       const inFlight = refreshInFlightRef.current;
       const hasVisibleCurrentServiceData =
         visibleServiceDataRef.current?.name === serviceName;
+      if (
+        source === 'initial' &&
+        !loadFullRequest &&
+        !requireFreshSummary &&
+        hasVisibleCurrentServiceData
+      ) {
+        setLoading(false);
+        setReplicasLoading(false);
+        setHistoryLoading(false);
+        return Promise.resolve();
+      }
+      const loadSummary =
+        requireFreshSummary ||
+        !loadFullRequest ||
+        source !== 'initial' ||
+        !hasVisibleCurrentServiceData;
       const shouldReuseInFlight =
         inFlight?.serviceName === serviceName &&
+        (!loadSummary || inFlight.loadSummary) &&
+        (!loadFullRequest || inFlight.loadFull) &&
         (!supersede ||
           (!hasVisibleCurrentServiceData && inFlight.summaryPending) ||
           inFlight.source === 'manual');
@@ -189,23 +210,27 @@ export function useServiceDetails({ serviceName }) {
         return inFlight.promise;
       }
       if (invalidate) {
-        dashboardCache.invalidate(getServices, summaryArgs);
-        dashboardCache.invalidate(getServices, fullArgs);
+        if (loadSummary) {
+          dashboardCache.invalidate(getServices, summaryArgs);
+        }
+        if (loadFullRequest) {
+          dashboardCache.invalidate(getServices, fullArgs);
+        }
       }
 
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
       setLoading(true);
-      setReplicasLoading(true);
-      setHistoryLoading(true);
-      if (resetHistory) {
+      setReplicasLoading(loadFullRequest);
+      setHistoryLoading(loadSummary);
+      if (resetHistory && loadSummary) {
         setReplicaHistory(null);
       }
       const isCurrentRequest = () =>
         requestVersionRef.current === requestVersion;
-      let summarySettled = false;
+      let summarySettled = !loadSummary;
       let fullLanded = false;
-      let fullSettled = false;
+      let fullSettled = !loadFullRequest;
       const finishLoadingIfReady = (hasRenderableData = false) => {
         if (!isCurrentRequest()) return;
         if (
@@ -218,71 +243,82 @@ export function useServiceDetails({ serviceName }) {
       };
       let refreshPromise;
       refreshPromise = (async () => {
-        const summaryPromise = dashboardCache
-          .get(getServices, summaryArgs)
-          .then(({ services }) => {
-            if (!isCurrentRequest()) return;
-            const found = (services || []).find((s) => s.name === serviceName);
-            setReplicaHistory(found?.replicaHistory || null);
-            if (fullLanded) return;
-            setServiceData((previous) => {
-              if (!found) return null;
-              if (
-                previous?.name !== serviceName ||
-                previous.summaryOnly === true ||
-                !Array.isArray(previous.replicas)
-              ) {
-                return found;
+        const promises = [];
+        if (loadSummary) {
+          const summaryPromise = dashboardCache
+            .get(getServices, summaryArgs)
+            .then(({ services }) => {
+              if (!isCurrentRequest()) return;
+              const found = (services || []).find(
+                (s) => s.name === serviceName
+              );
+              setReplicaHistory(found?.replicaHistory || null);
+              if (fullLanded) return;
+              setServiceData((previous) => {
+                if (!found) return null;
+                if (
+                  previous?.name !== serviceName ||
+                  previous.summaryOnly === true ||
+                  !Array.isArray(previous.replicas)
+                ) {
+                  return found;
+                }
+                // Summary mode is the cheap, current view, but it omits the
+                // full replica list. Keep the last complete snapshot visible
+                // while the corresponding full request is still in flight.
+                return {
+                  ...previous,
+                  ...found,
+                  replicas: previous.replicas,
+                  summaryOnly: false,
+                };
+              });
+              finishLoadingIfReady(Boolean(found));
+            })
+            .catch((error) => {
+              if (isCurrentRequest()) {
+                console.error('Failed to fetch service summary:', error);
               }
-              // Summary mode is the cheap, current view, but it omits the full
-              // replica list. Keep the last complete snapshot visible while
-              // the corresponding full request is still in flight.
-              return {
-                ...previous,
-                ...found,
-                replicas: previous.replicas,
-                summaryOnly: false,
-              };
+            })
+            .finally(() => {
+              summarySettled = true;
+              if (refreshInFlightRef.current?.promise === refreshPromise) {
+                refreshInFlightRef.current.summaryPending = false;
+              }
+              if (isCurrentRequest()) {
+                finishLoadingIfReady();
+                setHistoryLoading(false);
+              }
             });
-            finishLoadingIfReady(Boolean(found));
-          })
-          .catch((error) => {
-            if (isCurrentRequest()) {
-              console.error('Failed to fetch service summary:', error);
-            }
-          })
-          .finally(() => {
-            summarySettled = true;
-            if (refreshInFlightRef.current?.promise === refreshPromise) {
-              refreshInFlightRef.current.summaryPending = false;
-            }
-            if (isCurrentRequest()) {
-              finishLoadingIfReady();
-              setHistoryLoading(false);
-            }
-          });
-        const fullPromise = dashboardCache
-          .get(getServices, fullArgs)
-          .then(({ services }) => {
-            if (!isCurrentRequest()) return;
-            const found = (services || []).find((s) => s.name === serviceName);
-            fullLanded = true;
-            setServiceData(found || null);
-            finishLoadingIfReady(Boolean(found));
-          })
-          .catch((error) => {
-            if (isCurrentRequest()) {
-              console.error('Failed to fetch service replicas:', error);
-            }
-          })
-          .finally(() => {
-            fullSettled = true;
-            if (isCurrentRequest()) {
-              finishLoadingIfReady();
-              setReplicasLoading(false);
-            }
-          });
-        await Promise.allSettled([summaryPromise, fullPromise]);
+          promises.push(summaryPromise);
+        }
+        if (loadFullRequest) {
+          const fullPromise = dashboardCache
+            .get(getServices, fullArgs)
+            .then(({ services }) => {
+              if (!isCurrentRequest()) return;
+              const found = (services || []).find(
+                (s) => s.name === serviceName
+              );
+              fullLanded = true;
+              setServiceData(found || null);
+              finishLoadingIfReady(Boolean(found));
+            })
+            .catch((error) => {
+              if (isCurrentRequest()) {
+                console.error('Failed to fetch service replicas:', error);
+              }
+            })
+            .finally(() => {
+              fullSettled = true;
+              if (isCurrentRequest()) {
+                finishLoadingIfReady();
+                setReplicasLoading(false);
+              }
+            });
+          promises.push(fullPromise);
+        }
+        await Promise.allSettled(promises);
       })().finally(() => {
         if (refreshInFlightRef.current?.promise === refreshPromise) {
           refreshInFlightRef.current = null;
@@ -292,15 +328,24 @@ export function useServiceDetails({ serviceName }) {
         serviceName,
         promise: refreshPromise,
         source,
-        summaryPending: true,
+        summaryPending: loadSummary,
+        loadSummary,
+        loadFull: loadFullRequest,
       };
       return refreshPromise;
     },
-    [fullArgs, serviceName, summaryArgs]
+    [fullArgs, loadFull, serviceName, summaryArgs]
   );
 
   useEffect(() => {
-    fetchData({ resetHistory: true, source: 'initial' });
+    const requireFreshSummary =
+      initialLoadServiceNameRef.current !== serviceName;
+    initialLoadServiceNameRef.current = serviceName;
+    fetchData({
+      resetHistory: true,
+      source: 'initial',
+      requireFreshSummary,
+    });
     return () => {
       requestVersionRef.current += 1;
       if (refreshInFlightRef.current?.serviceName === serviceName) {
@@ -352,7 +397,10 @@ function ServiceDetails() {
     replicasLoading,
     historyLoading,
     refreshData,
-  } = useServiceDetails({ serviceName });
+  } = useServiceDetails({
+    serviceName,
+    loadFull: activeTab === 'overview',
+  });
 
   useEffect(() => {
     if (activeServiceNameRef.current !== serviceName) {
