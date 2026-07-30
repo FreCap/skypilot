@@ -16,6 +16,7 @@ from sqlalchemy import orm
 from sky import clouds
 from sky.resources import Resources
 from sky.serve import constants
+from sky.serve import controller_transport
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -937,8 +938,8 @@ class TestControllerHttpRetry:
             mock.Mock(status_code=200)
         ]
         with self._patch_record(), \
-             mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
-                        3), \
+             mock.patch.object(controller_transport,
+                               '_CONTROLLER_HTTP_RETRY_ATTEMPTS', 3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.post',
                         side_effect=side) as m:
@@ -1003,8 +1004,8 @@ class TestControllerHttpRetry:
         with mock.patch('sky.serve.serve_utils.serve_state.'
                         'get_service_controller_owner',
                         side_effect=records), \
-             mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
-                        3), \
+             mock.patch.object(controller_transport,
+                               '_CONTROLLER_HTTP_RETRY_ATTEMPTS', 3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=capture_get):
@@ -1108,8 +1109,8 @@ class TestControllerHttpRetry:
         # Patch the attempt count up to 3 so the retry path is actually
         # exercised; the production default is 1 (see lazy-handle PR).
         with self._patch_record(), \
-             mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
-                        3), \
+             mock.patch.object(controller_transport,
+                               '_CONTROLLER_HTTP_RETRY_ATTEMPTS', 3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=side) as m:
