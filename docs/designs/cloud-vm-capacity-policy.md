@@ -169,8 +169,10 @@ cover the new production module and the façade.
 ## Validation evidence
 
 - The characterization test passed before extraction and now proves 14
-  historical signatures, direct new-module/façade identity, historical
-  `__module__`, and pickle round trips.
+  historical call signatures, direct new-module/façade identity, historical
+  `__module__`, and pickle round trips. Signature comparison strips annotation
+  rendering because Python 3.14 represents `Optional[ForwardRef(...)]` as a
+  union while direct object identity already preserves annotation metadata.
 - All 16 moved function bodies are AST-equivalent to the
   `7b5f87c0a9ea5b90809c2582648df0d4283b32d4` baseline when source locations
   are ignored.

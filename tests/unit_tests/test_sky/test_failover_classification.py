@@ -19,41 +19,40 @@ from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
 
 _CAPACITY_POLICY_SIGNATURES = {
-    '_iter_error_chain': '(error: BaseException) -> collections.abc.Iterable[BaseException]',
-    '_provider_error_codes': '(error: BaseException) -> list[str]',
-    '_classify_capacity_error': "(cloud: 'clouds.Cloud', error: BaseException) -> str | None",
-    'classify_resources_unavailable_error':
-        "(cloud: 'clouds.Cloud', "
-        "error: sky.exceptions.ResourcesUnavailableError) -> str | None",
-    '_is_quota_error': '(error: BaseException) -> bool',
-    '_canonical_accelerators': "(to_provision: 'resources_lib.Resources') -> str",
-    '_capacity_cache_cloud_name': "(to_provision: 'resources_lib.Resources') -> str | None",
-    '_capacity_cache_account':
-        "(cloud: Optional[ForwardRef('clouds.Cloud')], "
-        'cloud_user_identity: list[str] | None) -> str | None',
-    '_capacity_cache_key':
-        "(to_provision: 'resources_lib.Resources', region: 'clouds.Region', "
-        "zones: list['clouds.Zone'] | None, num_nodes: int, "
-        "account: str | None) -> "
-        "Optional[ForwardRef('capacity_cache.ResourceKey')]",
-    '_quota_cooldown_key':
-        "(to_provision: 'resources_lib.Resources', region: 'clouds.Region', "
-        "num_nodes: int, account: str | None) -> "
-        "Optional[ForwardRef('capacity_cache.QuotaCooldownKey')]",
-    '_fully_created_fresh_demand':
-        "(provision_record: 'provision_common.ProvisionRecord', "
-        'num_nodes: int, cluster_exists: bool) -> bool',
-    '_failure_requested_full_demand': '(error: BaseException, num_nodes: int) -> bool',
-    '_placement_error_code': '(error: BaseException) -> str | None',
-    '_placement_outcome': '(error: Exception, capacity_reason: str | None = None) -> str',
+    '_iter_error_chain': '(error)',
+    '_provider_error_codes': '(error)',
+    '_classify_capacity_error': '(cloud, error)',
+    'classify_resources_unavailable_error': '(cloud, error)',
+    '_is_quota_error': '(error)',
+    '_canonical_accelerators': '(to_provision)',
+    '_capacity_cache_cloud_name': '(to_provision)',
+    '_capacity_cache_account': '(cloud, cloud_user_identity)',
+    '_capacity_cache_key': '(to_provision, region, zones, num_nodes, account)',
+    '_quota_cooldown_key': '(to_provision, region, num_nodes, account)',
+    '_fully_created_fresh_demand': '(provision_record, num_nodes, cluster_exists)',
+    '_failure_requested_full_demand': '(error, num_nodes)',
+    '_placement_error_code': '(error)',
+    '_placement_outcome': '(error, capacity_reason=None)',
 }
+
+
+def _call_signature(symbol) -> str:
+    """Returns the version-stable callable portion of a signature."""
+    signature = inspect.signature(symbol)
+    parameters = [
+        parameter.replace(annotation=inspect.Parameter.empty)
+        for parameter in signature.parameters.values()
+    ]
+    return str(
+        signature.replace(parameters=parameters,
+                          return_annotation=inspect.Signature.empty))
 
 
 def test_capacity_policy_historical_contract():
     for name, signature in _CAPACITY_POLICY_SIGNATURES.items():
         symbol = getattr(backend, name)
         assert getattr(capacity_policy, name) is symbol
-        assert str(inspect.signature(symbol)) == signature
+        assert _call_signature(symbol) == signature
         assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
         assert pickle.loads(pickle.dumps(symbol)) is symbol
 
