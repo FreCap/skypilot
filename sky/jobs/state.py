@@ -980,6 +980,9 @@ def _status_check_select(from_clause) -> 'sqlalchemy.Select':
         spot_table.c.task_id,
         spot_table.c.status,
         spot_table.c.task_name,
+        spot_table.c.submitted_at,
+        spot_table.c.start_at,
+        spot_table.c.last_recovered_at,
         job_info_table.c.name.label('job_info_name'),
         job_info_table.c.schedule_state,
         job_info_table.c.controller_pid,
@@ -1048,6 +1051,9 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
             'status': ManagedJobStatus(mapping['status']),
             'job_name': job_name,
             'task_name': mapping['task_name'],
+            'submitted_at': mapping['submitted_at'],
+            'start_at': mapping['start_at'],
+            'last_recovered_at': mapping['last_recovered_at'],
         })
 
 
@@ -1100,13 +1106,16 @@ def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
 
     Returns a mapping ``job_id -> {schedule_state, controller_pid,
     controller_pid_started_at, pool, tasks: [{task_id, status, job_name,
-    task_name}]}``
+    task_name, submitted_at, start_at, last_recovered_at}]}``
     with ``tasks`` ordered by ``task_id``. Job ids with no task rows are absent
     from the result.
 
     ``job_name`` mirrors ``get_managed_job_tasks`` (public display name with a
     fallback to ``task_name``); ``task_name`` preserves the controller launch
-    identity for teardown/recovery logic.
+    identity for teardown/recovery logic. The launch-attempt timestamps keep
+    cleanup on the slim snapshot path while distinguishing untouched backlog
+    tasks from tasks that already started launching and later fell back to
+    ``PENDING`` during recovery.
     """
     if not job_ids:
         return {}

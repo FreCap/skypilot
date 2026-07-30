@@ -28,6 +28,18 @@ class TestGetJobsStatusCheckInfoLaunchIdentity:
         task_names = [t['task_name'] for t in info[pipeline_id]['tasks']]
         assert task_names == ['extract', 'transform']
 
+    def test_snapshot_preserves_launch_attempt_fields(self, _seed_test_jobs):
+        job_id = _seed_test_jobs['job_id1']
+        slim_tasks = state.get_jobs_status_check_info([job_id])[job_id]['tasks']
+        full_tasks = state.get_managed_job_tasks(job_id)
+
+        assert len(slim_tasks) == len(full_tasks)
+        for slim, full in zip(slim_tasks, full_tasks):
+            assert slim['task_name'] == full['task_name']
+            assert slim['submitted_at'] == full.get('submitted_at')
+            assert slim['start_at'] == full.get('start_at')
+            assert slim['last_recovered_at'] == full.get('last_recovered_at')
+
     def test_snapshot_keeps_outer_controller_owner(self, _seed_test_jobs,
                                                    _mock_managed_jobs_db_conn):
         job_id = _seed_test_jobs['job_id1']
