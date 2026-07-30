@@ -393,6 +393,78 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.historyLoading).toBe(false);
   });
 
+  it('renders a late summary after an empty full-detail response', async () => {
+    const initialSummary = deferred();
+    const initialFull = deferred();
+
+    dashboardCache.get
+      .mockImplementationOnce(() => initialSummary.promise)
+      .mockImplementationOnce(() => initialFull.promise);
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initialFull.resolve({ services: [] });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData).toBe(null);
+    expect(result.current.loading).toBe(true);
+
+    await act(async () => {
+      initialSummary.resolve({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-summary');
+    expect(result.current.loading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves an early summary after an empty full-detail response', async () => {
+    const initialSummary = deferred();
+    const initialFull = deferred();
+
+    dashboardCache.get
+      .mockImplementationOnce(() => initialSummary.promise)
+      .mockImplementationOnce(() => initialFull.promise);
+
+    const { result } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initialSummary.resolve({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-summary');
+    expect(result.current.loading).toBe(false);
+
+    await act(async () => {
+      initialFull.resolve({ services: [] });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-summary');
+    expect(result.current.loading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps the initial load fenced while summary fails and full is pending', async () => {
     const initialSummary = deferred();
     const initialFull = deferred();

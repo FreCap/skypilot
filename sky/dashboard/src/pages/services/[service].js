@@ -229,7 +229,8 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       const isCurrentRequest = () =>
         requestVersionRef.current === requestVersion;
       let summarySettled = !loadSummary;
-      let fullLanded = false;
+      let summaryServiceLanded = false;
+      let fullServiceLanded = false;
       let fullSettled = !loadFullRequest;
       const finishLoadingIfReady = (hasRenderableData = false) => {
         if (!isCurrentRequest()) return;
@@ -252,8 +253,9 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
               const found = (services || []).find(
                 (s) => s.name === serviceName
               );
+              summaryServiceLanded = Boolean(found);
               setReplicaHistory(found?.replicaHistory || null);
-              if (fullLanded) return;
+              if (fullServiceLanded) return;
               setServiceData((previous) => {
                 if (!found) return null;
                 if (
@@ -300,8 +302,10 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
               const found = (services || []).find(
                 (s) => s.name === serviceName
               );
-              fullLanded = true;
-              setServiceData(found || null);
+              fullServiceLanded = Boolean(found);
+              if (found || !summaryServiceLanded) {
+                setServiceData(found || null);
+              }
               finishLoadingIfReady(Boolean(found));
             })
             .catch((error) => {
