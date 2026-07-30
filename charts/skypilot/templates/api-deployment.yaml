@@ -1,5 +1,7 @@
 {{- $fullName := include "skypilot.fullname" . -}}
-{{- $haEnabled := .Values.apiService.highAvailability.enabled -}}
+{{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
+{{- $haEnabled := get $haConfig "enabled" | default false -}}
+{{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
 {{- $executorService := .Values.executorService | default (dict) -}}
 {{- $executorReplicas := dig "replicas" 2 $executorService -}}
 {{- $controllerService := .Values.controllerService | default (dict) -}}
@@ -53,7 +55,7 @@
 {{- $apiReservedEnvNames = append $apiReservedEnvNames "VAST_API_KEY" -}}
 {{- end -}}
 
-{{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-config" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-config" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedVolumeNames = concat $apiReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -88,7 +90,7 @@
 {{- $apiReservedVolumeNames = append $apiReservedVolumeNames "vast-config" -}}
 {{- end -}}
 
-{{- $apiReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.ssh" "/root/sky_logs" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- $apiReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.aws" -}}
 {{- end -}}
@@ -133,6 +135,12 @@
 {{- fail "requestStore.backend=postgres requires databaseMigration.enabled=true" -}}
 {{- end -}}
 {{- if $haEnabled -}}
+{{- if not .Values.apiService.dbConnectionSecretName -}}
+{{- fail "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook" -}}
+{{- end -}}
+{{- if .Values.apiService.dbConnectionString -}}
+{{- fail "apiService.highAvailability.enabled=true does not support chart-managed apiService.dbConnectionString; use apiService.dbConnectionSecretName" -}}
+{{- end -}}
 {{- if lt (int .Values.apiService.replicas) 2 -}}
 {{- fail "apiService.highAvailability.enabled=true requires apiService.replicas>=2" -}}
 {{- end -}}
@@ -150,6 +158,30 @@
 {{- end -}}
 {{- if ne .Values.storage.accessMode "ReadWriteMany" -}}
 {{- fail "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany" -}}
+{{- end -}}
+{{- $readinessProbe := .Values.apiService.readinessProbe | default (dict) -}}
+{{- if not (hasKey $readinessProbe "httpGet") -}}
+{{- fail "apiService.highAvailability.enabled=true requires an HTTP apiService.readinessProbe" -}}
+{{- end -}}
+{{- $readinessPeriodSeconds := dig "periodSeconds" 10 $readinessProbe | int -}}
+{{- $readinessFailureThreshold := dig "failureThreshold" 3 $readinessProbe | int -}}
+{{- $readinessTimeoutSeconds := dig "timeoutSeconds" 1 $readinessProbe | int -}}
+{{- $readinessDetectionSeconds := add (mul $readinessPeriodSeconds $readinessFailureThreshold) $readinessTimeoutSeconds -}}
+{{- if lt (int $readinessDrainSeconds) (int $readinessDetectionSeconds) -}}
+{{- fail (printf "apiService.highAvailability.readinessDrainSeconds must be at least the API readiness failure-detection window (%d seconds)" (int $readinessDetectionSeconds)) -}}
+{{- end -}}
+{{- if lt (int $readinessDrainSeconds) 16 -}}
+{{- fail "apiService.highAvailability.readinessDrainSeconds must be at least 16 seconds for executor and controller readiness propagation" -}}
+{{- end -}}
+{{- $minimumTerminationSeconds := add (int $readinessDrainSeconds) 10 -}}
+{{- if lt (int .Values.apiService.terminationGracePeriodSeconds) (int $minimumTerminationSeconds) -}}
+{{- fail (printf "apiService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (%d seconds) in HA mode" (int $minimumTerminationSeconds)) -}}
+{{- end -}}
+{{- if lt (int (dig "terminationGracePeriodSeconds" 60 $executorService)) (int $minimumTerminationSeconds) -}}
+{{- fail (printf "executorService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (%d seconds) in HA mode" (int $minimumTerminationSeconds)) -}}
+{{- end -}}
+{{- if lt (int (dig "terminationGracePeriodSeconds" 60 $controllerService)) (int $minimumTerminationSeconds) -}}
+{{- fail (printf "controllerService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (%d seconds) in HA mode" (int $minimumTerminationSeconds)) -}}
 {{- end -}}
 {{- else -}}
 {{- if ne (int .Values.apiService.replicas) 1 -}}
@@ -254,6 +286,15 @@ spec:
         {{- end }}
         resources:
           {{- toYaml .Values.apiService.resources | nindent 10 }}
+        {{- if $haEnabled }}
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - touch /var/run/skypilot/draining && sleep {{ $readinessDrainSeconds }}
+        {{- end }}
         env:
         {{- /* Detect whether POD_IP is already declared in extraEnvs (e.g. */ -}}
         {{- /* injected by a downstream chart) so we don't emit duplicates. */ -}}
@@ -607,6 +648,10 @@ spec:
         {{- end }}
         {{- end }}
         volumeMounts:
+        {{- if $haEnabled }}
+        - name: skypilot-role-runtime
+          mountPath: /var/run/skypilot
+        {{- end }}
         {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
         # For RollingUpdate with storage enabled, use emptyDir for ~/.sky to avoid
         # running SQLite on NFS. Only persist the clients directory for file mounts.
@@ -1065,6 +1110,10 @@ spec:
       {{- end }}
 
       volumes:
+      {{- if $haEnabled }}
+      - name: skypilot-role-runtime
+        emptyDir: {}
+      {{- end }}
       {{- if .Values.storage.enabled }}
       - name: state-volume
         persistentVolumeClaim:

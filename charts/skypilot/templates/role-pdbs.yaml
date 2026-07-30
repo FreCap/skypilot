@@ -21,4 +21,15 @@ spec:
   selector:
     matchLabels:
       app: {{ $fullName }}-executor
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullName }}-controller
+  namespace: {{ .Release.Namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: {{ $fullName }}-controller
 {{- end }}

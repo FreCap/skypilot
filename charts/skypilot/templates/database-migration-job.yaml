@@ -1,5 +1,19 @@
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
 {{- if and $databaseConfigured .Values.databaseMigration.enabled }}
+{{- $haEnabled := .Values.apiService.highAvailability.enabled -}}
+{{- if and $haEnabled (not .Values.apiService.dbConnectionSecretName) -}}
+{{- fail "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook" -}}
+{{- end -}}
+{{- if and $haEnabled .Values.apiService.dbConnectionString -}}
+{{- fail "apiService.highAvailability.enabled=true does not support chart-managed apiService.dbConnectionString; use apiService.dbConnectionSecretName" -}}
+{{- end -}}
+{{- if and $haEnabled .Values.databaseMigration.annotations -}}
+{{- range $annotationName := list "helm.sh/hook" "helm.sh/hook-weight" "helm.sh/hook-delete-policy" -}}
+{{- if hasKey $.Values.databaseMigration.annotations $annotationName -}}
+{{- fail (printf "databaseMigration.annotations[%q] is managed by guarded HA mode" $annotationName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $migrationSuffix := printf "-db-migration-%d" .Release.Revision -}}
@@ -12,9 +26,19 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ $migrationName }}
-  {{- with .Values.databaseMigration.annotations }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: database-migration
+    skypilot.co/helm-revision: {{ .Release.Revision | quote }}
+  {{- if or .Values.databaseMigration.annotations $haEnabled }}
   annotations:
+    {{- with .Values.databaseMigration.annotations }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if $haEnabled }}
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- end }}
   {{- end }}
 spec:
   backoffLimit: {{ .Values.databaseMigration.backoffLimit }}
@@ -24,6 +48,9 @@ spec:
     metadata:
       labels:
         app: {{ $migrationName }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: database-migration
+        skypilot.co/helm-revision: {{ .Release.Revision | quote }}
     spec:
       automountServiceAccountToken: false
       restartPolicy: Never

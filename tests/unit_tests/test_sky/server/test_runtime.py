@@ -1,5 +1,6 @@
 """Role-isolation tests for the API server process supervisors."""
 
+import time
 from types import SimpleNamespace
 from unittest import mock
 
@@ -27,6 +28,26 @@ def _args() -> SimpleNamespace:
     return SimpleNamespace(host='127.0.0.1',
                            metrics_port=9090,
                            role_health_port=46581)
+
+
+def test_role_drain_marker_fails_readiness_before_shutdown(
+        monkeypatch, tmp_path):
+    drain_marker = tmp_path / 'draining'
+    monkeypatch.setattr(runtime.request_postgres, 'ROLE_DRAIN_MARKER_PATH',
+                        str(drain_marker))
+    lease = runtime.request_postgres.ServerInstanceLease('executor')
+    lease._ready = True  # pylint: disable=protected-access
+    lease._last_success_monotonic = time.monotonic()  # pylint: disable=protected-access
+    assert lease.is_locally_ready()
+
+    drain_marker.touch()
+
+    assert not lease.is_locally_ready()
+    assert not runtime.request_postgres.current_instance_is_ready()
+    values = lease._values(include_started_at=False)  # pylint: disable=protected-access
+    assert not values['ready']
+    assert values['draining_at'] is not None
+    assert values['health_detail'] == {'phase': 'draining'}
 
 
 def test_api_role_starts_only_public_server(monkeypatch):

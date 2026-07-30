@@ -212,6 +212,25 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet.path
           value: /api/health/ready
+      - equal:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command
+          value:
+            - /bin/sh
+            - -c
+            - touch /var/run/skypilot/draining && sleep 20
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-role-runtime
+            mountPath: /var/run/skypilot
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-role-runtime
+            emptyDir: {}
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].topologyKey
+          value: kubernetes.io/hostname
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
@@ -223,6 +242,47 @@ tests:
           content:
             name: sky-ephemeral
             emptyDir: {}
+
+  - it: should reject a chart-managed database secret in HA mode
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionString: postgresql://user:pass@host:5432/db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook"
+
+  - it: should reject an HA drain shorter than readiness detection
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.highAvailability.readinessDrainSeconds: 15
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.readinessDrainSeconds must be at least the API readiness failure-detection window (16 seconds)"
+
+  - it: should reserve enough termination time after the HA drain
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.highAvailability.readinessDrainSeconds: 51
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (61 seconds) in HA mode"
 
   - it: should reject HA without the PostgreSQL request store
     set:

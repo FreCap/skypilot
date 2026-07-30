@@ -187,9 +187,12 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
 
 
 def test_server_instance_lease_publishes_ready_and_draining(
-        request_database, monkeypatch):
+        request_database, monkeypatch, tmp_path):
     engine, _ = request_database
     instance_id = str(uuid.uuid4())
+    drain_marker = tmp_path / 'draining'
+    monkeypatch.setattr(request_postgres, 'ROLE_DRAIN_MARKER_PATH',
+                        str(drain_marker))
     monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR, instance_id)
     monkeypatch.setenv('HOSTNAME', 'executor-pod')
     monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-uid')
@@ -212,6 +215,18 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['draining_at'] is None
     assert row['health_detail'] == {'phase': 'claiming'}
     assert row['supported_handlers']
+    drain_marker.touch()
+    assert not lease.is_locally_ready()
+    assert not request_postgres.current_instance_is_ready()
+    assert lease._heartbeat()
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id == uuid.UUID(
+                    instance_id))).mappings().one()
+    assert not row['ready']
+    assert row['draining_at'] is not None
+    assert row['health_detail'] == {'phase': 'draining'}
     lease.stop()
     assert not lease.is_locally_ready()
     with engine.connect() as connection:

@@ -252,7 +252,17 @@ replica-independent and keeps each migration milestone deployable.
 
 ### Migrations and version skew
 
-- Helm runs the migration image as a blocking pre-install and pre-upgrade hook.
+- In guarded HA mode, Helm runs the migration image as a blocking pre-install
+  and pre-upgrade hook. The hook uses the target release image and must
+  complete before any Deployment template is applied.
+- HA mode requires `apiService.dbConnectionSecretName` to name a Secret that
+  exists before Helm starts. A chart-managed `dbConnectionString` Secret cannot
+  satisfy a pre-install hook because regular chart resources are created after
+  pre-install hooks.
+- Migration hook Jobs are revision-scoped and retained until their configured
+  TTL so operators can inspect the exact image, logs, and result. A retry of
+  the same Helm revision deletes the previous hook Job before creating its
+  replacement.
 - API and worker pods run in verify-only migration mode.
 - New schema revisions are additive during the expand phase.
 - A release may read both the old and new representation while mixed versions
@@ -908,22 +918,68 @@ Deployment:
 
 ### M4: Migration ordering, disruption safety, and stateless routing
 
-- Make the migration Job a blocking Helm hook.
-- Extend disruption budgets to controller replicas, add topology spread, and
-  complete readiness-first termination for every role.
-- Disable sticky sessions in HA mode.
+- Make the migration Job a blocking `pre-install,pre-upgrade` Helm hook in
+  guarded HA mode. HA validation requires a pre-existing PostgreSQL connection
+  Secret, while compatibility mode retains the regular Job so existing
+  chart-managed connection Secrets remain valid.
+- Extend disruption budgets to controller replicas. Default API, executor, and
+  controller topology spread to `kubernetes.io/hostname` with
+  `whenUnsatisfiable=DoNotSchedule`; operators may select a zone topology key
+  or explicitly disable the constraint.
+- Complete readiness-first termination for every role with a pod-local
+  `emptyDir` drain marker. A Kubernetes pre-stop hook creates the marker and
+  waits for `apiService.highAvailability.readinessDrainSeconds`, which defaults
+  to 20 seconds. API and role-health readiness fail immediately when the
+  marker exists, and PostgreSQL role heartbeats publish `draining` on their
+  next update. Helm rejects a drain interval shorter than the configured API
+  readiness failure-detection window and rejects any role termination budget
+  that does not leave at least ten seconds after the pre-stop interval.
+- Disable sticky ingress sessions whenever guarded HA mode is enabled, even if
+  the compatibility default `ingress.sessionAffinity=true` remains set.
+  Guarded HA also rejects custom NGINX affinity annotations so
+  `ingress.annotations` cannot silently restore pod affinity. Transport retry
+  annotations remain because endpoint convergence can race an in-flight
+  connection, but uploads and follow-up requests never depend on affinity.
 - Add an HA conformance script that drives traffic during pod deletion and
-  rolling upgrades.
+  rolling upgrades. The script is namespace- and release-scoped, requires an
+  explicit destructive-test confirmation, consumes an existing token Secret
+  without printing token material, records exact revisions and images, and
+  fails on any raw health, authenticated submission, durable lookup, or stream
+  fetch error. During graceful deletion it independently requires the target
+  role readiness endpoint to return 503 while the container is alive, its
+  PostgreSQL lease heartbeat to publish `ready=false` and `draining=true`, and
+  its Kubernetes Pod condition to become unready before termination.
 - Update administrator documentation and remove the experimental warning only
   for the guarded HA configuration.
 
+Implementation status: the local M4 candidate is complete. Chart schema
+generation, chart lint, all 236 Helm unit tests, guarded live-value
+server-side dry-run, shell syntax and ShellCheck for the conformance harness,
+targeted role-runtime tests, formatting, mypy, Pylint, dashboard checks, and a
+warning-as-error Sphinx build pass. The fast drain-marker unit test proves
+readiness fails without opening PostgreSQL. The Docker-backed PostgreSQL lease
+test could not start its disposable `postgres:16` container in the local
+testcontainers environment; the live isolated deployment must therefore prove
+the marker-driven heartbeat transition before M4 acceptance.
+
 Deployment:
 
-1. Run an image A to image B rolling upgrade under traffic.
-2. Run a schema expand upgrade under mixed API versions.
-3. Prove zero ordinary-request 5xx responses, bounded stream reconnects, and no
-   duplicate request generations.
-4. Run Helm rollback and then upgrade again.
+1. Render and server-side dry-run the guarded chart, including the hook,
+   controller PDB, topology constraints, pre-stop lifecycle, and non-sticky
+   ingress.
+2. Start the in-cluster conformance canary and record image A.
+3. Run an image A to image B rolling upgrade. The revision-scoped image B
+   migration hook must finish before any image B pod is created, and the
+   additive request schema must remain readable by the overlapping image A
+   pods.
+4. Gracefully delete every original image B API, executor, and controller pod.
+   Prove the direct readiness, durable lease, and Pod-condition drain signals
+   precede termination while raw and authenticated canaries remain error-free.
+5. Run Helm rollback to image A, then upgrade to image B again under the same
+   canary. Verify hook ordering, role readiness, PDB health, and exact pod image
+   digests after the final rollout.
+6. Remove the conformance canary and superseded hook Jobs, while retaining the
+   healthy isolated release and its declared PostgreSQL and RWX dependencies.
 
 ### M5: Compatibility cleanup gate
 
@@ -1407,3 +1463,30 @@ a pure monitoring resume to provider-side launch behavior. The smallest sound
 fix is one generation-fenced `LAUNCHING` to `ALIVE` transition after durable
 resume classification and before the monitor loop. It adds no schema, process,
 or steady-state probe.
+
+### Review 8: PURSUE
+
+The controller-loss review rejected catchable scheduler termination as a
+fence. A detached scheduler that receives ordinary `SIGTERM` can interpret it
+as user cancellation and enter workload cleanup even after its outer
+generation has lost PostgreSQL leadership. The implemented fail-stop path
+revalidates the scheduler process start time, terminates the complete process
+tree with a non-catchable signal, and has a subprocess sentinel proving that
+coroutine finalizers do not run. Durable user cancellation remains a separate
+intent path and retains its normal cleanup behavior.
+
+### Review 9: PURSUE
+
+The M4 review required rollout safety to be a guarded contract rather than a
+collection of best-effort defaults. It confirmed four gates:
+
+- The migration must block before target-image pod creation, which requires a
+  pre-existing connection Secret for a pre-install hook.
+- Pre-stop sleep must be long enough for readiness propagation and leave a
+  separate process-termination budget.
+- Drain acceptance must prove the direct endpoint and PostgreSQL lease
+  transition in addition to the Kubernetes Pod condition.
+- Guarded HA must reject custom affinity annotations, not only suppress the
+  chart's default cookie.
+
+The chart validation and conformance harness now enforce those gates.

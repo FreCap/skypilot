@@ -1,5 +1,7 @@
 {{- if .Values.apiService.highAvailability.enabled }}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
+{{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
 {{- $executorService := .Values.executorService | default (dict) -}}
 {{- $executorImage := default .Values.apiService.image (get $executorService "image") -}}
 {{- $executorPullPolicy := default .Values.apiService.imagePullPolicy (get $executorService "imagePullPolicy") -}}
@@ -51,7 +53,7 @@
 {{- $executorReservedEnvNames = append $executorReservedEnvNames "VAST_API_KEY" -}}
 {{- end -}}
 
-{{- $executorReservedVolumeNames := list "skypilot-config" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- $executorReservedVolumeNames := list "skypilot-config" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $executorReservedVolumeNames = concat $executorReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -86,7 +88,7 @@
 {{- $executorReservedVolumeNames = append $executorReservedVolumeNames "vast-config" -}}
 {{- end -}}
 
-{{- $executorReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.ssh" "/root/sky_logs" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- $executorReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $executorReservedMountPaths = append $executorReservedMountPaths "/root/.aws" -}}
 {{- end -}}
@@ -169,6 +171,13 @@ spec:
         {{- end }}
         resources:
           {{- toYaml $executorResources | nindent 10 }}
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - touch /var/run/skypilot/draining && sleep {{ $readinessDrainSeconds }}
         env:
         {{- with .Values.global.extraEnvs }}
         {{- toYaml . | nindent 8 }}
@@ -364,6 +373,8 @@ spec:
           periodSeconds: 5
           timeoutSeconds: 1
         volumeMounts:
+        - name: skypilot-role-runtime
+          mountPath: /var/run/skypilot
         - name: state-volume
           mountPath: /root/.sky
           subPath: .sky
@@ -629,6 +640,8 @@ spec:
       {{- toYaml . | nindent 6 }}
       {{- end }}
       volumes:
+      - name: skypilot-role-runtime
+        emptyDir: {}
       - name: state-volume
         persistentVolumeClaim:
           claimName: {{ $fullName }}-state

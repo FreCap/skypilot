@@ -283,6 +283,35 @@ tests:
           path: metadata.annotations["nginx.ingress.kubernetes.io/session-cookie-change-on-failure"]
           value: "true"
 
+  - it: should disable session affinity in guarded HA mode
+    set:
+      ingress.enabled: true
+      ingress.sessionAffinity: true
+      apiService.highAvailability.enabled: true
+      apiService.upgradeStrategy: RollingUpdate
+    asserts:
+      - notExists:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/affinity"]
+      - notExists:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/session-cookie-name"]
+      - notExists:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/affinity-mode"]
+      - notExists:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/session-cookie-change-on-failure"]
+      - equal:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/proxy-next-upstream"]
+          value: "http_502 non_idempotent"
+
+  - it: should reject custom affinity annotations in guarded HA mode
+    set:
+      ingress.enabled: true
+      apiService.highAvailability.enabled: true
+      ingress.annotations:
+        nginx.ingress.kubernetes.io/upstream-hash-by: $request_uri
+    asserts:
+      - failedTemplate:
+          errorMessage: 'ingress.annotations["nginx.ingress.kubernetes.io/upstream-hash-by"] cannot enable pod affinity in guarded HA mode'
+
   - it: should not add session affinity annotations for Recreate strategy
     set:
       ingress.enabled: true

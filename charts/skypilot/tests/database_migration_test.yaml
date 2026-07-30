@@ -49,6 +49,47 @@ tests:
               secretKeyRef:
                 name: external-db
                 key: connection_string
+      - notExists:
+          path: metadata.annotations["helm.sh/hook"]
+
+  - it: should block HA install and upgrade on the revision-scoped migration hook
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: pre-install,pre-upgrade
+      - equal:
+          path: metadata.annotations["helm.sh/hook-weight"]
+          value: "-10"
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: database-migration
+      - equal:
+          path: metadata.labels["skypilot.co/helm-revision"]
+          value: "0"
+
+  - it: should reject chart-managed database secrets in HA mode
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionString: postgresql://user:pass@host:5432/db
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook"
+
+  - it: should reserve migration hook annotations in HA mode
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.annotations:
+        helm.sh/hook: post-install
+    asserts:
+      - failedTemplate:
+          errorMessage: 'databaseMigration.annotations["helm.sh/hook"] is managed by guarded HA mode'
 
   - it: should use the chart-managed connection secret
     set:

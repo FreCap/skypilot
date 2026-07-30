@@ -40,6 +40,7 @@ SERVER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_API_SERVER_INSTANCE_ID'
 SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 CONTROLLER_GENERATION_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_GENERATION'
 CONTROLLER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'
+ROLE_DRAIN_MARKER_PATH = '/var/run/skypilot/draining'
 
 _CLAIM_LEASE_SECONDS = 30
 _CLAIM_HEARTBEAT_INTERVAL_SECONDS = 10
@@ -50,6 +51,12 @@ _VALID_SERVER_ROLES = frozenset({'all', 'api', 'executor', 'controller'})
 _CONTROLLER_LEADERSHIP_KEY = 'api-controller'
 _CONTROLLER_LEADER_LOCK_ID = 'skypilot:api-controller-leader:v1'
 _CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
+
+
+def role_is_draining() -> bool:
+    """Return whether Kubernetes has started the pod drain interval."""
+    return os.path.exists(ROLE_DRAIN_MARKER_PATH)
+
 
 _METADATA = sqlalchemy.MetaData()
 REQUESTS = sqlalchemy.Table(
@@ -313,6 +320,10 @@ class ServerInstanceLease:
             ready = self._ready
             draining = self._draining
             health_detail = dict(self._health_detail)
+        if role_is_draining():
+            draining = True
+            ready = False
+            health_detail = {'phase': 'draining'}
         values: dict[str, Any] = {
             'instance_id': uuid.UUID(self.instance_id),
             'role': self.role,
@@ -409,6 +420,8 @@ class ServerInstanceLease:
 
     def is_locally_ready(self) -> bool:
         """Return readiness using the latest successful database heartbeat."""
+        if role_is_draining():
+            return False
         with self._state_lock:
             last_success = self._last_success_monotonic
             return (self._ready and not self._draining and
@@ -436,6 +449,8 @@ class ServerInstanceLease:
 
 def current_instance_is_ready() -> bool:
     """Check the current supervisor's durable readiness using the DB clock."""
+    if role_is_draining():
+        return False
     instance_id = uuid.UUID(ensure_server_instance_id())
     engine = initialize_and_get_db()
     with engine.connect() as connection:

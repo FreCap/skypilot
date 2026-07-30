@@ -8,12 +8,12 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: should protect one API and one executor in HA mode
+  - it: should protect one API, executor, and controller in HA mode
     set:
       apiService.highAvailability.enabled: true
     asserts:
       - hasDocuments:
-          count: 2
+          count: 3
       - isKind:
           of: PodDisruptionBudget
         documentIndex: 0
@@ -44,3 +44,18 @@ tests:
           path: spec.selector.matchLabels.app
           value: RELEASE-NAME-executor
         documentIndex: 1
+      - isKind:
+          of: PodDisruptionBudget
+        documentIndex: 2
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-controller
+        documentIndex: 2
+      - equal:
+          path: spec.minAvailable
+          value: 1
+        documentIndex: 2
+      - equal:
+          path: spec.selector.matchLabels.app
+          value: RELEASE-NAME-controller
+        documentIndex: 2
