@@ -161,6 +161,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/api/stream', 'GET'),
     ('/api/status', 'GET'),
     ('/api/health', 'GET'),
+    ('/api/health/ready', 'GET'),
     ('/api/cancel', 'POST'),  # request cancellation
     ('/api/completion/cluster_name', 'GET'),
     ('/api/completion/storage_name', 'GET'),

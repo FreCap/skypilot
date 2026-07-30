@@ -150,6 +150,14 @@ AUTH_SESSION_TIMEOUT_SECONDS = 300  # 5 minutes
 # Cookie header for stream request id.
 STREAM_REQUEST_HEADER = 'X-SkyPilot-Stream-Request-ID'
 
+# Server-owned controller origin carried by nested SDK requests. These headers
+# do not grant authorization; API middleware uses them only to reject work from
+# a controller generation whose PostgreSQL leadership fence is no longer live.
+CONTROLLER_INSTANCE_ID_HEADER = 'X-SkyPilot-Controller-Instance-ID'
+CONTROLLER_GENERATION_HEADER = 'X-SkyPilot-Controller-Generation'
+CONTROLLER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'
+CONTROLLER_GENERATION_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_GENERATION'
+
 # Valid empty values for pickled fields (base64-encoded pickled None)
 # base64.b64encode(pickle.dumps(None)).decode('utf-8')
 EMPTY_PICKLED_VALUE = 'gAROLg=='

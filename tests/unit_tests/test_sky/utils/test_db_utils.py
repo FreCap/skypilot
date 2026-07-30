@@ -262,6 +262,35 @@ class TestGetEngine:
             assert call_args[1]['max_overflow'] == 0
             assert call_args[1]['pool_timeout'] == 15
 
+    def test_postgres_engine_namespaces_isolate_queuepools(self, monkeypatch):
+        """Named users get distinct strict pools for the same PostgreSQL DB."""
+        monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
+        monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
+                           'postgresql://user:pass@localhost/db')
+        db_utils.set_max_connections(1)
+        ordinary_engine = mock.MagicMock()
+        request_control_engine = mock.MagicMock()
+
+        with mock.patch('sqlalchemy.create_engine',
+                        side_effect=[ordinary_engine,
+                                     request_control_engine]) as mock_create:
+            ordinary = db_utils.get_engine(db_name='state')
+            control = db_utils.get_engine(
+                db_name='api_requests', engine_namespace='api-requests-control')
+            ordinary_again = db_utils.get_engine(db_name='other_state')
+            control_again = db_utils.get_engine(
+                db_name='ignored', engine_namespace='api-requests-control')
+
+        assert ordinary is ordinary_engine
+        assert control is request_control_engine
+        assert ordinary_again is ordinary
+        assert control_again is control
+        assert mock_create.call_count == 2
+        for call in mock_create.call_args_list:
+            assert call.kwargs['poolclass'] == sqlalchemy.pool.QueuePool
+            assert call.kwargs['pool_size'] == 1
+            assert call.kwargs['max_overflow'] == 0
+
     def test_postgres_lock_connections_use_separate_nullpool(self):
         """Session locks must not consume an ordinary QueuePool checkout."""
         ordinary_engine = mock.MagicMock()

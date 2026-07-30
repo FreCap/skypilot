@@ -592,6 +592,39 @@ def test_schema_025_rejects_same_name_with_wrong_columns(tmp_path, monkeypatch):
             version.c.version_num)).scalar_one() == '024'
 
 
+def test_schema_026_adds_managed_job_controller_ownership(
+        tmp_path, monkeypatch):
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "controller-owner.db"}')
+
+    @contextlib.contextmanager
+    def unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', unlocked)
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '025')
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '026')
+
+    columns = {
+        column['name']: column
+        for column in sqlalchemy.inspect(engine).get_columns('job_info')
+    }
+    assert columns['controller_instance_id'][
+        'type'].__class__.__name__ == 'TEXT'
+    assert (
+        columns['controller_generation']['type'].__class__.__name__ == 'BIGINT')
+    with engine.connect() as connection:
+        revision = connection.execute(
+            sqlalchemy.text('SELECT version_num FROM '
+                            'alembic_version_spot_jobs_db')).scalar_one()
+    assert revision == '026'
+    engine.dispose()
+
+
 def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
     engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "target.db"}')
     upgrade = mock.Mock()
@@ -601,9 +634,9 @@ def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
 
     upgrade.assert_called_once_with(engine,
                                     migration_utils.SPOT_JOBS_DB_NAME,
-                                    '025',
+                                    '026',
                                     mode='auto')
-    assert migration_utils.SPOT_JOBS_VERSION == '025'
+    assert migration_utils.SPOT_JOBS_VERSION == '026'
     engine.dispose()
 
 

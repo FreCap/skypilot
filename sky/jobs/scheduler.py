@@ -215,6 +215,76 @@ def kill_local_job_controllers(sig: int = signal.SIGTERM) -> int:
     return signaled
 
 
+def fail_stop_local_job_controllers() -> int:
+    """SIGKILL every live local controller process tree.
+
+    Leadership loss is not a user cancellation.  A catchable signal would let
+    ControllerManager run its cancellation finalizers, terminalize the managed
+    job, and tear down a still-running workload.  Revalidate each recorded
+    process start time, kill its isolated process group atomically, then kill
+    any snapshotted descendants that created their own process group.
+
+    Returns:
+        The number of validated controller process trees signaled.
+    """
+    records = get_controller_process_records()
+    if not records:
+        return 0
+    signaled = 0
+    current_process_group = os.getpgrp()
+    for record in records:
+        if not managed_job_utils.controller_process_alive(record):
+            continue
+        try:
+            process = psutil.Process(record.pid)
+            if process.create_time() != record.started_at:
+                continue
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
+            logger.warning('Failed to validate managed-job controller '
+                           f'pid={record.pid}: {e}')
+            continue
+        try:
+            descendants = process.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
+            logger.warning('Could not enumerate every descendant of '
+                           f'managed-job controller pid={record.pid}: {e}')
+            descendants = []
+        try:
+            # Recheck after enumeration so PID reuse during the snapshot cannot
+            # target a replacement process.
+            if process.create_time() != record.started_at:
+                continue
+            process_group = os.getpgid(record.pid)
+            if process_group == current_process_group:
+                # launch_new_process_tree() creates an isolated session.  Keep
+                # this defensive fallback so a malformed record cannot kill
+                # the API/controller supervisor's own process group.
+                process.kill()
+            else:
+                os.killpg(process_group, signal.SIGKILL)
+            signaled += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
+            logger.warning('Failed to fail-stop managed-job controller '
+                           f'process group for pid={record.pid}: {e}')
+            try:
+                if process.create_time() != record.started_at:
+                    continue
+                process.kill()
+                signaled += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e2:
+                logger.warning('Failed to fail-stop managed-job controller '
+                               f'pid={record.pid}: {e2}')
+                continue
+        for descendant in descendants:
+            try:
+                descendant.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                pass
+    if signaled:
+        logger.info(f'Fail-stopped {signaled} job controller process tree(s)')
+    return signaled
+
+
 def maybe_start_controllers(from_scheduler: bool = False) -> None:
     """Start the job controller process.
 
@@ -385,6 +455,18 @@ async def _complete_launch_state_transition(
     transition_task.result()
     if cancelled:
         raise asyncio.CancelledError()
+
+
+async def job_resumed(job_id: int) -> None:
+    """Restore ALIVE after reclaiming an already-running managed job.
+
+    A controller resume deliberately skips the provider launch context, so it
+    must complete the same durable LAUNCHING-to-ALIVE transition explicitly.
+    The state writer retains the outer-generation predicate and this shield
+    keeps cancellation from stranding the row in LAUNCHING.
+    """
+    await _complete_launch_state_transition(
+        state.scheduler_set_alive_async(job_id))
 
 
 @contextlib.asynccontextmanager

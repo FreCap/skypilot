@@ -863,6 +863,7 @@ def _create_table(engine: sqlalchemy.engine.Engine):
 # so no need to pass in db_name here.
 _db_manager = db_utils.DatabaseManager(db_name='config',
                                        create_table_fn=_create_table)
+initialize_and_get_db = _db_manager.get_engine
 
 
 def _reload_config_as_server() -> None:
@@ -876,7 +877,13 @@ def _reload_config_as_server() -> None:
     # the db url specified in config file to the env var.
     db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
 
-    if db_url:
+    # A fresh-schema migration job must initialize global user state before
+    # any companion schema creates objects in the shared PostgreSQL schema.
+    # Importing ``sky`` loads this module before the migration entrypoint can
+    # call global_user_state.initialize_and_get_db(), so defer the config
+    # overlay only for explicit bootstrap mode.  The migration entrypoint
+    # initializes this config schema immediately after global user state.
+    if (db_url and migration_utils.configured_migration_mode() != 'bootstrap'):
         server_config = _overlay_db_config(server_config, db_url)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
         safe_server_config = _redact_container_image_config_for_logging(

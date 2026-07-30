@@ -6,8 +6,9 @@ not the full daemon loop:
 * ``_lock_still_held`` dispatches correctly between ``PostgresLock``
   (probes the underlying PG session) and any other ``DistributedLock``
   (trusts the local ``is_locked`` flag).
-* ``_suicide_on_lock_loss`` sends ``SIGTERM`` to the API server PID so
-  K8s restarts the pod and the leader is re-elected on another replica.
+* ``_suicide_on_lock_loss`` fail-stops detached schedulers before sending
+  ``SIGTERM`` to the API server PID so K8s restarts the pod and the leader is
+  re-elected on another replica.
 * ``start_managed_job_refresh_daemon`` gates on consolidation mode,
   preserving the historical ``should_skip_managed_job_status_refresh``
   semantics now that the daemon no longer lives in
@@ -74,12 +75,12 @@ class TestSuicideOnLockLoss:
         with mock.patch.object(mjrt.os, 'kill') as kill_mock, \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345), \
                 mock.patch.object(mjrt.managed_job_scheduler,
-                                  'kill_local_job_controllers'):
+                                  'fail_stop_local_job_controllers'):
             thread._suicide_on_lock_loss()
         kill_mock.assert_called_once_with(12345, signal.SIGTERM)
 
     def test_kills_local_controllers_before_sigterm(self):
-        """Controllers must be SIGTERMed before the API server SIGTERM —
+        """Controllers must be fail-stopped before the API server SIGTERM —
         the lock is already released here, so a new leader can schedule
         within milliseconds. Killing first prevents split-brain."""
         thread = mjrt.ManagedJobRefreshDaemonThread()
@@ -89,7 +90,7 @@ class TestSuicideOnLockLoss:
         call_order = []
         with mock.patch.object(
                 mjrt.managed_job_scheduler,
-                'kill_local_job_controllers',
+                'fail_stop_local_job_controllers',
                 side_effect=lambda: call_order.append('kill_controllers')), \
                 mock.patch.object(
                     mjrt.os, 'kill',
@@ -108,7 +109,7 @@ class TestSuicideOnLockLoss:
                                             spec_set=True)
         with mock.patch.object(
                 mjrt.managed_job_scheduler,
-                'kill_local_job_controllers',
+                'fail_stop_local_job_controllers',
                 side_effect=RuntimeError('boom')), \
                 mock.patch.object(mjrt.os, 'kill') as kill_mock, \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345):
@@ -132,7 +133,7 @@ class TestSuicideOnLockLoss:
         order = []
         with mock.patch.object(
                 mjrt.managed_job_scheduler,
-                'kill_local_job_controllers',
+                'fail_stop_local_job_controllers',
                 side_effect=lambda: order.append('kill')), \
                 mock.patch.object(
                     mjrt.os, 'kill',
@@ -160,7 +161,7 @@ class TestSuicideOnLockLoss:
                                             spec_set=True)
         with mock.patch.object(mjrt.pathlib.Path, 'touch', boom_touch), \
                 mock.patch.object(mjrt.managed_job_scheduler,
-                                  'kill_local_job_controllers'), \
+                                  'fail_stop_local_job_controllers'), \
                 mock.patch.object(mjrt.os, 'kill') as kill_mock, \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345):
             thread._suicide_on_lock_loss()
@@ -544,6 +545,25 @@ class TestBecomeLeaderOrdering:
         # The gate file is NOT removed on the step-down path; the suicide
         # routine owns re-touching it for the shutdown drain.
         assert signal_file.exists()
+
+
+def test_recovery_fences_stale_jobs_before_scheduler_start(
+        tmp_path, monkeypatch):
+    """Replacement scheduler startup must be the last recovery operation."""
+    order = []
+    monkeypatch.setattr(mjrt.constants, 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                        str(tmp_path / '{}recovery.log'))
+    monkeypatch.setattr(mjrt.managed_job_state,
+                        'reset_stale_jobs_for_current_controller',
+                        lambda: order.append('reset-stale') or 1)
+    monkeypatch.setattr(mjrt.managed_job_state, 'get_managed_jobs_with_filters',
+                        lambda fields: ([], None))
+    monkeypatch.setattr(mjrt.managed_job_scheduler, 'maybe_start_controllers',
+                        lambda: order.append('start-scheduler'))
+
+    mjrt.managed_job_utils.ha_recovery_for_consolidation_mode()
+
+    assert order == ['reset-stale', 'start-scheduler']
 
 
 class TestStart:

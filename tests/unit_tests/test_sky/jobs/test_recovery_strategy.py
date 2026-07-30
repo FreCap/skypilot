@@ -1,6 +1,7 @@
 """Unit tests for sky.jobs.recovery_strategy helpers."""
 # pylint: disable=protected-access
 import contextlib
+import os
 from unittest import mock
 
 import pytest
@@ -9,8 +10,81 @@ from sky.container_images import consumers as container_image_consumers
 from sky.jobs import recovery_strategy
 from sky.jobs import runtime as managed_job_runtime
 from sky.jobs import utils as managed_job_utils
+from sky.server import common as server_common
+from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.utils import status_lib
+
+
+def test_explicit_controller_uses_existing_api_service(monkeypatch):
+    endpoint = 'http://skypilot-api-service.skypilot.svc'
+    monkeypatch.setenv(recovery_strategy._SERVER_ROLE_ENV_VAR, 'controller')
+    monkeypatch.setenv(constants.SKY_API_SERVER_URL_ENV_VAR, endpoint)
+    server_common.get_server_url.cache_clear()
+    server_common.is_api_server_local.cache_clear()
+    health_check = mock.Mock()
+    api_start = mock.Mock()
+    monkeypatch.setattr(server_common, 'check_server_healthy', health_check)
+    monkeypatch.setattr(recovery_strategy.sdk, 'api_start', api_start)
+
+    try:
+        recovery_strategy._ensure_api_server_for_nested_request()
+    finally:
+        server_common.get_server_url.cache_clear()
+        server_common.is_api_server_local.cache_clear()
+
+    health_check.assert_called_once_with(endpoint)
+    api_start.assert_not_called()
+
+
+def test_explicit_controller_rejects_loopback_api(monkeypatch):
+    monkeypatch.setenv(recovery_strategy._SERVER_ROLE_ENV_VAR, 'controller')
+    monkeypatch.setenv(constants.SKY_API_SERVER_URL_ENV_VAR,
+                       server_common.DEFAULT_SERVER_URL)
+    server_common.get_server_url.cache_clear()
+    server_common.is_api_server_local.cache_clear()
+    api_start = mock.Mock()
+    monkeypatch.setattr(recovery_strategy.sdk, 'api_start', api_start)
+
+    try:
+        with pytest.raises(RuntimeError, match='requires a non-local'):
+            recovery_strategy._ensure_api_server_for_nested_request()
+    finally:
+        server_common.get_server_url.cache_clear()
+        server_common.is_api_server_local.cache_clear()
+
+    api_start.assert_not_called()
+
+
+def test_compatibility_role_bootstraps_local_api_and_restores_endpoint(
+        monkeypatch):
+    remote_endpoint = 'https://client.example.com'
+    monkeypatch.setenv(recovery_strategy._SERVER_ROLE_ENV_VAR, 'all')
+    monkeypatch.setenv(constants.SKY_API_SERVER_URL_ENV_VAR, remote_endpoint)
+    monkeypatch.setattr(recovery_strategy, 'ENV_VARS_TO_CLEAR',
+                        (constants.SKY_API_SERVER_URL_ENV_VAR,))
+    monkeypatch.setattr(server_common.skypilot_config,
+                        'get_nested',
+                        lambda _, default_value=None: default_value)
+    server_common.get_server_url.cache_clear()
+    server_common.is_api_server_local.cache_clear()
+    assert server_common.get_server_url() == remote_endpoint
+
+    def assert_local_bootstrap():
+        assert constants.SKY_API_SERVER_URL_ENV_VAR not in os.environ
+        assert server_common.is_api_server_local()
+
+    monkeypatch.setattr(recovery_strategy.sdk, 'api_start',
+                        assert_local_bootstrap)
+
+    try:
+        recovery_strategy._ensure_api_server_for_nested_request()
+        assert os.environ[
+            constants.SKY_API_SERVER_URL_ENV_VAR] == remote_endpoint
+        assert server_common.get_server_url() == remote_endpoint
+    finally:
+        server_common.get_server_url.cache_clear()
+        server_common.is_api_server_local.cache_clear()
 
 
 @pytest.mark.asyncio

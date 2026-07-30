@@ -49,6 +49,7 @@ def _make_server_config(
 
 def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
     monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
 
     assert executor.queue_base.get_registered_queue_backend_factory() is None
     assert isinstance(executor.queue_base.get_queue_backend_factory(),
@@ -61,6 +62,35 @@ def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
     assert (executor.queue_base.get_registered_queue_backend_factory()
             is registered_factory)
     assert executor.queue_base.get_queue_backend_factory() is registered_factory
+
+
+def test_spawned_process_resolves_postgres_queue_from_environment(monkeypatch):
+    from sky.server.requests import postgres as request_postgres
+
+    monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+
+    factory = executor.queue_base.get_queue_backend_factory()
+
+    assert isinstance(factory, request_postgres.PostgresQueueFactory)
+
+
+@pytest.mark.asyncio
+async def test_non_durable_schedule_preserves_legacy_queue_tuple(monkeypatch):
+    backend = mock.Mock(uses_durable_queue=False)
+    queue = mock.Mock()
+    queue.put_async = mock.AsyncMock()
+    request = mock.Mock(request_id='legacy-request',
+                        schedule_type=requests_lib.ScheduleType.SHORT)
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(executor, '_get_queue', lambda _schedule_type: queue)
+
+    await executor.schedule_prepared_request(request,
+                                             ignore_return_value=True,
+                                             retryable=True)
+
+    queue.put_async.assert_awaited_once_with(('legacy-request', True, True))
 
 
 @pytest.mark.parametrize(
@@ -144,6 +174,43 @@ def test_worker_preserves_executor_construction_error(monkeypatch):
         worker.run()
 
 
+def test_task_monitor_heartbeats_durable_claim(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    heartbeat_seen = threading.Event()
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = 0.01
+
+    def heartbeat(claim):
+        heartbeat_seen.set()
+        return True
+
+    backend.heartbeat_claim.side_effect = heartbeat
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(worker, '_handle_task_result',
+                        lambda *_args: heartbeat_seen.wait(timeout=1))
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    item = executor.queue_base.QueueItem('heartbeat-request',
+                                         False,
+                                         False,
+                                         execution_generation=7,
+                                         claim_token='claim-token')
+
+    worker.handle_task_result(future, item)
+
+    backend.heartbeat_claim.assert_called()
+    claim = backend.heartbeat_claim.call_args.args[0]
+    assert claim.request_id == item.request_id
+    assert claim.execution_generation == item.execution_generation
+    assert claim.claim_token == item.claim_token
+    assert executor.request_storage.active_execution_claim() is None
+
+
 @pytest.fixture()
 def isolated_database(tmp_path):
     """Create an isolated DB and logs directory per-test."""
@@ -157,7 +224,8 @@ def isolated_database(tmp_path):
                         str(temp_log_path)):
             requests_lib._DB = None
             yield
-            requests_lib._DB = None
+            if requests_lib._DB is not None:
+                asyncio.run(requests_lib.close_db_async())
 
 
 @pytest.mark.asyncio
@@ -1743,13 +1811,25 @@ def test_override_env_rejects_server_owned_client_values(
     """A crafted request body cannot replace deployment-owned capabilities."""
     capability = serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR
     server_prefixed = f'{constants.SKYPILOT_SERVER_ENV_VAR_PREFIX}TEST_ONLY'
+    role = 'SKYPILOT_API_SERVER_ROLE'
+    pod_uid = 'SKYPILOT_POD_UID'
+    endpoint = constants.SKY_API_SERVER_URL_ENV_VAR
+    service_account_token = constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR
     monkeypatch.setenv(capability, 'true')
     monkeypatch.setenv(server_prefixed, 'server-value')
+    monkeypatch.setenv(role, 'controller')
+    monkeypatch.setenv(pod_uid, 'current-pod')
+    monkeypatch.setenv(endpoint, 'http://stable-api-service')
+    monkeypatch.setenv(service_account_token, 'sky_server_token')
 
     body = payloads.RequestBody(
         env_vars={
             capability: 'false',
             server_prefixed: 'client-value',
+            role: 'api',
+            pod_uid: 'stale-pod',
+            endpoint: 'http://client-controlled-endpoint',
+            service_account_token: 'sky_client_token',
             constants.USER_ID_ENV_VAR: 'client-user-id',
             constants.USER_ENV_VAR: 'client-user',
         })
@@ -1758,9 +1838,31 @@ def test_override_env_rejects_server_owned_client_values(
             body, request_id='not-a-daemon-uuid', request_name='sky.launch'):
         assert os.environ[capability] == 'true'
         assert os.environ[server_prefixed] == 'server-value'
+        assert os.environ[role] == 'controller'
+        assert os.environ[pod_uid] == 'current-pod'
+        assert os.environ[endpoint] == 'http://stable-api-service'
+        assert os.environ[service_account_token] == 'sky_server_token'
 
     assert capability not in body.env_vars
     assert server_prefixed not in body.env_vars
+    assert role not in body.env_vars
+    assert pod_uid not in body.env_vars
+    assert endpoint not in body.env_vars
+    assert service_account_token not in body.env_vars
+
+
+def test_controller_execution_environment_uses_claim_fence(monkeypatch):
+    """A claimed request sees its own durable controller generation."""
+    monkeypatch.setenv('SKYPILOT_SERVER_CONTROLLER_GENERATION', 'old')
+    monkeypatch.setenv('SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID', 'old-owner')
+
+    with executor._controller_execution_environment(7, 'new-owner'):
+        assert os.environ['SKYPILOT_SERVER_CONTROLLER_GENERATION'] == '7'
+        assert os.environ[
+            'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'] == 'new-owner'
+
+    assert os.environ['SKYPILOT_SERVER_CONTROLLER_GENERATION'] == 'old'
+    assert os.environ['SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'] == 'old-owner'
 
 
 def test_daemon_env_mutations_reverted_on_exit(stub_override_request_env_deps,

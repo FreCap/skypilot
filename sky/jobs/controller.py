@@ -7,6 +7,7 @@ import os
 import pathlib
 import resource
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -79,6 +80,40 @@ _background_tasks: set[asyncio.Task] = set()
 # failures without prior healthy evidence recover immediately.
 _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
 _FILE_MOUNTS_BLOB_ID_UNSET = object()
+_OUTER_CONTROLLER_PROBE_SECONDS = 2
+
+
+def _fail_stop_outer_controller_process_group(reason: str) -> typing.NoReturn:
+    """Exit a fenced scheduler without running managed-job finalizers."""
+    logger.error(reason)
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    except OSError:
+        logger.exception(
+            'Failed to SIGKILL the fenced scheduler process group.')
+    # killpg() does not return on success.  This fallback preserves fail-stop
+    # semantics if the process group disappeared or could not be signaled.
+    os._exit(1)  # pylint: disable=protected-access
+
+
+async def _watch_outer_controller_generation(owner: tuple[str, int]) -> None:
+    """Exit the detached scheduler when its outer generation is fenced."""
+    instance_id, generation = owner
+    while True:
+        await asyncio.sleep(_OUTER_CONTROLLER_PROBE_SECONDS)
+        try:
+            is_current = await asyncio.to_thread(
+                managed_job_state.controller_owner_is_current, owner)
+        except Exception as e:  # pylint: disable=broad-except
+            _fail_stop_outer_controller_process_group(
+                'Could not prove managed-job outer controller generation '
+                f'{generation} for instance {instance_id}: '
+                f'{common_utils.format_exception(e)}')
+        if not is_current:
+            _fail_stop_outer_controller_process_group(
+                'Managed-job outer controller generation '
+                f'{generation} for instance {instance_id} is no longer '
+                'current.')
 
 
 class _ClusterNotUpDebouncer:
@@ -748,6 +783,14 @@ class JobController:
                     raise asyncio.CancelledError()
             if prev_status != managed_job_state.ManagedJobStatus.RUNNING:
                 force_transit_to_recovering = True
+            elif (last_task_prev_status
+                  == managed_job_state.ManagedJobStatus.RUNNING and
+                  not launched_task):
+                # A resumed RUNNING task skips StrategyExecutor.launch(), whose
+                # scheduled_launch context normally restores ALIVE. Complete
+                # that generation-fenced transition before monitoring so the
+                # replacement controller does not remain LAUNCHING forever.
+                await scheduler.job_resumed(self._job_id)
 
             await self._strategy_executor.on_resume(cluster_name)
 
@@ -3011,12 +3054,18 @@ async def main(controller_uuid: str):
     # Will loop forever, do it in the background
     cancel_job_task = asyncio.create_task(controller.cancel_job())
     monitor_loop_task = asyncio.create_task(controller.monitor_loop())
+    controller_tasks = [cancel_job_task, monitor_loop_task]
+    outer_owner = managed_job_state.get_current_controller_owner()
+    if outer_owner is not None:
+        controller_tasks.append(
+            asyncio.create_task(
+                _watch_outer_controller_generation(outer_owner)))
     # Run the garbage collector in a dedicated daemon thread to avoid affecting
     # the main event loop.
     gc_thread = threading.Thread(target=log_gc.elect_for_log_gc, daemon=True)
     gc_thread.start()
     try:
-        await asyncio.gather(cancel_job_task, monitor_loop_task)
+        await asyncio.gather(*controller_tasks)
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Controller server crashed: {e}')
         sys.exit(1)

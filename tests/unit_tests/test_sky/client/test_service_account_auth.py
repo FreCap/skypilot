@@ -80,6 +80,38 @@ class TestServiceAccountAuth:
         headers = service_account_auth.get_service_account_headers()
         assert headers == {}
 
+    @mock.patch.dict(os.environ, {
+        'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID': '96d9d1f6-8ba4-402b-85f5-27db321fd504',
+        'SKYPILOT_SERVER_CONTROLLER_GENERATION': '22',
+    },
+                     clear=True)
+    @mock.patch('sky.skypilot_config.get_nested', return_value=None)
+    def test_controller_origin_headers_are_server_owned(self, _mock_get_nested):
+        headers = service_account_auth.get_service_account_headers()
+
+        assert headers == {
+            'X-SkyPilot-Controller-Instance-ID': '96d9d1f6-8ba4-402b-85f5-27db321fd504',
+            'X-SkyPilot-Controller-Generation': '22',
+        }
+
+    @pytest.mark.parametrize('environment', [{
+        'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID': '96d9d1f6-8ba4-402b-85f5-27db321fd504',
+    }, {
+        'SKYPILOT_SERVER_CONTROLLER_GENERATION': '22',
+    }, {
+        'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID': 'not-a-uuid',
+        'SKYPILOT_SERVER_CONTROLLER_GENERATION': '22',
+    }, {
+        'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID': '96d9d1f6-8ba4-402b-85f5-27db321fd504',
+        'SKYPILOT_SERVER_CONTROLLER_GENERATION': '0',
+    }])
+    @mock.patch('sky.skypilot_config.get_nested', return_value=None)
+    def test_invalid_controller_origin_fails_closed(self, _mock_get_nested,
+                                                    environment):
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with pytest.raises(RuntimeError, match='Controller SDK request'):
+                service_account_auth.get_service_account_headers()
+
     @mock.patch.dict(
         os.environ, {constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR: 'sky_test_token'})
     @mock.patch('sky.skypilot_config.get_nested')

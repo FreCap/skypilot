@@ -1,4 +1,15 @@
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
+{{- $haEnabled := get $haConfig "enabled" | default false -}}
+{{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
+{{- $apiTopologySpreadTopologyKey := get .Values.apiService "topologySpreadTopologyKey" -}}
+{{- if and $haEnabled (not (hasKey .Values.apiService "topologySpreadTopologyKey")) -}}
+{{- $apiTopologySpreadTopologyKey = "kubernetes.io/hostname" -}}
+{{- end -}}
+{{- $executorService := .Values.executorService | default (dict) -}}
+{{- $executorReplicas := dig "replicas" 2 $executorService -}}
+{{- $controllerService := .Values.controllerService | default (dict) -}}
+{{- $controllerReplicas := dig "replicas" 2 $controllerService -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
 {{- $externalLBResources := get $externalLB "resources" | default (dict) -}}
@@ -25,7 +36,7 @@
 {{- /* Custom credential wiring is the compatibility path when a native chart
       credential block is disabled. Reserve provider-owned fields only when the
       chart will actually emit them. */ -}}
-{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
+{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") -}}
 {{- end -}}
@@ -48,7 +59,7 @@
 {{- $apiReservedEnvNames = append $apiReservedEnvNames "VAST_API_KEY" -}}
 {{- end -}}
 
-{{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-config" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-config" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedVolumeNames = concat $apiReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -83,7 +94,7 @@
 {{- $apiReservedVolumeNames = append $apiReservedVolumeNames "vast-config" -}}
 {{- end -}}
 
-{{- $apiReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.ssh" "/root/sky_logs" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- $apiReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.aws" -}}
 {{- end -}}
@@ -120,6 +131,73 @@
 {{- if .Values.vastCredentials.enabled -}}
 {{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.config/vastai" -}}
 {{- end -}}
+{{- if eq .Values.requestStore.backend "postgres" -}}
+{{- if and (not .Values.apiService.dbConnectionSecretName) (not .Values.apiService.dbConnectionString) -}}
+{{- fail "requestStore.backend=postgres requires external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString" -}}
+{{- end -}}
+{{- if not .Values.databaseMigration.enabled -}}
+{{- fail "requestStore.backend=postgres requires databaseMigration.enabled=true" -}}
+{{- end -}}
+{{- if $haEnabled -}}
+{{- if not .Values.apiService.dbConnectionSecretName -}}
+{{- fail "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook" -}}
+{{- end -}}
+{{- if .Values.apiService.dbConnectionString -}}
+{{- fail "apiService.highAvailability.enabled=true does not support chart-managed apiService.dbConnectionString; use apiService.dbConnectionSecretName" -}}
+{{- end -}}
+{{- if lt (int .Values.apiService.replicas) 2 -}}
+{{- fail "apiService.highAvailability.enabled=true requires apiService.replicas>=2" -}}
+{{- end -}}
+{{- if lt (int $executorReplicas) 2 -}}
+{{- fail "apiService.highAvailability.enabled=true requires executorService.replicas>=2" -}}
+{{- end -}}
+{{- if lt (int $controllerReplicas) 2 -}}
+{{- fail "apiService.highAvailability.enabled=true requires controllerService.replicas>=2" -}}
+{{- end -}}
+{{- if ne .Values.apiService.upgradeStrategy "RollingUpdate" -}}
+{{- fail "apiService.highAvailability.enabled=true requires apiService.upgradeStrategy=RollingUpdate" -}}
+{{- end -}}
+{{- if not .Values.storage.enabled -}}
+{{- fail "apiService.highAvailability.enabled=true requires storage.enabled=true" -}}
+{{- end -}}
+{{- if ne .Values.storage.accessMode "ReadWriteMany" -}}
+{{- fail "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany" -}}
+{{- end -}}
+{{- $readinessProbe := .Values.apiService.readinessProbe | default (dict) -}}
+{{- if not (hasKey $readinessProbe "httpGet") -}}
+{{- fail "apiService.highAvailability.enabled=true requires an HTTP apiService.readinessProbe" -}}
+{{- end -}}
+{{- $readinessPeriodSeconds := dig "periodSeconds" 10 $readinessProbe | int -}}
+{{- $readinessFailureThreshold := dig "failureThreshold" 3 $readinessProbe | int -}}
+{{- $readinessTimeoutSeconds := dig "timeoutSeconds" 1 $readinessProbe | int -}}
+{{- $readinessDetectionSeconds := add (mul $readinessPeriodSeconds $readinessFailureThreshold) $readinessTimeoutSeconds -}}
+{{- if lt (int $readinessDrainSeconds) (int $readinessDetectionSeconds) -}}
+{{- fail (printf "apiService.highAvailability.readinessDrainSeconds must be at least the API readiness failure-detection window (%d seconds)" (int $readinessDetectionSeconds)) -}}
+{{- end -}}
+{{- if lt (int $readinessDrainSeconds) 16 -}}
+{{- fail "apiService.highAvailability.readinessDrainSeconds must be at least 16 seconds for executor and controller readiness propagation" -}}
+{{- end -}}
+{{- $minimumTerminationSeconds := add (int $readinessDrainSeconds) 10 -}}
+{{- if lt (int .Values.apiService.terminationGracePeriodSeconds) (int $minimumTerminationSeconds) -}}
+{{- fail (printf "apiService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (%d seconds) in HA mode" (int $minimumTerminationSeconds)) -}}
+{{- end -}}
+{{- if lt (int (dig "terminationGracePeriodSeconds" 60 $executorService)) (int $minimumTerminationSeconds) -}}
+{{- fail (printf "executorService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (%d seconds) in HA mode" (int $minimumTerminationSeconds)) -}}
+{{- end -}}
+{{- if lt (int (dig "terminationGracePeriodSeconds" 60 $controllerService)) (int $minimumTerminationSeconds) -}}
+{{- fail (printf "controllerService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (%d seconds) in HA mode" (int $minimumTerminationSeconds)) -}}
+{{- end -}}
+{{- else -}}
+{{- if ne (int .Values.apiService.replicas) 1 -}}
+{{- fail "requestStore.backend=postgres supports exactly one all-role API pod until role-split HA is enabled" -}}
+{{- end -}}
+{{- if ne .Values.apiService.upgradeStrategy "Recreate" -}}
+{{- fail "requestStore.backend=postgres requires apiService.upgradeStrategy=Recreate until role-split HA is enabled" -}}
+{{- end -}}
+{{- end -}}
+{{- else if $haEnabled -}}
+{{- fail "apiService.highAvailability.enabled=true requires requestStore.backend=postgres" -}}
+{{- end -}}
 {{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs) "reservedEnvNames" $apiReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes) "reservedVolumeNames" $apiReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts) "reservedMountPaths" $apiReservedMountPaths) }}
 apiVersion: apps/v1
 kind: Deployment
@@ -127,7 +205,6 @@ metadata:
   name: {{ $fullName }}-api-server
   namespace: {{ .Release.Namespace }}
 spec:
-  # Note: replicas > 1 is not well tested.
   replicas: {{ .Values.apiService.replicas }}
   {{- if eq .Values.apiService.upgradeStrategy "RollingUpdate" }}
   {{- if and (not .Values.apiService.dbConnectionSecretName) (not .Values.apiService.dbConnectionString) }}
@@ -213,6 +290,15 @@ spec:
         {{- end }}
         resources:
           {{- toYaml .Values.apiService.resources | nindent 10 }}
+        {{- if $haEnabled }}
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - touch /var/run/skypilot/draining && sleep {{ $readinessDrainSeconds }}
+        {{- end }}
         env:
         {{- /* Detect whether POD_IP is already declared in extraEnvs (e.g. */ -}}
         {{- /* injected by a downstream chart) so we don't emit duplicates. */ -}}
@@ -236,6 +322,24 @@ spec:
           value: {{ .Values.apiService.skypilotDev | quote }}
         - name: SKYPILOT_RELEASE_NAME
           value: {{ $fullName | quote }}
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: {{ .Values.requestStore.backend | quote }}
+        - name: SKYPILOT_API_SERVER_ROLE
+          value: {{ ternary "api" "all" $haEnabled | quote }}
+        - name: SKYPILOT_API_SERVER_INSTANCE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: SKYPILOT_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: SKYPILOT_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
+          value: {{ .Values.requestStore.cutoverGatePath | quote }}
         {{- if .Values.ingress.enabled }}
         - name: SKYPILOT_INGRESS_HOST
           value: {{ .Values.ingress.host | quote }}
@@ -349,12 +453,6 @@ spec:
         # load-balancer boot.
         - name: SKYPILOT_SERVE_LB_HA_RBAC_READY
           value: "true"
-        # Identity used to mirror the owning pod's image and selected Secret
-        # projections onto each per-service external LB Deployment.
-        - name: SKYPILOT_POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
         # Stable owner for controller-created LB Deployments and Services.
         # Its UID survives ordinary Pod/ReplicaSet rollouts and Kubernetes
         # garbage-collects the LB objects when the Helm Deployment is removed.
@@ -400,7 +498,7 @@ spec:
           # TODO(zhwu): remove this after 0.12.0.
           if [ -L /root/.sky/config.yaml ]; then
             echo "Config.yaml is a symlink to ConfigMap config, deleting symlink"
-            rm /root/.sky/config.yaml
+            rm -f /root/.sky/config.yaml
           fi
           # Initialize the SkyPilot config.
           if [ -s /root/.sky/config.yaml ]; then
@@ -408,8 +506,18 @@ spec:
             python3 -c "from sky.utils.kubernetes import config_map_utils; config_map_utils.initialize_configmap_sync_on_startup('~/.sky/config.yaml')"
           else
             # If the config.yaml is empty, we initialize the config on PVC with
-            # user specified config.
-            cp /var/skypilot/config/config.yaml /root/.sky/config.yaml
+            # user specified config. Stage a complete file and rename it so
+            # concurrent HA replicas never expose a partially copied config.
+            config_tmp="/root/.sky/.config.yaml.${SKYPILOT_POD_UID}.tmp"
+            cp /var/skypilot/config/config.yaml "$config_tmp"
+            if [ ! -e /root/.sky/config.yaml ]; then
+              mv -n "$config_tmp" /root/.sky/config.yaml
+            fi
+            if [ ! -s /root/.sky/config.yaml ]; then
+              mv -f "$config_tmp" /root/.sky/config.yaml
+            else
+              rm -f "$config_tmp"
+            fi
           fi
           {{- if .Values.apiService.sshNodePools }}
           mkdir -p /root/.sky
@@ -418,7 +526,16 @@ spec:
           ln -sf /var/skypilot/ssh_node_pool/ssh_node_pools.yaml /root/.sky/ssh_node_pools.yaml
           # ~/.kube/config is required to be persistent when sshNodePools is enabled, init it if it is empty to avoid parsing error.
           if [ ! -s /root/.kube/config ]; then
-            echo "{}" > /root/.kube/config
+            kubeconfig_tmp="/root/.kube/.config.${SKYPILOT_POD_UID}.tmp"
+            printf '{}\n' > "$kubeconfig_tmp"
+            if [ ! -e /root/.kube/config ]; then
+              mv -n "$kubeconfig_tmp" /root/.kube/config
+            fi
+            if [ ! -s /root/.kube/config ]; then
+              mv -f "$kubeconfig_tmp" /root/.kube/config
+            else
+              rm -f "$kubeconfig_tmp"
+            fi
           fi
           {{- end }}
           # Nebius credentials mounting
@@ -474,7 +591,7 @@ spec:
               echo "warning: failed to create log mirror directory $SKYPILOT_LOG_MIRROR_PER_POD_DIR; mirroring disabled" >&2
             fi
           fi
-          {{- if .Values.apiService.serveServerLog }}
+          {{- if and .Values.apiService.serveServerLog (not $haEnabled) }}
           mkdir -p /root/.sky/api_server
           # Use a FIFO instead of a pipe so that exec replaces the shell,
           # allowing tini to send SIGTERM directly to the API server process
@@ -510,8 +627,15 @@ spec:
           {{- toYaml . | nindent 10 }}
         {{- end }}
         {{- with .Values.apiService.readinessProbe }}
+        {{- $readinessProbe := deepCopy . }}
+        {{- if $haEnabled }}
+        {{- $readinessHttpGet := get $readinessProbe "httpGet" | default (dict) }}
+        {{- $_ := set $readinessHttpGet "path" "/api/health/ready" }}
+        {{- $_ := set $readinessHttpGet "port" 46580 }}
+        {{- $_ := set $readinessProbe "httpGet" $readinessHttpGet }}
+        {{- end }}
         readinessProbe:
-          {{- if not (hasKey . "successThreshold") }}
+          {{- if not (hasKey $readinessProbe "successThreshold") }}
           {{- if eq $.Values.apiService.upgradeStrategy "RollingUpdate" }}
           # When using RollingUpdate strategy, be more patient with the new
           # API server to avoid flaky serving where one of the server process
@@ -524,11 +648,15 @@ spec:
           successThreshold: 1
           {{- end }}
           {{- end }}
-          {{- toYaml . | nindent 10 }}
+          {{- toYaml $readinessProbe | nindent 10 }}
         {{- end }}
         {{- end }}
         volumeMounts:
-        {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") }}
+        {{- if $haEnabled }}
+        - name: skypilot-role-runtime
+          mountPath: /var/run/skypilot
+        {{- end }}
+        {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
         # For RollingUpdate with storage enabled, use emptyDir for ~/.sky to avoid
         # running SQLite on NFS. Only persist the clients directory for file mounts.
         # An ephemeral volume is still required since we have to share ~/.sky between
@@ -663,7 +791,7 @@ spec:
         {{- if .Values.apiService.extraVolumeMounts }}
         {{- toYaml .Values.apiService.extraVolumeMounts | nindent 8 }}
         {{- end }}
-      {{- if and .Values.apiService.serveServerLog .Values.apiService.logs.retention.enabled }}
+      {{- if and .Values.apiService.serveServerLog .Values.apiService.logs.retention.enabled (not $haEnabled) }}
       - name: logrotate
         image: {{ include "common.image" (dict "root" . "image" .Values.apiService.image) }}
         command: ["/bin/sh", "-c"]
@@ -699,7 +827,7 @@ spec:
             sleep 60;
           done
         volumeMounts:
-        {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") }}
+        {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
         - name: sky-ephemeral
           mountPath: /root/.sky
         {{- else }}
@@ -986,11 +1114,15 @@ spec:
       {{- end }}
 
       volumes:
+      {{- if $haEnabled }}
+      - name: skypilot-role-runtime
+        emptyDir: {}
+      {{- end }}
       {{- if .Values.storage.enabled }}
       - name: state-volume
         persistentVolumeClaim:
           claimName: {{ $fullName }}-state
-      {{- if eq .Values.apiService.upgradeStrategy "RollingUpdate" }}
+      {{- if and (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
       # When using RollingUpdate with storage enabled, use a separate emptyDir
       # for ~/.sky to avoid running SQLite on NFS. Only specific subdirectories
       # like api_server/clients are persisted to the PVC.
@@ -1121,10 +1253,10 @@ spec:
         emptyDir: {}
       {{- end }}
       {{- include "skypilot.apiPodScheduling" . }}
-      {{- if .Values.apiService.topologySpreadTopologyKey }}
+      {{- if $apiTopologySpreadTopologyKey }}
       topologySpreadConstraints:
         - maxSkew: 1
-          topologyKey: {{ .Values.apiService.topologySpreadTopologyKey }}
+          topologyKey: {{ $apiTopologySpreadTopologyKey }}
           whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels:

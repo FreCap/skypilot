@@ -79,6 +79,18 @@
                         "type": "object"
                     }
                 },
+                "highAvailability": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean"
+                        },
+                        "readinessDrainSeconds": {
+                            "type": "integer",
+                            "minimum": 1
+                        }
+                    }
+                },
                 "image": {
                     "type": "string"
                 },
@@ -416,6 +428,81 @@
                 }
             }
         },
+        "controllerService": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "extraVolumeMounts": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "extraVolumes": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "replicas": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "terminationGracePeriodSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "tolerations": {
+                    "type": "array"
+                },
+                "topologySpreadTopologyKey": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                }
+            }
+        },
         "coreweaveCredentials": {
             "type": "object",
             "properties": {
@@ -499,6 +586,81 @@
                 },
                 "enabled": {
                     "type": "boolean"
+                }
+            }
+        },
+        "executorService": {
+            "type": "object",
+            "properties": {
+                "affinity": {
+                    "type": "object"
+                },
+                "extraEnvs": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "extraVolumeMounts": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "extraVolumes": {
+                    "type": [
+                        "array",
+                        "null"
+                    ],
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "healthPort": {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 1
+                },
+                "image": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "imagePullPolicy": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
+                },
+                "nodeSelector": {
+                    "type": "object"
+                },
+                "replicas": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "resources": {
+                    "type": "object"
+                },
+                "terminationGracePeriodSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "tolerations": {
+                    "type": "array"
+                },
+                "topologySpreadTopologyKey": {
+                    "type": [
+                        "string",
+                        "null"
+                    ]
                 }
             }
         },
@@ -1150,6 +1312,26 @@
                 },
                 "serviceAccountName": {
                     "type": "string"
+                }
+            }
+        },
+        "requestStore": {
+            "type": "object",
+            "required": [
+                "backend",
+                "cutoverGatePath"
+            ],
+            "properties": {
+                "backend": {
+                    "type": "string",
+                    "enum": [
+                        "sqlite",
+                        "postgres"
+                    ]
+                },
+                "cutoverGatePath": {
+                    "type": "string",
+                    "minLength": 1
                 }
             }
         },

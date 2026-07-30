@@ -1282,7 +1282,10 @@ Refer to :ref:`Setup OAuth for SkyPilot API Server <api-server-oauth>` for detai
 Optional: High availability
 ---------------------------
 
-For production deployments, the API server can be configured for high availability by backing it with an external PostgreSQL database. See :ref:`api-server-ha` for details.
+For production deployments, guarded high availability runs separate API,
+executor, and controller replicas backed by external PostgreSQL and shared
+ReadWriteMany storage. See :ref:`api-server-ha` for prerequisites, values, and
+rollout verification.
 
 .. _sky-api-server-config:
 

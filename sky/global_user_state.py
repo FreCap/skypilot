@@ -4203,6 +4203,39 @@ def get_system_config(config_key: str) -> str | None:
 
 
 @metrics_lib.time_me
+def get_or_set_system_config(config_key: str, default_value: str) -> str:
+    """Atomically return an existing configuration or install a default.
+
+    This is the multi-replica-safe form of a read followed by
+    ``set_system_config``. Concurrent first writers may propose different
+    defaults, but every caller returns the single value that won the unique-key
+    insert.
+    """
+    engine = _db_manager.get_engine()
+    current_time = int(time.time())
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        insert_func = sqlite.insert
+    elif engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        insert_func = postgresql.insert
+    else:
+        raise ValueError('Unsupported database dialect')
+
+    insert_stmnt = insert_func(system_config_table).values(
+        config_key=config_key,
+        config_value=default_value,
+        created_at=current_time,
+        updated_at=current_time).on_conflict_do_nothing(
+            index_elements=[system_config_table.c.config_key])
+    with orm.Session(engine) as session:
+        session.execute(insert_stmnt)
+        value = session.execute(
+            sqlalchemy.select(system_config_table.c.config_value).where(
+                system_config_table.c.config_key == config_key)).scalar_one()
+        session.commit()
+    return str(value)
+
+
+@metrics_lib.time_me
 def set_system_config(config_key: str, config_value: str) -> None:
     """Set a system configuration value."""
     engine = _db_manager.get_engine()

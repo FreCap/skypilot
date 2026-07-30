@@ -12,7 +12,11 @@ and file mount cleanup in task_cleanup().
 # pylint: disable=protected-access,redefined-outer-name,reimported
 # pylint: disable=unused-argument,unused-variable
 import asyncio
+import os
 import pathlib
+import signal
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -325,6 +329,57 @@ class TestNormalJobRecovery:
         assert should_skip is False
         # Terminal status still triggers resume logic path
         assert is_resume is True
+
+    @pytest.mark.asyncio
+    async def test_running_resume_restores_alive_before_monitoring(
+            self, mock_task):
+        controller = JobController.__new__(JobController)
+        controller._job_id = 42
+        controller._pool = None
+        controller._backend = MagicMock()
+        controller._backend.run_timestamp = '2026-07-30-00-00-00-000000'
+        controller.starting = {42}
+        controller.starting_lock = asyncio.Lock()
+        controller.starting_signal = asyncio.Condition(controller.starting_lock)
+        mock_task.metadata = {}
+        mock_task.resources = []
+        mock_task.envs = {
+            constants.TASK_ID_ENV_VAR: 'managed-task-id',
+        }
+
+        call_order = []
+        executor = MagicMock()
+        executor.on_resume = AsyncMock(
+            side_effect=lambda _name: call_order.append('on-resume'))
+        executor.monitor_task = AsyncMock(
+            side_effect=lambda **_kwargs: call_order.append('monitor') or True)
+        mark_resumed = AsyncMock(
+            side_effect=lambda _job_id: call_order.append('mark-alive'))
+
+        with patch('sky.jobs.controller._add_k8s_annotations'), \
+             patch('sky.jobs.controller.usage_lib.messages.usage.'
+                   'update_task_id'), \
+             patch.object(controller,
+                          '_get_file_mounts_blob_id',
+                          new=AsyncMock(return_value=None)), \
+             patch('sky.jobs.state.get_latest_task_id_status_async',
+                   new=AsyncMock(return_value=(
+                       0, managed_job_state.ManagedJobStatus.RUNNING))), \
+             patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new=AsyncMock(return_value=(
+                       managed_job_state.ManagedJobStatus.RUNNING))), \
+             patch('sky.jobs.controller.scheduler.job_resumed',
+                   new=mark_resumed), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   return_value=executor):
+            result = await controller._run_one_task(0, mock_task)
+
+        assert result is True
+        mark_resumed.assert_awaited_once_with(42)
+        executor.launch.assert_not_called()
+        executor.on_resume.assert_awaited_once_with('test-task-42')
+        assert call_order == ['mark-alive', 'on-resume', 'monitor']
+        assert controller.starting == set()
 
 
 class TestPoolStartingRestartRecovery:
@@ -3576,3 +3631,83 @@ class TestApiAccessTokenCleanup:
             manager._cleanup_api_server_access_token(9)
 
         delete.assert_called_once_with('shared-token')
+
+
+class TestOuterControllerGenerationWatchdog:
+    """Detached scheduler processes fail closed after outer handoff."""
+
+    @pytest.mark.asyncio
+    async def test_generation_mismatch_exits_controller(self):
+        owner = ('73ebc1a8-d2ae-4ca4-b9a5-53d0b10990af', 13)
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new=AsyncMock()), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'controller_owner_is_current',
+                      return_value=False), \
+                patch(
+                    'sky.jobs.controller.'
+                    '_fail_stop_outer_controller_process_group',
+                    side_effect=managed_job_state.ControllerLeadershipLostError(
+                        'fail-stop')) as fail_stop:
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError,
+                               match='fail-stop'):
+                await controller_lib._watch_outer_controller_generation(owner)
+        assert 'no longer current' in fail_stop.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_database_proof_error_exits_controller(self):
+        owner = ('4c0382a3-5905-4d3b-b696-a05e43063c30', 14)
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new=AsyncMock()), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'controller_owner_is_current',
+                      side_effect=OSError('database unavailable')), \
+                patch(
+                    'sky.jobs.controller.'
+                    '_fail_stop_outer_controller_process_group',
+                    side_effect=managed_job_state.ControllerLeadershipLostError(
+                        'fail-stop')) as fail_stop:
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError,
+                               match='fail-stop'):
+                await controller_lib._watch_outer_controller_generation(owner)
+        assert 'Could not prove' in fail_stop.call_args.args[0]
+
+    def test_fail_stop_uses_noncatchable_process_group_signal(self):
+        with patch.object(controller_lib.os, 'getpgrp', return_value=321), \
+                patch.object(controller_lib.os, 'killpg') as kill_group, \
+                patch.object(
+                    controller_lib.os,
+                    '_exit',
+                    side_effect=SystemExit(1)) as exit_process:
+            with pytest.raises(SystemExit):
+                controller_lib._fail_stop_outer_controller_process_group(
+                    'generation fenced')
+
+        kill_group.assert_called_once_with(321, signal.SIGKILL)
+        exit_process.assert_called_once_with(1)
+
+    @pytest.mark.skipif(not hasattr(os, 'killpg'),
+                        reason='requires POSIX process groups')
+    def test_fail_stop_does_not_run_coroutine_finalizers(self, tmp_path):
+        sentinel = tmp_path / 'finalizer-ran'
+        script = f"""
+import asyncio
+import pathlib
+from sky.jobs import controller
+
+async def main():
+    try:
+        controller._fail_stop_outer_controller_process_group('test fence')
+    finally:
+        pathlib.Path({str(sentinel)!r}).write_text('unsafe', encoding='utf-8')
+
+asyncio.run(main())
+"""
+        result = subprocess.run([sys.executable, '-c', script],
+                                capture_output=True,
+                                text=True,
+                                start_new_session=True,
+                                check=False)
+
+        assert result.returncode == -signal.SIGKILL, result.stderr
+        assert not sentinel.exists()

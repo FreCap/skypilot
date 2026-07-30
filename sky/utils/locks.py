@@ -29,6 +29,14 @@ _T = TypeVar('_T')
 SKY_LOCKS_DIR = runtime_utils.get_runtime_dir_path('.sky/locks')
 
 
+def postgres_lock_key(lock_id: str) -> int:
+    """Convert a stable string ID to PostgreSQL's positive int8 key space."""
+    hash_digest = hashlib.sha256(lock_id.encode('utf-8')).digest()
+    # Take the first 8 bytes and reserve the sign bit so psycopg and
+    # PostgreSQL agree on the bigint representation on every platform.
+    return int.from_bytes(hash_digest[:8], 'big') & ((1 << 63) - 1)
+
+
 class LockTimeout(RuntimeError):
     """Raised when a lock acquisition times out."""
     pass
@@ -195,16 +203,14 @@ class PostgresLock(DistributedLock):
         """
         super().__init__(lock_id, timeout, poll_interval)
         # Convert string lock_id to integer for postgres advisory locks
-        self._lock_key = self._string_to_lock_key(lock_id)
+        self._lock_key = postgres_lock_key(lock_id)
         self._shared_lock = shared_lock
         self._acquired = False
         self._connection: sqlalchemy.pool.PoolProxiedConnection | None = None
 
     def _string_to_lock_key(self, s: str) -> int:
-        """Convert string to a 64-bit integer for advisory lock key."""
-        hash_digest = hashlib.sha256(s.encode('utf-8')).digest()
-        # Take first 8 bytes and convert to int, ensure positive 64-bit
-        return int.from_bytes(hash_digest[:8], 'big') & ((1 << 63) - 1)
+        """Compatibility wrapper for the stable advisory-lock key helper."""
+        return postgres_lock_key(s)
 
     @db_retries.retry
     def _get_connection(self) -> sqlalchemy.pool.PoolProxiedConnection:

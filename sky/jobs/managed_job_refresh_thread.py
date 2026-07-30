@@ -118,11 +118,11 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
             self._lock.acquire()
             logger.info('Consolidation mode lock acquired')
 
-        # Wait before recovery only when some job is already claimed by a
-        # controller, or otherwise past the pure backlog states. In those
-        # cases a prior leader may still have detached controllers alive for a
-        # moment after lock release (e.g. rolling update), so recovery must not
-        # race them. Empty or pending-only backlogs can recover immediately.
+        # Wait before recovery whenever a nonterminal job exists. A previous
+        # image may have a detached scheduler that can claim a WAITING row
+        # after this check without an outer-generation fence. The fixed wait is
+        # a mixed-version drain aid; current images also serialize every claim
+        # with the durable generation.
         if managed_job_state.has_jobs_requiring_recovery_grace_wait():
             logger.info(
                 f'Waiting {_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS}s after '
@@ -130,9 +130,8 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
                 'recovery, to let any previous leader finish shutting down')
             time.sleep(_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS)
         else:
-            logger.info('No controller-owned managed jobs require a '
-                        'post-acquire grace wait; running recovery '
-                        'immediately')
+            logger.info('No nonterminal managed jobs require a post-acquire '
+                        'grace wait; running recovery immediately')
 
         # The wait above widens the window between acquiring the lock and
         # running recovery, during which the lock's underlying session could go
@@ -194,9 +193,10 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # brain, e.g. new job controllers might have been launched on the new
         # replica during rolling-update
         try:
-            managed_job_scheduler.kill_local_job_controllers()
+            managed_job_scheduler.fail_stop_local_job_controllers()
         except Exception:  # pylint: disable=broad-except
-            logger.exception('Failed to kill local controllers on lock-loss')
+            logger.exception(
+                'Failed to fail-stop local controllers on lock-loss')
         # SIGTERM to trigger graceful shutdown
         os.kill(os.getpid(), signal.SIGTERM)
 

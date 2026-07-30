@@ -34,6 +34,11 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: sqlite
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_STATE_DB_MIGRATION_MODE
             value: upgrade
       - contains:
@@ -44,6 +49,47 @@ tests:
               secretKeyRef:
                 name: external-db
                 key: connection_string
+      - notExists:
+          path: metadata.annotations["helm.sh/hook"]
+
+  - it: should block HA install and upgrade on the revision-scoped migration hook
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: pre-install,pre-upgrade
+      - equal:
+          path: metadata.annotations["helm.sh/hook-weight"]
+          value: "-10"
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: database-migration
+      - equal:
+          path: metadata.labels["skypilot.co/helm-revision"]
+          value: "0"
+
+  - it: should reject chart-managed database secrets in HA mode
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionString: postgresql://user:pass@host:5432/db
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook"
+
+  - it: should reserve migration hook annotations in HA mode
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.annotations:
+        helm.sh/hook: post-install
+    asserts:
+      - failedTemplate:
+          errorMessage: 'databaseMigration.annotations["helm.sh/hook"] is managed by guarded HA mode'
 
   - it: should use the chart-managed connection secret
     set:
@@ -57,6 +103,17 @@ tests:
               secretKeyRef:
                 name: RELEASE-NAME-db-connection
                 key: connection_string
+
+  - it: should migrate the durable request schema when PostgreSQL is selected
+    set:
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: postgres
 
   - it: should bootstrap only when fresh-schema isolation is explicit
     set:
@@ -188,6 +245,16 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "SKYPILOT_STATE_DB_MIGRATION_MODE is managed by databaseMigration and cannot be set through extraEnvs"
+
+  - it: should reject an override of the migration request-store selector
+    set:
+      apiService.dbConnectionSecretName: external-db
+      databaseConnection.extraEnvs:
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: postgres
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_REQUEST_BACKEND" is duplicated or reserved by the chart'
 
   - it: should reject duplicate shared environment names
     set:

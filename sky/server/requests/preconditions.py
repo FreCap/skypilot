@@ -10,6 +10,7 @@ import abc
 import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
+import dataclasses
 import inspect
 import time
 from typing import Any
@@ -33,6 +34,15 @@ logger = sky_logging.init_logger(__name__)
 # asyncio only keeps weak references to tasks, so without this set a
 # long-running precondition wait (up to 1 hour) could be collected.
 background_tasks: set = set()
+
+
+@dataclasses.dataclass(frozen=True)
+class DurablePrecondition:
+    """JSON representation persisted with a queue delivery."""
+
+    type_name: str
+    payload: dict[str, Any]
+    deadline: float | None
 
 
 class Precondition(abc.ABC):
@@ -211,9 +221,16 @@ class ServiceReplicaLaunchPrecondition(Precondition):
     provide for an HTTP request still being accepted.
     """
 
-    def __init__(self, request_id: str, service_name: str, service_hash: str,
-                 controller_pid: int | None, controller_ip: str | None) -> None:
-        super().__init__(request_id=request_id, timeout=0)
+    def __init__(self,
+                 request_id: str,
+                 service_name: str,
+                 service_hash: str,
+                 controller_pid: int | None,
+                 controller_ip: str | None,
+                 check_interval: float = _PRECONDITION_CHECK_INTERVAL) -> None:
+        super().__init__(request_id=request_id,
+                         timeout=0,
+                         check_interval=check_interval)
         self.service_name = service_name
         self.service_hash = service_hash
         self.controller_pid = controller_pid
@@ -232,3 +249,68 @@ class ServiceReplicaLaunchPrecondition(Precondition):
                 f'Refusing replica launch for stale service owner '
                 f'{self.service_name!r}/{self.service_hash!r}.')
         return True, None
+
+
+def serialize(precondition: Precondition | None) -> DurablePrecondition | None:
+    """Serialize every supported precondition without Python pickle."""
+    if precondition is None:
+        return None
+    deadline = (time.time() +
+                precondition.timeout if precondition.timeout > 0 else None)
+    common = {'check_interval': precondition.check_interval}
+    if isinstance(precondition, ClusterStartCompletePrecondition):
+        return DurablePrecondition(
+            type_name='cluster-start-complete.v1',
+            payload={
+                **common,
+                'cluster_name': precondition.cluster_name,
+            },
+            deadline=deadline)
+    if isinstance(precondition, ServiceReplicaLaunchPrecondition):
+        return DurablePrecondition(
+            type_name='service-replica-launch.v1',
+            payload={
+                **common,
+                'service_name': precondition.service_name,
+                'service_hash': precondition.service_hash,
+                'controller_pid': precondition.controller_pid,
+                'controller_ip': precondition.controller_ip,
+            },
+            deadline=deadline)
+    raise ValueError(
+        f'Precondition {type(precondition).__module__}.'
+        f'{type(precondition).__qualname__} has no durable representation.')
+
+
+def deserialize(type_name: str, payload: dict[str, Any],
+                request_id: str) -> Precondition:
+    """Restore one supported precondition through a closed type registry."""
+    if type_name == 'cluster-start-complete.v1':
+        return ClusterStartCompletePrecondition(
+            request_id=request_id,
+            cluster_name=str(payload['cluster_name']),
+            check_interval=float(payload['check_interval']),
+            # The absolute queue deadline owns timeout after persistence.
+            timeout=0)
+    if type_name == 'service-replica-launch.v1':
+        controller_pid = payload.get('controller_pid')
+        if controller_pid is not None:
+            controller_pid = int(controller_pid)
+        controller_ip = payload.get('controller_ip')
+        if controller_ip is not None:
+            controller_ip = str(controller_ip)
+        return ServiceReplicaLaunchPrecondition(
+            request_id=request_id,
+            service_name=str(payload['service_name']),
+            service_hash=str(payload['service_hash']),
+            controller_pid=controller_pid,
+            controller_ip=controller_ip,
+            check_interval=float(payload['check_interval']))
+    raise ValueError(f'Unknown durable precondition type {type_name!r}.')
+
+
+def check_once(type_name: str, payload: dict[str, Any],
+               request_id: str) -> tuple[bool, str | None]:
+    """Synchronously evaluate one durable precondition from a queue thread."""
+    precondition = deserialize(type_name, payload, request_id)
+    return asyncio.run(precondition.check())

@@ -565,3 +565,26 @@ run: echo "hello world"
     # Verify the dag was created successfully
     assert dag is not None
     assert len(dag.tasks) == 1
+
+
+def test_controller_origin_headers_cannot_be_overridden(monkeypatch):
+    server_owned = {
+        server_constants.CONTROLLER_INSTANCE_ID_HEADER: '96d9d1f6-8ba4-402b-85f5-27db321fd504',
+        server_constants.CONTROLLER_GENERATION_HEADER: '22',
+    }
+    monkeypatch.setattr(common.service_account_auth,
+                        'get_service_account_headers',
+                        lambda: dict(server_owned))
+    _, kwargs = common._prepare_authenticated_request_params(
+        '/route',
+        'http://api',
+        headers={
+            server_constants.CONTROLLER_INSTANCE_ID_HEADER: '96d9d1f6-8ba4-402b-85f5-27db321fd999',
+            server_constants.CONTROLLER_GENERATION_HEADER: '999',
+        })
+
+    assert kwargs['headers'][
+        server_constants.CONTROLLER_INSTANCE_ID_HEADER] == server_owned[
+            server_constants.CONTROLLER_INSTANCE_ID_HEADER]
+    assert kwargs['headers'][
+        server_constants.CONTROLLER_GENERATION_HEADER] == '22'

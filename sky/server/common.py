@@ -309,11 +309,18 @@ def _prepare_authenticated_request_params(
         server_url = get_server_url()
 
     # Prepare headers and URL for service account authentication
-    headers = service_account_auth.get_service_account_headers()
+    server_owned_headers = service_account_auth.get_service_account_headers()
+    headers = dict(server_owned_headers)
 
     # Merge with existing headers
     if 'headers' in kwargs:
         headers.update(kwargs['headers'])
+    # A nested controller cannot override the generation inherited from its
+    # server-owned environment.
+    for header in (server_constants.CONTROLLER_INSTANCE_ID_HEADER,
+                   server_constants.CONTROLLER_GENERATION_HEADER):
+        if header in server_owned_headers:
+            headers[header] = server_owned_headers[header]
     kwargs['headers'] = headers
 
     # Always use the same URL regardless of authentication type

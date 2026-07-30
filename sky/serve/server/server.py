@@ -265,24 +265,40 @@ async def tail_logs(
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
     stream_utils.ensure_request_log_storage_available()
-    executor.check_request_thread_executor_available()
-    request_task = await executor.prepare_request_async(
-        request_id=request.state.request_id,
-        request_name=request_names.RequestName.SERVE_LOGS,
-        request_body=log_body,
-        func=core.tail_logs,
-        schedule_type=api_requests.ScheduleType.SHORT,
-        request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
-        auth_user=request.state.auth_user,
-    )
-    task = executor.execute_request_in_coroutine(request_task)
-    # Cancel the coroutine after the request is done or client disconnects
-    background_tasks.add_task(task.cancel)
+    kill_request_on_disconnect = False
+    if executor.api_process_execution_enabled():
+        executor.check_request_thread_executor_available()
+        request_task = await executor.prepare_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.SERVE_LOGS,
+            request_body=log_body,
+            func=core.tail_logs,
+            schedule_type=api_requests.ScheduleType.SHORT,
+            request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
+        task = executor.execute_request_in_coroutine(request_task)
+        # Cancel the coroutine after the request is done or client disconnects
+        background_tasks.add_task(task.cancel)
+    else:
+        await executor.schedule_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.SERVE_LOGS,
+            request_body=log_body,
+            func=core.tail_logs,
+            schedule_type=api_requests.ScheduleType.SHORT,
+            request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
+        request_task = await api_requests.get_request_async(
+            request.state.request_id)
+        assert request_task is not None
+        kill_request_on_disconnect = True
     return stream_utils.stream_response_for_long_request(
         request_id=request_task.request_id,
         logs_path=request_task.log_path,
         background_tasks=background_tasks,
-        kill_request_on_disconnect=False,
+        kill_request_on_disconnect=kill_request_on_disconnect,
     )
 
 

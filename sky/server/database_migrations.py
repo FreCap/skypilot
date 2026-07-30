@@ -11,6 +11,7 @@ def initialize_central_databases() -> None:
     # cannot observe another process role's deployment setting.
     # pylint: disable=import-outside-toplevel
     from sky import global_user_state
+    from sky import skypilot_config
     from sky.jobs import state_storage
     from sky.serve import serve_state
 
@@ -19,8 +20,15 @@ def initialize_central_databases() -> None:
     # effective PostgreSQL schema is empty before any companion schema creates
     # objects in it.
     global_user_state.initialize_and_get_db()
+    skypilot_config.initialize_and_get_db()
     serve_state.get_database_engine()
     state_storage.initialize_and_get_db()
+    if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
+        # Keep local and compatibility SQLite installations independent from
+        # this PostgreSQL-only central schema.
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import postgres as request_postgres
+        request_postgres.initialize_and_get_db()
 
 
 def main() -> None:
