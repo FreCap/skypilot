@@ -1664,23 +1664,28 @@ def stream_logs_by_id(job_id: int,
 
         backend = backends.CloudVmRayBackend()
 
+        snapshot: managed_job_state.JobLogStreamSnapshot | None = None
         while True:
             assert managed_job_status is not None, job_id
             if not _should_keep_logging(managed_job_status):
                 break
-            snapshot = get_stream_target_snapshot()
+            if snapshot is None:
+                snapshot = get_stream_target_snapshot()
             task_id = snapshot.task_id
             managed_job_status = snapshot.status
             pool = snapshot.pool
             cluster_name = snapshot.cluster_name
             job_id_to_tail = snapshot.job_id_on_pool_cluster
             task_name = snapshot.task_name
-
+            snapshot = None
             # We wait for managed_job_status to be not None above. Once we see
             # that it's not None, we don't expect it to every become None
             # again.
             assert managed_job_status is not None, (job_id, task_id,
                                                     managed_job_status)
+            if not _should_keep_logging(managed_job_status):
+                break
+
             assert task_id is not None, (job_id, task_id)
 
             handle = None
@@ -1732,8 +1737,6 @@ def stream_logs_by_id(job_id: int,
                     time.sleep(_PROVISION_LOG_POLL_GAP_SECONDS)
                     waited += _PROVISION_LOG_POLL_GAP_SECONDS
                 snapshot = get_stream_target_snapshot()
-                task_id = snapshot.task_id
-                managed_job_status = snapshot.status
                 continue
             assert (managed_job_status ==
                     managed_job_state.ManagedJobStatus.RUNNING)

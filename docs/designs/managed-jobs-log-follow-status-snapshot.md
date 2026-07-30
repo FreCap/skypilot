@@ -2,16 +2,25 @@
 
 ## Behavior contract
 
-`stream_logs_by_id()` uses `get_latest_task_id_status()` as the single source
-for both initial lifecycle status and the task selected when active log
-following starts. It must not read the scalar job status and then independently
-read the latest task at that boundary, because those reads can observe
-different recovery epochs. The later remote-log loop retains its existing
-scalar status refreshes.
+`stream_logs_by_id()` uses `get_latest_task_id_status()` to wait for the first
+initialized lifecycle status. Once active log following starts, the unfiltered
+path uses `get_latest_log_stream_snapshot()` as the single source for the
+latest task, lifecycle status, and routing fields. Those values must not be
+read in separate sessions because the reads can observe different recovery
+epochs. The remote-log loop retains its existing scalar status refreshes after
+tail attempts.
+
+When the target log is unavailable, the follower waits for the existing poll
+interval and reads one new combined snapshot. That post-wait snapshot is
+carried into the next loop iteration. It must not be discarded and immediately
+reread before target selection.
 
 When a task filter is present, the follower first reads the task inventory so
 an invalid task can fail immediately without waiting for job initialization.
 The inventory also supplies the task count and avoids a separate count query.
+The active filtered path keeps the existing split reads: latest lifecycle
+status still comes from the job-level reducer, while routing must use the
+explicitly selected task rather than the latest task.
 
 An initial task inventory is never authoritative after a terminal latest-task
 status is observed. The inventory read precedes the status read, so a job can
@@ -23,10 +32,12 @@ reading log paths, cleanup timestamps, and final task statuses.
 
 An uninitialized latest-task status is polled once per second until it becomes
 non-null. Cancellation and terminal statuses stop active following through the
-existing `_should_keep_logging()` policy. The remote-log loop continues to
-refresh scalar status after each tail attempt. Active JobGroup transitions
-continue to use `_wait_for_next_task()` and the existing managed-job polling
-interval.
+existing `_should_keep_logging()` policy. A terminal status observed by the
+post-wait snapshot stops before handle lookup or remote tailing. A recovered
+runnable target observed by that snapshot is used directly on the next
+iteration. The remote-log loop continues to refresh scalar status after each
+tail attempt. Active JobGroup transitions continue to use
+`_wait_for_next_task()` and the existing managed-job polling interval.
 
 Filtered and unfiltered terminal jobs preserve the existing final log and exit
 code behavior. A terminal transition that occurs before, during, or after the
@@ -35,16 +46,17 @@ still return before the initial status wait.
 
 ## Performance contract
 
-For an unfiltered active job, initial database reads fall from a task count,
-scalar job status, and latest-task status to a task count and latest-task
-status. For a filtered active job, reads fall from task count, task inventory,
-scalar job status, and latest-task status to task inventory and latest-task
-status.
+For an unfiltered active job, one combined query selects latest-task status and
+routing fields from one recovery snapshot. When the log target remains
+unavailable across a poll interval, the post-wait snapshot serves the next
+target-selection iteration, so each poll cycle performs one combined database
+read instead of two back-to-back reads. Initial status discovery, task counts,
+filtered-task reads, polling cadence, and scalar status refreshes after remote
+tail attempts are unchanged.
 
 Terminal paths perform at most one final inventory refresh. Filtered terminal
-paths still save the separate task-count read, while unfiltered terminal paths
-retain the original read count. Polling cadence, asymptotic work, remote
-backend calls, threads, and timers are unchanged.
+paths still avoid the separate task-count read. Polling cadence, asymptotic
+work, remote backend calls, threads, and timers are unchanged.
 
 ## Alternatives
 
@@ -65,7 +77,7 @@ persisted-state change. Rollback is a code rollback.
 status polling, no scalar status reads, active follow task selection, immediate
 terminal transitions, terminal transitions after a `None` status, stale
 initial task inventories, filtered task validation, exact query-call counts,
-and remote log-call counts.
+post-wait snapshot reuse for recovered targets, and remote log-call counts.
 
 `tests/unit_tests/test_sky/jobs/test_utils.py` covers the adjacent task-filter
 surface. Pull-request CI runs both under `Python Tests - Unit Tests`;

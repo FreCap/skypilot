@@ -86,6 +86,59 @@ class TestWaitForNextTask:
 class TestStreamLogsByIdLifecycle:
     """Checks integration with the full managed-job log follower."""
 
+    def test_recovered_target_reuses_post_wait_snapshot(self, monkeypatch):
+        backend = _FakeBackend()
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        snapshot_read = mock.Mock(side_effect=[
+            managed_job_state.JobLogStreamSnapshot(0, running, None, None, None,
+                                                   None),
+            managed_job_state.JobLogStreamSnapshot(0, running, 'pool-a',
+                                                   'pool-cluster', 73, 'first'),
+        ])
+        latest_status_read = mock.Mock(return_value=(0, running))
+        status_read = mock.Mock(
+            return_value=managed_job_state.ManagedJobStatus.SUCCEEDED)
+        sleep = mock.Mock()
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        handle_lookup = mock.Mock(return_value=_FakeHandle())
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks',
+                            mock.Mock(return_value=1))
+        monkeypatch.setattr(managed_job_state, 'get_status', status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
+                            latest_status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', handle_lookup)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayResourceHandle',
+                            _FakeHandle)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42, follow=True)
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        assert snapshot_read.call_count == 2
+        latest_status_read.assert_called_once_with(42)
+        status_read.assert_called_once_with(42)
+        handle_lookup.assert_called_once_with('pool-cluster')
+        assert backend.tail_calls == 1
+        assert backend.status_calls == 1
+        assert sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS
+
     @pytest.mark.parametrize(
         'terminal_status',
         managed_job_state.ManagedJobStatus.terminal_statuses(),
