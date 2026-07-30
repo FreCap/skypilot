@@ -1,7 +1,7 @@
 # Durable SkyServe Replica Actions
 
-Status: M0 design accepted; implementation, deployment, and removal gates are
-open
+Status: M0 design and contract correction accepted; implementation,
+deployment, and removal gates are open
 
 Last updated: 2026-07-30
 
@@ -184,6 +184,12 @@ never silently treated as another retry. A down action references the same
 incarnation and may only be superseded by a durable logical-target or terminal
 service transition.
 
+The canonical action spec is at most 65,536 UTF-8 bytes. `last_outcome` is at
+most 16,384 UTF-8 bytes. Both must be JSON objects; the spec has a positive
+integer `schema_version`. PostgreSQL enforces JSON shape and serialized-size
+ceilings, while application validation enforces canonical form and redaction
+before persistence.
+
 ### PostgreSQL schema and migration ordering
 
 Two additive migrations are required. Serve schema 032 runs first and adds:
@@ -248,8 +254,17 @@ Required constraints and indexes:
 - an all-or-none constraint for action ID, positive attempt, and payload hash;
 - a bounded JSON array of provider operation/idempotency references stored on
   the immutable request attempt, because one SkyPilot request may perform
-  bounded internal placement/failover operations; and
+  bounded internal placement/failover operations;
+- at most 32 provider operation reference objects and at most 16,384 serialized
+  UTF-8 bytes for the complete array; and
 - an index on `resource_action_id`.
+
+Every provider operation reference is a redacted JSON object with a positive
+integer `schema_version`, provider/adapter identity, bounded operation or
+idempotency reference when available, phase, and observation time. It never
+contains credentials, request bodies, environment values, or raw exceptions.
+Application code rejects an over-limit append before the claim-fenced update;
+PostgreSQL repeats the array-count, JSON-type, and serialized-size checks.
 
 Requests that predate this design or are unrelated to resource actions keep
 the correlation fields null.
@@ -326,6 +341,29 @@ SUPERSEDED
 ```
 
 Allowed transitions are closed in code and constrained in tests.
+
+The exact transition graph is:
+
+```text
+PLANNED       -> QUEUED | SUPERSEDED
+QUEUED        -> RUNNING | VERIFYING | RETRY_WAIT |
+                 TERMINAL_FAILED | SUPERSEDED
+RUNNING       -> VERIFYING | RETRY_WAIT | SUCCEEDED | TERMINAL_FAILED
+VERIFYING     -> PLANNED | RETRY_WAIT | SUCCEEDED |
+                 TERMINAL_FAILED | SUPERSEDED
+RETRY_WAIT    -> QUEUED | VERIFYING | SUPERSEDED
+SUCCEEDED     -> (none)
+TERMINAL_FAILED -> (none)
+SUPERSEDED    -> (none)
+```
+
+The state-shape and provider-certainty guards further narrow those edges:
+`VERIFYING -> PLANNED` is only attempt-zero legacy backfill;
+`QUEUED -> SUPERSEDED` atomically terminalizes an unstarted request;
+`VERIFYING/RETRY_WAIT -> SUPERSEDED` requires provider absence; and no edge may
+supersede a possibly started mutation. Attempt admission is the only operation
+that takes `PLANNED` or `RETRY_WAIT` to `QUEUED` and installs the new immutable
+request in the same transaction.
 
 State invariants are:
 
@@ -998,6 +1036,11 @@ attempt-zero backfill contradictions plus a missing lost-provider-response
 fault point; those were also resolved in place. The third review returned
 `ACCEPT` for content SHA-256
 `f03f909870dcf1ebc8a8af4bc859b348d73f5e9310601059b5db2f6925cce3c2`.
+The M1 implementation map then found that “bounded” provider references and
+the “closed” transition set lacked executable numeric/edge contracts. This
+revision added those contracts and its adversarial re-review returned `ACCEPT`
+for content SHA-256
+`2646ea5c2a994ad35cd2afb8767e872d9e40e69aaa4ea9a589259e05dc31ef34`.
 No implementation or live acceptance evidence has been recorded yet.
 
 Each stacked commit must add exact commands, counts, commit SHA, image digest,
@@ -1007,7 +1050,7 @@ invariant.
 
 ## Closed Gates
 
-- M0 adversarial review accepted on 2026-07-30.
+- M0 design and contract correction re-review accepted on 2026-07-30.
 
 ## Open Gates
 
