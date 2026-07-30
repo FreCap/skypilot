@@ -11,6 +11,7 @@ Usage example:
 
 """
 from collections.abc import Iterator
+import datetime
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from sky.client import common as client_common
 from sky.client import interactive_utils
 from sky.client.api_auth import api_login
 from sky.client.api_auth import api_logout
+from sky.events import api_models as event_api_models
 from sky.jobs import scheduler
 from sky.jobs import utils as managed_job_utils
 from sky.schemas.api import responses
@@ -74,10 +76,12 @@ if typing.TYPE_CHECKING:
     from sky import backends
     from sky import catalog
     from sky import models
+    from sky.events import client as events_client
     from sky.provision.kubernetes import utils as kubernetes_utils
     from sky.skylet import job_lib
 else:
     requests = adaptors_common.LazyImport('requests')
+    events_client = adaptors_common.LazyImport('sky.events.client')
     # only used in api_stop()
     psutil = adaptors_common.LazyImport('psutil')
 
@@ -2022,6 +2026,46 @@ def cost_report(
     response = server_common.make_authenticated_request(
         'POST', '/cost_report', json=json.loads(body.model_dump_json()))
     return server_common.get_request_id(response)
+
+
+def list_events(  # pylint: disable=redefined-outer-name
+    *,
+    cluster: str | None = None,
+    workspaces: list[str] | tuple[str, ...] | None = None,
+    kinds: list[event_api_models.EventKind | str] |
+    tuple[event_api_models.EventKind | str, ...] | None = None,
+    outcomes: list[event_api_models.EventOutcome | str] |
+    tuple[event_api_models.EventOutcome | str, ...] | None = None,
+    actor_ids: list[str] | tuple[str, ...] | None = None,
+    actor_types: list[event_api_models.EventActorType | str] |
+    tuple[event_api_models.EventActorType | str, ...] | None = None,
+    target_type: event_api_models.EventTargetType | str | None = None,
+    target_id: str | None = None,
+    target_name: str | None = None,
+    request_id: str | None = None,
+    since: datetime.datetime | str | None = None,
+    until: datetime.datetime | str | None = None,
+    direction: event_api_models.TraversalDirection |
+    str = (event_api_models.TraversalDirection.OLDER),
+    limit: int = 50,
+    cursor: str | None = None,
+) -> event_api_models.EventsPage:
+    """Returns one actor-aware operational event page."""
+    return events_client.list_events(cluster=cluster,
+                                     workspaces=workspaces,
+                                     kinds=kinds,
+                                     outcomes=outcomes,
+                                     actor_ids=actor_ids,
+                                     actor_types=actor_types,
+                                     target_type=target_type,
+                                     target_id=target_id,
+                                     target_name=target_name,
+                                     request_id=request_id,
+                                     since=since,
+                                     until=until,
+                                     direction=direction,
+                                     limit=limit,
+                                     cursor=cursor)
 
 
 # === Storage APIs ===

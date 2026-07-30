@@ -3,6 +3,7 @@
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import datetime
 import os
 import shutil
@@ -19,9 +20,14 @@ from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky import core
 from sky import global_user_state
+from sky.events import api_models as event_api_models
 from sky.jobs.server import core as managed_jobs_core
 from sky.serve.server import core as serve_core
 from sky.server import daemons
+from sky.server.events import cursors as event_cursors
+from sky.server.events import emission as event_emission
+from sky.server.events import schema as event_schema
+from sky.server.events import store as event_store
 from sky.server.requests import cutover
 from sky.server.requests import executor
 from sky.server.requests import payloads
@@ -123,6 +129,37 @@ def _controller_request(
     )
 
 
+def _event_request(
+    request_id: str,
+    *,
+    workspace: str = 'default',
+    actor_id: str = 'user',
+    actor_name: str = 'alice@example.com',
+    actor_type: str = 'sso',
+    cluster_name: str = 'trainer',
+    kind: event_api_models.EventKind = (
+        event_api_models.EventKind.CLUSTER_LAUNCH),
+    should_enqueue: bool = True,
+) -> requests.Request:
+    request = _request(request_id, should_enqueue=should_enqueue)
+    request.name = f'sky.{kind.value.split(".", 1)[1]}'
+    request.user_id = actor_id
+    request.cluster_name = cluster_name
+    request.event_context = {
+        'version': 1,
+        'kind': kind.value,
+        'actor_name': actor_name,
+        'actor_type': actor_type,
+        'workspace': workspace,
+        'targets': [{
+            'type': 'cluster',
+            'id': f'hash-{cluster_name}',
+            'name': cluster_name,
+        }],
+    }
+    return request
+
+
 def _controller_leader(
     engine: sqlalchemy.engine.Engine,
     monkeypatch,
@@ -168,13 +205,33 @@ def _claim(backend: request_postgres.PostgresRequestBackend,
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '003'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '004'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
         'api_request_store_metadata', 'api_controller_leadership',
-        'api_controller_action_reservations'
+        'api_controller_action_reservations', 'resource_events',
+        'resource_event_targets'
     }.issubset(inspector.get_table_names())
+    request_columns = {
+        column['name'] for column in inspector.get_columns('api_requests')
+    }
+    assert 'event_context' in request_columns
+    assert {
+        'ix_resource_events_workspace_sequence',
+        'ix_resource_events_workspace_actor_sequence',
+        'ix_resource_events_request',
+        'ix_resource_events_retention',
+    }.issubset(
+        {index['name'] for index in inspector.get_indexes('resource_events')})
+    with engine.connect() as connection:
+        authority = connection.execute(
+            sqlalchemy.select(
+                event_schema.REQUEST_STORE_METADATA.c.value).where(
+                    event_schema.REQUEST_STORE_METADATA.c.key ==
+                    event_schema.CURSOR_AUTHORITY_METADATA_KEY)).scalar_one()
+    assert uuid.UUID(authority['authority_id'])
+    assert authority['event_sequence'] == 0
     leadership_columns = {
         column['name']
         for column in inspector.get_columns('api_controller_leadership')
@@ -1179,3 +1236,308 @@ def test_claim_predicate_uses_database_clock(request_database):
     assert not backend.heartbeat_claim(
         storage.ExecutionClaim(item.request_id, item.execution_generation,
                                item.claim_token))
+
+
+def test_terminal_event_commits_with_request_and_queue_exactly_once(
+        request_database):
+    engine, backend = request_database
+    request = _event_request('event-success')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+
+    assert backend.transition_request_terminal(
+        request.request_id, requests.RequestStatus.SUCCEEDED,
+        event_api_models.EventCause.HANDLER_SUCCEEDED.value)
+    assert not backend.transition_request_terminal(
+        request.request_id, requests.RequestStatus.SUCCEEDED,
+        event_api_models.EventCause.HANDLER_SUCCEEDED.value)
+
+    with engine.connect() as connection:
+        stored_request = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id)).mappings().one()
+        event_rows = list(
+            connection.execute(
+                sqlalchemy.select(event_schema.RESOURCE_EVENTS).where(
+                    event_schema.RESOURCE_EVENTS.c.source_request_id ==
+                    request.request_id)).mappings())
+        target_rows = list(
+            connection.execute(
+                sqlalchemy.select(
+                    event_schema.RESOURCE_EVENT_TARGETS)).mappings())
+        queue_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 request_postgres.QUEUE)).scalar_one()
+
+    assert stored_request['status'] == requests.RequestStatus.SUCCEEDED.value
+    assert len(event_rows) == 1
+    assert event_rows[0]['event_sequence'] == 1
+    assert event_rows[0]['kind'] == 'cluster.launch'
+    assert event_rows[0]['outcome'] == 'succeeded'
+    assert event_rows[0]['cause'] == 'handler_succeeded'
+    assert event_rows[0]['message'] == 'Cluster launch succeeded.'
+    assert event_rows[0]['actor_id'] == 'user'
+    assert event_rows[0]['actor_name'] == 'alice@example.com'
+    assert event_rows[0]['actor_type'] == 'sso'
+    assert event_rows[0]['workspace'] == 'default'
+    assert event_rows[0]['source_execution_generation'] == 0
+    assert len(target_rows) == 1
+    assert target_rows[0]['target_id'] == 'hash-trainer'
+    assert target_rows[0]['target_name'] == 'trainer'
+    assert queue_count == 0
+
+
+def test_event_insert_failure_rolls_back_terminal_transition_and_delivery(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    request = _event_request('event-rollback')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    monkeypatch.setattr(
+        request_postgres.event_emission, 'emit_terminal_event',
+        mock.Mock(side_effect=RuntimeError('injected event failure')))
+
+    with pytest.raises(RuntimeError, match='injected event failure'):
+        backend.transition_request_terminal(
+            request.request_id,
+            requests.RequestStatus.FAILED,
+            event_api_models.EventCause.HANDLER_FAILED.value,
+            error=RuntimeError('provider detail'))
+
+    with engine.connect() as connection:
+        status = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.status).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id)).scalar_one()
+        queue_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 request_postgres.QUEUE)).scalar_one()
+        event_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 event_schema.RESOURCE_EVENTS)).scalar_one()
+    assert status == requests.RequestStatus.PENDING.value
+    assert queue_count == 1
+    assert event_count == 0
+
+
+def test_null_context_and_nonterminal_retry_emit_nothing(request_database):
+    engine, backend = request_database
+    request = _request('event-opt-out')
+    request.name = 'sky.start'
+    request.cluster_name = 'trainer'
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    assert backend.set_event_workspace(request.request_id, 'default')
+    asyncio.run(
+        backend.update_status_async(request.request_id,
+                                    requests.RequestStatus.WAITING))
+    assert backend.transition_request_terminal(
+        request.request_id, requests.RequestStatus.CANCELLED,
+        event_api_models.EventCause.EXPLICIT_CANCEL.value)
+    with engine.connect() as connection:
+        count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 event_schema.RESOURCE_EVENTS)).scalar_one()
+    assert count == 0
+
+
+def test_incomplete_context_pre_execution_terminal_emits_nothing(
+        request_database):
+    engine, backend = request_database
+    request = _event_request('event-before-workspace')
+    assert request.event_context is not None
+    request.event_context['workspace'] = None
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+
+    assert backend.transition_request_terminal(
+        request.request_id,
+        requests.RequestStatus.FAILED,
+        event_api_models.EventCause.PRECONDITION_FAILED.value,
+        error=RuntimeError('precondition detail'),
+    )
+    with engine.connect() as connection:
+        count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 event_schema.RESOURCE_EVENTS)).scalar_one()
+    assert count == 0
+
+
+def test_ambiguous_terminal_cause_emits_safe_canceled_event(request_database):
+    engine, backend = request_database
+    request = _event_request('event-ambiguous')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+
+    assert backend.transition_request_terminal(
+        request.request_id,
+        requests.RequestStatus.CANCELLED,
+        event_api_models.EventCause.EXECUTION_LEASE_EXPIRED.value,
+    )
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(event_schema.RESOURCE_EVENTS).where(
+                event_schema.RESOURCE_EVENTS.c.source_request_id ==
+                request.request_id)).mappings().one()
+    assert row['outcome'] == event_api_models.EventOutcome.CANCELED.value
+    assert row['cause'] == (
+        event_api_models.EventCause.EXECUTION_LEASE_EXPIRED.value)
+    assert row['message'] == (
+        'Cluster launch was interrupted. The external outcome may be '
+        'uncertain.')
+
+
+def test_event_store_enforces_workspace_filters_and_signed_cursors(
+        request_database, monkeypatch):
+    _, backend = request_database
+    monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
+                       request_postgres.POSTGRES_REQUEST_BACKEND)
+    for request_id, workspace, cluster_name in [
+        ('research-old', 'research', 'trainer-a'),
+        ('research-new', 'research', 'trainer-b'),
+        ('finance-hidden', 'finance', 'ledger'),
+    ]:
+        request = _event_request(request_id,
+                                 workspace=workspace,
+                                 cluster_name=cluster_name)
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+        assert backend.transition_request_terminal(
+            request_id, requests.RequestStatus.SUCCEEDED,
+            event_api_models.EventCause.HANDLER_SUCCEEDED.value)
+
+    scope = event_store.AuthorizationScope(
+        principal_id='alice',
+        is_admin=False,
+        effective_workspaces=('research',),
+    )
+    targeted = event_store.list_events(
+        event_store.EventQuery(
+            target_type=event_api_models.EventTargetType.CLUSTER,
+            target_id='hash-trainer-a',
+            limit=100,
+        ), scope)
+    assert [item.request_id for item in targeted.items] == ['research-old']
+    query = event_store.EventQuery(workspaces=('research',), limit=1)
+    first = event_store.list_events(query, scope)
+    assert len(first.items) == 1
+    assert first.items[0].workspace == 'research'
+    assert first.has_more
+    assert first.next_cursor is not None
+
+    second = event_store.list_events(
+        dataclasses.replace(query, cursor=first.next_cursor), scope)
+    assert len(second.items) == 1
+    assert second.items[0].workspace == 'research'
+    assert second.items[0].id != first.items[0].id
+    assert not second.has_more
+
+    changed_filter = dataclasses.replace(
+        query,
+        cursor=first.next_cursor,
+        outcomes=(event_api_models.EventOutcome.SUCCEEDED,))
+    with pytest.raises(event_cursors.StaleCursorError):
+        event_store.list_events(changed_filter, scope)
+    with pytest.raises(event_cursors.StaleCursorError):
+        event_store.list_events(
+            dataclasses.replace(query, cursor=first.next_cursor),
+            dataclasses.replace(scope, principal_id='bob'))
+    with pytest.raises(event_cursors.StaleCursorError):
+        event_store.list_events(
+            dataclasses.replace(query, cursor=first.next_cursor),
+            dataclasses.replace(scope,
+                                effective_workspaces=('finance', 'research')))
+
+    new_request = _event_request('research-latest',
+                                 workspace='research',
+                                 cluster_name='trainer-c')
+    assert asyncio.run(backend.create_if_not_exists_async(new_request))
+    assert backend.transition_request_terminal(
+        new_request.request_id, requests.RequestStatus.FAILED,
+        event_api_models.EventCause.HANDLER_FAILED.value)
+    newer = event_store.list_events(
+        event_store.EventQuery(
+            workspaces=('research',),
+            direction=(event_api_models.TraversalDirection.NEWER),
+            cursor=first.poll_cursor,
+            limit=100), scope)
+    assert [item.request_id for item in newer.items] == ['research-latest']
+    assert newer.items[0].outcome == event_api_models.EventOutcome.FAILED
+
+
+def test_poll_cursor_does_not_skip_an_event_committed_after_snapshot(
+        request_database, monkeypatch):
+    engine, _ = request_database
+    monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
+                       request_postgres.POSTGRES_REQUEST_BACKEND)
+    request = _event_request('late-commit')
+    emission_row = {
+        'request_id': request.request_id,
+        'name': request.name,
+        'user_id': request.user_id,
+        'execution_generation': 1,
+        'event_context': request.event_context,
+    }
+    scope = event_store.AuthorizationScope(principal_id='admin',
+                                           is_admin=True,
+                                           effective_workspaces=None)
+
+    writer = engine.connect()
+    transaction = writer.begin()
+    try:
+        assert event_emission.emit_terminal_event(
+            writer,
+            emission_row,
+            status=requests.RequestStatus.SUCCEEDED.value,
+            cause=event_api_models.EventCause.HANDLER_SUCCEEDED,
+        )
+        before_commit = event_store.list_events(
+            event_store.EventQuery(
+                direction=event_api_models.TraversalDirection.NEWER), scope)
+        assert before_commit.items == []
+        transaction.commit()
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        writer.close()
+
+    after_commit = event_store.list_events(
+        event_store.EventQuery(
+            direction=event_api_models.TraversalDirection.NEWER,
+            cursor=before_commit.poll_cursor,
+        ), scope)
+    assert [item.request_id for item in after_commit.items] == ['late-commit']
+
+
+def test_event_retention_batches_and_cascades_targets(request_database,
+                                                      monkeypatch):
+    engine, backend = request_database
+    monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
+                       request_postgres.POSTGRES_REQUEST_BACKEND)
+    for request_id in ('expired-event', 'fresh-event'):
+        request = _event_request(request_id)
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+        assert backend.transition_request_terminal(
+            request_id, requests.RequestStatus.SUCCEEDED,
+            event_api_models.EventCause.HANDLER_SUCCEEDED.value)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(event_schema.RESOURCE_EVENTS).where(
+                event_schema.RESOURCE_EVENTS.c.source_request_id ==
+                'expired-event').values(
+                    occurred_at=(sqlalchemy.func.clock_timestamp() -
+                                 datetime.timedelta(hours=2))))
+
+    assert event_store.delete_expired_events(1, batch_size=1) == 1
+    assert event_store.delete_expired_events(1, batch_size=1) == 0
+    with engine.connect() as connection:
+        events = list(
+            connection.execute(
+                sqlalchemy.select(event_schema.RESOURCE_EVENTS.c.
+                                  source_request_id)).scalars())
+        target_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(event_schema.RESOURCE_EVENT_TARGETS)).scalar_one()
+    assert events == ['fresh-event']
+    assert target_count == 1

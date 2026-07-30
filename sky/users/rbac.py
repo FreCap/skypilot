@@ -109,6 +109,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'POST'
     },
     {
+        'path': '/events',
+        'method': 'GET'
+    },
+    {
         'path': '/queue',
         'method': 'POST'
     },

@@ -176,6 +176,7 @@ from sky.utils.registry import JOBS_RECOVERY_STRATEGY_REGISTRY
 from sky.utils.status_lib import ClusterStatus
 
 image = adaptors_common.LazyImport('sky.container_images.client')
+events = adaptors_common.LazyImport('sky.events')
 
 # Aliases.
 IBM = clouds.IBM
@@ -298,6 +299,7 @@ __all__ = [
     'JOBS_RECOVERY_STRATEGY_REGISTRY',
     # Batch processing
     'batch',
+    'events',
 ]
 
 # --------------------- Client SDK namespace --------------------- #

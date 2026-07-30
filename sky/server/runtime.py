@@ -32,6 +32,7 @@ from sky.server import file_mount_uploads
 from sky.server import metrics
 from sky.server import plugins
 from sky.server.blob import blob_storage as bs
+from sky.server.events import store as operational_event_store
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
@@ -295,6 +296,10 @@ def _start_background_loop(role: str, host: str,
         background.create_task(
             _singleton_task('cluster-event-retention',
                             global_user_state.cluster_event_retention_daemon))
+        if _uses_postgres_requests():
+            background.create_task(
+                _singleton_task('operational-event-retention',
+                                operational_event_store.retention_daemon))
         background.create_task(
             _singleton_task('job-event-retention',
                             managed_job_state.job_event_retention_daemon))

@@ -22,8 +22,11 @@ from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 import sky
 from sky import sky_logging
+from sky.events import api_models as event_api_models
 from sky.server import constants as server_constants
 from sky.server import daemons
+from sky.server.events import emission as event_emission
+from sky.server.events import models as event_models
 from sky.server.requests import preconditions
 from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
@@ -103,6 +106,7 @@ REQUESTS = sqlalchemy.Table(
     sqlalchemy.Column('cancel_acknowledged_at',
                       sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column('interrupted_reason', sqlalchemy.Text),
+    sqlalchemy.Column('event_context', postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('updated_at',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
@@ -949,24 +953,25 @@ def fence_stale_controller_claims(instance_id: str,
                             updated_at=now))
                 replayed += 1
                 continue
-            connection.execute(
-                sqlalchemy.update(REQUESTS).where(
-                    REQUESTS.c.request_id == row['request_id']).values(
-                        status=requests_lib.RequestStatus.CANCELLED.value,
-                        pid=None,
-                        claim_token=None,
-                        worker_instance_id=None,
-                        lease_expires_at=None,
-                        heartbeat_at=None,
-                        should_retry=True,
-                        finished_at=now,
-                        interrupted_reason=(
-                            'Controller leadership changed with an ambiguous '
-                            'mutating outcome.'),
-                        updated_at=now))
-            connection.execute(
-                sqlalchemy.delete(QUEUE).where(
-                    QUEUE.c.request_id == row['request_id']))
+            transitioned = _terminalize_locked_request(
+                connection,
+                row,
+                status=requests_lib.RequestStatus.CANCELLED,
+                cause=event_api_models.EventCause.CONTROLLER_LEADERSHIP_LOST,
+                values={
+                    'pid': None,
+                    'claim_token': None,
+                    'worker_instance_id': None,
+                    'lease_expires_at': None,
+                    'heartbeat_at': None,
+                    'should_retry': True,
+                    'finished_at': now,
+                    'interrupted_reason':
+                        ('Controller leadership changed with an ambiguous '
+                         'mutating outcome.'),
+                })
+            if not transitioned:
+                continue
             connection.execute(
                 sqlalchemy.update(CONTROLLER_ACTION_RESERVATIONS).where(
                     CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id ==
@@ -1187,6 +1192,61 @@ def _mark_controller_action_state(
                        updated_at=sqlalchemy.func.clock_timestamp()))
 
 
+def _terminalize_locked_request(
+    connection: sqlalchemy.engine.Connection,
+    request_row: sqlalchemy.engine.RowMapping | dict[str, Any],
+    *,
+    status: requests_lib.RequestStatus,
+    cause: event_api_models.EventCause,
+    values: dict[str, Any],
+    extra_predicates: tuple[sqlalchemy.ColumnElement[bool], ...] = (),
+    delete_queue: bool = True,
+) -> bool:
+    """Commit one guarded terminal transition and its event atomically.
+
+    The caller must hold a row lock for ``request_row`` in this transaction.
+    """
+    if status not in requests_lib.RequestStatus.finished_status():
+        raise ValueError(f'Not a terminal request status: {status.value}')
+    existing_status = requests_lib.RequestStatus(str(request_row['status']))
+    if existing_status in requests_lib.RequestStatus.finished_status():
+        return False
+
+    terminal_values = dict(values)
+    terminal_values['status'] = status.value
+    terminal_values['updated_at'] = sqlalchemy.func.clock_timestamp()
+    result = connection.execute(
+        sqlalchemy.update(REQUESTS).where(
+            REQUESTS.c.request_id == request_row['request_id'],
+            REQUESTS.c.status.in_([
+                active.value
+                for active in requests_lib.RequestStatus.active_statuses()
+            ]), *extra_predicates).values(**terminal_values))
+    if result.rowcount != 1:
+        return False
+
+    emission_row = dict(request_row)
+    emission_row.update({
+        key: value
+        for key, value in terminal_values.items()
+        if not isinstance(value, sqlalchemy.sql.elements.ClauseElement)
+    })
+    emission_row['status'] = status.value
+    if delete_queue:
+        connection.execute(
+            sqlalchemy.delete(QUEUE).where(
+                QUEUE.c.request_id == request_row['request_id']))
+    # Allocate the globally ordered event sequence after all generic request
+    # and delivery work, minimizing how long this transaction holds the
+    # sequence metadata row lock. Caller-specific reservation updates may
+    # still follow in the same short transaction.
+    event_emission.emit_terminal_event(connection,
+                                       emission_row,
+                                       status=status.value,
+                                       cause=cause)
+    return True
+
+
 class PostgresRequestBackend(request_storage.RequestBackend):
     """PostgreSQL implementation of request persistence."""
 
@@ -1234,6 +1294,71 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             _controller_claim_is_current(),
         )
 
+    def _update_event_context(
+        self,
+        request_id: str,
+        update: Callable[[event_models.EventContext],
+                         event_models.EventContext],
+    ) -> bool:
+        engine = initialize_and_get_db()
+        with engine.begin() as connection:
+            row = connection.execute(
+                sqlalchemy.select(REQUESTS.c.event_context).where(
+                    REQUESTS.c.request_id == request_id,
+                    REQUESTS.c.status.in_([
+                        status.value for status in
+                        requests_lib.RequestStatus.active_statuses()
+                    ]), *self._fenced_request_predicates(
+                        request_id)).with_for_update()).mappings().first()
+            if row is None:
+                return False
+            # Requests written by an older binary during a rolling upgrade
+            # intentionally opt out. They must still execute normally.
+            if row['event_context'] is None:
+                return True
+            context = event_models.EventContext.model_validate(
+                row['event_context'])
+            updated = update(context)
+            result = connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == request_id,
+                    REQUESTS.c.status.in_([
+                        status.value for status in
+                        requests_lib.RequestStatus.active_statuses()
+                    ]), *self._fenced_request_predicates(request_id)).values(
+                        event_context=updated.durable_dict(),
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            if result.rowcount != 1:
+                raise RuntimeError(
+                    f'Operational event context update lost its execution '
+                    f'fence for {request_id}.')
+        return True
+
+    def set_event_workspace(self, request_id: str, workspace: str) -> bool:
+
+        def update(
+                context: event_models.EventContext
+        ) -> event_models.EventContext:
+            if context.workspace is not None and context.workspace != workspace:
+                raise RuntimeError(
+                    f'Operational event workspace changed for {request_id}.')
+            return context.with_workspace(workspace)
+
+        return self._update_event_context(request_id, update)
+
+    def set_event_target_id(self, request_id: str, target_id: str) -> bool:
+
+        def update(
+                context: event_models.EventContext
+        ) -> event_models.EventContext:
+            current = context.targets[0].id
+            if current is not None and current != target_id:
+                raise RuntimeError(
+                    f'Operational event target changed for {request_id}.')
+            return context.with_primary_target_id(target_id)
+
+        return self._update_event_context(request_id, update)
+
     def get_request(
             self,
             request_id: str,
@@ -1275,11 +1400,35 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             if request is not None:
                 values = _request_values_for_db(request)
                 values.pop('request_id')
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id == request_id,
-                        *self._fenced_request_predicates(request_id)).values(
-                            **values))
+                original_status = requests_lib.RequestStatus(row['status'])
+                if (original_status
+                        in requests_lib.RequestStatus.active_statuses() and
+                        request.status
+                        in requests_lib.RequestStatus.finished_status()):
+                    if request.terminal_cause is None:
+                        raise RuntimeError(
+                            'PostgreSQL terminal request updates require a '
+                            'closed terminal cause.')
+                    _terminalize_locked_request(
+                        connection,
+                        row,
+                        status=request.status,
+                        cause=event_api_models.EventCause(
+                            request.terminal_cause),
+                        values=values,
+                        extra_predicates=self._fenced_request_predicates(
+                            request_id))
+                elif (original_status
+                      in requests_lib.RequestStatus.finished_status() and
+                      request.status != original_status):
+                    raise RuntimeError('A terminal PostgreSQL request cannot '
+                                       'be reopened through update_request().')
+                else:
+                    connection.execute(
+                        sqlalchemy.update(REQUESTS).where(
+                            REQUESTS.c.request_id == request_id,
+                            *self._fenced_request_predicates(
+                                request_id)).values(**values))
 
     @contextlib.asynccontextmanager
     async def update_request_async(
@@ -1298,11 +1447,36 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             if request is not None:
                 values = _request_values_for_db(request)
                 values.pop('request_id')
-                await connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id == request_id,
-                        *self._fenced_request_predicates(request_id)).values(
-                            **values))
+                original_status = requests_lib.RequestStatus(row['status'])
+                if (original_status
+                        in requests_lib.RequestStatus.active_statuses() and
+                        request.status
+                        in requests_lib.RequestStatus.finished_status()):
+                    if request.terminal_cause is None:
+                        raise RuntimeError(
+                            'PostgreSQL terminal request updates require a '
+                            'closed terminal cause.')
+                    await connection.run_sync(
+                        lambda sync_connection: _terminalize_locked_request(
+                            sync_connection,
+                            row,
+                            status=request.status,
+                            cause=event_api_models.EventCause(request.
+                                                              terminal_cause),
+                            values=values,
+                            extra_predicates=self._fenced_request_predicates(
+                                request_id)))
+                elif (original_status
+                      in requests_lib.RequestStatus.finished_status() and
+                      request.status != original_status):
+                    raise RuntimeError('A terminal PostgreSQL request cannot '
+                                       'be reopened through update_request().')
+                else:
+                    await connection.execute(
+                        sqlalchemy.update(REQUESTS).where(
+                            REQUESTS.c.request_id == request_id,
+                            *self._fenced_request_predicates(
+                                request_id)).values(**values))
 
     async def create_if_not_exists_async(self,
                                          request: requests_lib.Request) -> bool:
@@ -1438,6 +1612,9 @@ class PostgresRequestBackend(request_storage.RequestBackend):
 
     async def update_status_async(self, request_id: str,
                                   status: requests_lib.RequestStatus) -> None:
+        if status in requests_lib.RequestStatus.finished_status():
+            raise ValueError('Use a cause-aware terminal transition for '
+                             'PostgreSQL requests.')
         engine = await _get_async_engine()
         async with engine.begin() as connection:
             await connection.execute(
@@ -1560,6 +1737,24 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                              status: requests_lib.RequestStatus,
                              error: BaseException | None = None,
                              result: Any | None = None) -> bool:
+        if status == requests_lib.RequestStatus.SUCCEEDED:
+            cause = event_api_models.EventCause.HANDLER_SUCCEEDED
+        elif status == requests_lib.RequestStatus.FAILED:
+            cause = event_api_models.EventCause.HANDLER_FAILED
+        else:
+            cause = event_api_models.EventCause.EXPLICIT_CANCEL
+        return self.transition_request_terminal(request_id,
+                                                status,
+                                                cause.value,
+                                                error=error,
+                                                result=result)
+
+    def transition_request_terminal(self,
+                                    request_id: str,
+                                    status: requests_lib.RequestStatus,
+                                    cause: str,
+                                    error: BaseException | None = None,
+                                    result: Any | None = None) -> bool:
         engine = initialize_and_get_db()
         with engine.begin() as connection:
             row = connection.execute(
@@ -1580,20 +1775,19 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                 request.set_return_value(result)
             values = _request_values_for_db(request)
             values.pop('request_id')
-            update_result = connection.execute(
-                sqlalchemy.update(REQUESTS).where(
-                    REQUESTS.c.request_id == request_id,
-                    *self._fenced_request_predicates(request_id)).values(
-                        **values))
-            if update_result.rowcount == 1:
+            transitioned = _terminalize_locked_request(
+                connection,
+                row,
+                status=status,
+                cause=event_api_models.EventCause(cause),
+                values=values,
+                extra_predicates=self._fenced_request_predicates(request_id))
+            if transitioned:
                 action_state = ('completed' if status
                                 == requests_lib.RequestStatus.SUCCEEDED else
                                 'failed')
                 _mark_controller_action_state(connection, request_id,
                                               self._instance_id, action_state)
-                connection.execute(
-                    sqlalchemy.delete(QUEUE).where(
-                        QUEUE.c.request_id == request_id))
                 return True
             return False
 
@@ -1604,6 +1798,16 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                                          result: Any | None = None) -> bool:
         return await asyncio.to_thread(self.set_request_finished, request_id,
                                        status, error, result)
+
+    async def transition_request_terminal_async(
+            self,
+            request_id: str,
+            status: requests_lib.RequestStatus,
+            cause: str,
+            error: BaseException | None = None,
+            result: Any | None = None) -> bool:
+        return await asyncio.to_thread(self.transition_request_terminal,
+                                       request_id, status, cause, error, result)
 
     def kill_requests(self,
                       request_ids: list[str] | None = None,
@@ -1631,17 +1835,18 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             for row in rows:
                 if daemons.is_daemon_request_id(row['request_id']):
                     continue
+                transitioned = _terminalize_locked_request(
+                    connection,
+                    row,
+                    status=requests_lib.RequestStatus.CANCELLED,
+                    cause=event_api_models.EventCause.EXPLICIT_CANCEL,
+                    values={
+                        'cancel_requested_at': now,
+                        'finished_at': now,
+                    })
+                if not transitioned:
+                    continue
                 cancelled.append(row['request_id'])
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id == row['request_id']).values(
-                            status=requests_lib.RequestStatus.CANCELLED.value,
-                            cancel_requested_at=now,
-                            finished_at=now,
-                            updated_at=now))
-                connection.execute(
-                    sqlalchemy.delete(QUEUE).where(
-                        QUEUE.c.request_id == row['request_id']))
                 connection.execute(
                     sqlalchemy.update(CONTROLLER_ACTION_RESERVATIONS).where(
                         CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id ==
@@ -1781,17 +1986,25 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             # preserve the row and surface a retry instead of silently
             # manufacturing a queue message with different execution
             # semantics.
-            connection.execute(
-                sqlalchemy.update(REQUESTS).where(
+            rows = connection.execute(
+                sqlalchemy.select(REQUESTS).where(
                     REQUESTS.c.status.in_(active), ~sqlalchemy.exists().where(
-                        QUEUE.c.request_id == REQUESTS.c.request_id)).values(
-                            status=requests_lib.RequestStatus.CANCELLED.value,
-                            should_retry=True,
-                            finished_at=sqlalchemy.func.clock_timestamp(),
-                            interrupted_reason=(
-                                'The compatibility process stopped while a '
-                                'non-queued coroutine request was active.'),
-                            updated_at=sqlalchemy.func.clock_timestamp()))
+                        QUEUE.c.request_id == REQUESTS.c.request_id)).
+                with_for_update()).mappings().all()
+            for row in rows:
+                now = sqlalchemy.func.clock_timestamp()
+                _terminalize_locked_request(
+                    connection,
+                    row,
+                    status=requests_lib.RequestStatus.CANCELLED,
+                    cause=event_api_models.EventCause.COMPATIBILITY_RESTART,
+                    values={
+                        'should_retry': True,
+                        'finished_at': now,
+                        'interrupted_reason':
+                            ('The compatibility process stopped while a '
+                             'non-queued coroutine request was active.'),
+                    })
         # Queue rows are already durable and must not be copied back through
         # the legacy in-memory re-enqueue path.
         return False
@@ -1966,24 +2179,25 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                             available_at=now,
                             updated_at=now))
             else:
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id == row['request_id']).values(
-                            status=requests_lib.RequestStatus.CANCELLED.value,
-                            pid=None,
-                            claim_token=None,
-                            worker_instance_id=None,
-                            lease_expires_at=None,
-                            heartbeat_at=None,
-                            should_retry=True,
-                            finished_at=now,
-                            interrupted_reason=(
-                                'Execution lease expired with an ambiguous '
-                                'mutating outcome.'),
-                            updated_at=now))
-                connection.execute(
-                    sqlalchemy.delete(QUEUE).where(
-                        QUEUE.c.request_id == row['request_id']))
+                transitioned = _terminalize_locked_request(
+                    connection,
+                    row,
+                    status=requests_lib.RequestStatus.CANCELLED,
+                    cause=(event_api_models.EventCause.EXECUTION_LEASE_EXPIRED),
+                    values={
+                        'pid': None,
+                        'claim_token': None,
+                        'worker_instance_id': None,
+                        'lease_expires_at': None,
+                        'heartbeat_at': None,
+                        'should_retry': True,
+                        'finished_at': now,
+                        'interrupted_reason':
+                            ('Execution lease expired with an ambiguous '
+                             'mutating outcome.'),
+                    })
+                if not transitioned:
+                    continue
                 if row['execution_class'] == (
                         request_registry.ExecutionClass.CONTROLLER.value):
                     connection.execute(
@@ -2057,13 +2271,12 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 request.set_error(precondition_error)
                 values = _request_values_for_db(request)
                 values.pop('request_id')
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id ==
-                        candidate['request_id']).values(**values))
-                connection.execute(
-                    sqlalchemy.delete(QUEUE).where(
-                        QUEUE.c.request_id == candidate['request_id']))
+                _terminalize_locked_request(
+                    connection,
+                    locked,
+                    status=requests_lib.RequestStatus.FAILED,
+                    cause=event_api_models.EventCause.PRECONDITION_FAILED,
+                    values=values)
                 return None
             if not met:
                 interval = float(candidate['precondition_payload'].get(
@@ -2121,25 +2334,31 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                                                    self._instance_id,
                                                    controller_generation)):
                 now = sqlalchemy.func.clock_timestamp()
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id ==
-                        candidate['request_id']).values(
-                            status=requests_lib.RequestStatus.CANCELLED.value,
-                            pid=None,
-                            claim_token=None,
-                            worker_instance_id=None,
-                            lease_expires_at=None,
-                            heartbeat_at=None,
-                            should_retry=True,
-                            finished_at=now,
-                            interrupted_reason=(
-                                'Controller action is already owned by a '
-                                'different leadership generation.'),
-                            updated_at=now))
-                connection.execute(
-                    sqlalchemy.delete(QUEUE).where(
-                        QUEUE.c.request_id == candidate['request_id']))
+                reservation_row = dict(locked)
+                reservation_row.update({
+                    'execution_generation': generation,
+                    'claim_token': token,
+                    'worker_instance_id': uuid.UUID(self._instance_id),
+                    'controller_generation': controller_generation,
+                })
+                _terminalize_locked_request(
+                    connection,
+                    reservation_row,
+                    status=requests_lib.RequestStatus.CANCELLED,
+                    cause=(event_api_models.EventCause.
+                           CONTROLLER_RESERVATION_CONFLICT),
+                    values={
+                        'pid': None,
+                        'claim_token': None,
+                        'worker_instance_id': None,
+                        'lease_expires_at': None,
+                        'heartbeat_at': None,
+                        'should_retry': True,
+                        'finished_at': now,
+                        'interrupted_reason':
+                            ('Controller action is already owned by a '
+                             'different leadership generation.'),
+                    })
                 return None
             connection.execute(
                 sqlalchemy.update(QUEUE).where(

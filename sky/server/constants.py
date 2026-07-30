@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 63  # Daily per-service request volume in estimated spend
+API_VERSION = 64  # Actor-aware PostgreSQL operational events
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -106,6 +106,9 @@ MIN_ESTIMATED_SPEND_SERVICE_REQUESTS_API_VERSION = 63
 
 # Minimum server API version exposing the managed image catalog.
 MIN_CONTAINER_IMAGES_API_VERSION = 62
+
+# Minimum server API version exposing actor-aware operational events.
+MIN_OPERATIONAL_EVENTS_API_VERSION = 64
 
 # Minimum server API version that exposes the admin-only, low-cardinality
 # operator notification inbox used by the dashboard.

@@ -1057,6 +1057,36 @@ def _success_entrypoint():
     return 'success'
 
 
+@pytest.mark.parametrize(
+    ('request_name', 'expected_calls'),
+    [
+        ('sky.status', []),
+        ('sky.launch', [mock.call('request-id', 'cluster')]),
+        ('sky.down', [
+            mock.call('request-id', 'cluster'),
+            mock.call('request-id', 'cluster'),
+        ]),
+    ],
+)
+def test_capture_event_target_only_wraps_opted_in_lifecycle_operations(
+        monkeypatch, request_name, expected_calls):
+    enrich = mock.Mock()
+    monkeypatch.setattr(executor, '_enrich_event_target_id', enrich)
+    with executor._capture_event_target('request-id', request_name, 'cluster'):
+        pass
+    assert enrich.call_args_list == expected_calls
+
+
+def test_capture_event_target_after_failed_launch(monkeypatch):
+    enrich = mock.Mock()
+    monkeypatch.setattr(executor, '_enrich_event_target_id', enrich)
+    with pytest.raises(RuntimeError, match='failed'):
+        with executor._capture_event_target('request-id', 'sky.launch',
+                                            'cluster'):
+            raise RuntimeError('failed')
+    enrich.assert_called_once_with('request-id', 'cluster')
+
+
 def _retryable_error_entrypoint():
     from sky import exceptions
     raise exceptions.ExecutionRetryableError('Simulated retryable error',
@@ -1742,6 +1772,8 @@ def stub_override_request_env_deps(monkeypatch):
     monkeypatch.setattr(
         'sky.workspaces.core.reject_request_for_unauthorized_workspace',
         mock.Mock())
+    monkeypatch.setattr('sky.server.requests.requests.set_event_workspace',
+                        mock.Mock(return_value=True))
 
     fake_user = mock.Mock()
     fake_user.id = 'client-user-id'
@@ -1804,6 +1836,43 @@ def test_override_env_applied_for_client_request(stub_override_request_env_deps,
             body, request_id='not-a-daemon-uuid', request_name='sky.launch'):
         assert os.environ['SKYPILOT_POD_MEMORY_BYTES_LIMIT'] == str(100 * 1024 *
                                                                     1024)
+
+
+def test_override_env_blocks_when_event_workspace_loses_execution_fence(
+        stub_override_request_env_deps, monkeypatch):
+    """An opted-in mutation cannot start after its audit fence is lost."""
+    monkeypatch.setattr('sky.server.requests.requests.set_event_workspace',
+                        mock.Mock(return_value=False))
+    body = payloads.RequestBody(
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'client-user-id',
+            constants.USER_ENV_VAR: 'client-user',
+        })
+
+    with pytest.raises(RuntimeError, match='lost its execution fence'):
+        with executor.override_request_env_and_config(
+                body, request_id='not-a-daemon-uuid',
+                request_name='sky.launch'):
+            pytest.fail('The mutation body must not start.')
+
+
+def test_override_env_skips_event_context_write_for_unrelated_request(
+        stub_override_request_env_deps, monkeypatch):
+    set_workspace = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.set_event_workspace',
+        set_workspace,
+    )
+    body = payloads.RequestBody(
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'client-user-id',
+            constants.USER_ENV_VAR: 'client-user',
+        })
+
+    with executor.override_request_env_and_config(
+            body, request_id='not-a-daemon-uuid', request_name='sky.status'):
+        pass
+    set_workspace.assert_not_called()
 
 
 def test_override_env_rejects_server_owned_client_values(

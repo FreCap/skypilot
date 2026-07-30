@@ -295,6 +295,47 @@ class RequestBackend(abc.ABC):
                 request.set_return_value(result)
         return True
 
+    def transition_request_terminal(self,
+                                    request_id: str,
+                                    status: RequestStatus,
+                                    cause: str,
+                                    error: BaseException | None = None,
+                                    result: Any | None = None) -> bool:
+        """Persist a cause-aware terminal transition.
+
+        PostgreSQL overrides this to atomically emit an operational event.
+        The default keeps existing plugin and SQLite backends compatible.
+        """
+        del cause
+        return self.set_request_finished(request_id,
+                                         status,
+                                         error=error,
+                                         result=result)
+
+    async def transition_request_terminal_async(
+            self,
+            request_id: str,
+            status: RequestStatus,
+            cause: str,
+            error: BaseException | None = None,
+            result: Any | None = None) -> bool:
+        """Async cause-aware terminal transition."""
+        del cause
+        return await self.set_request_finished_async(request_id,
+                                                     status,
+                                                     error=error,
+                                                     result=result)
+
+    def set_event_workspace(self, request_id: str, workspace: str) -> bool:
+        """Persist an authoritative event workspace, if supported."""
+        del request_id, workspace
+        return True
+
+    def set_event_target_id(self, request_id: str, target_id: str) -> bool:
+        """Enrich an event target identity, if supported."""
+        del request_id, target_id
+        return True
+
     @abc.abstractmethod
     def kill_requests(self,
                       request_ids: list[str] | None = None,

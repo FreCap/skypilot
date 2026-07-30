@@ -70,6 +70,7 @@ from sky.server.auth import middleware as auth_middleware
 from sky.server.auth import oauth2_proxy
 from sky.server.auth import sessions as auth_sessions
 from sky.server.blob import blob_storage as bs
+from sky.server.events import server as events_rest
 from sky.server.requests import executor
 from sky.server.requests import log_provider
 from sky.server.requests import payloads
@@ -399,6 +400,7 @@ app.include_router(ssh_node_pools_rest.router,
                    prefix='/ssh_node_pools',
                    tags=['ssh_node_pools'])
 app.include_router(recipes_rest.router, prefix='/recipes', tags=['recipes'])
+app.include_router(events_rest.router, prefix='/events', tags=['events'])
 app.include_router(file_mount_uploads.router)
 # increase the resource limit for the server
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

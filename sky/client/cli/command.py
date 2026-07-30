@@ -62,6 +62,7 @@ from sky.adaptors import common as adaptors_common
 from sky.client import sdk
 from sky.client.cli import api as api_commands
 from sky.client.cli import click_utils
+from sky.client.cli import events as events_command
 from sky.client.cli import flags
 from sky.client.cli import gpus as gpu_commands
 from sky.client.cli import service_logs
@@ -2400,6 +2401,12 @@ def cost_report(
         'Costs for clusters with auto{stop,down} '
         'scheduled may not be accurate.',
         fg='yellow')
+
+
+events = events_command.events
+if events.callback is not None:
+    events.callback.__module__ = __name__
+cli.add_command(events)
 
 
 @cli.command()

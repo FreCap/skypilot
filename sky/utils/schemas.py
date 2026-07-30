@@ -2740,6 +2740,9 @@ def get_config_schema():
             'cluster_terminal_event_retention_hours': {
                 'type': 'number',
             },
+            'operational_event_retention_hours': {
+                'type': 'number',
+            },
             'daemon_log_max_bytes': {
                 'type': 'integer',
                 'minimum': 0,
