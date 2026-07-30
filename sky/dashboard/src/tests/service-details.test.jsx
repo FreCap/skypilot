@@ -1076,6 +1076,97 @@ describe('ServiceDetails route ownership rendering', () => {
     expect(screen.getAllByText('svc-b')).not.toHaveLength(0);
     expect(dashboardCache.get).toHaveBeenCalledTimes(4);
   });
+
+  it('does not reuse a previous snapshot when returning through an A-B-A route cycle', async () => {
+    const serviceBSummary = deferred();
+    const serviceBFull = deferred();
+    const freshServiceASummary = deferred();
+    const freshServiceAFull = deferred();
+    const routerState = {
+      isReady: true,
+      query: { service: 'svc-a' },
+    };
+    mockUseRouter.mockImplementation(() => routerState);
+
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          {
+            name: 'svc-a',
+            status: 'STALE-A',
+            summaryOnly: true,
+            replicas: [],
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc-a', status: 'STALE-A', replicas: [] }],
+      })
+      .mockImplementationOnce(() => serviceBSummary.promise)
+      .mockImplementationOnce(() => serviceBFull.promise)
+      .mockImplementationOnce(() => freshServiceASummary.promise)
+      .mockImplementationOnce(() => freshServiceAFull.promise);
+
+    const { rerender } = render(<ServiceDetailsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('STALE-A')).toBeInTheDocument()
+    );
+
+    routerState.query = { service: 'svc-b' };
+    rerender(<ServiceDetailsPage />);
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+
+    routerState.query = { service: 'svc-a' };
+    rerender(<ServiceDetailsPage />);
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(6));
+    rerender(<ServiceDetailsPage />);
+
+    expect(screen.getByText('Loading service details...')).toBeInTheDocument();
+    expect(screen.queryByText('STALE-A')).not.toBeInTheDocument();
+
+    await act(async () => {
+      freshServiceASummary.resolve({
+        services: [
+          {
+            name: 'svc-a',
+            status: 'FRESH-A',
+            summaryOnly: true,
+            replicas: [],
+          },
+        ],
+      });
+      freshServiceAFull.resolve({
+        services: [{ name: 'svc-a', status: 'FRESH-A', replicas: [] }],
+      });
+      await Promise.all([
+        freshServiceASummary.promise,
+        freshServiceAFull.promise,
+      ]);
+    });
+
+    expect(screen.getByText('FRESH-A')).toBeInTheDocument();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(6);
+
+    await act(async () => {
+      serviceBSummary.resolve({
+        services: [
+          {
+            name: 'svc-b',
+            status: 'STALE-B',
+            summaryOnly: true,
+            replicas: [],
+          },
+        ],
+      });
+      serviceBFull.resolve({
+        services: [{ name: 'svc-b', status: 'STALE-B', replicas: [] }],
+      });
+      await Promise.all([serviceBSummary.promise, serviceBFull.promise]);
+    });
+
+    expect(screen.getByText('FRESH-A')).toBeInTheDocument();
+    expect(screen.queryByText('STALE-B')).not.toBeInTheDocument();
+  });
 });
 
 describe('ServiceDetailCard cost and request estimates', () => {
