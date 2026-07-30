@@ -1507,6 +1507,17 @@ def stream_logs_by_id(job_id: int,
                     f'Valid task IDs are {valid_range}.',
                     exceptions.JobExitCode.NOT_FOUND)
 
+    def get_stream_target_snapshot() -> managed_job_state.JobLogStreamSnapshot:
+        if filtered_task_id is None:
+            return managed_job_state.get_latest_log_stream_snapshot(job_id)
+
+        _, status = managed_job_state.get_latest_task_id_status(job_id)
+        pool, cluster_name, job_id_to_tail, task_name = (
+            managed_job_state.get_log_stream_context(job_id, filtered_task_id))
+        return managed_job_state.JobLogStreamSnapshot(filtered_task_id, status,
+                                                      pool, cluster_name,
+                                                      job_id_to_tail, task_name)
+
     # Follow the jobs controller log during provisioning so the user sees the
     # same spinner messages that `sky launch` shows. The controller relays the
     # inner cluster-launch rich-status payloads into its per-job log (see
@@ -1524,11 +1535,15 @@ def stream_logs_by_id(job_id: int,
 
     with status_display:
         prev_msg = msg
-        latest_task_id, managed_job_status = _wait_for_initial_task_status(
-            job_id)
+        _, managed_job_status = _wait_for_initial_task_status(job_id)
         managed_job_status: managed_job_state.ManagedJobStatus | None = (
             managed_job_status)
         assert managed_job_status is not None, job_id
+        task_id: int | None = None
+        pool: str | None = None
+        cluster_name: str | None = None
+        job_id_to_tail: int | None = None
+        task_name: str | None = None
 
         # Show hint about per-task filtering when there are multiple tasks
         if num_tasks > 1 and task is None:
@@ -1649,32 +1664,32 @@ def stream_logs_by_id(job_id: int,
 
         backend = backends.CloudVmRayBackend()
 
-        # If a task filter was specified, use the filtered task_id instead of
-        # the latest task_id. This allows viewing logs for a specific task in
-        # a JobGroup with parallel execution.
-        if filtered_task_id is not None:
-            latest_task_id = filtered_task_id
+        while True:
+            assert managed_job_status is not None, job_id
+            if not _should_keep_logging(managed_job_status):
+                break
+            snapshot = get_stream_target_snapshot()
+            task_id = snapshot.task_id
+            managed_job_status = snapshot.status
+            pool = snapshot.pool
+            cluster_name = snapshot.cluster_name
+            job_id_to_tail = snapshot.job_id_on_pool_cluster
+            task_name = snapshot.task_name
 
-        # We wait for managed_job_status to be not None above. Once we see that
-        # it's not None, we don't expect it to every become None again.
-        assert managed_job_status is not None, (job_id, latest_task_id,
-                                                managed_job_status)
-        assert latest_task_id is not None, (job_id, latest_task_id)
-        task_id = latest_task_id
+            # We wait for managed_job_status to be not None above. Once we see
+            # that it's not None, we don't expect it to every become None
+            # again.
+            assert managed_job_status is not None, (job_id, task_id,
+                                                    managed_job_status)
+            assert task_id is not None, (job_id, task_id)
 
-        while _should_keep_logging(managed_job_status):
             handle = None
-            cluster_name = None
-            job_id_to_tail = None
-            if task_id is not None:
-                pool, cluster_name, job_id_to_tail, task_name = (
-                    managed_job_state.get_log_stream_context(job_id, task_id))
-                if pool is None and task_name is not None:
-                    cluster_name = generate_managed_job_cluster_name(
-                        task_name, job_id)
-                if cluster_name is not None:
-                    handle = global_user_state.get_handle_from_cluster_name(
-                        cluster_name)
+            if pool is None and task_name is not None:
+                cluster_name = generate_managed_job_cluster_name(
+                    task_name, job_id)
+            if cluster_name is not None:
+                handle = global_user_state.get_handle_from_cluster_name(
+                    cluster_name)
 
             # Check the handle: The cluster can be preempted and removed from
             # the table before the managed job state is updated by the
@@ -1716,15 +1731,9 @@ def stream_logs_by_id(job_id: int,
                         break
                     time.sleep(_PROVISION_LOG_POLL_GAP_SECONDS)
                     waited += _PROVISION_LOG_POLL_GAP_SECONDS
-                latest_task_id, managed_job_status = (
-                    managed_job_state.get_latest_task_id_status(job_id))
-                # Preserve filtered task_id if specified
-                if filtered_task_id is not None:
-                    latest_task_id = filtered_task_id
-                assert managed_job_status is not None, (job_id, latest_task_id,
-                                                        managed_job_status)
-                assert latest_task_id is not None, (job_id, latest_task_id)
-                task_id = latest_task_id
+                snapshot = get_stream_target_snapshot()
+                task_id = snapshot.task_id
+                managed_job_status = snapshot.status
                 continue
             assert (managed_job_status ==
                     managed_job_state.ManagedJobStatus.RUNNING)
@@ -1876,6 +1885,7 @@ def stream_logs_by_id(job_id: int,
     # Preserve the latest-task verdict already observed by the follow loop.
     # get_status() repeats the same latest-task query, so only a non-terminal
     # snapshot needs the final-wait refresh below.
+    assert managed_job_status is not None, job_id
     if not managed_job_status.is_terminal():
         # The managed_job_status may not be in terminal status yet, since the
         # controller has not updated the managed job state yet. We wait for a
@@ -1890,6 +1900,7 @@ def stream_logs_by_id(job_id: int,
             managed_job_status = managed_job_state.get_status(job_id)
             assert managed_job_status is not None, job_id
 
+    assert managed_job_status is not None, job_id
     if not follow and not managed_job_status.is_terminal():
         # The job is not in terminal state and we are not following,
         # just return.

@@ -107,11 +107,30 @@ class TestStreamLogsByIdLifecycle:
             (0, managed_job_state.ManagedJobStatus.RUNNING),
             (0, terminal_status),
         ])
+        snapshot_read = mock.Mock(side_effect=[
+            managed_job_state.JobLogStreamSnapshot(
+                0,
+                managed_job_state.ManagedJobStatus.RUNNING,
+                context[0],
+                context[1],
+                context[2],
+                context[3],
+            ),
+            managed_job_state.JobLogStreamSnapshot(
+                0,
+                terminal_status,
+                context[0],
+                context[1],
+                context[2],
+                context[3],
+            ),
+        ])
         num_tasks_read = mock.Mock(return_value=2)
         sleep = mock.Mock()
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
-        context_read = mock.Mock(return_value=context)
+        context_read = mock.Mock(
+            side_effect=AssertionError('scalar log context read used'))
         generate_cluster_name = mock.Mock(return_value='cluster')
         handle_lookup = mock.Mock(return_value=_FakeHandle())
 
@@ -124,6 +143,8 @@ class TestStreamLogsByIdLifecycle:
         monkeypatch.setattr(managed_job_state, 'get_status', status_read)
         monkeypatch.setattr(managed_job_state, 'get_latest_task_id_status',
                             latest_status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
         monkeypatch.setattr(managed_job_state, 'is_batch_job',
                             mock.Mock(return_value=False))
         monkeypatch.setattr(managed_job_state, 'get_log_stream_context',
@@ -155,10 +176,13 @@ class TestStreamLogsByIdLifecycle:
         assert message == ''
         assert exit_code == exceptions.JobExitCode.from_managed_job_status(
             terminal_status)
-        assert latest_status_read.call_count == 2
+        expected_latest_status_calls = 2 if expected_tail_calls else 1
+        assert latest_status_read.call_count == expected_latest_status_calls
+        expected_snapshot_reads = 1 if expected_tail_calls else 2
+        assert snapshot_read.call_count == expected_snapshot_reads
         num_tasks_read.assert_called_once_with(42)
         status_read.assert_not_called()
-        context_read.assert_called_once_with(42, 0)
+        context_read.assert_not_called()
         if expected_cluster is None:
             handle_lookup.assert_not_called()
         else:

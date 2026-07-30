@@ -28,6 +28,7 @@ from sky.jobs.state_schema import job_info_table
 from sky.jobs.state_schema import spot_table
 from sky.jobs.status_types import ControllerPidRecord
 from sky.jobs.status_types import JobCancellationState
+from sky.jobs.status_types import JobLogStreamSnapshot
 from sky.jobs.status_types import ManagedJobScheduleState
 from sky.jobs.status_types import ManagedJobStatus
 from sky.skylet import constants
@@ -1358,6 +1359,46 @@ def get_log_stream_context(
     if context is None:
         return None, None, None, None
     return context[0], context[1], context[2], context[3]
+
+
+@db_retries.retry
+def get_latest_log_stream_snapshot(job_id: int) -> JobLogStreamSnapshot:
+    """Return one latest-task status and routing snapshot for log following."""
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    latest_task = _latest_task_status_query([job_id],
+                                            terminal_status_values).subquery()
+    query = sqlalchemy.select(
+        latest_task.c.task_id,
+        latest_task.c.status,
+        job_info_table.c.pool,
+        job_info_table.c.current_cluster_name,
+        job_info_table.c.job_id_on_pool_cluster,
+        spot_table.c.task_name,
+    ).select_from(
+        latest_task.join(
+            spot_table,
+            sqlalchemy.and_(
+                spot_table.c.spot_job_id == latest_task.c.spot_job_id,
+                spot_table.c.task_id == latest_task.c.task_id,
+            )).outerjoin(
+                job_info_table,
+                job_info_table.c.spot_job_id == latest_task.c.spot_job_id))
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(query).fetchone()
+    if row is None:
+        return JobLogStreamSnapshot(None, None, None, None, None, None)
+    return JobLogStreamSnapshot(
+        row.task_id,
+        ManagedJobStatus(row.status),
+        row.pool,
+        row.current_cluster_name,
+        row.job_id_on_pool_cluster,
+        row.task_name,
+    )
 
 
 def get_latest_job_id() -> int | None:
