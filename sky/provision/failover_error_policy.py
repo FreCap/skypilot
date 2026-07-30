@@ -423,14 +423,23 @@ class FailoverCloudErrorHandlerV2:
 
 # Preserve reflection and pickle lookup through the historical backend facade.
 _HISTORICAL_MODULE = 'sky.backends.cloud_vm_ray_backend'
-_add_to_blocked_resources.__module__ = _HISTORICAL_MODULE
 for _handler_class in (FailoverCloudErrorHandlerV1,
                        FailoverCloudErrorHandlerV2):
     _handler_class.__module__ = _HISTORICAL_MODULE
-    for _handler_name in vars(_handler_class):
-        _handler_symbol = getattr(_handler_class, _handler_name)
-        if callable(_handler_symbol):
-            _handler_symbol.__module__ = _HISTORICAL_MODULE
 del _handler_class
-del _handler_name
+
+for _handler_symbol in (
+        _add_to_blocked_resources,
+        FailoverCloudErrorHandlerV1._handle_errors,
+        FailoverCloudErrorHandlerV1._ibm_handler,
+        FailoverCloudErrorHandlerV1.update_blocklist_on_error,
+        FailoverCloudErrorHandlerV2._azure_handler,
+        FailoverCloudErrorHandlerV2._gcp_handler,
+        FailoverCloudErrorHandlerV2._lambda_handler,
+        FailoverCloudErrorHandlerV2._aws_handler,
+        FailoverCloudErrorHandlerV2._scp_handler,
+        FailoverCloudErrorHandlerV2._default_handler,
+        FailoverCloudErrorHandlerV2.update_blocklist_on_error,
+):
+    _handler_symbol.__module__ = _HISTORICAL_MODULE
 del _handler_symbol
