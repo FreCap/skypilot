@@ -1027,6 +1027,22 @@ event evidence before cleanup on both success and failure. The complete
 upgrade, controlled-eviction, rollback, and final-upgrade sequence must repeat
 from a fresh canary.
 
+The fourth live attempt used commit
+`4bc5a28356` and revision 21. Its migration hook completed successfully, all
+roles rolled to the exact target digest, and 2,699 health probes plus 168
+complete submit, lookup, and stream cycles had zero failures. After the
+post-rollout stability check passed, Karpenter won a new Eviction API race for
+one API replica. The captured state showed one available API replica and zero
+allowed API disruptions, so the harness correctly refused to start its own
+disruption but stopped instead of waiting for redundancy to recover.
+
+This is negative harness evidence, not M4 acceptance. External PDB-governed
+disruption is expected in the target environment. Before each controlled
+drain, the harness now waits for all roles and PDBs to regain stable redundant
+state, selects one current ready target, and retries selection if an external
+eviction wins the race. It still requires two fully observed controlled drains
+per role; external evictions cannot satisfy that count.
+
 Deployment:
 
 1. Render and server-side dry-run the guarded chart, including the hook,
@@ -1037,9 +1053,10 @@ Deployment:
    migration hook must finish before any image B pod is created, and the
    additive request schema must remain readable by the overlapping image A
    pods.
-4. Gracefully delete every original image B API, executor, and controller pod.
-   Prove the direct readiness, durable lease, and Pod-condition drain signals
-   precede termination while raw and authenticated canaries remain error-free.
+4. Gracefully drain two image B replicas of each API, executor, and controller
+   role. Prove the direct readiness, durable lease, and Pod-condition drain
+   signals precede termination while raw and authenticated canaries remain
+   error-free.
 5. Run Helm rollback to image A, then upgrade to image B again under the same
    canary. Verify hook ordering, role readiness, PDB health, and exact pod image
    digests after the final rollout.

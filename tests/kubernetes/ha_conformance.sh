@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Exercise a guarded SkyPilot HA release under continuous in-cluster traffic.
-# The script rolls image A to image B, deletes every original role pod, rolls
+# The script rolls image A to image B, drains two replicas of every role, rolls
 # back to A, and upgrades to B again. It never reads or prints token material;
 # the canary consumes an existing Kubernetes Secret directly.
 
@@ -362,6 +362,20 @@ verify_stable_ha() {
   done
 }
 
+wait_for_stable_ha() {
+  local deadline=$((SECONDS + 900))
+  while true; do
+    if wait_roles && verify_stable_ha; then
+      return
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "HA roles did not regain redundant, disruption-ready state" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 record_state() {
   local phase="$1"
   echo "STATE ${phase}"
@@ -545,13 +559,20 @@ evict_pod() {
   local pod="$2"
   local pdb="${RELEASE}-${role}"
   local deadline=$((SECONDS + 600))
-  local output allowed_before expected_allowed
+  local output allowed_before expected_allowed pod_json
 
   while true; do
-    if ! kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pod "${pod}" \
-      >/dev/null 2>&1; then
-      echo "target pod ${pod} disappeared before its controlled eviction" >&2
-      return 1
+    if ! pod_json="$(
+      kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pod "${pod}" \
+        -o json 2>/dev/null
+    )"; then
+      echo "target pod ${pod} disappeared before its controlled eviction"
+      return 2
+    fi
+    if jq -e '.metadata.deletionTimestamp != null' \
+      <<<"${pod_json}" >/dev/null; then
+      echo "target pod ${pod} entered an external disruption first"
+      return 2
     fi
     allowed_before="$(
       kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pdb "${pdb}" \
@@ -581,6 +602,10 @@ EOF
     )"; then
       break
     fi
+    if [[ "${output}" == *"NotFound"* ]]; then
+      echo "target pod ${pod} disappeared before its controlled eviction"
+      return 2
+    fi
     if [[ "${output}" != *"TooManyRequests"* &&
           "${output}" != *"disruption budget"* ]]; then
       echo "failed to evict ${pod}: ${output}" >&2
@@ -609,25 +634,29 @@ EOF
   echo "eviction ${pod}: PDB ${pdb} reserved its disruption budget"
 }
 
-delete_original_role_pods() {
+drain_role_replicas() {
   local role="$1"
   local selector="app=${RELEASE}-${role}"
-  local pods pod
-  pods="$(
-    kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pods \
-      -l "${selector}" -o json | jq -r \
-      '[.items[]
-       | select(.metadata.deletionTimestamp == null)
-       | select(
-           any(.status.conditions[]?;
-               .type == "Ready" and .status == "True"))]
-       | sort_by(.metadata.name)[] | .metadata.name'
-  )"
-  if [[ "$(wc -w <<<"${pods}" | tr -d ' ')" -lt 2 ]]; then
-    echo "role ${role} does not have two pods to delete" >&2
-    return 1
-  fi
-  for pod in ${pods}; do
+  local completed=0
+  while ((completed < 2)); do
+    wait_for_stable_ha
+    local pod
+    pod="$(
+      kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pods \
+        -l "${selector}" -o json | jq -r '
+        [.items[]
+         | select(.metadata.deletionTimestamp == null)
+         | select(
+             any(.status.conditions[]?;
+                 .type == "Ready" and .status == "True"))]
+        | sort_by(.metadata.creationTimestamp, .metadata.name)
+        | .[0].metadata.name // ""
+      '
+    )"
+    if [[ -z "${pod}" ]]; then
+      echo "role ${role} lost its ready target after the stable-state check; retrying"
+      continue
+    fi
     local pod_ip instance_id probe_path probe_port
     read -r pod_ip instance_id probe_path probe_port < <(
       kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get pod "${pod}" \
@@ -658,7 +687,15 @@ delete_original_role_pods() {
       probe_host="[${probe_host}]"
     fi
 
-    evict_pod "${role}" "${pod}"
+    local eviction_status=0
+    evict_pod "${role}" "${pod}" || eviction_status=$?
+    if ((eviction_status == 2)); then
+      echo "external disruption won the race for ${pod}; selecting a fresh ${role} target"
+      continue
+    fi
+    if ((eviction_status != 0)); then
+      return "${eviction_status}"
+    fi
     local endpoint_seen=false
     local lease_seen=false
     local pod_condition_seen=false
@@ -715,7 +752,8 @@ delete_original_role_pods() {
     echo "drain ${pod}: endpoint=503 lease=draining pod_ready=False"
     kubectl --context "${CONTEXT}" -n "${NAMESPACE}" wait \
       --for=delete "pod/${pod}" --timeout="${TIMEOUT}"
-    wait_roles
+    completed=$((completed + 1))
+    wait_for_stable_ha
     sleep 5
     assert_canary "${role}-pod-${pod}"
   done
@@ -745,10 +783,11 @@ sleep 15
 assert_canary image-a-to-b
 record_state image-b
 
-delete_original_role_pods api
-delete_original_role_pods executor
-delete_original_role_pods controller
+drain_role_replicas api
+drain_role_replicas executor
+drain_role_replicas controller
 verify_stable_ha
+verify_role_image "${IMAGE_B}"
 
 helm rollback "${RELEASE}" "${REVISION_A}" --kube-context "${CONTEXT}" \
   --namespace "${NAMESPACE}" --wait --timeout "${TIMEOUT}"
