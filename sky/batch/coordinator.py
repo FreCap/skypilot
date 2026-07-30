@@ -184,11 +184,24 @@ class BatchCoordinator:
         then shuts down any active worker services.
         """
         workers_snapshot = self._begin_cleanup()
+        shutdown_threads = []
         for cluster_name, worker_job_id in workers_snapshot:
-            try:
-                self._shutdown_worker(cluster_name, worker_job_id)
-            except Exception:  # pylint: disable=broad-except
-                logger.warning(f'Failed to shutdown worker on {cluster_name}')
+            thread_ctx = contextvars.copy_context()
+            shutdown_thread = threading.Thread(target=thread_ctx.run,
+                                               args=(self._cancel_worker,
+                                                     cluster_name,
+                                                     worker_job_id))
+            shutdown_thread.start()
+            shutdown_threads.append(shutdown_thread)
+        for shutdown_thread in shutdown_threads:
+            shutdown_thread.join()
+
+    def _cancel_worker(self, cluster_name: str, worker_job_id: int) -> None:
+        """Shut down one owned worker without aborting sibling cleanup."""
+        try:
+            self._shutdown_worker(cluster_name, worker_job_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(f'Failed to shutdown worker on {cluster_name}')
 
     def _begin_cleanup(self, superseded: bool = False) -> list[tuple[str, int]]:
         """Atomically assign cleanup ownership for tracked workers."""

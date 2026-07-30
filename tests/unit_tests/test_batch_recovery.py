@@ -906,6 +906,86 @@ def test_cancel_claims_worker_cleanup_once(monkeypatch):
     assert not batch_coordinator._active_workers
 
 
+def test_cancel_fans_out_worker_shutdowns(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    batch_coordinator._active_workers.update({
+        'worker-a': 17,
+        'worker-b': 18,
+    })
+    events = []
+
+    def _shutdown_worker(cluster_name, worker_job_id=None):
+        events.append(f'shutdown:{cluster_name}:{worker_job_id}')
+
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', _shutdown_worker)
+
+    class _ContextStub:
+        """Runs the provided target inline for deterministic testing."""
+
+        def run(self, fn, *args):
+            fn(*args)
+
+    class _FakeThread:
+        """Records start/join ordering before running the target on join."""
+
+        def __init__(self, target, args=(), kwargs=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            events.append(f'start:{self._args[1]}:{self._args[2]}')
+
+        def join(self):
+            events.append(f'join:{self._args[1]}:{self._args[2]}')
+            self._target(*self._args, **self._kwargs)
+
+    def _copy_context():
+        return _ContextStub()
+
+    monkeypatch.setattr(coordinator.contextvars, 'copy_context', _copy_context)
+    monkeypatch.setattr(coordinator.threading, 'Thread', _FakeThread)
+
+    batch_coordinator.cancel()
+
+    assert events == [
+        'start:worker-a:17',
+        'start:worker-b:18',
+        'join:worker-a:17',
+        'shutdown:worker-a:17',
+        'join:worker-b:18',
+        'shutdown:worker-b:18',
+    ]
+    assert not batch_coordinator._active_workers
+
+
+def test_cancel_contains_worker_shutdown_failure(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    batch_coordinator._active_workers.update({
+        'worker-a': 17,
+        'worker-b': 18,
+    })
+    second_started = threading.Event()
+
+    def _shutdown_worker(cluster_name, worker_job_id=None):
+        if cluster_name == 'worker-a':
+            assert worker_job_id == 17
+            raise RuntimeError('shutdown unavailable')
+        if cluster_name == 'worker-b':
+            assert worker_job_id == 18
+            second_started.set()
+            return
+        raise AssertionError(f'unexpected worker {cluster_name!r}')
+
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', _shutdown_worker)
+    with mock.patch.object(coordinator.logger, 'warning') as log_warning:
+        batch_coordinator.cancel()
+
+    assert second_started.is_set()
+    log_warning.assert_called_once_with('Failed to shutdown worker on worker-a')
+    assert not batch_coordinator._active_workers
+
+
 def test_cancel_retries_unresolved_worker_cleanup_once(monkeypatch):
     batch_coordinator = _make_coordinator()
     entered = threading.Event()
