@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Implemented.
 
 ## Context
 
@@ -147,7 +147,7 @@ live.
 | `sky/provision/capacity_policy.py` provider classification | `test_failover_classification.py` terminal, provider-code, mixed-code, cycle, and bounded-history cases |
 | exact cache-key and demand proofs | `test_failover_classification.py`, `test_capacity_storm_path.py` |
 | `cloud_vm_ray_backend.py` façade aliases and retry callers | capacity-policy contract assertions, retry-zone cases, `test_cloud_vm_ray_backend.py` |
-| Serve terminal classifier caller | `test_replica_manager_capacity_errors.py` and existing Serve replica-manager focused tests |
+| Serve terminal classifier caller | `test_serve_replica_managers.py` and `test_serve_placement_history.py` |
 | import and serialization compatibility | capacity-policy signature, direct identity, historical module, and pickle assertions |
 
 ## Performance evidence plan
@@ -165,6 +165,29 @@ changed-path filters. The Unit Tests matrix collects the full
 `tests/unit_tests` tree containing the focused tests above. Format, mypy,
 Pylint, BasedPyright, import-linter, limited-dependency, and compile checks
 cover the new production module and the façade.
+
+## Validation evidence
+
+- The characterization test passed before extraction and now proves 14
+  historical signatures, direct new-module/façade identity, historical
+  `__module__`, and pickle round trips.
+- All 16 moved function bodies are AST-equivalent to the
+  `7b5f87c0a9ea5b90809c2582648df0d4283b32d4` baseline when source locations
+  are ignored.
+- The final formatted state passes 465 focused unit tests:
+  54 failover-classification, 2 capacity-storm, 331 Serve replica-manager,
+  66 Cloud VM backend, and 12 placement-history cases.
+- The Cloud VM backend integration file collects four parametrized cases,
+  proving the changed production path remains represented in the integration
+  suite without launching cloud resources locally.
+- `format.sh --files` passes YAPF, isort, mypy across 768 source files, Pylint
+  at 10.00, dashboard ESLint, and Prettier. Ruff, import-linter, compileall,
+  both staged and unstaged `git diff --check`, and an isolated
+  BasedPyright 1.39.9 run all pass.
+- Eight alternating fresh-process import samples measured a 1.080149-second
+  baseline median and 0.941929-second extracted median, a 12.796% improvement.
+  Direct aliases add no wrapper frame, and AST equivalence proves no provider,
+  database, cache-query, copy, loop, or retry change in the moved bodies.
 
 ## Rollout and rollback
 
