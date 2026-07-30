@@ -868,6 +868,72 @@ describe('useServiceDetails stale-response fencing', () => {
     }
   });
 
+  it('skips periodic refreshes while hidden and resumes when visible', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    Object.defineProperty(window.document, 'visibilityState', {
+      configurable: true,
+      value: 'hidden',
+    });
+    dashboardCache.get.mockResolvedValue({
+      services: [{ name: 'svc', status: 'READY', replicas: [] }],
+    });
+
+    const { unmount } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+    let mounted = true;
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(2 * 60 * 1000);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      Object.defineProperty(window.document, 'visibilityState', {
+        configurable: true,
+        value: 'visible',
+      });
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+
+      expect(dashboardCache.invalidate.mock.calls).toEqual([
+        [getServices, detailSummaryArgs('svc')],
+        [getServices, detailFullArgs('svc')],
+      ]);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
+
   it('does not start a periodic refresh while a manual refresh is in flight', async () => {
     jest.useFakeTimers();
     const refreshedSummary = deferred();
