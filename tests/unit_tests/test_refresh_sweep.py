@@ -8,6 +8,7 @@ override for its thread count.
 """
 # pylint: disable=protected-access
 import threading
+from unittest import mock
 
 from sky.backends import backend_utils
 from sky.utils import status_lib
@@ -113,6 +114,56 @@ class TestRefreshFaultIsolation:
         assert attempted == ['launching', 'init-fresh', 'up-stale']
         assert all(kwargs['cluster_status_lock_timeout'] == 0
                    for kwargs in refresh_kwargs)
+
+    def test_sweep_adds_only_nominated_ownerless_managed_services(
+            self, monkeypatch):
+        attempted = []
+
+        def _fake_refresh_cluster_record(cluster_name, **kwargs):
+            del kwargs
+            attempted.append(cluster_name)
+            return _record(status_lib.ClusterStatus.UP, 1)
+
+        monkeypatch.setattr(
+            backend_utils.global_user_state,
+            'get_cluster_status_fields',
+            lambda names=None, *, exclude_managed_clusters=False:
+            {'user-cluster': (status_lib.ClusterStatus.UP.value, 10)})
+        monkeypatch.setattr(
+            backend_utils.serve_utils,
+            'get_orphaned_service_cluster_status_fields', lambda:
+            {'orphaned-service': (status_lib.ClusterStatus.INIT.value, 1)})
+        monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
+                            _fake_refresh_cluster_record)
+        monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
+                            lambda: 1)
+
+        backend_utils.refresh_cluster_records()
+
+        assert attempted == ['orphaned-service', 'user-cluster']
+
+    def test_owner_discovery_failure_preserves_ordinary_sweep(
+            self, monkeypatch):
+        attempted = []
+
+        monkeypatch.setattr(
+            backend_utils.global_user_state,
+            'get_cluster_status_fields',
+            lambda names=None, *, exclude_managed_clusters=False:
+            {'user-cluster': (status_lib.ClusterStatus.UP.value, 1)})
+        monkeypatch.setattr(
+            backend_utils.serve_utils,
+            'get_orphaned_service_cluster_status_fields',
+            mock.Mock(side_effect=RuntimeError('serve db unavailable')))
+        monkeypatch.setattr(
+            backend_utils, 'refresh_cluster_record',
+            lambda cluster_name, **_kwargs: attempted.append(cluster_name))
+        monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
+                            lambda: 1)
+
+        backend_utils.refresh_cluster_records()
+
+        assert attempted == ['user-cluster']
 
     def test_sweep_covers_all_clusters_when_snapshot_fails(self, monkeypatch):
         """A status-snapshot failure falls back to the names-only sweep."""

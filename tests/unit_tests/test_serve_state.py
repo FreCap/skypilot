@@ -2979,3 +2979,24 @@ class TestGroupedReplicaSnapshot:
 
     def test_empty_table_returns_empty_mapping(self, _mock_serve_db):
         assert not serve_state.get_replica_infos_grouped()
+
+
+class TestReplicaClusterNameSnapshot:
+    """Exact owner discovery reads only the scalar cluster-name column."""
+
+    def test_returns_all_exact_cluster_names_in_one_statement(
+            self, _mock_serve_db):
+        serve_state.add_or_update_replicas(
+            'svc-a', [(1, _replica(1, cluster_name='svc-a-r1')),
+                      (2, _replica(2, cluster_name='svc-a-r2'))])
+        serve_state.add_or_update_replica('svc-b', 1,
+                                          _replica(1, cluster_name='svc-b-r1'))
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            cluster_names = serve_state.get_replica_cluster_names()
+
+        assert counts['n'] == 1
+        assert cluster_names == {'svc-a-r1', 'svc-a-r2', 'svc-b-r1'}
+
+    def test_empty_table_returns_empty_set(self, _mock_serve_db):
+        assert not serve_state.get_replica_cluster_names()

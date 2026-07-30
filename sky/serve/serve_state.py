@@ -2974,6 +2974,20 @@ def get_replica_ids(service_name: str) -> set[int]:
     return {row[0] for row in rows}
 
 
+def get_replica_cluster_names() -> set[str]:
+    """Gets exact cluster identities for all current replica rows.
+
+    The JSON-state migration backfilled and verifies this plain column, so
+    ownership discovery need not deserialize every replica state blob.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(replicas_table.c.cluster_name).where(
+                replicas_table.c.cluster_name.is_not(None))).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def get_replica_infos(
         service_name: str) -> list['replica_managers.ReplicaInfo']:
     """Gets all replica infos of a service."""

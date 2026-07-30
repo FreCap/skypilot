@@ -4441,7 +4441,7 @@ def _sort_clusters_for_refresh(
 
 
 def refresh_cluster_records() -> None:
-    """Refreshes the status of all clusters, except managed clusters.
+    """Refreshes user clusters and ownerless managed service clusters.
 
     Used by the background status refresh daemon.
     This function is a stripped-down version of get_clusters, with only the
@@ -4455,7 +4455,9 @@ def refresh_cluster_records() -> None:
     """
     # We force to exclude managed clusters to avoid multiple sources
     # manipulating them. For example, SkyServe assumes the replica manager
-    # is the only source of truth for the cluster status.
+    # is the only source of truth for the cluster status. Consolidated
+    # SkyServe separately nominates exact cluster rows for which no replica
+    # owner remains; those rows no longer have a competing lifecycle writer.
     try:
         status_fields = global_user_state.get_cluster_status_fields(
             None, exclude_managed_clusters=True)
@@ -4469,6 +4471,25 @@ def refresh_cluster_records() -> None:
         cluster_names = list(
             global_user_state.get_cluster_names(exclude_managed_clusters=True))
         status_fields = {}
+
+    try:
+        orphaned_service_status_fields = (
+            serve_utils.get_orphaned_service_cluster_status_fields())
+    except Exception as e:  # pylint: disable=broad-except
+        # Owner discovery is an additive repair path. Never let a Serve-state
+        # read failure stop the ordinary user-cluster refresh sweep.
+        logger.debug('Failed to discover ownerless managed service clusters; '
+                     'continuing with ordinary cluster refresh: '
+                     f'{common_utils.format_exception(e, use_bracket=True)}')
+        orphaned_service_status_fields = {}
+    if orphaned_service_status_fields:
+        logger.info('Reconciling provider status for '
+                    f'{len(orphaned_service_status_fields)} managed service '
+                    'cluster(s) without an exact replica owner.')
+        for cluster_name, fields in orphaned_service_status_fields.items():
+            if cluster_name not in status_fields:
+                cluster_names.append(cluster_name)
+                status_fields[cluster_name] = fields
 
     def _refresh_cluster_record(cluster_name):
         return _refresh_cluster(cluster_name,

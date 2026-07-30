@@ -2807,6 +2807,29 @@ def get_cluster_status_fields(
 
 
 @metrics_lib.time_me
+def get_managed_cluster_status_fields(
+    workload_type: str,) -> dict[str, tuple[str | None, int | None]]:
+    """Returns plain status fields for one managed workload type.
+
+    This is intentionally separate from ``get_cluster_status_fields``:
+    ordinary cluster refresh excludes every managed cluster, while a
+    workload owner may use this narrower inventory to nominate only rows for
+    which it no longer has an exact child record.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(
+            cluster_table.c.name,
+            cluster_table.c.status,
+            cluster_table.c.status_updated_at,
+        ).filter(
+            cluster_table.c.is_managed == int(True),
+            cluster_table.c.workload_type == workload_type,
+        ).all()
+    return {row.name: (row.status, row.status_updated_at) for row in rows}
+
+
+@metrics_lib.time_me
 def get_cluster_image_consumers(
     cluster_names: list[str],
 ) -> dict[str, tuple[str | None, str | None] | None]:
