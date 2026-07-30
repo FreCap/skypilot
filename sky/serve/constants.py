@@ -748,11 +748,10 @@ INITIAL_VERSION = 1
 REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
 
 # Name of the environment variable holding the controller pod's own name.
-# In external load balancer mode the controller (running in the api-server pod)
-# reads its own pod spec to mirror its container image onto the LB Deployment
-# it creates. The platform must inject this via the downward API
-# (metadata.name). It is a hard contract: without it the controller cannot
-# resolve the LB image.
+# In external load balancer mode the controller reads its own pod spec to
+# mirror its container image onto the LB Deployment it creates. The platform
+# must inject this via the downward API (metadata.name). It is a hard contract:
+# without it the controller cannot resolve the LB image.
 POD_NAME_ENV_VAR = 'SKYPILOT_POD_NAME'
 # Helm-rendered name of the stable API Deployment that owns generated external
 # LB objects. Unlike the API Pod/ReplicaSet identities, this Deployment UID is

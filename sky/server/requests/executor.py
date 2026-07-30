@@ -55,6 +55,7 @@ from sky.server import watchdog
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import process
+from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.server.requests import role_filter
@@ -248,8 +249,16 @@ class RequestWorker:
         self._thread = thread
 
     def cancel(self) -> None:
+        self.request_shutdown()
+        self.wait_for_shutdown()
+
+    def request_shutdown(self) -> None:
+        """Stop this worker from claiming another request."""
+        self._cancel_event.set()
+
+    def wait_for_shutdown(self) -> None:
+        """Wait for the worker dispatcher and its process pool to exit."""
         if self._thread is not None:
-            self._cancel_event.set()
             self._thread.join()
 
     def process_request(self, executor: process.BurstableExecutor,
@@ -794,6 +803,41 @@ def override_request_env_and_config(
         os.environ.update(original_env)
 
 
+@contextlib.contextmanager
+def _controller_execution_environment(
+    controller_generation: int | None,
+    controller_instance_id: str | None,
+) -> Generator[None, None, None]:
+    """Expose the durable controller fence to one claimed request."""
+    if controller_generation is None:
+        yield
+        return
+    if controller_instance_id is None:
+        raise RuntimeError('A controller claim must have an owner instance.')
+
+    # Runtime import avoids loading the PostgreSQL backend for the legacy
+    # local and multiprocessing executors.
+    # pylint: disable=import-outside-toplevel
+    from sky.server.requests import postgres
+    generation_env_var = postgres.CONTROLLER_GENERATION_ENV_VAR
+    instance_env_var = postgres.CONTROLLER_INSTANCE_ID_ENV_VAR
+    previous_generation = os.environ.get(generation_env_var)
+    previous_instance = os.environ.get(instance_env_var)
+    os.environ[generation_env_var] = str(controller_generation)
+    os.environ[instance_env_var] = controller_instance_id
+    try:
+        yield
+    finally:
+        if previous_generation is None:
+            os.environ.pop(generation_env_var, None)
+        else:
+            os.environ[generation_env_var] = previous_generation
+        if previous_instance is None:
+            os.environ.pop(instance_env_var, None)
+        else:
+            os.environ[instance_env_var] = previous_instance
+
+
 def _sigterm_handler(signum: int, frame: Optional['types.FrameType']) -> None:
     raise KeyboardInterrupt
 
@@ -909,6 +953,8 @@ def _request_execution_wrapper(request_id: str,
         func = request_task.entrypoint
         request_body = request_task.request_body
         request_name = request_task.name
+        controller_generation = request_task.controller_generation
+        controller_instance_id = request_task.worker_instance_id
         del request_task
 
         # Store copies of the original stdout and stderr file descriptors
@@ -933,6 +979,8 @@ def _request_execution_wrapper(request_id: str,
             with debug_log_ctx, \
                 override_request_env_and_config(
                     request_body, request_id, request_name), \
+                _controller_execution_environment(
+                    controller_generation, controller_instance_id), \
                 tempstore.tempdir():
                 if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
                     config = debug_dump_helpers.redact_config(
@@ -1445,7 +1493,10 @@ async def schedule_prepared_request(request_task: api_requests.Request,
 
 
 def start(
-    config: server_config.ServerConfig
+    config: server_config.ServerConfig,
+    *,
+    execution_classes: frozenset[request_registry.ExecutionClass] | None = None,
+    controller_generation: int | None = None,
 ) -> tuple[multiprocessing.Process | None, list[RequestWorker]]:
     """Start the request workers.
 
@@ -1460,20 +1511,37 @@ def start(
     factory = queue_base.get_registered_queue_backend_factory()
     # Explicitly registered plugin backends take precedence over config.
     if factory is not None:
+        if execution_classes is not None:
+            raise RuntimeError(
+                'Explicit queue plugins cannot be used with role-scoped '
+                'request execution because QueueBackendFactory has no '
+                'execution-class filter contract.')
         _queue_factory = factory
     elif os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
         # Runtime import avoids loading the PostgreSQL implementation before
         # plugins have had an opportunity to register a custom queue factory.
         # pylint: disable=import-outside-toplevel
         from sky.server.requests import postgres
-        _queue_factory = postgres.PostgresQueueFactory()
+        allowed_classes = (frozenset(
+            execution_class.value for execution_class in execution_classes)
+                           if execution_classes is not None else None)
+        _queue_factory = postgres.PostgresQueueFactory(
+            execution_classes=allowed_classes,
+            controller_generation=controller_generation)
     elif config.queue_backend == server_config.QueueBackend.MULTIPROCESSING:
+        if execution_classes is not None:
+            raise RuntimeError('Role-scoped request execution requires the '
+                               'PostgreSQL request backend.')
         _queue_factory = queue_base.MultiprocessingQueueFactory()
     elif config.queue_backend == server_config.QueueBackend.LOCAL:
+        if execution_classes is not None:
+            raise RuntimeError('Role-scoped request execution requires the '
+                               'PostgreSQL request backend.')
         _queue_factory = queue_base.LocalQueueFactory()
     else:
         raise RuntimeError(f'Invalid queue backend: {config.queue_backend}')
 
+    _get_queue.cache_clear()
     queue_server = _queue_factory.start()
     logger.info('Request queues created')
 

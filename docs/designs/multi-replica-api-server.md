@@ -320,11 +320,18 @@ The new PostgreSQL-only `api_requests` Alembic schema contains:
 - Singleton controller-role key.
 - Monotonically increasing `generation`.
 - Current `instance_id`.
+- PostgreSQL backend PID and generation-specific advisory-lock key for the
+  session that holds both the controller election lock and generation lock.
 - `acquired_at`, `heartbeat_at`, and `released_at`.
 
 The elected process advances this row only while holding the dedicated
-PostgreSQL advisory lock. The persisted generation, not advisory-lock
-ownership alone, is the fence passed to child controllers.
+PostgreSQL advisory lock. It also takes a generation-specific session lock
+before committing the new row. A generation is current only when the row is
+unreleased and `pg_locks` proves that the recorded backend still holds both
+exact granted exclusive advisory locks. The generation lock prevents backend
+PID reuse during a handoff from making an old row appear live. The persisted
+generation and live session proof together form the fence passed to child
+controllers.
 
 ### `api_controller_action_reservations`
 
@@ -693,6 +700,73 @@ Deployment:
 - Persist worker instance and controller generation ownership.
 - Reconstruct Serve control files from durable version state during recovery.
 
+M3 uses schema revision `003`. It adds the controller-leadership and
+controller-action-reservation tables described above plus a nullable
+`controller_generation` on each request. A controller acquires its advisory
+leader lock through a dedicated PostgreSQL session and advances the durable
+generation, takes a generation-specific advisory lock, and records that
+session's backend PID and generation-lock key on the same session before it
+can claim work. Every claim heartbeat, RUNNING transition, result write,
+retry, and terminal write for a controller-class request must match the
+request claim, current unreleased leadership row, and live `pg_locks` entries
+for that PID, the election-lock key, and the generation-lock key. Losing the
+leader session therefore fences the old generation immediately, even before
+a standby advances the generation and while another database connection in
+the stale pod remains usable.
+
+PostgreSQL queue consumers receive an immutable set of allowed execution
+classes. Explicit executor roles claim only `normal`; only the current
+controller leader starts a bounded pool that claims `controller`; the
+compatibility `all` role remains the sole temporary consumer of both. The
+first M3 leader also transactionally fences controller-class claims left by an
+M2 executor. Reconcile and read-only work returns to the durable queue under a
+new execution generation. Ambiguous mutating work becomes terminal and is
+never replayed.
+
+Controller promotion also has an explicit M2-to-M3 mixed-version gate. An M2
+executor advertises controller handlers in its durable instance lease, while
+an M3 executor advertises only normal handlers. Controller standbys refuse
+leadership until the last all-role or executor advertisement that includes a
+controller handler has been quiet for the configured executor termination
+grace plus ten seconds. This uses the last database heartbeat even after the
+old instance marks itself draining, because M2 published draining before its
+worker pools had necessarily exited. A pod waiting on this gate is unready and
+publishes `phase=waiting-for-executor-cutover`, so Helm cannot accept the new
+controller Deployment before the mixed-version window closes. The winner
+rechecks the gate while holding leadership and before spawning any worker or
+subsystem child. An active leader continuously rechecks the same condition and
+becomes unready, fences its children, releases leadership, and exits if a
+legacy consumer reappears during rollback.
+
+Every non-replayable controller-class request reserves its stable logical
+action before its handler starts. Reservation ownership includes the
+controller instance and generation; only that generation may advance the
+reservation to running or terminal. A handoff marks an unfinished prior
+reservation ambiguous rather than silently repeating it. This request-level
+fence composes with the existing resource-specific protections: managed jobs
+retain the consolidation-mode session lock and exact controller process
+records, while SkyServe retains service lifecycle epochs, incarnation-scoped
+resource identities, and exact controller PID/IP ownership. These inner fences
+remain authoritative before individual provider-side actions, rather than
+adding a second parallel implementation for every cloud operation.
+
+Standbys publish Ready with `phase=standby`. A leader publishes its generation
+and continuously probes and heartbeats the lock-owning session. On SIGTERM it
+first becomes unready, stops controller claims, interrupts the specialized
+worker pools and local child controllers, releases its durable leadership row,
+and exits. If the lock session is lost, it follows the same sequence but
+cannot mark the already-lost session released; the new durable generation is
+the fence and the old process exits after local cleanup. Singleton maintenance
+loops start only with leader-owned resources or retain their narrower
+PostgreSQL session locks.
+
+The chart renders two controller replicas with a distinct label, role command,
+health port, resources, credentials, shared storage, and PostgreSQL
+configuration. HA validation requires at least two. M3 intentionally leaves
+the controller PodDisruptionBudget and topology-spread rollout policy for M4,
+but active and standby deletion are both failure-injected before M3 is
+accepted.
+
 Deployment:
 
 1. Deploy two controller replicas.
@@ -935,6 +1009,27 @@ uses them. The default must no longer silently select a pod-local queue.
 API-local Uvicorn worker coordination may remain where it does not imply
 cross-role ownership.
 
+### Adjacent-version controller cutover guards
+
+- `recent_legacy_controller_consumers()` and its M2 handler-advertisement
+  intersection in `sky/server/requests/postgres.py`
+- `SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS`, the
+  `waiting-for-executor-cutover` controller supervisor phases, and the
+  pre-acquisition, post-acquisition, and active-leader regression probes in
+  `sky/server/runtime.py`
+- The controller Deployment calculation and injection of executor termination
+  grace plus ten seconds
+- The `all`-role null-generation exception in
+  `_controller_claim_is_current()` and the queue-construction exception that
+  permits controller execution without a generation only in that role
+- Tests whose only contract is safe M2 or `all`-role overlap
+
+Delete these only after M3 is outside the fleet rollback window and no
+registered `all` or M2 executor instance can advertise controller handlers.
+The controller generation, dual advisory-lock proof, durable action
+reservations, and stale-write predicates are steady-state safety mechanisms
+and must remain.
+
 ### Pod-local artifact lifecycle
 
 - `LocalFilesystemBlobStorage.reset_on_startup()` destructive client-state
@@ -1069,3 +1164,25 @@ No blocking correctness gap remains in the design. The highest implementation
 risks are complete handler classification, reconciling ambiguous provider
 actions, and preserving the current single-pod compatibility path through M1.
 The milestone tests make each of those a release gate.
+
+### Review 3: PURSUE
+
+The M3 implementation review exposed an adjacent-version race not covered by
+the original design: an M2 executor may keep controller-capable workers alive
+after publishing its draining state. The amended design uses the durable
+instance advertisement and last heartbeat as a cutover gate for the complete
+executor termination grace plus ten seconds. Both controller replicas remain
+unready while that gate is closed, and an active leader exits if a legacy
+consumer reappears. This closes the rollout and rollback window without a new
+coordination system or a permanent compatibility path.
+
+### Review 4: PURSUE
+
+The exact M3 write predicates exposed a second fencing gap: an unreleased
+leadership row alone can outlive its advisory-lock session until the standby
+advances the generation. A backend PID check alone also admits PID reuse. The
+revised contract binds each generation to a second, unique advisory lock on
+the election-lock session and proves both exact lock keys through `pg_locks`.
+This immediately invalidates the old generation when its session disappears.
+The bounded extra lock-manager and predicate cost applies only to
+controller-owned work and is preferable to a time-based split-brain window.

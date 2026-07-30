@@ -126,11 +126,37 @@ EXTERNAL_LOCAL_ENV_VARS = [
     'KUBECONFIG',
 ]
 
-# Platform capabilities must come from the server deployment, never a client
-# process or a hand-crafted request body. The external-LB variable predates the
-# SKYPILOT_SERVER_ naming convention, so classify it explicitly while keeping
-# the existing name compatible across rolling chart/image upgrades.
+# Platform identity and capabilities must come from the server deployment,
+# never a client process, an older API pod's persisted environment, or a
+# hand-crafted request body. Most of these variables predate the
+# SKYPILOT_SERVER_ naming convention, so classify them explicitly while
+# keeping their existing names compatible across rolling chart/image upgrades.
 _SERVER_OWNED_ENV_VARS = frozenset({
+    'POD_IP',
+    'SKY_API_SERVER_METRICS_ENABLED',
+    'SKYPILOT_APISERVER_UUID',
+    'SKYPILOT_API_DEPLOYMENT_NAME',
+    'SKYPILOT_API_REQUEST_BACKEND',
+    'SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH',
+    'SKYPILOT_API_SERVER_INSTANCE_ID',
+    'SKYPILOT_API_SERVER_ROLE',
+    'SKYPILOT_API_SERVER_STORAGE_ENABLED',
+    'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS',
+    'SKYPILOT_GRACE_PERIOD_SECONDS',
+    'SKYPILOT_IN_CLUSTER_NAMESPACE',
+    'SKYPILOT_POD_NAME',
+    'SKYPILOT_POD_NAMESPACE',
+    'SKYPILOT_POD_UID',
+    'SKYPILOT_RELEASE_NAME',
+    'SKYPILOT_ROLLING_UPDATE_ENABLED',
+    'SKYPILOT_SERVE_API_SERVICE_URL',
+    'SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE',
+    'SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE',
+    'SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED',
+    'SKYPILOT_SERVE_LB_HA_RBAC_READY',
+    'SKYPILOT_SERVE_LB_RESOURCES_JSON',
+    'SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE',
+    'SKYPILOT_STATE_DB_MIGRATION_MODE',
     serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
 })
 

@@ -18,6 +18,9 @@ import sqlalchemy
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky import core
+from sky import global_user_state
+from sky.jobs.server import core as managed_jobs_core
+from sky.serve.server import core as serve_core
 from sky.server import daemons
 from sky.server.requests import cutover
 from sky.server.requests import executor
@@ -95,6 +98,45 @@ def _request(request_id: str,
     )
 
 
+def _controller_request(
+    request_id: str,
+    *,
+    replayable: bool = False,
+) -> requests.Request:
+    if replayable:
+        daemon = daemons.INTERNAL_REQUEST_DAEMONS[0]
+        request = requests.build_internal_daemon_request(daemon)
+        request.request_id = request_id
+        return request
+    return requests.Request(
+        request_id=request_id,
+        name='sky.jobs.launch',
+        entrypoint=managed_jobs_core.launch,
+        request_body=payloads.JobsLaunchBody(task='run: echo controller',
+                                             name='controller-test'),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='user',
+        cluster_name='managed-job:test',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+    )
+
+
+def _controller_leader(
+    engine: sqlalchemy.engine.Engine,
+    monkeypatch,
+    instance_id: str,
+) -> request_postgres.ControllerLeaderLease:
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        lambda: engine)
+    monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'controller')
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR, instance_id)
+    leader = request_postgres.ControllerLeaderLease(instance_id)
+    assert leader.try_acquire()
+    return leader
+
+
 def _write_legacy_database(path, legacy_requests):
     connection = sqlite3.connect(path)
     try:
@@ -126,12 +168,19 @@ def _claim(backend: request_postgres.PostgresRequestBackend,
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '002'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '003'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
-        'api_request_store_metadata'
+        'api_request_store_metadata', 'api_controller_leadership',
+        'api_controller_action_reservations'
     }.issubset(inspector.get_table_names())
+    leadership_columns = {
+        column['name']
+        for column in inspector.get_columns('api_controller_leadership')
+    }
+    assert {'lock_backend_pid',
+            'generation_lock_key'}.issubset(leadership_columns)
     sqlite_engine = sqlalchemy.create_engine('sqlite://')
     with pytest.raises(RuntimeError, match='requires PostgreSQL'):
         request_postgres._initialize_schema(sqlite_engine)
@@ -172,6 +221,41 @@ def test_server_instance_lease_publishes_ready_and_draining(
                     instance_id))).mappings().one()
     assert not row['ready']
     assert row['draining_at'] is not None
+
+
+def test_controller_cutover_waits_for_recent_m2_executor_heartbeat(
+        request_database):
+    engine, _ = request_database
+    instance_id = uuid.uuid4()
+    legacy_handler = registry.registration_for_handler(
+        managed_jobs_core.launch).name
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=instance_id,
+                role='executor',
+                pod_name='old-executor',
+                pod_uid='old-executor',
+                pod_ip='10.0.0.2',
+                version='m2',
+                started_at=sqlalchemy.func.clock_timestamp(),
+                heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                draining_at=sqlalchemy.func.clock_timestamp(),
+                ready=False,
+                health_detail={'phase': 'draining'},
+                supported_handlers=[legacy_handler],
+                supported_payload_versions={}))
+    assert request_postgres.recent_legacy_controller_consumers(70) == [
+        str(instance_id)
+    ]
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id == instance_id).
+            values(heartbeat_at=sqlalchemy.func.clock_timestamp() -
+                   datetime.timedelta(seconds=71)))
+    assert not request_postgres.recent_legacy_controller_consumers(70)
 
 
 def test_request_control_pool_survives_saturated_ordinary_pool(
@@ -276,6 +360,325 @@ def test_distributed_singleton_promotes_one_standby(request_database):
             await standby_task
 
     asyncio.run(exercise())
+
+
+def test_controller_leadership_uses_same_session_and_monotonic_generation(
+        request_database, monkeypatch):
+    engine, _ = request_database
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = _controller_leader(engine, monkeypatch, first_id)
+    second = request_postgres.ControllerLeaderLease(second_id)
+    try:
+        assert first.generation == 1
+        assert not second.try_acquire()
+        lock_backend_pid = first.backend_pid()
+        assert lock_backend_pid is not None
+        with engine.begin() as connection:
+            assert connection.execute(
+                sqlalchemy.text('SELECT pg_terminate_backend(:pid)'), {
+                    'pid': lock_backend_pid
+                }).scalar_one()
+        assert not first.heartbeat()
+        assert not request_postgres.controller_leadership_is_current(
+            first_id, 1)
+
+        deadline = time.monotonic() + 5
+        while not second.try_acquire() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert second.generation == 2
+        assert request_postgres.controller_leadership_is_current(second_id, 2)
+        assert not request_postgres.controller_leadership_is_current(
+            first_id, 1)
+    finally:
+        first.release()
+        second.release()
+
+
+def test_stale_controller_cannot_refresh_daemons_or_fence_new_generation(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = _controller_leader(engine, monkeypatch, first_id)
+    second = request_postgres.ControllerLeaderLease(second_id)
+    request = requests.build_internal_daemon_request(
+        daemons.INTERNAL_REQUEST_DAEMONS[0])
+    try:
+        monkeypatch.setenv(request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
+                           first_id)
+        monkeypatch.setenv(request_postgres.CONTROLLER_GENERATION_ENV_VAR,
+                           str(first.generation))
+        assert asyncio.run(
+            backend.create_or_refresh_internal_daemon_async(request))
+
+        lock_backend_pid = first.backend_pid()
+        assert lock_backend_pid is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_terminate_backend(:pid)'),
+                {'pid': lock_backend_pid})
+        assert second.try_acquire()
+
+        with pytest.raises(RuntimeError, match='leadership changed'):
+            asyncio.run(
+                backend.create_or_refresh_internal_daemon_async(request))
+        with pytest.raises(RuntimeError, match='leadership changed'):
+            request_postgres.fence_stale_controller_claims(
+                first_id, first.generation)
+
+        monkeypatch.setenv(request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
+                           second_id)
+        monkeypatch.setenv(request_postgres.CONTROLLER_GENERATION_ENV_VAR,
+                           str(second.generation))
+        assert not asyncio.run(
+            backend.create_or_refresh_internal_daemon_async(request))
+    finally:
+        first.release()
+        second.release()
+
+
+def test_role_scoped_queues_isolate_normal_and_controller_claims(
+        request_database, monkeypatch):
+    engine, fixture_backend = request_database
+    instance_id = str(uuid.uuid4())
+    leader = _controller_leader(engine, monkeypatch, instance_id)
+    backend = request_postgres.PostgresRequestBackend()
+    try:
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(
+                _request('normal-class')))
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(
+                _controller_request('controller-class')))
+
+        normal_queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset({registry.ExecutionClass.NORMAL.value}))
+        normal_item = normal_queue.get()
+        assert normal_item is not None
+        assert normal_item.request_id == 'normal-class'
+        assert normal_queue.get() is None
+
+        controller_queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=leader.generation)
+        controller_item = controller_queue.get()
+        assert controller_item is not None
+        assert controller_item.request_id == 'controller-class'
+        assert backend.try_mark_running(controller_item.request_id, 1234,
+                                        controller_item.execution_generation,
+                                        controller_item.claim_token)
+
+        restored = backend.get_request('controller-class')
+        assert restored.controller_generation == leader.generation
+        assert restored.worker_instance_id == instance_id
+        with engine.connect() as connection:
+            reservation = connection.execute(
+                sqlalchemy.select(
+                    request_postgres.CONTROLLER_ACTION_RESERVATIONS).where(
+                        request_postgres.CONTROLLER_ACTION_RESERVATIONS.c.
+                        logical_action_id ==
+                        'controller-class')).mappings().one()
+        assert reservation['state'] == 'running'
+        assert reservation['controller_generation'] == leader.generation
+        assert str(reservation['controller_instance_id']) == instance_id
+    finally:
+        leader.release()
+
+
+def test_cancelling_running_controller_action_marks_outcome_ambiguous(
+        request_database, monkeypatch):
+    engine, fixture_backend = request_database
+    instance_id = str(uuid.uuid4())
+    leader = _controller_leader(engine, monkeypatch, instance_id)
+    backend = request_postgres.PostgresRequestBackend()
+    try:
+        request = _controller_request('cancel-controller-action')
+        assert asyncio.run(fixture_backend.create_if_not_exists_async(request))
+        queue = request_postgres.PostgresQueueBackend(
+            request.schedule_type.value,
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=leader.generation)
+        item = queue.get()
+        assert item is not None
+        assert backend.try_mark_running(item.request_id, 1234,
+                                        item.execution_generation,
+                                        item.claim_token)
+        kill = mock.Mock()
+        monkeypatch.setattr(request_postgres.os, 'kill', kill)
+
+        assert backend.kill_requests([item.request_id]) == [item.request_id]
+
+        kill.assert_called_once_with(1234, request_postgres.signal.SIGTERM)
+        with engine.connect() as connection:
+            reservation = connection.execute(
+                sqlalchemy.select(
+                    request_postgres.CONTROLLER_ACTION_RESERVATIONS).where(
+                        request_postgres.CONTROLLER_ACTION_RESERVATIONS.c.
+                        logical_action_id == item.request_id)).mappings().one()
+        assert reservation['state'] == 'ambiguous'
+        assert reservation['reconciliation_at'] is not None
+    finally:
+        leader.release()
+
+
+def test_role_filter_is_rechecked_after_precondition_evaluation(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    request = _request('role-change-during-precondition')
+    request.precondition_type = 'cluster-start-complete.v1'
+    request.precondition_payload = {
+        'cluster_name': 'cluster',
+        'request_id': 'launch',
+        'check_interval': 0,
+    }
+    request.precondition_deadline = time.time() + 10
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+
+    def change_execution_class(*args, **kwargs):
+        del args, kwargs
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id == request.request_id
+                ).values(
+                    execution_class=registry.ExecutionClass.CONTROLLER.value))
+        return True, None
+
+    monkeypatch.setattr(preconditions, 'check_once', change_execution_class)
+    normal_queue = request_postgres.PostgresQueueBackend(
+        'short',
+        execution_classes=frozenset({registry.ExecutionClass.NORMAL.value}))
+    assert normal_queue.get() is None
+    with engine.connect() as connection:
+        execution_class, delivery_state = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.execution_class,
+                              request_postgres.QUEUE.c.delivery_state).join(
+                                  request_postgres.QUEUE,
+                                  request_postgres.QUEUE.c.request_id ==
+                                  request_postgres.REQUESTS.c.request_id).where(
+                                      request_postgres.REQUESTS.c.request_id ==
+                                      request.request_id)).one()
+    assert execution_class == registry.ExecutionClass.CONTROLLER.value
+    assert delivery_state == 'queued'
+
+
+def test_controller_handoff_interrupts_ambiguous_mutation_and_fences_write(
+        request_database, monkeypatch):
+    engine, fixture_backend = request_database
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = _controller_leader(engine, monkeypatch, first_id)
+    first_backend = request_postgres.PostgresRequestBackend()
+    second = request_postgres.ControllerLeaderLease(second_id)
+    try:
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(
+                _controller_request('ambiguous-controller-action')))
+        queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=first.generation)
+        item = queue.get()
+        assert item is not None
+        assert first_backend.try_mark_running(item.request_id, 1234,
+                                              item.execution_generation,
+                                              item.claim_token)
+        stale_context = storage.activate_execution_claim(
+            item.request_id, item.execution_generation, item.claim_token)
+
+        lock_backend_pid = first.backend_pid()
+        assert lock_backend_pid is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_terminate_backend(:pid)'),
+                {'pid': lock_backend_pid})
+        assert not first.heartbeat()
+        assert not first_backend.set_request_finished(
+            item.request_id, requests.RequestStatus.SUCCEEDED, result=[])
+        assert second.try_acquire()
+        assert second.generation == 2
+        fenced = request_postgres.fence_stale_controller_claims(
+            second_id, second.generation)
+        assert fenced == {'replayed': 0, 'interrupted': 1}
+        try:
+            assert not first_backend.set_request_finished(
+                item.request_id, requests.RequestStatus.SUCCEEDED, result=[])
+        finally:
+            storage.deactivate_execution_claim(stale_context)
+
+        restored = first_backend.get_request(item.request_id)
+        assert restored.status is requests.RequestStatus.CANCELLED
+        assert restored.should_retry
+        assert 'ambiguous mutating outcome' in restored.interrupted_reason
+        with engine.connect() as connection:
+            reservation_state = connection.execute(
+                sqlalchemy.select(
+                    request_postgres.CONTROLLER_ACTION_RESERVATIONS.c.state).
+                where(request_postgres.CONTROLLER_ACTION_RESERVATIONS.c.
+                      logical_action_id == item.request_id)).scalar_one()
+        assert reservation_state == 'ambiguous'
+    finally:
+        first.release()
+        second.release()
+
+
+def test_controller_handoff_requeues_reconcilable_work(request_database,
+                                                       monkeypatch):
+    engine, fixture_backend = request_database
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = _controller_leader(engine, monkeypatch, first_id)
+    first_backend = request_postgres.PostgresRequestBackend()
+    second = request_postgres.ControllerLeaderLease(second_id)
+    try:
+        request = _controller_request('reconcilable-controller-action',
+                                      replayable=True)
+        assert asyncio.run(fixture_backend.create_if_not_exists_async(request))
+        first_queue = request_postgres.PostgresQueueBackend(
+            request.schedule_type.value,
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=first.generation)
+        first_item = first_queue.get()
+        assert first_item is not None
+        assert first_backend.try_mark_running(first_item.request_id, 1234,
+                                              first_item.execution_generation,
+                                              first_item.claim_token)
+
+        lock_backend_pid = first.backend_pid()
+        assert lock_backend_pid is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_terminate_backend(:pid)'),
+                {'pid': lock_backend_pid})
+        assert second.try_acquire()
+        assert second.generation == 2
+        fenced = request_postgres.fence_stale_controller_claims(
+            second_id, second.generation)
+        assert fenced == {'replayed': 1, 'interrupted': 0}
+
+        monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
+                           second_id)
+        second_queue = request_postgres.PostgresQueueBackend(
+            request.schedule_type.value,
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=second.generation)
+        second_item = second_queue.get()
+        assert second_item is not None
+        assert second_item.request_id == first_item.request_id
+        assert (second_item.execution_generation ==
+                first_item.execution_generation + 1)
+        assert second_item.claim_token != first_item.claim_token
+    finally:
+        first.release()
+        second.release()
 
 
 def test_create_round_trip_and_atomic_enqueue(request_database):
@@ -618,6 +1021,26 @@ def test_registry_rejects_row_selected_code_and_execution_class():
     values['execution_class'] = registry.ExecutionClass.CONTROLLER.value
     with pytest.raises(ValueError, match='execution class'):
         requests.Request.from_durable_values(values)
+
+
+def test_registry_owns_controller_classes_and_replay_policies():
+    jobs_launch = registry.registration_for_handler(managed_jobs_core.launch)
+    jobs_queue = registry.registration_for_handler(managed_jobs_core.queue)
+    serve_status = registry.registration_for_handler(serve_core.status)
+    normal_read = registry.registration_for_handler(core.enabled_clouds)
+    daemon = registry.registration_for_handler(
+        daemons.INTERNAL_REQUEST_DAEMONS[0].run_event)
+
+    assert jobs_launch.execution_class is registry.ExecutionClass.CONTROLLER
+    assert jobs_launch.replay_policy is registry.ReplayPolicy.NEVER
+    assert jobs_queue.execution_class is registry.ExecutionClass.CONTROLLER
+    assert jobs_queue.replay_policy is registry.ReplayPolicy.READ_ONLY
+    assert serve_status.execution_class is registry.ExecutionClass.CONTROLLER
+    assert serve_status.replay_policy is registry.ReplayPolicy.READ_ONLY
+    assert normal_read.execution_class is registry.ExecutionClass.NORMAL
+    assert normal_read.replay_policy is registry.ReplayPolicy.READ_ONLY
+    assert daemon.execution_class is registry.ExecutionClass.CONTROLLER
+    assert daemon.replay_policy is registry.ReplayPolicy.RECONCILE
 
 
 def test_sqlite_cutover_is_atomic_verified_and_idempotent(

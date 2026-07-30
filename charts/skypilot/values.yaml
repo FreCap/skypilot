@@ -307,6 +307,45 @@ executorService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: null
 
+# Active-standby owners of controller-class requests and singleton maintenance.
+# Both replicas remain Ready; PostgreSQL leadership fencing permits only one to
+# spawn controller workers or subsystem children at a time. This Deployment is
+# rendered only when apiService.highAvailability.enabled=true.
+controllerService:
+  # HA mode requires at least two, enforced contextually by the template.
+  # @schema type: [integer]; minimum: 0
+  replicas: 2
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Dependency-free liveness and readiness port.
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 46582
+  # @schema type: [integer]; minimum: 1
+  terminationGracePeriodSeconds: 60
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  # @schema type: [array, null]; item: object
+  extraVolumes: null
+  # @schema type: [array, null]; item: object
+  extraVolumeMounts: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # @schema type: [string, null]
+  topologySpreadTopologyKey: null
+
 # Environment and files required by every central PostgreSQL client. Use these
 # for private CA bundles, client certificates, or shared libpq settings instead
 # of apiService.extra* so the migration Job and managed image workers receive

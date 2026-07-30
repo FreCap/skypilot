@@ -28,6 +28,7 @@ from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
+from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
@@ -37,6 +38,8 @@ REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 POSTGRES_REQUEST_BACKEND = 'postgres'
 SERVER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_API_SERVER_INSTANCE_ID'
 SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
+CONTROLLER_GENERATION_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_GENERATION'
+CONTROLLER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'
 
 _CLAIM_LEASE_SECONDS = 30
 _CLAIM_HEARTBEAT_INTERVAL_SECONDS = 10
@@ -44,6 +47,9 @@ _MAX_EXPIRED_CLAIMS_PER_SWEEP = 100
 _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 _INSTANCE_STALE_AFTER_SECONDS = 20
 _VALID_SERVER_ROLES = frozenset({'all', 'api', 'executor', 'controller'})
+_CONTROLLER_LEADERSHIP_KEY = 'api-controller'
+_CONTROLLER_LEADER_LOCK_ID = 'skypilot:api-controller-leader:v1'
+_CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
 
 _METADATA = sqlalchemy.MetaData()
 REQUESTS = sqlalchemy.Table(
@@ -80,6 +86,7 @@ REQUESTS = sqlalchemy.Table(
                       nullable=False),
     sqlalchemy.Column('claim_token', postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('worker_instance_id', postgresql.UUID(as_uuid=True)),
+    sqlalchemy.Column('controller_generation', sqlalchemy.BigInteger),
     sqlalchemy.Column('lease_expires_at', sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column('heartbeat_at', sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column('cancel_requested_at',
@@ -163,6 +170,59 @@ SERVER_INSTANCES = sqlalchemy.Table(
                       postgresql.JSONB(none_as_null=True),
                       nullable=False),
 )
+CONTROLLER_LEADERSHIP = sqlalchemy.Table(
+    'api_controller_leadership',
+    _METADATA,
+    sqlalchemy.Column('leadership_key', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('generation', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('instance_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('lock_backend_pid', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('generation_lock_key',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('acquired_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('heartbeat_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('released_at', sqlalchemy.DateTime(timezone=True)),
+)
+CONTROLLER_ACTION_RESERVATIONS = sqlalchemy.Table(
+    'api_controller_action_reservations',
+    _METADATA,
+    sqlalchemy.Column('logical_action_id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('resource_identity', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('action_type', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('state', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('controller_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('controller_instance_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('provider_operation_id', sqlalchemy.Text),
+    sqlalchemy.Column('created_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('updated_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('reconciliation_at', sqlalchemy.DateTime(timezone=True)),
+)
+_PG_LOCKS = sqlalchemy.table(
+    'pg_locks',
+    sqlalchemy.column('locktype', sqlalchemy.Text),
+    sqlalchemy.column('pid', sqlalchemy.Integer),
+    sqlalchemy.column('classid'),
+    sqlalchemy.column('objid'),
+    sqlalchemy.column('objsubid', sqlalchemy.Integer),
+    sqlalchemy.column('mode', sqlalchemy.Text),
+    sqlalchemy.column('granted', sqlalchemy.Boolean),
+    schema='pg_catalog',
+)
 
 _DATETIME_FIELDS = frozenset({
     'created_at',
@@ -204,8 +264,13 @@ def _supported_handlers(role: str) -> list[str]:
                       for registration in registrations
                       if registration.execution_class is
                       request_registry.ExecutionClass.CONTROLLER)
-    # M2's executor role is the compatibility consumer for both execution
-    # classes. M3 narrows it to NORMAL when the controller role is available.
+    if role == 'executor':
+        return sorted(registration.name
+                      for registration in registrations
+                      if registration.execution_class is
+                      request_registry.ExecutionClass.NORMAL)
+    # The compatibility all-role process remains the only consumer for both
+    # execution classes.
     return sorted(registration.name for registration in registrations)
 
 
@@ -387,6 +452,38 @@ def current_instance_is_ready() -> bool:
                         seconds=_INSTANCE_STALE_AFTER_SECONDS))).scalar_one())
 
 
+def recent_legacy_controller_consumers(quiescence_seconds: float) -> list[str]:
+    """Return recent all/executor instances that can claim controller work.
+
+    M2 executors advertised controller handlers and marked themselves draining
+    before their worker pools had fully exited. M3 leaders therefore wait for a
+    full termination-grace window after the last such heartbeat, not merely for
+    Ready=false, before starting the specialized controller pool.
+    """
+    if quiescence_seconds < 0:
+        raise ValueError('Controller cutover quiescence must be non-negative.')
+    controller_handlers = frozenset(_supported_handlers('controller'))
+    engine = initialize_and_get_db()
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(
+                SERVER_INSTANCES.c.instance_id,
+                SERVER_INSTANCES.c.supported_handlers).where(
+                    SERVER_INSTANCES.c.role.in_(['all', 'executor']),
+                    SERVER_INSTANCES.c.heartbeat_at
+                    >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                        seconds=quiescence_seconds))).mappings().all()
+    blockers = []
+    for row in rows:
+        advertised = row['supported_handlers']
+        if not isinstance(advertised, list):
+            blockers.append(str(row['instance_id']))
+            continue
+        if controller_handlers.intersection(advertised):
+            blockers.append(str(row['instance_id']))
+    return blockers
+
+
 def _utc_datetime(timestamp: float | None) -> datetime.datetime | None:
     if timestamp is None:
         return None
@@ -441,6 +538,400 @@ def initialize_and_get_db() -> sqlalchemy.engine.Engine:
 
 async def _get_async_engine() -> sqlalchemy_async.AsyncEngine:
     return await _DB_MANAGER.get_async_engine()
+
+
+def _controller_owner_from_environment() -> tuple[str, int] | None:
+    """Return the split-role controller owner, or None in compatibility mode."""
+    role = os.environ.get(SERVER_ROLE_ENV_VAR, 'all')
+    if role == 'all':
+        return None
+    if role != 'controller':
+        raise RuntimeError(
+            f'Controller-owned work cannot run in the {role!r} server role.')
+    instance_id = os.environ.get(CONTROLLER_INSTANCE_ID_ENV_VAR)
+    generation = os.environ.get(CONTROLLER_GENERATION_ENV_VAR)
+    if instance_id is None or generation is None:
+        raise RuntimeError(
+            'The controller role has no active leadership generation.')
+    try:
+        uuid.UUID(instance_id)
+        parsed_generation = int(generation)
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(
+            'The controller leadership identity is invalid.') from e
+    if parsed_generation <= 0:
+        raise RuntimeError('The controller leadership generation must be '
+                           'positive.')
+    return instance_id, parsed_generation
+
+
+def _pg_advisory_lock_key(
+    lock: sqlalchemy.sql.Alias,) -> sqlalchemy.ColumnElement[int]:
+    """Reconstruct an int8 advisory key from one ``pg_locks`` row."""
+    high_bits = sqlalchemy.cast(lock.c.classid, sqlalchemy.BigInteger)
+    low_bits = sqlalchemy.cast(lock.c.objid, sqlalchemy.BigInteger)
+    shift = sqlalchemy.literal(32, type_=sqlalchemy.Integer())
+    return high_bits.op('<<')(shift).op('|')(low_bits)
+
+
+def _controller_session_locks_are_live() -> sqlalchemy.ColumnElement[bool]:
+    """Prove both controller locks are held by the recorded PG session."""
+    election_lock = _PG_LOCKS.alias('controller_election_lock')
+    generation_lock = _PG_LOCKS.alias('controller_generation_lock')
+    base_lock_key = locks.postgres_lock_key(_CONTROLLER_LEADER_LOCK_ID)
+    statement = sqlalchemy.select(sqlalchemy.literal(1)).select_from(
+        election_lock.join(
+            generation_lock,
+            generation_lock.c.pid == election_lock.c.pid)).where(
+                election_lock.c.pid == CONTROLLER_LEADERSHIP.c.lock_backend_pid,
+                election_lock.c.locktype == 'advisory',
+                election_lock.c.objsubid == 1,
+                election_lock.c.mode == 'ExclusiveLock',
+                election_lock.c.granted,
+                _pg_advisory_lock_key(election_lock) == base_lock_key,
+                generation_lock.c.locktype == 'advisory',
+                generation_lock.c.objsubid == 1,
+                generation_lock.c.mode == 'ExclusiveLock',
+                generation_lock.c.granted,
+                _pg_advisory_lock_key(generation_lock) ==
+                CONTROLLER_LEADERSHIP.c.generation_lock_key)
+    return sqlalchemy.exists(statement)
+
+
+def _controller_leadership_is_current_predicate(
+    instance_id: Any,
+    generation: Any,
+) -> sqlalchemy.ColumnElement[bool]:
+    """Build the row and live-session controller ownership predicate."""
+    return sqlalchemy.and_(
+        CONTROLLER_LEADERSHIP.c.leadership_key == _CONTROLLER_LEADERSHIP_KEY,
+        CONTROLLER_LEADERSHIP.c.generation == generation,
+        CONTROLLER_LEADERSHIP.c.instance_id == instance_id,
+        CONTROLLER_LEADERSHIP.c.released_at.is_(None),
+        _controller_session_locks_are_live(),
+    )
+
+
+def _current_controller_leadership_statement(
+    instance_id: str,
+    generation: int,
+    *,
+    lock: bool = False,
+) -> sqlalchemy.sql.Select:
+    """Build the durable ownership lookup used to serialize leader writes."""
+    statement = sqlalchemy.select(CONTROLLER_LEADERSHIP.c.generation).where(
+        _controller_leadership_is_current_predicate(uuid.UUID(instance_id),
+                                                    generation))
+    if lock:
+        # FOR SHARE makes generation advancement wait for this short
+        # transaction. A stale generation either commits before the handoff or
+        # observes the replacement generation and fails closed.
+        statement = statement.with_for_update(read=True)
+    return statement
+
+
+def _lock_current_controller_leadership(
+        connection: sqlalchemy.engine.Connection, instance_id: str,
+        generation: int) -> bool:
+    return connection.execute(
+        _current_controller_leadership_statement(
+            instance_id, generation,
+            lock=True)).scalar_one_or_none() is not None
+
+
+async def _lock_environment_controller_leadership(
+        connection: sqlalchemy_async.AsyncConnection) -> None:
+    """Serialize a controller-maintenance write with generation advancement."""
+    owner = _controller_owner_from_environment()
+    if owner is None:
+        return
+    result = await connection.execute(
+        _current_controller_leadership_statement(*owner, lock=True))
+    if result.scalar_one_or_none() is None:
+        raise RuntimeError('Controller leadership changed before the durable '
+                           'maintenance write.')
+
+
+class ControllerLeaderLease:
+    """Dedicated-session controller leadership with a durable generation."""
+
+    def __init__(self, instance_id: str | None = None) -> None:
+        self.instance_id = instance_id or ensure_server_instance_id()
+        self.generation: int | None = None
+        self._generation_lock_key: int | None = None
+        self._lock = locks.PostgresLock(_CONTROLLER_LEADER_LOCK_ID, timeout=0)
+
+    def _advance_generation(self, connection: Any) -> tuple[int, int]:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO api_controller_leadership (
+                    leadership_key, generation, instance_id,
+                    lock_backend_pid, generation_lock_key, acquired_at,
+                    heartbeat_at, released_at
+                )
+                VALUES (%s, 1, %s::uuid, pg_backend_pid(), 0,
+                        clock_timestamp(), clock_timestamp(), NULL)
+                ON CONFLICT (leadership_key) DO UPDATE SET
+                    generation =
+                        api_controller_leadership.generation + 1,
+                    instance_id = EXCLUDED.instance_id,
+                    lock_backend_pid = pg_backend_pid(),
+                    generation_lock_key = 0,
+                    acquired_at = clock_timestamp(),
+                    heartbeat_at = clock_timestamp(),
+                    released_at = NULL
+                RETURNING generation
+                """, (_CONTROLLER_LEADERSHIP_KEY, self.instance_id))
+            generation = int(cursor.fetchone()[0])
+            generation_lock_key = locks.postgres_lock_key(
+                f'{_CONTROLLER_GENERATION_LOCK_PREFIX}{generation}')
+            if generation_lock_key == locks.postgres_lock_key(
+                    _CONTROLLER_LEADER_LOCK_ID):
+                raise RuntimeError(
+                    'Controller election and generation lock keys collided.')
+            cursor.execute('SELECT pg_try_advisory_lock(%s)',
+                           (generation_lock_key,))
+            if not bool(cursor.fetchone()[0]):
+                raise RuntimeError(
+                    'Failed to acquire the controller generation lock.')
+            cursor.execute(
+                """
+                UPDATE api_controller_leadership
+                SET generation_lock_key = %s
+                WHERE leadership_key = %s
+                  AND generation = %s
+                  AND instance_id = %s::uuid
+                  AND lock_backend_pid = pg_backend_pid()
+                  AND released_at IS NULL
+                """, (generation_lock_key, _CONTROLLER_LEADERSHIP_KEY,
+                      generation, self.instance_id))
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    'Controller generation changed during lock binding.')
+            connection.commit()
+            return generation, generation_lock_key
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def try_acquire(self) -> bool:
+        """Acquire leadership without blocking and advance its generation."""
+        if self.generation is not None:
+            return True
+        try:
+            self._lock.acquire(blocking=False)
+        except locks.LockTimeout:
+            return False
+        try:
+            generation, generation_lock_key = self._lock.run_in_lock_session(
+                self._advance_generation)
+            self.generation = generation
+            self._generation_lock_key = generation_lock_key
+        except BaseException:
+            self._lock.release()
+            raise
+        logger.info('Acquired API controller leadership generation '
+                    f'{self.generation} as {self.instance_id}.')
+        return True
+
+    def heartbeat(self) -> bool:
+        """Prove the lock session and refresh only this durable generation."""
+        if self.generation is None or not self._lock.is_session_alive():
+            return False
+
+        def update(connection: Any) -> bool:
+            cursor = connection.cursor()
+            try:
+                assert self._generation_lock_key is not None
+                cursor.execute(
+                    """
+                    UPDATE api_controller_leadership
+                    SET heartbeat_at = clock_timestamp()
+                    WHERE leadership_key = %s
+                      AND generation = %s
+                      AND instance_id = %s::uuid
+                      AND lock_backend_pid = pg_backend_pid()
+                      AND generation_lock_key = %s
+                      AND released_at IS NULL
+                    """, (_CONTROLLER_LEADERSHIP_KEY, self.generation,
+                          self.instance_id, self._generation_lock_key))
+                matched = cursor.rowcount == 1
+                if matched:
+                    connection.commit()
+                else:
+                    connection.rollback()
+                return matched
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                cursor.close()
+
+        try:
+            return self._lock.run_in_lock_session(update)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Controller leadership heartbeat failed for '
+                           f'generation {self.generation}: {e}')
+            return False
+
+    def backend_pid(self) -> int | None:
+        """Return the exact lock-session backend PID for failure injection."""
+        if self.generation is None:
+            return None
+
+        def get_pid(connection: Any) -> int:
+            cursor = connection.cursor()
+            try:
+                cursor.execute('SELECT pg_backend_pid()')
+                pid = int(cursor.fetchone()[0])
+                connection.commit()
+                return pid
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                cursor.close()
+
+        try:
+            return self._lock.run_in_lock_session(get_pid)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def release(self) -> None:
+        """Release this generation after marking it durably inactive."""
+        generation = self.generation
+        generation_lock_key = self._generation_lock_key
+        if (generation is not None and generation_lock_key is not None and
+                self._lock.is_session_alive()):
+
+            def mark_released(connection: Any) -> None:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        """
+                        UPDATE api_controller_leadership
+                        SET released_at = clock_timestamp(),
+                            heartbeat_at = clock_timestamp()
+                        WHERE leadership_key = %s
+                          AND generation = %s
+                          AND instance_id = %s::uuid
+                          AND lock_backend_pid = pg_backend_pid()
+                          AND generation_lock_key = %s
+                          AND released_at IS NULL
+                        """, (_CONTROLLER_LEADERSHIP_KEY, generation,
+                              self.instance_id, generation_lock_key))
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    cursor.close()
+
+            try:
+                self._lock.run_in_lock_session(mark_released)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Failed to mark controller generation '
+                               f'{generation} released: {e}')
+        self._lock.release()
+        self.generation = None
+        self._generation_lock_key = None
+
+
+def controller_leadership_is_current(instance_id: str, generation: int) -> bool:
+    """Return whether the instance owns the current unreleased generation."""
+    engine = initialize_and_get_db()
+    with engine.connect() as connection:
+        return connection.execute(
+            _current_controller_leadership_statement(
+                instance_id, generation)).scalar_one_or_none() is not None
+
+
+def fence_stale_controller_claims(instance_id: str,
+                                  generation: int) -> dict[str, int]:
+    """Fence claims from older controller owners before this leader starts."""
+    engine = initialize_and_get_db()
+    replayed = 0
+    interrupted = 0
+    now = sqlalchemy.func.clock_timestamp()
+    with engine.begin() as connection:
+        if not _lock_current_controller_leadership(connection, instance_id,
+                                                   generation):
+            raise RuntimeError('Controller leadership changed before stale '
+                               'claims could be fenced.')
+        rows = connection.execute(
+            sqlalchemy.select(REQUESTS, QUEUE).join(
+                QUEUE, QUEUE.c.request_id == REQUESTS.c.request_id).where(
+                    REQUESTS.c.execution_class ==
+                    request_registry.ExecutionClass.CONTROLLER.value,
+                    REQUESTS.c.status.in_([
+                        status.value for status in
+                        requests_lib.RequestStatus.active_statuses()
+                    ]), QUEUE.c.delivery_state == 'claimed',
+                    sqlalchemy.or_(
+                        REQUESTS.c.worker_instance_id != uuid.UUID(instance_id),
+                        REQUESTS.c.controller_generation.is_(None),
+                        REQUESTS.c.controller_generation
+                        != generation)).with_for_update()).mappings().all()
+        for row in rows:
+            registration = request_registry.resolve_handler(row['handler_name'])
+            replayable = registration.replay_policy in (
+                request_registry.ReplayPolicy.READ_ONLY,
+                request_registry.ReplayPolicy.RECONCILE)
+            if replayable:
+                connection.execute(
+                    sqlalchemy.update(REQUESTS).where(
+                        REQUESTS.c.request_id == row['request_id']).values(
+                            status=requests_lib.RequestStatus.WAITING.value,
+                            pid=None,
+                            claim_token=None,
+                            worker_instance_id=None,
+                            controller_generation=None,
+                            lease_expires_at=None,
+                            heartbeat_at=None,
+                            status_msg='Controller leadership changed; '
+                            'reconciling',
+                            updated_at=now))
+                connection.execute(
+                    sqlalchemy.update(QUEUE).where(
+                        QUEUE.c.request_id == row['request_id']).values(
+                            delivery_state='queued',
+                            claim_generation=None,
+                            available_at=now,
+                            updated_at=now))
+                replayed += 1
+                continue
+            connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == row['request_id']).values(
+                        status=requests_lib.RequestStatus.CANCELLED.value,
+                        pid=None,
+                        claim_token=None,
+                        worker_instance_id=None,
+                        lease_expires_at=None,
+                        heartbeat_at=None,
+                        should_retry=True,
+                        finished_at=now,
+                        interrupted_reason=(
+                            'Controller leadership changed with an ambiguous '
+                            'mutating outcome.'),
+                        updated_at=now))
+            connection.execute(
+                sqlalchemy.delete(QUEUE).where(
+                    QUEUE.c.request_id == row['request_id']))
+            connection.execute(
+                sqlalchemy.update(CONTROLLER_ACTION_RESERVATIONS).where(
+                    CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id ==
+                    row['request_id'],
+                    CONTROLLER_ACTION_RESERVATIONS.c.state.in_(
+                        ['reserved', 'running'])).values(state='ambiguous',
+                                                         reconciliation_at=now,
+                                                         updated_at=now))
+            interrupted += 1
+    return {'replayed': replayed, 'interrupted': interrupted}
 
 
 async def run_distributed_singleton(
@@ -571,6 +1062,86 @@ def _request_filter_statement(
     return statement
 
 
+def _controller_claim_is_current() -> sqlalchemy.ColumnElement[bool]:
+    """Correlated predicate fencing controller writes by durable generation."""
+    current_leadership = sqlalchemy.exists().where(
+        _controller_leadership_is_current_predicate(
+            REQUESTS.c.worker_instance_id, REQUESTS.c.controller_generation))
+    # The single-process ``all`` role is the rollback-compatible mode. It
+    # predates controller generations and deliberately keeps its historical
+    # unfenced controller execution until the split-role cutover is complete.
+    compatibility_claim = sqlalchemy.false()
+    if os.environ.get(SERVER_ROLE_ENV_VAR, 'all') == 'all':
+        compatibility_claim = REQUESTS.c.controller_generation.is_(None)
+    return sqlalchemy.or_(
+        REQUESTS.c.execution_class
+        != request_registry.ExecutionClass.CONTROLLER.value,
+        compatibility_claim,
+        sqlalchemy.and_(REQUESTS.c.controller_generation.is_not(None),
+                        current_leadership))
+
+
+def _reserve_controller_action(connection: sqlalchemy.engine.Connection,
+                               request: sqlalchemy.engine.RowMapping,
+                               instance_id: str,
+                               controller_generation: int | None) -> bool:
+    """Reserve a non-replayable controller mutation for this generation."""
+    if request['execution_class'] != (
+            request_registry.ExecutionClass.CONTROLLER.value):
+        return True
+    registration = request_registry.resolve_handler(request['handler_name'])
+    if registration.replay_policy is not request_registry.ReplayPolicy.NEVER:
+        return True
+    if controller_generation is None:
+        return False
+    values = {
+        'logical_action_id': request['request_id'],
+        'resource_identity': request['cluster_name'] or request['request_id'],
+        'action_type': request['handler_name'],
+        'state': 'reserved',
+        'controller_generation': controller_generation,
+        'controller_instance_id': uuid.UUID(instance_id),
+        'created_at': sqlalchemy.func.clock_timestamp(),
+        'updated_at': sqlalchemy.func.clock_timestamp(),
+    }
+    inserted = connection.execute(
+        postgresql.insert(CONTROLLER_ACTION_RESERVATIONS).values(
+            **values).on_conflict_do_nothing(index_elements=[
+                CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id
+            ]).returning(CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id)
+    ).scalar_one_or_none()
+    if inserted is not None:
+        return True
+    existing = connection.execute(
+        sqlalchemy.select(CONTROLLER_ACTION_RESERVATIONS).where(
+            CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id ==
+            request['request_id']).with_for_update()).mappings().one()
+    return (existing['controller_generation'] == controller_generation and
+            str(existing['controller_instance_id']) == instance_id and
+            existing['state'] in ('reserved', 'running'))
+
+
+def _mark_controller_action_state(
+    connection: sqlalchemy.engine.Connection,
+    request_id: str,
+    instance_id: str,
+    state: str,
+) -> None:
+    """Advance this controller generation's optional action reservation."""
+    connection.execute(
+        sqlalchemy.update(CONTROLLER_ACTION_RESERVATIONS).where(
+            CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id == request_id,
+            CONTROLLER_ACTION_RESERVATIONS.c.controller_instance_id ==
+            uuid.UUID(instance_id),
+            CONTROLLER_ACTION_RESERVATIONS.c.controller_generation ==
+            sqlalchemy.select(REQUESTS.c.controller_generation).where(
+                REQUESTS.c.request_id == request_id).scalar_subquery(),
+            CONTROLLER_ACTION_RESERVATIONS.c.state.in_([
+                'reserved', 'running'
+            ])).values(state=state,
+                       updated_at=sqlalchemy.func.clock_timestamp()))
+
+
 class PostgresRequestBackend(request_storage.RequestBackend):
     """PostgreSQL implementation of request persistence."""
 
@@ -604,6 +1175,18 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             REQUESTS.c.claim_token == uuid.UUID(claim.claim_token),
             REQUESTS.c.worker_instance_id == uuid.UUID(self._instance_id),
             REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
+            _controller_claim_is_current(),
+        )
+
+    def _claim_predicates(
+            self, execution_generation: int, claim_token: uuid.UUID
+    ) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
+        return (
+            REQUESTS.c.execution_generation == execution_generation,
+            REQUESTS.c.claim_token == claim_token,
+            REQUESTS.c.worker_instance_id == uuid.UUID(self._instance_id),
+            REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
+            _controller_claim_is_current(),
         )
 
     def get_request(
@@ -700,6 +1283,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         engine = await _get_async_engine()
         values = _request_values_for_db(request)
         async with engine.begin() as connection:
+            await _lock_environment_controller_leadership(connection)
             result = await connection.execute(
                 postgresql.insert(REQUESTS).values(
                     **values).on_conflict_do_nothing(
@@ -745,6 +1329,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     'finished_at': None,
                     'claim_token': None,
                     'worker_instance_id': None,
+                    'controller_generation': None,
                     'lease_expires_at': None,
                     'heartbeat_at': None,
                     'cancel_requested_at': None,
@@ -775,6 +1360,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         if keep_ids:
             statement = statement.where(REQUESTS.c.request_id.not_in(keep_ids))
         async with engine.begin() as connection:
+            await _lock_environment_controller_leadership(connection)
             await connection.execute(statement)
 
     def query_requests(
@@ -840,11 +1426,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                 for status in requests_lib.RequestStatus.executable_statuses()
             ]))
         if claim_token is not None:
-            statement = statement.where(
-                REQUESTS.c.execution_generation == execution_generation,
-                REQUESTS.c.claim_token == uuid.UUID(claim_token),
-                REQUESTS.c.worker_instance_id == uuid.UUID(self._instance_id),
-                REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp())
+            statement = statement.where(*self._claim_predicates(
+                execution_generation, uuid.UUID(claim_token)))
         else:
             # Direct coroutine execution is allowed only for requests that
             # were intentionally created without a durable queue delivery.
@@ -858,6 +1441,9 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             updated_at=sqlalchemy.func.clock_timestamp())
         with engine.begin() as connection:
             result = connection.execute(statement)
+            if result.rowcount == 1:
+                _mark_controller_action_state(connection, request_id,
+                                              self._instance_id, 'running')
         return result.rowcount == 1
 
     def heartbeat_claim(self, claim: request_storage.ExecutionClaim) -> bool:
@@ -870,10 +1456,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             QUEUE.c.claim_generation == claim.execution_generation)
         statement = sqlalchemy.update(REQUESTS).where(
             REQUESTS.c.request_id == claim.request_id,
-            REQUESTS.c.execution_generation == claim.execution_generation,
-            REQUESTS.c.claim_token == uuid.UUID(claim.claim_token),
-            REQUESTS.c.worker_instance_id == uuid.UUID(self._instance_id),
-            REQUESTS.c.lease_expires_at > now,
+            *self._claim_predicates(claim.execution_generation,
+                                    uuid.UUID(claim.claim_token)),
             REQUESTS.c.status.in_([
                 status.value
                 for status in requests_lib.RequestStatus.active_statuses()
@@ -895,16 +1479,12 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             row = connection.execute(
                 sqlalchemy.select(REQUESTS.c.pid).where(
                     REQUESTS.c.request_id == claim.request_id,
-                    REQUESTS.c.execution_generation ==
-                    claim.execution_generation,
-                    REQUESTS.c.claim_token == claim_token,
-                    REQUESTS.c.worker_instance_id == uuid.UUID(
-                        self._instance_id), REQUESTS.c.status ==
+                    *self._claim_predicates(claim.execution_generation,
+                                            claim_token), REQUESTS.c.status ==
                     requests_lib.RequestStatus.CANCELLED.value,
                     REQUESTS.c.cancel_requested_at.is_not(None),
-                    REQUESTS.c.cancel_acknowledged_at.is_(None),
-                    REQUESTS.c.lease_expires_at > sqlalchemy.func.
-                    clock_timestamp()).with_for_update()).first()
+                    REQUESTS.c.cancel_acknowledged_at.is_(
+                        None)).with_for_update()).first()
             if row is None or row.pid is None:
                 return False
             pid = int(row.pid)
@@ -922,11 +1502,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             result = connection.execute(
                 sqlalchemy.update(REQUESTS).where(
                     REQUESTS.c.request_id == claim.request_id,
-                    REQUESTS.c.execution_generation ==
-                    claim.execution_generation,
-                    REQUESTS.c.claim_token == claim_token,
-                    REQUESTS.c.worker_instance_id == uuid.UUID(
-                        self._instance_id),
+                    *self._claim_predicates(claim.execution_generation,
+                                            claim_token),
                     REQUESTS.c.cancel_requested_at.is_not(None)).values(
                         cancel_acknowledged_at=(
                             sqlalchemy.func.clock_timestamp()),
@@ -964,6 +1541,11 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     *self._fenced_request_predicates(request_id)).values(
                         **values))
             if update_result.rowcount == 1:
+                action_state = ('completed' if status
+                                == requests_lib.RequestStatus.SUCCEEDED else
+                                'failed')
+                _mark_controller_action_state(connection, request_id,
+                                              self._instance_id, action_state)
                 connection.execute(
                     sqlalchemy.delete(QUEUE).where(
                         QUEUE.c.request_id == request_id))
@@ -1015,6 +1597,15 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                 connection.execute(
                     sqlalchemy.delete(QUEUE).where(
                         QUEUE.c.request_id == row['request_id']))
+                connection.execute(
+                    sqlalchemy.update(CONTROLLER_ACTION_RESERVATIONS).where(
+                        CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id ==
+                        row['request_id'],
+                        CONTROLLER_ACTION_RESERVATIONS.c.state.in_(
+                            ['reserved',
+                             'running'])).values(state='ambiguous',
+                                                 reconciliation_at=now,
+                                                 updated_at=now))
                 if (row['pid'] is not None and
                         row['claim_token'] is not None and
                         str(row['worker_instance_id']) == self._instance_id and
@@ -1164,18 +1755,65 @@ class PostgresRequestBackend(request_storage.RequestBackend):
 class PostgresQueueBackend(queue_base.QueueBackend):
     """One schedule-class view over the durable PostgreSQL queue."""
 
-    def __init__(self, schedule_type: str):
+    def __init__(
+        self,
+        schedule_type: str,
+        *,
+        execution_classes: frozenset[str] | None = None,
+        controller_generation: int | None = None,
+    ):
         self._schedule_type = schedule_type
         self._instance_id = ensure_server_instance_id()
+        valid_classes = frozenset(
+            execution_class.value
+            for execution_class in request_registry.ExecutionClass)
+        if execution_classes is not None and not execution_classes:
+            raise ValueError('At least one execution class must be allowed.')
+        if (execution_classes is not None and
+                not execution_classes.issubset(valid_classes)):
+            raise ValueError('Invalid queue execution classes: '
+                             f'{sorted(execution_classes - valid_classes)}')
+        if (execution_classes is not None and
+                request_registry.ExecutionClass.CONTROLLER.value
+                in execution_classes and controller_generation is None and
+                os.environ.get(SERVER_ROLE_ENV_VAR, 'all') != 'all'):
+            raise ValueError('A controller-scoped queue requires an active '
+                             'controller generation.')
+        self._execution_classes = execution_classes
+        self._controller_generation = controller_generation
+
+    def _role_predicates(self) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
+        predicates: list[sqlalchemy.ColumnElement[bool]] = []
+        if self._execution_classes is not None:
+            predicates.append(
+                REQUESTS.c.execution_class.in_(self._execution_classes))
+        if self._controller_generation is not None:
+            predicates.append(sqlalchemy.exists().where(
+                _controller_leadership_is_current_predicate(
+                    uuid.UUID(self._instance_id), self._controller_generation)))
+        return tuple(predicates)
+
+    def _lock_controller_leadership(
+            self, connection: sqlalchemy.engine.Connection) -> bool:
+        if self._controller_generation is None:
+            return True
+        return _lock_current_controller_leadership(connection,
+                                                   self._instance_id,
+                                                   self._controller_generation)
 
     def put(self, item: queue_base.QueueItemLike) -> None:
         normalized = queue_base.normalize_queue_item(item)
         engine = initialize_and_get_db()
         with engine.begin() as connection:
+            if not self._lock_controller_leadership(connection):
+                logger.warning('Ignoring requeue after controller leadership '
+                               f'changed for {normalized.request_id}.')
+                return
             row = connection.execute(
                 sqlalchemy.select(REQUESTS).where(
-                    REQUESTS.c.request_id == normalized.request_id).
-                with_for_update()).mappings().first()
+                    REQUESTS.c.request_id == normalized.request_id,
+                    *self._role_predicates()).with_for_update()).mappings(
+                    ).first()
             if row is None:
                 return
             queue_row = connection.execute(
@@ -1220,11 +1858,13 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                     REQUESTS.c.claim_token == uuid.UUID(normalized.claim_token),
                     REQUESTS.c.worker_instance_id == uuid.UUID(
                         self._instance_id), REQUESTS.c.lease_expires_at
-                    > sqlalchemy.func.clock_timestamp()).values(
+                    > sqlalchemy.func.clock_timestamp(),
+                    _controller_claim_is_current()).values(
                         status=requests_lib.RequestStatus.WAITING.value,
                         pid=None,
                         claim_token=None,
                         worker_instance_id=None,
+                        controller_generation=None,
                         lease_expires_at=None,
                         heartbeat_at=None,
                         updated_at=sqlalchemy.func.clock_timestamp()))
@@ -1268,6 +1908,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                             pid=None,
                             claim_token=None,
                             worker_instance_id=None,
+                            controller_generation=None,
                             lease_expires_at=None,
                             heartbeat_at=None,
                             status_msg='Execution owner lost; reconciling',
@@ -1284,6 +1925,11 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                     sqlalchemy.update(REQUESTS).where(
                         REQUESTS.c.request_id == row['request_id']).values(
                             status=requests_lib.RequestStatus.CANCELLED.value,
+                            pid=None,
+                            claim_token=None,
+                            worker_instance_id=None,
+                            lease_expires_at=None,
+                            heartbeat_at=None,
                             should_retry=True,
                             finished_at=now,
                             interrupted_reason=(
@@ -1293,25 +1939,38 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 connection.execute(
                     sqlalchemy.delete(QUEUE).where(
                         QUEUE.c.request_id == row['request_id']))
+                if row['execution_class'] == (
+                        request_registry.ExecutionClass.CONTROLLER.value):
+                    connection.execute(
+                        sqlalchemy.update(CONTROLLER_ACTION_RESERVATIONS).where(
+                            CONTROLLER_ACTION_RESERVATIONS.c.logical_action_id
+                            == row['request_id'],
+                            CONTROLLER_ACTION_RESERVATIONS.c.state.in_(
+                                ['reserved',
+                                 'running'])).values(state='ambiguous',
+                                                     reconciliation_at=now,
+                                                     updated_at=now))
 
     def _candidate(
         self, connection: sqlalchemy.engine.Connection
     ) -> sqlalchemy.engine.RowMapping | None:
+        statement = sqlalchemy.select(
+            QUEUE, REQUESTS.c.execution_class,
+            sqlalchemy.func.clock_timestamp().label('_database_now')).join(
+                REQUESTS, REQUESTS.c.request_id == QUEUE.c.request_id).where(
+                    QUEUE.c.schedule_type == self._schedule_type,
+                    QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
+                    <= sqlalchemy.func.clock_timestamp(),
+                    *self._role_predicates())
         return connection.execute(
-            sqlalchemy.select(
-                QUEUE, REQUESTS.c.execution_class,
-                sqlalchemy.func.clock_timestamp().label('_database_now')).join(
-                    REQUESTS,
-                    REQUESTS.c.request_id == QUEUE.c.request_id).where(
-                        QUEUE.c.schedule_type == self._schedule_type,
-                        QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
-                        <= sqlalchemy.func.clock_timestamp()).order_by(
-                            QUEUE.c.priority.desc(),
-                            QUEUE.c.sequence).limit(1)).mappings().first()
+            statement.order_by(QUEUE.c.priority.desc(),
+                               QUEUE.c.sequence).limit(1)).mappings().first()
 
     def get(self) -> queue_base.QueueItem | None:
         engine = initialize_and_get_db()
         with engine.begin() as connection:
+            if not self._lock_controller_leadership(connection):
+                return None
             self._reap_expired_claims(connection)
             candidate = self._candidate(connection)
         if candidate is None:
@@ -1333,13 +1992,16 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 precondition_error = e
 
         with engine.begin() as connection:
+            if not self._lock_controller_leadership(connection):
+                return None
             locked = connection.execute(
                 sqlalchemy.select(QUEUE, REQUESTS).join(
                     REQUESTS,
                     REQUESTS.c.request_id == QUEUE.c.request_id).where(
                         QUEUE.c.request_id == candidate['request_id'],
                         QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
-                        <= sqlalchemy.func.clock_timestamp()).with_for_update(
+                        <= sqlalchemy.func.clock_timestamp(),
+                        *self._role_predicates()).with_for_update(
                             skip_locked=True)).mappings().first()
             if locked is None:
                 return None
@@ -1380,22 +2042,56 @@ class PostgresQueueBackend(queue_base.QueueBackend):
 
             generation = int(locked['execution_generation']) + 1
             token = uuid.uuid4()
+            execution_class = locked['execution_class']
+            controller_generation = (
+                self._controller_generation if execution_class
+                == request_registry.ExecutionClass.CONTROLLER.value else None)
+            claim_statement = sqlalchemy.update(REQUESTS).where(
+                REQUESTS.c.request_id == candidate['request_id'],
+                REQUESTS.c.status.in_([
+                    status.value for status in
+                    requests_lib.RequestStatus.executable_statuses()
+                ]))
+            if controller_generation is not None:
+                claim_statement = claim_statement.where(
+                    sqlalchemy.exists().where(
+                        _controller_leadership_is_current_predicate(
+                            uuid.UUID(self._instance_id),
+                            controller_generation)))
             result = connection.execute(
-                sqlalchemy.update(REQUESTS).where(
-                    REQUESTS.c.request_id == candidate['request_id'],
-                    REQUESTS.c.status.in_([
-                        status.value for status in
-                        requests_lib.RequestStatus.executable_statuses()
-                    ])).values(
-                        execution_generation=generation,
-                        claim_token=token,
-                        worker_instance_id=uuid.UUID(self._instance_id),
-                        lease_expires_at=(
-                            sqlalchemy.func.clock_timestamp() +
-                            datetime.timedelta(seconds=_CLAIM_LEASE_SECONDS)),
-                        heartbeat_at=sqlalchemy.func.clock_timestamp(),
-                        updated_at=sqlalchemy.func.clock_timestamp()))
+                claim_statement.values(
+                    execution_generation=generation,
+                    claim_token=token,
+                    worker_instance_id=uuid.UUID(self._instance_id),
+                    controller_generation=controller_generation,
+                    lease_expires_at=(
+                        sqlalchemy.func.clock_timestamp() +
+                        datetime.timedelta(seconds=_CLAIM_LEASE_SECONDS)),
+                    heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                    updated_at=sqlalchemy.func.clock_timestamp()))
             if result.rowcount != 1:
+                return None
+            if (controller_generation is not None and
+                    not _reserve_controller_action(connection, locked,
+                                                   self._instance_id,
+                                                   controller_generation)):
+                now = sqlalchemy.func.clock_timestamp()
+                connection.execute(
+                    sqlalchemy.update(REQUESTS).where(
+                        REQUESTS.c.request_id ==
+                        candidate['request_id']).values(
+                            status=requests_lib.RequestStatus.CANCELLED.value,
+                            pid=None,
+                            claim_token=None,
+                            worker_instance_id=None,
+                            lease_expires_at=None,
+                            heartbeat_at=None,
+                            should_retry=True,
+                            finished_at=now,
+                            interrupted_reason=(
+                                'Controller action is already owned by a '
+                                'different leadership generation.'),
+                            updated_at=now))
                 connection.execute(
                     sqlalchemy.delete(QUEUE).where(
                         QUEUE.c.request_id == candidate['request_id']))
@@ -1415,18 +2111,34 @@ class PostgresQueueBackend(queue_base.QueueBackend):
 
     def qsize(self) -> int:
         engine = initialize_and_get_db()
+        statement = sqlalchemy.select(
+            sqlalchemy.func.count()  # pylint: disable=not-callable
+        ).select_from(
+            QUEUE.join(REQUESTS,
+                       REQUESTS.c.request_id == QUEUE.c.request_id)).where(
+                           QUEUE.c.schedule_type == self._schedule_type,
+                           QUEUE.c.delivery_state == 'queued')
+        if self._execution_classes is not None:
+            statement = statement.where(
+                REQUESTS.c.execution_class.in_(self._execution_classes))
         with engine.connect() as connection:
-            return int(
-                connection.execute(
-                    sqlalchemy.select(
-                        sqlalchemy.func.count()  # pylint: disable=not-callable
-                    ).select_from(QUEUE).where(
-                        QUEUE.c.schedule_type == self._schedule_type,
-                        QUEUE.c.delivery_state == 'queued')).scalar_one())
+            return int(connection.execute(statement).scalar_one())
 
 
 class PostgresQueueFactory(queue_base.QueueBackendFactory):
     """Create schedule-specific views over one PostgreSQL queue table."""
 
+    def __init__(
+        self,
+        *,
+        execution_classes: frozenset[str] | None = None,
+        controller_generation: int | None = None,
+    ) -> None:
+        self._execution_classes = execution_classes
+        self._controller_generation = controller_generation
+
     def create_queue(self, schedule_type: str) -> queue_base.QueueBackend:
-        return PostgresQueueBackend(schedule_type)
+        return PostgresQueueBackend(
+            schedule_type,
+            execution_classes=self._execution_classes,
+            controller_generation=self._controller_generation)

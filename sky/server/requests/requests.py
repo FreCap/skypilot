@@ -348,6 +348,7 @@ class Request:
     execution_generation: int = 0
     claim_token: str | None = None
     worker_instance_id: str | None = None
+    controller_generation: int | None = None
     lease_expires_at: float | None = None
     heartbeat_at: float | None = None
     cancel_requested_at: float | None = None
@@ -446,6 +447,7 @@ class Request:
             'execution_generation': self.execution_generation,
             'claim_token': self.claim_token,
             'worker_instance_id': self.worker_instance_id,
+            'controller_generation': self.controller_generation,
             'lease_expires_at': self.lease_expires_at,
             'heartbeat_at': self.heartbeat_at,
             'cancel_requested_at': self.cancel_requested_at,
@@ -503,6 +505,9 @@ class Request:
             worker_instance_id=(str(values['worker_instance_id'])
                                 if values.get('worker_instance_id') is not None
                                 else None),
+            controller_generation=(int(values['controller_generation'])
+                                   if values.get('controller_generation')
+                                   is not None else None),
             lease_expires_at=values.get('lease_expires_at'),
             heartbeat_at=values.get('heartbeat_at'),
             cancel_requested_at=values.get('cancel_requested_at'),

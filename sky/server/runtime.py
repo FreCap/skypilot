@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import multiprocessing
 import os
 import shutil
 import signal
@@ -33,6 +34,7 @@ from sky.server.blob import blob_storage as bs
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
+from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
 from sky.server.requests import requests as requests_lib
 from sky.skylet import constants
@@ -47,8 +49,12 @@ from sky.utils.db import db_utils
 logger = sky_logging.init_logger(__name__)
 
 _SERVER_USER_HASH_KEY = 'server_user_hash'
-_ROLE_CHOICES = ('all', 'api', 'executor')
+_ROLE_CHOICES = ('all', 'api', 'executor', 'controller')
 _SINGLETON_PREFIX = 'skypilot:api-server-runtime:v1'
+_CONTROLLER_LEADERSHIP_POLL_SECONDS = 2
+_CONTROLLER_LEADERSHIP_PROBE_SECONDS = 2
+_CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR = (
+    'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS')
 
 
 @dataclasses.dataclass
@@ -80,6 +86,31 @@ def _uses_postgres_requests() -> bool:
             request_postgres.POSTGRES_REQUEST_BACKEND)
 
 
+def _controller_cutover_quiescence_seconds() -> float:
+    value = os.environ.get(_CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR, '70')
+    try:
+        seconds = float(value)
+    except ValueError as e:
+        raise ValueError(
+            f'{_CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR} must be numeric.') from e
+    if seconds < 0:
+        raise ValueError(
+            f'{_CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR} must be non-negative.')
+    return seconds
+
+
+def _start_surface_interrupted_cluster_launches() -> None:
+    try:
+        scan_delay = float(
+            os.environ.get(constants.GRACE_PERIOD_SECONDS_ENV_VAR, '60'))
+    except ValueError:
+        scan_delay = 60
+    threading.Thread(target=requests_lib.surface_interrupted_cluster_launches,
+                     args=(scan_delay,),
+                     name='surface-interrupted-launches',
+                     daemon=True).start()
+
+
 def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     """Load plugins, verify schemas, identity, policy, and role resources."""
     logger.info(f'Initializing SkyPilot {role} role')
@@ -95,20 +126,11 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     requests_recovered = False
     if role == 'all':
         requests_recovered = requests_lib.recover_db_and_logs()
-        try:
-            scan_delay = float(
-                os.environ.get(constants.GRACE_PERIOD_SECONDS_ENV_VAR, '60'))
-        except ValueError:
-            scan_delay = 60
-        threading.Thread(
-            target=requests_lib.surface_interrupted_cluster_launches,
-            args=(scan_delay,),
-            name='surface-interrupted-launches',
-            daemon=True).start()
+        _start_surface_interrupted_cluster_launches()
 
     logger.info('Initializing server user hash')
     init_or_restore_server_user_hash()
-    if role in ('all', 'executor'):
+    if role in ('all', 'controller'):
         managed_job_utils.setup_consolidation_mode_on_startup(deploy)
 
     logger.info('Pre-loading plugin RBAC rules + viewer allowlist')
@@ -121,7 +143,7 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     max_db_connections = global_user_state.get_max_db_connections()
     logger.info(f'Max db connections: {max_db_connections}')
     reserved_memory_mb: float = 0
-    if role in ('all', 'executor'):
+    if role in ('all', 'controller'):
         reserved_memory_mb = (
             controller_utils.compute_memory_reserved_for_controllers(
                 reserve_for_controllers=os.environ.get(
@@ -130,7 +152,7 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
                     constants.IS_SKYPILOT_SERVE_CONTROLLER)))
     config = server_config.compute_server_config(
         deploy, max_db_connections, reserved_memory_mb=reserved_memory_mb)
-    if role in ('all', 'executor'):
+    if role in ('all', 'controller'):
         server_config.publish_serve_launch_parallelism(config)
 
     instance_lease = None
@@ -155,14 +177,18 @@ async def _schedule_on_boot_check_async() -> None:
                      'already exists.')
 
 
-async def _initialize_executor_requests() -> None:
-    """Submit durable internal work after queue consumers exist."""
+async def _initialize_controller_requests() -> None:
+    """Submit leader-owned durable daemons after controller consumers exist."""
     await requests_lib.delete_orphan_internal_daemons_async(
         daemons.INTERNAL_REQUEST_DAEMONS)
     for event in daemons.INTERNAL_REQUEST_DAEMONS:
         if event.should_skip():
             continue
         await executor.schedule_internal_daemon_async(event)
+
+
+async def _initialize_normal_executor_requests() -> None:
+    """Submit non-controller startup work after normal consumers exist."""
     await _schedule_on_boot_check_async()
 
 
@@ -262,7 +288,7 @@ def _start_background_loop(role: str, host: str,
         background.create_task(metrics_server.serve())
         background.create_task(metrics.multiproc_reaper_daemon())
 
-    if role in ('all', 'executor'):
+    if role in ('all', 'controller'):
         background.create_task(
             _singleton_task('requests-gc', requests_lib.requests_gc_daemon))
         background.create_task(
@@ -288,7 +314,7 @@ def _start_background_loop(role: str, host: str,
 
 
 class _RoleHealthServer:
-    """Dependency-free executor liveness and readiness endpoint."""
+    """Dependency-free role-supervisor liveness and readiness endpoint."""
 
     def __init__(self, host: str, port: int,
                  lease: request_postgres.ServerInstanceLease) -> None:
@@ -319,7 +345,7 @@ class _RoleHealthServer:
 
         self._server = http.server.ThreadingHTTPServer((host, port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever,
-                                        name='executor-role-health',
+                                        name=f'{lease.role}-role-health',
                                         daemon=True)
 
     def start(self) -> None:
@@ -370,26 +396,300 @@ def _wait_for_executor_shutdown() -> None:
         signal.signal(signal.SIGINT, previous_int)
 
 
+def _request_worker_shutdown(workers: list[executor.RequestWorker],
+                             *,
+                             terminate_children: bool = False) -> None:
+    """Stop new claims, optionally fence children, then join dispatchers."""
+    for worker in workers:
+        worker.request_shutdown()
+    if terminate_children:
+        subprocess_utils.kill_children_processes()
+    if workers:
+        subprocess_utils.run_in_parallel(
+            lambda worker: worker.wait_for_shutdown(),
+            workers,
+            num_threads=len(workers))
+
+
+def _stop_queue_server(queue_server: multiprocessing.Process | None) -> None:
+    if queue_server is None:
+        return
+    if queue_server.is_alive():
+        try:
+            queue_server.kill()
+        except ProcessLookupError:
+            pass
+    queue_server.join()
+
+
+def _kill_local_controller_children() -> None:
+    """Stop detached and worker-owned controllers before leader handoff."""
+    # Managed job controllers use detached process sessions, so use their
+    # durable local process records in addition to walking the worker tree.
+    # pylint: disable=import-outside-toplevel
+    from sky.jobs import scheduler as managed_job_scheduler
+    try:
+        managed_job_scheduler.kill_local_job_controllers()
+    except Exception:  # pylint: disable=broad-except
+        logger.exception('Failed to stop local managed-job controllers.')
+
+
+def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
+    """Elect one controller leader and supervise all leader-owned work."""
+    if state.instance_lease is None:
+        raise RuntimeError(
+            'The controller role requires PostgreSQL instance leases.')
+
+    lease = request_postgres.ControllerLeaderLease(
+        state.instance_lease.instance_id)
+    health_server = _RoleHealthServer(args.host, args.role_health_port,
+                                      state.instance_lease)
+    background: _BackgroundLoop | None = None
+    queue_server: multiprocessing.Process | None = None
+    workers: list[executor.RequestWorker] = []
+    shutdown = threading.Event()
+    became_leader = False
+    leadership_lost = False
+    cutover_regressed = False
+    waiting_for_cutover = False
+    cutover_ready = False
+    cutover_quiescence_seconds = _controller_cutover_quiescence_seconds()
+
+    def request_shutdown(signum, frame) -> None:
+        del signum, frame
+        shutdown.set()
+
+    previous_term = signal.signal(signal.SIGTERM, request_shutdown)
+    previous_int = signal.signal(signal.SIGINT, request_shutdown)
+    health_server.start()
+    try:
+        state.instance_lease.set_ready(
+            False, health_detail={'phase': 'checking-executor-cutover'})
+        while not shutdown.is_set():
+            try:
+                blockers = request_postgres.recent_legacy_controller_consumers(
+                    cutover_quiescence_seconds)
+                if blockers:
+                    if not waiting_for_cutover:
+                        logger.info(
+                            'Waiting for legacy controller consumers to '
+                            f'quiesce: {len(blockers)} recent instance(s).')
+                        state.instance_lease.set_ready(
+                            False,
+                            health_detail={
+                                'phase': 'waiting-for-executor-cutover',
+                                'legacy_consumer_count': len(blockers),
+                            })
+                        waiting_for_cutover = True
+                        cutover_ready = False
+                    shutdown.wait(_CONTROLLER_LEADERSHIP_POLL_SECONDS)
+                    continue
+                if not cutover_ready:
+                    state.instance_lease.set_ready(
+                        True, health_detail={'phase': 'standby'})
+                    waiting_for_cutover = False
+                    cutover_ready = True
+                if lease.try_acquire():
+                    try:
+                        blockers = (
+                            request_postgres.recent_legacy_controller_consumers(
+                                cutover_quiescence_seconds))
+                    except Exception:
+                        lease.release()
+                        state.instance_lease.set_ready(
+                            False,
+                            health_detail={
+                                'phase': 'checking-executor-cutover'
+                            })
+                        cutover_ready = False
+                        raise
+                    if blockers:
+                        logger.warning(
+                            'Legacy controller consumers appeared during '
+                            'promotion; releasing leadership and waiting.')
+                        lease.release()
+                        state.instance_lease.set_ready(
+                            False,
+                            health_detail={
+                                'phase': 'waiting-for-executor-cutover',
+                                'legacy_consumer_count': len(blockers),
+                            })
+                        waiting_for_cutover = True
+                        cutover_ready = False
+                        shutdown.wait(_CONTROLLER_LEADERSHIP_POLL_SECONDS)
+                        continue
+                    break
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f'Controller leadership probe failed: {e}')
+            shutdown.wait(_CONTROLLER_LEADERSHIP_POLL_SECONDS)
+        if shutdown.is_set():
+            return
+
+        generation = lease.generation
+        assert generation is not None
+        became_leader = True
+        os.environ[request_postgres.CONTROLLER_GENERATION_ENV_VAR] = str(
+            generation)
+        os.environ[request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR] = (
+            lease.instance_id)
+
+        fenced = request_postgres.fence_stale_controller_claims(
+            lease.instance_id, generation)
+        logger.info('Controller generation '
+                    f'{generation} fenced {fenced["replayed"]} replayable and '
+                    f'{fenced["interrupted"]} ambiguous stale claim(s).')
+
+        # The snapshot must include the immutable leader identity before any
+        # worker or controller subprocess can be spawned.
+        clean_env_module.capture_clean_server_env()
+        queue_server, workers = executor.start(
+            state.config,
+            execution_classes=frozenset(
+                {request_registry.ExecutionClass.CONTROLLER}),
+            controller_generation=generation)
+        background = _start_background_loop('controller', args.host,
+                                            args.metrics_port)
+        background.run(_initialize_controller_requests())
+
+        # The existing managed-jobs consolidation lock and SkyServe lifecycle
+        # epochs remain inner subsystem fences under this outer leader.
+        # pylint: disable=import-outside-toplevel
+        from sky.jobs import managed_job_refresh_thread
+        managed_job_refresh_thread.start_managed_job_refresh_daemon()
+        _start_surface_interrupted_cluster_launches()
+
+        lock_backend_pid = lease.backend_pid()
+        state.instance_lease.set_ready(True,
+                                       health_detail={
+                                           'phase': 'leading',
+                                           'controller_generation': generation,
+                                           'lock_backend_pid': lock_backend_pid,
+                                       })
+        logger.info(f'Controller generation {generation} is ready.')
+
+        while not shutdown.wait(_CONTROLLER_LEADERSHIP_PROBE_SECONDS):
+            blockers = request_postgres.recent_legacy_controller_consumers(
+                cutover_quiescence_seconds)
+            if blockers:
+                cutover_regressed = True
+                logger.error(
+                    'A legacy controller consumer reappeared after controller '
+                    f'promotion: {len(blockers)} recent instance(s).')
+                try:
+                    state.instance_lease.set_ready(
+                        False,
+                        health_detail={
+                            'phase': 'legacy-consumer-detected',
+                            'controller_generation': generation,
+                            'legacy_consumer_count': len(blockers),
+                        })
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        'Failed to publish unsafe controller cutover.')
+                break
+            if lease.heartbeat():
+                continue
+            leadership_lost = True
+            logger.error('Lost API controller leadership generation '
+                         f'{generation}; fencing local work and exiting.')
+            try:
+                state.instance_lease.set_ready(
+                    False,
+                    health_detail={
+                        'phase': 'leadership-lost',
+                        'controller_generation': generation,
+                    })
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    'Failed to publish controller leadership loss.')
+            break
+    finally:
+        try:
+            if became_leader:
+                if not leadership_lost and not cutover_regressed:
+                    try:
+                        state.instance_lease.set_ready(
+                            False,
+                            health_detail={
+                                'phase': 'draining',
+                                'controller_generation': generation,
+                            })
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception(
+                            'Failed to publish controller drain state.')
+                # Stop claim loops first. Then terminate every local child
+                # before releasing the leadership session so no
+                # old-generation provider work survives into the replacement
+                # generation.
+                try:
+                    for worker in workers:
+                        worker.request_shutdown()
+                    _kill_local_controller_children()
+                    if workers:
+                        _request_worker_shutdown(workers,
+                                                 terminate_children=True)
+                    if background is not None:
+                        background.stop()
+                    _stop_queue_server(queue_server)
+                finally:
+                    try:
+                        lease.release()
+                    finally:
+                        os.environ.pop(
+                            request_postgres.CONTROLLER_GENERATION_ENV_VAR,
+                            None)
+                        os.environ.pop(
+                            request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
+                            None)
+        finally:
+            try:
+                try:
+                    state.instance_lease.set_ready(
+                        False, health_detail={'phase': 'stopped'})
+                except Exception:  # pylint: disable=broad-except
+                    logger.warning('Failed to publish controller stop state.')
+                health_server.stop()
+            finally:
+                signal.signal(signal.SIGTERM, previous_term)
+                signal.signal(signal.SIGINT, previous_int)
+
+    if leadership_lost:
+        raise RuntimeError('Controller leadership session was lost.')
+    if cutover_regressed:
+        raise RuntimeError('A legacy controller consumer reappeared.')
+
+
 def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
     """Start the selected role and unwind every owned resource on exit."""
-    background = _start_background_loop(state.role, args.host,
-                                        args.metrics_port)
+    background: _BackgroundLoop | None = None
     queue_server = None
     workers: list[executor.RequestWorker] = []
     health_server = None
     try:
-        if state.role in ('all', 'executor'):
-            # The leader thread and controller children must share the same
-            # supervisor lifecycle until M3 introduces the controller role.
-            # pylint: disable=import-outside-toplevel
-            from sky.jobs import managed_job_refresh_thread
-            managed_job_refresh_thread.start_managed_job_refresh_daemon()
+        if state.role == 'controller':
+            _run_controller_role(state, args)
+            return
 
+        background = _start_background_loop(state.role, args.host,
+                                            args.metrics_port)
+        if state.role in ('all', 'executor'):
             clean_env_module.capture_clean_server_env()
-            queue_server, workers = executor.start(state.config)
+            execution_classes = None
+            if state.role == 'executor':
+                execution_classes = frozenset(
+                    {request_registry.ExecutionClass.NORMAL})
+            queue_server, workers = executor.start(
+                state.config, execution_classes=execution_classes)
             if state.requests_recovered:
                 executor.reenqueue_recovered_requests()
-            background.run(_initialize_executor_requests())
+            if state.role == 'all':
+                # Compatibility mode owns both execution classes and retains
+                # the historical inner leader until split-role cutover.
+                # pylint: disable=import-outside-toplevel
+                from sky.jobs import managed_job_refresh_thread
+                managed_job_refresh_thread.start_managed_job_refresh_daemon()
+                background.run(_initialize_controller_requests())
+            background.run(_initialize_normal_executor_requests())
 
         if state.role == 'executor':
             if state.instance_lease is None:
@@ -414,16 +714,14 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
         logger.info(f'Shutting down SkyPilot {state.role} role...')
         if state.instance_lease is not None:
             state.instance_lease.stop()
-        if health_server is not None:
-            health_server.stop()
-        if workers:
-            subprocess_utils.run_in_parallel(lambda worker: worker.cancel(),
-                                             workers,
-                                             num_threads=len(workers))
-        if queue_server is not None:
-            queue_server.kill()
-            queue_server.join()
-        background.stop()
+        if state.role != 'controller':
+            if health_server is not None:
+                health_server.stop()
+            if workers:
+                _request_worker_shutdown(workers)
+            _stop_queue_server(queue_server)
+            if background is not None:
+                background.stop()
         for plugin in plugins.get_plugins():
             plugin.shutdown()
 

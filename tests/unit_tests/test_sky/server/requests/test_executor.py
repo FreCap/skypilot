@@ -1793,13 +1793,19 @@ def test_override_env_rejects_server_owned_client_values(
     """A crafted request body cannot replace deployment-owned capabilities."""
     capability = serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR
     server_prefixed = f'{constants.SKYPILOT_SERVER_ENV_VAR_PREFIX}TEST_ONLY'
+    role = 'SKYPILOT_API_SERVER_ROLE'
+    pod_uid = 'SKYPILOT_POD_UID'
     monkeypatch.setenv(capability, 'true')
     monkeypatch.setenv(server_prefixed, 'server-value')
+    monkeypatch.setenv(role, 'controller')
+    monkeypatch.setenv(pod_uid, 'current-pod')
 
     body = payloads.RequestBody(
         env_vars={
             capability: 'false',
             server_prefixed: 'client-value',
+            role: 'api',
+            pod_uid: 'stale-pod',
             constants.USER_ID_ENV_VAR: 'client-user-id',
             constants.USER_ENV_VAR: 'client-user',
         })
@@ -1808,9 +1814,27 @@ def test_override_env_rejects_server_owned_client_values(
             body, request_id='not-a-daemon-uuid', request_name='sky.launch'):
         assert os.environ[capability] == 'true'
         assert os.environ[server_prefixed] == 'server-value'
+        assert os.environ[role] == 'controller'
+        assert os.environ[pod_uid] == 'current-pod'
 
     assert capability not in body.env_vars
     assert server_prefixed not in body.env_vars
+    assert role not in body.env_vars
+    assert pod_uid not in body.env_vars
+
+
+def test_controller_execution_environment_uses_claim_fence(monkeypatch):
+    """A claimed request sees its own durable controller generation."""
+    monkeypatch.setenv('SKYPILOT_SERVER_CONTROLLER_GENERATION', 'old')
+    monkeypatch.setenv('SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID', 'old-owner')
+
+    with executor._controller_execution_environment(7, 'new-owner'):
+        assert os.environ['SKYPILOT_SERVER_CONTROLLER_GENERATION'] == '7'
+        assert os.environ[
+            'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'] == 'new-owner'
+
+    assert os.environ['SKYPILOT_SERVER_CONTROLLER_GENERATION'] == 'old'
+    assert os.environ['SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'] == 'old-owner'
 
 
 def test_daemon_env_mutations_reverted_on_exit(stub_override_request_env_deps,

@@ -2,6 +2,8 @@
 {{- $haEnabled := .Values.apiService.highAvailability.enabled -}}
 {{- $executorService := .Values.executorService | default (dict) -}}
 {{- $executorReplicas := dig "replicas" 2 $executorService -}}
+{{- $controllerService := .Values.controllerService | default (dict) -}}
+{{- $controllerReplicas := dig "replicas" 2 $controllerService -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
 {{- $externalLBResources := get $externalLB "resources" | default (dict) -}}
@@ -136,6 +138,9 @@
 {{- end -}}
 {{- if lt (int $executorReplicas) 2 -}}
 {{- fail "apiService.highAvailability.enabled=true requires executorService.replicas>=2" -}}
+{{- end -}}
+{{- if lt (int $controllerReplicas) 2 -}}
+{{- fail "apiService.highAvailability.enabled=true requires controllerService.replicas>=2" -}}
 {{- end -}}
 {{- if ne .Values.apiService.upgradeStrategy "RollingUpdate" -}}
 {{- fail "apiService.highAvailability.enabled=true requires apiService.upgradeStrategy=RollingUpdate" -}}

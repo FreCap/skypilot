@@ -263,6 +263,20 @@ tests:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires executorService.replicas>=2"
 
+  - it: should reject HA with fewer than two controller replicas
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      controllerService.replicas: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires controllerService.replicas>=2"
+
   - it: should reject HA without shared RWX storage
     set:
       apiService.highAvailability.enabled: true
