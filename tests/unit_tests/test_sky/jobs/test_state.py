@@ -699,6 +699,29 @@ def test_get_job_controller_processes_empty_input_uses_no_query(
     assert counts['n'] == 0, counts
 
 
+def test_scheduler_set_waiting_deduplicates_repeated_job_ids(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = state.set_job_info_without_job_id(
+        name='waiting',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+
+    with _count_sql_statements(engine) as counts:
+        state.scheduler_set_waiting([job_id, job_id], '/tmp/dag.yaml',
+                                    '/tmp/user.yaml', '/tmp/env', None, 100)
+
+    assert state.get_job_schedule_state(job_id) is (
+        state.ManagedJobScheduleState.WAITING)
+    assert (state.get_job_file_contents(job_id)['dag_yaml_content'] ==
+            '/tmp/dag.yaml')
+    assert counts['n'] == 1, counts
+
+
 def test_get_job_controller_process_reuses_bulk_reader(monkeypatch):
     record = state.ControllerPidRecord(pid=101, started_at=1001.5)
     calls = []

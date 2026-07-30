@@ -278,6 +278,37 @@ def test_submit_jobs_returns_before_file_reads_when_every_controller_is_live(
     start_controllers.assert_not_called()
 
 
+def test_submit_jobs_deduplicates_ids_before_controller_checks_and_submit(
+        tmp_path):
+    dag, user, env = _submission_files(tmp_path)
+    records = {
+        1: _record(101, 1001.0),
+        2: _record(202, 1002.0),
+    }
+
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_controller_processes',
+            return_value=records) as get_processes, mock.patch.object(
+                scheduler.state,
+                'get_job_controller_process',
+                side_effect=AssertionError('scalar lookup used')), \
+            mock.patch.object(scheduler.managed_job_utils,
+                              'controller_process_alive',
+                              return_value=False) as is_alive, \
+            mock.patch.object(scheduler.state,
+                              'scheduler_set_waiting') as set_waiting, \
+            mock.patch.object(scheduler,
+                              'maybe_start_controllers') as start_controllers:
+        scheduler.submit_jobs([1, 2, 1, 2], str(dag), str(user), str(env), 50)
+
+    get_processes.assert_called_once_with([1, 2])
+    assert [call.args[0].pid for call in is_alive.call_args_list] == [101, 202]
+    set_waiting.assert_called_once_with([1, 2], 'name: dag\n', 'name: user\n',
+                                        'KEY=value\n', None, 50, None)
+    start_controllers.assert_called_once_with(from_scheduler=True)
+
+
 class TestKillLocalConsolidationControllers:
     """Tests shutdown cleanup for consolidated controller processes."""
 
