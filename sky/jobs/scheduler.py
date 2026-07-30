@@ -387,6 +387,18 @@ async def _complete_launch_state_transition(
         raise asyncio.CancelledError()
 
 
+async def job_resumed(job_id: int) -> None:
+    """Restore ALIVE after reclaiming an already-running managed job.
+
+    A controller resume deliberately skips the provider launch context, so it
+    must complete the same durable LAUNCHING-to-ALIVE transition explicitly.
+    The state writer retains the outer-generation predicate and this shield
+    keeps cancellation from stranding the row in LAUNCHING.
+    """
+    await _complete_launch_state_transition(
+        state.scheduler_set_alive_async(job_id))
+
+
 @contextlib.asynccontextmanager
 async def scheduled_launch(
     job_id: int,

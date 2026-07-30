@@ -326,6 +326,57 @@ class TestNormalJobRecovery:
         # Terminal status still triggers resume logic path
         assert is_resume is True
 
+    @pytest.mark.asyncio
+    async def test_running_resume_restores_alive_before_monitoring(
+            self, mock_task):
+        controller = JobController.__new__(JobController)
+        controller._job_id = 42
+        controller._pool = None
+        controller._backend = MagicMock()
+        controller._backend.run_timestamp = '2026-07-30-00-00-00-000000'
+        controller.starting = {42}
+        controller.starting_lock = asyncio.Lock()
+        controller.starting_signal = asyncio.Condition(controller.starting_lock)
+        mock_task.metadata = {}
+        mock_task.resources = []
+        mock_task.envs = {
+            constants.TASK_ID_ENV_VAR: 'managed-task-id',
+        }
+
+        call_order = []
+        executor = MagicMock()
+        executor.on_resume = AsyncMock(
+            side_effect=lambda _name: call_order.append('on-resume'))
+        executor.monitor_task = AsyncMock(
+            side_effect=lambda **_kwargs: call_order.append('monitor') or True)
+        mark_resumed = AsyncMock(
+            side_effect=lambda _job_id: call_order.append('mark-alive'))
+
+        with patch('sky.jobs.controller._add_k8s_annotations'), \
+             patch('sky.jobs.controller.usage_lib.messages.usage.'
+                   'update_task_id'), \
+             patch.object(controller,
+                          '_get_file_mounts_blob_id',
+                          new=AsyncMock(return_value=None)), \
+             patch('sky.jobs.state.get_latest_task_id_status_async',
+                   new=AsyncMock(return_value=(
+                       0, managed_job_state.ManagedJobStatus.RUNNING))), \
+             patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new=AsyncMock(return_value=(
+                       managed_job_state.ManagedJobStatus.RUNNING))), \
+             patch('sky.jobs.controller.scheduler.job_resumed',
+                   new=mark_resumed), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   return_value=executor):
+            result = await controller._run_one_task(0, mock_task)
+
+        assert result is True
+        mark_resumed.assert_awaited_once_with(42)
+        executor.launch.assert_not_called()
+        executor.on_resume.assert_awaited_once_with('test-task-42')
+        assert call_order == ['mark-alive', 'on-resume', 'monitor']
+        assert controller.starting == set()
+
 
 class TestPoolStartingRestartRecovery:
     """Restart recovery for pool jobs before their first worker assignment."""

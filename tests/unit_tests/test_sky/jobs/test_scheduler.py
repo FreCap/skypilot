@@ -99,6 +99,16 @@ async def test_scheduled_launch_records_backoff_and_releases_slot():
 
 
 @pytest.mark.asyncio
+async def test_job_resumed_restores_alive_without_launching():
+    with mock.patch.object(scheduler.state,
+                           'scheduler_set_alive_async',
+                           new_callable=mock.AsyncMock) as set_alive:
+        await scheduler.job_resumed(7)
+
+    set_alive.assert_awaited_once_with(7)
+
+
+@pytest.mark.asyncio
 async def test_scheduled_launch_uses_preclaimed_slot_at_capacity():
     starting = {7}
     starting_lock = asyncio.Lock()

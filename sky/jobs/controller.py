@@ -769,6 +769,14 @@ class JobController:
                     raise asyncio.CancelledError()
             if prev_status != managed_job_state.ManagedJobStatus.RUNNING:
                 force_transit_to_recovering = True
+            elif (last_task_prev_status
+                  == managed_job_state.ManagedJobStatus.RUNNING and
+                  not launched_task):
+                # A resumed RUNNING task skips StrategyExecutor.launch(), whose
+                # scheduled_launch context normally restores ALIVE. Complete
+                # that generation-fenced transition before monitoring so the
+                # replacement controller does not remain LAUNCHING forever.
+                await scheduler.job_resumed(self._job_id)
 
             await self._strategy_executor.on_resume(cluster_name)
 

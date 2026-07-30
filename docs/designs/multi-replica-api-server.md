@@ -210,6 +210,10 @@ replica-independent and keeps each migration milestone deployable.
   generation, and only then launches scheduler processes. Status refresh never
   interprets a PID from another generation as a local controller failure and
   therefore cannot terminalize or tear down that job.
+- When the replacement scheduler resumes a task that is already `RUNNING`, it
+  transitions its outer schedule state from `LAUNCHING` to `ALIVE` before
+  entering the monitor loop. Resume deliberately skips the cluster-launch
+  context, so that state transition must not depend on a new launch.
 - A newly elected leader may coexist briefly with an isolated old process, but
   the old generation cannot reserve or commit new work. An action whose
   provider-side result became ambiguous during lock-session loss is reconciled
@@ -810,6 +814,12 @@ owned by another generation is recovery work, never evidence that the current
 leader's local controller crashed. This distinction is required because PIDs
 are meaningful only inside their owning pod.
 
+After a scheduler reclaims a job whose durable task status is already
+`RUNNING`, the resumed controller changes the schedule state from `LAUNCHING`
+to `ALIVE` before monitoring. This is an ownership-state correction, not a new
+cluster launch. The transition retains the same instance and generation
+predicate, so a concurrent handoff fences it like every other scheduler write.
+
 Standbys publish Ready with `phase=standby`. A leader publishes its generation
 and continuously probes and heartbeats the lock-owning session. On SIGTERM it
 first becomes unready, stops controller claims, interrupts the specialized
@@ -898,6 +908,9 @@ by HA mode.
 - Managed-job refresh tests prove a stale-generation PID is never interpreted
   as a current local crash and cannot cause cluster teardown or
   `FAILED_CONTROLLER`.
+- Managed-job resume tests prove an already-running task restores schedule
+  state to `ALIVE` under the reclaimed generation without launching a second
+  workload.
 - Detached managed-job controller tests prove the process exits when its outer
   generation loses either advisory-lock proof, while all-role local mode keeps
   its compatibility behavior.
@@ -1310,3 +1323,19 @@ second election system. Ordered stale-owner recovery and a detached-controller
 watchdog close both sides of the race. The permanent cost is two nullable
 columns, one claim predicate, and one ownership probe; that is justified by
 the otherwise destructive false terminalization seen in the live test.
+
+### Review 7: PURSUE
+
+The first generation-fenced live deletion preserved the workload and advanced
+its progress, but the replacement row stayed `LAUNCHING`. The resumed task
+correctly bypasses `StrategyExecutor.launch()` because its remote job is
+already `RUNNING`; that also bypasses `scheduled_launch()`, which is the only
+normal writer of the `ALIVE` schedule state.
+
+Leaving this state stuck would make the ownership model internally
+inconsistent and misclassify a monitoring controller as launching for the
+rest of a long job. Re-entering the launch context is worse because it couples
+a pure monitoring resume to provider-side launch behavior. The smallest sound
+fix is one generation-fenced `LAUNCHING` to `ALIVE` transition after durable
+resume classification and before the monitor loop. It adds no schema, process,
+or steady-state probe.
