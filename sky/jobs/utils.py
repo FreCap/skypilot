@@ -1873,10 +1873,9 @@ def stream_logs_by_id(job_id: int,
             managed_job_status = managed_job_state.get_status(job_id)
             assert managed_job_status is not None, (job_id, managed_job_status)
 
-    # Preserve a terminal latest-task verdict we already observed. A fresh
-    # scalar status poll can lag behind that transition by one refresh tick and
-    # needlessly reintroduce RUNNING, which adds an extra DB read and sleep
-    # before we return the terminal result.
+    # Preserve the latest-task verdict already observed by the follow loop.
+    # get_status() repeats the same latest-task query, so only a non-terminal
+    # snapshot needs the final-wait refresh below.
     if not managed_job_status.is_terminal():
         # The managed_job_status may not be in terminal status yet, since the
         # controller has not updated the managed job state yet. We wait for a

@@ -87,6 +87,10 @@ class TestStreamLogsByIdLifecycle:
     """Checks integration with the full managed-job log follower."""
 
     @pytest.mark.parametrize(
+        'terminal_status',
+        managed_job_state.ManagedJobStatus.terminal_statuses(),
+    )
+    @pytest.mark.parametrize(
         ('context', 'expected_cluster', 'expected_pool_job_id',
          'expected_tail_calls'), [
              ((None, None, None, 'first'), 'cluster', None, 1),
@@ -95,13 +99,13 @@ class TestStreamLogsByIdLifecycle:
          ])
     def test_terminal_transition_between_tasks_ends_follow(
             self, monkeypatch, context, expected_cluster, expected_pool_job_id,
-            expected_tail_calls):
+            expected_tail_calls, terminal_status):
         backend = _FakeBackend()
         status_read = mock.Mock(
-            side_effect=AssertionError('scalar status poll used'))
+            side_effect=AssertionError('redundant scalar status poll used'))
         latest_status_read = mock.Mock(side_effect=[
             (0, managed_job_state.ManagedJobStatus.RUNNING),
-            (0, managed_job_state.ManagedJobStatus.FAILED),
+            (0, terminal_status),
         ])
         num_tasks_read = mock.Mock(return_value=2)
         sleep = mock.Mock()
@@ -150,7 +154,7 @@ class TestStreamLogsByIdLifecycle:
 
         assert message == ''
         assert exit_code == exceptions.JobExitCode.from_managed_job_status(
-            managed_job_state.ManagedJobStatus.FAILED)
+            terminal_status)
         assert latest_status_read.call_count == 2
         num_tasks_read.assert_called_once_with(42)
         status_read.assert_not_called()
