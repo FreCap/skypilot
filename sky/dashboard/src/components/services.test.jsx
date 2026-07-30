@@ -17,6 +17,7 @@ jest.mock('@/lib/cache', () => ({
 
 import dashboardCache from '@/lib/cache';
 import { Services, ServicesTable } from '@/components/services';
+import { getServices } from '@/data/connectors/services';
 
 const SERVICES_RESPONSE = {
   services: [
@@ -52,6 +53,13 @@ function responseFor(name) {
     services: [{ ...SERVICES_RESPONSE.services[0], name }],
   };
 }
+
+const setDocumentVisibility = (value) => {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+};
 
 // Flush the pending fetch promise chain and any state updates it causes.
 // Repeated rounds give an unstable-callback fetch loop (fetch -> state
@@ -117,6 +125,166 @@ describe('Services fetch wiring', () => {
     });
     await flushFetches();
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes once immediately when the page becomes visible again', async () => {
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('hidden');
+    const { unmount } = render(<Services />);
+    let mounted = true;
+
+    try {
+      await flushFetches();
+      dashboardCache.get.mockClear();
+      dashboardCache.invalidate.mockClear();
+
+      await act(async () => {
+        jest.advanceTimersByTime(60000 - 1);
+      });
+      expect(dashboardCache.get).not.toHaveBeenCalled();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+
+      expect(dashboardCache.invalidate).toHaveBeenCalledWith(getServices, [
+        { summaryOnly: true },
+      ]);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      unmount();
+      mounted = false;
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => {
+        jest.advanceTimersByTime(30000);
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('fences a pre-hide request when visibility restore starts a fresh read', async () => {
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const oldRequest = deferred();
+    const visibleRequest = deferred();
+    dashboardCache.get
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(visibleRequest.promise);
+    setDocumentVisibility('hidden');
+    const { unmount } = render(<Services />);
+
+    try {
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        oldRequest.resolve(responseFor('stale-service'));
+        await oldRequest.promise;
+      });
+      expect(screen.queryByText('stale-service')).not.toBeInTheDocument();
+
+      await act(async () => {
+        visibleRequest.resolve(responseFor('visible-service'));
+        await visibleRequest.promise;
+      });
+      expect(screen.getByText('visible-service')).toBeInTheDocument();
+    } finally {
+      unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('reuses a manual refresh when the page becomes visible', async () => {
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const initialRequest = deferred();
+    const manualRequest = deferred();
+    const refreshDataRef = { current: null };
+    dashboardCache.get
+      .mockReturnValueOnce(initialRequest.promise)
+      .mockReturnValueOnce(manualRequest.promise);
+    setDocumentVisibility('hidden');
+    const { unmount } = render(
+      <StatefulServicesTable refreshDataRef={refreshDataRef} />
+    );
+
+    try {
+      await act(async () => {
+        refreshDataRef.current();
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+      dashboardCache.invalidate.mockClear();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+
+      expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        manualRequest.resolve(responseFor('manual-service'));
+        await manualRequest.promise;
+      });
+      expect(screen.getByText('manual-service')).toBeInTheDocument();
+    } finally {
+      unmount();
+      initialRequest.resolve(SERVICES_RESPONSE);
+      await initialRequest.promise;
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
   });
 
   it('coalesces interval ticks while the current request is pending', async () => {
