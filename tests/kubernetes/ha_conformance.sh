@@ -15,6 +15,8 @@ TOKEN_SECRET="${SKYPILOT_HA_TOKEN_SECRET:?set SKYPILOT_HA_TOKEN_SECRET}"
 TOKEN_KEY="${SKYPILOT_HA_TOKEN_KEY:-token}"
 CHART="${SKYPILOT_HA_CHART:-charts/skypilot}"
 TIMEOUT="${SKYPILOT_HA_TIMEOUT:-30m}"
+GET_TIMEOUT="${SKYPILOT_HA_GET_TIMEOUT:-120}"
+STREAM_TIMEOUT="${SKYPILOT_HA_STREAM_TIMEOUT:-60}"
 EXPECTED_CONFIRM="${CONTEXT}/${NAMESPACE}/${RELEASE}"
 CONFIRM="${SKYPILOT_HA_CONFIRM:-}"
 
@@ -31,6 +33,15 @@ if [[ "${CONFIRM}" != "${EXPECTED_CONFIRM}" ]]; then
 fi
 if [[ "${NAMESPACE}" == "default" || "${NAMESPACE}" == "test" ]]; then
   echo "refusing to run in protected namespace ${NAMESPACE}" >&2
+  exit 1
+fi
+if [[ ! "${GET_TIMEOUT}" =~ ^[0-9]+$ || "${GET_TIMEOUT}" -lt 30 ]]; then
+  echo "SKYPILOT_HA_GET_TIMEOUT must be an integer of at least 30 seconds" >&2
+  exit 1
+fi
+if [[ ! "${STREAM_TIMEOUT}" =~ ^[0-9]+$ ||
+      "${STREAM_TIMEOUT}" -lt 30 ]]; then
+  echo "SKYPILOT_HA_STREAM_TIMEOUT must be an integer of at least 30 seconds" >&2
   exit 1
 fi
 if [[ ! -d "${CHART}" ]]; then
@@ -79,8 +90,30 @@ if [[ "${IMAGE_A}" == "${IMAGE_B}" ]]; then
 fi
 
 CANARY_NAME="${RELEASE:0:39}-ha-conformance"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+EVIDENCE_DIR="${SKYPILOT_HA_EVIDENCE_DIR:-/tmp}"
+EVIDENCE_PREFIX="${EVIDENCE_DIR}/${CANARY_NAME}-${RUN_ID}"
+if [[ ! -d "${EVIDENCE_DIR}" || ! -w "${EVIDENCE_DIR}" ]]; then
+  echo "evidence directory is not writable: ${EVIDENCE_DIR}" >&2
+  exit 1
+fi
 
 cleanup_canary() {
+  if kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get deployment \
+    "${CANARY_NAME}" >/dev/null 2>&1; then
+    kubectl --context "${CONTEXT}" -n "${NAMESPACE}" logs \
+      "deployment/${CANARY_NAME}" --all-containers \
+      >"${EVIDENCE_PREFIX}-canary.log" 2>&1 || true
+    {
+      helm status "${RELEASE}" --kube-context "${CONTEXT}" \
+        --namespace "${NAMESPACE}" || true
+      kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get \
+        deployments,pods,pdb,jobs -o wide || true
+      kubectl --context "${CONTEXT}" -n "${NAMESPACE}" get events \
+        --sort-by=.metadata.creationTimestamp || true
+    } >"${EVIDENCE_PREFIX}-state.log" 2>&1
+    echo "saved conformance evidence: ${EVIDENCE_PREFIX}-{canary,state}.log" >&2
+  fi
   kubectl --context "${CONTEXT}" -n "${NAMESPACE}" delete deployment \
     "${CANARY_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl --context "${CONTEXT}" -n "${NAMESPACE}" delete pdb \
@@ -116,6 +149,10 @@ spec:
             secretKeyRef:
               name: ${TOKEN_SECRET}
               key: ${TOKEN_KEY}
+        - name: GET_TIMEOUT
+          value: "${GET_TIMEOUT}"
+        - name: STREAM_TIMEOUT
+          value: "${STREAM_TIMEOUT}"
         command:
         - /bin/sh
         - -c
@@ -136,36 +173,61 @@ spec:
           }
           durable_loop() {
             headers="/tmp/status-headers"
+            submit_error="/tmp/submit-error"
+            get_error="/tmp/get-error"
+            stream_error="/tmp/stream-error"
             while true; do
               : >"\${headers}"
-              if ! submit_code="\$(curl --silent --show-error \
+              : >"\${submit_error}"
+              submit_exit=0
+              if submit_code="\$(curl --silent --show-error \
                 --dump-header "\${headers}" --output /dev/null \
                 --write-out '%{http_code}' --max-time 10 \
                 --header "Authorization: Bearer \${token}" \
                 --header "Content-Type: application/json" \
                 --data '{"include_credentials":false,"summary_response":true}' \
-                "\${base_url}/status")"; then
+                "\${base_url}/status" 2>"\${submit_error}")"; then
+                :
+              else
+                submit_exit=\$?
                 submit_code=000
               fi
               request_id="\$(awk '
                 tolower(\$1) == "x-skypilot-request-id:" {print \$2}
               ' "\${headers}" | tail -n 1 | tr -d '\r\n')"
-              echo "CANARY submit \${submit_code} \${request_id:-missing}"
+              submit_detail="\$(tr '\n' ' ' <"\${submit_error}")"
+              echo "CANARY submit \${submit_code} \${request_id:-missing} \$(date -u +%Y-%m-%dT%H:%M:%SZ) exit=\${submit_exit} error=\${submit_detail:-none}"
               if [ "\${submit_code}" = 200 ] && [ -n "\${request_id}" ]; then
-                if ! get_code="\$(curl --silent --show-error \
-                  --output /dev/null --write-out '%{http_code}' --max-time 30 \
+                : >"\${get_error}"
+                get_exit=0
+                if get_code="\$(curl --silent --show-error \
+                  --output /dev/null --write-out '%{http_code}' \
+                  --max-time "\${GET_TIMEOUT}" \
                   --header "Authorization: Bearer \${token}" \
-                  "\${base_url}/api/get?request_id=\${request_id}")"; then
+                  "\${base_url}/api/get?request_id=\${request_id}" \
+                  2>"\${get_error}")"; then
+                  :
+                else
+                  get_exit=\$?
                   get_code=000
                 fi
-                echo "CANARY get \${get_code} \${request_id}"
-                if ! stream_code="\$(curl --silent --show-error \
-                  --output /dev/null --write-out '%{http_code}' --max-time 30 \
+                get_detail="\$(tr '\n' ' ' <"\${get_error}")"
+                echo "CANARY get \${get_code} \${request_id} \$(date -u +%Y-%m-%dT%H:%M:%SZ) exit=\${get_exit} error=\${get_detail:-none}"
+                : >"\${stream_error}"
+                stream_exit=0
+                if stream_code="\$(curl --silent --show-error \
+                  --output /dev/null --write-out '%{http_code}' \
+                  --max-time "\${STREAM_TIMEOUT}" \
                   --header "Authorization: Bearer \${token}" \
-                  "\${base_url}/api/stream?request_id=\${request_id}&follow=false&format=plain")"; then
+                  "\${base_url}/api/stream?request_id=\${request_id}&follow=false&format=plain" \
+                  2>"\${stream_error}")"; then
+                  :
+                else
+                  stream_exit=\$?
                   stream_code=000
                 fi
-                echo "CANARY stream \${stream_code} \${request_id}"
+                stream_detail="\$(tr '\n' ' ' <"\${stream_error}")"
+                echo "CANARY stream \${stream_code} \${request_id} \$(date -u +%Y-%m-%dT%H:%M:%SZ) exit=\${stream_exit} error=\${stream_detail:-none}"
               fi
               sleep 1
             done

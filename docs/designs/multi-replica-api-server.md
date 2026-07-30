@@ -1005,6 +1005,28 @@ manual test eviction and Karpenter eviction serialize atomically. Durable row
 queries may run through any ready API, executor, or controller pod and
 explicitly initialize server database selection.
 
+The third live attempt used commit
+`40086217bd28cb09c539ecd83643b6efb41026be` and the same exact runtime digest
+`sha256:e3e09c656d952412296dda6cc4a4c4c95d504e3e0fcef4dd5e6911f0a5c73c3e`.
+Revision 20's migration hook completed at 13:52:18 UTC, one second before its
+first target pod, and the tag-based role rollout completed. The first
+post-rollout assertion then found one durable lookup with HTTP code `000`.
+PostgreSQL and executor logs prove that request was not lost or duplicated: it
+was created at 13:55:07.767 UTC, generation 2 claimed it at 13:55:37.956 UTC,
+and it succeeded at 13:55:38.174 UTC. The canary's fixed 30-second client
+deadline expired just before the queued request completed while executors were
+turning over.
+
+This is negative harness evidence, not M4 acceptance and not a durable-request
+failure. A blocking durable lookup must still fail on an actual broken
+connection, but its client deadline must cover a valid queue delay during a
+guarded executor rollout. The harness now uses a 120-second lookup deadline,
+records timestamps, curl exit codes, and sanitized error text for every
+authenticated operation, and preserves canary, Helm, workload, PDB, Job, and
+event evidence before cleanup on both success and failure. The complete
+upgrade, controlled-eviction, rollback, and final-upgrade sequence must repeat
+from a fresh canary.
+
 Deployment:
 
 1. Render and server-side dry-run the guarded chart, including the hook,
