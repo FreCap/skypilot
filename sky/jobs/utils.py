@@ -576,6 +576,21 @@ def _controller_is_restarting() -> bool:
         os.path.expanduser(constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE))
 
 
+def _task_has_launch_attempt(task: dict[str, Any]) -> bool:
+    """Whether cleanup must treat this task as having launched.
+
+    A later pipeline stage that never left the backlog still has a durable
+    ``spot`` row, but it never owned a cluster and should not trigger a best-
+    effort teardown. Launch and recovery paths stamp at least one of the
+    lifecycle timestamps below and keep it when the task falls back to
+    ``PENDING`` during retry backoff, so the marker remains correct on the
+    failure path without refetching the full task row.
+    """
+    return any(
+        task.get(field) is not None
+        for field in ('submitted_at', 'start_at', 'last_recovered_at'))
+
+
 def update_managed_jobs_statuses(job_ids: list[int] | None = None):
     """Update managed job status if the controller process failed abnormally.
 
@@ -616,6 +631,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             return None
         cluster_names = []
         for task in tasks:
+            if not _task_has_launch_attempt(task):
+                continue
             cluster_name = generate_managed_job_cluster_name(
                 task['task_name'], job_id)
             if cluster_name is not None:

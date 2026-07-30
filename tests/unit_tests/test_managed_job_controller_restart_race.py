@@ -34,6 +34,9 @@ def _make_status_check_info():
                 'task_id': 0,
                 'status': managed_job_state.ManagedJobStatus.RUNNING,
                 'task_name': 'job',
+                'submitted_at': 100.0,
+                'start_at': 110.0,
+                'last_recovered_at': 110.0,
             }],
         }
     }
@@ -163,6 +166,9 @@ def test_cleanup_reports_every_failed_cluster_termination(monkeypatch, caplog):
         'task_id': i,
         'status': managed_job_state.ManagedJobStatus.RUNNING,
         'task_name': name,
+        'submitted_at': 100.0 + i,
+        'start_at': 110.0 + i,
+        'last_recovered_at': 110.0 + i,
     } for i, name in enumerate(['task-a', 'task-b', 'task-c'])]
     monkeypatch.setattr(managed_job_state,
                         'get_jobs_to_check_status_info',
@@ -196,6 +202,71 @@ def test_cleanup_reports_every_failed_cluster_termination(monkeypatch, caplog):
     assert 'task-c-1' in caplog.text
     assert not job_done_calls, (
         'failed cleanup must remain eligible for a later retry')
+
+
+def test_cleanup_skips_never_launched_followup_tasks(monkeypatch):
+    """Cleanup should not invent clusters for untouched later pipeline stages."""
+    set_failed_calls, job_done_calls = [], []
+    _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls)
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    info = _make_status_check_info()
+    info[1]['tasks'] = [{
+        'task_id': 0,
+        'status': managed_job_state.ManagedJobStatus.FAILED,
+        'task_name': 'launched-task',
+        'submitted_at': 100.0,
+        'start_at': 110.0,
+        'last_recovered_at': 110.0,
+    }, {
+        'task_id': 1,
+        'status': managed_job_state.ManagedJobStatus.PENDING,
+        'task_name': 'never-launched-task',
+        'submitted_at': None,
+        'start_at': None,
+        'last_recovered_at': None,
+    }]
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: info)
+    monkeypatch.setattr(utils, 'generate_managed_job_cluster_name',
+                        lambda task_name, job_id: f'{task_name}-{job_id}')
+    terminated_clusters = []
+    monkeypatch.setattr(utils, 'terminate_cluster', terminated_clusters.append)
+
+    utils.update_managed_jobs_statuses(job_ids=[1])
+
+    assert terminated_clusters == ['launched-task-1']
+    assert len(set_failed_calls) == 1
+    assert len(job_done_calls) == 1
+
+
+def test_cleanup_keeps_backoff_pending_task_with_launch_attempt(monkeypatch):
+    """A retry-backoff ``PENDING`` task still owns a cluster to tear down."""
+    set_failed_calls, job_done_calls = [], []
+    _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls)
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    info = _make_status_check_info()
+    info[1]['tasks'] = [{
+        'task_id': 0,
+        'status': managed_job_state.ManagedJobStatus.PENDING,
+        'task_name': 'retrying-task',
+        'submitted_at': 100.0,
+        'start_at': None,
+        'last_recovered_at': 95.0,
+    }]
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: info)
+    monkeypatch.setattr(utils, 'generate_managed_job_cluster_name',
+                        lambda task_name, job_id: f'{task_name}-{job_id}')
+    terminated_clusters = []
+    monkeypatch.setattr(utils, 'terminate_cluster', terminated_clusters.append)
+
+    utils.update_managed_jobs_statuses(job_ids=[1])
+
+    assert terminated_clusters == ['retrying-task-1']
+    assert len(set_failed_calls) == 1
+    assert len(job_done_calls) == 1
 
 
 def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
@@ -454,10 +525,16 @@ def test_cleanup_uses_task_name_identity_for_multi_task_jobs(monkeypatch):
                 'task_id': 0,
                 'status': managed_job_state.ManagedJobStatus.SUCCEEDED,
                 'task_name': 'extract',
+                'submitted_at': 100.0,
+                'start_at': 110.0,
+                'last_recovered_at': 110.0,
             }, {
                 'task_id': 1,
                 'status': managed_job_state.ManagedJobStatus.RUNNING,
                 'task_name': 'transform',
+                'submitted_at': 120.0,
+                'start_at': 130.0,
+                'last_recovered_at': 130.0,
             }],
         }
     }
@@ -516,6 +593,9 @@ def test_cleanup_terminates_task_clusters_in_parallel(monkeypatch):
         'task_id': i,
         'status': managed_job_state.ManagedJobStatus.RUNNING,
         'task_name': name,
+        'submitted_at': 100.0 + i,
+        'start_at': 110.0 + i,
+        'last_recovered_at': 110.0 + i,
     } for i, name in enumerate(['task-a', 'task-b', 'task-c'])]
     monkeypatch.setattr(managed_job_state,
                         'get_jobs_to_check_status_info',
