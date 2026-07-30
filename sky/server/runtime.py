@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Coroutine
 import dataclasses
 import multiprocessing
 import os
@@ -11,7 +12,7 @@ import shutil
 import signal
 import threading
 import time
-from typing import Any, Coroutine
+from typing import Any
 
 import uvloop
 
@@ -340,8 +341,11 @@ class _RoleHealthServer:
                 self.end_headers()
                 self.wfile.write(b'ok\n' if status == 200 else b'not ready\n')
 
-            def log_message(self, format_string: str, *args: Any) -> None:
-                del format_string, args
+            def log_message(
+                    self,
+                    format: str,  # pylint: disable=redefined-builtin
+                    *args: Any) -> None:
+                del format, args
 
         self._server = http.server.ThreadingHTTPServer((host, port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever,
@@ -453,6 +457,7 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
     cutover_regressed = False
     waiting_for_cutover = False
     cutover_ready = False
+    generation: int | None = None
     cutover_quiescence_seconds = _controller_cutover_quiescence_seconds()
 
     def request_shutdown(signum, frame) -> None:
@@ -606,6 +611,7 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
     finally:
         try:
             if became_leader:
+                assert generation is not None
                 if not leadership_lost and not cutover_regressed:
                     try:
                         state.instance_lease.set_ready(

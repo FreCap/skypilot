@@ -1693,3 +1693,18 @@ cleanup but never recovers the workload. Controller-origin admission metadata
 closes the independent stale-child submission path at the API boundary. This
 uses the existing generation and task state, adds no schema, and preserves the
 compatibility `all` role.
+
+### Review 11: legacy queue enqueue shape
+
+The first complete cloud test rollup found that compatibility queues were
+receiving the new durable `QueueItem` object. Existing queue plugins and the
+shared API test fixture still implement the documented three-tuple `put`
+contract. The PostgreSQL path already inserts the queue row in the request
+transaction and never calls the local enqueue closure, so carrying durable
+claim metadata into that closure had no HA value.
+
+Non-durable enqueue therefore retains the historical
+`(request_id, ignore_return_value, retryable)` tuple. PostgreSQL attaches
+generation and claim-token metadata only when it dequeues a durable row. A
+focused contract test now fails if the compatibility shape changes before the
+M5 plugin and local-queue removal gate.

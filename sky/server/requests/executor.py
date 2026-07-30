@@ -1463,12 +1463,12 @@ async def schedule_prepared_request(request_task: api_requests.Request,
     """
 
     async def enqueue():
-        input_tuple = queue_base.QueueItem(
-            request_task.request_id,
-            ignore_return_value,
-            retryable,
-            execution_generation=request_task.execution_generation,
-            claim_token=request_task.claim_token)
+        # The non-durable queue contract is intentionally the historical
+        # three-tuple. PostgreSQL inserts its queue row transactionally and
+        # returns above without calling this closure; durable claim metadata is
+        # attached only when that backend dequeues the row. Keeping this shape
+        # also preserves external queue plugins and test fixtures during M5.
+        input_tuple = (request_task.request_id, ignore_return_value, retryable)
         logger.info(f'Queuing request: {request_task.request_id}')
         await _get_queue(request_task.schedule_type).put_async(input_tuple)
 

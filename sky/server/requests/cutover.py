@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import dataclasses
 import datetime
 import hashlib
@@ -13,7 +14,7 @@ import pathlib
 import sqlite3
 import stat
 import sys
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 import uuid
 
 import orjson
@@ -108,7 +109,7 @@ def block_legacy_submissions(sqlite_path: str) -> pathlib.Path:
     return _write_gate(payload)
 
 
-def _load_sqlite_requests(source: pathlib.Path) -> list['requests_lib.Request']:
+def _load_sqlite_requests(source: pathlib.Path) -> list[requests_lib.Request]:
     # Imported lazily so the lightweight middleware gate does not import the
     # request database and its transitive dependencies.
     # pylint: disable=import-outside-toplevel
@@ -163,8 +164,7 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _canonical_request_values(
-        request: 'requests_lib.Request') -> dict[str, Any]:
+def _canonical_request_values(request: requests_lib.Request) -> dict[str, Any]:
     # pylint: disable=import-outside-toplevel
     from sky.server.requests import postgres
 
@@ -173,7 +173,7 @@ def _canonical_request_values(
     return _jsonable(values)
 
 
-def _logical_hash(requests: Sequence['requests_lib.Request']) -> str:
+def _logical_hash(requests: Sequence[requests_lib.Request]) -> str:
     digest = hashlib.sha256()
     for request in sorted(requests, key=lambda item: item.request_id):
         digest.update(

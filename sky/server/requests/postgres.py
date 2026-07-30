@@ -2033,7 +2033,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 met, status_msg = preconditions.check_once(
                     candidate['precondition_type'],
                     candidate['precondition_payload'], candidate['request_id'])
-            except BaseException as e:  # pylint: disable=broad-exception-caught
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 precondition_error = e
 
         with engine.begin() as connection:

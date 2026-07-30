@@ -75,6 +75,24 @@ def test_spawned_process_resolves_postgres_queue_from_environment(monkeypatch):
     assert isinstance(factory, request_postgres.PostgresQueueFactory)
 
 
+@pytest.mark.asyncio
+async def test_non_durable_schedule_preserves_legacy_queue_tuple(monkeypatch):
+    backend = mock.Mock(uses_durable_queue=False)
+    queue = mock.Mock()
+    queue.put_async = mock.AsyncMock()
+    request = mock.Mock(request_id='legacy-request',
+                        schedule_type=requests_lib.ScheduleType.SHORT)
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(executor, '_get_queue', lambda _schedule_type: queue)
+
+    await executor.schedule_prepared_request(request,
+                                             ignore_return_value=True,
+                                             retryable=True)
+
+    queue.put_async.assert_awaited_once_with(('legacy-request', True, True))
+
+
 @pytest.mark.parametrize(
     ('queue_backend', 'expected_factory_name', 'unexpected_factory_name'), [
         (server_config.QueueBackend.LOCAL, 'LocalQueueFactory',
