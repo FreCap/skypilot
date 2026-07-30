@@ -1911,6 +1911,16 @@ def status(
     """
     # TODO(zhwu): this does not stream the logs output by logger back to the
     # user, due to the rich progress implementation.
+    remote_api_version = versions.get_remote_api_version()
+    if (workspaces_filter is not None and remote_api_version is not None and
+            remote_api_version
+            < server_constants.MIN_STATUS_WORKSPACE_FILTER_API_VERSION):
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.APINotSupportedError(
+                'Filtering cluster status by workspace requires API server '
+                'version '
+                f'{server_constants.MIN_STATUS_WORKSPACE_FILTER_API_VERSION} '
+                'or newer. Please upgrade the remote server.')
     body = payloads.StatusBody(
         cluster_names=cluster_names,
         workspaces_filter=workspaces_filter,

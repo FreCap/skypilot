@@ -4,10 +4,10 @@
 
 The workspace editor loads cluster capacity for one workspace, but its cluster
 request currently fetches every cluster visible to the caller and discards
-other workspaces in the browser. The request does unnecessary database,
-serialization, network, cache, and client-side summarization work. Its cost
-grows with the caller's total visible cluster inventory instead of the active
-workspace.
+other workspaces in the browser. The request unnecessarily materializes,
+serializes, transfers, caches, and summarizes records from unrelated
+workspaces. The current cluster table has no workspace index, so the database
+scan itself still grows with the total cluster inventory.
 
 Moving the filter to the API boundary must not weaken workspace authorization.
 A client-supplied workspace name is only a requested narrowing of the
@@ -31,6 +31,9 @@ server-derived accessible-workspace set.
   and request scheduling retain their existing behavior.
 - The default synchronous and asynchronous SDK call shapes remain unchanged
   when no workspace filter is requested.
+- A client rejects an explicit filter when the remote server predates API
+  version 63 instead of letting that server silently ignore the field and
+  return clusters outside the requested workspaces.
 
 ## Solution
 
@@ -44,6 +47,18 @@ single cluster-record query.
 The dashboard cache key includes the workspace argument, so cached results from
 one workspace cannot satisfy another workspace's request.
 
+The filter bounds database row materialization and all downstream response
+work, but it does not change the database scan from O(total clusters). A
+100,000-row SQLite characterization returned 100 target rows and reduced median
+query time from 118.19 ms to 17.21 ms across seven alternating rounds, while
+both query plans still reported `SCAN clusters`.
+
+The SDK checks the remote API version only when a filter is explicit, including
+an empty filter. API version 63 is the first conservative capability boundary:
+every server reporting 63 includes this status field, while some older servers
+silently discard it through the request payload's unknown-field compatibility
+behavior.
+
 ## Alternatives considered
 
 Keeping browser-side filtering avoids an API change but preserves the
@@ -53,17 +68,29 @@ response-shaping behavior. Trusting the requested workspace directly is
 smaller but would create an authorization bypass for callers that can name a
 workspace they cannot access.
 
+Warning and continuing against an older server was rejected because the
+returned list would violate the filter contract. Client-side post-filtering was
+also rejected because `status()` returns an asynchronous request ID rather than
+the eventual records, and it would preserve the unnecessary server query and
+response work.
+
+Adding a workspace index was rejected for this correction because the
+representative filtered scan completed in 17.21 ms at 100,000 rows and no
+production profile establishes the scan as a material bottleneck. An index also
+adds migration and write-path cost. It should be reconsidered only with
+production scale evidence.
+
 ## Changed-path-to-test matrix
 
 | Changed path | Invariant | Test and command |
 | --- | --- | --- |
 | `sky/dashboard/src/components/workspace-editor.jsx` | One workspace-scoped cluster read per route; route changes use distinct cache arguments | `npm --prefix sky/dashboard test -- --runInBand src/components/workspace-editor.test.jsx` |
 | `sky/dashboard/src/data/connectors/clusters.jsx` | `/status` request serializes the workspace filter without adding another request | `npm --prefix sky/dashboard test -- --runInBand src/data/connectors/clusters.test.jsx` |
-| `sky/client/sdk.py`, `sky/server/requests/payloads.py` | Synchronous SDK serializes the filter into the status body | `pytest -q -o addopts='' tests/unit_tests/test_sky/client/test_sdk_async_status_workspace_filter.py` |
+| `sky/client/sdk.py`, `sky/server/constants.py`, `sky/server/requests/payloads.py` | Synchronous SDK serializes the filter for capable servers, rejects explicit nonempty and empty filters on older servers, and preserves omitted-filter calls | `pytest -q -o addopts='' tests/unit_tests/test_sky/client/test_sdk_async_status_workspace_filter.py` |
 | `sky/client/sdk_async.py` | Explicit filters reach the synchronous SDK; omitted filters preserve the default call shape | `pytest -q -o addopts='' tests/unit_tests/test_sky/client/test_sdk_async.py tests/unit_tests/test_sky/client/test_sdk_async_status_workspace_filter.py` |
 | `sky/core.py` | The scheduled request filter reaches the backend unchanged | `pytest -q -o addopts='' tests/unit_tests/test_core.py` |
 | `sky/backends/backend_utils.py` | Requested and accessible workspaces are intersected; omitted, empty, and inaccessible-only boundaries are closed; glob and direct-name filtering share the result | `pytest -q -o addopts='' tests/unit_tests/test_backend_utils.py` |
-| Performance | One dashboard fetch, one backend cluster query, and a result set bounded by the active workspace | Exact request and call-count assertions in the focused dashboard and backend tests |
+| Performance | One dashboard fetch and one backend cluster query; row materialization and response work are bounded by the active workspace while the unindexed database scan remains O(total clusters) | Exact request and call-count assertions in the focused dashboard and backend tests, plus the 100,000-row SQLite query-plan characterization |
 
 ## CI and rollout
 
@@ -75,4 +102,6 @@ formatting, mypy, Pylint, Ruff, basedpyright, async lifecycle, import contracts,
 stub runtime contracts, and the worker-floor import.
 
 No migration is required. The field defaults to `None`, so existing callers
-retain the server-derived accessible-workspace filter.
+retain the server-derived accessible-workspace filter. Explicit filters require
+API version 63 or newer; older compatible servers continue to support ordinary
+unfiltered status calls.
