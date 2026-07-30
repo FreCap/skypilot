@@ -332,37 +332,36 @@ def add_column_to_table_alembic(
     """
     from alembic import op  # pylint: disable=import-outside-toplevel
 
-    try:
-        # Create the column with server_default if provided
-        column = sqlalchemy.Column(column_name,
-                                   column_type,
-                                   server_default=server_default,
-                                   index=index)
-        op.add_column(table_name, column)
+    bind = op.get_bind()
+    existing_columns = {
+        column['name']
+        for column in sqlalchemy.inspect(bind).get_columns(table_name)
+    }
+    if column_name in existing_columns:
+        return
 
-        # Handle data migration
-        if copy_from is not None:
-            op.execute(
-                sqlalchemy.text(
-                    f'UPDATE {table_name} SET {column_name} = {copy_from}'))
+    # Check before issuing DDL instead of catching a duplicate-column error.
+    # PostgreSQL aborts the entire transaction on that error, so swallowing the
+    # exception would make every later statement in the migration fail.
+    column = sqlalchemy.Column(column_name,
+                               column_type,
+                               server_default=server_default,
+                               index=index)
+    op.add_column(table_name, column)
 
-        if value_to_replace_existing_entries is not None:
-            # Use parameterized query for safety
-            op.get_bind().execute(
-                sqlalchemy.text(f'UPDATE {table_name} '
-                                f'SET {column_name} = :replacement_value '
-                                f'WHERE {column_name} IS NULL'),
-                {'replacement_value': value_to_replace_existing_entries})
-    except sqlalchemy_exc.ProgrammingError as e:
-        if 'already exists' in str(e).lower():
-            pass  # Column already exists, that's fine
-        else:
-            raise
-    except sqlalchemy_exc.OperationalError as e:
-        if 'duplicate column name' in str(e).lower():
-            pass  # Column already exists, that's fine
-        else:
-            raise
+    # Handle data migration
+    if copy_from is not None:
+        op.execute(
+            sqlalchemy.text(
+                f'UPDATE {table_name} SET {column_name} = {copy_from}'))
+
+    if value_to_replace_existing_entries is not None:
+        # Use parameterized query for safety
+        bind.execute(
+            sqlalchemy.text(f'UPDATE {table_name} '
+                            f'SET {column_name} = :replacement_value '
+                            f'WHERE {column_name} IS NULL'),
+            {'replacement_value': value_to_replace_existing_entries})
 
 
 def drop_column_from_table_alembic(

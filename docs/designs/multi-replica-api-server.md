@@ -963,10 +963,19 @@ guarded live-value
 server-side dry-run, shell syntax and ShellCheck for the conformance harness,
 targeted role-runtime tests, formatting, mypy, Pylint, dashboard checks, and a
 warning-as-error Sphinx build pass. The fast drain-marker unit test proves
-readiness fails without opening PostgreSQL. The Docker-backed PostgreSQL lease
-test could not start its disposable `postgres:16` container in the local
-testcontainers environment; the completed conformance run and its six retained
-PostgreSQL drain rows provide the corresponding live proof.
+readiness fails without opening PostgreSQL.
+
+Exact-head validation after rebasing onto the current `improvements` base found
+and fixed a fresh-bootstrap regression in the shared PostgreSQL schema. The
+managed-jobs ownership columns are present in current table metadata before
+Alembic stamps revision 026. The generic add-column helper previously attempted
+the duplicate DDL, caught PostgreSQL's duplicate-column error, and then
+continued inside the aborted transaction. It now inspects the current schema
+before issuing DDL, so an already-converged column is a true no-op and an
+unexpected DDL error rolls back the migration. All 38 request and batch
+PostgreSQL cases pass with zero skips, and the complete PostgreSQL migration
+and database-utility matrix passes all 257 cases, including fresh subprocess
+bootstrap and all central schemas sharing one search path.
 
 The first live M4 attempt used commit
 `ca47898533a904f89ce5a40b821cb1274966989c` and exact image digest
