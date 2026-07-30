@@ -848,6 +848,38 @@ left outer schedule state `DONE`. This is negative evidence, not M3
 acceptance. The fail-stop contract above is required before repeating both
 failure modes with a fresh long-running job.
 
+Revision 17 used commit
+`a03c0c0abdfff91db3a1e86cf903ad14cd5d58fc` and exact image digest
+`sha256:a312d720fb4975523f533b1821ec9770f4a279a7744a593d214c2c9abc9aee4e`.
+The migration Job completed on that digest, all three roles rolled to two Ready
+replicas, and schema revisions remained API `003` and managed jobs `026`.
+Terminating generation 23's PostgreSQL lock session promoted generation 24;
+the detached scheduler log ended immediately after reporting that generation
+23 was no longer current, without cancellation or cleanup finalizers. Job 3
+returned to `ALIVE` and its original workload pod continued through tick 62
+with zero restarts. Deleting the generation 24 leader then promoted generation
+25 and retained the same workload through tick 115.
+
+A fresh two-replica Serve service was added for the combined gate. Active-pod
+deletion promoted generation 25 to 26 while the service stayed `READY`, the
+managed job returned to `ALIVE`, both Serve replica UIDs and the job workload
+UID remained unchanged, and the API and Serve canaries recorded zero failures.
+Karpenter later forcefully terminated a node that independently hosted the job
+and one Serve replica during the first database-session sample. That event
+changed the workload UIDs and produced two Serve 503s, so the sample was
+rejected rather than attributed to controller failover. After SkyPilot
+recovered both workloads, the three test pods were marked non-disruptable to
+isolate the controller failure injection and the canary baseline was reset.
+Terminating generation 27's lock session then promoted generation 28, restored
+the job to `ALIVE`, kept the service `READY`, retained job pod UID
+`0c132233-af62-45c9-b242-731fe797f09e` and Serve pod UIDs
+`c4ffd558-8f5e-42fd-acd4-136a7818e764` and
+`66d0f2d4-5dea-4a6a-a9dc-cd53c6790537`, and left all three at zero restarts.
+The final API canary sample was 1,194 successes and zero failures; the reset
+Serve sample was 122 successes and zero failures. PostgreSQL showed exactly
+the election and generation advisory locks for the live generation. M3 is
+accepted.
+
 Standbys publish Ready with `phase=standby`. A leader publishes its generation
 and continuously probes and heartbeats the lock-owning session. On SIGTERM it
 first becomes unready, stops controller claims, interrupts the specialized
