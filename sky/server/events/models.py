@@ -108,12 +108,12 @@ class EventContext(_ContextModel):
     def complete(self) -> bool:
         return self.workspace is not None
 
-    def with_workspace(self, workspace: str) -> 'EventContext':
+    def with_workspace(self, workspace: str) -> EventContext:
         values = self.model_dump(mode='json')
         values['workspace'] = workspace
         return EventContext.model_validate(values)
 
-    def with_primary_target_id(self, target_id: str | None) -> 'EventContext':
+    def with_primary_target_id(self, target_id: str | None) -> EventContext:
         if target_id is None or not self.targets:
             return self
         values = self.model_dump(mode='json')
