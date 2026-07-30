@@ -194,8 +194,8 @@ module and facade.
   delta within cold-import noise. Direct aliases add no wrapper frame, and
   AST equivalence proves no added resource copy, provider call, dispatch,
   loop, or retry in the moved bodies.
-- The deterministic diff report classifies the change as L with 919
-  significant changed lines, 1,203 total changed lines, and four files.
+- The deterministic diff report classifies the change as L with 952
+  significant changed lines, 1,239 total changed lines, and four files.
 
 ## Rollout and rollback
 
