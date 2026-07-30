@@ -18,6 +18,7 @@ from sky.provision import aws
 from sky.provision import azure
 from sky.provision import common
 from sky.provision import cudo
+from sky.provision import do
 from sky.provision import fluidstack
 from sky.provision import gcp
 from sky.provision import hyperbolic
@@ -26,7 +27,9 @@ from sky.provision import lambda_cloud
 from sky.provision import mithril
 from sky.provision import nebius
 from sky.provision import oci
+from sky.provision import paperspace
 from sky.provision import primeintellect
+from sky.provision import provider_facets
 from sky.provision import runpod
 from sky.provision import scp
 from sky.provision import seeweb
@@ -117,6 +120,147 @@ class Provisioner:
 
 
 _registered_provisioners: dict[str, Provisioner] = {}
+_registered_provisioner_bundles: dict[str,
+                                      provider_facets.ProvisionerBundleV1] = {}
+_legacy_mixed_owner_diagnostics: set[tuple[str, str]] = set()
+
+
+def _make_builtin_bundle(
+    canonical_name: str,
+    module: Any,
+) -> provider_facets.ProvisionerBundleV1:
+    return provider_facets.ProvisionerBundleV1(
+        canonical_name=canonical_name,
+        instance_lifecycle=provider_facets.LegacyInstanceLifecycleAdapter(
+            module),
+        legacy_module=module,
+    )
+
+
+# One explicit inventory owns the in-tree new-provisioner implementations.
+# Late-bound getters preserve whole-module and attribute monkeypatch seams while
+# avoiding the former import-order-dependent ``globals()`` discovery.
+_BUILTIN_PROVISIONER_MODULE_GETTERS: dict[str, typing.Callable[[], Any]] = {
+    'aws': lambda: aws,
+    'azure': lambda: azure,
+    'cudo': lambda: cudo,
+    'do': lambda: do,
+    'fluidstack': lambda: fluidstack,
+    'gcp': lambda: gcp,
+    'hyperbolic': lambda: hyperbolic,
+    'kubernetes': lambda: kubernetes,
+    'lambda': lambda: lambda_cloud,
+    'mithril': lambda: mithril,
+    'nebius': lambda: nebius,
+    'oci': lambda: oci,
+    'paperspace': lambda: paperspace,
+    'primeintellect': lambda: primeintellect,
+    'runpod': lambda: runpod,
+    'scp': lambda: scp,
+    'seeweb': lambda: seeweb,
+    'shadeform': lambda: shadeform,
+    'slurm': lambda: slurm,
+    'ssh': lambda: ssh,
+    'vast': lambda: vast,
+    'verda': lambda: verda,
+    'vsphere': lambda: vsphere,
+    'yotta': lambda: yotta,
+}
+
+
+def _canonical_provider_name(provider_name: str) -> str:
+    """Return the one canonical key used by registration and dispatch."""
+    normalized = provider_name.lower()
+    if normalized == 'lambda_cloud':
+        return 'lambda'
+    return normalized
+
+
+def _get_builtin_provisioner_bundle(
+        provider_name: str) -> provider_facets.ProvisionerBundleV1 | None:
+    canonical_name = _canonical_provider_name(provider_name)
+    module_getter = _BUILTIN_PROVISIONER_MODULE_GETTERS.get(canonical_name)
+    if module_getter is None:
+        return None
+    return _make_builtin_bundle(canonical_name, module_getter())
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProvisionerResolution:
+    """One provider lookup shared by lifecycle and template dispatch."""
+
+    canonical_name: str
+    strict_bundle: provider_facets.ProvisionerBundleV1 | None
+    legacy_registration: Provisioner | None
+    builtin_bundle: provider_facets.ProvisionerBundleV1 | None
+
+    @property
+    def exists(self) -> bool:
+        return (self.strict_bundle is not None or
+                self.legacy_registration is not None or
+                self.builtin_bundle is not None)
+
+    @property
+    def template_override(self) -> TemplateOverrideFn | None:
+        if self.strict_bundle is not None:
+            return self.strict_bundle.template_override
+        if (self.legacy_registration is not None and
+                self.legacy_registration.template_override is not None):
+            return self.legacy_registration.template_override
+        if self.builtin_bundle is not None:
+            return self.builtin_bundle.template_override
+        return None
+
+    def implementation(self, method_name: str) -> Any | None:
+        if (self.strict_bundle is not None and
+                method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS):
+            return getattr(self.strict_bundle.instance_lifecycle, method_name)
+
+        legacy_module = (self.legacy_registration.module
+                         if self.legacy_registration is not None else None)
+        if legacy_module is not None:
+            implementation = getattr(legacy_module, method_name, None)
+            if implementation is not None:
+                return implementation
+
+        builtin_module = None
+        if self.builtin_bundle is not None:
+            if method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS:
+                raw_builtin_module = self.builtin_bundle.legacy_module
+                if (raw_builtin_module is not None and getattr(
+                        raw_builtin_module, method_name, None) is not None):
+                    builtin_module = self.builtin_bundle.instance_lifecycle
+            else:
+                builtin_module = self.builtin_bundle.legacy_module
+
+        if (legacy_module is not None and builtin_module is not None and
+                method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS):
+            plugin_owns_part_of_facet = any(
+                callable(getattr(legacy_module, name, None))
+                for name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS)
+            diagnostic_key = (self.canonical_name, 'InstanceLifecycleV1')
+            if (plugin_owns_part_of_facet and
+                    diagnostic_key not in _legacy_mixed_owner_diagnostics):
+                _legacy_mixed_owner_diagnostics.add(diagnostic_key)
+                logger.warning(
+                    'Legacy provisioner %r mixes plugin and built-in '
+                    'InstanceLifecycleV1 methods. Register one complete '
+                    'ProvisionerBundleV1 to remove fallback.',
+                    self.canonical_name)
+
+        if builtin_module is not None:
+            return getattr(builtin_module, method_name, None)
+        return None
+
+
+def _resolve_provisioner(provider_name: str) -> _ProvisionerResolution:
+    canonical_name = _canonical_provider_name(provider_name)
+    return _ProvisionerResolution(
+        canonical_name=canonical_name,
+        strict_bundle=_registered_provisioner_bundles.get(canonical_name),
+        legacy_registration=_registered_provisioners.get(canonical_name),
+        builtin_bundle=_get_builtin_provisioner_bundle(canonical_name),
+    )
 
 
 def register_provisioner(
@@ -131,17 +275,78 @@ def register_provisioner(
     matches the lowercase canonical cloud name (e.g. ``'kubernetes'``,
     ``'aws'``).
     """
-    _registered_provisioners[cloud_name.lower()] = Provisioner(
+    canonical_name = _canonical_provider_name(cloud_name)
+    _registered_provisioner_bundles.pop(canonical_name, None)
+    _registered_provisioners[canonical_name] = Provisioner(
         module=module, template_override=template_override)
     logger.debug(
         'Registered Provisioner for %r: module=%s, '
-        'template_override=%s', cloud_name.lower(),
+        'template_override=%s', canonical_name,
         type(module).__name__, template_override is not None)
 
 
 def get_registered_provisioner(cloud_name: str) -> Provisioner | None:
     """Return the Provisioner registered for ``cloud_name``, or None."""
-    return _registered_provisioners.get(cloud_name.lower())
+    canonical_name = _canonical_provider_name(cloud_name)
+    legacy_registration = _registered_provisioners.get(canonical_name)
+    if legacy_registration is not None:
+        return legacy_registration
+    strict_bundle = _registered_provisioner_bundles.get(canonical_name)
+    if strict_bundle is None:
+        return None
+    return Provisioner(module=strict_bundle.instance_lifecycle,
+                       template_override=strict_bundle.template_override)
+
+
+def register_provisioner_bundle(
+        bundle: provider_facets.ProvisionerBundleV1) -> None:
+    """Register one complete, strictly owned V1 lifecycle facet."""
+    validation_errors = (
+        provider_facets.instance_lifecycle_v1_validation_errors(
+            bundle.instance_lifecycle))
+    if validation_errors:
+        raise ValueError('Incomplete InstanceLifecycleV1 for '
+                         f'{bundle.canonical_name!r}: '
+                         f'{"; ".join(validation_errors)}.')
+    if bundle.legacy_module is not None:
+        raise ValueError('Strict ProvisionerBundleV1 registration cannot '
+                         'declare a legacy module fallback.')
+
+    canonical_name = _canonical_provider_name(bundle.canonical_name)
+    if bundle.canonical_name != canonical_name:
+        bundle = dataclasses.replace(bundle, canonical_name=canonical_name)
+    existing_bundle = _registered_provisioner_bundles.get(canonical_name)
+    if (existing_bundle is not None and
+            existing_bundle.instance_lifecycle is bundle.instance_lifecycle and
+            existing_bundle.template_override is bundle.template_override and
+            existing_bundle.legacy_module is bundle.legacy_module):
+        logger.debug('ProvisionerBundleV1 for %r is already registered.',
+                     canonical_name)
+        return
+    _registered_provisioners.pop(canonical_name, None)
+    replaced = existing_bundle is not None
+    _registered_provisioner_bundles[canonical_name] = bundle
+    if replaced:
+        logger.info('Replaced strict ProvisionerBundleV1 for %r.',
+                    canonical_name)
+    else:
+        logger.debug('Registered strict ProvisionerBundleV1 for %r.',
+                     canonical_name)
+
+
+def get_provisioner_bundle(
+        provider_name: str) -> provider_facets.ProvisionerBundleV1 | None:
+    """Return the strict or built-in typed bundle for a provider."""
+    resolution = _resolve_provisioner(provider_name)
+    if resolution.strict_bundle is not None:
+        return resolution.strict_bundle
+    return resolution.builtin_bundle
+
+
+def get_provisioner_template_override(
+        provider_name: str) -> TemplateOverrideFn | None:
+    """Return the template hook chosen by the shared provider resolver."""
+    return _resolve_provisioner(provider_name).template_override
 
 
 def _route_to_cloud_impl(func):
@@ -156,24 +361,10 @@ def _route_to_cloud_impl(func):
         else:
             provider_name = kwargs.pop('provider_name')
 
-        module_name = provider_name.lower()
-        if module_name == 'lambda':
-            module_name = 'lambda_cloud'
-        # Registered Provisioner methods take precedence over the static
-        # cloud module's; if the registered Provisioner's module does not
-        # define ``func.__name__``, dispatch falls through to the existing
-        # cloud module.
-        plugin = _registered_provisioners.get(module_name)
-        plugin_module = plugin.module if plugin is not None else None
-        existing_module = globals().get(module_name)
-        assert (plugin_module is not None or existing_module
-                is not None), (f'Unknown provider: {module_name}')
-
-        impl = None
-        if plugin_module is not None:
-            impl = getattr(plugin_module, func.__name__, None)
-        if impl is None and existing_module is not None:
-            impl = getattr(existing_module, func.__name__, None)
+        resolution = _resolve_provisioner(provider_name)
+        assert resolution.exists, (
+            f'Unknown provider: {resolution.canonical_name}')
+        impl = resolution.implementation(func.__name__)
 
         if impl is not None:
             return impl(*args, **kwargs)

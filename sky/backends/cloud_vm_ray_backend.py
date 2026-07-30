@@ -1113,16 +1113,15 @@ class RetryingVmProvisioner:
             # Let the registered Provisioner (if any) override the cluster
             # config template by returning a ``TemplateSpec``; otherwise
             # fall back to the default template for the cloud.
-            plugin = provision_lib.get_registered_provisioner(
+            template_override = provision_lib.get_provisioner_template_override(
                 to_provision.cloud.canonical_name())
-            template_spec = (plugin.template_override(
+            template_spec = (template_override(
                 task,
                 to_provision,
                 _extra_launch_context=self._extra_launch_context,
                 _is_launched_by_jobs_controller=self.
                 _is_launched_by_jobs_controller,
-            ) if plugin is not None and plugin.template_override is not None
-                             else None)
+            ) if template_override is not None else None)
             if template_spec is not None:
                 template = template_spec.template_path
                 extra_vars = template_spec.variables
