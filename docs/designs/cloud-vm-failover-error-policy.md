@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Implemented and locally validated.
 
 ## Context
 
@@ -110,9 +110,14 @@ owner.
 ## Behavior contract
 
 - Historical backend symbols remain direct aliases, not wrappers.
-- Callable signatures, return values, exceptions, logs, detailed reasons,
-  historical `__module__`, qualified names, pickle identity, and monkeypatch
-  behavior remain unchanged.
+- Callable signatures, return values, exceptions, log messages and logger
+  identity, detailed reasons, historical `__module__`, qualified names, and
+  pickle identity remain unchanged. Source pathname and line fields in log
+  records reflect the new implementation module.
+- Existing monkeypatches of the historical handler classes and their static
+  methods continue to affect the exact runtime objects used by the retry
+  orchestrator. Incidental backend module globals are not a supported policy
+  injection surface.
 - V1 keeps exact stdout and stderr parsing and the conservative
   `definitely_no_nodes_launched` proof.
 - V2 keeps exact provider dispatch and resource, zone, region, and cloud block
@@ -160,6 +165,37 @@ filters. Unit Tests collects the focused contracts and backend tests. Failover
 Tests covers provider retry behavior. Format, mypy, Pylint, BasedPyright,
 import-linter, limited-dependency, and compile checks cover the new production
 module and facade.
+
+## Validation evidence
+
+- The characterization contract passed before the move. It now proves direct
+  implementation and facade identity, 11 callable signatures, historical
+  module and qualified names, both handler class identities, the rsync message
+  alias, and pickle round trips.
+- Focused pre-move tests pin duplicate block suppression, V1 error ordering,
+  detailed rsync diagnostics, gang-failure zone coverage, representative GCP
+  zone, region, and cloud block widths, and V2 default multi-zone behavior.
+- All three moved AST nodes, `_add_to_blocked_resources`,
+  `FailoverCloudErrorHandlerV1`, and `FailoverCloudErrorHandlerV2`, are
+  identical to exact base
+  `28939af91c53fc8b9f4e80ac1e4af0df7ffe75f7` when source locations are
+  ignored.
+- The local credential-independent matrix passed 57 failover-policy and
+  capacity tests plus all 66 Cloud VM backend tests. The paid AWS failover
+  test and four parametrized Cloud VM integration tests collect successfully.
+  Seven unrelated capacity-cache cases require an account catalog and remain
+  covered by the credential-isolated Unit Tests CI job.
+- `format.sh --files` passes exact YAPF and isort, mypy over 769 source files,
+  Pylint at 10.00, dashboard ESLint, and dashboard formatting. Ruff, Python
+  3.14 compileall, BasedPyright 1.39.9 with the locked baseline,
+  import-linter, and git diff checks also pass.
+- Ten balanced alternating pairs of fresh-process imports measured a
+  0.790720-second base median and 0.795379-second branch median, a 0.589%
+  delta within cold-import noise. Direct aliases add no wrapper frame, and
+  AST equivalence proves no added resource copy, provider call, dispatch,
+  loop, or retry in the moved bodies.
+- The deterministic diff report classifies the change as L with 919
+  significant changed lines, 1,203 total changed lines, and four files.
 
 ## Rollout and rollback
 
