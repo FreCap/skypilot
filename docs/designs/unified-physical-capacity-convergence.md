@@ -1,7 +1,7 @@
 # Unified Physical-Capacity Convergence
 
-Status: accepted for C0 and revision-001/C1 implementation; later phases gated;
-no mutation authority is enabled
+Status: C0 accepted; revision-001/C1 implemented and locally verified; first
+test-fleet rollout and all later phases gated; no mutation authority is enabled
 
 Last updated: 2026-07-30
 
@@ -1702,17 +1702,55 @@ deletion are not supported repair procedures.
 
 ## Verification evidence
 
-No implementation or deployment evidence is claimed yet.
-
 Baseline source:
 
 - branch base: `3464ffada`;
+- implementation branch: `feat/unified-physical-capacity`, developed in an
+  isolated worktree without modifying the original dirty worktree;
 - PR #1070 request/action and controller-generation foundations are present;
 - PR #1071 ownerless Serve provider-refresh fallback is present.
 
-Runtime baseline, exact database revisions, image digests, and Helm revisions
-will be recorded here before the first C1 rollout. The 2026-07-30 read-only
-audit found:
+Revision-001/C1 implementation evidence on 2026-07-30:
+
+- `capacity_state_db` revision `001`, independent runtime metadata, the lazy
+  shared-engine repository, closed row enums, strict disabled-by-default
+  configuration, and bounded generic canonical JSON were implemented. No
+  production projector, writer, reader cutover, observation, action,
+  authority, permit, or occupancy path exists.
+- A disposable local PostgreSQL 14.23 instance executed the literal migration
+  and independent runtime metadata. Their catalog tables, columns, defaults,
+  constraints, indexes, deferrability, and delete actions matched exactly.
+- Real-PostgreSQL tests passed for the deferred group/intent cycle, global
+  active cluster-generation uniqueness, A-to-B-to-A intent history, immutable
+  intent/desire collisions, cross-workspace foreign-key rejection, idempotent
+  concurrent publication, scan provenance, empty-only downgrade, and
+  `ACCESS EXCLUSIVE` locking of each of the five tables.
+- The actual Alembic lineage passed `upgrade`, `bootstrap`, verify-only
+  startup, missing-lineage refusal, concurrent first initialization, and
+  later-additive numeric revision compatibility.
+- A fresh Python subprocess bootstrapped the shared PostgreSQL schema with
+  global state first and all central histories present:
+  `state_db=027`, `sky_config_db=001`, `serve_db=031`,
+  `spot_jobs_db=026`, `api_requests_db=004`, and
+  `capacity_state_db=001`. Success proves capacity did not preempt the
+  global-state empty-schema bootstrap check; mocked ordering separately proves
+  capacity is invoked last.
+- The focused command covering capacity models, repository, real PostgreSQL
+  schema, and central migration integration exited zero. Running the schema
+  and repository modules with `pytest -n 2 --dist loadgroup` also exited zero
+  with 34 tests and proved both modules share one xdist group when an external
+  test URI is used.
+- The repository formatter completed YAPF and isort; mypy passed all 797
+  checked source files; pylint reported 10.00/10; and dashboard lint/format
+  passed. Final commands were rerun on the staged commit candidate.
+- Every fixture and temporary schema was removed after validation; the
+  disposable PostgreSQL `public` schema ended empty.
+
+Exact code-bearing commit, image digest, database revisions, Helm revision,
+pod state, and post-rollout empty-table queries will be appended before C2.
+The first C1 deployment has **not** occurred.
+
+The 2026-07-30 read-only deployment audit found:
 
 - the configured shared API health endpoint returned HTTP 200;
 - the server reported version `1.1.924`, commit `915d020a3`, and API version
@@ -1720,8 +1758,8 @@ audit found:
 - exact `skypilot-ha` Helm revision, image digest, database revisions, and pod
   state were not inspectable because every relevant AWS SSO session had
   expired and this host lacked Kubernetes/Helm tooling; and
-- no schema, runtime code, image, or deployment has yet changed for this
-  project;
+- no shared or test-fleet schema, image, or deployment was changed by this
+  project; only the disposable local PostgreSQL database was exercised;
 - an isolated Python 3.14.3 virtual environment installed the editable
   all-cloud package and development requirements successfully; and
 - the baseline command
@@ -1817,3 +1855,20 @@ remains blocked on the documented test-fleet preflight and exact artifact, not
 on C1 coding. This review-record/status amendment is non-contractual; the hash
 above is the exact reviewed behavioral and schema contract immediately before
 the verdict was recorded.
+
+### Review 4: PURSUE
+
+An independent implementation review accepted the revision-001/C1 commit
+candidate after its first pass required five corrections: serialize both
+real-PostgreSQL modules under the same xdist group; add explicit
+cross-workspace foreign-key and immutable intent/desire tests; exercise a
+fresh-process bootstrap of every central lineage; reject future row schema
+versions from the v1 fixture repository; and replace the borrowed `intent`
+domain for unhashed scan counters with domain-neutral bounded encoding.
+
+The re-review found no remaining correctness or contract blocker. It confirmed
+literal migration/runtime catalog parity, empty-only locked downgrade,
+default-engine and PostgreSQL-only initialization, fail-closed modes, absence
+of a production writer, and the final verification evidence above. Deployment
+of the exact code-bearing commit remains the gate before C2; the review did
+not waive either test-fleet preflight or exact-artifact provenance.
