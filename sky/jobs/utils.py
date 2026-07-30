@@ -1424,14 +1424,14 @@ def _wait_for_next_task(
         time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
 
 
-def _wait_for_initial_task_status(
-        job_id: int) -> tuple[int | None, managed_job_state.ManagedJobStatus]:
-    """Wait until the latest-task status is initialized for log following."""
+def _wait_for_initial_log_stream_snapshot(
+    get_snapshot: typing.Callable[[], managed_job_state.JobLogStreamSnapshot]
+) -> managed_job_state.JobLogStreamSnapshot:
+    """Wait until one log-target snapshot exposes a concrete lifecycle."""
     while True:
-        latest_task_id, status = (
-            managed_job_state.get_latest_task_id_status(job_id))
-        if status is not None:
-            return latest_task_id, status
+        snapshot = get_snapshot()
+        if snapshot.status is not None:
+            return snapshot
         time.sleep(1)
 
 
@@ -1600,7 +1600,11 @@ def stream_logs_by_id(job_id: int,
 
     with status_display:
         prev_msg = msg
-        _, managed_job_status = _wait_for_initial_task_status(job_id)
+        initial_snapshot = (
+            _wait_for_initial_log_stream_snapshot(get_stream_target_snapshot))
+        snapshot: managed_job_state.JobLogStreamSnapshot | None = (
+            initial_snapshot)
+        managed_job_status = initial_snapshot.status
         managed_job_status: managed_job_state.ManagedJobStatus | None = (
             managed_job_status)
         assert managed_job_status is not None, job_id
@@ -1729,13 +1733,11 @@ def stream_logs_by_id(job_id: int,
 
         backend = backends.CloudVmRayBackend()
 
-        snapshot: managed_job_state.JobLogStreamSnapshot | None = None
         while True:
             assert managed_job_status is not None, job_id
             if not _should_keep_logging(managed_job_status):
                 break
-            if snapshot is None:
-                snapshot = get_stream_target_snapshot()
+            assert snapshot is not None, job_id
             task_id = snapshot.task_id
             managed_job_status = snapshot.status
             pool = snapshot.pool
