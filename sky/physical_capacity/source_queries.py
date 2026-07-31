@@ -10,9 +10,10 @@ the pure adapters consume a row.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
 import time
-from typing import Any, cast, Iterable, Mapping, Protocol, Sequence
+from typing import Any, cast, Protocol
 
 import sqlalchemy
 
