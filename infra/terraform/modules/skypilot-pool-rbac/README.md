@@ -81,18 +81,19 @@ live namespace.
 ## Module reference
 
 <!-- BEGIN_TF_DOCS -->
+
 ## Requirements
 
-| Name | Version |
-|------|---------|
-| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.5.0 |
-| <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | >= 2.20 |
+| Name                                                                        | Version  |
+| --------------------------------------------------------------------------- | -------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement_terraform)    | >= 1.5.0 |
+| <a name="requirement_kubernetes"></a> [kubernetes](#requirement_kubernetes) | >= 2.20  |
 
 ## Providers
 
-| Name | Version |
-|------|---------|
-| <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | >= 2.20 |
+| Name                                                                  | Version |
+| --------------------------------------------------------------------- | ------- |
+| <a name="provider_kubernetes"></a> [kubernetes](#provider_kubernetes) | >= 2.20 |
 
 ## Modules
 
@@ -100,33 +101,34 @@ No modules.
 
 ## Resources
 
-| Name | Type |
-|------|------|
+| Name                                                                                                                                                  | Type     |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
 | [kubernetes_cluster_role_binding_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_binding_v1) | resource |
-| [kubernetes_cluster_role_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_v1) | resource |
-| [kubernetes_namespace_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/namespace_v1) | resource |
-| [kubernetes_role_binding_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_binding_v1) | resource |
-| [kubernetes_role_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_v1) | resource |
-| [kubernetes_service_account_v1.pool_sa](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/service_account_v1) | resource |
+| [kubernetes_cluster_role_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_v1)                 | resource |
+| [kubernetes_namespace_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/namespace_v1)                       | resource |
+| [kubernetes_role_binding_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_binding_v1)                 | resource |
+| [kubernetes_role_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_v1)                                 | resource |
+| [kubernetes_service_account_v1.pool_sa](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/service_account_v1)        | resource |
 
 ## Inputs
 
-| Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
-| <a name="input_allow_pvc_read"></a> [allow\_pvc\_read](#input\_allow\_pvc\_read) | Grant read (get/list) on persistentvolumeclaims in the namespace. Required when<br/>a tier mounts pre-existing PVCs (e.g. FSx): before creating the pod SkyPilot GETs<br/>each referenced claim to check its phase. Read-only — the PVCs are Terraform-<br/>provisioned, so SkyPilot never creates/deletes them. Leave false for tiers with<br/>no volumes (nothing to read). | `bool` | `false` | no |
-| <a name="input_labels"></a> [labels](#input\_labels) | Extra labels applied to the RBAC objects. | `map(string)` | `{}` | no |
-| <a name="input_manage_namespace"></a> [manage\_namespace](#input\_manage\_namespace) | Create the namespace. Set false if it is provisioned elsewhere. | `bool` | `true` | no |
-| <a name="input_name"></a> [name](#input\_name) | Name for the RBAC objects (ClusterRole/Role/bindings). | `string` | `"skypilot-pool"` | no |
-| <a name="input_namespace"></a> [namespace](#input\_namespace) | Dedicated namespace SkyPilot launches workloads into. NOT a shared application namespace. | `string` | `"skypilot-pool"` | no |
-| <a name="input_service_account_name"></a> [service\_account\_name](#input\_service\_account\_name) | ServiceAccount created in the pool namespace for SkyPilot pods (matches the control plane's kubernetes.pod\_config serviceAccountName). | `string` | `"skypilot-pool-sa"` | no |
-| <a name="input_subjects"></a> [subjects](#input\_subjects) | RBAC subjects that represent the SkyPilot control plane's identity on this<br/>cluster. EKS pools pass a Group (populated by an access entry); GKE pools pass<br/>a User equal to the controller's GCP service-account email. | <pre>list(object({<br/>    kind      = string<br/>    name      = string<br/>    api_group = optional(string, "rbac.authorization.k8s.io")<br/>  }))</pre> | n/a | yes |
+| Name                                                                                            | Description                                                                                                                                                                                                                                                                                                                                                                   | Type                                                                                                                                   | Default              | Required |
+| ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | :------: |
+| <a name="input_allow_pvc_read"></a> [allow\_pvc\_read](#input_allow_pvc_read)                   | Grant read (get/list) on persistentvolumeclaims in the namespace. Required when<br/>a tier mounts pre-existing PVCs (e.g. FSx): before creating the pod SkyPilot GETs<br/>each referenced claim to check its phase. Read-only — the PVCs are Terraform-<br/>provisioned, so SkyPilot never creates/deletes them. Leave false for tiers with<br/>no volumes (nothing to read). | `bool`                                                                                                                                 | `false`              |    no    |
+| <a name="input_labels"></a> [labels](#input_labels)                                             | Extra labels applied to the RBAC objects.                                                                                                                                                                                                                                                                                                                                     | `map(string)`                                                                                                                          | `{}`                 |    no    |
+| <a name="input_manage_namespace"></a> [manage\_namespace](#input_manage_namespace)              | Create the namespace. Set false if it is provisioned elsewhere.                                                                                                                                                                                                                                                                                                               | `bool`                                                                                                                                 | `true`               |    no    |
+| <a name="input_name"></a> [name](#input_name)                                                   | Name for the RBAC objects (ClusterRole/Role/bindings).                                                                                                                                                                                                                                                                                                                        | `string`                                                                                                                               | `"skypilot-pool"`    |    no    |
+| <a name="input_namespace"></a> [namespace](#input_namespace)                                    | Dedicated namespace SkyPilot launches workloads into. NOT a shared application namespace.                                                                                                                                                                                                                                                                                     | `string`                                                                                                                               | `"skypilot-pool"`    |    no    |
+| <a name="input_service_account_name"></a> [service\_account\_name](#input_service_account_name) | ServiceAccount created in the pool namespace for SkyPilot pods (matches the control plane's kubernetes.pod\_config serviceAccountName).                                                                                                                                                                                                                                       | `string`                                                                                                                               | `"skypilot-pool-sa"` |    no    |
+| <a name="input_subjects"></a> [subjects](#input_subjects)                                       | RBAC subjects that represent the SkyPilot control plane's identity on this<br/>cluster. EKS pools pass a Group (populated by an access entry); GKE pools pass<br/>a User equal to the controller's GCP service-account email.                                                                                                                                                 | <pre>list(object({<br/> kind = string<br/> name = string<br/> api_group = optional(string, "rbac.authorization.k8s.io")<br/> }))</pre> | n/a                  |   yes    |
 
 ## Outputs
 
-| Name | Description |
-|------|-------------|
-| <a name="output_cluster_role_name"></a> [cluster\_role\_name](#output\_cluster\_role\_name) | Name shared by the cluster role and its binding. |
-| <a name="output_namespace"></a> [namespace](#output\_namespace) | Namespace SkyPilot launches pool workloads into. |
-| <a name="output_role_name"></a> [role\_name](#output\_role\_name) | Name shared by the namespaced role and its binding. |
-| <a name="output_service_account_name"></a> [service\_account\_name](#output\_service\_account\_name) | Name of the service account created for SkyPilot workloads. |
+| Name                                                                                              | Description                                                 |
+| ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| <a name="output_cluster_role_name"></a> [cluster\_role\_name](#output_cluster_role_name)          | Name shared by the cluster role and its binding.            |
+| <a name="output_namespace"></a> [namespace](#output_namespace)                                    | Namespace SkyPilot launches pool workloads into.            |
+| <a name="output_role_name"></a> [role\_name](#output_role_name)                                   | Name shared by the namespaced role and its binding.         |
+| <a name="output_service_account_name"></a> [service\_account\_name](#output_service_account_name) | Name of the service account created for SkyPilot workloads. |
+
 <!-- END_TF_DOCS -->
