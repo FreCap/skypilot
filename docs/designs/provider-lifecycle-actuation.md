@@ -1,6 +1,7 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: approved for M1 and M2 implementation; M3 requires a dedicated review
+Status: M1 merged; M2 S1 implemented and locally qualified; exact-head CI and
+deployment pending; M3 requires a dedicated review
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -22,11 +23,15 @@ resource state machine. Clusters, volumes, managed jobs, Serve, pools, and
 managed container images retain their domain-specific desired state, legal
 transitions, incarnation identity, compensation policy, and deletion proof.
 
-The useful dstack concepts are explicit provider capabilities, immutable
-placement offers, nonblocking provisioning observations, and one reusable
-leased-work scheduler. SkyPilot will not copy dstack's destructive-operation
-semantics. A lost lease or elapsed deadline must never convert an ambiguous
-provider mutation into success.
+The useful dstack concepts are explicit provider capabilities, first-class
+placement offers carried from planning into actuation, nonblocking provisioning
+observations, and one reusable leased-work scheduler. SkyPilot strengthens the
+offer handoff with recursive immutability, stable and observation identities,
+freshness, typed revalidation, bounded redaction, and serialized-handle
+compatibility. SkyPilot will not copy dstack's mutable offer updates,
+provider-private unbounded payloads, nondeterministic Kubernetes offer ordering,
+or destructive-operation semantics. A lost lease or elapsed deadline must never
+convert an ambiguous provider mutation into success.
 
 Every milestone is independently deployable to the isolated `skypilot-ha`
 release in Kubernetes context `boltz-test`. The final migration removes the
@@ -226,52 +231,1696 @@ explicit removal commit.
 
 ## Placement Offer
 
-`PlacementOffer` is an immutable internal object produced by `OfferSource`,
-ranked by the optimizer, and consumed first by the existing launch path and
-later by the versioned nonblocking actuator facet.
+### V1 Ownership and Source Contract
 
-It contains:
+`PlacementOfferV1` is a recursively immutable internal decision object produced
+by an optional provider `OfferSourceV1`, ranked by the optimizer, and carried
+unchanged into actuation unless an explicit revalidation produces a new
+observation of the same stable offer. It is not part of
+`ProvisionerBundleV1`. `Cloud.get_offer_source()` is an additive positive
+capability whose default implementation returns `None`; existing Cloud
+subclasses and plugins therefore retain their current behavior without a second
+universal provider registry.
 
-- stable offer ID, observation ID, and schema version;
-- normalized resources;
-- provider and account or cluster scope;
-- region, candidate zones, and batching scope;
-- price, price basis, and currency;
-- spot or on-demand mode;
-- availability classification;
-- observation time and TTL;
-- reservation, quota, and capacity evidence;
-- a versioned, size-bounded, redacted provider payload.
+The V1 source boundary is:
 
-Availability is advisory. Provisioning revalidates expired or provider-required
-evidence immediately before mutation. An unavailable revalidation produces a
-typed outcome rather than silently selecting a different placement.
+```python
+class OfferOperationV1(enum.Enum):
+    PLAN_CREATE = 'plan_create'
+    FRESH_CREATE = 'fresh_create'
+    REUSE = 'reuse'
+    RESTART = 'restart'
 
-The stable offer ID is a provider-namespaced native offer ID when one exists.
-Otherwise it is a SHA-256 digest of canonical JSON containing only placement
-identity: schema version, provider, account or cluster scope, region, zone
-batch, instance type or equivalent resource identity, purchase mode, and the
-versioned redacted provider identity payload. Price, availability,
-`observed_at`, and TTL are excluded from the stable ID. The observation ID
-hashes the stable ID plus those time-varying observation fields.
 
-During M2, existing `Resources` remains the public and serialized
-representation. The selected offer is held in an optional internal
-`RetryingVmProvisioner.ToProvisionConfig.placement_offer` field through
-failover. After a successful launch, its redacted versioned envelope is copied
-to an optional `CloudVmRayResourceHandle.placement_offer` attribute beside
-`launched_resources`. It is not added to the public `Resources` schema or wire
-API. Older readers continue to ignore the unknown pickled-handle attribute;
-old/new handle compatibility tests prove this before promotion. A later
-durable action migration stores the same envelope in the action row rather
-than relying on the handle.
+class OfferActuationKindV1(enum.Enum):
+    DIRECT_POD = 'direct_pod'
+    CONTROLLER = 'controller'
+    HA_DEPLOYMENT = 'ha_deployment'
+    UNKNOWN = 'unknown'
 
-A shadow comparator records whether the old region and zone reconstruction
-selects the same safety and placement class. Mutation stays on the old path
-until a frozen characterization corpus and a bounded test-cluster observation
-window have zero unexplained safety or placement-class mismatches. Transient
-availability or price disagreement is classified and retained, not treated as
-an impossible literal-zero requirement.
+
+class ObservationFreshnessV1(enum.Enum):
+    ALLOW_REQUEST_CACHE = 'allow_request_cache'
+    REQUIRE_FRESH = 'require_fresh'
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferRequestV1:
+    resources: 'resources_lib.Resources'
+    num_nodes: int
+    workspace: str | None
+    has_volume_mounts: bool
+    has_storage_mounts: bool
+    operation: OfferOperationV1
+    actuation_kind: OfferActuationKindV1
+
+
+@typing.runtime_checkable
+class ProviderObservationSnapshotV1(typing.Protocol):
+
+    @property
+    def provider(self) -> str:
+        ...
+
+    @property
+    def observed_at(self) -> datetime.datetime:
+        ...
+
+    @property
+    def capture_id(self) -> str:
+        ...
+
+
+@typing.runtime_checkable
+class ProviderActuationContextV1(typing.Protocol):
+
+    @property
+    def provider(self) -> str:
+        ...
+
+    @property
+    def capture_id(self) -> str:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ObservationCaptureV1:
+    observation: ProviderObservationSnapshotV1
+    actuation_context: ProviderActuationContextV1 | None
+
+    def __post_init__(self) -> None:
+        # Protocol conformance and the provider, capture-ID, and UTC timestamp
+        # grammars are checked before these equality checks.
+        if self.actuation_context is not None:
+            if (self.actuation_context.provider !=
+                    self.observation.provider):
+                raise ValueError('Observation and context providers differ.')
+            if (self.actuation_context.capture_id !=
+                    self.observation.capture_id):
+                raise ValueError('Observation and context captures differ.')
+
+
+@typing.runtime_checkable
+class OfferSourceV1(typing.Protocol):
+
+    def capture_observation(
+        self,
+        request: OfferRequestV1,
+        *,
+        observed_at: datetime.datetime,
+        freshness: ObservationFreshnessV1,
+    ) -> ObservationCaptureV1:
+        ...
+
+    def list_offers(
+        self,
+        request: OfferRequestV1,
+        *,
+        observation: ProviderObservationSnapshotV1,
+    ) -> OfferSetResultV1:
+        ...
+
+    def revalidate(
+        self,
+        offer: PlacementOfferV1,
+        request: OfferRequestV1,
+        *,
+        observation: ProviderObservationSnapshotV1,
+    ) -> OfferRevalidationResultV1:
+        ...
+```
+
+The caller supplies a timezone-aware UTC `observed_at`, so identity, expiry, and
+tests do not depend on a hidden provider clock. All three methods are read-only
+with respect to provider state. A provider snapshot is a provider-specific
+frozen value containing only the bounded raw fields needed by both projections.
+It is process-local, is never serialized, persisted, hashed into an offer,
+logged, or sent to Datadog, and rejects access by a source for a different
+provider or observation time. Its random `capture_id` distinguishes provider
+reads without entering offer identity.
+
+Every observation, context, and selection capture ID is exactly the canonical
+lowercase string form of an RFC 4122 UUIDv4 generated with `uuid.uuid4()`:
+`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`.
+No braces, uppercase letters, alternate UUID versions, nil UUID, compact form,
+or provider-native ID is accepted.
+
+`ObservationCaptureV1.__post_init__()` requires `observation` to implement
+`ProviderObservationSnapshotV1`, validates its provider, capture ID, and aware
+whole-second UTC timestamp, and, when a context is present, requires it to
+implement `ProviderActuationContextV1` and validates the same provider and
+capture-ID grammars before enforcing the equalities shown above.
+`ObservationCaptureV1` keeps any provider client outside that frozen snapshot.
+Optimizer-only captures close and discard their actuation context before
+ranking. Kubernetes `REQUIRE_FRESH` returns a
+`KubernetesPinnedActuationContextV1` that owns one newly constructed
+`ApiClient`; the source derives the endpoint fingerprint from that exact
+client's attached `Configuration` and performs namespace, node, identity, and
+resource-readiness calls through API objects built from the same client. It
+never independently reloads kubeconfig to describe a different target. The
+authoritative V1 subset rejects every configured autoscaler before querying it;
+in particular, it never combines this pinned Kubernetes identity with the
+ambient GCP client used by `GKEAutoscaler`. The context is request-local,
+contains credentials, is never hashed, serialized, logged, or placed in an
+offer, and is closed by its current owner on every terminal success or
+exception path. The only credential copy is the private exact-target transport
+described below.
+
+The generic offer and evidence modules are leaf modules. S1 is the generic
+offer contract foundation in `sky/placement/offer.py`; the separate
+`ActualPlacementEvidenceV1` leaf and `ProvisionRecord` field are deferred to
+S3. Both leaves import only the standard library and existing leaf JSON typing
+helpers. `Resources` and `Cloud` annotations are quoted and imported only under
+`TYPE_CHECKING`; the generic modules do not import clouds, optimizer, backend,
+provisioner, server, or Kubernetes modules. `Cloud.get_offer_source()` likewise
+uses a quoted return annotation and performs no provider SDK, kubeconfig, or
+plugin work at import time. Placement types are not re-exported from
+`sky.__init__` or `sky.clouds.__init__`.
+
+The two S1 leaf files remain importable on the repository's supported Python
+3.10 through 3.14 range. They use `from __future__ import annotations` and the
+PEP 585 and PEP 604 forms required by the repository's Ruff `py310` target.
+`FrozenJSONDict` is declared before the recursive `FrozenJSONValue` runtime
+alias. Its runtime base is
+`collections.abc.Mapping[str, 'FrozenJSONValue']`; after that class exists,
+`FrozenJSONValue` may include the class object in a PEP 604 union. The leaf
+never evaluates `UnionType | 'FrozenJSONDict'`, which raises `TypeError` on
+Python 3.10 through 3.13. The existing `worker-floor-import` CI job explicitly
+imports both leaves on Python 3.10 and compile-checks the whole package; normal
+CI imports and tests them on the deployed Python 3.14 ceiling.
+
+#### Exact V1 leaf types
+
+`Cloud.get_offer_source()` is an instance method. The generic leaf defines
+these additional closed enums and exact wire values:
+
+| Enum | V1 members and wire values |
+|---|---|
+| `OfferSetStatusV1` | `OK='ok'`, `NO_OFFERS='no_offers'`, `NOT_REPRESENTABLE='not_representable'` |
+| `OfferRevalidationStatusV1` | `VALID='valid'`, `UNAVAILABLE='unavailable'`, `NOT_REPRESENTABLE='not_representable'` |
+| `OfferPriceBasisV1` | `NODE_HOUR='node_hour'` |
+| `OfferCurrencyV1` | `USD='USD'` |
+| `OfferPurchaseModeV1` | `ON_DEMAND='on_demand'` |
+| `OfferAvailabilityV1` | `UNKNOWN='unknown'`, `UNAVAILABLE='unavailable'` |
+| `OfferRevalidationPolicyV1` | `BEFORE_MUTATION='before_mutation'` |
+| `OfferReservationEvidenceV1` | `NOT_APPLICABLE='not_applicable'` |
+| `OfferQuotaEvidenceV1` | `UNKNOWN='unknown'`, `UNAVAILABLE='unavailable'` |
+| `OfferCapacityEvidenceV1` | `SHAPE_FITS_EXISTING_NODE='shape_fits_existing_node'`, `CONTEXT_UNREACHABLE='context_unreachable'`, `SHAPE_NO_LONGER_SUPPORTED='shape_no_longer_supported'`, `CAPACITY_UNAVAILABLE='capacity_unavailable'`, `PROVIDER_OBJECT_CONFLICT='provider_object_conflict'` |
+
+These generic V1 sets intentionally equal the values needed by the Kubernetes
+pilot. A later provider does not silently extend them; a new wire value requires
+an explicit schema-version design update.
+
+The in-memory offer has exactly these frozen nested dataclasses and fields:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class OfferScopeV1:
+    kind: str
+    id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferAcceleratorV1:
+    name: str
+    count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferResourcesV1:
+    instance_type: str
+    cpus: str
+    memory_gib: str
+    accelerators: tuple[OfferAcceleratorV1, ...]
+    disk_tier: str | None
+    network_tier: str | None
+    placement_constraints_digest: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferPriceV1:
+    amount: str
+    basis: OfferPriceBasisV1
+    currency: OfferCurrencyV1
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferEvidenceV1:
+    reservation: OfferReservationEvidenceV1
+    quota: OfferQuotaEvidenceV1
+    capacity: OfferCapacityEvidenceV1
+    requested_nodes: int
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class OfferProviderPayloadV1:
+    version: int
+    identity: FrozenJSONDict
+    observation: FrozenJSONDict
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class PlacementOfferV1:
+    schema_version: int
+    operation: OfferOperationV1
+    actuation_kind: OfferActuationKindV1
+    offer_id: str
+    observation_id: str
+    provider: str
+    scope: OfferScopeV1
+    resources: OfferResourcesV1
+    region: str
+    candidate_zones: tuple[str, ...]
+    batching_scope: str
+    price: OfferPriceV1
+    purchase_mode: OfferPurchaseModeV1
+    availability: OfferAvailabilityV1
+    observed_at: datetime.datetime
+    ttl_seconds: int
+    revalidation_policy: OfferRevalidationPolicyV1
+    evidence: OfferEvidenceV1
+    provider_payload: OfferProviderPayloadV1
+```
+
+`FrozenJSONDict` is a detached, recursively immutable mapping. Objects are
+stored with keys sorted by Unicode code point; arrays become tuples. Equal
+frozen objects therefore have equal hashes regardless of input insertion
+order. Thawing always produces a fresh tree of JSON built-ins.
+
+`OfferProviderPayloadV1` has only one supported construction path:
+
+```python
+@classmethod
+def create(
+    cls,
+    *,
+    identity: dict[str, JSONValue],
+    observation: dict[str, JSONValue],
+    payload_schema: ProviderPayloadSchemaV1,
+) -> OfferProviderPayloadV1:
+    ...
+```
+
+`PlacementOfferV1` has only these three supported construction paths:
+
+```python
+@classmethod
+def create(
+    cls,
+    *,
+    operation: OfferOperationV1,
+    actuation_kind: OfferActuationKindV1,
+    provider: str,
+    scope: OfferScopeV1,
+    resources: OfferResourcesV1,
+    region: str,
+    candidate_zones: tuple[str, ...],
+    batching_scope: str,
+    price: OfferPriceV1,
+    purchase_mode: OfferPurchaseModeV1,
+    availability: OfferAvailabilityV1,
+    observed_at: datetime.datetime,
+    ttl_seconds: int,
+    revalidation_policy: OfferRevalidationPolicyV1,
+    evidence: OfferEvidenceV1,
+    provider_payload: OfferProviderPayloadV1,
+    payload_schema: ProviderPayloadSchemaV1,
+) -> PlacementOfferV1:
+    ...
+
+
+@classmethod
+def from_envelope(
+    cls,
+    envelope: dict[str, JSONValue],
+    *,
+    payload_schema: ProviderPayloadSchemaV1,
+) -> PlacementOfferV1:
+    ...
+
+
+@classmethod
+def from_json(
+    cls,
+    serialized: str | bytes,
+    *,
+    payload_schema: ProviderPayloadSchemaV1,
+) -> PlacementOfferV1:
+    ...
+```
+
+Both dataclasses use `init=False`. Callers never supply `version`,
+`schema_version`, `offer_id`, or `observation_id`; the factory fixes the
+versions and computes both IDs. All three placement-offer paths apply the
+generic envelope validators and injected payload schema. `observed_at` is an
+aware UTC `datetime` with whole-second precision. Candidate-zone order is
+preserved because it enters stable identity. Accelerator names must be unique
+and arrive in normalized sorted order; the parser rejects an unsorted or
+duplicate list rather than silently changing a provider decision.
+
+Only `PLAN_CREATE` and `FRESH_CREATE` offers may be constructed.
+`PLAN_CREATE` is process-local and cannot be enveloped or handed off.
+`REUSE` and `RESTART` are request classifications only and return
+`NOT_REPRESENTABLE(UNSUPPORTED_OPERATION)` in V1.
+
+The leaf also defines an injected, recursively immutable payload allowlist:
+
+```python
+class ProviderPayloadNodeKindV1(enum.Enum):
+    STRING = 'string'
+    DIGEST = 'digest'
+    INTEGER = 'integer'
+    BOOLEAN = 'boolean'
+    NULL = 'null'
+    OBJECT = 'object'
+    ARRAY = 'array'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPayloadSchemaNodeV1:
+    kind: ProviderPayloadNodeKindV1
+    fields: tuple[tuple[str, 'ProviderPayloadSchemaNodeV1'], ...] = ()
+    item: 'ProviderPayloadSchemaNodeV1 | None' = None
+    allowed_strings: tuple[str, ...] = ()
+    allow_empty: bool = False
+
+    def __post_init__(self) -> None:
+        # Enforce the closed shape rules below before an instance is usable.
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPayloadSchemaV1:
+    provider: str
+    identity: ProviderPayloadSchemaNodeV1
+    observation: ProviderPayloadSchemaNodeV1
+
+    def __post_init__(self) -> None:
+        # Enforce the provider grammar and object roots described below.
+        ...
+```
+
+`ProviderPayloadSchemaNodeV1.__post_init__()` requires `fields` to be an exact
+tuple of exact two-tuples, every key to satisfy the provider-payload key bound,
+every child to be a schema node, and keys to be unique and already sorted by
+Unicode code point. An `OBJECT` node has no `item`, `allowed_strings`, or
+`allow_empty`. An `ARRAY` node has exactly one schema-node `item` and has no
+fields, `allowed_strings`, or `allow_empty`. Every scalar node has no fields or
+item. Only `STRING` may have `allowed_strings` or `allow_empty`;
+`allowed_strings` is an exact tuple of valid fixed-`NFC_V1` strings that is
+unique and already sorted by Unicode code point. An empty allowed string is
+valid only when `allow_empty` is true.
+
+`ProviderPayloadSchemaV1.__post_init__()` requires `provider` to match
+`^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$`, requires both roots to be exact
+`ProviderPayloadSchemaNodeV1` instances, and requires both root kinds to be
+`OBJECT`.
+The schema is passed explicitly to payload creation and envelope parsing, and
+its provider must equal the offer provider. This is not a global registry and
+does not import provider code into the generic leaf. The Kubernetes source owns
+and passes its exact schema. Unknown keys are rejected by this schema at every
+payload level.
+
+For each eligible optimizer comparison in shadow mode the orchestrator calls
+`capture_observation()` exactly once. The provider's legacy projection adapter
+and `list_offers()` independently consume that same object. The legacy adapter
+is allowed only at this comparison seam and cannot accept offers as its input.
+The closed configuration and resource classifiers run before provider reads.
+When they return `NOT_REPRESENTABLE`, shadow records that result and invokes the
+untouched legacy feasibility path; it does not query excluded systems merely to
+manufacture a comparison snapshot. The later under-lock binding and
+pre-mutation revalidation are distinct captures with distinct IDs. Outside
+shadow mode, the legacy path retains its existing observation behavior until
+its authoritative promotion commit.
+
+Optimizer shadow capture uses `ALLOW_REQUEST_CACHE` so the two projections can
+share the request's existing provider read. Pre-mutation revalidation must call
+`capture_observation()` with `REQUIRE_FRESH` and pass that new snapshot to
+`revalidate()`. A provider implementation of `REQUIRE_FRESH` bypasses every
+request-scoped node, context, and configuration cache and performs new
+underlying reads. Revalidation rejects the selection snapshot's `capture_id`.
+Tests assert both a distinct capture ID and increased underlying Kubernetes
+client call counts.
+
+`PLAN_CREATE` is a read-only optimizer intent, not proof that a fresh create is
+still safe. It may produce comparison offers but no `PLAN_CREATE` offer can
+cross into provisioning. `CloudVmRayBackend._check_existing_cluster()` owns the
+authoritative operation classification because it runs while both the cluster
+status lock and cluster resource-operation lock are held, after
+`refresh_cluster_record()` has resolved the live handle and status:
+
+- no record, no live handle, and no restart or resume path is `FRESH_CREATE`;
+- an existing UP cluster is `REUSE`;
+- an existing STOPPED or recoverable INIT cluster is `RESTART`.
+
+For `FRESH_CREATE`, `_check_existing_cluster()` captures a new observation and
+binds an exact offer to the concrete `to_provision` winner before constructing
+`ToProvisionConfig`. `REUSE` and `RESTART` return
+`NOT_REPRESENTABLE(UNSUPPORTED_OPERATION)` and clear any optimizer shadow
+decision. M2 authoritative binding is limited to the first provider mutation
+attempt of a locked provisioning entry. `RetryingVmProvisioner` carries a
+monotonic process-local `provider_attempt_count`, incremented immediately before
+calling `bulk_provision()`. Once that call starts, any return or exception
+permanently makes later candidates in that entry
+`NOT_REPRESENTABLE(RETRY_AFTER_PROVIDER_ATTEMPT)`. The retry loop clears the
+offer and first runs only the exact handle-backed fenced reconciler described
+below. If and only if that reconciler proves every planned Kubernetes name
+absent and clears the fence, the loop may continue through the existing legacy
+placement path; it emits the typed fallback event and passes the explicit
+trusted `LEGACY_RETRY_AFTER_PROVIDER_ATTEMPT` handoff described below. An
+unresolved or quarantined fence stops failover. M2 does not generalize that
+Kubernetes name-and-UID proof into provider-wide cleanup evidence and never
+binds another authoritative offer.
+Failures before `bulk_provision()` do not increment the count and may replan
+only after any precommitted attempt fence is proved mutation-free and cleared.
+Recoverable INIT remains `RESTART` for the whole entry. Shadow mode may continue
+comparing offers on every retry but never
+hands them to mutation. A later durable cleanup milestone may broaden this only
+after every provider has typed absence evidence and an atomic cluster-record
+reset. A control path that releases either lock must reacquire both and return
+to `_check_existing_cluster()`. Dry run always remains `PLAN_CREATE`.
+
+`OfferReasonCodeV1` is a closed enum with exactly these member names and wire
+values:
+
+```python
+class OfferReasonCodeV1(enum.Enum):
+    NONE = 'none'
+    NO_FEASIBLE_SHAPE = 'no_feasible_shape'
+    UNSUPPORTED_OPERATION = 'unsupported_operation'
+    UNSUPPORTED_ACTUATION_KIND = 'unsupported_actuation_kind'
+    UNSUPPORTED_NODE_COUNT = 'unsupported_node_count'
+    UNSUPPORTED_ACCELERATOR = 'unsupported_accelerator'
+    UNSUPPORTED_RESOURCE_MODE = 'unsupported_resource_mode'
+    UNSUPPORTED_NETWORK_TIER = 'unsupported_network_tier'
+    VOLUME_OR_STORAGE_MOUNT = 'volume_or_storage_mount'
+    KUEUE_ENABLED = 'kueue_enabled'
+    RESERVATION_REQUESTED = 'reservation_requested'
+    CUSTOM_PLACEMENT_CONFIG = 'custom_placement_config'
+    UNRESOLVED_SCOPE = 'unresolved_scope'
+    CONTEXT_UNREACHABLE = 'context_unreachable'
+    SCOPE_CHANGED = 'scope_changed'
+    CONFIGURATION_CHANGED = 'configuration_changed'
+    SHAPE_NO_LONGER_SUPPORTED = 'shape_no_longer_supported'
+    CAPACITY_UNAVAILABLE = 'capacity_unavailable'
+    QUOTA_UNAVAILABLE = 'quota_unavailable'
+    OFFER_IDENTITY_CHANGED = 'offer_identity_changed'
+    OBSERVATION_LIMIT_EXCEEDED = 'observation_limit_exceeded'
+    PROVIDER_OBJECT_CONFLICT = 'provider_object_conflict'
+    SOURCE_ERROR = 'source_error'
+    RETRY_AFTER_PROVIDER_ATTEMPT = 'retry_after_provider_attempt'
+```
+
+`OfferSetResultV1` is a validated direct-construction dataclass with this exact
+field order:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class OfferSetResultV1:
+    status: OfferSetStatusV1
+    offers: tuple[PlacementOfferV1, ...]
+    reason_code: OfferReasonCodeV1
+```
+
+Its `__post_init__()` enforces the disposition matrix below.
+`OfferSetResultV1.status` is exactly one of:
+
+- `OK`, with a nonempty ordered tuple of offers;
+- `NO_OFFERS`, when the provider observation proves no feasible offer;
+- `NOT_REPRESENTABLE`, when the V1 source cannot faithfully encode a supported
+  legacy placement constraint.
+
+`OK` requires `reason_code=NONE`. `NO_OFFERS` requires an empty offer tuple and
+`NO_FEASIBLE_SHAPE`. `NOT_REPRESENTABLE` requires an empty offer tuple and one
+of exactly `UNSUPPORTED_OPERATION`, `UNSUPPORTED_ACTUATION_KIND`,
+`UNSUPPORTED_NODE_COUNT`, `UNSUPPORTED_ACCELERATOR`,
+`UNSUPPORTED_RESOURCE_MODE`, `UNSUPPORTED_NETWORK_TIER`,
+`VOLUME_OR_STORAGE_MOUNT`, `KUEUE_ENABLED`, `RESERVATION_REQUESTED`,
+`CUSTOM_PLACEMENT_CONFIG`, `UNRESOLVED_SCOPE`, or
+`OBSERVATION_LIMIT_EXCEEDED`. `SOURCE_ERROR` and
+`RETRY_AFTER_PROVIDER_ATTEMPT` are orchestration outcomes, not source result
+dispositions.
+
+`OfferRevalidationResultV1` has this exact field order and blocks direct
+construction:
+
+```python
+@dataclasses.dataclass(frozen=True, init=False)
+class OfferRevalidationResultV1:
+    status: OfferRevalidationStatusV1
+    offer: PlacementOfferV1 | None
+    reason_code: OfferReasonCodeV1
+```
+
+Its `status` is exactly one of:
+
+- `VALID`, with a new observation of the same stable offer;
+- `UNAVAILABLE`, with typed quota, capacity, reachability, or reservation
+  evidence;
+- `NOT_REPRESENTABLE`, when current inputs can no longer be represented safely.
+
+`VALID` requires a non-null offer, the original `offer_id`,
+`reason_code=NONE`, and a nondecreasing `observed_at`. `UNAVAILABLE` requires a
+non-null observation of the same offer with unavailable evidence and one of
+`CONTEXT_UNREACHABLE`, `SHAPE_NO_LONGER_SUPPORTED`, `CAPACITY_UNAVAILABLE`, or
+`QUOTA_UNAVAILABLE`; the rendered-name preflight may additionally use
+`PROVIDER_OBJECT_CONFLICT`. That preflight converts a `VALID`
+replacement into an unavailable observation of the same stable offer with
+`PROVIDER_OBJECT_CONFLICT`; that is a non-failover terminal safety result, not
+permission to enter the legacy mutation path. `NOT_REPRESENTABLE` has no offer
+and requires
+`SCOPE_CHANGED`, `CONFIGURATION_CHANGED`, or `OFFER_IDENTITY_CHANGED`. A
+revalidation that computes a different stable identity returns
+`NOT_REPRESENTABLE` with `OFFER_IDENTITY_CHANGED`; only orchestration may
+explicitly replan.
+
+`OfferRevalidationResultV1` is `init=False` and has only these supported
+factories:
+
+- `valid(original, replacement)`;
+- `unavailable(original, replacement, reason_code)`;
+- `not_representable(reason_code)`.
+
+The first two factories enforce the same `offer_id`, requested-node count, and
+nondecreasing `observed_at` against `original`. The full evidence state is
+closed, not just the reason-associated field:
+
+| Factory and reason | Availability | Reservation | Quota | Capacity |
+|---|---|---|---|---|
+| `valid()` | `UNKNOWN` | `NOT_APPLICABLE` | `UNKNOWN` | `SHAPE_FITS_EXISTING_NODE` |
+| `unavailable(CONTEXT_UNREACHABLE)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `CONTEXT_UNREACHABLE` |
+| `unavailable(SHAPE_NO_LONGER_SUPPORTED)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `SHAPE_NO_LONGER_SUPPORTED` |
+| `unavailable(CAPACITY_UNAVAILABLE)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `CAPACITY_UNAVAILABLE` |
+| `unavailable(QUOTA_UNAVAILABLE)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNAVAILABLE` | `SHAPE_FITS_EXISTING_NODE` |
+| `unavailable(PROVIDER_OBJECT_CONFLICT)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `PROVIDER_OBJECT_CONFLICT` |
+
+`not_representable()` accepts exactly `SCOPE_CHANGED`,
+`CONFIGURATION_CHANGED`, or `OFFER_IDENTITY_CHANGED` and stores no offer.
+
+Expected absence and unsupported-shape results use these typed outcomes rather
+than exceptions. Unexpected provider, credential, or programming failures retain
+their existing typed exception behavior. Shadow mode records such a source
+failure and leaves mutation on the legacy path. Authoritative mode never turns a
+source failure into an implicit legacy placement or a different offer.
+
+The offer source may consume the same bounded raw provider observation snapshot
+as the legacy projection during shadow comparison. It must not call
+`make_launchables_for_valid_region_zones()`, `_yield_zones()`, or construct its
+offers from the already generated legacy candidates. Sharing raw read-only
+observations avoids time-skew noise; independently projecting those observations
+keeps the comparison non-tautological.
+
+### V1 Offer and Envelope Schema
+
+The in-memory offer uses frozen dataclasses, tuples, enums, canonical decimal
+strings, and immutable provider payload values. It is never stored directly in a
+cluster handle. `to_envelope()` produces a fresh dictionary containing only JSON
+built-ins.
+
+The V1 persisted envelope has this exact shape:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "fresh_create",
+  "actuation_kind": "direct_pod",
+  "offer_id": "kubernetes:sha256:<64-lowercase-hex>",
+  "observation_id": "sha256:<64-lowercase-hex>",
+  "provider": "kubernetes",
+  "scope": {
+    "kind": "kubernetes_context_endpoint_identity_namespace_v1",
+    "id": "sha256:<64-lowercase-hex>"
+  },
+  "resources": {
+    "instance_type": "4CPU--16GB",
+    "cpus": "4",
+    "memory_gib": "16",
+    "accelerators": [],
+    "disk_tier": null,
+    "network_tier": null,
+    "placement_constraints_digest": null
+  },
+  "region": "context-name",
+  "candidate_zones": [],
+  "batching_scope": "context",
+  "price": {
+    "amount": "0.42",
+    "basis": "node_hour",
+    "currency": "USD"
+  },
+  "purchase_mode": "on_demand",
+  "availability": "unknown",
+  "observed_at": "2026-07-30T12:34:56Z",
+  "ttl_seconds": 15,
+  "revalidation_policy": "before_mutation",
+  "evidence": {
+    "reservation": "not_applicable",
+    "quota": "unknown",
+    "capacity": "shape_fits_existing_node",
+    "requested_nodes": 1
+  },
+  "provider_payload": {
+    "version": 1,
+    "identity": {
+      "rendered_pod_placement_fingerprint": "sha256:<64-lowercase-hex>",
+      "service_account_identity_digest": "sha256:<64-lowercase-hex>"
+    },
+    "observation": {
+      "capacity_evidence": "shape_fits_existing_node",
+      "configuration_fingerprint": "sha256:<64-lowercase-hex>"
+    }
+  }
+}
+```
+
+Accelerators are encoded as a list of
+`{"name": <normalized-name>, "count": <positive-integer>}` objects sorted by
+normalized name. Decimal quantities and prices are canonical non-exponent
+strings, never JSON floats. Timestamps are UTC RFC 3339 values normalized to
+`Z`. Object keys are sorted for canonical JSON; array order is significant
+except where the schema explicitly requires sorting.
+
+M2 V1 accepts only the derived offer-ID grammar. No pilot provider declares a
+native offer-ID grammar. Adding one requires a later explicit policy and
+schema-version design update rather than an inferred provider-name special
+case. `offer_id` is `<provider>:sha256:<digest>` over a canonical object whose
+keys and nesting are exactly:
+
+```text
+schema_version
+provider
+operation
+actuation_kind
+scope {kind, id}
+region
+candidate_zones
+batching_scope
+resources {
+  instance_type, cpus, memory_gib, accelerators,
+  disk_tier, network_tier, placement_constraints_digest
+}
+purchase_mode
+provider_payload {version, identity}
+```
+
+Price, availability, observation time, TTL, revalidation policy, evidence, and
+the provider payload `observation` object are excluded from the stable ID.
+`observation_id` is `sha256:<digest>` over a canonical object whose keys and
+nesting are exactly:
+
+```text
+offer_id
+price {amount, basis, currency}
+availability
+observed_at
+ttl_seconds
+revalidation_policy
+evidence {reservation, quota, capacity, requested_nodes}
+provider_payload {observation}
+```
+
+Changing requested node count changes the observation ID through evidence but
+does not change the per-placement stable ID.
+
+`canonical_json_bytes_v1(value)` is exactly:
+
+```python
+json.dumps(
+    value,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(',', ':'),
+    allow_nan=False,
+).encode('utf-8')
+```
+
+There is no trailing newline. Every string is already NFC-normalized before
+this call. `NFC_V1` is fixed to
+`unicodedata.ucd_3_2_0.normalize('NFC', value)`, never the interpreter's
+default `unicodedata.normalize()`. Ingestion accepts a string only when it
+equals that fixed normalization. It rejects every surrogate code point
+`U+D800` through `U+DFFF` and every C0 or C1 control code point in the explicit
+ranges `U+0000` through `U+001F` and `U+007F` through `U+009F`; control
+validation does not consult a runtime Unicode category database. The parser
+recomputes both digest preimages with this function and rejects a mismatch.
+Cross-version golden fixtures lock both
+`NFC_V1('\u0301\U00016ff0') == '\U00016ff0\u0301'` and
+`NFC_V1('\u0301\U00016ff1') == '\U00016ff1\u0301'`; the left-hand input forms
+are rejected as non-normalized and the right-hand forms are accepted.
+
+The persistence-ingestion entry point is exactly the `from_json()` signature
+above, where `serialized` is `str` or strict UTF-8 `bytes`; `bytearray` and
+every other type are rejected. It uses `object_pairs_hook` to reject a duplicate
+key before dictionary materialization and rejects JSON constants and floats.
+`from_envelope()` accepts an already-materialized in-process dictionary only;
+it cannot prove that upstream text had no duplicate keys and is not a
+persistence-ingestion API. The `bulk_provision()` validation path calls
+`to_envelope()`, canonical-serializes that fresh dictionary, and then calls
+`from_json()` with the provider schema.
+
+A V1 provider payload is constructed only through the injected provider
+allowlist. Raw SDK responses, kubeconfigs, credentials, tokens, environment
+variables, pod configuration, labels, annotations, or admission payloads are
+never accepted as generic payload data. Suspicious secret-like keys are
+rejected as defense-in-depth, but key-name filtering is not considered
+redaction.
+
+Secret-key matching is exact and recursive. Lowercase the printable ASCII key,
+split it on one or more `_` or `-` characters, and reject if any segment is
+`secret`, `password`, `passwd`, `token`, `credential`, `credentials`,
+`kubeconfig`, `authorization`, or `cookie`; if any adjacent pair is `api_key`,
+`access_key`, `private_key`, or `client_secret`; or if the unsplit lowercase
+key is `apikey`, `accesskey`, `privatekey`, or `clientsecret`. Substrings do
+not match, so `tokenizer`, `credentialed`, `monkey`, and `key_count` are
+allowed by this defense-in-depth filter, subject to the provider allowlist.
+
+The canonical provider payload is limited to 4 KiB and the full canonical
+envelope to 16 KiB. Exactly 4,096 UTF-8 bytes is accepted for the complete
+canonical provider payload and 4,097 is rejected. Exactly 16,384 UTF-8 bytes is
+accepted for the full canonical envelope and 16,385 is rejected. V1 has these
+closed per-field bounds:
+
+| Field | V1 bound |
+|---|---|
+| `schema_version` | integer exactly `1` |
+| `operation` | exactly `fresh_create` for a provisionable or persisted envelope; `plan_create` is process-local and cannot be enveloped |
+| `actuation_kind` | exact closed enum; Kubernetes V1 envelopes require `direct_pod` |
+| `provider` | 1 to 63 lowercase ASCII letters, digits, `.`, `_`, or `-`, starting and ending with a letter or digit |
+| `offer_id` | `<provider>:sha256:` plus exactly 64 lowercase hexadecimal characters, with a total maximum of 256 ASCII characters |
+| `observation_id`, scope ID, optional constraint digest, and provider identity digests | `sha256:` plus exactly 64 lowercase hexadecimal characters |
+| scope kind and batching scope | 1 to 128 lowercase ASCII letters, digits, or `_`; Kubernetes V1 values are exact enums |
+| instance type | 1 to 256 UTF-8 bytes after fixed `NFC_V1` validation, with the explicit control ranges forbidden |
+| CPU and memory decimal strings | exact regex `(?:0|[1-9][0-9]{0,37})(?:\.[0-9]{0,17}[1-9])?`; canonical, nonnegative, and non-exponent |
+| accelerators | at most 8 entries; normalized name 1 to 128 UTF-8 bytes; count integer 1 through 2,147,483,647 |
+| disk and network tier | null or 1 to 64 lowercase ASCII letters, digits, `_`, or `-` |
+| region and each zone | 1 to 1,024 UTF-8 bytes after fixed `NFC_V1` validation, with the explicit control ranges forbidden |
+| candidate zones | at most 32 unique entries |
+| price amount | the same exact decimal regex as CPU and memory |
+| price basis, currency, purchase mode, availability, revalidation policy, and evidence values | exact closed enums; V1 currency is `OfferCurrencyV1.USD` |
+| observed time | exactly 20 ASCII bytes in `YYYY-MM-DDTHH:MM:SSZ` form and a valid UTC datetime |
+| TTL | integer 1 through 300 seconds; Kubernetes V1 emits exactly 15 |
+| requested nodes | integer 1 through 10,000; the Kubernetes authoritative V1 subset requires exactly 1 |
+| provider payload version | integer exactly `1` |
+
+Each provider-payload object has at most 32 keys, each key is 1 to 64 printable
+ASCII characters, and the combined `identity` and `observation` trees have at
+most 64 keys and 128 array elements. Maximum nesting depth is four below either
+payload root and each array has at most 32 elements. Payload strings are at most
+1,024 UTF-8 bytes after fixed `NFC_V1` validation; integers are in the signed 64-bit
+range; only strings, integers, booleans, nulls, bounded arrays, and bounded
+objects are allowed. JSON floats are forbidden. Empty strings are allowed only
+for a provider field whose allowlist explicitly declares them meaningful;
+Kubernetes V1 declares none.
+
+For these counts, each `identity` and `observation` root object is depth zero;
+a directly nested container is depth one and a container at depth four is the
+deepest accepted container. Root keys count toward the combined 64-key limit,
+and every member of every array counts toward the combined 128-element limit.
+The 4 KiB limit covers the complete canonical `provider_payload` object,
+including `version`, `identity`, and `observation`.
+
+V1 ingestion rejects unknown keys at every level, duplicate object keys before
+dictionary materialization, non-JSON values, invalid normalization, nonfinite
+or negative monetary values, invalid UTC timestamps, invalid enum values, and
+values outside these bounds. A later shape change increments
+`schema_version`; it does not silently extend V1.
+
+The Kubernetes V1 parser narrows the generic enums to these exact values:
+
+| Field | Accepted Kubernetes V1 values |
+|---|---|
+| scope kind | `kubernetes_context_endpoint_identity_namespace_v1` |
+| batching scope | `context` |
+| price basis | `node_hour` |
+| currency | `USD` |
+| purchase mode | `on_demand` |
+| availability | `unknown`, `unavailable` |
+| revalidation policy | `before_mutation` |
+| reservation evidence | `not_applicable` |
+| quota evidence | `unknown`, `unavailable` |
+| capacity evidence | `shape_fits_existing_node`, `context_unreachable`, `shape_no_longer_supported`, `capacity_unavailable`, `provider_object_conflict` |
+
+The injected Kubernetes payload schema has exactly these leaf paths:
+
+| Payload root and field | Schema node |
+|---|---|
+| `identity.rendered_pod_placement_fingerprint` | `DIGEST` |
+| `identity.service_account_identity_digest` | `DIGEST` |
+| `observation.capacity_evidence` | `STRING`, allowed strings exactly `shape_fits_existing_node`, `context_unreachable`, `shape_no_longer_supported`, `capacity_unavailable`, `provider_object_conflict` |
+| `observation.configuration_fingerprint` | `DIGEST` |
+
+Both roots reject every other key and no string field permits an empty value.
+
+Kubernetes V1 additionally requires an empty accelerator list, null disk and
+network tiers, and an empty candidate-zone list. No sample value implicitly
+extends these enums.
+
+Payload-schema validation narrows only `provider_payload`; it is not allowed to
+stand in for provider-wide envelope policy. The Kubernetes-owned leaf therefore
+defines this exact post-validator:
+
+```python
+def validate_kubernetes_offer_v1(
+    offer: PlacementOfferV1,
+) -> PlacementOfferV1:
+    ...
+```
+
+The validator returns the identical object after requiring provider
+`kubernetes`; operation `PLAN_CREATE` or `FRESH_CREATE`; actuation kind
+`DIRECT_POD`; scope kind
+`kubernetes_context_endpoint_identity_namespace_v1`; batching scope `context`;
+price basis `NODE_HOUR`; currency `USD`; purchase mode `ON_DEMAND`;
+revalidation policy `BEFORE_MUTATION`; TTL 15; one requested node; empty
+accelerators and candidate zones; null disk, network, and placement-constraint
+tiers or digests; and one of exactly the six complete availability,
+reservation, quota, and capacity tuples in the revalidation matrix above.
+There is no cross-product between rows: in particular, quota `UNAVAILABLE`
+requires capacity `SHAPE_FITS_EXISTING_NODE`, and every capacity-derived
+unavailable value requires quota `UNKNOWN`. It also requires the allowlisted
+`provider_payload.observation.capacity_evidence` to equal
+`evidence.capacity.value`.
+
+The Kubernetes source calls this validator after every generic `create()`,
+`from_envelope()`, and `from_json()` result. Orchestration and
+`bulk_provision()` call it again before placing any Kubernetes offer in an
+actuation handoff. Generic parsing alone never establishes Kubernetes
+eligibility.
+
+An offer expires when
+`now >= observed_at + ttl_seconds`. Provisioning revalidates an expired offer or
+any offer whose policy is `before_mutation`. An unavailable revalidation returns
+a typed outcome to orchestration. The source never silently substitutes another
+region, zone batch, context, purchase mode, or resource shape.
+
+### Kubernetes Pilot
+
+Kubernetes is the first M2 source because it uses the new provisioner, represents
+a Sky region as a Kubernetes context, and has no zone retry dimension. The first
+authoritative subset is deliberately narrower than all Kubernetes support:
+
+- a fresh cluster create, not reuse or restart;
+- a direct Pod launch for an ordinary cluster, not any managed-jobs, Serve, or
+  pool controller and not a high-availability Deployment/PVC launch;
+- one node;
+- CPU-only on-demand resources;
+- no explicit disk tier, network tier, ephemeral-storage request, local disk,
+  accelerator arguments, resource labels, resource volumes, FUSE requirement,
+  or job-recovery mode;
+- no nonempty `Resources.ports`;
+- no volume mounts or storage mounts;
+- no Kueue queue;
+- no reservation;
+- no configured Kubernetes autoscaler;
+- an explicitly resolved, existing, non-default Kubernetes service account, so
+  authoritative bootstrap does not create or patch shared RBAC resources;
+- no resource priority or priority class;
+- a context, cloud identity, and effective namespace that can be resolved before
+  rendering, where that namespace already exists and its live Kubernetes UID is
+  readable.
+
+Inputs outside this subset return `NOT_REPRESENTABLE` and remain on the legacy
+path until a later characterization and promotion commit explicitly adds them.
+`PLAN_CREATE` may list offers only for read-only shadow comparison.
+`FRESH_CREATE` is the only operation that may be revalidated or handed to
+actuation. `REUSE` and `RESTART` return `UNSUPPORTED_OPERATION`.
+
+The backend derives `OfferActuationKindV1` from the exact cluster name,
+workload type, `Controllers.from_name()`, and
+`controller_utils.high_availability_specified()` result that
+`backend_utils.write_cluster_config()` uses. Only `DIRECT_POD` is eligible;
+`CONTROLLER`, `HA_DEPLOYMENT`, and `UNKNOWN` return
+`UNSUPPORTED_ACTUATION_KIND`. Before handoff, `_retry_zones()` also parses the
+independently rendered cluster YAML and requires a Pod node config with no
+`deployment_spec` or `pvc_spec`. `bulk_provision()` repeats that check, and
+Kubernetes `run_instances()` rejects an authoritative envelope if its config
+would take the Deployment branch. A disagreement between the request
+classification and rendered YAML fails before provider mutation.
+
+The resource classifier is also closed. It enumerates every field in the
+current `Resources` version and accepts only the Kubernetes cloud, one concrete
+context, no zone, the CPU/memory instance shape, ordinary image/container
+selection, default OS-disk size, maximum-price filtering, autostop, and hooks.
+Spot, accelerators, accelerator arguments, nonempty ports, explicit disk or
+network tier including `NetworkTier.BEST`, nondefault ephemeral storage, local
+disk, labels, resource volumes, FUSE, priority, priority class, and job recovery
+return `UNSUPPORTED_RESOURCE_MODE` or `UNSUPPORTED_NETWORK_TIER` as applicable.
+A new
+`Resources` field is ineligible until this table and its frozen corpus are
+updated. This prevents `_detect_network_type()` and other label-dependent
+render paths from running inside the V1 subset while the snapshot deliberately
+stores no raw node labels. Rejecting nonempty ports also makes the backend
+`_open_ports()` branch unreachable before READY; port Services and Ingresses
+remain entirely on the legacy path until their full UID inventory is modeled.
+
+Eligibility is closed over the effective configuration, not inferred from a
+small set of presence flags. A new
+`classify_kubernetes_offer_config_v1()` helper freezes
+`skypilot_config.to_dict()`, the active workspace,
+`Resources.cluster_config_overrides`, the sorted registered Kubernetes-property
+names, every registered queue-key path, and current Kubernetes provisioner and
+template-override ownership once per observation. From that frozen input it
+reads every applicable raw scope: global `kubernetes`, workspace `kubernetes`,
+each selected `context_configs.<context>` block, and resource overrides. It
+preserves the existing precedence, then accepts only these semantic V1
+properties:
+
+| Effective property | Allowed V1 value and representation |
+|---|---|
+| `allowed_contexts` | `all` or a bounded list containing the candidate context; used to construct the candidate set |
+| `namespace` | a nonempty resolved namespace whose live UID is readable; encoded only through the opaque scope digest |
+| `autoscaler` | absent; any explicitly configured value, including GKE and optimistic autoscalers, is outside V1 |
+| `remote_identity` | required and resolves to one existing non-default Kubernetes service-account name; its nonsecret digest enters provider placement identity |
+| `pricing` | absent or the built-in `_PRICING_SCHEMA`; the CPU and memory components are encoded in offer price |
+| `provision_timeout` | absent or an integer accepted by the existing schema; execution-only and excluded from placement identity |
+| workspace `disabled` | absent or exactly `false` |
+| `context_configs` | only as the container for the selected context's properties above |
+
+Every other built-in Kubernetes property is outside the authoritative V1
+subset when explicitly present at an applicable scope, even when its value is
+null, false, empty, or equal to a current default. This includes
+`allowed_nodes`, `networking`, `ports`, `pod_config`, `custom_metadata`,
+`high_availability`, `kueue`, `quota`, `dws`,
+`post_provision_runcmd`, `apt_mirrors`, `set_pod_resource_limits`,
+`auto_mounts`, and `enable_docker`. Any property registered through
+`register_kubernetes_property()`, any queue spelling registered by a plugin,
+and any unknown client-pass-through property is also outside V1 whenever
+present. The classifier returns
+`NOT_REPRESENTABLE(CUSTOM_PLACEMENT_CONFIG)` before reading or logging its
+value. Adding an allowed property requires a schema-versioned design and frozen
+characterization cases; plugin registration alone can never expand
+authoritative eligibility.
+
+A registered property name that collides with any built-in or structural
+Kubernetes key fails closed even when that property is absent, because the
+current last-registration-wins schema registry can replace the built-in schema.
+Initial V1 also requires both
+`provision.get_registered_provisioner('kubernetes') is None` and
+`provision.get_provisioner_template_override('kubernetes') is None`; a plugin
+provisioner or template can change placement without any Kubernetes config
+property. M2 adds a read-only
+`provision.get_builtin_implementation_fingerprint_v1('kubernetes')` helper that
+compares the resolved built-in module object and all seven
+`InstanceLifecycleV1` callable objects with their import-time captured
+identities. Whole-module or attribute monkeypatches, including supported M1
+test/downstream seams, produce `CUSTOM_PLACEMENT_CONFIG` rather than silently
+entering authoritative mode. The implementation fingerprint contains only
+module, qualname, code-digest, and match booleans, never `id()` values, and is
+recaptured during revalidation.
+
+The classifier hashes only the secret-free normalized allowed values,
+active-workspace digest, sorted registry names and queue paths, registration and
+template ownership, and the built-in implementation fingerprint into
+`configuration_fingerprint`, then discards the raw configuration copy.
+Revalidation captures them again and returns
+`NOT_REPRESENTABLE(CONFIGURATION_CHANGED)` if the fingerprint differs.
+
+`KubernetesPlacementObservationV1` is the frozen Kubernetes snapshot. It stores
+the exact candidate-context order returned by the current legacy enumeration
+and a tuple of per-context observations. Each per-context observation contains
+the context name; a nonsecret endpoint fingerprint; a nonsecret cloud-identity
+digest; the effective namespace and live `Namespace.metadata.uid`; configured
+price; the resolved non-default service-account name, its live
+`ServiceAccount.metadata.uid`, and a digest over namespace, name, and UID; a
+deterministically sorted tuple of normalized node records containing
+`status.capacity`, `status.allocatable`, and the exact existing `is_ready()`
+boolean; the configuration fingerprint; and the closed eligibility result
+above. The endpoint fingerprint hashes only the
+normalized API-server scheme, host, port, path, and CA bundle digest from the
+loaded client configuration. Userinfo, query strings, client certificates,
+keys, tokens, exec-plugin arguments, environment variables, and raw kubeconfig
+data are forbidden inputs.
+
+The snapshot contains no kubeconfig, credential, token, full node object, pod
+configuration, label, annotation, or admission payload. Both the legacy shadow
+adapter and offer source project from this exact value. Node input order is
+normalized before either projection, so provider response or future-completion
+order cannot affect offer ordering. The comparison-only
+legacy adapter preserves the captured legacy context order; the offer source
+sorts by normalized context identity. The comparator records order and winner
+differences separately. Neither projection replaces or reorders the real legacy
+candidate list in shadow mode, which is important because the current
+`allowed_contexts: all` path passes through a set.
+
+One observation accepts at most 256 candidate contexts, 10,000 node records per
+context, 256 registered Kubernetes-property names, 256 registered queue paths,
+and 256 resulting offers. Context, registry-name, and queue-path strings use the
+envelope's 1,024-byte region or 128-byte key bound as applicable. The source
+checks API collection metadata and the materialized lengths, never truncates,
+and returns `NOT_REPRESENTABLE(OBSERVATION_LIMIT_EXCEEDED)` on any overflow.
+Provider completion order cannot decide which entries survive because overflow
+rejects the whole observation.
+
+The legacy projection applies the recorded readiness filter and then uses
+`status.capacity`, not allocatable resources, because the existing
+`check_instance_fits()` contract intentionally tests total Ready-node capacity
+and leaves changing free capacity to the scheduler. The rendered-request
+projection applies the same recorded readiness filter before the existing
+allocatable clamp. The frozen corpus proves the snapshot-backed legacy adapter
+and clamp return the same results and reasons as the existing helpers.
+
+For an eligible request, `region` is the selected context and
+`candidate_zones` is empty. The opaque scope ID hashes canonical JSON containing
+the context name, endpoint fingerprint, cloud-identity digest, effective
+namespace, and live namespace UID. A shared Kubernetes scope helper derives the
+identity digest from the same normalized kubeconfig cluster/user or in-cluster
+identity used by `Kubernetes.get_identity_from_context_name()`, without storing
+the raw identity. `REQUIRE_FRESH` reloads that identity instead of reusing a
+credential or context cache. Only the scope digest is stored; the raw endpoint,
+context identity, namespace, and UID are not stored in the provider payload.
+
+Kubernetes V1's allowlisted provider-payload `identity` object contains exactly
+`rendered_pod_placement_fingerprint` and
+`service_account_identity_digest`. The latter hashes canonical JSON containing
+the effective namespace, resolved service-account name, and live UID.
+`rendered_pod_placement_fingerprint` covers normalized resource
+requests for every regular and init container, Pod overhead and Pod-level
+resources, after the existing allocatable clamp, plus every hard scheduling
+input: node selector, required node affinity and anti-affinity, scheduler,
+runtime class, priority class, `DoNotSchedule` topology spread, tolerations,
+resource claims, volume-binding constraints, and the resolved service-account
+name. The offer projection computes the expected value from the snapshot and
+pure template inputs. The independently rendered cluster YAML must match it
+before `bulk_provision()` is called. Since the complete identity object enters
+the stable offer ID, same-name service-account replacement changes stable
+identity and cannot pass revalidation.
+Admission-added sidecars, requests, or hard constraints therefore produce an
+actual-result mismatch instead of escaping the offer contract. Soft preferences
+and runtime-only image, environment, command, and metadata fields are excluded.
+The `observation` object contains exactly `capacity_evidence` and
+`configuration_fingerprint`; it contains no raw node or configuration data.
+
+The source preserves context-specific configured Kubernetes pricing using
+`Decimal(str(existing_price))`. It does not assume Kubernetes cost is zero.
+Current Kubernetes fit probes establish shape support, not free capacity or a
+reservation, so V1 reports `availability: unknown`, `quota: unknown`, and
+`capacity: shape_fits_existing_node`. A no-fit observation produces
+`NO_OFFERS(NO_FEASIBLE_SHAPE)` rather than consulting an autoscaler.
+
+Kubernetes V1 uses `revalidation_policy: before_mutation`. Revalidation repeats
+the read-only scope, reachability, service-account name-and-UID, shape, and
+configuration checks immediately before provider mutation. A changed
+service-account UID produces a different stable identity and
+`OFFER_IDENTITY_CHANGED`; it is never accepted as a fresh observation of the
+old offer. A positive result remains advisory and does not claim reserved
+capacity. The Kubernetes utilities expose uncached internal
+`get_kubernetes_nodes_uncached()` path; existing request-cached helpers may
+delegate to it, but `REQUIRE_FRESH` calls the uncached path directly through the
+pinned client. Tests replace the underlying Kubernetes client and prove
+revalidation performs new calls after optimizer capture. A configured
+autoscaler returns `NOT_REPRESENTABLE(CUSTOM_PLACEMENT_CONFIG)` before the
+offer source or revalidation constructs or queries any autoscaler client. The
+independent legacy projection may retain its current autoscaler query before
+typed fallback; that evidence never enters an offer.
+
+### Shadow, Propagation, and Persistence
+
+The server-side gate is:
+
+`SKYPILOT_KUBERNETES_PLACEMENT_OFFER_MODE=off|shadow|authoritative`
+
+The default is `off`. Invalid values fail closed to `off` and emit one warning.
+This is an operator-controlled server setting, not a client request field.
+
+In `shadow` mode, an eligible source projects candidates from the same raw
+observation snapshot used by the legacy adapter. The current optimizer objective
+is applied to both projections, but only legacy `Resources` controls mutation.
+An ineligible classifier result skips dual projection and leaves the untouched
+legacy path authoritative. The comparator records:
+
+- safety class: `eligible`, `no_offer`, `not_representable`, or `source_error`;
+- normalized placement-set equality;
+- optimizer-winner equality;
+- price: `match`, `drift`, or `not_comparable`;
+- availability: `match`, `drift`, or `not_comparable`;
+- freshness: `fresh` or `expired`;
+- actual provider result: `match`, `drift`, or `not_comparable`;
+- a bounded typed reason code.
+
+The normalized placement class is provider, opaque scope, region, ordered zone
+batch, batching scope, normalized resources, purchase mode, and requested node
+count. Comparator logs contain only the mode, provider, offer and observation
+IDs, counts, comparison axes, and typed reason. They do not contain raw scope,
+context identity, namespace, provider payload, or user configuration. Existing
+logs and Datadog collection are the observation plane; M2 adds no statistics
+store.
+
+Shadow mode deliberately leaves the current refreshable Kubernetes wrappers in
+control of mutation. It therefore does not claim that every legacy call used
+one client or endpoint. It compares the legacy logical region, resource shape,
+and node count, but marks endpoint-, scope-, UID-, and admission-sensitive
+actual-result axes `not_comparable`. It never fabricates
+`ActualPlacementEvidenceV1` from a wrapper that may transparently refresh.
+Exact scope and provider evidence are authoritative-mode gates proven by
+focused tests and isolated `boltz-test` authoritative canaries before wider
+promotion, not claims inferred from shadow mutation.
+
+Offer matching returns a provisioner-owned sidecar rather than mutating a
+`Task`, `Resources`, or DAG:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class TaskPlacementDecisionV1:
+    task_index: int
+    resources_fingerprint: str
+    operation: OfferOperationV1
+    offer: PlacementOfferV1 | None
+    selection_capture_id: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class OptimizationOfferPlanV1:
+    decisions: tuple[TaskPlacementDecisionV1, ...]
+```
+
+`TaskPlacementDecisionV1` is a validated direct-construction dataclass. Its
+`task_index` is nonnegative, its fingerprint has the exact SHA-256 grammar, and
+its operation is exactly `PLAN_CREATE`. A non-null offer must also have
+operation `PLAN_CREATE`, must equal the decision operation, and requires a
+non-null canonical UUIDv4 `selection_capture_id`. A null offer may carry either
+a null selection capture ID when classification ended before a provider
+capture, or a non-null canonical UUIDv4 ID when the captured observation
+produced no selected offer. Thus offer presence implies capture-ID presence,
+but capture-ID presence does not imply offer presence. `FRESH_CREATE`, `REUSE`,
+and `RESTART` decisions are rejected because their authoritative state is
+carried separately after the locks.
+
+`OptimizationOfferPlanV1` accepts only an exact tuple of decisions, preserves
+their supplied order, and rejects any negative or duplicate `task_index`.
+
+Immediately after every successful pre-lock `Optimizer.optimize()` call, the
+internal placement runtime builds a fresh `OptimizationOfferPlanV1` for the
+returned DAG and current optimize target using `operation=PLAN_CREATE`.
+`task_index` is the task's position in that exact DAG.
+`resources_fingerprint` is the canonical normalized placement class and
+requested node count, excluding runtime-only image resolution, serialized with
+`canonical_json_bytes_v1()` and encoded as `sha256:<64-lowercase-hex>`.
+`task_index` is a nonnegative integer and decision indices are unique within a
+plan. The runtime
+independently ranks the offer projection and compares it with
+`task.best_resources`. This plan is comparison evidence only: no
+`PLAN_CREATE` decision is copied into `ToProvisionConfig`, `_retry_zones()`, or
+`bulk_provision()`.
+
+After live-state refresh under both locks,
+`CloudVmRayBackend._check_existing_cluster()` discards the `PLAN_CREATE`
+decision, classifies the operation, and, only for `FRESH_CREATE`, captures a new
+observation and resolves exactly one offer matching the concrete
+`to_provision` winner and objective. Optional
+`ToProvisionConfig.placement_offer`, `selection_capture_id`, and `operation`
+carry only that newly bound decision into `provision_with_retries()`. The
+runtime never writes either plan onto a `Task`, `Resources`, or DAG.
+
+After a cross-region or cross-cloud failure, the retry loop atomically clears
+its offer, capture ID, and operation before changing `task.best_resources` or
+`to_provision`. It may record a new `PLAN_CREATE` comparison, but if
+`provider_attempt_count > 0` it records
+`RETRY_AFTER_PROVIDER_ATTEMPT` and leaves the next mutation on the existing
+legacy retry path only after the exact attempt fence has been reconciled and
+cleared. An unresolved fence stops the retry. A missing, duplicate, stale, or
+fingerprint-mismatched first-attempt binding is recorded and leaves mutation on
+the legacy path in
+shadow mode. It is a fail-closed error for an otherwise eligible authoritative
+first attempt. An offer is never carried across a changed placement,
+operation, or provider-attempt boundary.
+
+`_retry_zones()` revalidates immediately before `bulk_provision()`. Shadow mode
+records the result and leaves mutation unchanged. Authoritative mode either
+mutates the exact valid offer or returns the typed unavailable result for an
+explicit replan. A `VALID` result replaces the stale in-memory offer before
+mutation. The replacement must retain the exact `offer_id`, have a
+nondecreasing `observed_at`, and come from a `REQUIRE_FRESH` snapshot with a
+different capture ID.
+
+The handoff is an explicit same-process API, not cluster YAML or a subprocess
+side channel. The trusted actuation mode is separate from the offer envelope:
+
+```python
+class PlacementOfferActuationModeV1(enum.Enum):
+    SHADOW = 'shadow'
+    SHADOW_LEGACY_FALLBACK = 'shadow_legacy_fallback'
+    AUTHORITATIVE = 'authoritative'
+    LEGACY_FIRST_ATTEMPT = 'legacy_first_attempt'
+    LEGACY_RETRY_AFTER_PROVIDER_ATTEMPT = (
+        'legacy_retry_after_provider_attempt')
+
+
+@dataclasses.dataclass(frozen=True)
+class PlacementOfferHandoffV1:
+    mode: PlacementOfferActuationModeV1
+    offer: PlacementOfferV1 | None
+    actuation_context: ProviderActuationContextV1 | None
+    provider_attempt_count: int
+    reason_code: OfferReasonCodeV1
+```
+
+`provisioner.bulk_provision()` gains one optional keyword-only
+`placement_offer_handoff: PlacementOfferHandoffV1 | None`. `off` passes null.
+Shadow passes mode `SHADOW`, a valid recursively immutable offer, a null context,
+`reason_code=NONE`, and the current positive attempt ordinal. If any shadow
+classification, listing, binding, or revalidation outcome has no valid offer,
+including `NO_FEASIBLE_SHAPE`, source error, stale identity, or a retry-only
+disagreement, shadow passes `SHADOW_LEGACY_FALLBACK`, null offer and context,
+the current positive attempt ordinal, and that exact non-`NONE` reason.
+`PROVIDER_OBJECT_CONFLICT` is the sole reason forbidden in this disposition.
+This mode is accepted only while the re-read server gate is `shadow`, only when
+the legacy optimizer selected the concrete mutation candidate, and only when
+the cluster handle has no unresolved attempt fence. It is valid for first and
+later attempts and never creates or clears a fence. Thus an offer-side
+disagreement cannot alter legacy mutation.
+
+An authoritative first attempt passes mode `AUTHORITATIVE`, a valid offer, a
+non-null context, `provider_attempt_count=1`, and `reason_code=NONE`.
+`PlacementOfferHandoffV1` deliberately has no capture-ID field and the offer
+identity deliberately excludes request-local capture IDs, so this dataclass
+cannot prove capture provenance by itself. `_retry_zones()` must call
+this exact leaf helper immediately before constructing the handoff:
+
+```python
+def validate_authoritative_capture_v1(
+    offer: PlacementOfferV1,
+    capture: ObservationCaptureV1,
+    *,
+    freshness: ObservationFreshnessV1,
+    selection_capture_id: str,
+) -> ProviderActuationContextV1:
+    ...
+```
+
+It requires `freshness is REQUIRE_FRESH`, validates
+`selection_capture_id`, requires a non-null context, requires observation and
+context provider and capture ID equality, rejects a capture ID equal to
+`selection_capture_id`, requires `offer.provider` to equal that provider, and
+requires `offer.observed_at` to equal the observation's supplied
+`observed_at`. It returns that exact validated context object. Only the
+returned object may be put in the handoff.
+
+A deterministic first-attempt legacy fallback passes mode
+`LEGACY_FIRST_ATTEMPT`, null offer and context, attempt ordinal one, and the
+exact non-`NONE` reason returned by classification. Under the authoritative
+gate, accepted reasons are only `UNSUPPORTED_OPERATION`,
+`UNSUPPORTED_ACTUATION_KIND`, `UNSUPPORTED_NODE_COUNT`,
+`UNSUPPORTED_ACCELERATOR`, `UNSUPPORTED_RESOURCE_MODE`,
+`UNSUPPORTED_NETWORK_TIER`, `VOLUME_OR_STORAGE_MOUNT`, `KUEUE_ENABLED`,
+`RESERVATION_REQUESTED`, `CUSTOM_PLACEMENT_CONFIG`, `UNRESOLVED_SCOPE`, and
+`OBSERVATION_LIMIT_EXCEEDED`.
+`NO_FEASIBLE_SHAPE` never reaches mutation because the optimizer has no
+candidate in authoritative mode. Reachability, changed configuration or
+identity, stale or missing eligible bindings, and
+`PROVIDER_OBJECT_CONFLICT` fail or replan; they cannot use this authoritative
+fallback.
+
+After any provider mutation was attempted,
+an authoritative retry passes mode
+`LEGACY_RETRY_AFTER_PROVIDER_ATTEMPT`, null offer and context, an attempt
+ordinal of at least two, and reason `RETRY_AFTER_PROVIDER_ATTEMPT`. No other field
+combination beyond the dispositions above is valid. Before an authoritative
+call to `bulk_provision()`, `_retry_zones()` requires the helper above to accept
+the capture; it rejects a missing, non-fresh, reused selection, or
+cross-provider context before mutation.
+`_retry_zones()` passes the revalidated immutable offer and the pinned context
+from that capture in the frozen handoff.
+`bulk_provision()` re-reads the server gate. Under an authoritative gate it
+accepts only `AUTHORITATIVE` with attempt ordinal one, the exact allowlisted
+first-attempt fallback, or the exact typed legacy-retry combination above.
+Under a shadow gate it accepts only `SHADOW` or
+`SHADOW_LEGACY_FALLBACK`; every changed or mismatched combination fails before
+mutation. For a handoff with an offer, it materializes a fresh built-in
+envelope, reparses it,
+recomputes its digests, and verifies provider, scope, region, ordered zones,
+resource fingerprint, node count, operation, freshness, and revalidation policy
+before any bootstrap or provider mutation. It then puts the validated handoff
+in an optional in-memory field on the `ProvisionConfig` passed through the
+existing provider facet. Kubernetes
+bootstrap must retain the identical context object and build every Core, Apps,
+Auth, and other API facade from its pinned client; `bulk_provision()` verifies
+object identity again before `run_instances()`. `bulk_provision()` returns that
+same opaque context beside the record in its process-local result. The backend,
+not `bulk_provision()`, owns its lifetime through final cluster-info reads,
+runtime setup, the READY transaction, or failure cleanup. Every Kubernetes API
+call in that interval, including cluster-info and cleanup calls currently
+reconstructed from `provider_config`, must instead use a facade from the pinned
+client. A credential error may enter readback or quarantine but may not reload
+the context and silently change endpoints. The backend closes the context only
+after the READY transaction commits or the attempt is durably quarantined and
+all safe same-process cleanup reads finish. No handoff value is written into
+`cluster_yaml` or generic provider configuration, and mode, context, attempt
+count, and reason are never persisted in a handle.
+
+`KubernetesPinnedActuationContextV1` also owns the exact-target command
+transport used after provisioning. It renders a minimal request-local
+kubeconfig from the already attached `ApiClient.Configuration`, never from the
+ambient kubeconfig path. The directory is mode 0700 and the file is mode 0600;
+any required CA, certificate, or key bytes are copied into that directory
+rather than referring back to mutable ambient files. Tokens, certificates, and
+keys never appear in command arguments or logs, and every file is deleted by
+`close()`. `KubernetesCommandRunner` receives that exact path and generated
+context name for every `kubectl` invocation through READY.
+If the pinned configuration cannot be represented safely for `kubectl`, the
+request is not authoritative. `make_deploy_resources_variables()` consumes the
+already frozen placement/configuration inputs and performs no later context
+lookup. `get_cluster_info()`, port-forward or exec setup, runtime setup, final
+UID/scope fencing, and failure cleanup all use either facades from the pinned
+client or this exact-target transport. Immediately before READY, the backend
+re-reads scope and all attempt-owned UIDs through the pinned client.
+
+Authoritative mutation also uses a durable, Kubernetes-specific attempt fence
+inside the already persisted early INIT handle:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class KubernetesOwnedObjectV1:
+    api_version: str
+    kind: str
+    namespace: str
+    name: str
+    uid: str | None
+    state: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PlacementAttemptFenceV1:
+    schema_version: int
+    attempt_id: str
+    state: str
+    provider: str
+    scope_kind: str
+    scope_id: str
+    context_name: str
+    namespace: str
+    namespace_uid: str
+    offer_id: str
+    created_at: str
+    reason_code: str
+    owned_objects: tuple[KubernetesOwnedObjectV1, ...]
+```
+
+The V1 fence accepts exactly provider `kubernetes`, state `in_flight` or
+`quarantined`, operation `fresh_create` by implication, the same bounded scope
+fields as the envelope, an RFC 3339 creation time, a UUIDv4 attempt ID, and at
+most three objects for the one-node pilot: the two rendered Services and the
+head Pod. Object kinds are exactly `Service` or `Pod`, API version is exactly
+`v1`, names and namespaces are valid bounded Kubernetes names, UIDs are null or
+valid bounded Kubernetes UIDs, and state is exactly `planned`, `created`,
+`absent`, or `foreign_replacement`. Raw context, namespace, object names, and
+UIDs are persisted only in this internal fence so reconciliation can act; they
+are omitted from logs, events, Datadog, client display, and exception strings.
+The serialized representation is a validated JSON-built-in dictionary, not a
+dataclass instance. `in_flight` requires `reason_code=none`;
+`quarantined` requires exactly `provider_error`,
+`placement_evidence_mismatch`, `uid_conflict`, `target_scope_changed`, or
+`process_recovery`. Unknown fields or values fail closed.
+
+Before calling `bulk_provision()`, `_retry_zones()` derives all three names from
+the independently rendered YAML and uses the pinned client to list all
+cluster-labelled Pods without a phase filter and read each exact Pod and Service
+name. Any Pending, Running, Terminating, Failed, Succeeded, Unknown, deleted-but
+still-readable, or same-name object returns the non-failover terminal
+`PROVIDER_OBJECT_CONFLICT` result. Authoritative mode never enters the legacy
+adoption, stale-Pod deletion, terminating-Pod force-delete, or 409 retry
+branches. A create-time 409 after the preflight is a race and enters fenced
+quarantine without deleting the conflicting object.
+
+After that all-phase preflight, `_retry_zones()` stamps the attempt ID and full
+cluster name on each object template, stores the `in_flight` fence with null
+UIDs on the early INIT handle, and commits that handle under the existing
+cluster lock. Provider I/O is forbidden until this commit succeeds.
+Authoritative bootstrap is a closed path: the required non-default service
+account and namespace must already exist, no RBAC, namespace, volume, PVC, or
+other shared resource may be created or patched, and the only allowed mutations
+are fresh creation of the two rendered Services followed by the head Pod
+through the pinned client. Immediately before Pod creation, `run_instances()`
+re-reads the ServiceAccount and requires the same UID digest as the revalidated
+offer. Every successful create response records its UID in the process-local
+result, and every object retains the attempt-ID annotation.
+
+The READY transaction clears `placement_attempt_fence` only after exact
+placement evidence succeeds, final pinned-client reads prove the two Services
+and Pod still have their create-response UIDs and attempt-ID annotations, and a
+final ServiceAccount read has the same identity digest. The transaction then
+atomically persists the offer envelope and clears the fence. Any
+exception after the fence commit carries the bounded owned-object inventory
+back to `_retry_zones()`, which durably advances the fence to `quarantined`
+before returning the error. A process crash may leave `in_flight`; recovery
+must create a fresh pinned client, recompute the identical scope, read every
+planned name, adopt a UID only when the attempt-ID annotation matches, and then
+use UID-preconditioned cleanup or quarantine. It never replays a create or
+falls through to generic cleanup while the outcome is unknown.
+
+One central backend guard rejects launch, restart, stop, down, autostop cleanup,
+retry cleanup, and direct calls into Kubernetes generic terminate or
+`cleanup_cluster_resources()` whenever the handle has a non-null attempt fence.
+The only allowed mutator is the fenced reconciler for that exact attempt. It
+deletes only a stored matching UID and waits for absence. A same-name object
+with a different UID is marked `foreign_replacement` and left untouched. The
+cluster record and fence remain until every planned name is absent; only then
+may reconciliation remove the record without invoking generic cleanup.
+
+The deployment and rollback tooling scans every cluster handle using the
+current image and refuses an image rollback while any attempt fence is non-null.
+The exact pre-M2 rollback-image qualification therefore runs only after the
+fenced reconciler proves zero live fences. Bypassing this preflight is an
+unsupported unsafe operator action. Unit and live crash-at-every-create tests
+prove the fence is durable before the first provider call, all later lifecycle
+entries refuse broad cleanup, foreign replacements survive, and the disposable
+test scope ends with no fence or owned object.
+
+`ProvisionConfig.get_redacted_config()` must reconstruct its log dictionary
+without traversing the handoff or opaque context, then emit only mode, reason
+code, attempt count, schema version, provider, offer ID, and observation ID. It
+never logs scope, region, provider payload, evidence, context, or the complete
+envelope. The
+`ProvisionRecord` logging path may emit `ActualPlacementEvidenceV1` because that
+object contains only bounded enums, counts, and digests.
+
+Shadow mode carries the envelope only for logical result comparison; the
+provider continues to mutate from the legacy configuration and returns no
+`ActualPlacementEvidenceV1`. Authoritative Kubernetes
+requires its `run_instances()` path to consume and verify the exact
+`ProvisionConfig` envelope. On success, `_retry_zones()` returns that same
+validated built-in envelope in its output `config_dict` beside the
+`ProvisionRecord`. Only this revalidated envelope can later be persisted on the
+READY handle. A changed stable ID, expired replacement, invalid envelope, or
+failure to propagate it forces explicit replanning and never mutates with the
+stale offer.
+
+The existing `ProvisionRecord.region` and `zone` fields are input echoes for
+Kubernetes and are not accepted as actual-placement evidence. This contract is
+implemented in M2 S3, not in the S1 generic offer foundation. S3 adds the
+separate leaf type and an optional final `ProvisionRecord.placement_evidence`
+field defaulting to null:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class ActualPlacementEvidenceV1:
+    schema_version: int
+    operation: str
+    actuation_kind: str
+    provider: str
+    scope_kind: str
+    scope_id: str
+    candidate_zones: tuple[str, ...]
+    batching_scope: str
+    provider_placement_fingerprint: str
+    provider_workload_identity_digest: str
+    purchase_mode: str
+    requested_nodes: int
+    observed_nodes: int
+    created_nodes: int
+    provider_evidence_kind: str
+    provider_evidence_id: str
+    provider_attempt_inventory_digest: str
+```
+
+Every string uses the corresponding envelope bound. All fingerprint fields are
+`sha256:` plus 64 lowercase hexadecimal characters, candidate zones use the
+envelope bound, and all node counts are integers 0 through 10,000.
+`schema_version` is exactly 1, `operation` is exactly `fresh_create`,
+`actuation_kind` is exactly `direct_pod`, and Kubernetes V1 requires
+`requested_nodes == observed_nodes == created_nodes == 1`,
+`scope_kind == kubernetes_context_endpoint_identity_namespace_v1`,
+`batching_scope == context`,
+`provider_evidence_kind == kubernetes_pod_binding_v1`, an empty zone tuple, and
+`purchase_mode == on_demand`.
+
+The evidence is produced only after `run_instances()` performs a final labeled
+API read of the live Namespace and all cluster Pods. Authoritative
+`run_instances()` uses the exact pinned client carried through
+`ProvisionConfig` for creation and all final reads. Shadow mode does not produce
+this evidence.
+`scope_id` is recomputed
+from the identical canonical five-field tuple used by the offer: context name,
+fresh endpoint fingerprint, fresh cloud-identity digest, server-returned
+Namespace name, and server-returned Namespace UID.
+`provider_placement_fingerprint` is computed from all final server-returned
+scheduling inputs above and must match
+`rendered_pod_placement_fingerprint` in the offer's provider identity payload.
+`provider_workload_identity_digest` is recomputed from the final pinned-client
+ServiceAccount namespace, name, and UID and must match
+`service_account_identity_digest` in the offer's provider identity payload.
+`provider_attempt_inventory_digest` covers the attempt ID and final kind,
+namespace, name, UID, and attempt annotation of both Services and the Pod.
+`provider_evidence_id` additionally covers both digests and the
+context name, freshly loaded endpoint fingerprint and cloud-identity digest; the
+server-returned Namespace name and UID; the final Pod namespace, name, UID,
+Running phase, and bound `spec.nodeName`; normalized accepted `ray-node` CPU and
+memory requests, all other container and Pod scheduling resources, and hard
+scheduling constraints; the cluster label and full-name annotation; and the UID
+from the original create response. The final Pod UID must equal the
+create-response UID. Only bounded digests, enums, and counts leave the provider.
+Raw context identity, namespace, Pod UID, Pod name, node name, labels, and
+annotations, plus the ServiceAccount name and UID, are neither logged nor stored
+in the record. Thus neither scope, workload identity, nor resource evidence can
+be satisfied by copying `region`, `provider_config`, or the submitted Pod spec.
+
+Shadow mode returns no exact evidence and leaves the legacy mutation
+authoritative. In authoritative mode, the all-phase preflight has already
+proved there were no cluster-labelled or same-name Pods or Services, the
+dedicated create path has bypassed every adoption and name-only cleanup branch,
+and exactly two Services plus one Pod were freshly created. It validates the
+evidence against the revalidated envelope inside `run_instances()`. On mismatch
+it uses the raw internally held names and UIDs to delete only exact
+attempt-created objects with Kubernetes UID preconditions and waits for
+absence. It then raises a typed
+`PlacementEvidenceMismatchError` whose cleanup disposition is
+`QUARANTINE_FENCED`. That exception carries raw created identities only in a
+non-stringified internal field; its message and logs contain digests.
+
+`bulk_provision()` catches this error before its broad cleanup handlers, marks
+the INIT attempt non-failover, and never invokes existing generic
+`terminate_instances()` or `cleanup_cluster_resources()` for it. Those paths
+select by label or name and could delete a foreign Pod recreated under the same
+name. If the UID precondition reports a replacement, the provider leaves that
+replacement untouched and returns its exact owned-object inventory. The backend
+durably changes the precommitted attempt fence to `quarantined` before exposing
+the error. M2 cleans only a stored exact attempt-created UID whose precondition
+still matches; all two Services and the Pod have planned entries before
+mutation and captured create-response UIDs when known. No cross-cloud retry
+follows this error. Unit and live fault tests inspect the durable fence, prove
+the replacement survives, then use the fenced reconciler to clean the
+disposable test scope explicitly. The provider never returns a successful
+`ProvisionRecord` for an adopted object, UID change, unbound or non-Running Pod,
+or evidence mismatch.
+
+The early INIT handle does not contain an offer envelope, but authoritative
+mutation requires its precommitted attempt fence. After provider success, the
+backend defensively reparses `ProvisionRecord.placement_evidence` and compares
+it with the selected envelope rather than trusting `ProvisionRecord.region`.
+Only an exact match may copy the envelope to
+`CloudVmRayResourceHandle.placement_offer` and clear the fence atomically in the
+READY transaction. A failed provider call, failed runtime setup, absent
+evidence, or actual-placement mismatch leaves the offer attribute `None` and
+the fence non-null; in authoritative mode an absent or mismatched evidence
+object raises the same non-failover quarantine error and skips generic cleanup
+rather than allowing READY. Other provider or runtime failures retain their
+existing typed cleanup behavior only when no attempt fence exists.
+
+Adding the two handle attributes bumps `CloudVmRayResourceHandle._VERSION` from
+13 to 14. `placement_offer` and `placement_attempt_fence` each have type exactly
+`dict[str, JSONValue] | None`; a placement class, enum, dataclass, `Decimal`,
+datetime, mapping proxy, or provider SDK object is forbidden in serialized
+state. V13 and older state defaults both attributes to `None`. Pickle and
+`to_dict()`/`from_dict()` validate and preserve both built-in envelopes.
+
+Neither envelope is a new public `Resources` field or an independently typed
+REST response field. They are opaque optional metadata inside the already
+serialized handle. No API version bump is required because supported old
+clients can load the built-in state, may retain the unknown attributes, and do
+not inspect them. An old server image may not become mutation owner while a
+fence exists, which is enforced by the rollback preflight rather than reader
+compatibility. A later durable action migration stores the offer and attempt
+inventory in its action row.
+
+### Shadow and Promotion Gates
+
+The shadow implementation, authoritative promotion, and legacy removal are
+separate commits and deployments.
+
+The frozen Kubernetes characterization corpus must cover:
+
+- allowed, filtered, missing, and unreachable contexts;
+- effective namespace precedence;
+- Ready and non-Ready nodes with identical capacity/allocatable shapes;
+- configured zero and nonzero pricing;
+- existing-node fit and no-fit;
+- every configured autoscaler, including queryable GKE and optimistic
+  implementations, falls back before the offer source or revalidation
+  constructs or queries an autoscaler client;
+- every accepted effective-config property, every excluded built-in Kubernetes
+  property, a plugin-registered property, an unknown client-pass-through
+  property, built-in module and attribute monkeypatches, every current
+  `Resources` mode, direct Pod versus controller/HA actuation, and every
+  `NOT_REPRESENTABLE` reason;
+- offer expiry and provider-required revalidation;
+- every envelope scalar and collection boundary, payload depth and aggregate
+  limit, observation context/node/offer overflow, every handoff disposition
+  invariant, and `PLAN_CREATE` handoff rejection;
+- shadow no-offer, source-error, binding-drift, revalidation-drift, and later
+  retry cases all preserve the concrete legacy mutation candidate through
+  `SHADOW_LEGACY_FALLBACK`;
+- cross-context and cross-cloud reoptimization;
+- under-lock create/reuse/restart classification, first-provider-attempt
+  authority, and typed legacy retry after an attempted mutation;
+- cached-client endpoint A versus freshly configured endpoint B, proving every
+  authoritative observation, mutation, post-provision read, runtime setup call,
+  and cleanup call uses the client whose configuration was hashed;
+- provider-observed namespace, endpoint, Pod UID, rendered-request match and
+  mismatch, plus authoritative UID-conflict quarantine that preserves a
+  same-name replacement;
+- service-account absence, default-account rejection, name and UID binding,
+  same-name UID replacement before revalidation, before Pod creation, and
+  before READY;
+- nonempty ports fall back and never call `_open_ports()` in authoritative V1;
+- all Pod phases and both Service names at preflight, plus a create-time 409,
+  prove every legacy adoption and name-only cleanup branch is unreachable;
+- crash before and after each Service and Pod create, durable attempt-fence
+  recovery, every later lifecycle guard, and rollback refusal until
+  reconciliation;
+- envelope size, redaction, and identity invariants.
+
+Promotion requires all of the following on the exact pushed SHA:
+
+1. Full focused and compatibility CI passes.
+2. The frozen corpus has zero unexplained safety, placement-set, optimizer-winner,
+   or comparable actual-result mismatches; shadow endpoint-sensitive axes are
+   explicitly `not_comparable`, never silently counted as matches.
+3. `skypilot-ha` runs in shadow mode for at least 30 minutes and records at least
+   20 eligible decisions and three successful one-node create/down cycles in
+   `boltz-test`.
+4. The live window includes at least one expected `NOT_REPRESENTABLE` decision
+   and proves that it remains on the legacy path.
+5. Every eligible mutation records revalidation immediately before the provider
+   call; an injected-clock test proves the same ordering for an expired offer.
+6. Datadog contains every expected bounded shadow event and zero unexplained
+   safety, placement-set, winner, or comparable actual-result mismatches.
+7. Classified price or availability drift is retained and explained. It is
+   nonblocking only when it cannot change safety, the candidate set, the
+   optimizer winner, or actual placement.
+8. The minimum-compatible old client, the current client, and the captured
+   pre-M2 rollback image pass the handle qualification below.
+9. With the authoritative-capable image still rollback-safe, an isolated
+   `boltz-test` authoritative canary completes three create, runtime setup,
+   status, exec, and down cycles with exact offer, scope, UID, Service, and
+   pinned-transport evidence. After each cycle the attempt-fence inventory is
+   empty.
+10. The final Helm revision, immutable image digest, pod readiness, restarts,
+   error logs, request execution, cluster cleanup, and absence of orphaned pods
+   are re-read and recorded.
+
+The authoritative commit changes only the eligible Kubernetes subset to use the
+offer projection and exact selected offer. All other Kubernetes requests retain
+the typed legacy fallback, except provider-object conflicts and unresolved
+attempt fences, which always fail closed. Rollback changes the server mode to
+`shadow` or `off`; an image rollback additionally requires the current-image
+preflight to prove every attempt fence is null. No database schema is introduced
+by M2.
+
+Kubernetes-specific shadow and fallback code remains for one full compatibility
+release after authoritative promotion. Generic placement reconstruction is not
+removed based on a Kubernetes-only gate.
 
 ## Provisioning Attempt and Provider Outcome
 
@@ -488,15 +2137,46 @@ identically.
 
 ### M2: Placement offer
 
-- add immutable offer and serialization contract;
-- adapt one new-provisioner cloud;
-- shadow-compare old and new placement selection;
-- persist the optional redacted envelope through the internal launch config and
-  successful cluster handle;
-- promote only after the bounded explained-mismatch and stale-offer gates pass.
+- lock the exact `OfferSourceV1`, result, identity, envelope, redaction, and
+  revalidation contracts in this file and pass a new adversarial review;
+- add the optional Cloud offer-source capability without adding it to
+  `ProvisionerBundleV1` or creating a second universal provider registry;
+- implement recursively immutable offers and built-in-only handle envelopes;
+- adapt the initial single-node CPU Kubernetes subset;
+- independently shadow-project the old and new placement sets from one raw
+  observation snapshot while legacy `Resources` remains mutation owner;
+- carry an exactly matched selected offer only through the first provider
+  mutation attempt, then use a typed legacy retry until M4 can prove complete
+  cleanup and atomically reset the cluster record;
+- revalidate immediately before mutation and compare the selected offer with the
+  actual provider result;
+- persist the optional envelope only on a successful READY handle;
+- pass the frozen corpus, bounded Datadog observation, stale-offer,
+  minimum-compatible-client, and rollback-image gates;
+- promote the eligible Kubernetes subset in a separate commit and retain all
+  other Kubernetes requests on the typed legacy fallback.
 
-Deployment proves the selected placement and provisioning result match the old
-path.
+M2 implementation is split into three reviewed slices:
+
+- S1, named `generic offer contract foundation`, owns
+  `sky/utils/json_types.py`, `sky/placement/offer.py`, the docstring-only
+  `sky/placement/__init__.py`, the side-effect-free default
+  `Cloud.get_offer_source()`, `PlacementOfferHandoffV1`,
+  `validate_authoritative_capture_v1()`, their focused leaf tests, and the
+  narrow `.github/workflows/static-analysis.yml` edit that imports both leaves
+  and executes the fixed-Unicode goldens in the existing Python 3.10
+  `worker-floor-import` job. It does not add Kubernetes policy, orchestration
+  wiring, `ActualPlacementEvidenceV1`, or a `ProvisionRecord` field.
+- S2 owns the Kubernetes observation source, payload schema, closed
+  resource/config classifiers, and `validate_kubernetes_offer_v1()`, with no
+  mutation ownership change.
+- S3 owns orchestration propagation and use of the already-defined handoff,
+  shadow comparison, actual-placement evidence, persistence, and the guarded
+  authoritative promotion.
+
+Deployment proves candidate safety, optimizer winner, selected placement,
+pre-mutation revalidation, actual provisioning result, handle compatibility,
+rollback, and cleanup on the exact image digest.
 
 ### M3: Durable action runtime and volume pilot
 
@@ -558,7 +2238,12 @@ Removal is part of completion, not optional follow-up.
 | `ProvisionerVersion` and `StatusVersion` in `sky/clouds/cloud.py` plus backend branches | legacy Ray providers are adapted or frozen behind one explicit legacy facet | no call site reads either version and old/new client-server compatibility passes |
 | provider-wide `OpenPortsVersion` branches | `PortLifecycle` expresses launch-only, updatable, or reconcilable behavior | all port tests derive behavior from the facet |
 | provider-specific type checks and string parsing in `capacity_policy.py` and `failover_error_policy.py` | providers emit typed outcomes | characterization corpus maps to identical or safer retry decisions |
-| region and zone reconstruction in `resources_utils.py` and backend launch loops | `PlacementOffer` is authoritative | the frozen corpus and bounded observation window have zero unexplained safety or placement-class mismatches; classified transient availability or price differences may remain |
+| Kubernetes use of `make_launchables_for_valid_region_zones()` and backend `_yield_zones()` for the declared eligible subset | the eligible Kubernetes subset is authoritative through `PlacementOfferV1` and its rollback window is closed | frozen corpus and bounded live window have zero unexplained safety, placement-set, optimizer-winner, or actual-result mismatches; minimum-client and rollback-image qualification pass |
+| Kubernetes placement-offer shadow dual projection | Kubernetes authoritative mode has remained healthy for one full compatibility release | Datadog records no unexplained mismatch or rollback, and repository tests retain a frozen legacy-versus-offer characterization corpus |
+| Kubernetes `NOT_REPRESENTABLE` legacy fallback | every officially supported Kubernetes placement-affecting input has a typed, characterized offer representation | one compatibility release records zero fallback for supported inputs, the full Kubernetes corpus passes, and repository search finds no eligible legacy call |
+| M2 first-provider-attempt-only authoritative fence and `RETRY_AFTER_PROVIDER_ATTEMPT` fallback | M4 carries typed complete cleanup and provider-absence evidence across every failover provider and resets the cluster record atomically | cross-provider lost-response, partial-create, teardown, absence, and stale-record corpus passes with no blind replay |
+| M2 handle-backed `placement_attempt_fence`, reconciler, and `QUARANTINE_FENCED` path | M4 stores every cluster attempt and UID inventory in the durable action runtime and the pre-M2 rollback window is closed | crash and UID-replacement tests prove foreign objects survive, every owned child reaches proved absence, no generic label/name delete is reachable, and repository search finds no handle-backed fence writer |
+| provider-agnostic region and zone reconstruction in `resources_utils.py` and backend launch loops | every supported provider is authoritative through a placement-offer source or is explicitly frozen behind a declared legacy adapter | provider-wide corpus and bounded observation gates pass, repository and plugin inventory find zero migrated callers, and old/new client-server compatibility passes |
 | blocking provider wait ownership inside `run_instances()` implementations | `ProvisioningAttempt.observe()` owns progress | provider conformance proves pending, success, timeout, and partial-create behavior |
 | generic retry, cache update, and failure classification in `RetryingVmProvisioner` | typed attempts and domain retry policy are authoritative | old and new failover traces agree on the characterization corpus |
 | central-PostgreSQL volume mutation `FileLock`, synchronous provider calls, and refresh daemon ownership in `sky/volumes/server/core.py` | M3 action worker owns central volume lifecycle | HA stale-worker, readback, and cleanup tests pass and the server gate is promoted |
@@ -595,6 +2280,71 @@ Every declared facet generates conformance tests for:
 - provider request and operation IDs are preserved;
 - terminal deletion requires complete absence proof.
 
+### Placement offer
+
+- exact enum member names and wire values, protocol method signatures and
+  order, dataclass field order, and factory-only constructors;
+- equal recursively frozen payload objects have equal hashes regardless of
+  input insertion order, and mutation of the source or thawed output cannot
+  mutate the offer;
+- a golden canonical-byte fixture locks both digest preimages and IDs;
+- the injected payload schema rejects unknown, missing, unsorted, wrongly
+  typed, disallowed-string, and empty fields at every depth;
+- JSON text rejects duplicates before materialization, floats, constants,
+  lone surrogates, explicit C0/C1 controls, invalid fixed `NFC_V1`, and unknown
+  envelope keys;
+- the locked secret-key deny and allow corpus matches exactly;
+- scalar, per-container, combined-tree, 4 KiB payload, and 16 KiB envelope
+  boundaries test the accepted value and the first rejected value;
+- offer-set, revalidation-factory, capture/context, plan, and handoff
+  disposition matrices cover every closed enum member;
+- plan tests reject duplicate `task_index` values and accept unique
+  nonnegative indices without reordering decisions;
+- stable-field changes change both IDs, observation-only changes preserve the
+  offer ID and change the observation ID, and requested node count remains
+  observation-only;
+- import tests prove the generic leaf has no runtime cloud, optimizer,
+  backend, provisioner, server, or Kubernetes import and no public root
+  re-export;
+- the default `Cloud.get_offer_source()` is side-effect-free and returns null.
+
+The S1 suite has these 15 named acceptance tests, with the noted assertions
+owned by the named test rather than left implicit:
+
+1. `test_v1_enum_value_sets_are_exact` also inspects exact protocol method
+   declaration order and signatures, dataclass field order, factory signatures,
+   and disabled direct constructors.
+2. `test_offer_payload_is_recursively_immutable_and_detached` also constructs
+   every invalid schema-node shape, unsorted or duplicate field and string
+   allowlist, invalid provider grammar, and non-object root.
+3. `test_observation_capture_requires_matching_provider_and_capture_id` covers
+   canonical UUIDv4 acceptance and rejects every provider, context, freshness,
+   selection-reuse, UUID case, version, variant, and shape mismatch.
+4. `test_offer_set_result_disposition_matrix`.
+5. `test_offer_revalidation_result_disposition_matrix` covers every exact
+   availability, reservation, quota, and capacity tuple and rejects the full
+   invalid cross-product.
+6. `test_stable_and_observation_identity_field_partition` includes golden
+   canonical bytes and both IDs.
+7. `test_envelope_round_trip_returns_fresh_json_builtins`.
+8. `test_envelope_recomputes_and_rejects_mismatched_digests`.
+9. `test_plan_create_cannot_be_enveloped_or_handed_off` also covers every
+   `TaskPlacementDecisionV1` combination, rejects negative and duplicate plan
+   indices, and proves unique decision order is preserved.
+10. `test_envelope_rejects_unknown_duplicate_float_and_secret_like_values`.
+11. `test_envelope_scalar_collection_depth_and_byte_boundaries` also runs
+    fixed-`NFC_V1` golden cases containing `U+16FF0` and `U+16FF1` beside the
+    older combining mark `U+0301`, and proves C0/C1 rejection is independent of
+    the runtime Unicode database. The same goldens execute without pytest in
+    the Python 3.10 worker-floor import job.
+12. `test_handoff_disposition_matrix`.
+13. `test_offer_module_has_only_allowed_leaf_imports` also runs the leaf import
+    and runtime-alias compatibility check on Python 3.10 in the existing
+    worker-floor job and on Python 3.14 in normal CI; package metadata and
+    classifiers cover the supported 3.10 through 3.14 range.
+14. `test_placement_types_are_not_publicly_reexported`.
+15. `test_cloud_offer_source_default_is_none_and_side_effect_free`.
+
 ### Action runtime
 
 - two workers cannot own one live lease;
@@ -626,6 +2376,57 @@ Every declared facet generates conformance tests for:
 - legacy plugin registration during the compatibility window;
 - rollback to the previous image before irreversible schema activation.
 
+#### M2 placement-offer handle qualification
+
+M2 extends the existing two-environment harness in
+`tests/smoke_tests/backward_compat/test_backward_compat.py` for pickle and client
+compatibility only. The base environment defaults to
+`v{MIN_COMPATIBLE_VERSION}` and must be isolated from the current checkout. The
+local harness does not claim that its sequential API servers share PostgreSQL
+state.
+
+The CI qualification performs both directions:
+
+1. The current environment creates and pickles a V14 handle fixture whose
+   `placement_offer` and `placement_attempt_fence` recursively contain only JSON
+   built-ins.
+2. The isolated base environment unpickles that fixture without importing a new
+   offer class, exercises its existing handle read methods, and semantically
+   ignores the opaque metadata.
+3. A base client runs `sky status`, queue, logs, and down-compatible read
+   operations against a current server containing an offer-bearing handle.
+4. In the reverse direction, a base server emits a pre-M2 handle and the current
+   client verifies both new attributes are `None`.
+
+The CI job asserts the active interpreter's `sky.__file__`, SkyPilot version, and
+API version before each direction, uses no current-checkout path in the base
+process, and fails if the envelope contains any non-built-in value. Loading two
+copies of the current class in one interpreter is not compatibility evidence.
+
+Server rollback is a separate `skypilot-ha` PostgreSQL qualification before
+promotion:
+
+1. Capture the exact pre-M2 image digest, Helm revision, PostgreSQL Secret, and
+   values. Both images must report the same redacted PostgreSQL URI fingerprint
+   at runtime.
+2. The current image creates an eligible Kubernetes cluster and commits a READY
+   V14 handle to that PostgreSQL database.
+3. Set placement-offer mode to `off`, drain all active API requests and provider
+   mutations, run the current-image rollback preflight, prove every cluster
+   handle has `placement_attempt_fence is None`, and only then deploy the exact
+   pre-M2 image with `--reuse-values` against the same database.
+4. The pre-M2 server must read `sky status`, queue, logs, and other
+   down-compatible operations for that row without an unpickle, import, or
+   schema error. It is not required to delete the unknown attribute.
+5. Restore the current image against the same database, read the same handle,
+   tear down the canary cluster, and prove no row, pod, Service, PVC, request, or
+   test credential remains.
+
+The test records image digests, database fingerprints, handle version, exact
+read results, pod restarts, and logs at every transition. The
+minimum-compatible CI test and exact pre-M2 rollback-image test are independent
+gates.
+
 ## Per-Commit Deployment Gate
 
 Each stacked commit follows this gate:
@@ -654,7 +2455,9 @@ identity evidence.
 
 ## Rollback
 
-- M1 and M2 are code-only additive changes and roll back by image.
+- M1 is code-only additive and rolls back by image. M2 adds no database schema,
+  but image rollback is permitted only after the current-image preflight proves
+  every `placement_attempt_fence` is null.
 - New schema is expand-first. Old readers ignore new tables and columns.
 - Mutation ownership switches behind a server-side gate and can return to the
   old writer only before the new writer performs an irreversible action.
@@ -720,3 +2523,89 @@ The second review verified coherent ownership, the versioned V1 compatibility
 contract, concrete offer identity and persistence, and objective rollout and
 removal gates. M3 remains explicitly unapproved and always requires its later
 dedicated review.
+
+### Review 3
+
+Verdict: `PURSUE` for M2.
+
+Three independent reviews reloaded the complete M2 contract at exact SHA-256
+`038a4d9ea459c8e1117cac56b440a3972e7dc8f2924fc08960d5c17e08ea226a`.
+They verified:
+
+- complete shadow-only legacy fallback without weakening authoritative gates;
+- live ServiceAccount UID binding in stable identity, revalidation, Pod
+  creation, final evidence, and READY;
+- exclusion of ports, autoscalers, controllers, HA, reuse, restart, mounts,
+  plugins, and unmodeled resource or configuration modes;
+- one pinned Kubernetes client and exact-target command transport through
+  bootstrap, mutation, runtime setup, READY, and safe failure cleanup;
+- all-phase Pod and Service conflict checks plus a dedicated fresh-create path;
+- a durable attempt fence committed before provider I/O, exact Service and Pod
+  UID inventory, fenced reconciliation, lifecycle guards, and rollback refusal;
+- first-provider-attempt authority and typed initial or later legacy fallback.
+
+No confirmed M2 safety, compatibility, or implementation blocker remained.
+M3 was out of scope and remains explicitly unapproved.
+
+### Review 4
+
+Verdict: `PURSUE` for M2 S1.
+
+Three independent reviews reloaded the complete generic offer contract at exact
+SHA-256
+`3877665d095e330ff55ad96c72b4241b3d838d9f91506d5fb0c64d23f6c6938e`.
+The final review verified:
+
+- exact wire enums, dataclass and protocol order, factory-only construction,
+  canonical bytes, digest preimages, and bounds;
+- an immutable injected payload-schema DSL with constructor-time invariants;
+- fixed Unicode 3.2 normalization, explicit control ranges, and deterministic
+  behavior on the Python 3.10 through 3.14 support range;
+- canonical UUIDv4 capture provenance and a distinct fresh authoritative
+  capture;
+- closed offer-set, revalidation evidence, plan-decision, and handoff
+  disposition matrices;
+- provider-owned Kubernetes envelope narrowing without importing provider code
+  into the generic leaf;
+- explicit S1 ownership of the generic handoff contract and existing Python
+  3.10 worker-floor qualification, while S2 and S3 retain provider and
+  orchestration ownership.
+
+No confirmed S1 wire, compatibility, ownership, or implementation blocker
+remained. M3 was out of scope and remains explicitly unapproved.
+
+### Review 5
+
+Verdict: `PURSUE` and `MERGE` for the M2 S1 implementation.
+
+Three independent read-only reviews verified the final implementation against
+this contract. The reviewed leaf hashes were:
+
+- `sky/placement/offer.py`:
+  `793548c249ecff76c659c45909bf464206ef0fb0d26fcf29041671e34cb158b8`;
+- `sky/utils/json_types.py`:
+  `1e1b7eb856b3e0f537d02d139fcb580f99be8b407cadad7b84f25d3f70a6d988`;
+- `tests/unit_tests/test_placement_offer.py`:
+  `e4ed1aa7e666092711380a323e70fffd29ab200f7d5c46e194c17d16a57a8b11`;
+- `.github/workflows/static-analysis.yml`:
+  `2d46ea4666376818843122469659f2b8fade175b411fe526bcb74c891252fdc8`;
+- `sky/clouds/cloud.py`:
+  `296c22a9c8c23ce37ee30a2eeba9a8d80cee3547723363ba5673e27115fd7a53`;
+- `sky/placement/__init__.py`:
+  `0f6cd7b22225e11c37c395297672e8a68cac603304dd133ecd30c46afd0b58ec`.
+
+The security review found that runtime protocol membership alone accepts a
+non-callable `close` attribute. The implementation now explicitly requires a
+callable cleanup method, and the capture, authoritative validation, and
+handoff tests lock that rejection across Python 3.10 through 3.14.
+
+The final 15-test acceptance suite also calls every blocked constructor and
+covers request validation, `REUSE` and `RESTART` construction rejection, TTL
+boundaries, empty-string schema behavior, nested missing keys, malformed
+persisted timestamps, and the complete contract matrices. Local qualification
+passed the focused suite, YAPF, isort, Ruff, mypy, Pylint, full-package Python
+3.10 compilation, and installed-package imports at the Python 3.10 and 3.14
+support endpoints. S1 remains additive: it activates no provider source,
+changes no mutation owner, and closes no removal-ledger row. Exact-head CI,
+image qualification, deployment, canary, and monitoring remain required before
+S1 is recorded as deployed.
