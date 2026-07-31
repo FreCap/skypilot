@@ -1043,7 +1043,7 @@ class ScanRepository:
         except sqlalchemy_exc.SQLAlchemyError as e:
             raise _database_failure(e, outer_deadline=deadline) from e
 
-        last_error: BaseException | None = None
+        last_error: Exception | None = None
         for delay in _SERIALIZATION_DELAYS_SECONDS:
             self._raise_if_cancelled()
             if delay:
@@ -1092,7 +1092,7 @@ class ScanRepository:
                 raise
             except ScanFailure:
                 raise
-            except BaseException as e:
+            except Exception as e:
                 last_error = e
                 if _sqlstate(e) == '40001':
                     continue

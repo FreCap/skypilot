@@ -28,7 +28,7 @@ _SLOT_SECONDS = 900
 _ScanAdapter = Callable[..., contracts.PartitionEvidenceResult]
 
 
-def _failure_for(error: BaseException,
+def _failure_for(error: Exception,
                  *,
                  rows_seen: int = 0) -> capacity_repository.ScanFailure:
     if isinstance(error, capacity_repository.ScanFailure):
@@ -204,7 +204,7 @@ class EvidenceProjector:
             metrics.set_projector_health(healthy=False, expired=False)
             self._stop.set()
             return
-        except BaseException as error:  # pylint: disable=broad-except
+        except Exception as error:  # pylint: disable=broad-except
             if self._stop.is_set():
                 return
             failure = _failure_for(error, rows_seen=rows_seen)
@@ -270,7 +270,7 @@ class EvidenceProjector:
                 database_now = self._repository.current_database_time()
                 if self._stop.wait(self._next_wait_seconds(database_now)):
                     return
-        except BaseException:  # pylint: disable=broad-except
+        except Exception:  # pylint: disable=broad-except
             self._healthy = False
             metrics.set_projector_health(healthy=False, expired=False)
             logger.error('Physical-capacity evidence projector stopped '

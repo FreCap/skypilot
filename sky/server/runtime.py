@@ -744,13 +744,13 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                                 request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
                                 None)
                 else:
-                    drain_errors: list[BaseException] = []
+                    drain_errors: list[Exception] = []
 
                     def drain_step(name: str, operation: Callable[[],
                                                                   Any]) -> None:
                         try:
                             operation()
-                        except BaseException as e:  # pylint: disable=broad-except
+                        except Exception as e:  # pylint: disable=broad-except
                             drain_errors.append(e)
                             logger.exception(f'Controller drain step {name} '
                                              'failed.')
