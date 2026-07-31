@@ -1025,6 +1025,14 @@ selector-days and missing intervals, and never claims fleet coverage.
    decision no later than 14 calendar days after expiry, and execute the
    removal deadline below.
 
+Disabled mode preserves the pre-C2 controller promotion and drain path: it
+does not emit the C2 `activating-controller` phase, start or stop a projector,
+make managed-child cleanup fail closed, or invoke the C2 drain-step
+`os._exit(1)` path. The strict all-step drain and process fail-stop apply only
+after shadow mode has returned a live projector, because that projector must
+be joined before leadership release. A disabled-mode cleanup exception still
+uses the existing `try/finally` release semantics.
+
 Rollback is controller `shadow -> disabled`, unset both C2 variables, and roll
 back the binary. The projector is joined before leadership release. Existing
 scan summaries remain inert and old code ignores the new variables. No source
@@ -1114,10 +1122,9 @@ runtime lifecycle hooks merely because one payoff gate passed.
     `capacity-projector-failed` readiness state, `stop_controller_projector`,
     the capacity failure guard on normal draining, and the final
     `Physical-capacity evidence projector failed` exception.
-  - Remove the C2-originated generic drain-step/fail-stop rewrite and the
-    corresponding `_kill_local_controller_children` behavior change unless
-    another accepted design independently owns those exact controller-hardening
-    changes.
+  - Remove the shadow-only strict drain-step/fail-stop branch and the
+    `fail_closed` option on `_kill_local_controller_children`. The disabled
+    controller path retains its pre-C2 behavior and requires no restoration.
 - `sky/utils/db/db_utils.py`
   - Remove `_ISOLATED_POSTGRES_CONNECT_TIMEOUT_SECONDS`.
   - Remove `_ISOLATED_POSTGRES_POOL_TIMEOUT_SECONDS`.
@@ -1162,14 +1169,20 @@ occupancy-ledger code cannot be added under the label of C2 cleanup.
 
 ### C2.1 verification evidence
 
-Implementation anchors:
+Curated stacked-PR implementation anchors:
 
-- `67259d80f`: strict selectors, evidence contracts, and canonical hashing.
-- `14c7c3a4b`: bounded read-only source queries and pure adapters.
-- `2497b690d`: scan repository, metrics, projector, controller lifecycle
+- `beb56f741`: strict selectors, evidence contracts, and canonical hashing.
+- `89963c1fb`: bounded read-only source queries and pure adapters.
+- `2dabe0717`: scan repository, metrics, projector, controller lifecycle
   integration, and PostgreSQL/runtime tests.
 
-Observed against the exact implementation on 2026-07-31:
+These commits were cleanly reconstructed on `improvements` commit
+`004c7b2bc`. Every feature-path blob at the curated projector tip matched the
+reviewed pre-replay tree before the disabled-path correction in this PR; the
+rejected design and rollout-helper commits are absent from the stack. The
+curated commits above are the only implementation anchors for review.
+
+Observed against the pre-replay implementation on 2026-07-31:
 
 - all 165 non-PostgreSQL C2 tests passed: 29 selector/config, 20 hashing,
   93 source-adapter, and 23 projector/runtime cases;
@@ -1182,6 +1195,14 @@ Observed against the exact implementation on 2026-07-31:
   plus `git diff --check` were clean; and
 - independent adversarial implementation review found no remaining C2.1
   contract blocker after the final fencing and committed-metric fixes.
+
+After clean replay and the disabled-path correction, all 219
+non-PostgreSQL capacity cases (the 52 C1 model cases plus 167 C2 cases,
+including 25 projector/runtime cases) and the existing runtime,
+database-utility, and migration unit-test files passed on the curated stack.
+Mypy checked 810 source files clean and pylint reported 10.00/10. The live
+PostgreSQL results above apply to the feature implementation before replay.
+An exact curated-image build and disabled deployment remain the next gate.
 
 This evidence authorizes only C2.2. No disabled-deployment, live selector,
 provider-call audit, source-write audit, restart/handoff, or measurement-cohort
@@ -1215,7 +1236,8 @@ Automated tests cover:
 - exact long/short statement, lock, idle, connect, checkout, and watchdog
   budgets plus every closed database-failure mapping;
 - sequential 15-minute cadence, 35-day expiry, shutdown-before-lease-release,
-  and no DML outside `capacity_projection_scans`; and
+  disabled-mode legacy drain/release behavior, shadow-only fail-stop, and no
+  DML outside `capacity_projection_scans`; and
 - metric/committed-counter parity with no high-cardinality labels.
 
 Manual test:
