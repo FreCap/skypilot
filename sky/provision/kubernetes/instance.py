@@ -21,11 +21,11 @@ from sky.provision.kubernetes import constants as k8s_constants
 from sky.provision.kubernetes import host_network_probe
 from sky.provision.kubernetes import pod_diagnostics
 from sky.provision.kubernetes import pod_scheduling
+from sky.provision.kubernetes import pod_spec as pod_spec_lib
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes import volume
 from sky.utils import command_runner
 from sky.utils import common_utils
-from sky.utils import config_utils
 from sky.utils import plugin_extensions
 from sky.utils import rich_utils
 from sky.utils import status_lib
@@ -135,10 +135,6 @@ def _get_pvc_name(cluster_name: str, volume_name: str) -> str:
 
 def _get_deployment_name(cluster_name: str) -> str:
     return f'{cluster_name}-deployment'
-
-
-def _head_service_selector(cluster_name: str) -> dict[str, str]:
-    return {'component': f'{cluster_name}-head'}
 
 
 def is_high_availability_cluster_by_kubectl(
@@ -784,25 +780,15 @@ def _wait_for_deployment_pod(context,
         'ready.')
 
 
-def _configure_runtime_class(pod_spec: dict[str,
-                                            Any], nvidia_runtime_exists: bool,
-                             needs_gpus_nvidia: bool) -> None:
-    """Sets or strips runtimeClassName on the pod spec in-place.
-
-    A falsy runtimeClassName (e.g. '' or None from a
-    kubernetes.pod_config override) means the user explicitly disabled
-    the runtime class. It is stripped from all pods regardless of GPU
-    requests: the Kubernetes API rejects pods with an empty-string
-    runtimeClassName ('resource name may not be empty'), and it must
-    also suppress the automatic 'nvidia' assignment below.
-    """
-    spec = pod_spec['spec']
-    if 'runtimeClassName' in spec and not spec['runtimeClassName']:
-        del spec['runtimeClassName']
-        return
-    if (nvidia_runtime_exists and needs_gpus_nvidia and
-            'runtimeClassName' not in spec):
-        spec['runtimeClassName'] = 'nvidia'
+# Preserve the historical private import seam for focused callers while the
+# production mutation owner lives in pod_spec.py.
+# pylint: disable=protected-access
+_configure_runtime_class = pod_spec_lib._configure_runtime_class
+_head_service_selector = pod_spec_lib._head_service_selector
+# pylint: enable=protected-access
+for _pod_spec_symbol in (_configure_runtime_class, _head_service_selector):
+    _pod_spec_symbol.__module__ = __name__
+del _pod_spec_symbol
 
 
 def _validate_cluster_name_annotations(pods: dict[str, Any], cluster_name: str,
@@ -980,151 +966,73 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
     needs_gpus = False
     needs_gpus_nvidia = False
+    gpu_resource_key = kubernetes_utils.SUPPORTED_GPU_RESOURCE_KEYS['nvidia']
     limits = pod_spec['spec']['containers'][0].get('resources',
                                                    {}).get('limits')
     if limits is not None:
-        needs_gpus = limits.get(kubernetes_utils.get_gpu_resource_key(context),
-                                0) > 0
+        gpu_resource_key = kubernetes_utils.get_gpu_resource_key(context)
+        needs_gpus = limits.get(gpu_resource_key, 0) > 0
         needs_gpus_nvidia = limits.get(
             kubernetes_utils.SUPPORTED_GPU_RESOURCE_KEYS['nvidia'], 0) > 0
 
-    # TPU pods provisioned on GKE use the default containerd runtime.
-    # Reference: https://cloud.google.com/kubernetes-engine/docs/how-to/migrate-containerd#overview  # pylint: disable=line-too-long
-    _configure_runtime_class(pod_spec, nvidia_runtime_exists, needs_gpus_nvidia)
+    tpu_label = kubernetes_utils.GKELabelFormatter.TPU_LABEL_KEY
+    needs_tpu = tpu_label in config.node_config.get('spec',
+                                                    {}).get('nodeSelector', {})
+
+    # Resolve allowed_nodes once before parallel Pod construction.  This is the
+    # only part of the policy that may list provider nodes; the pure finalizer
+    # receives the resulting full base affinity.
+    resolved_base_affinity = None
+    if to_start_count > 0:
+        resolved_spec = copy.deepcopy(pod_spec['spec'])
+        allowed_nodes_config = kubernetes_utils.get_allowed_nodes_config(
+            context)
+        kubernetes_utils.inject_allowed_nodes_affinity(resolved_spec,
+                                                       allowed_nodes_config,
+                                                       context=context)
+        resolved_base_affinity = resolved_spec.get('affinity')
 
     logger.debug(f'run_instances: calling create_namespaced_pod '
                  f'(count={to_start_count}).')
 
     def _create_resource_thread(i: int):
-        pod_spec_copy = copy.deepcopy(pod_spec)
         # 0 is for head pod, while 1+ is for worker pods.
         if i == 0:
             if head_pod_name is None:
                 # First pod should be head if no head exists
-                pod_spec_copy['metadata']['labels'].update(
-                    constants.HEAD_NODE_TAGS)
-                head_selector = _head_service_selector(cluster_name_on_cloud)
-                pod_spec_copy['metadata']['labels'].update(head_selector)
-                pod_spec_copy['metadata'][
-                    'name'] = f'{cluster_name_on_cloud}-head'
+                role: pod_spec_lib.PodRole = 'head'
+                pod_name = f'{cluster_name_on_cloud}-head'
             else:
                 # If head pod already exists, we skip creating it.
                 return
         else:
             # Worker pods
-            pod_spec_copy['metadata']['labels'].update(
-                constants.WORKER_NODE_TAGS)
+            role = 'worker'
             pod_name = f'{cluster_name_on_cloud}-worker{i}'
             if pod_name in running_pods:
                 # If the pod is already running, we skip creating it.
                 return
-            pod_spec_copy['metadata']['name'] = pod_name
-            pod_spec_copy['metadata']['labels']['component'] = pod_name
 
-        # Inject cache volume + volumeMount for the Docker sidecar container.
-        if docker_config:
-            kubernetes_utils.inject_docker_cache_volume(
-                pod_spec=pod_spec_copy,
-                docker_config=docker_config,
-                pvc_name=docker_pvc_name,
-                context=context,
-                namespace=namespace,
-            )
-
-        # We need to keep the following fields in the pod spec to be same for
-        # head and worker pods.
-        # So that Kueue can merge them into a single PodSet when creating
-        # ProvisioningRequest to trigger scale up of the cluster autoscaler,
-        # this is especially required for DWS queued provisioning mode in GKE.
-        #  spec.containers[*].resources.requests
-        #  spec.initContainers[*].resources.requests
-        #  spec.resources
-        #  spec.nodeSelector
-        #  spec.tolerations
-        #  spec.affinity
-        #  resourceClaims
-        # Refer to the following links for more details:
-        # https://cloud.google.com/kubernetes-engine/docs/how-to/provisioningrequest#define_a_provisioningrequest_object # pylint: disable=line-too-long
-        # https://kueue.sigs.k8s.io/docs/admission-check-controllers/provisioning/#podset-merge-policy # pylint: disable=line-too-long
-        if config.count > 1:
-            # For multi-node support, we put a soft-constraint to schedule
-            # worker pods on different nodes than the head pod.
-            # This is not set as a hard constraint because if different nodes
-            # are not available, we still want to be able to schedule worker
-            # pods on larger nodes which may be able to fit multiple SkyPilot
-            # "nodes".
-            pod_spec_config = config_utils.Config(pod_spec_copy['spec'].get(
-                'affinity', {}))
-            existing_rules = pod_spec_config.get_nested(
-                ('podAntiAffinity',
-                 'preferredDuringSchedulingIgnoredDuringExecution'), [])
-            existing_rules.append({
-                # Max weight to avoid scheduling on the
-                # same physical node unless necessary.
-                'weight': 100,
-                'podAffinityTerm': {
-                    'labelSelector': {
-                        'matchExpressions': [{
-                            'key': constants.TAG_SKYPILOT_CLUSTER_NAME,
-                            'operator': 'In',
-                            'values': [cluster_name_on_cloud]
-                        }]
-                    },
-                    'topologyKey': 'kubernetes.io/hostname'
-                }
-            })
-            pod_spec_config.set_nested(
-                ('podAntiAffinity',
-                 'preferredDuringSchedulingIgnoredDuringExecution'),
-                existing_rules)
-            pod_spec_copy['spec']['affinity'] = pod_spec_config
-
-        # TPU slice nodes are given a taint, google.com/tpu=present:NoSchedule.
-        # This is to prevent from non-TPU workloads from being scheduled on TPU
-        # slice nodes. We need this toleration to allow the pod to be scheduled
-        # on TPU nodes.
-        # Reference: https://cloud.google.com/kubernetes-engine/docs/concepts/tpus#how_tpus_work # pylint: disable=line-too-long
-        tpu_label = kubernetes_utils.GKELabelFormatter.TPU_LABEL_KEY
-        if tpu_label in config.node_config.get('spec',
-                                               {}).get('nodeSelector', {}):
-            tpu_toleration = {
-                'key': kubernetes_utils.TPU_RESOURCE_KEY,
-                'operator': 'Equal',
-                'value': 'present',
-                'effect': 'NoSchedule'
-            }
-            # Preserve existing tolerations if any
-            existing_tolerations = pod_spec_copy['spec'].get('tolerations', [])
-            pod_spec_copy['spec']['tolerations'] = existing_tolerations + [
-                tpu_toleration
-            ]
-        # Add GPU toleration if GPU is requested.
-        # The nodes provisioned by DWS with flex start with queued provisioning
-        # mode have the GPU taint, so we have to add the GPU toleration.
-        # No need to check if DWS is enabled here since this has no side effect
-        # to the non-DWS case.
-        if needs_gpus:
-            gpu_toleration = {
-                'key': kubernetes_utils.get_gpu_resource_key(context),
-                'operator': 'Exists',
-                'effect': 'NoSchedule'
-            }
-            # Preserve existing tolerations if any
-            existing_tolerations = pod_spec_copy['spec'].get('tolerations', [])
-            pod_spec_copy['spec']['tolerations'] = existing_tolerations + [
-                gpu_toleration
-            ]
-
-        # Apply allowed_nodes scheduling constraints to restrict pods to
-        # nodes permitted by the user's config. This is required in addition
-        # to discovery filtering because the K8s scheduler doesn't know
-        # about our filter - it would schedule on any node matching the GPU
-        # label, including non-allowed nodes with the same GPU type.
-        allowed_nodes_config = kubernetes_utils.get_allowed_nodes_config(
-            context)
-        kubernetes_utils.inject_allowed_nodes_affinity(pod_spec_copy['spec'],
-                                                       allowed_nodes_config,
-                                                       context=context)
+        deployment_name = (deployment_spec['metadata']['name']
+                           if to_create_deployment else None)
+        pod_spec_copy = pod_spec_lib.finalize_pod_spec(
+            pod_spec,
+            role=role,
+            pod_name=pod_name,
+            cluster_name_on_cloud=cluster_name_on_cloud,
+            node_count=config.count,
+            nvidia_runtime_exists=nvidia_runtime_exists,
+            needs_gpus=needs_gpus,
+            needs_gpus_nvidia=needs_gpus_nvidia,
+            gpu_resource_key=gpu_resource_key,
+            needs_tpu=needs_tpu,
+            resolved_base_affinity=resolved_base_affinity,
+            docker_config=docker_config,
+            docker_pvc_name=docker_pvc_name,
+            context=context,
+            namespace=namespace,
+            deployment_name=deployment_name,
+        )
 
         if to_create_deployment:
             volume.create_persistent_volume_claim(namespace, context, pvc_spec)
@@ -1132,10 +1040,6 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             # It's safe to directly modify the template spec in the deployment spec
             # because controller pod is singleton, i in [0].
             template_pod_spec = deployment_spec['spec']['template']
-            # Add the deployment name as a label to the pod spec
-            deployment_name = deployment_spec['metadata']['name']
-            pod_spec_copy['metadata']['labels'][
-                k8s_constants.TAG_SKYPILOT_DEPLOYMENT_NAME] = deployment_name
             template_pod_spec['metadata'] = pod_spec_copy['metadata']
             template_pod_spec['spec'].update(pod_spec_copy['spec'])
             # Propagate the labels to the deployment for identification.
