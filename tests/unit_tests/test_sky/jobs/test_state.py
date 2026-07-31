@@ -904,6 +904,20 @@ def test_get_controller_log_follow_state_missing_job_is_one_query(
     assert counts['n'] == 1, counts
 
 
+def test_get_controller_log_follow_state_keeps_legacy_task_in_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 999, 0, status=ManagedJobStatus.SUCCEEDED)
+
+    with _count_sql_statements(engine) as counts:
+        follow_state = state.get_controller_log_follow_state(999)
+
+    assert follow_state == state.ControllerLogFollowState(
+        ManagedJobStatus.SUCCEEDED, None)
+    assert follow_state.__class__.__module__ == 'sky.jobs.state'
+    assert counts['n'] == 1, counts
+
+
 def test_get_task_log_stream_snapshot_reads_one_task_snapshot(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn

@@ -64,6 +64,23 @@ reports terminal status with the same message and exit code, and returns success
 without output when a non-following request finds no file. Existing database,
 config, CLI, controller-codegen, and remote-command formats do not change.
 
+For modern managed jobs, a terminal task status does not end a following
+controller-log request by itself. The controller may still be streaming task
+logs or cleaning up resources. Following ends only after the scheduler's
+durable `DONE` transition, then performs the existing final-byte drain. Legacy
+jobs without a scheduler-state row retain the terminal-task fallback. Each
+poll reads task status and scheduler state in one SQL statement so the stop
+decision cannot combine values from different lifecycle snapshots or add a
+second query to the polling path.
+
+The lifecycle correction uses this changed-path-to-test matrix:
+
+| Changed production path | Invariants | Focused tests and command |
+| --- | --- | --- |
+| `sky/jobs/controller_log_stream.py` | modern terminal plus `ALIVE` keeps following; `DONE` stops and drains; legacy `NULL` schedule uses terminal status; non-following paths are unchanged | `pytest -n 0 tests/unit_tests/test_sky/jobs/test_controller_log_stream.py tests/unit_tests/test_sky/jobs/test_log_follow_lifecycle.py tests/unit_tests/test_jobs_utils.py` |
+| `sky/jobs/state.py`, `sky/jobs/status_types.py` | one coherent query returns active, finalized, missing, and legacy lifecycle snapshots; the facade type identity remains stable | `pytest -n 0 tests/unit_tests/test_sky/jobs/test_state.py` |
+| Polling performance | one SQL statement per lifecycle snapshot and only the required `ALIVE` to `DONE` polls | the SQL-count and call-count assertions in the two focused lifecycle test files above |
+
 ## Milestones and test plan
 
 1. Add facade-level characterization tests for controller-log tail filtering,
@@ -74,6 +91,10 @@ config, CLI, controller-codegen, and remote-command formats do not change.
 3. Compare the moved behavior structurally and benchmark non-following local
    requests to confirm the single dispatch frame is immaterial relative to the
    unchanged filesystem and status operations.
+4. Correct following completion to use the scheduler's durable `DONE` state,
+   while preserving the legacy terminal-status fallback. Prove modern,
+   legacy, missing-job, final-drain, and one-query polling boundaries with the
+   matrix above.
 
 The changed Python paths are covered by the pull-request `Unit Tests` matrix in
 `.github/workflows/pytest.yml`, which has no pull-request path filter and runs

@@ -1,11 +1,34 @@
 """Managed-job controller-log follow lifecycle tests."""
 
+# pylint: disable=protected-access
+
 from unittest import mock
+
+import pytest
 
 from sky import exceptions
 from sky.jobs import controller_log_stream
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as jobs_utils
+
+
+@pytest.mark.parametrize(('status', 'schedule_state', 'expected'), [
+    (None, None, False),
+    (managed_job_state.ManagedJobStatus.RUNNING, None, False),
+    (managed_job_state.ManagedJobStatus.SUCCEEDED, None, True),
+    (managed_job_state.ManagedJobStatus.SUCCEEDED,
+     managed_job_state.ManagedJobScheduleState.ALIVE, False),
+    (managed_job_state.ManagedJobStatus.SUCCEEDED,
+     managed_job_state.ManagedJobScheduleState.DONE, True),
+    (managed_job_state.ManagedJobStatus.RUNNING,
+     managed_job_state.ManagedJobScheduleState.DONE, True),
+])
+def test_follow_completion_boundaries(status, schedule_state, expected):
+    follow_state = managed_job_state.ControllerLogFollowState(
+        status, schedule_state)
+
+    assert controller_log_stream._controller_log_follow_is_complete(
+        follow_state) is expected
 
 
 def test_follow_waits_for_done_schedule_state(tmp_path, capsys):
