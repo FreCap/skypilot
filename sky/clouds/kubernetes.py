@@ -19,6 +19,7 @@ from sky import resources as resources_lib
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import kubernetes
+from sky.clouds import kubernetes_context_policy
 from sky.clouds.utils import gcp_utils
 from sky.provision import instance_setup
 from sky.provision.gcp import constants as gcp_constants
@@ -329,79 +330,59 @@ class Kubernetes(clouds.Cloud):
         if not all_contexts:
             return []
 
-        all_contexts = set(all_contexts)
-
-        # Allowed_contexts specified for workspace should take precedence over
-        # the global allowed_contexts.
-        allowed_contexts = skypilot_config.get_workspace_cloud(
-            'kubernetes').get('allowed_contexts', None)
-        if allowed_contexts is None:
-            allowed_contexts = skypilot_config.get_effective_region_config(
+        config_snapshot = skypilot_config.to_dict()
+        workspace = skypilot_config.get_active_workspace()
+        effective_allowed_contexts = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                config_snapshot=config_snapshot,
                 cloud='kubernetes',
                 region=None,
                 keys=('allowed_contexts',),
-                default_value=None)
+                default_value=None,
+                workspace=workspace,
+                override_configs=None))
+        contexts_explicitly_set = (effective_allowed_contexts is not None and
+                                   effective_allowed_contexts != 'all')
+        allow_all_contexts = False
+        if effective_allowed_contexts is None:
+            allow_all_contexts = (
+                env_options.Options.ALLOW_ALL_KUBERNETES_CONTEXTS.get())
+        include_in_cluster = True
+        if not contexts_explicitly_set:
+            include_in_cluster = (
+                env_options.Options.ALL_KUBERNETES_CONTEXTS_INCLUDES_IN_CLUSTER.
+                get())
 
-        # Whether the user explicitly pinned the contexts to a list, as
-        # opposed to leaving them to be derived (`'all'`, the allow-all env
-        # var, or the in-cluster fallback below). The in-cluster exclusion at
-        # the end of this method only applies to the derived case; an explicit
-        # list is a deliberate choice and is honored as-is.
-        contexts_explicitly_set = (allowed_contexts is not None and
-                                   allowed_contexts != 'all')
-
-        # Exclude contexts starting with `ssh-`
-        # TODO(romilb): Remove when SSH Node Pools use a separate kubeconfig.
-        all_contexts = [
-            ctx for ctx in all_contexts if not ctx.startswith('ssh-')
-        ]
-
-        allow_all_contexts = allowed_contexts == 'all' or (
-            allowed_contexts is None and
-            env_options.Options.ALLOW_ALL_KUBERNETES_CONTEXTS.get())
-        if allow_all_contexts:
-            allowed_contexts = all_contexts
-
-        if allowed_contexts is None:
-            # Try kubeconfig if present
+        current_context = None
+        in_cluster_available = False
+        in_cluster_context = None
+        derive_current_context = (effective_allowed_contexts is None and
+                                  not allow_all_contexts)
+        if derive_current_context:
             current_context = (
                 kubernetes_utils.get_current_kube_config_context_name())
-            if ((current_context is None or current_context.startswith('ssh-'))
-                    and kubernetes_utils.is_incluster_config_available()):
-                # If no kubeconfig contexts found, use in-cluster if available
-                current_context = kubernetes.in_cluster_context_name()
-            allowed_contexts = []
-            if current_context is not None:
-                allowed_contexts = [current_context]
+            if (current_context is None or current_context.startswith('ssh-')):
+                in_cluster_available = (
+                    kubernetes_utils.is_incluster_config_available())
+                if in_cluster_available:
+                    in_cluster_context = kubernetes.in_cluster_context_name()
+        if (not contexts_explicitly_set and not include_in_cluster and
+                in_cluster_context is None):
+            in_cluster_context = kubernetes.in_cluster_context_name()
 
-        existing_contexts = []
-        skipped_contexts = []
-        for context in allowed_contexts:
-            if context in all_contexts:
-                existing_contexts.append(context)
-            else:
-                # Skip SSH Node Pool contexts
-                if context.startswith('ssh-'):
-                    continue
-                skipped_contexts.append(context)
-
-        # `SKYPILOT_ALL_KUBERNETES_CONTEXTS_INCLUDES_IN_CLUSTER=false` keeps the
-        # API server's own in-cluster context from being surfaced as a
-        # user-facing compute target. Applied to the final result so it holds
-        # regardless of how the contexts were derived -- the `allowed_contexts:
-        # all` expansion, the allow-all env var, or the in-cluster fallback
-        # above. An explicitly configured list is honored as-is. Default is to
-        # include in-cluster (backward compatible).
-        if (not contexts_explicitly_set and not env_options.Options.
-                ALL_KUBERNETES_CONTEXTS_INCLUDES_IN_CLUSTER.get()):
-            in_cluster_name = kubernetes.in_cluster_context_name()
-            existing_contexts = [
-                c for c in existing_contexts if c != in_cluster_name
-            ]
+        resolution = (
+            kubernetes_context_policy.resolve_kubernetes_allowed_contexts(
+                effective_allowed_contexts=effective_allowed_contexts,
+                available_contexts=tuple(all_contexts),
+                current_context=current_context,
+                in_cluster_available=in_cluster_available,
+                in_cluster_context=in_cluster_context,
+                allow_all_contexts=allow_all_contexts,
+                include_in_cluster=include_in_cluster))
 
         if not silent:
-            cls._log_skipped_contexts_once(tuple(skipped_contexts))
-        return existing_contexts
+            cls._log_skipped_contexts_once(resolution.skipped_contexts)
+        return list(resolution.existing_contexts)
 
     @classmethod
     def _log_unreachable_context(cls,
@@ -900,8 +881,8 @@ class Kubernetes(clouds.Cloud):
                 region=context,
                 keys=('autoscaler',),
                 default_value=None)
-            if (autoscaler_type
-                    != kubernetes_enums.KubernetesAutoscalerType.GKE.value):
+            if (autoscaler_type !=
+                    kubernetes_enums.KubernetesAutoscalerType.GKE.value):
                 raise ValueError(
                     f'DWS is only supported in GKE, but the autoscaler type '
                     f'for context {context} is {autoscaler_type}')
@@ -1587,8 +1568,8 @@ class Kubernetes(clouds.Cloud):
                                     k8s_resource_key
                                     not in node.status.allocatable or
                                     int(node.status.
-                                        allocatable[k8s_resource_key])
-                                    < acc_count):
+                                        allocatable[k8s_resource_key]) <
+                                    acc_count):
                                 continue
                             # Calculate EFA count proportionally
                             if AWS_EFA_RESOURCE_KEY in node.status.allocatable:
@@ -1683,8 +1664,8 @@ class Kubernetes(clouds.Cloud):
             region=context,
             keys=('autoscaler',),
             default_value=None)
-        if (autoscaler_type
-                != kubernetes_enums.KubernetesAutoscalerType.GKE.value):
+        if (autoscaler_type !=
+                kubernetes_enums.KubernetesAutoscalerType.GKE.value):
             return KubernetesHighPerformanceNetworkType.NONE, None
         autoscaler = kubernetes_utils.get_autoscaler(
             kubernetes_enums.KubernetesAutoscalerType(autoscaler_type))

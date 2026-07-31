@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from sky import skypilot_config
 from sky.clouds import kubernetes
 from sky.clouds.utils import gcp_utils
 from sky.provision.kubernetes import utils as kubernetes_utils
@@ -22,12 +23,28 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
         # Clear any cached results
         kubernetes.Kubernetes._log_skipped_contexts_once.cache_clear()
 
+        self._config_snapshot = {}
+        snapshot_patcher = patch.object(
+            skypilot_config,
+            'to_dict',
+            side_effect=lambda: copy.deepcopy(self._config_snapshot))
+        workspace_patcher = patch.object(skypilot_config,
+                                         'get_active_workspace',
+                                         return_value='default')
+        snapshot_patcher.start()
+        workspace_patcher.start()
+        self.addCleanup(snapshot_patcher.stop)
+        self.addCleanup(workspace_patcher.stop)
+
+    def _set_allowed_contexts(self, value, *, workspace=False):
+        cloud_config = {'kubernetes': {'allowed_contexts': value}}
+        if workspace:
+            self._config_snapshot = {'workspaces': {'default': cloud_config}}
+        else:
+            self._config_snapshot = cloud_config
+
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
-    def test_no_contexts_available(self, mock_get_nested,
-                                   mock_get_workspace_cloud,
-                                   mock_get_all_contexts):
+    def test_no_contexts_available(self, mock_get_all_contexts):
         """Test when no Kubernetes contexts are available."""
         mock_get_all_contexts.return_value = []
 
@@ -37,85 +54,56 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
         mock_get_all_contexts.assert_called_once()
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
     def test_workspace_allowed_contexts_takes_precedence(
-            self, mock_get_nested, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+            self, mock_get_all_contexts):
         """Test that workspace allowed_contexts takes precedence over global."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2', 'ctx3']
-        mock_get_workspace_cloud.return_value.get.return_value = [
-            'ctx1', 'ctx2'
-        ]
-        mock_get_nested.return_value = ['ctx3']  # This should be ignored
+        self._config_snapshot = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx3']
+            },
+            'workspaces': {
+                'default': {
+                    'kubernetes': {
+                        'allowed_contexts': ['ctx1', 'ctx2']
+                    }
+                }
+            },
+        }
 
         result = kubernetes.Kubernetes.existing_allowed_contexts()
 
         self.assertEqual(result, ['ctx1', 'ctx2'])
-        mock_get_workspace_cloud.assert_called_once_with('kubernetes')
-        # get_nested should not be called when workspace config exists
-        mock_get_nested.assert_not_called()
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
     def test_global_allowed_contexts_when_no_workspace_config(
-            self, mock_get_cloud_config_value, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+            self, mock_get_all_contexts):
         """Test using global allowed_contexts when workspace config is None."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2', 'ctx3']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_cloud_config_value.return_value = ['ctx2', 'ctx3']
+        self._set_allowed_contexts(['ctx2', 'ctx3'])
 
         result = kubernetes.Kubernetes.existing_allowed_contexts()
 
         self.assertEqual(result, ['ctx2', 'ctx3'])
-        mock_get_cloud_config_value.assert_called_once_with(
-            cloud='kubernetes',
-            keys=('allowed_contexts',),
-            region=None,
-            default_value=None)
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
     def test_global_allowed_all_contexts_in_config_when_no_workspace_config(
-            self, mock_get_cloud_config_value, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+            self, mock_get_all_contexts):
         """Test using global allowed_contexts=all in config when workspace config is None."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2', 'ctx3']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-
-        # get_effective_region_config is called for 'allowed_contexts';
-        # 'all_includes_in_cluster' is read via
-        # get_effective_workspace_region_config and patched separately.
-        def _get_eff(*args, **kwargs):
-            keys = kwargs.get('keys') or (args[1] if len(args) > 1 else None)
-            if keys == ('allowed_contexts',):
-                return 'all'
-            return kwargs.get('default_value')
-
-        mock_get_cloud_config_value.side_effect = _get_eff
+        self._set_allowed_contexts('all')
 
         result = kubernetes.Kubernetes.existing_allowed_contexts()
 
         self.assertEqual(set(result), {'ctx1', 'ctx2', 'ctx3'})
-        mock_get_cloud_config_value.assert_any_call(cloud='kubernetes',
-                                                    keys=('allowed_contexts',),
-                                                    region=None,
-                                                    default_value=None)
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
     def test_env_ignored_when_global_allowed_contexts_is_set(
-            self, mock_get_cloud_config_value, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+            self, mock_get_all_contexts):
         """Env var should NOT override when global allowed_contexts is set (even empty)."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2', 'ctx3']
-        mock_get_workspace_cloud.return_value.get.return_value = None
         # Global config present but empty list means no contexts allowed; env should be ignored.
-        mock_get_cloud_config_value.return_value = []
+        self._set_allowed_contexts([])
 
         with patch.dict(os.environ,
                         {'SKYPILOT_ALLOW_ALL_KUBERNETES_CONTEXTS': 'true'},
@@ -124,22 +112,13 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
 
         # Since global allowed_contexts is explicitly set (empty), env is ignored -> no contexts.
         self.assertEqual(result, [])
-        mock_get_cloud_config_value.assert_called_once_with(
-            cloud='kubernetes',
-            keys=('allowed_contexts',),
-            region=None,
-            default_value=None)
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_env_does_not_override_global_when_present(
-            self, mock_get_cloud_config_value, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+    def test_env_does_not_override_global_when_present(self,
+                                                       mock_get_all_contexts):
         """Env var should NOT override global allowed_contexts when present."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2', 'ctx3']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_cloud_config_value.return_value = ['ctx1']
+        self._set_allowed_contexts(['ctx1'])
 
         with patch.dict(os.environ,
                         {'SKYPILOT_ALLOW_ALL_KUBERNETES_CONTEXTS': 'true'},
@@ -148,24 +127,24 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
 
         # Global allowed_contexts is set; env should be ignored -> only ctx1 allowed.
         self.assertEqual(result, ['ctx1'])
-        mock_get_cloud_config_value.assert_called_once_with(
-            cloud='kubernetes',
-            keys=('allowed_contexts',),
-            region=None,
-            default_value=None)
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
     def test_env_does_not_override_workspace_when_present(
-            self, mock_get_cloud_config_value, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+            self, mock_get_all_contexts):
         """Env var should NOT override workspace/global allowed_contexts when present."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2', 'ctx3']
-        # Workspace config present
-        mock_get_workspace_cloud.return_value.get.return_value = ['ctx1']
-        # Global config also present but should be ignored due to env override
-        mock_get_cloud_config_value.return_value = ['ctx1', 'ctx2']
+        self._config_snapshot = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx1', 'ctx2']
+            },
+            'workspaces': {
+                'default': {
+                    'kubernetes': {
+                        'allowed_contexts': ['ctx1']
+                    }
+                }
+            },
+        }
 
         with patch.dict(os.environ,
                         {'SKYPILOT_ALLOW_ALL_KUBERNETES_CONTEXTS': 'true'},
@@ -175,17 +154,11 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
         self.assertEqual(result, ['ctx1'])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
-    def test_excludes_ssh_contexts(self, mock_get_nested,
-                                   mock_get_workspace_cloud,
-                                   mock_get_all_contexts):
+    def test_excludes_ssh_contexts(self, mock_get_all_contexts):
         """Test that contexts starting with 'ssh-' are excluded."""
         mock_get_all_contexts.return_value = [
             'ctx1', 'ssh-cluster1', 'ctx2', 'ssh-cluster2'
         ]
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_nested.return_value = None
 
         # Mock current context to be ctx1
         with patch(
@@ -197,8 +170,6 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
         self.assertEqual(result, ['ctx1'])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
     @patch('sky.provision.kubernetes.utils.'
            'get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.is_incluster_config_available')
@@ -206,36 +177,29 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
     def test_fallback_to_current_context(self, mock_in_cluster_name,
                                          mock_is_incluster_available,
                                          mock_get_current_context,
-                                         mock_get_nested,
-                                         mock_get_workspace_cloud,
                                          mock_get_all_contexts):
         """Test fallback to current context when no allowed_contexts set."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_nested.return_value = None
         mock_get_current_context.return_value = 'ctx1'
         mock_is_incluster_available.return_value = False
 
         result = kubernetes.Kubernetes.existing_allowed_contexts()
 
         self.assertEqual(result, ['ctx1'])
+        mock_is_incluster_available.assert_not_called()
+        mock_in_cluster_name.assert_not_called()
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
     @patch('sky.provision.kubernetes.utils.'
            'get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.is_incluster_config_available')
     @patch('sky.adaptors.kubernetes.in_cluster_context_name')
     def test_fallback_to_incluster_when_no_current_context(
             self, mock_in_cluster_name, mock_is_incluster_available,
-            mock_get_current_context, mock_get_nested, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+            mock_get_current_context, mock_get_all_contexts):
         """Test fallback to in-cluster context when no current context."""
         # Include the in-cluster context in all_contexts
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2', 'in-cluster']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_nested.return_value = None
         mock_get_current_context.return_value = None
         mock_is_incluster_available.return_value = True
         mock_in_cluster_name.return_value = 'in-cluster'
@@ -245,51 +209,30 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
         self.assertEqual(result, ['in-cluster'])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_filters_existing_contexts_only(self, mock_get_cloud_config_value,
-                                            mock_get_workspace_cloud,
-                                            mock_get_all_contexts):
+    def test_filters_existing_contexts_only(self, mock_get_all_contexts):
         """Test that only existing contexts are returned."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_cloud_config_value.return_value = [
-            'ctx1', 'ctx2', 'nonexistent-ctx'
-        ]
+        self._set_allowed_contexts(['ctx1', 'ctx2', 'nonexistent-ctx'])
 
         result = kubernetes.Kubernetes.existing_allowed_contexts()
 
         self.assertEqual(result, ['ctx1', 'ctx2'])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_skips_ssh_contexts_in_allowed_list(self,
-                                                mock_get_cloud_config_value,
-                                                mock_get_workspace_cloud,
-                                                mock_get_all_contexts):
+    def test_skips_ssh_contexts_in_allowed_list(self, mock_get_all_contexts):
         """Test that SSH contexts in allowed list are skipped."""
         mock_get_all_contexts.return_value = ['ctx1', 'ctx2']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_cloud_config_value.return_value = [
-            'ctx1', 'ssh-cluster', 'ctx2'
-        ]
+        self._set_allowed_contexts(['ctx1', 'ssh-cluster', 'ctx2'])
 
         result = kubernetes.Kubernetes.existing_allowed_contexts()
 
         self.assertEqual(result, ['ctx1', 'ctx2'])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_logs_skipped_contexts_when_not_silent(self,
-                                                   mock_get_cloud_config_value,
-                                                   mock_get_workspace_cloud,
-                                                   mock_get_all_contexts):
+    def test_logs_skipped_contexts_when_not_silent(self, mock_get_all_contexts):
         """Test that skipped contexts are logged when not silent."""
         mock_get_all_contexts.return_value = ['ctx1']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_cloud_config_value.return_value = ['ctx1', 'nonexistent-ctx']
+        self._set_allowed_contexts(['ctx1', 'nonexistent-ctx'])
 
         with patch.object(kubernetes.Kubernetes,
                           '_log_skipped_contexts_once') as mock_log:
@@ -300,15 +243,11 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
             mock_log.assert_called_once_with(('nonexistent-ctx',))
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_does_not_log_skipped_contexts_when_silent(
-            self, mock_get_cloud_config_value, mock_get_workspace_cloud,
-            mock_get_all_contexts):
+    def test_does_not_log_skipped_contexts_when_silent(self,
+                                                       mock_get_all_contexts):
         """Test that skipped contexts are not logged when silent=True."""
         mock_get_all_contexts.return_value = ['ctx1']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_cloud_config_value.return_value = ['ctx1', 'nonexistent-ctx']
+        self._set_allowed_contexts(['ctx1', 'nonexistent-ctx'])
 
         with patch.object(kubernetes.Kubernetes,
                           '_log_skipped_contexts_once') as mock_log:
@@ -319,18 +258,15 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
             mock_log.assert_not_called()
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.is_incluster_config_available')
-    def test_empty_result_when_no_contexts_found(
-            self, mock_is_incluster_available, mock_get_current_context,
-            mock_get_nested, mock_get_workspace_cloud, mock_get_all_contexts):
+    def test_empty_result_when_no_contexts_found(self,
+                                                 mock_is_incluster_available,
+                                                 mock_get_current_context,
+                                                 mock_get_all_contexts):
         """Test empty result when no valid contexts are found."""
         mock_get_all_contexts.return_value = ['ctx1']
-        mock_get_workspace_cloud.return_value.get.return_value = None
-        mock_get_nested.return_value = None
         mock_get_current_context.return_value = None
         mock_is_incluster_available.return_value = False
 
@@ -339,24 +275,18 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
         self.assertEqual(result, [])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_complex_scenario_with_mixed_contexts(self,
-                                                  mock_get_cloud_config_value,
-                                                  mock_get_workspace_cloud,
-                                                  mock_get_all_contexts):
+    def test_complex_scenario_with_mixed_contexts(self, mock_get_all_contexts):
         """Test complex scenario with various context types."""
         # Available contexts include regular, SSH, and others
         mock_get_all_contexts.return_value = [
             'prod-cluster', 'ssh-dev-cluster', 'staging-cluster',
             'ssh-test-cluster', 'local-cluster'
         ]
-        mock_get_workspace_cloud.return_value.get.return_value = None
         # Allowed contexts include existing, non-existing, and SSH contexts
-        mock_get_cloud_config_value.return_value = [
+        self._set_allowed_contexts([
             'prod-cluster', 'nonexistent-cluster', 'ssh-dev-cluster',
             'staging-cluster', 'ssh-nonexistent'
-        ]
+        ])
 
         with patch.object(kubernetes.Kubernetes,
                           '_log_skipped_contexts_once') as mock_log:
@@ -380,6 +310,25 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         kubernetes.Kubernetes._log_skipped_contexts_once.cache_clear()
         # Ensure env var leaks from other tests don't influence assertions.
         self._original_env = os.environ.pop(self.ENV_VAR, None)
+        self._config_snapshot = {}
+        snapshot_patcher = patch.object(
+            skypilot_config,
+            'to_dict',
+            side_effect=lambda: copy.deepcopy(self._config_snapshot))
+        workspace_patcher = patch.object(skypilot_config,
+                                         'get_active_workspace',
+                                         return_value='default')
+        snapshot_patcher.start()
+        workspace_patcher.start()
+        self.addCleanup(snapshot_patcher.stop)
+        self.addCleanup(workspace_patcher.stop)
+
+    def _set_allowed_contexts(self, value, *, workspace=False):
+        cloud_config = {'kubernetes': {'allowed_contexts': value}}
+        if workspace:
+            self._config_snapshot = {'workspaces': {'default': cloud_config}}
+        else:
+            self._config_snapshot = cloud_config
 
     def tearDown(self):
         if self._original_env is not None:
@@ -388,30 +337,20 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
             os.environ.pop(self.ENV_VAR, None)
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_default_includes_in_cluster(self, mock_get_region,
-                                         mock_get_workspace,
-                                         mock_get_all_contexts):
+    def test_default_includes_in_cluster(self, mock_get_all_contexts):
         """Default (env unset): 'all' includes in-cluster (backward compat)."""
         mock_get_all_contexts.return_value = ['ctx-a', 'ctx-b', 'in-cluster']
-        mock_get_workspace.return_value.get.return_value = None
-        mock_get_region.return_value = 'all'
+        self._set_allowed_contexts('all')
 
         result = kubernetes.Kubernetes.existing_allowed_contexts()
 
         self.assertEqual(set(result), {'ctx-a', 'ctx-b', 'in-cluster'})
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_env_true_includes_in_cluster(self, mock_get_region,
-                                          mock_get_workspace,
-                                          mock_get_all_contexts):
+    def test_env_true_includes_in_cluster(self, mock_get_all_contexts):
         """Env var explicitly true: 'all' includes in-cluster."""
         mock_get_all_contexts.return_value = ['ctx-a', 'in-cluster']
-        mock_get_workspace.return_value.get.return_value = None
-        mock_get_region.return_value = 'all'
+        self._set_allowed_contexts('all')
 
         with patch.dict(os.environ, {self.ENV_VAR: 'true'}, clear=False):
             result = kubernetes.Kubernetes.existing_allowed_contexts()
@@ -419,18 +358,13 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         self.assertEqual(set(result), {'ctx-a', 'in-cluster'})
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_env_false_excludes_in_cluster(self, mock_get_region,
-                                           mock_get_workspace,
-                                           mock_get_all_contexts):
+    def test_env_false_excludes_in_cluster(self, mock_get_all_contexts):
         """Env var false: in-cluster is filtered out of the 'all' expansion.
 
         This is the hosted-product use case.
         """
         mock_get_all_contexts.return_value = ['ctx-a', 'ctx-b', 'in-cluster']
-        mock_get_workspace.return_value.get.return_value = None
-        mock_get_region.return_value = 'all'
+        self._set_allowed_contexts('all')
 
         with patch.dict(os.environ, {self.ENV_VAR: 'false'}, clear=False):
             result = kubernetes.Kubernetes.existing_allowed_contexts()
@@ -438,11 +372,7 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         self.assertEqual(set(result), {'ctx-a', 'ctx-b'})
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
-    def test_legacy_allow_all_env_respects_filter(self, mock_get_region,
-                                                  mock_get_workspace,
-                                                  mock_get_all_contexts):
+    def test_legacy_allow_all_env_respects_filter(self, mock_get_all_contexts):
         """`SKYPILOT_ALLOW_ALL_KUBERNETES_CONTEXTS=true` path is symmetric.
 
         When no `allowed_contexts` is set in config but the legacy
@@ -450,8 +380,6 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         in-cluster filter env var still applies.
         """
         mock_get_all_contexts.return_value = ['ctx-a', 'in-cluster']
-        mock_get_workspace.return_value.get.return_value = None
-        mock_get_region.return_value = None
 
         with patch.dict(os.environ, {
                 'SKYPILOT_ALLOW_ALL_KUBERNETES_CONTEXTS': 'true',
@@ -463,18 +391,10 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         self.assertEqual(set(result), {'ctx-a'})
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    def test_explicit_in_cluster_in_list_is_kept(self, mock_get_workspace,
-                                                 mock_get_all_contexts):
+    def test_explicit_in_cluster_in_list_is_kept(self, mock_get_all_contexts):
         """Explicit allowed_contexts list is honored even with env var false."""
         mock_get_all_contexts.return_value = ['ctx-a', 'in-cluster']
-
-        def _workspace_get(key, default=None):
-            if key == 'allowed_contexts':
-                return ['ctx-a', 'in-cluster']
-            return default
-
-        mock_get_workspace.return_value.get.side_effect = _workspace_get
+        self._set_allowed_contexts(['ctx-a', 'in-cluster'], workspace=True)
 
         with patch.dict(os.environ, {self.ENV_VAR: 'false'}, clear=False):
             result = kubernetes.Kubernetes.existing_allowed_contexts()
@@ -482,16 +402,13 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         self.assertEqual(set(result), {'ctx-a', 'in-cluster'})
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
     @patch('sky.provision.kubernetes.utils.'
            'get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.is_incluster_config_available')
     @patch('sky.adaptors.kubernetes.in_cluster_context_name')
     def test_no_kubeconfig_fallback_respects_env(self, mock_in_cluster_name,
                                                  mock_is_incluster,
-                                                 mock_current, mock_get_nested,
-                                                 mock_get_workspace,
+                                                 mock_current,
                                                  mock_get_all_contexts):
         """The "no kubeconfig -> in-cluster" fallback also honors the filter
         env var: with it false the in-cluster context is not surfaced, even
@@ -500,8 +417,6 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         exclusion that applies to the `'all'` path applies here.
         """
         mock_get_all_contexts.return_value = ['in-cluster']
-        mock_get_workspace.return_value.get.return_value = None
-        mock_get_nested.return_value = None
         mock_current.return_value = None
         mock_is_incluster.return_value = True
         mock_in_cluster_name.return_value = 'in-cluster'
@@ -512,20 +427,16 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         self.assertEqual(result, [])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_nested')
     @patch('sky.provision.kubernetes.utils.'
            'get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.is_incluster_config_available')
     @patch('sky.adaptors.kubernetes.in_cluster_context_name')
     def test_no_kubeconfig_fallback_default_keeps_in_cluster(
             self, mock_in_cluster_name, mock_is_incluster, mock_current,
-            mock_get_nested, mock_get_workspace, mock_get_all_contexts):
+            mock_get_all_contexts):
         """The fallback keeps in-cluster by default (env unset) so existing
         single-cluster deployments are unaffected."""
         mock_get_all_contexts.return_value = ['in-cluster']
-        mock_get_workspace.return_value.get.return_value = None
-        mock_get_nested.return_value = None
         mock_current.return_value = None
         mock_is_incluster.return_value = True
         mock_in_cluster_name.return_value = 'in-cluster'
@@ -535,12 +446,8 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         self.assertEqual(result, ['in-cluster'])
 
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
-    @patch('sky.skypilot_config.get_workspace_cloud')
-    @patch('sky.skypilot_config.get_effective_region_config')
     @patch('sky.adaptors.kubernetes.in_cluster_context_name')
     def test_custom_in_cluster_name_is_filtered(self, mock_in_cluster_name,
-                                                mock_get_region,
-                                                mock_get_workspace,
                                                 mock_get_all_contexts):
         """Custom in-cluster name (via SKYPILOT_IN_CLUSTER_CONTEXT_NAME) is
         what gets filtered — not the literal string 'in-cluster'."""
@@ -548,8 +455,7 @@ class TestKubernetesAllIncludesInCluster(unittest.TestCase):
         mock_get_all_contexts.return_value = [
             'ctx-a', 'my-host-cluster', 'in-cluster'
         ]
-        mock_get_workspace.return_value.get.return_value = None
-        mock_get_region.return_value = 'all'
+        self._set_allowed_contexts('all')
 
         with patch.dict(os.environ, {self.ENV_VAR: 'false'}, clear=False):
             result = kubernetes.Kubernetes.existing_allowed_contexts()
@@ -587,8 +493,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.region.name = "test-context"
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -658,8 +564,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
                          'test-context')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -725,8 +631,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertNotIn('UCX_NET_DEVICES', k8s_env_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -790,8 +696,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertFalse(deploy_vars['k8s_ipc_lock_capability'])
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values')
@@ -898,8 +804,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertFalse(deploy_vars['tpu_requested'])  # H100 is GPU, not TPU
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values')
@@ -995,8 +901,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertEqual(k8s_env_vars['NCCL_SOCKET_IFNAME'], 'eth0')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values')
@@ -1106,8 +1012,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.region.name = "my-k8s-cluster"
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1201,8 +1107,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['timeout'], '3600')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1290,11 +1196,12 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['timeout'], '5400')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
+    @patch('sky.skypilot_config.get_effective_workspace_region_config')
     @patch('sky.skypilot_config.get_effective_region_config')
     @patch('sky.skypilot_config.get_workspace_cloud')
     @patch('sky.provision.kubernetes.network_utils.get_port_mode')
@@ -1303,8 +1210,9 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
     def test_remote_identity_with_cluster_overrides(
             self, mock_detect_network_type, mock_get_image, mock_get_port_mode,
             mock_get_workspace_cloud, mock_get_cloud_config_value,
-            mock_is_exec_auth, mock_get_accelerator_label_keys,
-            mock_get_namespace, mock_get_current_context, mock_get_k8s_nodes):
+            mock_get_workspace_region_config, mock_is_exec_auth,
+            mock_get_accelerator_label_keys, mock_get_namespace,
+            mock_get_current_context, mock_get_k8s_nodes):
         """Test that remote_identity override from task config is passed correctly."""
 
         # Setup mocks
@@ -1346,6 +1254,7 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
             return default_value
 
         mock_get_cloud_config_value.side_effect = config_side_effect
+        mock_get_workspace_region_config.side_effect = config_side_effect
 
         # Mock networking
         mock_port_mode = mock.MagicMock()
@@ -1454,8 +1363,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         mock_get_image.return_value = "test-image:latest"
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1504,8 +1413,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['k8s_memory_limit'], 4.0)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1554,8 +1463,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['k8s_memory_limit'], 6.0)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1601,8 +1510,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertNotIn('k8s_memory_limit', deploy_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1652,8 +1561,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertNotIn('k8s_ephemeral_storage_limit', deploy_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1704,8 +1613,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['k8s_ephemeral_storage_limit'], 75.0)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1839,8 +1748,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         return jinja2.Template(snippet).render(**deploy_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1893,8 +1802,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertIn('if [ "$APT_OS" = "ubuntu" ]; then', rendered)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1946,8 +1855,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
             rendered)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch(
-        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
+    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
+          )
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
