@@ -2,9 +2,10 @@
 
 Status: C1 foundation implemented and verified; C2 evidence-scan contract
 accepted; C2.1 implementation and local verification recorded with an exact
-removal ledger; disabled deployment is the next gate, shadow activation
-remains gated by the canary manifest and audit protocol, and every materialized
-or authoritative capacity phase remains blocked
+removal ledger; C2.2 disabled deployment verified on the test EKS cluster;
+C2.3 shadow activation is blocked on a real Serve selector and independent
+provider-call audit evidence, and every materialized or authoritative capacity
+phase remains blocked
 
 Last updated: 2026-07-31
 
@@ -1183,9 +1184,70 @@ Observed against the exact implementation on 2026-07-31:
 - independent adversarial implementation review found no remaining C2.1
   contract blocker after the final fencing and committed-metric fixes.
 
-This evidence authorizes only C2.2. No disabled-deployment, live selector,
-provider-call audit, source-write audit, restart/handoff, or measurement-cohort
-evidence is recorded at this revision.
+### C2.2 disabled-deployment evidence
+
+The exact implementation commit `0aae14884482642523ed96227a42523c5c0a1583`
+was packaged as one `linux/amd64` image and pushed to the test account's
+immutable ECR repository. The deployed digest is
+`sha256:a349f24a81f1c37d85bc0fb896a05541b57cf4c142716d98948502603b73fa02`.
+The packaged chart SHA-256 remained
+`ad803ece8c15eed01eed86b51376dbecd192167f6f0a52c33eeeceb953cc604b`.
+
+On 2026-07-31, account `361913687221`, EKS cluster
+`boltz-platform-test-eks-cluster`, namespace and release `skypilot-ha`:
+
+- release 35 was the verified rollback baseline, with API, controller, and
+  executor at 2/2 on digest `sha256:4310ff0de03aa9e2d193733b463a62e96ef97cc0d59e8f2d5bf087e78987cbac`;
+- the new digest was rolled out without capacity variables in three bounded
+  stages because the static nodes could not safely absorb all three 4-CPU,
+  8-GiB surges together: API at revision 36, executor at revision 37, and
+  controller at revision 38;
+- release history records the three stage descriptions and successful
+  outcomes. Pre/post value sets are identical after excluding the three image
+  fields, the staged deployment snapshots show the intended old/new role
+  digests, and each normal PostgreSQL verification hook succeeded before its
+  role rollout. Karpenter supplied at most one staged surge at a time; PDBs
+  kept at least one healthy replica during rollout and ordinary
+  underutilized-node consolidation;
+- final release 38 was deployed with API, controller, and executor each 2/2,
+  all six role pods on the exact new digest, zero restarts, and PDB disruption
+  allowance restored to one per role;
+- every role pod independently reported SkyPilot commit `0aae14884`, mode
+  `disabled`, zero selectors, and no pilot end. The live Helm manifest
+  contained none of the three C2 variables;
+- the API health response reported `healthy`, build `7978`, and the exact
+  commit. All four controller and executor readiness/liveness pairs returned
+  `ok`, with no physical-capacity failure, traceback, or fatal signature in
+  the post-rollout role logs;
+- PostgreSQL reported zero connections with application name
+  `skypilot-physical-capacity-evidence`. Before rollout, after stage 2, and
+  after release 38, all five C1 capacity tables existed and each contained
+  zero rows;
+- central revisions remained state `027`, Serve `031`, jobs `026`, requests
+  `004`, and capacity `001`. The final read-only audit found no active cluster,
+  Serve service, Serve replica, or unresolved managed job; and
+- the three successful staged migration-hook jobs had status and logs
+  captured and were then removed to restore the baseline namespace shape.
+  Helm release history and PostgreSQL state were retained.
+
+Release 35 is the binary rollback anchor if disabled-mode regressions are
+found. No rollback was required. The deployed implementation remains disabled.
+
+### C2.3 activation gate result
+
+C2.3 was not activated. The fresh pre- and post-deployment source audits found
+zero Serve services and zero Serve replicas, so there is no real isolated
+service selector. No independent provider-call audit exporter, query, owner,
+or baseline was declared for this canary. A synthetic missing selector would
+exercise only scheduling and cannot substitute for adapter or provider-call
+evidence. Creating a purpose-built Serve service would mutate provider
+resources and is outside this deployment's existing-state verification scope.
+
+Consequently, there is no claim of zero provider calls, source-write safety
+under an active scan, digest stability, three completed slots, or
+restart/handoff behavior. All three C2 variables remain absent. C2.3 stays
+blocked until a real selector and independent provider-call audit are supplied
+and frozen in the canary manifest.
 
 Automated tests cover:
 
@@ -1242,11 +1304,13 @@ Manual test:
 
 - C2.1 complete: strict configuration, pure adapters, digest/counters, scan
   repository, controller daemon, and unit/PostgreSQL tests.
-- C2.2 next: deploy this exact binary on every role with mode `disabled`; prove
-  no projector starts and all five C1 table counts remain unchanged.
-- C2.3 gated: set all three variables only through
-  `controllerService.extraEnvs`; run one real isolated service selector for
-  three scans spanning a restart and leadership handoff, with independent
+- C2.2 complete: the exact binary is deployed on every role with mode
+  `disabled`; zero projector connections and unchanged zero counts in all five
+  C1 tables were verified before and after the rollout.
+- C2.3 blocked: supply and freeze one real isolated Serve selector plus an
+  independently owned provider-call audit. Then set all three variables only
+  through `controllerService.extraEnvs`; run one real isolated service selector
+  for three scans spanning a restart and leadership handoff, with independent
   proof of zero provider calls, zero source writes, and no rows in the four
   materialized C1 tables. Finish this canary within three days. Do not add pool
   or managed-task selectors until the audits pass.
