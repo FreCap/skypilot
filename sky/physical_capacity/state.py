@@ -6,7 +6,9 @@ fixtures.  A production projection API requires the separately reviewed C2
 payload and source-mapping contract.
 """
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator
+from collections.abc import Mapping
+from collections.abc import Sequence
 import contextlib
 import enum
 import re
