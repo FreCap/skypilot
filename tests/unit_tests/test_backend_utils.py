@@ -2,6 +2,10 @@
 
 # pylint: disable=protected-access,unused-argument
 
+import base64
+import gzip
+import hashlib
+import io
 import os
 import pathlib
 from types import SimpleNamespace
@@ -17,10 +21,14 @@ from sky import skypilot_config
 from sky.backends import backend_utils
 from sky.exceptions import ClusterNotUpError
 from sky.provision import docker_utils
+from sky.provision import instance_setup
+from sky.provision import ray_commands
+from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.resources import Resources
 from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import resources_utils
 from sky.utils import status_lib
 from sky.utils import yaml_utils
 
@@ -324,6 +332,151 @@ def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
         0] == cluster_config_template, 'config template incorrect'
     assert mock_fill_template.call_args[0][1][
         'runcmd'] == expected_runcmd, 'runcmd not passed correctly'
+
+
+@pytest.mark.parametrize(
+    ('scenario', 'cloud', 'region_name', 'config_cloud', 'host_network',
+     'network_type'), [
+         ('kubernetes-host-network-false', clouds.Kubernetes(), 'test-context',
+          'kubernetes', False,
+          kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+         ('kubernetes-host-network-true', clouds.Kubernetes(), 'test-context',
+          'kubernetes', True,
+          kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+         ('kubernetes-oci-roce', clouds.Kubernetes(), 'oci-context',
+          'kubernetes', False,
+          kubernetes_utils.KubernetesHighPerformanceNetworkType.OCI_ROCE),
+         ('ssh-host-network-false', clouds.SSH(), 'ssh-test-context', 'ssh',
+          False, kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+         ('ssh-host-network-true', clouds.SSH(), 'ssh-test-context', 'ssh',
+          True, kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+     ])
+def test_host_network_probe_is_only_builtin_render_delta(
+        scenario, cloud, region_name, config_cloud, host_network, network_type,
+        monkeypatch, tmp_path):
+    """Locks the full built-in render differential for probe packaging."""
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    # Earlier tests in this module exercise SKYPILOT_CONFIG reloads.  The
+    # process-wide environment is intentionally mutable, so make this render
+    # golden own an explicit empty config instead of depending on xdist order.
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+    monkeypatch.setattr(kubernetes_utils, 'get_kubernetes_nodes',
+                        lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace',
+                        lambda **_kwargs: 'default')
+    monkeypatch.setattr(clouds.Kubernetes, '_detect_network_type',
+                        lambda *_args, **_kwargs: (network_type, None))
+    monkeypatch.setattr(clouds.Kubernetes,
+                        '_unsupported_features_for_resources',
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
+                        lambda: ('/tmp/test-key', 'test-public-key'))
+    monkeypatch.setattr(backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_args: {})
+    monkeypatch.setattr(backend_utils.logs, 'get_logging_agent', lambda: None)
+    monkeypatch.setattr('sky.catalog.get_image_id_from_tag',
+                        lambda *_args, **_kwargs: 'test-image:latest')
+    monkeypatch.setattr(common_utils, 'get_user_hash', lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend_utils.sky, '__version__', '1.0.0')
+
+    output_path = tmp_path / scenario / 'cluster.yaml'
+    monkeypatch.setattr(backend_utils, '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    overrides = {}
+    if host_network:
+        overrides = {
+            config_cloud: {
+                'pod_config': {
+                    'spec': {
+                        'hostNetwork': True,
+                    },
+                },
+            },
+        }
+    network_tier = None
+    if network_type == (
+            kubernetes_utils.KubernetesHighPerformanceNetworkType.OCI_ROCE):
+        network_tier = resources_utils.NetworkTier.BEST
+    resource = Resources(cloud=cloud,
+                         instance_type='4CPU--16GB',
+                         network_tier=network_tier,
+                         _cluster_config_overrides=overrides)
+
+    current_b64 = ray_commands.host_network_probe_b64()
+    source = gzip.decompress(base64.b64decode(current_b64, validate=True))
+    legacy_buffer = io.BytesIO()
+    with gzip.GzipFile(filename='',
+                       mode='wb',
+                       fileobj=legacy_buffer,
+                       compresslevel=9,
+                       mtime=1) as gzip_file:
+        gzip_file.write(source)
+    legacy_b64 = base64.b64encode(legacy_buffer.getvalue()).decode('ascii')
+    legacy_compressed = base64.b64decode(legacy_b64, validate=True)
+    current_compressed = base64.b64decode(current_b64, validate=True)
+    assert legacy_compressed[:4] == current_compressed[:4]
+    assert legacy_compressed[8:] == current_compressed[8:]
+    assert legacy_compressed[4:8] == b'\x01\x00\x00\x00'
+    assert current_compressed[4:8] == b'\x00\x00\x00\x00'
+
+    def _render(payload: str) -> bytes:
+        monkeypatch.setattr(instance_setup, '_host_network_probe_b64',
+                            lambda: payload)
+        result = backend_utils.write_cluster_config(
+            to_provision=resource,
+            num_nodes=2,
+            cluster_config_template='kubernetes-ray.yml.j2',
+            cluster_name='display',
+            local_wheel_path=pathlib.Path('/tmp/test-wheel'),
+            wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
+            region=clouds.Region(name=region_name),
+            dryrun=True,
+            keep_launch_fields_in_existing_config=True)
+        return pathlib.Path(result['ray']).read_bytes()
+
+    legacy_render = _render(legacy_b64)
+    current_render = _render(current_b64)
+    legacy_member = legacy_b64.encode('ascii')
+    current_member = current_b64.encode('ascii')
+    assert legacy_render.count(legacy_member) == 2
+    assert current_render.count(current_member) == 2
+    assert legacy_render.replace(legacy_member,
+                                 current_member) == current_render
+
+    canonical_root = str(tmp_path).encode('utf-8')
+    legacy_hash = hashlib.sha256(legacy_render.replace(canonical_root,
+                                                       b'<TMP>')).hexdigest()
+    current_hash = hashlib.sha256(
+        current_render.replace(canonical_root, b'<TMP>')).hexdigest()
+    expected_hashes = {
+        'kubernetes-host-network-false': (
+            '1ad2ec4dc4e48a057bab83ebcd41b344307acfde6a1869794399b9b2e1c3b418',
+            '7072727546c878addf5a2270e850a14f0e4d060da7b19e2df71c353b9cf0fa5f',
+        ),
+        'kubernetes-host-network-true': (
+            '0c008a015257edc2669ef24e3a34ebed81e5fb7b1d8ccabbb03c06e211d27247',
+            'c477f93d965bdf66903925c0e1f9f306108a4dde2eb35f88a855ccf982132f66',
+        ),
+        'kubernetes-oci-roce': (
+            'ade6d30625309ebad9354aae916610aaf4bf00e2e900f314e8e77937231e87ef',
+            '2c510b79dd6de34e8b0f4a99b0ad91a5e4ff619bf3ab3bc701e23b470b001acf',
+        ),
+        'ssh-host-network-false': (
+            '8ffc8f17bcfb2c2369b94a08c7cb511e6eaae41006966953cf84b0e8e5e91fd8',
+            'aa4fb2a14edc506d88f033bcba8d7a119b04ae8e0c4e9fea1846ff747ca9a245',
+        ),
+        'ssh-host-network-true': (
+            'fa20655d2211484668724d119cff82fcdeb3fba9a74426c9b96a03097190fc81',
+            '8c05fb8d8ff4e372e129988539181a3a591f8388d1d3e8c6c27605981e1af297',
+        ),
+    }
+    assert (legacy_hash, current_hash) == expected_hashes[scenario]
 
 
 @mock.patch.object(skypilot_config, '_global_config_context',
