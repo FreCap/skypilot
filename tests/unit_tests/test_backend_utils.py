@@ -356,14 +356,23 @@ def test_host_network_probe_is_only_builtin_render_delta(
         monkeypatch, tmp_path):
     """Locks the full built-in render differential for probe packaging."""
     monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    # Earlier tests in this module exercise SKYPILOT_CONFIG reloads.  The
+    # process-wide environment is intentionally mutable, so make this render
+    # golden own an explicit empty config instead of depending on xdist order.
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
     monkeypatch.setattr(skypilot_config, '_global_config_context',
                         skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
     monkeypatch.setattr(kubernetes_utils, 'get_kubernetes_nodes',
                         lambda *_args, **_kwargs: [])
     monkeypatch.setattr(kubernetes_utils, 'get_namespace',
                         lambda **_kwargs: 'default')
     monkeypatch.setattr(clouds.Kubernetes, '_detect_network_type',
                         lambda *_args, **_kwargs: (network_type, None))
+    monkeypatch.setattr(clouds.Kubernetes,
+                        '_unsupported_features_for_resources',
+                        lambda *_args, **_kwargs: {})
     monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
                         lambda: ('/tmp/test-key', 'test-public-key'))
     monkeypatch.setattr(backend_utils.sky_check,
