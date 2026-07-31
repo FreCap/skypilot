@@ -1,9 +1,10 @@
 # Unified Physical-Capacity Convergence
 
-Status: C0 accepted; revision-001/C1 implemented and locally verified; first
-test-fleet rollout and all later phases gated; no mutation authority is enabled
+Status: C0 accepted; revision-001/C1 implemented, locally verified, and
+deployed to the isolated test release in capacity mode `disabled`; C2 and all
+later phases remain gated; no mutation authority is enabled
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 Canonical owner: this file. External plans, pull requests, and rollout notes
 must link here rather than restating a divergent contract.
@@ -1746,11 +1747,87 @@ Revision-001/C1 implementation evidence on 2026-07-30:
 - Every fixture and temporary schema was removed after validation; the
   disposable PostgreSQL `public` schema ended empty.
 
-Exact code-bearing commit, image digest, database revisions, Helm revision,
-pod state, and post-rollout empty-table queries will be appended before C2.
-The first C1 deployment has **not** occurred.
+Revision-001/C1 isolated deployment evidence on 2026-07-31:
 
-The 2026-07-30 read-only deployment audit found:
+- The deployed code commit is
+  `23a7c632ccf9811d29c62a098d11d56c8c2cc412`. The exact Linux/amd64 image
+  reports version `1.1.927`, build `7968`, OCI revision equal to that full
+  commit, and config ID
+  `sha256:27fa2c35589474ba1785ad8a1b1cd1b4ea05636d8468acc18a09c52edabd2a88`.
+- The commit-specific tag `test-capacity-c1-23a7c632c` was first published to
+  `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz`.
+  That cross-account repository had neither a repository pull policy nor a
+  replication rule, and the release had no image-pull Secret. Rather than
+  widen IAM during the rollout, the same manifest was copied without rebuilding
+  to the test account's existing immutable `skypilot-ha` repository. Both
+  registries returned the identical manifest digest
+  `sha256:4310ff0de03aa9e2d193733b463a62e96ef97cc0d59e8f2d5bf087e78987cbac`;
+  the release uses the same-account digest-qualified reference.
+- The packaged chart SHA-256 was
+  `ad803ece8c15eed01eed86b51376dbecd192167f6f0a52c33eeeceb953cc604b`.
+  The secret-safe database audit program SHA-256 was
+  `6e830229237e341ac2d60844575258339cff84a7fd6c6683b0eac3dbd3ba2b3f`.
+- STS resolved the Kubernetes operator to account `361913687221` and the
+  first artifact registry operator to account `255203429798`. The exact target
+  was active EKS cluster
+  `arn:aws:eks:us-east-1:361913687221:cluster/boltz-platform-test-eks-cluster`,
+  Kubernetes `v1.33.13-eks-8f14419`. Its endpoint is private-only, so a
+  transient SSM port-forward through an existing managed node was used; no EKS
+  endpoint, security-group, instance, or route configuration was changed.
+- Baseline Helm revision `34` was deployed with PostgreSQL request storage,
+  RWX state, blocking migrations, two API/executor/controller replicas,
+  RollingUpdate, and three healthy PDBs. `global.imageRegistry` was unset,
+  managed image workers were disabled, and capacity mode/allowlist variables
+  were absent. The initial audit observed one unrelated launch in progress, so
+  the rollout waited. The final preflight at `2026-07-31T03:22:50Z` had no
+  active cluster, unresolved managed job, Serve entity, non-periodic request,
+  or timeout-like request anomaly.
+- The final preflight database revisions were `state_db=027`,
+  `sky_config_db=001`, `serve_db=031`, `spot_jobs_db=026`,
+  `api_requests_db=004`, `kv_cache_db=001`, and no capacity lineage or
+  capacity tables. A Helm server-side dry run projected revision `35`, the
+  revision-scoped pre-upgrade migration Job, and the exact digest. A parsed
+  comparison of the nine retained Helm resources found no non-image manifest
+  change.
+- Helm's blocking `pre-upgrade` hook started at
+  `2026-07-31T03:23:26.601017887Z` and completed successfully at
+  `2026-07-31T03:23:37.125927219Z`. The Kubernetes Job was labeled for release
+  `skypilot-ha`, component `database-migration`, revision `35`, used the exact
+  digest, and exited zero. Helm hook ordering causally completed the migration
+  before applying the Deployment updates; every target-image pod has a
+  Kubernetes creation timestamp at or after `2026-07-31T03:23:37Z`.
+- Surge pods initially waited for CPU and memory. One new API pod had a
+  transient ConfigMap-cache `FailedMount`, and expected startup and draining
+  probe warnings occurred. Karpenter supplied nodes, then evicted one executor
+  at `03:27:23Z` and one API pod at `03:28:04Z` as `Underutilized`. During the
+  executor replacement its PDB briefly had one healthy pod, one desired
+  healthy pod, and zero disruptions allowed. Observed Deployment availability
+  remained two for every role, so there was no observed role-availability
+  loss, image-pull error, OOM, migration failure, or Helm failure.
+- Helm revision `35` reached `deployed` at `03:27:17Z` with description
+  `C1 unified capacity foundation 23a7c632c`. By `03:27:36Z`, six
+  API/executor/controller pods were Running and Ready with zero restarts and
+  exact image IDs at the target digest. Each Deployment was `2/2` updated,
+  Ready, and available; each PDB had two healthy pods, one desired healthy pod,
+  and one disruption allowed. Six stability samples from `03:29:37Z` through
+  `03:31:33Z` were unchanged.
+- Both API replicas returned HTTP 200, API version `64`, version
+  `1.1.927`, build `7968`, and the exact C1 commit. API, executor, and
+  controller processes each loaded capacity mode `disabled` with no allowlist.
+  A live SDK/CLI request-status call through the API service succeeded.
+- The post-rollout database revisions preserved every pre-existing lineage and
+  added only `capacity_state_db=001`. All five capacity tables existed with
+  zero rows. After removing timestamps, periodic lease timestamps/generations,
+  the expected capacity lineage, and the five expected tables, the bounded
+  pseudonymized pre/post non-capacity audit reports were byte-identical. The
+  post-audit still had no active test workload or timeout-like anomaly.
+- After its object and empty log were captured, only migration Job `35` was
+  deleted. No revision-35 migration pod, failed or terminating pod, canary,
+  test workload, or unexpected release resource remained. The pre-existing
+  successful revision-34 migration Job was not modified and remains governed
+  by its existing 86,400-second TTL.
+
+For history, the 2026-07-30 pre-authentication read-only audit found:
 
 - the configured shared API health endpoint returned HTTP 200;
 - the server reported version `1.1.924`, commit `915d020a3`, and API version
@@ -1769,31 +1846,33 @@ The 2026-07-30 read-only deployment audit found:
 
 ## Open gates
 
-1. The isolated deployment's current health and retained dependencies must be
-   re-audited with refreshed operator credentials before the first rollout.
-2. C1/C2 share the ordinary engine namespace and existing controller
+1. C1/C2 share the ordinary engine namespace and existing controller
    leadership. Connection and lock-wait behavior must be measured before any
    capacity-specific namespace or lock session; if later justified, account
    for one additional strict pool per process/role.
-3. C2 production writers require accepted literal v1 payload/source mappings;
+2. C2 production writers require accepted literal v1 payload/source mappings;
    revision `001` alone authorizes only empty schema and generic codec tests.
-4. Each revision `002`-`004` requires its literal DDL and another exact-file
+3. Each revision `002`-`004` requires its literal DDL and another exact-file
    adversarial acceptance before implementation.
-5. AWS, GCP, and Kubernetes tag propagation must preserve provider tag limits,
+4. AWS, GCP, and Kubernetes tag propagation must preserve provider tag limits,
    existing selectors, billing markers, and old-resource discoverability.
-6. Authoritative teardown cannot begin until the action journal, typed
+5. Authoritative teardown cannot begin until the action journal, typed
    outcomes, and exact provider identity are live and shadow-tested.
-7. Non-consolidated managed jobs remain a declared migration exception until a
+6. Non-consolidated managed jobs remain a declared migration exception until a
    durable central intent feed has its own accepted design and deployment.
-8. C4 cannot begin unless the quantified C2 value gate passes.
-9. The latest protected test-fleet rollout left an update acknowledgement in an
-   unresolved timeout state. It must be inspected through authenticated request
-   and service-version history before that fleet is reused for application
-   validation.
-10. The current publisher accepts only `improvements`; before the first
-    code-bearing deployment, an approved exact-feature-commit test publisher or
-    reviewed merge artifact must exist and its source commit/digest must be
-    proved.
+7. C4 cannot begin unless the quantified C2 value gate passes.
+8. Before every remaining code-bearing stack deployment, an approved
+   exact-feature-commit artifact or reviewed merge artifact must exist and its
+   source commit/digest must be proved. The ordinary publisher still accepts
+   only `improvements`; the C1 test-only exact-image procedure does not relax
+   that branch guard.
+9. The C1 rollout required Karpenter surge capacity and then experienced
+   consolidation churn. Before the C2 rollout, preflight must prove eligible
+   surge headroom or explicitly test and review the one-replica availability
+   window and controller-leader handoff of a `maxSurge: 0`,
+   `maxUnavailable: 1` strategy. It must also prove Karpenter consolidation
+   cannot compound that strategy's zero-disruption-margin interval, and must
+   not discover the choice after the migration hook runs.
 
 ## Adversarial review record
 
@@ -1850,11 +1929,12 @@ occupancy behavior.
 The reviewers confirmed stable owner versus mutable writer fences, global
 cluster-generation uniqueness, A-to-B-to-A intent monotonicity, cyclic
 group/intent deletion semantics, scan provenance, PostgreSQL/default-engine
-initialization, SQLite/mode refusal, and later-phase gates. Live deployment
-remains blocked on the documented test-fleet preflight and exact artifact, not
-on C1 coding. This review-record/status amendment is non-contractual; the hash
-above is the exact reviewed behavioral and schema contract immediately before
-the verdict was recorded.
+initialization, SQLite/mode refusal, and later-phase gates. At review time,
+live deployment was blocked on the documented test-fleet preflight and exact
+artifact, not on C1 coding; the 2026-07-31 evidence above records satisfaction
+of that deployment gate. This review-record/status amendment is
+non-contractual; the hash above is the exact reviewed behavioral and schema
+contract immediately before the verdict was recorded.
 
 ### Review 4: PURSUE
 
@@ -1870,5 +1950,6 @@ The re-review found no remaining correctness or contract blocker. It confirmed
 literal migration/runtime catalog parity, empty-only locked downgrade,
 default-engine and PostgreSQL-only initialization, fail-closed modes, absence
 of a production writer, and the final verification evidence above. Deployment
-of the exact code-bearing commit remains the gate before C2; the review did
-not waive either test-fleet preflight or exact-artifact provenance.
+of the exact code-bearing commit was the remaining gate before C2 at review
+time; the 2026-07-31 rollout satisfied it without waiving test-fleet preflight
+or exact-artifact provenance for later commits.
