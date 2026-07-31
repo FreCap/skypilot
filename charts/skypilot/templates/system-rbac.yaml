@@ -1,5 +1,5 @@
 {{/* Policies for managing skypilot system components */}}
-{{- if and .Values.rbac.create .Values.rbac.manageSystemComponents }}
+{{- if and (or .Values.rbac.create .Values.rbac.bindExistingServiceAccount) .Values.rbac.manageSystemComponents }}
 {{- $namespace := "skypilot-system" }}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- include "skypilot.ensureNamespace" $namespace -}}

@@ -3,6 +3,16 @@ suite: server_deployment_test
 templates:
   - templates/api-deployment.yaml
 tests:
+  - it: should run as the externally managed API service account
+    set:
+      rbac.create: false
+      rbac.bindExistingServiceAccount: true
+      rbac.serviceAccountName: external-api
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: external-api
+
   - it: should mount kubeconfig correctly when useKubeconfig is enabled
     set:
       kubernetesCredentials.useKubeconfig: true
