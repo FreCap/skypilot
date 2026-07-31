@@ -12,6 +12,7 @@ import pytest
 import sqlalchemy
 
 from sky.jobs import managed_job_refresh_thread
+from sky.jobs import scheduler as managed_job_scheduler
 from sky.physical_capacity import config
 from sky.physical_capacity import contracts
 from sky.physical_capacity import hashing
@@ -640,7 +641,11 @@ def test_expiry_fencing_cannot_report_healthy(monkeypatch):
     health.assert_called_once_with(healthy=False, expired=False)
 
 
-def _mock_controller_runtime(monkeypatch, *, projector_stop_fails=False):
+def _mock_controller_runtime(monkeypatch,
+                             *,
+                             shadow: bool,
+                             projector_stop_fails: bool = False,
+                             background_stop_fails: bool = False):
     events = []
 
     class FakeInstanceLease:
@@ -710,6 +715,8 @@ def _mock_controller_runtime(monkeypatch, *, projector_stop_fails=False):
 
         def stop(self):
             events.append('background-stop')
+            if background_stop_fails:
+                raise RuntimeError('background stop failed')
 
     fake_lease = FakeLeaderLease()
     fake_projector = FakeProjector()
@@ -756,7 +763,7 @@ def _mock_controller_runtime(monkeypatch, *, projector_stop_fails=False):
     monkeypatch.setattr(runtime, '_start_surface_interrupted_cluster_launches',
                         lambda: events.append('surface-start'))
     monkeypatch.setattr(runtime, '_kill_local_controller_children',
-                        lambda: events.append('children-fail-stop'))
+                        lambda **kwargs: events.append('children-fail-stop'))
     monkeypatch.setattr(runtime, '_request_worker_shutdown',
                         lambda *args, **kwargs: events.append('workers-joined'))
     monkeypatch.setattr(runtime, '_stop_queue_server',
@@ -765,8 +772,14 @@ def _mock_controller_runtime(monkeypatch, *, projector_stop_fails=False):
                         'start_managed_job_refresh_daemon',
                         lambda: events.append('managed-refresh-start'))
 
+    if shadow:
+        capacity = config.CapacityConfig(mode=config.CapacityMode.SHADOW,
+                                         sources=(_selector(),),
+                                         pilot_end_utc='2030-01-01T00:00:00Z')
+    else:
+        capacity = config.CapacityConfig()
     state = runtime.RuntimeState('controller', mock.Mock(), instance_lease,
-                                 False, config.CapacityConfig())
+                                 False, capacity)
     args = types.SimpleNamespace(host='127.0.0.1',
                                  role_health_port=1,
                                  metrics_port=2)
@@ -774,7 +787,7 @@ def _mock_controller_runtime(monkeypatch, *, projector_stop_fails=False):
 
 
 def test_controller_activation_precedes_workers_and_readiness(monkeypatch):
-    state, args, events = _mock_controller_runtime(monkeypatch)
+    state, args, events = _mock_controller_runtime(monkeypatch, shadow=True)
 
     runtime._run_controller_role(state, args)
 
@@ -793,6 +806,7 @@ def test_controller_activation_precedes_workers_and_readiness(monkeypatch):
 
 def test_controller_drain_failure_fail_stops_before_release(monkeypatch):
     state, args, events = _mock_controller_runtime(monkeypatch,
+                                                   shadow=True,
                                                    projector_stop_fails=True)
 
     class FailStop(RuntimeError):
@@ -812,3 +826,34 @@ def test_controller_drain_failure_fail_stops_before_release(monkeypatch):
     assert 'workers-joined' in events
     assert ('process-exit', 1) in events
     assert 'lease-release' not in events
+
+
+def test_disabled_controller_preserves_legacy_drain_semantics(monkeypatch):
+    state, args, events = _mock_controller_runtime(monkeypatch,
+                                                   shadow=False,
+                                                   background_stop_fails=True)
+    fail_stop = mock.Mock(side_effect=AssertionError('unexpected fail-stop'))
+    monkeypatch.setattr(runtime.os, '_exit', fail_stop)
+
+    with pytest.raises(RuntimeError, match='background stop failed'):
+        runtime._run_controller_role(state, args)
+
+    assert 'projector-start' not in events
+    assert 'projector-stop' not in events
+    assert ('ready', False, 'activating-controller') not in events
+    assert 'lease-release' in events
+    fail_stop.assert_not_called()
+
+
+def test_local_controller_child_failure_is_strict_only_when_requested(
+        monkeypatch):
+    failure = RuntimeError('managed child fail-stop failed')
+    stop_children = mock.Mock(side_effect=failure)
+    monkeypatch.setattr(managed_job_scheduler,
+                        'fail_stop_local_job_controllers', stop_children)
+
+    runtime._kill_local_controller_children()
+    with pytest.raises(RuntimeError, match='managed child fail-stop failed'):
+        runtime._kill_local_controller_children(fail_closed=True)
+
+    assert stop_children.call_count == 2
