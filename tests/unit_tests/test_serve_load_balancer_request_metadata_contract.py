@@ -20,28 +20,28 @@ _CALLABLE_CONTRACT = {
     '_priority_header_error': (
         staticmethod,
         '(detail: str) -> fastapi.exceptions.HTTPException',
-        '5efdb998ebf7028df74cf13ba14d2249763edb83ce85dfbb19ab0d1b0d277c37',
+        '0b0c9e207bcc441716ec8b041838373a645bbb9cb9011b7699e78dec677c1a0f',
     ),
     '_parse_request_priority': (
         classmethod,
         '(cls, request: starlette.requests.Request) -> int',
-        'f2a18b44149fe568ebf0d6b6f6371ad40c952894e11066932e8e024b78b32aad',
+        'ec2f4763f1c49b76e7063675fd13be1a642097f1225d14226e9801fcec4f99ce',
     ),
     '_accelerator_header_error': (
         staticmethod,
         '(detail: str, status_code: int = 400) -> '
         'fastapi.exceptions.HTTPException',
-        '1bdb7e64d558960fd8af5d440425dd0914404b27d44fe063808600a5354bfcf0',
+        'c1bbd149b7793633fc90b9b973fa0564665e03d0fa255a375796b3955cdc4b62',
     ),
     '_parse_request_accelerators': (
         type(lambda: None),
         '(self, request: starlette.requests.Request) -> tuple[str, ...] | None',
-        '7faccd849ee7ffa7c28d38b599597a9dc4993d47238e93b79d3c292950310157',
+        '49fdb6f601d7b88ba1efe0952c26f50fb1b60986ab4168034a8ed16f38c5df96',
     ),
     '_headers_without_request_priority': (
         staticmethod,
         '(request: starlette.requests.Request) -> Any',
-        'd47f092f0b5bda5d71ffb16469f1259de32fa23ab5a960fbb39382333dc6d4e1',
+        'c3ec5bf75fff52fc966b56a79118d4566c49d08a63df2a5b171a3181e10e802a',
     ),
 }
 
@@ -55,11 +55,23 @@ def _request(raw_headers: list[tuple[bytes, bytes]]) -> fastapi.Request:
     })
 
 
+def _version_stable_ast(value):
+    """Serialize AST fields shared by the supported Python versions."""
+    if isinstance(value, ast.AST):
+        return (type(value).__name__,
+                tuple((field, _version_stable_ast(getattr(value, field)))
+                      for field in value._fields
+                      if field != 'type_params'))
+    if isinstance(value, list):
+        return tuple(_version_stable_ast(item) for item in value)
+    return value
+
+
 def _normalized_ast_sha256(function) -> str:
     node = ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
     assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     node.decorator_list = []
-    normalized = ast.dump(node, include_attributes=False)
+    normalized = repr(_version_stable_ast(node))
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
