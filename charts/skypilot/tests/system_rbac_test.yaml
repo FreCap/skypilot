@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: system_rbac_test
+templates:
+  - templates/system-rbac.yaml
+tests:
+  - it: should preserve chart-managed system policies when the new field is absent
+    release:
+      name: test-release
+      namespace: test-namespace
+    set:
+      rbac.bindExistingServiceAccount: null
+    asserts:
+      - hasDocuments:
+          count: 5
+      - isKind:
+          of: RoleBinding
+        documentIndex: 2
+      - equal:
+          path: subjects[0].name
+          value: test-release-api-sa
+        documentIndex: 2
+
+  - it: should bind system policies to an external API service account
+    release:
+      name: test-release
+      namespace: test-namespace
+    set:
+      rbac.create: false
+      rbac.bindExistingServiceAccount: true
+      rbac.serviceAccountName: external-api
+    asserts:
+      - hasDocuments:
+          count: 5
+      - isKind:
+          of: RoleBinding
+        documentIndex: 2
+      - equal:
+          path: subjects[0].name
+          value: external-api
+        documentIndex: 2
+      - equal:
+          path: subjects[0].namespace
+          value: test-namespace
+        documentIndex: 2
+      - isKind:
+          of: ClusterRoleBinding
+        documentIndex: 4
+      - equal:
+          path: subjects[0].name
+          value: external-api
+        documentIndex: 4
+      - equal:
+          path: subjects[0].namespace
+          value: test-namespace
+        documentIndex: 4
+
+  - it: should render no system policies when chart-managed RBAC is disabled
+    set:
+      rbac.create: false
+      rbac.bindExistingServiceAccount: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should respect disabled system-component management in external mode
+    set:
+      rbac.create: false
+      rbac.bindExistingServiceAccount: true
+      rbac.serviceAccountName: external-api
+      rbac.manageSystemComponents: false
+    asserts:
+      - hasDocuments:
+          count: 0

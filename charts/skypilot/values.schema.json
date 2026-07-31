@@ -1243,6 +1243,9 @@
         "rbac": {
             "type": "object",
             "properties": {
+                "bindExistingServiceAccount": {
+                    "type": "boolean"
+                },
                 "clusterRules": {
                     "type": "array",
                     "items": {

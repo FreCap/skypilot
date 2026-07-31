@@ -157,6 +157,7 @@ Below is the available helm value keys and the default value of each key:
 
   :ref:`rbac <helm-values-rbac>`:
     :ref:`create <helm-values-rbac-create>`: true
+    :ref:`bindExistingServiceAccount <helm-values-rbac-bindExistingServiceAccount>`: false
     :ref:`serviceAccountName <helm-values-rbac-serviceAccountName>`: ""
     :ref:`namespaceRules <helm-values-rbac-namespaceRules>`:
       - apiGroups: [ "" ]
@@ -1810,7 +1811,9 @@ Default: see the yaml below.
 ``rbac.create``
 ^^^^^^^^^^^^^^^
 
-Whether to create the service account and RBAC policies for the API server. If false, an external service account is expected.
+Whether to create the service account and RBAC policies for the API server. If
+false, either all permissions must be managed externally or
+``rbac.bindExistingServiceAccount`` must be enabled.
 
 Default: ``true``
 
@@ -1818,6 +1821,25 @@ Default: ``true``
 
   rbac:
     create: true
+
+.. _helm-values-rbac-bindExistingServiceAccount:
+
+``rbac.bindExistingServiceAccount``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Whether to create chart-managed RBAC policies for the external API server
+service account named by ``rbac.serviceAccountName``. The service account must
+already exist in the Helm release namespace and must not be owned by the
+current Helm release. This is mutually exclusive with ``rbac.create`` and does
+not transfer ownership of a chart-created service account.
+
+Default: ``false``
+
+.. code-block:: yaml
+
+  rbac:
+    create: false
+    bindExistingServiceAccount: false
 
 .. _helm-values-rbac-serviceAccountName:
 
