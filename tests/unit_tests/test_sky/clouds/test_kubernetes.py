@@ -4145,5 +4145,59 @@ class TestKubernetesRemoteIdentityFnmatch(unittest.TestCase):
         self.assertEqual(result, 'numeric-sa')
 
 
+class TestKubernetesContextIdentityNormalization(unittest.TestCase):
+    """Tests the cloud facade's shared identity-normalization ownership."""
+
+    def test_legacy_facade_matches_shared_normalizer(self):
+        contexts = (
+            {
+                'context': {
+                    'cluster': 'cluster',
+                    'user': 'user',
+                }
+            },
+            {
+                'context': {
+                    'cluster': 'cluster_with_under',
+                    'user': 'user__with_under',
+                    'namespace': 'namespace_with_under',
+                }
+            },
+            {
+                'context': {
+                    'cluster': 'cluster',
+                    'user': 'user',
+                    'namespace': '',
+                }
+            },
+        )
+        normalizer = (
+            kubernetes.kubernetes.normalize_kubernetes_context_identity)
+        for context in contexts:
+            with self.subTest(context=context):
+                expected = normalizer(context)
+                self.assertEqual(
+                    kubernetes.Kubernetes.get_identity_from_context(context),
+                    expected)
+                self.assertIsInstance(expected, str)
+
+    @patch.object(kubernetes.kubernetes,
+                  'normalize_kubernetes_context_identity',
+                  return_value='shared-normalized-identity')
+    def test_legacy_facade_delegates_to_shared_normalizer(
+            self, mock_normalizer):
+        context = {
+            'context': {
+                'cluster': 'cluster',
+                'user': 'user',
+            }
+        }
+
+        identity = kubernetes.Kubernetes.get_identity_from_context(context)
+
+        self.assertEqual(identity, 'shared-normalized-identity')
+        mock_normalizer.assert_called_once_with(context)
+
+
 if __name__ == '__main__':
     unittest.main()

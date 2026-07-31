@@ -1377,14 +1377,7 @@ class Kubernetes(clouds.Cloud):
         # namespace and switches, then the a CloudUserIdentityError will
         # be raised. Currently, this is difficult as there is no good
         # forward compatibility mechanism (upgrade -> downgrade).
-        if 'namespace' in context['context']:
-            namespace = context['context']['namespace']
-        else:
-            namespace = kubernetes_utils.DEFAULT_NAMESPACE
-        user = context['context']['user']
-        cluster = context['context']['cluster']
-        identity_str = f'{cluster}_{user}_{namespace}'
-        return identity_str
+        return kubernetes.normalize_kubernetes_context_identity(context)
 
     @classmethod
     def get_identity_from_context_name(cls, context: str) -> list[str] | None:
