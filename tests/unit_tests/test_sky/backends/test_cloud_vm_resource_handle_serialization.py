@@ -7,6 +7,7 @@ import copy
 import inspect
 import os
 import pickle
+import typing
 from unittest import mock
 
 from sky import resources as resources_lib
@@ -61,6 +62,8 @@ def test_serialization_hook_contract() -> None:
         assert function.__qualname__ == qualname
 
     assert isinstance(cls.__dict__['from_dict'], classmethod)
+    assert typing.get_type_hints(
+        cls.__dict__['from_dict'].__func__)['return'] is cls
 
 
 def test_serialization_hooks_are_direct_implementation_methods() -> None:

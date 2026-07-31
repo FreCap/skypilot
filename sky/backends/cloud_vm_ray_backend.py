@@ -2898,6 +2898,11 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
     __setstate__ = cloud_vm_resource_handle_serialization.__setstate__
 
 
+# Preserve runtime annotation resolution for the directly attached methods.
+setattr(cloud_vm_resource_handle_serialization, 'CloudVmRayResourceHandle',
+        CloudVmRayResourceHandle)
+
+
 class LocalResourcesHandle(CloudVmRayResourceHandle):
     """A handle for local resources."""
 
