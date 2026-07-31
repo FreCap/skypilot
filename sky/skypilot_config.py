@@ -50,6 +50,7 @@ then:
 """
 from collections.abc import Callable
 from collections.abc import Iterator
+from collections.abc import Mapping
 import contextlib
 import copy
 import json
@@ -436,6 +437,54 @@ def get_nested(keys: tuple[str, ...],
         disallowed_override_keys=None)
 
 
+def get_effective_workspace_region_config_from_snapshot(
+        config_snapshot: Mapping[str, Any],
+        cloud: str,
+        keys: tuple[str, ...],
+        region: str | None = None,
+        default_value: Any | None = None,
+        *,
+        workspace: str | None,
+        override_configs: dict[str, Any] | None = None) -> Any:
+    """Resolve effective config from an explicit immutable-time snapshot.
+
+    This has the same workspace, region, cloud, and resource-override
+    precedence as :func:`get_effective_workspace_region_config`, but never
+    reads the active workspace or the process-global loaded config. Passing
+    ``workspace=None`` deliberately skips the workspace layer.
+
+    Callers that need one coherent decision should capture the config and
+    workspace once, then use this function for every read in that decision.
+    The input mappings are not mutated.
+    """
+    snapshot = config_utils.Config(dict(config_snapshot))
+    workspaced_config_value = None
+    if workspace is not None:
+        workspace_cloud_config = snapshot.get_nested(keys=(
+            'workspaces',
+            workspace,
+        ),
+                                                     default_value=None)
+        if workspace_cloud_config is not None:
+            workspaced_config_value = (
+                config_utils.get_cloud_config_value_from_dict(
+                    dict_config=workspace_cloud_config,
+                    cloud=cloud,
+                    keys=keys,
+                    region=region,
+                    default_value=None,
+                    override_configs=override_configs))
+    if workspaced_config_value is not None:
+        return workspaced_config_value
+    return config_utils.get_cloud_config_value_from_dict(
+        dict_config=snapshot,
+        cloud=cloud,
+        keys=keys,
+        region=region,
+        default_value=default_value,
+        override_configs=override_configs)
+
+
 def get_effective_workspace_region_config(
         cloud: str,
         keys: tuple[str, ...],
@@ -445,24 +494,15 @@ def get_effective_workspace_region_config(
         override_configs: dict[str, Any] | None = None) -> Any:
     if workspace is None:
         workspace = get_active_workspace()
-    workspaced_config_value = None
-    workspace_cloud_config = get_nested(keys=(
-        'workspaces',
-        workspace,
-    ),
-                                        default_value=None)
-    if workspace_cloud_config is not None:
-        workspaced_config_value = config_utils.get_cloud_config_value_from_dict(
-            dict_config=workspace_cloud_config,
-            cloud=cloud,
-            keys=keys,
-            region=region,
-            default_value=None,
-            override_configs=override_configs)
-    if workspaced_config_value is not None:
-        return workspaced_config_value
-    return get_effective_region_config(cloud, keys, region, default_value,
-                                       override_configs)
+    config_snapshot = _get_loaded_config()
+    return get_effective_workspace_region_config_from_snapshot(
+        config_snapshot=config_snapshot,
+        cloud=cloud,
+        keys=keys,
+        region=region,
+        default_value=default_value,
+        workspace=workspace,
+        override_configs=override_configs)
 
 
 def get_effective_region_config(cloud: str,

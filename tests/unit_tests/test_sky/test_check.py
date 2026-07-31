@@ -122,6 +122,10 @@ def test_k8s_summary_allowed_contexts_default_config(monkeypatch):
                         lambda *args, **kwargs: {})
     monkeypatch.setattr('sky.skypilot_config.get_effective_region_config',
                         lambda **kwargs: ['ctx-b', 'ctx-c'])
+    monkeypatch.setattr(
+        'sky.skypilot_config.'
+        'get_effective_workspace_region_config_from_snapshot',
+        lambda **kwargs: ['ctx-b', 'ctx-c'])
 
     # ctx2text marks only allowed contexts as enabled for summary inclusion
     ctx2text = {
@@ -174,6 +178,15 @@ def test_k8s_summary_allowed_contexts_workspace_override(monkeypatch):
 
     monkeypatch.setattr('sky.skypilot_config.get_workspace_cloud',
                         mock_get_workspace_cloud)
+
+    def mock_effective_workspace_region_config(*, workspace, **kwargs):
+        del kwargs
+        return ['ctx-c'] if workspace == 'ws1' else ['ctx-a', 'ctx-b']
+
+    monkeypatch.setattr(
+        'sky.skypilot_config.'
+        'get_effective_workspace_region_config_from_snapshot',
+        mock_effective_workspace_region_config)
 
     enabled_clouds = {
         repr(sky_clouds.Kubernetes()): [CloudCapability.COMPUTE],
@@ -311,8 +324,8 @@ def _mock_k8s_env(monkeypatch,
     """Helper to mock kubernetes utils and config for tests.
 
     - all_contexts: list of contexts returned by get_all_kube_context_names
-    - workspace_allowed_contexts: dict workspace -> list[str] for get_workspace_cloud
-    - global_allowed_contexts: list[str] for get_effective_region_config
+    - workspace_allowed_contexts: workspace-specific context lists
+    - global_allowed_contexts: fallback context list
     - check_note: optional note appended by check_credentials for enabled ctxs
     """
     # Prevent dependency checks from failing
@@ -362,6 +375,25 @@ def _mock_k8s_env(monkeypatch,
     if global_allowed_contexts is not None:
         monkeypatch.setattr('sky.skypilot_config.get_effective_region_config',
                             lambda **kwargs: list(global_allowed_contexts))
+
+    def mock_effective_workspace_region_config(*,
+                                               workspace,
+                                               default_value=None,
+                                               **kwargs):
+        del kwargs
+        allowed = None
+        if workspace_allowed_contexts is not None:
+            allowed = workspace_allowed_contexts.get(workspace)
+        if allowed is not None:
+            return list(allowed)
+        if global_allowed_contexts is not None:
+            return list(global_allowed_contexts)
+        return default_value
+
+    monkeypatch.setattr(
+        'sky.skypilot_config.'
+        'get_effective_workspace_region_config_from_snapshot',
+        mock_effective_workspace_region_config)
 
     # Workspaces
     monkeypatch.setattr('sky.workspaces.core.get_workspaces', lambda: {

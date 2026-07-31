@@ -2,8 +2,9 @@
 
 Status: M1 and M2 S1 merged; S1 exact-head CI, revision 34 deployment, canary,
 cleanup, and monitor qualified; responsibility-deduplication review accepted
-for planning; M2 S2 is next; M3 and M4 implementation require dedicated
-exact-design adversarial reviews
+for planning; the first M2 S2 prototype was rejected because it duplicated
+placement policy, so S2 is being reshaped around shared production owners; M3
+and M4 implementation require dedicated exact-design adversarial reviews
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -1497,7 +1498,7 @@ remain entirely on the legacy path until their full UID inventory is modeled.
 Eligibility is closed over the effective configuration, not inferred from a
 small set of presence flags. A new
 `classify_kubernetes_offer_config_v1()` helper freezes
-`skypilot_config.to_dict()`, the active workspace,
+`skypilot_config.to_dict()`, the explicit `OfferRequestV1.workspace`,
 `Resources.cluster_config_overrides`, the sorted registered Kubernetes-property
 names, every registered queue-key path, and current Kubernetes provisioner and
 template-override ownership once per observation. From that frozen input it
@@ -1549,9 +1550,9 @@ entering authoritative mode. The implementation fingerprint contains only
 module, qualname, code-digest, and match booleans, never `id()` values, and is
 recaptured during revalidation.
 
-The classifier hashes only the secret-free normalized allowed values,
-active-workspace digest, sorted registry names and queue paths, registration and
-template ownership, and the built-in implementation fingerprint into
+The classifier hashes only the secret-free normalized allowed values, explicit
+request-workspace digest, sorted registry names and queue paths, registration
+and template ownership, and the built-in implementation fingerprint into
 `configuration_fingerprint`, then discards the raw configuration copy.
 Revalidation captures them again and returns
 `NOT_REPRESENTABLE(CONFIGURATION_CHANGED)` if the fingerprint differs.
@@ -1563,34 +1564,116 @@ the context name; a nonsecret endpoint fingerprint; a nonsecret cloud-identity
 digest; the effective namespace and live `Namespace.metadata.uid`; configured
 price; the resolved non-default service-account name, its live
 `ServiceAccount.metadata.uid`, and a digest over namespace, name, and UID; a
-deterministically sorted tuple of normalized node records containing
-`status.capacity`, `status.allocatable`, and the exact existing `is_ready()`
-boolean; the configuration fingerprint; and the closed eligibility result
-above. The endpoint fingerprint hashes only the
+provider-order tuple of normalized node records containing `status.capacity`,
+`status.allocatable`, and the exact existing `is_ready()` boolean; a bounded
+tuple of CPU avoid-accelerator label keys derived by consuming exact provider
+node and label-map order, with no raw labels retained; the configuration
+fingerprint; and the closed eligibility result above. A separately sorted
+projection of the node records is used only for offer ordering and identity.
+The endpoint fingerprint hashes only the
 normalized API-server scheme, host, port, path, and CA bundle digest from the
 loaded client configuration. Userinfo, query strings, client certificates,
 keys, tokens, exec-plugin arguments, environment variables, and raw kubeconfig
 data are forbidden inputs.
 
+Candidate enumeration and selected-context clients come from one private,
+capture-scoped kubeconfig load session. The session captures the kubeconfig
+path, merged config tree, current context, context names, in-cluster
+availability, and in-cluster name once. A single pure
+`resolve_kubernetes_allowed_contexts()` policy owner accepts those captured
+facts, the effective `allowed_contexts` value, and captured environment-option
+booleans. Both `Kubernetes.existing_allowed_contexts()` and the offer source
+call that owner. The live wrapper retains the historical warning behavior;
+the pure function returns both selected and skipped names without logging. It
+deliberately preserves the legacy set-derived order until a separately
+reviewed behavior change replaces it.
+
+Effective configuration precedence also has one owner. A pure
+`get_effective_workspace_region_config_from_snapshot()` helper applies the
+same resource-override, explicit-workspace, context, and global precedence as
+`get_effective_workspace_region_config()`. The live getter delegates to it;
+the offer classifier calls it against the copied config. The classifier may
+still inspect raw applicable scopes to reject unknown or forbidden keys, but
+it must not independently decide an allowed property's value.
+
+Selected clients are constructed from the retained config tree, so a changed
+kubeconfig file, environment variable, active workspace, or same-name context
+cannot retarget observation after enumeration. Kubeconfig users containing
+`exec` or `auth-provider` fail closed before upstream `KubeConfigLoader` can
+execute or log them; a bounded, scrubbed credential implementation is required
+before either mode becomes eligible. Endpoint and CA identity are frozen while
+ordinary external `tokenFile`, client-certificate, and client-key rotation
+remains live. An external token file's final path component is opened without
+following symbolic links, must be a regular file, and is read through a 1 MiB
+cap on every authorization lookup; upstream unbounded token-file loading is
+bypassed. Its UTF-8 text, including leading and trailing whitespace, is used
+exactly. A failed refresh clears the prior authorization value and permanently
+disables that target's token-file refresh rather than reusing a stale token.
+Inline token data remains frozen with the captured config tree. The returned
+target owns its client and temporary CA and has an idempotent `close()` that
+removes both immediately even if the closed target remains referenced,
+including Kubernetes-client-version-specific refresh callables that capture a
+loader or token path. Concurrent `close()` calls are linearizable: every
+caller returns only after that one cleanup has completed. Kubeconfig capture
+also contains and detaches every `BaseException` raised after credential data
+has been loaded. Ordinary invalid-config exceptions yield the fixed empty
+inventory, while control exceptions retain their type and are re-raised only
+from a credential-free outer boundary. A finalizer is fallback only. The
+credential-bearing session and target never enter the snapshot, an offer, a
+digest, logs, or Datadog.
+
 The snapshot contains no kubeconfig, credential, token, full node object, pod
-configuration, label, annotation, or admission payload. Both the legacy shadow
-adapter and offer source project from this exact value. Node input order is
-normalized before either projection, so provider response or future-completion
-order cannot affect offer ordering. The comparison-only
-legacy adapter preserves the captured legacy context order; the offer source
-sorts by normalized context identity. The comparator records order and winner
-differences separately. Neither projection replaces or reorders the real legacy
-candidate list in shadow mode, which is important because the current
-`allowed_contexts: all` path passes through a set.
+configuration, raw node label map, label value, annotation, or admission
+payload. Both the legacy shadow
+adapter and offer source project from this exact value. The capture preserves
+provider node order because the legacy no-fit reason is order-sensitive when
+nodes tie on maximum CPU. The comparison-only legacy adapter consumes that
+order exactly. The offer source sorts a separate normalized node projection,
+so provider response or future-completion order cannot affect offer ordering.
+The comparison-only legacy adapter also preserves the captured legacy context
+order; the offer source sorts by normalized context identity. The comparator
+records order and winner differences separately. Neither projection replaces
+or reorders the real legacy candidate list in shadow mode, which is important
+because the current `allowed_contexts: all` path passes through a set.
 
 One observation accepts at most 256 candidate contexts, 10,000 node records per
-context, 256 registered Kubernetes-property names, 256 registered queue paths,
-and 256 resulting offers. Context, registry-name, and queue-path strings use the
-envelope's 1,024-byte region or 128-byte key bound as applicable. The source
-checks API collection metadata and the materialized lengths, never truncates,
-and returns `NOT_REPRESENTABLE(OBSERVATION_LIMIT_EXCEEDED)` on any overflow.
+context, 64 MiB of decompressed node-list input across all contexts, 64 nested
+JSON containers, 256 registered Kubernetes-property names, 256 registered
+queue paths, and 256 resulting offers. Context, node-name, resource-value,
+registry-name, and queue-path strings have explicit UTF-8 byte bounds.
+Transient node-label keys are at most 1,024 UTF-8 bytes and values at most 256
+KiB; neither is retained. The derived CPU avoid-accelerator tuple has at most
+16 keys of at most 317 UTF-8 bytes each. An `ijson` counting stream enforces
+the aggregate byte budget while parsing and projects each node directly into
+`KubernetesNodeResources`; it never constructs or retains a raw `V1Node`, raw
+label map, label value, annotation, or unrelated provider field. The source
+requires exactly one root collection-metadata map, checks its pagination
+fields, per-field bounds, and projected lengths, never truncates, and returns
+`NOT_REPRESENTABLE(OBSERVATION_LIMIT_EXCEEDED)` on any overflow. Encoded HTTP
+content length is never used as decoded EOF when a content decoder can retain
+buffered output; the byte cap and EOF probe apply to decompressed bytes.
 Provider completion order cannot decide which entries survive because overflow
-rejects the whole observation.
+rejects the whole observation. If an otherwise valid response has unknown
+length and consumes its exact accepted-byte limit, the reader performs at most
+one discard-only one-byte EOF probe for that context. Therefore the hard
+physical read ceiling is 64 MiB plus 256 bytes, while accepted and retained
+response content remains capped at 64 MiB. A nonempty probe rejects the whole
+observation.
+
+Readiness and accelerator-family selection remain single-owner policies.
+`_transition_kubernetes_node_readiness()` owns the first-`Ready` condition and
+exact `status == 'True'` decision used by both `V1Node.is_ready()` and the
+streaming projection. `_GPULabelFormatterSelector` owns formatter priority,
+first-nonempty matching, and value validation used by both
+`detect_gpu_label_formatter()` and the streaming projection. The observation
+path retains only one tri-state decision per formatter and registers no
+invalid-value callback, so the shared policy does not retain label values.
+
+Capture has an aggregate monotonic deadline and a fixed worker bound. Each
+context writes to its original candidate index, so completion order cannot
+change offers. Deadline or budget exhaustion cancels pending work, closes every
+opened target, discards every partial result, and returns one typed whole-capture
+failure. A partial context set is never published.
 
 The legacy projection applies the recorded readiness filter and then uses
 `status.capacity`, not allocatable resources, because the existing
@@ -1606,9 +1689,14 @@ the context name, endpoint fingerprint, cloud-identity digest, effective
 namespace, and live namespace UID. A shared Kubernetes scope helper derives the
 identity digest from the same normalized kubeconfig cluster/user or in-cluster
 identity used by `Kubernetes.get_identity_from_context_name()`, without storing
-the raw identity. `REQUIRE_FRESH` reloads that identity instead of reusing a
-credential or context cache. Only the scope digest is stored; the raw endpoint,
-context identity, namespace, and UID are not stored in the provider payload.
+the raw identity. Pure adaptor-layer normalizers own the historical
+cluster/user/namespace and in-cluster identity wire shapes. Exact-target
+construction, `Kubernetes.get_identity_from_context()`, and
+`in_cluster_identity()` delegate to those normalizers, including the existing
+default-namespace and underscore behavior. `REQUIRE_FRESH` reloads that
+identity instead of reusing a credential or context cache. Only the scope
+digest is stored; the raw endpoint, context identity, namespace, and UID are
+not stored in the provider payload.
 
 Kubernetes V1's allowlisted provider-payload `identity` object contains exactly
 `rendered_pod_placement_fingerprint` and
@@ -1620,11 +1708,32 @@ resources, after the existing allocatable clamp, plus every hard scheduling
 input: node selector, required node affinity and anti-affinity, scheduler,
 runtime class, priority class, `DoNotSchedule` topology spread, tolerations,
 resource claims, volume-binding constraints, and the resolved service-account
-name. The offer projection computes the expected value from the snapshot and
-pure template inputs. The independently rendered cluster YAML must match it
-before `bulk_provision()` is called. Since the complete identity object enters
-the stable offer ID, same-name service-account replacement changes stable
-identity and cannot pass revalidation.
+name.
+
+S2 does not maintain a second Pod renderer. Production first resolves external
+facts, including runtime-class existence, allowed-node policy, and Docker-cache
+PVC identity. One pure `pod_spec.finalize_pod_spec()` owner then copies the
+base Pod and applies every pre-admission scheduling mutation: role metadata,
+runtime class, Docker cache volume, multi-node affinity, TPU and GPU
+tolerations, and allowed-node affinity. `_create_pods()` and offer projection
+both call this owner. Provider reads, waits, adoption, PVC checks, and the final
+API create remain outside it. Inputs outside the V1 subset still use the same
+function in production, while V1 supplies the characterized single-node CPU
+facts.
+
+The base Pod is likewise rendered by one production-shared
+`render_kubernetes_base_pod_spec()` owner extracted from deploy-variable,
+template, and pod-config combination. It accepts resolved immutable inputs and
+captured bounded template text; neither the offer source nor provisioning may
+reimplement its Jinja variable set or merge order. A new template variable or
+a changed reviewed template digest fails closed until its placement semantics
+are characterized. The V1 classifier rejects managed container-image paths
+whose later resolution could add a node selector outside that captured render.
+Immediately before the Kubernetes create call, production fingerprints the
+exact output of the shared finalizer and compares it with the selected offer.
+Since the complete identity object enters the stable offer ID, same-name
+service-account replacement changes stable identity and cannot pass
+revalidation.
 Admission-added sidecars, requests, or hard constraints therefore produce an
 actual-result mismatch instead of escaping the offer contract. Soft preferences
 and runtime-only image, environment, command, and metadata fields are excluded.
@@ -2664,7 +2773,7 @@ identically.
 - promote the eligible Kubernetes subset in a separate commit and retain all
   other Kubernetes requests on the typed legacy fallback.
 
-M2 implementation is split into three reviewed slices:
+M2 implementation is split into reviewed slices:
 
 - S1, named `generic offer contract foundation`, owns
   `sky/utils/json_types.py`, `sky/placement/offer.py`, the docstring-only
@@ -2675,9 +2784,20 @@ M2 implementation is split into three reviewed slices:
   and executes the fixed-Unicode goldens in the existing Python 3.10
   `worker-floor-import` job. It does not add Kubernetes policy, orchestration
   wiring, `ActualPlacementEvidenceV1`, or a `ProvisionRecord` field.
-- S2 owns the Kubernetes observation source, payload schema, closed
-  resource/config classifiers, and `validate_kubernetes_offer_v1()`, with no
-  mutation ownership change.
+- S2a.1 owns shared context/config policy, bounded one-load observation
+  primitives, and the production-shared final pre-admission Pod-spec owner.
+  It removes the corresponding policy and mutation bodies from legacy callers
+  before adding an offer source.
+- S2a.2 owns the production-shared base-Pod renderer and its exact legacy
+  characterization corpus. The rejected independent template renderer is not
+  carried forward. S2a.2 implementation cannot begin until this file names the
+  exact immutable resolved-input schema and passes a dedicated exact-design
+  review; the current text establishes ownership but not that input contract.
+- S2b owns the Kubernetes observation source, payload schema, closed
+  resource/config classifiers, aggregate deadline, and
+  `validate_kubernetes_offer_v1()`, with no mutation ownership change. It must
+  call the S2a owners and contains no candidate, precedence, or Pod-rendering
+  policy of its own.
 - S3 owns orchestration propagation and use of the already-defined handoff,
   shadow comparison, actual-placement evidence, persistence, and the guarded
   authoritative promotion.
@@ -2781,6 +2901,10 @@ Removal is part of completion, not optional follow-up.
 | Kubernetes use of `make_launchables_for_valid_region_zones()` and backend `_yield_zones()` for the declared eligible subset | the eligible Kubernetes subset is authoritative through `PlacementOfferV1` and its rollback window is closed | frozen corpus and bounded live window have zero unexplained safety, placement-set, optimizer-winner, or actual-result mismatches; minimum-client and rollback-image qualification pass |
 | Kubernetes placement-offer shadow dual projection | Kubernetes authoritative mode has remained healthy for one full compatibility release | Datadog records no unexplained mismatch or rollback, and repository tests retain a frozen legacy-versus-offer characterization corpus |
 | Kubernetes `NOT_REPRESENTABLE` legacy fallback | every officially supported Kubernetes placement-affecting input has a typed, characterized offer representation | one compatibility release records zero fallback for supported inputs, the full Kubernetes corpus passes, and repository search finds no eligible legacy call |
+| candidate selection body in `Kubernetes.existing_allowed_contexts()` and provisional `resolve_kubernetes_candidate_contexts_v1()` | shared pure context policy is authoritative | legacy characterization is exact, offer tests call the same owner, and repository search finds no second selector |
+| duplicated workspace, context, and global precedence in the provisional Kubernetes offer source | snapshot getter is authoritative | live and frozen-input corpora agree and no offer-owned effective-value helper remains |
+| pre-admission Pod mutation body inside Kubernetes `_create_pods()` | shared final Pod-spec owner is called immediately before create | head, worker, CPU, GPU, TPU, allowed-node, Docker-cache, single-node, and multi-node corpus is exact and repository search finds no second mutation body |
+| independent Kubernetes offer template renderer and hand-maintained Jinja variable set | production-shared base-Pod renderer is authoritative | legacy rendered YAML corpus and offer projection are identical, changed template input fails closed, and no offer-only renderer remains |
 | M2 first-provider-attempt-only authoritative fence and `RETRY_AFTER_PROVIDER_ATTEMPT` fallback | M4 carries typed complete cleanup and provider-absence evidence across every failover provider and resets the cluster record atomically | cross-provider lost-response, partial-create, teardown, absence, and stale-record corpus passes with no blind replay |
 | M2 handle-backed `placement_attempt_fence`, reconciler, and `QUARANTINE_FENCED` path | M4 stores every cluster attempt and UID inventory in the durable action runtime and the pre-M2 rollback window is closed | crash and UID-replacement tests prove foreign objects survive, every owned child reaches proved absence, no generic label/name delete is reachable, and repository search finds no handle-backed fence writer |
 | provider-agnostic region and zone reconstruction in `resources_utils.py` and backend launch loops | every supported provider is authoritative through a placement-offer source or is explicitly frozen behind a declared legacy adapter | provider-wide corpus and bounded observation gates pass, repository and plugin inventory find zero migrated callers, and old/new client-server compatibility passes |
@@ -3322,3 +3446,134 @@ and returned `PURSUE` after the design closed:
 This verdict accepts the architecture and removal ledger. It does not approve
 M3 schema or M4 actuation implementation. Each still requires the dedicated
 exact-design review named in its milestone before code is written.
+
+### Review 8
+
+Verdict: `MERGE` completed for the responsibility-deduplication design.
+
+Exact head `d601e17e339b231e036766f37b8d465f042abc92` passed all 24
+GitHub checks with no review or comment state. PR #1081 merged at
+`7aaa99041065a57c6f733ceed04f025520bac871`; its first parent is the M2 S1
+merge `53973b18a6e214b37b0ac3985d148886eb422a01` and its second parent is the
+exact reviewed design head. The PR changed only this canonical design, so it
+had no runtime image or live deployment delta. The remote feature branch was
+deleted after the merge.
+
+### Review 9
+
+Verdict: `RESHAPE`; the first M2 S2 prototype must not merge.
+
+The exact working-tree review found that the provisional 2,249-line
+Kubernetes source repeated candidate selection, configuration precedence, and
+template rendering instead of removing those owners. Its implementation
+fingerprint covered seven provision lifecycle callables but not the production
+render and pre-create mutation path; changing
+`Kubernetes.make_deploy_resources_variables()` could therefore change a hard
+selector while classification remained eligible. Node reads were count-bounded
+but could retain an arbitrarily large label object, context reads had no
+aggregate deadline, upstream kubeconfig exec authentication could run without
+the bounded scrubbed path, and explicit close left credentials and temporary CA
+files alive until garbage collection.
+
+S2 is approved to resume only through S2a.1 and S2a.2 above. A new exact-diff
+review must prove that production and offer capture call the same context,
+precedence, base-render, and final-Pod owners; that node input and wall time are
+aggregate-bounded; and that credential execution and cleanup fail closed. The
+rejected source is research evidence, not an implementation to merge.
+
+### Review 10
+
+Verdict: `PURSUE` for S2a.1 only.
+
+The challenge review found that sharing context selection, effective-config
+precedence, final Pod mutation, and bounded observation inputs removes proven
+owners without committing the system to an offer-specific framework. Each
+change has a direct legacy caller and a reversible characterization boundary.
+S2a.2 did not pass the same completeness bar because the immutable resolved
+inputs to base rendering are not yet enumerated; its explicit design and review
+gate above prevents implementation from starting on an assumed interface.
+
+### Review 11
+
+Verdict: `PURSUE` for the completed S2a.1 shared observation primitives.
+
+The final independent architecture review inspected the settled working tree
+on base head `c014c1dba8` and returned `PASS` with no confirmed blocker. The
+reviewed leaf hashes were:
+
+- `sky/adaptors/kubernetes.py`:
+  `d82b885189476f3c6e91eaa1c3675741a3da241536d35209eeb6e99b8ffddd3e`;
+- `sky/clouds/kubernetes.py`:
+  `1a0f3c4f9815a94e1ee3b58b064835fed1662d1fb42dc79a4fd13c6428069dc4`;
+- `sky/provision/kubernetes/utils.py`:
+  `d50327ec09b2e3b65aeb5409cf3dc4b33d20e40b768053e76c815f5b4b0f42b9`;
+- `tests/unit_tests/test_sky/adaptors/test_kubernetes_observation_primitives.py`:
+  `ec43408de6bd7d7a981d6052a61b3c2de94481604acfef0a92272788d9d2d178`;
+- `tests/unit_tests/kubernetes/test_kubernetes_node_observation_primitives.py`:
+  `5dced105a72a17e6bd0c4ca002dad6edc7f849c52b96084d22e8dd84bd7078b9`;
+- `tests/unit_tests/test_sky/clouds/test_kubernetes.py`:
+  `5938f0528aec59bbe7acbdde8f5acf085f5585cbee2c95ec96983be49115f865`.
+
+The iterative review closed cleanup-exception isolation, exact root metadata,
+decoded gzip EOF, and three responsibility-duplication findings. Shared owners
+now decide GPU formatter selection, first-Ready readiness, kubeconfig identity,
+in-cluster identity, and API-client cleanup. The bounded path adds exactly one
+provider `list_node()` operation and retains no raw label map or value. It adds
+no S2b offer, classifier, aggregate-deadline, or orchestration wiring, no S2a.2
+base renderer, and no provider mutation.
+
+Local acceptance imported the intended worktree and passed 720 serial tests,
+exact YAPF 0.32, isort 5.12, Python compilation, changed-file mypy, exact
+Pylint 2.14.5 at 10.00/10 for production and new tests, and
+`git diff --check`. The three broader mypy findings in
+`check_instance_fits()` predate and are outside every changed hunk. Exact-head
+CI, review state, and merge proof remain required before this slice advances to
+S2a.2.
+
+### Review 12
+
+Verdict: `PURSUE` for the final rebased S2a.1 implementation and its CI
+corrections.
+
+Review 11 records the pre-rebase implementation review. This review supersedes
+it as the merge evidence after rebasing onto exact base
+`7ad9483f62a5da58d18cb8d09e564411ce8b1757` and applying the current CI
+contracts. The final independent read-only architecture review returned
+`PASS`. It confirmed that YAPF 0.43 changes are AST-identical formatting, the
+explicit `ASYNC103` and `ASYNC104` annotations preserve the designed
+cleanup and credential exception-containment boundaries, optional deployment
+state is only statically narrowed, and tests now mock the canonical snapshot
+configuration owner instead of relying on the removed ambient-read seam.
+
+The reviewed leaf hashes are:
+
+- `.basedpyright-baseline.json`:
+  `a403cf78e495487b59687e1f0cb3a2f557348b064a598392f0fe9a9421bbdd7c`;
+- `sky/adaptors/kubernetes.py`:
+  `3e58acfe82f3dc2deddfc2747a122ceabda11b212ba347c0a6505883dfca2b6a`;
+- `sky/clouds/kubernetes.py`:
+  `33022b2315ec85921b932c56c51f1239f2f95be95dc9f42ceb55282f87a004ea`;
+- `sky/provision/kubernetes/instance.py`:
+  `dbe15d4de0cef17d0eff1d4a1101fd42e221ef4005e40ca71eccfabf9a53044b`;
+- `sky/provision/kubernetes/utils.py`:
+  `69df95a4f6581f7184faacfef2dccd773537bb4d431a32c4f91fb92b456dab2e`;
+- `tests/unit_tests/test_sky/adaptors/test_kubernetes_observation_primitives.py`:
+  `ec43408de6bd7d7a981d6052a61b3c2de94481604acfef0a92272788d9d2d178`;
+- `tests/unit_tests/kubernetes/test_kubernetes_node_observation_primitives.py`:
+  `5dced105a72a17e6bd0c4ca002dad6edc7f849c52b96084d22e8dd84bd7078b9`;
+- `tests/unit_tests/test_sky/clouds/test_kubernetes.py`:
+  `c5ad057fbf2e856f53b1062c1c79b62e66df0b045a9f666d1671976bf37282a4`;
+- `tests/unit_tests/test_sky/test_check.py`:
+  `44f7c5374b712b308714a7c1b1f475c82252a47556dc57a3727002249d706c32`.
+
+Local acceptance imported the intended worktree and passed 741 affected serial
+tests, 3 subtests, YAPF 0.43, isort 5.12, Python compilation, and exact Pylint
+2.14.5 at 10.00/10 for production and new tests. Exact basedpyright 1.39.9 on
+Python 3.14 reported zero errors, warnings, or notes and removed exactly five
+resolved baseline entries. The flake8 7.3.0 and flake8-async 27.7.1 output
+remained byte-identical to the 17-line repository baseline at SHA-256
+`145746a05f5781e3d6654ca963172382f87b9a10abb5cd08d92fea8c987a8d11`.
+The corrective diff adds no placement offer, classifier, aggregate-deadline or
+orchestration activation, provider mutation, retry owner, or statistics
+storage. Exact-head CI, review state, merge proof, and live rollout evidence
+remain required.

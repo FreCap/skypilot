@@ -210,48 +210,6 @@
                 }
             }
         ],
-        "./sky/provision/kubernetes/instance.py": [
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 70,
-                    "endColumn": 78,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 32,
-                    "endColumn": 47,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 30,
-                    "endColumn": 45,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 12,
-                    "endColumn": 27,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 35,
-                    "endColumn": 50,
-                    "lineCount": 1
-                }
-            }
-        ],
         "./sky/provision/kubernetes/volume.py": [
             {
                 "code": "reportReturnType",
