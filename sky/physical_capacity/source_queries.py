@@ -10,7 +10,9 @@ the pure adapters consume a row.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable
+from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
 import time
 from typing import Any, cast, Protocol
