@@ -1,12 +1,13 @@
 """Strict server-owned configuration for physical-capacity staging."""
 
+from collections.abc import Callable
 import dataclasses
 import datetime
 import enum
 import json
 import os
 import re
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 import uuid
 
 from sky.physical_capacity import canonical

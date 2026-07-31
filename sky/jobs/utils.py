@@ -7,7 +7,6 @@ ManagedJobCodeGen.
 import asyncio
 import contextlib
 from datetime import datetime
-import enum
 import os
 import pathlib
 import re
@@ -146,13 +145,6 @@ _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS = 120
 
 # Content written to the jobs cancel signal file.
 _JOBS_GRACEFUL_CANCEL_SIGNAL = 'graceful'
-
-
-class UserSignal(enum.Enum):
-    """The signal to be sent to the user."""
-    CANCEL = 'CANCEL'
-    # NOTE: We can have more communication signals here if needed
-    # in the future.
 
 
 # ====== internal functions ======
@@ -1144,39 +1136,21 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
             wrong_workspace_job_ids.append(job_id)
             continue
 
-        if snapshot.is_legacy_controller:
-            # The job is running on a legacy single-job controller process.
-            # TODO(cooperc): Remove this handling for 0.13.0
-
-            # Send the signal to the jobs controller.
-            signal_file = (pathlib.Path(
-                managed_job_constants.SIGNAL_FILE_PREFIX.format(job_id)))
-            # Filelock is needed to prevent race condition between signal
-            # check/removal and signal writing.
+        try:
+            signal_file = pathlib.Path(
+                managed_job_constants.CONSOLIDATED_SIGNAL_PATH, f'{job_id}')
             with filelock.FileLock(str(signal_file) + '.lock'):
-                with signal_file.open('w', encoding='utf-8') as f:
-                    f.write(UserSignal.CANCEL.value)
-                    f.flush()
-            if graceful:
-                logger.warning(f'Job {job_id} is on legacy controller, '
-                               'graceful shutdown not supported.')
-        else:
-            # New controller process.
-            try:
-                signal_file = pathlib.Path(
-                    managed_job_constants.CONSOLIDATED_SIGNAL_PATH, f'{job_id}')
-                with filelock.FileLock(str(signal_file) + '.lock'):
-                    if graceful:
-                        content = _JOBS_GRACEFUL_CANCEL_SIGNAL
-                        if graceful_timeout is not None:
-                            content += f':{graceful_timeout}'
-                        signal_file.write_text(content, encoding='utf-8')
-                    else:
-                        signal_file.touch()
-            except OSError as e:
-                logger.error(f'Failed to cancel job {job_id}: {e}')
-                # Don't add it to the to be cancelled job ids
-                continue
+                if graceful:
+                    content = _JOBS_GRACEFUL_CANCEL_SIGNAL
+                    if graceful_timeout is not None:
+                        content += f':{graceful_timeout}'
+                    signal_file.write_text(content, encoding='utf-8')
+                else:
+                    signal_file.touch()
+        except OSError as e:
+            logger.error(f'Failed to cancel job {job_id}: {e}')
+            # Don't add it to the to be cancelled job ids
+            continue
 
         cancelled_job_ids.append(job_id)
 

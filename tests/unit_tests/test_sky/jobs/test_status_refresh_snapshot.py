@@ -171,17 +171,16 @@ class TestGetJobsToCheckStatusInfo:
         assert info
         assert select_count == 1
 
-    def test_cancel_legacy_job_skips_refresh_snapshot_and_writes_signal(
+    def test_cancel_legacy_job_is_not_cancellable_through_modern_snapshot(
             self, _mock_managed_jobs_db_conn, tmp_path, monkeypatch):
         legacy_job_id = _insert_legacy_running_job(_mock_managed_jobs_db_conn)
-        monkeypatch.setattr('sky.jobs.constants.SIGNAL_FILE_PREFIX',
-                            str(tmp_path / '{}'))
+        monkeypatch.setattr('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH',
+                            str(tmp_path))
         monkeypatch.setattr(jobs_utils, '_controller_is_restarting',
                             lambda: False)
 
         result = jobs_utils.cancel_jobs_by_id([legacy_job_id],
                                               current_workspace='default')
 
-        assert result == f'Job with ID {legacy_job_id} is scheduled to be cancelled.'
-        assert ((tmp_path / str(legacy_job_id)).read_text(
-            encoding='utf-8') == jobs_utils.UserSignal.CANCEL.value)
+        assert result == 'No job to cancel.'
+        assert not (tmp_path / str(legacy_job_id)).exists()
