@@ -1564,10 +1564,13 @@ the context name; a nonsecret endpoint fingerprint; a nonsecret cloud-identity
 digest; the effective namespace and live `Namespace.metadata.uid`; configured
 price; the resolved non-default service-account name, its live
 `ServiceAccount.metadata.uid`, and a digest over namespace, name, and UID; a
-deterministically sorted tuple of normalized node records containing
-`status.capacity`, `status.allocatable`, and the exact existing `is_ready()`
-boolean; the configuration fingerprint; and the closed eligibility result
-above. The endpoint fingerprint hashes only the
+provider-order tuple of normalized node records containing `status.capacity`,
+`status.allocatable`, and the exact existing `is_ready()` boolean; a bounded
+tuple of CPU avoid-accelerator label keys derived by consuming exact provider
+node and label-map order, with no raw labels retained; the configuration
+fingerprint; and the closed eligibility result above. A separately sorted
+projection of the node records is used only for offer ordering and identity.
+The endpoint fingerprint hashes only the
 normalized API-server scheme, host, port, path, and CA bundle digest from the
 loaded client configuration. Userinfo, query strings, client certificates,
 keys, tokens, exec-plugin arguments, environment variables, and raw kubeconfig
@@ -1599,35 +1602,72 @@ cannot retarget observation after enumeration. Kubeconfig users containing
 `exec` or `auth-provider` fail closed before upstream `KubeConfigLoader` can
 execute or log them; a bounded, scrubbed credential implementation is required
 before either mode becomes eligible. Endpoint and CA identity are frozen while
-ordinary token and client-certificate rotation remains live. The returned
+ordinary external `tokenFile`, client-certificate, and client-key rotation
+remains live. An external token file's final path component is opened without
+following symbolic links, must be a regular file, and is read through a 1 MiB
+cap on every authorization lookup; upstream unbounded token-file loading is
+bypassed. Its UTF-8 text, including leading and trailing whitespace, is used
+exactly. A failed refresh clears the prior authorization value and permanently
+disables that target's token-file refresh rather than reusing a stale token.
+Inline token data remains frozen with the captured config tree. The returned
 target owns its client and temporary CA and has an idempotent `close()` that
-removes both immediately even if the closed target remains referenced; a
-finalizer is fallback only. The credential-bearing session and target never
-enter the snapshot, an offer, a digest, logs, or Datadog.
+removes both immediately even if the closed target remains referenced,
+including Kubernetes-client-version-specific refresh callables that capture a
+loader or token path. Concurrent `close()` calls are linearizable: every
+caller returns only after that one cleanup has completed. Kubeconfig capture
+also contains and detaches every `BaseException` raised after credential data
+has been loaded. Ordinary invalid-config exceptions yield the fixed empty
+inventory, while control exceptions retain their type and are re-raised only
+from a credential-free outer boundary. A finalizer is fallback only. The
+credential-bearing session and target never enter the snapshot, an offer, a
+digest, logs, or Datadog.
 
 The snapshot contains no kubeconfig, credential, token, full node object, pod
-configuration, label, annotation, or admission payload. Both the legacy shadow
-adapter and offer source project from this exact value. Node input order is
-normalized before either projection, so provider response or future-completion
-order cannot affect offer ordering. The comparison-only
-legacy adapter preserves the captured legacy context order; the offer source
-sorts by normalized context identity. The comparator records order and winner
-differences separately. Neither projection replaces or reorders the real legacy
-candidate list in shadow mode, which is important because the current
-`allowed_contexts: all` path passes through a set.
+configuration, raw node label map, label value, annotation, or admission
+payload. Both the legacy shadow
+adapter and offer source project from this exact value. The capture preserves
+provider node order because the legacy no-fit reason is order-sensitive when
+nodes tie on maximum CPU. The comparison-only legacy adapter consumes that
+order exactly. The offer source sorts a separate normalized node projection,
+so provider response or future-completion order cannot affect offer ordering.
+The comparison-only legacy adapter also preserves the captured legacy context
+order; the offer source sorts by normalized context identity. The comparator
+records order and winner differences separately. Neither projection replaces
+or reorders the real legacy candidate list in shadow mode, which is important
+because the current `allowed_contexts: all` path passes through a set.
 
 One observation accepts at most 256 candidate contexts, 10,000 node records per
-context, 64 MiB of decompressed node-list input across all contexts, 256
-registered Kubernetes-property names, 256 registered queue paths, and 256
-resulting offers. Context, node-name, resource-value, registry-name, and
-queue-path strings have explicit UTF-8 byte bounds. An `ijson` counting stream
-enforces the aggregate byte budget while parsing and projects each node
-directly into `KubernetesNodeResources`; it never constructs or retains a raw
-`V1Node`, label, annotation, or unrelated provider field. The source checks API
-collection metadata, per-field bounds, and projected lengths, never truncates,
-and returns `NOT_REPRESENTABLE(OBSERVATION_LIMIT_EXCEEDED)` on any overflow.
+context, 64 MiB of decompressed node-list input across all contexts, 64 nested
+JSON containers, 256 registered Kubernetes-property names, 256 registered
+queue paths, and 256 resulting offers. Context, node-name, resource-value,
+registry-name, and queue-path strings have explicit UTF-8 byte bounds.
+Transient node-label keys are at most 1,024 UTF-8 bytes and values at most 256
+KiB; neither is retained. The derived CPU avoid-accelerator tuple has at most
+16 keys of at most 317 UTF-8 bytes each. An `ijson` counting stream enforces
+the aggregate byte budget while parsing and projects each node directly into
+`KubernetesNodeResources`; it never constructs or retains a raw `V1Node`, raw
+label map, label value, annotation, or unrelated provider field. The source
+requires exactly one root collection-metadata map, checks its pagination
+fields, per-field bounds, and projected lengths, never truncates, and returns
+`NOT_REPRESENTABLE(OBSERVATION_LIMIT_EXCEEDED)` on any overflow. Encoded HTTP
+content length is never used as decoded EOF when a content decoder can retain
+buffered output; the byte cap and EOF probe apply to decompressed bytes.
 Provider completion order cannot decide which entries survive because overflow
-rejects the whole observation.
+rejects the whole observation. If an otherwise valid response has unknown
+length and consumes its exact accepted-byte limit, the reader performs at most
+one discard-only one-byte EOF probe for that context. Therefore the hard
+physical read ceiling is 64 MiB plus 256 bytes, while accepted and retained
+response content remains capped at 64 MiB. A nonempty probe rejects the whole
+observation.
+
+Readiness and accelerator-family selection remain single-owner policies.
+`_transition_kubernetes_node_readiness()` owns the first-`Ready` condition and
+exact `status == 'True'` decision used by both `V1Node.is_ready()` and the
+streaming projection. `_GPULabelFormatterSelector` owns formatter priority,
+first-nonempty matching, and value validation used by both
+`detect_gpu_label_formatter()` and the streaming projection. The observation
+path retains only one tri-state decision per formatter and registers no
+invalid-value callback, so the shared policy does not retain label values.
 
 Capture has an aggregate monotonic deadline and a fixed worker bound. Each
 context writes to its original candidate index, so completion order cannot
@@ -1649,9 +1689,14 @@ the context name, endpoint fingerprint, cloud-identity digest, effective
 namespace, and live namespace UID. A shared Kubernetes scope helper derives the
 identity digest from the same normalized kubeconfig cluster/user or in-cluster
 identity used by `Kubernetes.get_identity_from_context_name()`, without storing
-the raw identity. `REQUIRE_FRESH` reloads that identity instead of reusing a
-credential or context cache. Only the scope digest is stored; the raw endpoint,
-context identity, namespace, and UID are not stored in the provider payload.
+the raw identity. Pure adaptor-layer normalizers own the historical
+cluster/user/namespace and in-cluster identity wire shapes. Exact-target
+construction, `Kubernetes.get_identity_from_context()`, and
+`in_cluster_identity()` delegate to those normalizers, including the existing
+default-namespace and underscore behavior. `REQUIRE_FRESH` reloads that
+identity instead of reusing a credential or context cache. Only the scope
+digest is stored; the raw endpoint, context identity, namespace, and UID are
+not stored in the provider payload.
 
 Kubernetes V1's allowlisted provider-payload `identity` object contains exactly
 `rendered_pod_placement_fingerprint` and
@@ -3447,3 +3492,40 @@ change has a direct legacy caller and a reversible characterization boundary.
 S2a.2 did not pass the same completeness bar because the immutable resolved
 inputs to base rendering are not yet enumerated; its explicit design and review
 gate above prevents implementation from starting on an assumed interface.
+
+### Review 11
+
+Verdict: `PURSUE` for the completed S2a.1 shared observation primitives.
+
+The final independent architecture review inspected the settled working tree
+on base head `c014c1dba8` and returned `PASS` with no confirmed blocker. The
+reviewed leaf hashes were:
+
+- `sky/adaptors/kubernetes.py`:
+  `d82b885189476f3c6e91eaa1c3675741a3da241536d35209eeb6e99b8ffddd3e`;
+- `sky/clouds/kubernetes.py`:
+  `1a0f3c4f9815a94e1ee3b58b064835fed1662d1fb42dc79a4fd13c6428069dc4`;
+- `sky/provision/kubernetes/utils.py`:
+  `d50327ec09b2e3b65aeb5409cf3dc4b33d20e40b768053e76c815f5b4b0f42b9`;
+- `tests/unit_tests/test_sky/adaptors/test_kubernetes_observation_primitives.py`:
+  `ec43408de6bd7d7a981d6052a61b3c2de94481604acfef0a92272788d9d2d178`;
+- `tests/unit_tests/kubernetes/test_kubernetes_node_observation_primitives.py`:
+  `5dced105a72a17e6bd0c4ca002dad6edc7f849c52b96084d22e8dd84bd7078b9`;
+- `tests/unit_tests/test_sky/clouds/test_kubernetes.py`:
+  `5938f0528aec59bbe7acbdde8f5acf085f5585cbee2c95ec96983be49115f865`.
+
+The iterative review closed cleanup-exception isolation, exact root metadata,
+decoded gzip EOF, and three responsibility-duplication findings. Shared owners
+now decide GPU formatter selection, first-Ready readiness, kubeconfig identity,
+in-cluster identity, and API-client cleanup. The bounded path adds exactly one
+provider `list_node()` operation and retains no raw label map or value. It adds
+no S2b offer, classifier, aggregate-deadline, or orchestration wiring, no S2a.2
+base renderer, and no provider mutation.
+
+Local acceptance imported the intended worktree and passed 720 serial tests,
+exact YAPF 0.32, isort 5.12, Python compilation, changed-file mypy, exact
+Pylint 2.14.5 at 10.00/10 for production and new tests, and
+`git diff --check`. The three broader mypy findings in
+`check_instance_fits()` predate and are outside every changed hunk. Exact-head
+CI, review state, and merge proof remain required before this slice advances to
+S2a.2.
