@@ -11202,6 +11202,7 @@ def test_database_migration_process_bootstraps_before_config_overlay(
                     'alembic_version_serve_state_db',
                     'alembic_version_spot_jobs_db',
                     'alembic_version_api_requests_db',
+                    'alembic_version_capacity_state_db',
                 )
             }
         assert revisions == {
@@ -11213,6 +11214,8 @@ def test_database_migration_process_bootstraps_before_config_overlay(
             'alembic_version_spot_jobs_db': migration_utils.SPOT_JOBS_VERSION,
             'alembic_version_api_requests_db':
                 migration_utils.API_REQUESTS_VERSION,
+            'alembic_version_capacity_state_db':
+                migration_utils.CAPACITY_STATE_VERSION,
         }
     finally:
         with postgres_engine.begin() as connection:

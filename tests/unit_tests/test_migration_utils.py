@@ -9,6 +9,8 @@ import sqlalchemy
 from sky import global_user_state
 from sky import skypilot_config
 from sky.jobs import state_storage
+from sky.physical_capacity import config as capacity_config
+from sky.physical_capacity import state as capacity_state
 from sky.serve import serve_state
 from sky.server import database_migrations
 from sky.server.requests import postgres as request_postgres
@@ -160,3 +162,84 @@ def test_database_migration_initializes_selected_request_store(
     initialize_serve.assert_called_once_with()
     initialize_jobs.assert_called_once_with()
     initialize_requests.assert_called_once_with()
+
+
+def test_database_migration_initializes_capacity_last_on_postgres(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    order: list[str] = []
+    postgres_engine = mock.Mock()
+    postgres_engine.dialect.name = 'postgresql'
+    configuration = mock.Mock(mode=capacity_config.CapacityMode.DISABLED)
+
+    def initialize_global():
+        order.append('global')
+        return postgres_engine
+
+    def load_capacity_config():
+        order.append('capacity_config')
+        return configuration
+
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        initialize_global)
+    monkeypatch.setattr(skypilot_config, 'initialize_and_get_db',
+                        lambda: order.append('config'))
+    monkeypatch.setattr(serve_state, 'get_database_engine',
+                        lambda: order.append('serve'))
+    monkeypatch.setattr(state_storage, 'initialize_and_get_db',
+                        lambda: order.append('jobs'))
+    monkeypatch.setattr(capacity_config, 'load_config', load_capacity_config)
+    validate = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: order.append('capacity_validate'))
+    monkeypatch.setattr(capacity_config, 'validate_runtime_capability',
+                        validate)
+    monkeypatch.setattr(capacity_state, 'initialize_and_get_db',
+                        lambda: order.append('capacity'))
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
+
+    database_migrations.initialize_central_databases()
+
+    assert order == [
+        'capacity_config', 'global', 'config', 'serve', 'jobs',
+        'capacity_validate', 'capacity'
+    ]
+    validate.assert_called_once_with(configuration, revision='001')
+
+
+def test_database_migration_skips_disabled_capacity_on_sqlite(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    sqlite_engine = mock.Mock()
+    sqlite_engine.dialect.name = 'sqlite'
+    configuration = mock.Mock(mode=capacity_config.CapacityMode.DISABLED)
+    initialize_capacity = mock.Mock()
+
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        lambda: sqlite_engine)
+    monkeypatch.setattr(skypilot_config, 'initialize_and_get_db', mock.Mock())
+    monkeypatch.setattr(serve_state, 'get_database_engine', mock.Mock())
+    monkeypatch.setattr(state_storage, 'initialize_and_get_db', mock.Mock())
+    monkeypatch.setattr(capacity_config, 'load_config', lambda: configuration)
+    monkeypatch.setattr(capacity_state, 'initialize_and_get_db',
+                        initialize_capacity)
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
+
+    database_migrations.initialize_central_databases()
+
+    initialize_capacity.assert_not_called()
+
+
+def test_database_migration_rejects_capacity_mode_on_sqlite(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    sqlite_engine = mock.Mock()
+    sqlite_engine.dialect.name = 'sqlite'
+    configuration = mock.Mock(mode=capacity_config.CapacityMode.SHADOW)
+
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        lambda: sqlite_engine)
+    monkeypatch.setattr(skypilot_config, 'initialize_and_get_db', mock.Mock())
+    monkeypatch.setattr(serve_state, 'get_database_engine', mock.Mock())
+    monkeypatch.setattr(state_storage, 'initialize_and_get_db', mock.Mock())
+    monkeypatch.setattr(capacity_config, 'load_config', lambda: configuration)
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
+
+    with pytest.raises(RuntimeError, match='PostgreSQL'):
+        database_migrations.initialize_central_databases()

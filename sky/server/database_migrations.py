@@ -13,13 +13,15 @@ def initialize_central_databases() -> None:
     from sky import global_user_state
     from sky import skypilot_config
     from sky.jobs import state_storage
+    from sky.physical_capacity import config as capacity_config
     from sky.serve import serve_state
 
     # pylint: enable=import-outside-toplevel
+    capacity_configuration = capacity_config.load_config()
     # Global state must run first: explicit bootstrap proves the shared
     # effective PostgreSQL schema is empty before any companion schema creates
     # objects in it.
-    global_user_state.initialize_and_get_db()
+    global_engine = global_user_state.initialize_and_get_db()
     skypilot_config.initialize_and_get_db()
     serve_state.get_database_engine()
     state_storage.initialize_and_get_db()
@@ -29,6 +31,17 @@ def initialize_central_databases() -> None:
         # pylint: disable=import-outside-toplevel
         from sky.server.requests import postgres as request_postgres
         request_postgres.initialize_and_get_db()
+    if global_engine.dialect.name == 'postgresql':
+        capacity_config.validate_runtime_capability(capacity_configuration,
+                                                    revision='001')
+        # Capacity is initialized last. It shares the ordinary PostgreSQL
+        # engine namespace and owns no DDL on SQLite.
+        # pylint: disable=import-outside-toplevel
+        from sky.physical_capacity import state as capacity_state
+        capacity_state.initialize_and_get_db()
+    elif capacity_configuration.mode != capacity_config.CapacityMode.DISABLED:
+        raise RuntimeError('Physical capacity requires the central PostgreSQL '
+                           'database; SQLite supports only disabled mode.')
 
 
 def main() -> None:

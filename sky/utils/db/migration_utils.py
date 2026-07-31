@@ -71,6 +71,10 @@ API_REQUESTS_DB_NAME = 'api_requests_db'
 API_REQUESTS_VERSION = '004'
 API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
 
+CAPACITY_STATE_DB_NAME = 'capacity_state_db'
+CAPACITY_STATE_VERSION = '001'  # read-only physical-capacity projection core
+CAPACITY_STATE_LOCK_PATH = f'~/.sky/locks/.{CAPACITY_STATE_DB_NAME}.lock'
+
 
 @contextlib.contextmanager
 def db_lock(db_name: str):
