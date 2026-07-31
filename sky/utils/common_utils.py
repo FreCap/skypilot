@@ -33,6 +33,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.skylet import constants
 from sky.utils import context
+from sky.utils import kubernetes_template_source
 from sky.utils import ux_utils
 from sky.utils import validator
 
@@ -992,15 +993,33 @@ def fill_template(template_ref: str, variables: dict[str, Any],
     don't have to write into SkyPilot's tree.
     """
     assert template_ref.endswith('.j2'), template_ref
+    root_dir = os.path.dirname(os.path.dirname(__file__))
     if os.path.isabs(template_ref):
         template_path = template_ref
     else:
-        root_dir = os.path.dirname(os.path.dirname(__file__))
         template_path = os.path.join(root_dir, 'templates', template_ref)
     if not os.path.exists(template_path):
         raise FileNotFoundError(f'Template "{template_ref}" does not exist.')
-    with open(template_path, encoding='utf-8') as fin:
-        template = fin.read()
+    template_dir = os.path.join(root_dir, 'templates')
+    builtin_kubernetes_template = os.path.join(template_dir,
+                                               'kubernetes-ray.yml.j2')
+    is_builtin_kubernetes_template = (os.path.realpath(
+        template_path) == os.path.realpath(builtin_kubernetes_template))
+    if is_builtin_kubernetes_template:
+        outer_path = os.path.join(template_dir, 'kubernetes-ray-outer.yml.j2')
+        node_config_path = os.path.join(template_dir,
+                                        'kubernetes-ray-node-config.yml.j2')
+        decode_source = (kubernetes_template_source.
+                         decode_builtin_kubernetes_template_source)
+        with open(outer_path, 'rb') as fin:
+            outer_source = decode_source(fin.read())
+        with open(node_config_path, 'rb') as fin:
+            node_config_source = decode_source(fin.read())
+        template = kubernetes_template_source.compose_builtin_kubernetes_template_source(
+            outer_source, node_config_source)
+    else:
+        with open(template_path, encoding='utf-8') as fin:
+            template = fin.read()
     output_path = os.path.abspath(os.path.expanduser(output_path))
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 

@@ -334,6 +334,135 @@ def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
         'runcmd'] == expected_runcmd, 'runcmd not passed correctly'
 
 
+def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
+    """Return one hermetic built-in Kubernetes writer invocation."""
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+    monkeypatch.setattr(kubernetes_utils, 'get_kubernetes_nodes',
+                        lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace',
+                        lambda **_kwargs: 'default')
+    monkeypatch.setattr(
+        clouds.Kubernetes, '_detect_network_type', lambda *_args, **_kwargs:
+        (kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE, None))
+    monkeypatch.setattr(clouds.Kubernetes,
+                        '_unsupported_features_for_resources',
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
+                        lambda: ('/tmp/test-key', 'test-public-key'))
+    monkeypatch.setattr(backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_args: {})
+    monkeypatch.setattr(backend_utils.logs, 'get_logging_agent', lambda: None)
+    monkeypatch.setattr('sky.catalog.get_image_id_from_tag',
+                        lambda *_args, **_kwargs: 'test-image:latest')
+    monkeypatch.setattr(common_utils, 'get_user_hash', lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend_utils.sky, '__version__', '1.0.0')
+    monkeypatch.setattr(backend_utils, '_deterministic_cluster_yaml_hash',
+                        lambda _path: 'test-hash')
+
+    output_path = tmp_path / test_name / 'cluster.yaml'
+    monkeypatch.setattr(backend_utils, '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    return ({
+        'to_provision': Resources(cloud=clouds.Kubernetes(),
+                                  instance_type='4CPU--16GB'),
+        'num_nodes': 2,
+        'cluster_config_template': 'kubernetes-ray.yml.j2',
+        'cluster_name': 'display',
+        'local_wheel_path': pathlib.Path('/tmp/test-wheel'),
+        'wheel_hash': 'b1bd84059bc0342f7843fcbe04ab563e',
+        'region': clouds.Region(name='test-context'),
+        'dryrun': True,
+        'keep_launch_fields_in_existing_config': True,
+    }, output_path)
+
+
+def test_builtin_kubernetes_writer_preserves_fill_template_facade(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'direct-facade')
+    original_fill_template = common_utils.fill_template
+    fill_template = mock.Mock(wraps=original_fill_template)
+    safe_load = mock.Mock(wraps=yaml_utils.safe_load)
+    monkeypatch.setattr(common_utils, 'fill_template', fill_template)
+    monkeypatch.setattr(yaml_utils, 'safe_load', safe_load)
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    fill_template.assert_called_once()
+    call = fill_template.call_args
+    assert call.args[0] == 'kubernetes-ray.yml.j2'
+    assert type(call.args[1]) is dict
+    assert len(call.args) == 2
+    assert call.kwargs == {'output_path': f'{output_path}.tmp'}
+    assert result['ray'] == f'{output_path}.tmp'
+    safe_load.assert_called_once()
+
+
+def test_builtin_kubernetes_writer_preserves_delegating_wrapper(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'delegating-wrapper')
+    original_fill_template = common_utils.fill_template
+    wrapper_calls = []
+
+    def delegating_wrapper(template_ref, variables, output_path):
+        wrapper_calls.append((template_ref, variables, output_path))
+        return original_fill_template(template_ref, variables, output_path)
+
+    monkeypatch.setattr(common_utils, 'fill_template', delegating_wrapper)
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    assert len(wrapper_calls) == 1
+    template_ref, variables, rendered_path = wrapper_calls[0]
+    assert template_ref == 'kubernetes-ray.yml.j2'
+    assert type(variables) is dict
+    assert rendered_path == f'{output_path}.tmp'
+    assert result['ray'] == rendered_path
+
+
+def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'replacement-renderer')
+    replacement_calls = []
+
+    def replacement_renderer(template_ref, variables, output_path):
+        replacement_calls.append((template_ref, variables, output_path))
+        if os.path.isabs(template_ref):
+            template_path = pathlib.Path(template_ref)
+        else:
+            template_path = (pathlib.Path(common_utils.__file__).parents[1] /
+                             'templates' / template_ref)
+        source_bytes = template_path.read_bytes()
+        assert hashlib.sha256(source_bytes).hexdigest() == (
+            '988b6d5e2afd7e96b3a6d7e0091c661a3d05d5a61d23fd7efa138ab75d55a6f8')
+        source = source_bytes.decode('utf-8')
+        assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
+        rendered = common_utils.jinja2.Template(source).render(**variables)
+        rendered += '\nreplacement_renderer_authoritative: true\n'
+        rendered_path = pathlib.Path(output_path)
+        rendered_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered_path.write_text(rendered, encoding='utf-8')
+
+    monkeypatch.setattr(common_utils, 'fill_template', replacement_renderer)
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    assert len(replacement_calls) == 1
+    assert replacement_calls[0][0] == 'kubernetes-ray.yml.j2'
+    assert replacement_calls[0][2] == f'{output_path}.tmp'
+    rendered_config = yaml_utils.read_yaml(result['ray'])
+    assert rendered_config['replacement_renderer_authoritative'] is True
+
+
 @pytest.mark.parametrize(
     ('scenario', 'cloud', 'region_name', 'config_cloud', 'host_network',
      'network_type'), [

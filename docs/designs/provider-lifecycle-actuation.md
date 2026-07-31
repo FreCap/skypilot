@@ -5,11 +5,12 @@ deployment, canary, cleanup, and monitor qualified; S2a.1 exact-head CI and
 merge qualified; responsibility-deduplication review accepted for planning;
 the first M2 S2 prototype was rejected because it duplicated placement policy,
 and the bounded S2a.2 production-owner contract passed exact design review;
-S2a.2 implementation remains gated on reconciliation with the live physical
-capacity branch; M3 and M4 implementation require dedicated exact-design
-adversarial reviews. The separately deployable S2a.2 deterministic-gzip
-prerequisite is implemented and locally qualified; its exact-head CI, merge,
-and deployment gates remain open.
+the live physical-capacity branch is reconciled; and the separately deployable
+S2a.2 deterministic-gzip prerequisite passed exact-head CI, merge, staged
+revision 45 deployment, and bounded monitoring. The source-composer staging
+slice is implemented and locally qualified; its exact-head CI, merge, and
+deployment gates remain open. M3 and M4 implementation require dedicated
+exact-design adversarial reviews.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -4133,9 +4134,38 @@ M2 implementation is split into reviewed slices:
   Kubernetes and SSH with effective `hostNetwork` both false and true plus
   Kubernetes OCI RoCE. Each golden locks the fixed legacy and replacement
   hashes and proves that replacing exactly the two embedded Base64 gzip
-  members accounts for the entire full-render delta. Exact-head CI and staged
-  deployment evidence will be appended before this prerequisite is marked
-  complete.
+  members accounts for the entire full-render delta. PR #1099 passed all 29
+  visible checks on exact head
+  `fbc616a7d7128af4456d3eb58e265f3406250da9`, then merged normally as
+  `1bf168a800ebbee77d76172f5c2d4d6ea46e4eee`, with first parent
+  `24310104235e54de446d7fb4a2a9de9bdcfd2510` and that tested head as second
+  parent. Image digest
+  `sha256:36fe70700a797101dbec0fd31c5b324e41e5ab72d1848d4f72d4d2f19c4a6324`
+  reports the exact merge commit and build 8057. Helm revisions 43 through 45
+  deployed API, executor, and controller separately with reused values and the
+  merged PR #1100 RBAC chart retained. Six consecutive 30-second revision 45
+  snapshots kept every role at two ready, updated, and available replicas,
+  all six pods at zero restarts on the exact digest, all PDBs healthy, and
+  every direct health, ready, and live probe at HTTP 200. Capacity remained
+  disabled, all five capacity tables remained empty, and PostgreSQL reported
+  zero `skypilot-physical-capacity-evidence` connections. The retained PR
+  #1100 Helm bindings still target the external `skypilot-ha-api` service
+  account.
+- S2a.2 source-composer staging extracts the exact 67,812-byte `node_config`
+  fragment and 16,028-byte outer while leaving the 83,790-byte compatibility
+  monolith unchanged. The standard-library-only source owner validates UTF-8,
+  marker count, size, and SHA-256 identities before one Jinja render. The
+  established three-argument `fill_template()` facade dispatches only the
+  canonically resolved built-in path; wrappers still delegate, replacement
+  renderers still own their output, same-basename plugin paths and other bare
+  templates remain unchanged, and exact built-in runtime reads the outer and
+  fragment once each without reading the mirror. Local qualification passes
+  all 72 cases in the complete source and backend utility test files, including
+  the 26 focused source, facade, and full-writer render cases, plus an installed
+  wheel smoke test that proves all three physical sources and the composer are
+  packaged and operational. Repository formatting, mypy, pylint, dashboard
+  lint, and dashboard formatting pass. Exact-head CI, merge, staged deployment,
+  and monitoring remain gates for this slice.
 - S2b owns the Kubernetes observation source, payload schema, closed
   resource/config classifiers, aggregate deadline, and a separately reviewed
   bounded source-safe scheduling projection. S2b may not invoke S2a.2 full
@@ -4259,7 +4289,7 @@ Removal is part of completion, not optional follow-up.
 | candidate selection body in `Kubernetes.existing_allowed_contexts()` and provisional `resolve_kubernetes_candidate_contexts_v1()` | shared pure context policy is authoritative | legacy characterization is exact, offer tests call the same owner, and repository search finds no second selector |
 | duplicated workspace, context, and global precedence in the provisional Kubernetes offer source | snapshot getter is authoritative | live and frozen-input corpora agree and no offer-owned effective-value helper remains |
 | pre-admission Pod mutation body inside Kubernetes `_create_pods()` | shared final Pod-spec owner is called immediately before create | head, worker, CPU, GPU, TPU, allowed-node, Docker-cache, single-node, and multi-node corpus is exact and repository search finds no second mutation body |
-| time-bearing `gzip.compress()` in `host_network_probe_b64()` | implementation is removed by S2a.2 prerequisite A in this stack; close the row after exact-head CI and staged deployment qualify the replacement | `GzipFile` output has the exact portable header, is byte-identical across Python 3.10 through 3.14 and separate processes, round-trips, and compiles the actual probe |
+| time-bearing `gzip.compress()` in `host_network_probe_b64()` | removed and qualified by merged S2a.2 prerequisite A at `1bf168a800ebbee77d76172f5c2d4d6ea46e4eee` | `GzipFile` output has the exact portable header, is byte-identical across Python 3.10 through 3.14 and separate processes, round-trips, and compiles the actual probe; exact-head CI passed 29 checks and revision 45 passed the staged six-snapshot deployment monitor |
 | authoritative inline built-in Kubernetes `node_config` body and raw one-file built-in render | the physical fragment, single source composer behind the established facade, one initial render/pre-combination parse, and `build_kubernetes_base_pod_spec()` are authoritative | against the deterministic-gzip prerequisite head, outer, fragment, monolith, and name digests, exact facade arguments, wrapper behavior, anchor and error-coordinate corpus, initial parsed tree, exact later parse/serialization sequence, dumped YAML, validation, deterministic hash, SSH use, managed-image, reuse, and rollback behavior are exact; exact built-in and delegating-facade dispatch has no composer bypass or independent fragment render, and the old monolith is only the validated compatibility mirror tracked by its own row |
 | digest-locked `kubernetes-ray.yml.j2` compatibility monolith and temporary-outer selection branch | direct physical-template readers have completed their inventory and deprecation window | delegating wrappers remain green; the identity-gated custom-`fill_template` compatibility diagnostic records zero dispatches for one compatibility release; repository and downstream-package inventory find no reader that opens the physical path outside the facade; all inventoried readers migrate to the facade or a structured extension; and a separate commit replaces the mirror path atomically with the validated outer, removes the temporary `-outer` path and selection branch, and leaves repository search with no inline monolith or second physical source copy |
 | post-`bulk_provision()` `make_deploy_resources_variables()` callback for Kubernetes, SSH, and other providers | the M4 immutable provider descriptor supplies an inventoried typed deploy-variable snapshot with an explicit freshness contract to every promoted provider | per-provider config, credential, catalog, API-read, side-effect, mutable-value, plugin, failover, reuse-name, and post-mutation semantics are characterized; identity-admitted Kubernetes/SSH writer paths retain two cloud callbacks and two Pod reads, while public mutable paths retain their three Pod reads until their separate gate closes; each promoted provider passes stable-input and intentional-delta conformance; repository search finds no promoted-provider second callback, while unpromoted providers remain behind an explicit compatibility branch |
