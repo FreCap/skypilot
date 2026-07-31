@@ -109,19 +109,18 @@ addresses and run another plan; do not remove resources from state.
 ## Module reference
 
 <!-- BEGIN_TF_DOCS -->
-
 ## Requirements
 
-| Name                                                                     | Version   |
-| ------------------------------------------------------------------------ | --------- |
-| <a name="requirement_terraform"></a> [terraform](#requirement_terraform) | >= 1.5.0  |
-| <a name="requirement_aws"></a> [aws](#requirement_aws)                   | >= 6.24.0 |
+| Name | Version |
+|------|---------|
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.5.0 |
+| <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 6.24.0 |
 
 ## Providers
 
-| Name                                             | Version   |
-| ------------------------------------------------ | --------- |
-| <a name="provider_aws"></a> [aws](#provider_aws) | >= 6.24.0 |
+| Name | Version |
+|------|---------|
+| <a name="provider_aws"></a> [aws](#provider\_aws) | >= 6.24.0 |
 
 ## Modules
 
@@ -129,52 +128,51 @@ No modules.
 
 ## Resources
 
-| Name                                                                                                                                                | Type        |
-| --------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| [aws_iam_instance_profile.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile)                     | resource    |
-| [aws_iam_role.provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role)                                    | resource    |
-| [aws_iam_role.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role)                                             | resource    |
-| [aws_iam_role_policy.provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy)                      | resource    |
-| [aws_iam_role_policy.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy)                               | resource    |
-| [aws_iam_role_policy.vm_assume_provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy)            | resource    |
-| [aws_iam_role_policy.vm_extra_inline](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy)                  | resource    |
-| [aws_iam_role_policy.vm_serve_replica](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy)                 | resource    |
-| [aws_iam_role_policy_attachment.vm_extra](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment)   | resource    |
-| [aws_iam_role_policy_attachment.vm_ssm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment)     | resource    |
-| [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/caller_identity)                       | data source |
-| [aws_iam_policy_document.provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document)           | data source |
-| [aws_iam_policy_document.provisioner_assume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document)    | data source |
-| [aws_iam_policy_document.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document)                    | data source |
-| [aws_iam_policy_document.vm_assume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document)             | data source |
+| Name | Type |
+|------|------|
+| [aws_iam_instance_profile.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile) | resource |
+| [aws_iam_role.provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
+| [aws_iam_role.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
+| [aws_iam_role_policy.provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
+| [aws_iam_role_policy.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
+| [aws_iam_role_policy.vm_assume_provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
+| [aws_iam_role_policy.vm_extra_inline](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
+| [aws_iam_role_policy.vm_serve_replica](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
+| [aws_iam_role_policy_attachment.vm_extra](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment) | resource |
+| [aws_iam_role_policy_attachment.vm_ssm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment) | resource |
+| [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/caller_identity) | data source |
+| [aws_iam_policy_document.provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
+| [aws_iam_policy_document.provisioner_assume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
+| [aws_iam_policy_document.vm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
+| [aws_iam_policy_document.vm_assume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 | [aws_iam_policy_document.vm_assume_provisioner](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
-| [aws_iam_policy_document.vm_serve_replica](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document)      | data source |
-| [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/partition)                                   | data source |
+| [aws_iam_policy_document.vm_serve_replica](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
+| [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/partition) | data source |
 
 ## Inputs
 
-| Name                                                                                                             | Description                                                                                                                                                                                                                                                                                                                                | Type                                                                                           | Default                  | Required |
-| ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- | ------------------------ | :------: |
-| <a name="input_controller_role_arn"></a> [controller\_role\_arn](#input_controller_role_arn)                     | Exact IAM role ARN used by the SkyPilot control plane. The role is trusted<br/>to assume the provisioner role created in this account.                                                                                                                                                                                                     | `string`                                                                                       | n/a                      |   yes    |
-| <a name="input_enable_serve_controller"></a> [enable\_serve\_controller](#input_enable_serve_controller)         | Grant the VM role the additional IAM needed by an in-account SkyServe<br/>controller. The role can pass its own instance profile, manage SSM sessions<br/>to replicas, and assume the provisioner role; the provisioner trust also<br/>includes the VM role. Leave false when only the external control plane<br/>provisions this account. | `bool`                                                                                         | `false`                  |    no    |
-| <a name="input_enable_ssm"></a> [enable\_ssm](#input_enable_ssm)                                                 | Attach AmazonSSMManagedInstanceCore to the VM role and allow the<br/>provisioner to start Session Manager SSH sessions. SkyPilot must separately<br/>be configured to use SSM or an SSM-based ssh\_proxy\_command. Instances need<br/>outbound HTTPS access to the SSM endpoints through NAT or VPC endpoints.                             | `bool`                                                                                         | `true`                   |    no    |
-| <a name="input_external_id"></a> [external\_id](#input_external_id)                                              | Optional ExternalId required on the AssumeRole (defense in depth for the cross-account trust). Null = no ExternalId.                                                                                                                                                                                                                       | `string`                                                                                       | `null`                   |    no    |
-| <a name="input_instance_profile_name"></a> [instance\_profile\_name](#input_instance_profile_name)               | Name of the instance profile/role SkyPilot attaches to launched VMs. SkyPilot expects skypilot-v1 by default.                                                                                                                                                                                                                              | `string`                                                                                       | `"skypilot-v1"`          |    no    |
-| <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input_permissions_boundary_arn)      | Optional organization-managed IAM permissions boundary attached to both roles created by this module.                                                                                                                                                                                                                                      | `string`                                                                                       | `null`                   |    no    |
-| <a name="input_provisioner_role_name"></a> [provisioner\_role\_name](#input_provisioner_role_name)               | Name of the provisioner role the control plane assumes to launch EC2 here.                                                                                                                                                                                                                                                                 | `string`                                                                                       | `"skypilot-provisioner"` |    no    |
-| <a name="input_tags"></a> [tags](#input_tags)                                                                    | Tags applied to IAM resources.                                                                                                                                                                                                                                                                                                             | `map(string)`                                                                                  | `{}`                     |    no    |
-| <a name="input_vm_dataset_grants"></a> [vm\_dataset\_grants](#input_vm_dataset_grants)                           | S3 datasets the launched VMs may read/write in-job. Each grants ListBucket/Get/Put (+ multipart) on the bucket; set kms\_key\_arn for SSE-KMS buckets to add Decrypt/GenerateDataKey. Cross-account buckets also need the matching bucket and key policies in the owning account.                                                          | <pre>list(object({<br/> bucket_arn = string<br/> kms_key_arn = optional(string)<br/> }))</pre> | `[]`                     |    no    |
-| <a name="input_vm_role_extra_policy_arns"></a> [vm\_role\_extra\_policy\_arns](#input_vm_role_extra_policy_arns) | Extra managed policy ARNs to attach to the launched-VM role (e.g. S3 read access for datasets).                                                                                                                                                                                                                                            | `list(string)`                                                                                 | `[]`                     |    no    |
-| <a name="input_vm_role_extra_policy_json"></a> [vm\_role\_extra\_policy\_json](#input_vm_role_extra_policy_json) | Inline IAM policy JSON attached to the launched-VM role, for resource-scoped<br/>grants that don't fit a managed-policy ARN — e.g. cross-account ECR pull of the<br/>model image plus model-weights S3 read. Null = none.                                                                                                                  | `string`                                                                                       | `null`                   |    no    |
+| Name | Description | Type | Default | Required |
+|------|-------------|------|---------|:--------:|
+| <a name="input_controller_role_arn"></a> [controller\_role\_arn](#input\_controller\_role\_arn) | Exact IAM role ARN used by the SkyPilot control plane. The role is trusted<br/>to assume the provisioner role created in this account. | `string` | n/a | yes |
+| <a name="input_enable_serve_controller"></a> [enable\_serve\_controller](#input\_enable\_serve\_controller) | Grant the VM role the additional IAM needed by an in-account SkyServe<br/>controller. The role can pass its own instance profile, manage SSM sessions<br/>to replicas, and assume the provisioner role; the provisioner trust also<br/>includes the VM role. Leave false when only the external control plane<br/>provisions this account. | `bool` | `false` | no |
+| <a name="input_enable_ssm"></a> [enable\_ssm](#input\_enable\_ssm) | Attach AmazonSSMManagedInstanceCore to the VM role and allow the<br/>provisioner to start Session Manager SSH sessions. SkyPilot must separately<br/>be configured to use SSM or an SSM-based ssh\_proxy\_command. Instances need<br/>outbound HTTPS access to the SSM endpoints through NAT or VPC endpoints. | `bool` | `true` | no |
+| <a name="input_external_id"></a> [external\_id](#input\_external\_id) | Optional ExternalId required on the AssumeRole (defense in depth for the cross-account trust). Null = no ExternalId. | `string` | `null` | no |
+| <a name="input_instance_profile_name"></a> [instance\_profile\_name](#input\_instance\_profile\_name) | Name of the instance profile/role SkyPilot attaches to launched VMs. SkyPilot expects skypilot-v1 by default. | `string` | `"skypilot-v1"` | no |
+| <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input\_permissions\_boundary\_arn) | Optional organization-managed IAM permissions boundary attached to both roles created by this module. | `string` | `null` | no |
+| <a name="input_provisioner_role_name"></a> [provisioner\_role\_name](#input\_provisioner\_role\_name) | Name of the provisioner role the control plane assumes to launch EC2 here. | `string` | `"skypilot-provisioner"` | no |
+| <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to IAM resources. | `map(string)` | `{}` | no |
+| <a name="input_vm_dataset_grants"></a> [vm\_dataset\_grants](#input\_vm\_dataset\_grants) | S3 datasets the launched VMs may read/write in-job. Each grants ListBucket/Get/Put (+ multipart) on the bucket; set kms\_key\_arn for SSE-KMS buckets to add Decrypt/GenerateDataKey. Cross-account buckets also need the matching bucket and key policies in the owning account. | <pre>list(object({<br/>    bucket_arn  = string<br/>    kms_key_arn = optional(string)<br/>  }))</pre> | `[]` | no |
+| <a name="input_vm_role_extra_policy_arns"></a> [vm\_role\_extra\_policy\_arns](#input\_vm\_role\_extra\_policy\_arns) | Extra managed policy ARNs to attach to the launched-VM role (e.g. S3 read access for datasets). | `list(string)` | `[]` | no |
+| <a name="input_vm_role_extra_policy_json"></a> [vm\_role\_extra\_policy\_json](#input\_vm\_role\_extra\_policy\_json) | Inline IAM policy JSON attached to the launched-VM role, for resource-scoped<br/>grants that don't fit a managed-policy ARN — e.g. cross-account ECR pull of the<br/>model image plus model-weights S3 read. Null = none. | `string` | `null` | no |
 
 ## Outputs
 
-| Name                                                                                                 | Description                                                                                                                                                                                                |
-| ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| <a name="output_instance_profile_arn"></a> [instance\_profile\_arn](#output_instance_profile_arn)    | ARN of the instance profile attached to launched VMs.                                                                                                                                                      |
-| <a name="output_instance_profile_name"></a> [instance\_profile\_name](#output_instance_profile_name) | Name of the instance profile attached to launched VMs (skypilot-v1).                                                                                                                                       |
-| <a name="output_provisioner_role_arn"></a> [provisioner\_role\_arn](#output_provisioner_role_arn)    | ARN of the role the control plane assumes to launch EC2 here. Use it in the<br/>API server's ~/.aws/config profile (role\_arn=...) and grant the control-plane<br/>Pod Identity role sts:AssumeRole on it. |
-| <a name="output_provisioner_role_name"></a> [provisioner\_role\_name](#output_provisioner_role_name) | Name of the role the SkyPilot control plane assumes to manage EC2 resources.                                                                                                                               |
-| <a name="output_vm_role_arn"></a> [vm\_role\_arn](#output_vm_role_arn)                               | ARN of the IAM role attached to launched VMs through the instance profile.                                                                                                                                 |
-| <a name="output_vm_role_name"></a> [vm\_role\_name](#output_vm_role_name)                            | Name of the IAM role attached to launched VMs through the instance profile.                                                                                                                                |
-
+| Name | Description |
+|------|-------------|
+| <a name="output_instance_profile_arn"></a> [instance\_profile\_arn](#output\_instance\_profile\_arn) | ARN of the instance profile attached to launched VMs. |
+| <a name="output_instance_profile_name"></a> [instance\_profile\_name](#output\_instance\_profile\_name) | Name of the instance profile attached to launched VMs (skypilot-v1). |
+| <a name="output_provisioner_role_arn"></a> [provisioner\_role\_arn](#output\_provisioner\_role\_arn) | ARN of the role the control plane assumes to launch EC2 here. Use it in the<br/>API server's ~/.aws/config profile (role\_arn=...) and grant the control-plane<br/>Pod Identity role sts:AssumeRole on it. |
+| <a name="output_provisioner_role_name"></a> [provisioner\_role\_name](#output\_provisioner\_role\_name) | Name of the role the SkyPilot control plane assumes to manage EC2 resources. |
+| <a name="output_vm_role_arn"></a> [vm\_role\_arn](#output\_vm\_role\_arn) | ARN of the IAM role attached to launched VMs through the instance profile. |
+| <a name="output_vm_role_name"></a> [vm\_role\_name](#output\_vm\_role\_name) | Name of the IAM role attached to launched VMs through the instance profile. |
 <!-- END_TF_DOCS -->
