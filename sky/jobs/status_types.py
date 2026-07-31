@@ -387,10 +387,17 @@ class JobLogStreamSnapshot(typing.NamedTuple):
     task_name: str | None
 
 
+class ControllerLogFollowState(typing.NamedTuple):
+    """Latest-task status plus scheduler finalization for controller logs."""
+    status: ManagedJobStatus | None
+    schedule_state: ManagedJobScheduleState | None
+
+
 # These types were historically defined in sky.jobs.state. Keep their module
 # identity stable for existing imports and serialized values while state.py
 # remains the public facade.
 for _status_type in (ManagedJobStatus, BatchLifecycleTransition,
                      ManagedJobScheduleState, ControllerPidRecord,
-                     JobCancellationState, JobLogStreamSnapshot):
+                     JobCancellationState, JobLogStreamSnapshot,
+                     ControllerLogFollowState):
     _status_type.__module__ = 'sky.jobs.state'

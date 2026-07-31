@@ -10,6 +10,18 @@ from sky.skylet import log_lib
 from sky.utils import ux_utils
 
 
+def _controller_log_follow_is_complete(
+    follow_state: managed_job_state.ControllerLogFollowState,) -> bool:
+    """Whether controller-log following has observed final controller exit."""
+    status = follow_state.status
+    if status is None:
+        return False
+    if follow_state.schedule_state is None:
+        return status.is_terminal()
+    return follow_state.schedule_state == (
+        managed_job_state.ManagedJobScheduleState.DONE)
+
+
 def stream_controller_logs(
     job_id: int | None,
     job_name: str | None,
@@ -45,7 +57,7 @@ def stream_controller_logs(
     assert job_id is not None, (job_id, job_name)
 
     controller_log_path = controller_log_file_for_job_func(job_id)
-    job_status = None
+    follow_state = managed_job_state.ControllerLogFollowState(None, None)
 
     # Wait for the log file to be written.
     while not os.path.exists(controller_log_path):
@@ -54,17 +66,17 @@ def stream_controller_logs(
             # aren't following, just return.
             return '', exceptions.JobExitCode.SUCCEEDED
 
-        job_status = managed_job_state.get_status(job_id)
-        if job_status is None:
+        follow_state = managed_job_state.get_controller_log_follow_state(job_id)
+        if follow_state.status is None:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Job {job_id} not found.')
-        if job_status.is_terminal():
+        if _controller_log_follow_is_complete(follow_state):
             # Don't keep waiting. If the log file is not created by this
             # point, it never will be. This job may have been submitted using
             # an old version that did not create the file, so this is not an
             # exceptional case.
             return '', exceptions.JobExitCode.from_managed_job_status(
-                job_status)
+                follow_state.status)
 
         time.sleep(log_lib.SKY_LOG_WAITING_GAP_SECONDS)
 
@@ -111,12 +123,10 @@ def stream_controller_logs(
                 # Flush.
                 print(end='', flush=True)
 
-                # TODO(cooperc): The controller can still be cleaning up if
-                # the job is in a terminal status (e.g. SUCCEEDED). We want to
-                # follow those logs too. Use DONE instead?
-                job_status = managed_job_state.get_status(job_id)
-                assert job_status is not None, (job_id, job_name)
-                if job_status.is_terminal():
+                follow_state = managed_job_state.get_controller_log_follow_state(
+                    job_id)
+                assert follow_state.status is not None, (job_id, job_name)
+                if _controller_log_follow_is_complete(follow_state):
                     break
 
                 time.sleep(log_lib.SKY_LOG_TAILING_GAP_SECONDS)
@@ -134,8 +144,9 @@ def stream_controller_logs(
                       flush=True)
 
     if follow:
+        assert follow_state.status is not None, (job_id, job_name)
         return ux_utils.finishing_message(
-            f'Job finished (status: {job_status}).'
-        ), exceptions.JobExitCode.from_managed_job_status(job_status)
+            f'Job finished (status: {follow_state.status}).'
+        ), exceptions.JobExitCode.from_managed_job_status(follow_state.status)
 
     return '', exceptions.JobExitCode.SUCCEEDED

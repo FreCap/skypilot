@@ -859,6 +859,51 @@ def test_get_latest_log_stream_snapshot_keeps_task_without_job_info(
     assert counts['n'] == 1, counts
 
 
+def test_get_controller_log_follow_state_reads_one_lifecycle_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 0, status=ManagedJobStatus.SUCCEEDED)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        follow_state = state.get_controller_log_follow_state(job_id)
+
+    assert follow_state == state.ControllerLogFollowState(
+        ManagedJobStatus.SUCCEEDED, state.ManagedJobScheduleState.ALIVE)
+    assert counts['n'] == 1, counts
+
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.DONE.value))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        finalized_state = state.get_controller_log_follow_state(job_id)
+
+    assert finalized_state == state.ControllerLogFollowState(
+        ManagedJobStatus.SUCCEEDED, state.ManagedJobScheduleState.DONE)
+    assert counts['n'] == 1, counts
+
+
+def test_get_controller_log_follow_state_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        follow_state = state.get_controller_log_follow_state(999)
+
+    assert follow_state == state.ControllerLogFollowState(None, None)
+    assert counts['n'] == 1, counts
+
+
 def test_get_task_log_stream_snapshot_reads_one_task_snapshot(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
