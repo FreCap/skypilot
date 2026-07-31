@@ -36,6 +36,7 @@ class TestProbeRoundBatching(unittest.TestCase):
 
     def _make_manager(self):
         manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+        manager._ownership_lost = threading.Event()
         manager.lock = threading.Lock()
         manager._service_name = 'svc'
         manager._is_pool = False
@@ -328,8 +329,8 @@ class TestProbeRoundBatching(unittest.TestCase):
                  replica_managers.serve_utils,
                  'set_service_status_and_active_versions_from_replica'
              ) as status_update, \
-             mock.patch.object(replica_managers.time, 'sleep',
-                               side_effect=_StopLoop):
+             mock.patch.object(manager._ownership_lost,
+                               'wait', side_effect=_StopLoop) as ownership_wait:
             manager._get_endpoint_probe_interval_seconds = mock.Mock(
                 return_value=10)
             with self.assertRaises(_StopLoop):
@@ -341,6 +342,7 @@ class TestProbeRoundBatching(unittest.TestCase):
         self.assertEqual(full_read.call_count, 1)
         status_update.assert_called_once_with('svc', [info],
                                               manager._update_mode)
+        ownership_wait.assert_called_once_with(10)
 
     def test_no_tracked_replicas_skips_probe_round_work(self):
         manager = self._make_manager()

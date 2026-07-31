@@ -1951,11 +1951,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         # job-status reaping / readiness probing while the controller keeps
         # serving HTTP -- they are restarted instead.
         thread_utils.start_supervised_thread(self._thread_pool_refresher,
-                                             'replica-thread-pool-refresher')
+                                             'replica-thread-pool-refresher',
+                                             stop_event=self._ownership_lost)
         thread_utils.start_supervised_thread(self._job_status_fetcher,
-                                             'replica-job-status-fetcher')
+                                             'replica-job-status-fetcher',
+                                             stop_event=self._ownership_lost)
         thread_utils.start_supervised_thread(self._replica_prober,
-                                             'replica-prober')
+                                             'replica-prober',
+                                             stop_event=self._ownership_lost)
 
     def _recover_replica_operations(self):
         """Re-drive interrupted replica operations from durable state.
@@ -6505,7 +6508,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _thread_pool_refresher(self) -> None:
         """Periodically refresh the launch/down thread pool."""
-        while True:
+        while not self._ownership_lost.is_set():
             logger.debug('Refreshing thread pool.')
             try:
                 self._refresh_thread_pool()
@@ -6516,7 +6519,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            time.sleep(_PROCESS_POOL_REFRESH_INTERVAL)
+            if self._ownership_lost.wait(_PROCESS_POOL_REFRESH_INTERVAL):
+                return
 
     def _fetch_job_status(self) -> None:
         """Fetch the service job status of all replicas.
@@ -6664,7 +6668,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _job_status_fetcher(self) -> None:
         """Periodically fetch the service job status of all replicas."""
-        while True:
+        while not self._ownership_lost.is_set():
             logger.debug('Refreshing job status.')
             try:
                 self._fetch_job_status()
@@ -6675,7 +6679,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            time.sleep(_JOB_STATUS_FETCH_INTERVAL)
+            if self._ownership_lost.wait(_JOB_STATUS_FETCH_INTERVAL):
+                return
 
     def _resolve_probe_urls(self,
                             infos: list[ReplicaInfo]) -> dict[int, str | None]:
@@ -6955,7 +6960,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""
-        while True:
+        while not self._ownership_lost.is_set():
             logger.debug('Running replica prober.')
             try:
                 # Reuse the probe round's end-of-round snapshot instead of
@@ -6983,7 +6988,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # one across ticks.
                 self._tick_version_spec_cache = {}
             # TODO(MaoZiming): Probe cloud for early preemption warning.
-            time.sleep(self._get_endpoint_probe_interval_seconds())
+            if self._ownership_lost.wait(
+                    self._get_endpoint_probe_interval_seconds()):
+                return
 
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of all active replicas."""
