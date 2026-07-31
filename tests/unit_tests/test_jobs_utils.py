@@ -418,7 +418,7 @@ def test_cancel_signal_file_no_graceful():
     """Test that cancel_jobs_by_id writes an empty signal file (touch)
     for non-graceful cancels on the new controller."""
     snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                          'default', False)
+                                          'default')
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
@@ -440,7 +440,7 @@ def test_cancel_signal_file_no_graceful():
 
 def test_cancel_pending_wrong_workspace_is_not_mutated():
     snapshot = state.JobCancellationState(state.ManagedJobStatus.PENDING,
-                                          'team-b', False)
+                                          'team-b')
     with mock.patch('sky.jobs.state.get_job_cancellation_states',
                     return_value={42: snapshot}), \
          mock.patch('sky.jobs.state.set_pending_cancelled') as set_cancelled, \
@@ -455,9 +455,9 @@ def test_cancel_pending_wrong_workspace_is_not_mutated():
 
 def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
     running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default', False)
+                                         'default')
     succeeded = state.JobCancellationState(state.ManagedJobStatus.SUCCEEDED,
-                                           'default', False)
+                                           'default')
     with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
          mock.patch('sky.jobs.state.get_job_cancellation_states',
                     side_effect=[{42: running}, {42: succeeded}]) as snapshots, \
@@ -476,14 +476,13 @@ def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
 def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
     job_ids = list(range(1, 21))
     running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default', False)
+                                         'default')
     snapshot = {job_id: running for job_id in job_ids}
     with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
          mock.patch('sky.jobs.state.get_job_cancellation_states',
                     side_effect=[snapshot, snapshot]) as snapshots, \
          mock.patch('sky.jobs.state.get_status') as point_status, \
          mock.patch('sky.jobs.state.get_workspace') as point_workspace, \
-         mock.patch('sky.jobs.state.is_legacy_controller_process') as point_legacy, \
          mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh:
         result = utils.cancel_jobs_by_id(job_ids=job_ids,
                                          current_workspace='default')
@@ -495,14 +494,13 @@ def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
     assert refresh.call_args_list == [mock.call(job_ids)]
     point_status.assert_not_called()
     point_workspace.assert_not_called()
-    point_legacy.assert_not_called()
     assert all((tmp_path / str(job_id)).exists() for job_id in job_ids)
 
 
 def test_cancel_signal_file_graceful():
     """Test that cancel_jobs_by_id writes 'graceful' to signal file."""
     snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                          'default', False)
+                                          'default')
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
@@ -525,7 +523,7 @@ def test_cancel_signal_file_graceful_with_timeout():
     """Test that cancel_jobs_by_id writes 'graceful:<timeout>' to signal
     file."""
     snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                          'default', False)
+                                          'default')
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(

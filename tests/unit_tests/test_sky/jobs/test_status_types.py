@@ -15,8 +15,7 @@ def test_status_types_preserve_historical_module_and_pickle_identity():
         state.ManagedJobScheduleState.INACTIVE,
         state.ControllerPidRecord(pid=123, started_at=1.5),
         state.JobCancellationState(status=state.ManagedJobStatus.RUNNING,
-                                   workspace='workspace',
-                                   is_legacy_controller=False),
+                                   workspace='workspace'),
     ]
 
     for sample in samples:
@@ -80,8 +79,5 @@ def test_status_snapshot_shapes():
     assert controller._fields == ('pid', 'started_at')
 
     cancellation = state.JobCancellationState(
-        status=state.ManagedJobStatus.RUNNING,
-        workspace='workspace',
-        is_legacy_controller=False)
-    assert cancellation._fields == ('status', 'workspace',
-                                    'is_legacy_controller')
+        status=state.ManagedJobStatus.RUNNING, workspace='workspace')
+    assert cancellation._fields == ('status', 'workspace')

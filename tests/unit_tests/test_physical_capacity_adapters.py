@@ -930,7 +930,7 @@ class _FakeMappingResult:
     def __init__(self, rows: list[dict[str, object]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> '_FakeMappingResult':
+    def mappings(self) -> _FakeMappingResult:
         return self
 
     def partitions(self, size: int):
@@ -949,7 +949,7 @@ class _FakeConnection:
         self.execute_count = 0
         self.statements = []
 
-    def execution_options(self, **kwargs) -> '_FakeConnection':
+    def execution_options(self, **kwargs) -> _FakeConnection:
         del kwargs
         return self
 

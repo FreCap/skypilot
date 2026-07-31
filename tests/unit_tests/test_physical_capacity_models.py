@@ -64,7 +64,7 @@ def test_canonical_envelope_is_deterministic_domain_separated_and_utf8(
         payload, domain=canonical.CanonicalDomain.INTENT)
     assert encoded == (
         '{"domain":"intent","payload":{"a":"é","z":[1,true,null]},'
-        '"schema_version":1}').encode('utf-8')
+        '"schema_version":1}').encode()
     assert canonical.canonical_hash(
         payload, domain='intent') == hashlib.sha256(encoded).hexdigest()
     assert canonical.canonical_hash(
@@ -77,7 +77,7 @@ def test_unhashed_canonical_payload_encoding_is_bounded_and_domain_neutral(
 ) -> None:
     payload = {'z': [1, True, None], 'a': 'é'}
     assert canonical.canonical_payload_json_bytes(payload) == (
-        '{"a":"é","z":[1,true,null]}').encode('utf-8')
+        '{"a":"é","z":[1,true,null]}').encode()
 
     oversized = {
         f'key-{index}': 'x' * canonical.MAX_CANONICAL_STRING_BYTES

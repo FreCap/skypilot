@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 import datetime
 import enum
 import hashlib
 import re
 import struct
-from typing import Iterable, Sequence
 
 from sky.physical_capacity import canonical
 from sky.physical_capacity import contracts
