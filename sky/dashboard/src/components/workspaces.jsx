@@ -28,6 +28,7 @@ import { ErrorDisplay } from '@/components/elements/ErrorDisplay';
 import { RotateCwIcon } from 'lucide-react';
 import { LastUpdatedTimestamp } from '@/components/utils';
 import { useMobile } from '@/hooks/useMobile';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import { statusGroups } from './job-domain';
 import dashboardCache from '@/lib/cache';
 import { REFRESH_INTERVALS } from '@/lib/config';
@@ -540,25 +541,32 @@ export function Workspaces() {
 
     initializeData();
 
-    // Set up refresh interval
-    const interval = setInterval(() => {
-      if (
-        isCurrent &&
-        manualRefreshOwnerRef.current === null &&
-        window.document.visibilityState === 'visible'
-      ) {
-        void fetchData({ showLoadingIndicators: false });
-      }
-    }, REFRESH_INTERVALS.REFRESH_INTERVAL);
-
     return () => {
       isCurrent = false;
       requestVersionRef.current += 1;
       activeRequestRef.current = null;
       manualRefreshOwnerRef.current = null;
-      clearInterval(interval);
     };
   }, [fetchData]);
+
+  const refreshWhenVisible = useCallback(
+    (refreshSource) => {
+      if (manualRefreshOwnerRef.current !== null) {
+        return;
+      }
+      void fetchData({
+        showLoadingIndicators: false,
+        supersede: refreshSource === 'visibilitychange',
+      });
+    },
+    [fetchData]
+  );
+
+  useVisibleRefreshInterval(
+    true,
+    REFRESH_INTERVALS.REFRESH_INTERVAL,
+    refreshWhenVisible
+  );
 
   const handleRefresh = useCallback(async () => {
     trackWorkspaceAction('refresh');
