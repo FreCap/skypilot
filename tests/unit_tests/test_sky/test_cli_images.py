@@ -13,6 +13,7 @@ from click import testing as click_testing
 import pytest
 
 from sky.client.cli import command
+from sky.client.cli import images
 
 _COMMAND_NAMES = (
     'image',
@@ -89,6 +90,13 @@ def test_image_command_hierarchy_and_facade_metadata() -> None:
         assert callback is not None
         assert callback.__module__ == command.__name__
         assert callback.__qualname__ == name
+
+
+def test_image_commands_are_direct_facade_aliases() -> None:
+    for name in _COMMAND_NAMES:
+        assert getattr(command, name) is getattr(images, name)
+    assert command.container_images_sdk is images.container_images_sdk
+    assert command.container_image_models is images.container_image_models
 
 
 @pytest.mark.parametrize('name', _COMMAND_NAMES)
