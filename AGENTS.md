@@ -12,6 +12,18 @@ SkyPilot is a system to run, manage, and scale AI workloads on any AI infrastruc
 - **Multi-cloud and multi-Kubernetes**: Unified interface across 25+ clouds and multiple K8s clusters
 - Cost optimization and GPU availability maximization
 
+## Repository Authority
+
+Treat `boltz-bio/skypilot` and its `improvements` branch as the sole
+authoritative source for code, history, issues, pull requests, comparisons, and
+development baselines in this repository. Fetch, diff, blame, search, and branch
+from `origin/improvements`.
+
+Do not add, fetch, consult, compare, or cherry-pick from
+`skypilot-org/skypilot`, including its `main` or `master` branches, unless the
+user explicitly requests that upstream repository. Pin cross-repository modules
+and artifacts to an immutable commit or tag from `boltz-bio/skypilot`.
+
 ## Repository Structure
 
 ```
@@ -87,7 +99,7 @@ export SKYPILOT_DEBUG=1                    # Enable debug logging
 **Always run `format.sh` before committing:**
 
 ```bash
-bash format.sh         # Format changed files (vs origin/master)
+bash format.sh         # Format changed files (vs origin/improvements)
 bash format.sh --all   # Format entire codebase
 bash format.sh --files path/to/file.py  # Format specific files
 ```
@@ -368,7 +380,7 @@ kebab-case filename such as
 
 ## Pull Request Guidelines
 
-1. **Branch from master**, create descriptive branch name
+1. **Branch from improvements**, create descriptive branch name
 2. **Run `format.sh`** before committing
 3. **Add tests** for core system changes
 4. **Run smoke tests** for significant changes
@@ -580,6 +592,5 @@ sky jobs launch <job-spec.yaml>
 
 - **Full contributing guide**: `docs/source/developers/CONTRIBUTING.md`
 - **User docs**: https://docs.skypilot.co/
-- **GitHub Issues**: https://github.com/skypilot-org/skypilot/issues
-- **Discussions**: https://github.com/skypilot-org/skypilot/discussions
+- **GitHub Issues**: https://github.com/boltz-bio/skypilot/issues
 - **Slack**: http://slack.skypilot.co

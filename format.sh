@@ -4,7 +4,7 @@
 # Usage:
 #    # Do work and commit your work.
 
-#    # Format files that differ from origin/master.
+#    # Format files that differ from origin/improvements.
 #    bash format.sh
 
 #    # Commit changed files with message 'Run yapf and pylint'
@@ -48,6 +48,9 @@ YAPF_FLAGS=(
 
 YAPF_EXCLUDES=(
     '--exclude' 'build/**'
+    # The exact script bytes participate in the control-plane seed generation.
+    # Preserve compatibility with already-deployed module revisions.
+    '--exclude' 'infra/terraform/modules/skypilot-control-plane/scripts/seed_config.py'
     '--exclude' 'sky/schemas/generated/**'
     '--exclude' 'tests/unit_tests/test_sky/backends/testdata/**'
 )
@@ -76,7 +79,7 @@ format_changed() {
     #
     # `diff-filter=ACM` and $MERGEBASE is to ensure we only format files that
     # exist on both branches.
-    MERGEBASE="$(git merge-base origin/master HEAD)"
+    MERGEBASE="$(git merge-base origin/improvements HEAD)"
 
     if ! git diff --diff-filter=ACM --quiet --exit-code "$MERGEBASE" -- '*.py' '*.pyi' &>/dev/null; then
         git diff --name-only --diff-filter=ACM "$MERGEBASE" -- '*.py' '*.pyi' | \
