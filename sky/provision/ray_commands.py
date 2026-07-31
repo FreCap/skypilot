@@ -3,6 +3,7 @@
 import base64
 from collections.abc import Callable
 import gzip
+import io
 import json
 import os
 from typing import Any
@@ -39,7 +40,14 @@ def host_network_probe_b64() -> str:
     minified = source_utils.minify_python_source(source)
     # Sanity-check: minified source must still parse.
     compile(minified, path, 'exec')
-    compressed = gzip.compress(minified.encode('utf-8'))
+    compressed_buffer = io.BytesIO()
+    with gzip.GzipFile(filename='',
+                       mode='wb',
+                       fileobj=compressed_buffer,
+                       compresslevel=9,
+                       mtime=0) as gzip_file:
+        gzip_file.write(minified.encode('utf-8'))
+    compressed = compressed_buffer.getvalue()
     return base64.b64encode(compressed).decode('ascii')
 
 
