@@ -26,14 +26,14 @@ _COMMAND_NAMES = (
     'image_profile_canary',
 )
 _BODY_HASHES = {
-    'image': 'd8941125789cae216e8b9b4aa756972dc9ef8341295f72fe8d32972f37bd7273',
-    'image_publish': 'a2064359cafbc1c5d08af7e3d6bdc3ee096299ed262d70b4f0ed8c05e9a0b7ab',
-    'image_status': '7e447c205e9b27f0e49833c45fcc66aafeb3efaca13e0d422411684a4712e298',
-    'image_prepare': '844008f75f057a6afc1721bc79bd0451b18459944ccb57b859bd397bd4f9412f',
-    'image_retry': 'd99cb8e1a4798a0bb55517a26ee35336c97594ec9c4dc14fa4e1cc6340489ab5',
-    'image_profile': 'bfaee79e74c907d8f4ca3c1e92823beea3577f235b93f1ebc5a730985d064e3f',
-    'image_profile_qualify': '5ea5716a25c03ee6a06e4991d86e7194bf5e2e66b3ac94175f839ec1e58140c7',
-    'image_profile_canary': 'ccaa899ea7b459004b98d68ddcfc8525fb76a78c29ef249a3a1591985e44c032',
+    'image': 'afb61f10bb719b0de8255317938009a7ae8f3394523dac73f17c06fe0d56925b',
+    'image_publish': 'c801ead794a362a175871588f3a720aaa8b45382b64e62fbbea5600788044d5c',
+    'image_status': 'aca7623bad0ab4e0802fdfdf735f5c6268f48b35c38d580f51646a78100f07aa',
+    'image_prepare': '9daf98b1f5d90ce8c6c7e0d7ea10999826e829a76d83d152d54cba858e53a923',
+    'image_retry': 'f374bf8a7d7fb79d2cfc8fa1767c838987e2f46f63967d561ed3b0770bc10fd4',
+    'image_profile': '594522f94db2f00455444d6abe571d623879c14f63ada1644916c8b18a9d44f1',
+    'image_profile_qualify': 'cec45982a49d73ee8b7e20641541a33df818e6a4861ac202c48063cb17f1d02a',
+    'image_profile_canary': '7ce2227863fc39571348069c1afd7c80d1f775688bb5ed12c31b32d91e580928',
 }
 _HELP_HASHES = {
     ('image',): '8fa44ebb61178eb4c65ddc6da584747e5e1cf73ec0a9e19c5608567876fab1ae',
@@ -58,11 +58,20 @@ def _body_hash(name: str) -> str:
     function = next(
         node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
-    for node in ast.walk(function):
-        if hasattr(node, 'type_params'):
-            node.type_params = []
-    body = ast.Module(body=function.body, type_ignores=[])
-    return hashlib.sha256(ast.dump(body).encode()).hexdigest()
+    return hashlib.sha256(repr(_stable_ast(function.body)).encode()).hexdigest()
+
+
+def _stable_ast(value: object) -> object:
+    if isinstance(value, ast.AST):
+        fields = []
+        for field, child in ast.iter_fields(value):
+            if field == 'type_params':
+                continue
+            fields.append((field, _stable_ast(child)))
+        return type(value).__name__, tuple(fields)
+    if isinstance(value, list):
+        return tuple(_stable_ast(item) for item in value)
+    return value
 
 
 def test_image_command_hierarchy_and_facade_metadata() -> None:
