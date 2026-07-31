@@ -729,7 +729,7 @@ CONTROLLER_AUTOSTOP = {
 # A period of time to initialize your service. Any readiness probe failures
 # during this period will be ignored.
 DEFAULT_INITIAL_DELAY_SECONDS = 1200
-DEFAULT_MIN_REPLICAS = 1
+DEFAULT_MIN_REPLICAS = 0
 
 # Default dynamic controller-port start and fixed per-service LB container
 # port. Controller ports stay pod-local; only each Kubernetes LB Service
