@@ -275,6 +275,12 @@ class EvidenceProjector:
             metrics.set_projector_health(healthy=False, expired=False)
             logger.error('Physical-capacity evidence projector stopped '
                          'unexpectedly.')
+        except BaseException:  # pylint: disable=broad-except
+            self._healthy = False
+            metrics.set_projector_health(healthy=False, expired=False)
+            logger.error('Physical-capacity evidence projector stopped '
+                         'because of a process-control exception.')
+            raise
 
     def stop(self) -> None:
         """Cancel the active query, join the daemon, and dispose its pool."""

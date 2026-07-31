@@ -744,13 +744,16 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                                 request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
                                 None)
                 else:
-                    drain_errors: list[Exception] = []
+                    drain_errors: list[BaseException] = []
 
                     def drain_step(name: str, operation: Callable[[],
                                                                   Any]) -> None:
                         try:
                             operation()
-                        except Exception as e:  # pylint: disable=broad-except
+                        # This synchronous all-step barrier deliberately
+                        # collects even process-control failures. The caller
+                        # fail-stops before releasing leadership.
+                        except BaseException as e:  # pylint: disable=broad-except  # noqa: ASYNC103
                             drain_errors.append(e)
                             logger.exception(f'Controller drain step {name} '
                                              'failed.')
