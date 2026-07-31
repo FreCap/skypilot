@@ -129,6 +129,13 @@ function detailFullArgs(serviceName) {
   return [{ serviceNames: [serviceName] }];
 }
 
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
 describe('useServiceDetails stale-response fencing', () => {
   beforeEach(() => {
     jest.resetAllMocks();
@@ -868,16 +875,13 @@ describe('useServiceDetails stale-response fencing', () => {
     }
   });
 
-  it('skips periodic refreshes while hidden and resumes when visible', async () => {
+  it('refreshes immediately on visibility restore and skips the adjacent timer boundary', async () => {
     jest.useFakeTimers();
     const visibilityDescriptor = Object.getOwnPropertyDescriptor(
       window.document,
       'visibilityState'
     );
-    Object.defineProperty(window.document, 'visibilityState', {
-      configurable: true,
-      value: 'hidden',
-    });
+    setDocumentVisibility('hidden');
     dashboardCache.get.mockResolvedValue({
       services: [{ name: 'svc', status: 'READY', replicas: [] }],
     });
@@ -894,18 +898,17 @@ describe('useServiceDetails stale-response fencing', () => {
       expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
       await act(async () => {
-        jest.advanceTimersByTime(2 * 60 * 1000);
+        jest.advanceTimersByTime(2 * 60 * 1000 - 1);
         await Promise.resolve();
       });
       expect(dashboardCache.invalidate).not.toHaveBeenCalled();
       expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
-      Object.defineProperty(window.document, 'visibilityState', {
-        configurable: true,
-        value: 'visible',
-      });
+      dashboardCache.get.mockClear();
+      dashboardCache.invalidate.mockClear();
+      setDocumentVisibility('visible');
       await act(async () => {
-        jest.advanceTimersByTime(60 * 1000);
+        window.document.dispatchEvent(new Event('visibilitychange'));
         await Promise.resolve();
       });
 
@@ -913,7 +916,201 @@ describe('useServiceDetails stale-response fencing', () => {
         [getServices, detailSummaryArgs('svc')],
         [getServices, detailFullArgs('svc')],
       ]);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      unmount();
+      mounted = false;
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
+
+  it('fences a pre-hide poll when visibility restore starts a fresh read', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const pollSummary = deferred();
+    const pollFull = deferred();
+    const visibleSummary = deferred();
+    const visibleFull = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'initial-full', replicas: ['r0'] }],
+      })
+      .mockImplementationOnce(() => pollSummary.promise)
+      .mockImplementationOnce(() => pollFull.promise)
+      .mockImplementationOnce(() => visibleSummary.promise)
+      .mockImplementationOnce(() => visibleFull.promise);
+    setDocumentVisibility('visible');
+
+    const { result, unmount } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+    let mounted = true;
+
+    try {
+      await waitFor(() =>
+        expect(result.current.serviceData.status).toBe('initial-full')
+      );
+      expect(result.current.serviceData.replicas).toEqual(['r0']);
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
       expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+      setDocumentVisibility('hidden');
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(6);
+
+      await act(async () => {
+        pollSummary.resolve({
+          services: [
+            { name: 'svc', status: 'stale-summary', summaryOnly: true },
+          ],
+        });
+        pollFull.resolve({
+          services: [
+            { name: 'svc', status: 'stale-full', replicas: ['stale'] },
+          ],
+        });
+        await Promise.all([pollSummary.promise, pollFull.promise]);
+      });
+      expect(result.current.serviceData.status).toBe('initial-full');
+      expect(result.current.serviceData.replicas).toEqual(['r0']);
+
+      await act(async () => {
+        visibleSummary.resolve({
+          services: [
+            { name: 'svc', status: 'fresh-summary', summaryOnly: true },
+          ],
+        });
+        visibleFull.resolve({
+          services: [
+            { name: 'svc', status: 'fresh-full', replicas: ['fresh'] },
+          ],
+        });
+        await Promise.all([visibleSummary.promise, visibleFull.promise]);
+      });
+      expect(result.current.serviceData.status).toBe('fresh-full');
+      expect(result.current.serviceData.replicas).toEqual(['fresh']);
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
+
+  it('reuses a manual refresh when visibility returns', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const manualSummary = deferred();
+    const manualFull = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'initial-full', replicas: ['r0'] }],
+      })
+      .mockImplementationOnce(() => manualSummary.promise)
+      .mockImplementationOnce(() => manualFull.promise);
+    setDocumentVisibility('hidden');
+
+    const { result, unmount } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+    let mounted = true;
+
+    try {
+      await waitFor(() =>
+        expect(result.current.serviceData.status).toBe('initial-full')
+      );
+
+      let manualRefresh;
+      act(() => {
+        manualRefresh = result.current.refreshData();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        manualSummary.resolve({
+          services: [
+            { name: 'svc', status: 'manual-summary', summaryOnly: true },
+          ],
+        });
+        manualFull.resolve({
+          services: [
+            { name: 'svc', status: 'manual-full', replicas: ['manual'] },
+          ],
+        });
+        await manualRefresh;
+      });
+      expect(result.current.serviceData.status).toBe('manual-full');
+      expect(result.current.serviceData.replicas).toEqual(['manual']);
 
       unmount();
       mounted = false;
