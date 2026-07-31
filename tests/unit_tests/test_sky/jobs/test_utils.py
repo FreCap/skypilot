@@ -1,4 +1,5 @@
 """Unit tests for sky.jobs.utils functions."""
+# pylint: disable=missing-class-docstring,protected-access,unused-argument,use-implicit-booleaness-not-comparison,unused-variable,import-outside-toplevel,unnecessary-lambda,reimported,unused-import
 import pickle
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1119,6 +1120,11 @@ class TestStreamLogsByIdTaskFiltering:
         return [(t_id, t_name, managed_job_state.ManagedJobStatus.SUCCEEDED,
                  log_file, None) for t_id, t_name in tasks]
 
+    def _terminal_snapshot(self, task_id: int, task_name: str):
+        return managed_job_state.JobLogStreamSnapshot(
+            task_id, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
+            None, task_name)
+
     def test_task_filter_by_int_matches_task_id(self, monkeypatch):
         """Test that int task filter matches against task_id."""
         job_id = 1
@@ -1136,10 +1142,13 @@ class TestStreamLogsByIdTaskFiltering:
         # Task filter is int 1, should match task_id=1 (eval)
         # We need to verify the filter finds the right task by checking
         # that it doesn't return NOT_FOUND
-        # Return a terminal latest-task snapshot so we exit early.
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_latest_task_id_status',
-            lambda jid: (2, managed_job_state.ManagedJobStatus.SUCCEEDED))
+            mock.Mock(side_effect=AssertionError('scalar latest-task poll '
+                                                 'used')))
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_task_log_stream_snapshot',
+            lambda jid, task_id: self._terminal_snapshot(task_id, 'eval'))
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('scalar status poll used')))
@@ -1169,7 +1178,11 @@ class TestStreamLogsByIdTaskFiltering:
         )
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_latest_task_id_status',
-            lambda jid: (2, managed_job_state.ManagedJobStatus.SUCCEEDED))
+            mock.Mock(side_effect=AssertionError('scalar latest-task poll '
+                                                 'used')))
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_task_log_stream_snapshot',
+            lambda jid, task_id: self._terminal_snapshot(task_id, 'eval'))
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('scalar status poll used')))
@@ -1292,7 +1305,11 @@ class TestStreamLogsByIdTaskFiltering:
         )
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_latest_task_id_status',
-            lambda jid: (1, managed_job_state.ManagedJobStatus.SUCCEEDED))
+            mock.Mock(side_effect=AssertionError('scalar latest-task poll '
+                                                 'used')))
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_latest_log_stream_snapshot',
+                            lambda jid: self._terminal_snapshot(1, 'eval'))
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('scalar status poll used')))
