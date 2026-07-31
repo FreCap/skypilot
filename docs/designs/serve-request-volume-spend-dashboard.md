@@ -65,7 +65,12 @@ One row represents one service incarnation and UTC day:
 
 The primary key is `(day_start, service_name, service_hash)`. Counts use a
 wide integer. The table has indexes for date-range reads and service/date
-grouping. It is not created for SQLite.
+grouping. The global coverage lookup first selects the earliest `day_start`
+through the existing day index, then computes `MIN(first_bucket_start)` only
+for rows on that day. Since every represented minute belongs to its row's UTC
+day, this preserves the exact global minimum while preventing dashboard
+refreshes from scanning the indefinitely retained historical table. The table
+is not created for SQLite.
 
 On the existing Serve history cadence, run an isolated best-effort rollup by
 UTC day, service name, and service incarnation. The first run and hourly runs
@@ -287,8 +292,10 @@ Backend tests cover PostgreSQL-only migration, multi-reporter summation,
 same-name multi-incarnation grouping, idempotent reruns, late counter increases,
 raw-retention non-decrement, initial 72-hour backfill, UTC midnight boundaries,
 zero-filled days, top-eight plus `Other`, top-50 ordering, partial coverage, and
-non-PostgreSQL unavailability. A fault-injection test proves a request-rollup
-failure cannot prevent status snapshot persistence or raw-history pruning.
+non-PostgreSQL unavailability. Query-shape coverage also asserts that the
+global coverage lookup is restricted to the earliest represented day. A
+fault-injection test proves a request-rollup failure cannot prevent status
+snapshot persistence or raw-history pruning.
 
 API tests preserve admin-only authorization, verify the additive response and
 date-range behavior, and prove old response consumers remain valid.

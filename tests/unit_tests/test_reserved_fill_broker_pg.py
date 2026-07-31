@@ -3836,6 +3836,54 @@ class TestServeStatusHistoryPG:
             chart_limit=1)
         assert summary['total_request_count'] == 20
 
+    def test_daily_request_coverage_query_is_bounded_to_first_day(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.insert(daily), [{
+                'day_start': day + datetime.timedelta(days=offset),
+                'service_name': f'svc-{offset}',
+                'service_hash': f'hash-{offset}',
+                'first_bucket_start': day + datetime.timedelta(
+                    days=offset, minutes=offset + 1),
+                'last_bucket_start': day +
+                                     datetime.timedelta(days=offset, hours=1),
+                'request_count': offset + 1,
+                'observed_at': day + datetime.timedelta(days=offset, hours=2),
+            } for offset in range(3)])
+
+        statements = []
+
+        def capture_statement(_connection, _cursor, statement, _parameters,
+                              _context, _executemany):
+            statements.append(' '.join(statement.split()))
+
+        sqlalchemy.event.listen(history_engine, 'before_cursor_execute',
+                                capture_statement)
+        try:
+            summary = serve_history.get_daily_request_summary(
+                history_engine,
+                int(day.timestamp()),
+                int((day + datetime.timedelta(days=2)).timestamp()), [{
+                    'day_start_utc': int(
+                        (day + datetime.timedelta(days=offset)).timestamp())
+                } for offset in range(3)],
+                table_limit=50,
+                chart_limit=8)
+        finally:
+            sqlalchemy.event.remove(history_engine, 'before_cursor_execute',
+                                    capture_statement)
+
+        assert summary['coverage_start_utc'] == int(
+            (day + datetime.timedelta(minutes=1)).timestamp())
+        coverage_query = next(statement for statement in statements
+                              if 'min(serve_request_activity_daily.'
+                              'first_bucket_start)' in statement)
+        assert ('WHERE serve_request_activity_daily.day_start = '
+                '(SELECT min(serve_request_activity_daily.day_start)'
+               ) in coverage_query
+
     def test_estimated_spend_joins_daily_service_cost_and_requests(
             self, history_engine, monkeypatch):
         global_user_state.estimated_spend_daily_table.create(history_engine)
