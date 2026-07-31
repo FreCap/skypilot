@@ -2335,6 +2335,15 @@ name = "skypilot.resource-action.child-request.v1/" +
        canonical_nonnegative_decimal(child_slot)
 ```
 
+API005 installs checked-in, extension-free PostgreSQL SHA-1 and UUIDv5 helper
+functions solely to recompute these identities in guards. PostgreSQL 14 has no
+core SHA-1 function, and the central database must not depend on optional
+`uuid-ossp` or `pgcrypto` installation/extension privileges. The literal
+helpers are immutable and strict, use no relation or dynamic SQL, are covered
+by RFC/Python cross-language vectors, and are exact-definition artifacts of
+the API005 structural verifier. They are not general credential or content
+hashing APIs; persisted content continues to use SHA-256.
+
 The namespace conversion occurs only after validating the parent as canonical
 lowercase UUID text. Canonical decimal text has no sign, leading zero,
 whitespace, exponent, or alternate Unicode digits. A child request's own
@@ -4689,12 +4698,23 @@ named function/trigger constants for:
 - correlated `api_requests`; and
 - correlated `api_request_queue` delivery.
 
-API005 also ships the exact generic materialize, claim, correlated-terminalize,
-reap, effect-insert/result-fill, and quiescence-publication functions. It has no
-Serve import, Serve table lookup, Serve foreign key, Serve action-kind literal,
-or conditional catalog reference to a Serve schema. The generic postverifier
-loads only API005's expected definitions and therefore succeeds against an API
-database in which Serve has never been installed.
+The API005 application kernel also ships exact Python store entry points for
+generic materialization, the two-stage claim transaction,
+correlated terminalization/reaping, effect insert/result fill, and quiescence
+publication. These are caller-transaction operations rather than PostgreSQL
+stored functions: claim must invoke the process-local adapter's prelock and
+consume callbacks in one SQLAlchemy transaction, and no database function may
+dynamically select or impersonate an adapter callback. Their transaction,
+lock-order, CAS, and result contracts are the ones specified below. The schema
+marker proves only the literal PostgreSQL structures, helpers, and guards; the
+kernel runtime token and adapter-manifest digest prove the matching Python
+store/registry implementation before any process may dispatch or claim.
+
+Neither the API005 DDL nor those generic Python entry points have a Serve
+import, Serve table lookup, Serve foreign key, Serve action-kind literal, or
+conditional catalog reference to a Serve schema. The generic structural
+postverifier loads only API005's expected PostgreSQL definitions and therefore
+succeeds against an API database in which Serve has never been installed.
 
 After API005 and Serve032 are both verified, API006 installs a separate literal
 Serve adapter DDL module. It owns:
@@ -4711,7 +4731,8 @@ No API005 function is replaced with a Serve-aware body. API006 adds only
 extension triggers/functions whose dependencies are declared and removed with
 API006.
 
-Every function is `SECURITY INVOKER`, has
+Every PostgreSQL function installed by either literal DDL module is
+`SECURITY INVOKER`, has
 `SET search_path = pg_catalog, <exact_api_schema>`, uses schema-qualified
 relations, has no default arguments, and has its executable-bit and owner
 verified. Every trigger name, timing, event set, granularity, enabled state,
