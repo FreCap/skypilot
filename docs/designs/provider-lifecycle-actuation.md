@@ -1,6 +1,7 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: M1 merged; M2 S1 approved for implementation; M3 requires a dedicated review
+Status: M1 merged; M2 S1 implemented and locally qualified; exact-head CI and
+deployment pending; M3 requires a dedicated review
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -2572,3 +2573,39 @@ The final review verified:
 
 No confirmed S1 wire, compatibility, ownership, or implementation blocker
 remained. M3 was out of scope and remains explicitly unapproved.
+
+### Review 5
+
+Verdict: `PURSUE` and `MERGE` for the M2 S1 implementation.
+
+Three independent read-only reviews verified the final implementation against
+this contract. The reviewed leaf hashes were:
+
+- `sky/placement/offer.py`:
+  `793548c249ecff76c659c45909bf464206ef0fb0d26fcf29041671e34cb158b8`;
+- `sky/utils/json_types.py`:
+  `1e1b7eb856b3e0f537d02d139fcb580f99be8b407cadad7b84f25d3f70a6d988`;
+- `tests/unit_tests/test_placement_offer.py`:
+  `e4ed1aa7e666092711380a323e70fffd29ab200f7d5c46e194c17d16a57a8b11`;
+- `.github/workflows/static-analysis.yml`:
+  `2d46ea4666376818843122469659f2b8fade175b411fe526bcb74c891252fdc8`;
+- `sky/clouds/cloud.py`:
+  `296c22a9c8c23ce37ee30a2eeba9a8d80cee3547723363ba5673e27115fd7a53`;
+- `sky/placement/__init__.py`:
+  `0f6cd7b22225e11c37c395297672e8a68cac603304dd133ecd30c46afd0b58ec`.
+
+The security review found that runtime protocol membership alone accepts a
+non-callable `close` attribute. The implementation now explicitly requires a
+callable cleanup method, and the capture, authoritative validation, and
+handoff tests lock that rejection across Python 3.10 through 3.14.
+
+The final 15-test acceptance suite also calls every blocked constructor and
+covers request validation, `REUSE` and `RESTART` construction rejection, TTL
+boundaries, empty-string schema behavior, nested missing keys, malformed
+persisted timestamps, and the complete contract matrices. Local qualification
+passed the focused suite, YAPF, isort, Ruff, mypy, Pylint, full-package Python
+3.10 compilation, and installed-package imports at the Python 3.10 and 3.14
+support endpoints. S1 remains additive: it activates no provider source,
+changes no mutation owner, and closes no removal-ledger row. Exact-head CI,
+image qualification, deployment, canary, and monitoring remain required before
+S1 is recorded as deployed.

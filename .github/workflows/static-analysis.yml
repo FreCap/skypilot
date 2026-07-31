@@ -192,7 +192,41 @@ jobs:
           uv venv --seed ~/worker-env
           source ~/worker-env/bin/activate
           uv pip install -e .
-          python -c "import sky, sky.skylet.constants, sky.jobs.state, sky.data.storage; print(sky.__version__)"
+          python - <<'PY'
+          import unicodedata
+
+          import sky
+          import sky.skylet.constants
+          import sky.jobs.state
+          import sky.data.storage
+          import sky.placement.offer
+          import sky.utils.json_types
+
+          frozen = sky.utils.json_types.freeze_json({
+              'z': [],
+              'a': {
+                  'value': True,
+              },
+          })
+          assert isinstance(frozen, sky.utils.json_types.FrozenJSONDict)
+          assert tuple(frozen) == ('a', 'z')
+
+          for suffix in ('\U00016ff0', '\U00016ff1'):
+              source = f'\u0301{suffix}'
+              expected = f'{suffix}\u0301'
+              assert unicodedata.ucd_3_2_0.normalize('NFC',
+                                                    source) == expected
+              try:
+                  sky.placement.offer.OfferAcceleratorV1(name=source, count=1)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(
+                      'Non-NFC placement text must be rejected.')
+              sky.placement.offer.OfferAcceleratorV1(name=expected, count=1)
+
+          print(sky.__version__)
+          PY
       - name: Compile the whole package on the cluster-worker Python
         # The imports above only reach modules on those four import paths; a
         # 3.11+ syntax construct anywhere else in the package would still
