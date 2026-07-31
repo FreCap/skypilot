@@ -6,10 +6,13 @@ fixtures.  A production projection API requires the separately reviewed C2
 payload and source-mapping contract.
 """
 
+from collections.abc import Iterator
+from collections.abc import Mapping
+from collections.abc import Sequence
 import contextlib
 import enum
 import re
-from typing import Any, Iterator, Mapping, Sequence, TypeAlias
+from typing import Any, TypeAlias
 import uuid
 
 import sqlalchemy

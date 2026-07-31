@@ -9,8 +9,10 @@ atomic.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
-from typing import Any, Mapping, Sequence
+from typing import Any
 import uuid
 
 from sky.jobs import naming as managed_job_naming

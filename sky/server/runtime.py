@@ -475,13 +475,18 @@ def _stop_queue_server(queue_server: multiprocessing.Process | None) -> None:
     queue_server.join()
 
 
-def _kill_local_controller_children() -> None:
+def _kill_local_controller_children(*, fail_closed: bool = False) -> None:
     """Fail-stop detached schedulers before leader handoff."""
     # Managed job controllers use detached process sessions, so use their
     # durable local process records in addition to walking the worker tree.
     # pylint: disable=import-outside-toplevel
     from sky.jobs import scheduler as managed_job_scheduler
-    managed_job_scheduler.fail_stop_local_job_controllers()
+    try:
+        managed_job_scheduler.fail_stop_local_job_controllers()
+    except Exception:  # pylint: disable=broad-except
+        logger.exception('Failed to fail-stop local managed-job controllers.')
+        if fail_closed:
+            raise
 
 
 def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
@@ -507,6 +512,11 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
     cutover_ready = False
     generation: int | None = None
     cutover_quiescence_seconds = _controller_cutover_quiescence_seconds()
+    configured_capacity = state.physical_capacity_config
+    if configured_capacity is None:
+        configured_capacity = physical_capacity_config.load_config()
+    shadow_capacity = (configured_capacity.mode
+                       is physical_capacity_config.CapacityMode.SHADOW)
 
     def request_shutdown(signum, frame) -> None:
         del signum, frame
@@ -544,14 +554,15 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                     cutover_ready = True
                 if lease.try_acquire():
                     try:
-                        acquiring_generation = lease.generation
-                        assert acquiring_generation is not None
-                        state.instance_lease.set_ready(
-                            False,
-                            health_detail={
-                                'phase': 'activating-controller',
-                                'controller_generation': acquiring_generation,
-                            })
+                        if shadow_capacity:
+                            acquiring_generation = lease.generation
+                            assert acquiring_generation is not None
+                            state.instance_lease.set_ready(
+                                False,
+                                health_detail={
+                                    'phase': 'activating-controller',
+                                    'controller_generation': acquiring_generation,
+                                })
                         blockers = (
                             request_postgres.recent_legacy_controller_consumers(
                                 cutover_quiescence_seconds))
@@ -600,13 +611,13 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                     f'{generation} fenced {fenced["replayed"]} replayable and '
                     f'{fenced["interrupted"]} ambiguous stale claim(s).')
 
-        configured_capacity = state.physical_capacity_config
-        if configured_capacity is None:
-            configured_capacity = physical_capacity_config.load_config()
-        capacity_projector = capacity_projector_lib.start_controller_projector(
-            configured_capacity,
-            controller_instance_id=lease.instance_id,
-            controller_generation=generation)
+        if shadow_capacity:
+            capacity_projector = (
+                capacity_projector_lib.start_controller_projector(
+                    configured_capacity,
+                    controller_instance_id=lease.instance_id,
+                    controller_generation=generation))
+            assert capacity_projector is not None
 
         # The snapshot must include the immutable leader identity before any
         # worker or controller subprocess can be spawned.
@@ -708,49 +719,81 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                 # before releasing the leadership session so no
                 # old-generation provider work survives into the replacement
                 # generation.
-                drain_errors: list[BaseException] = []
-
-                def drain_step(name: str, operation: Callable[[], Any]) -> None:
+                if capacity_projector is None:
+                    # Preserve the existing disabled-mode drain and release
+                    # behavior exactly. C2 strict fail-stop semantics are
+                    # justified only while a shadow projector owns work.
                     try:
-                        operation()
-                    except BaseException as e:  # pylint: disable=broad-except
-                        drain_errors.append(e)
-                        logger.exception(f'Controller drain step {name} '
-                                         'failed.')
+                        for worker in workers:
+                            worker.request_shutdown()
+                        _kill_local_controller_children()
+                        if workers:
+                            _request_worker_shutdown(workers,
+                                                     terminate_children=True)
+                        if background is not None:
+                            background.stop()
+                        _stop_queue_server(queue_server)
+                    finally:
+                        try:
+                            lease.release()
+                        finally:
+                            os.environ.pop(
+                                request_postgres.CONTROLLER_GENERATION_ENV_VAR,
+                                None)
+                            os.environ.pop(
+                                request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
+                                None)
+                else:
+                    drain_errors: list[BaseException] = []
 
-                for worker in workers:
-                    drain_step('request-worker-stop-request',
-                               worker.request_shutdown)
-                drain_step(
-                    'capacity-projector-stop', lambda: capacity_projector_lib.
-                    stop_controller_projector(capacity_projector))
-                drain_step('local-controller-child-fail-stop',
-                           _kill_local_controller_children)
-                if workers:
+                    def drain_step(name: str, operation: Callable[[],
+                                                                  Any]) -> None:
+                        try:
+                            operation()
+                        except BaseException as e:  # pylint: disable=broad-except
+                            drain_errors.append(e)
+                            logger.exception(f'Controller drain step {name} '
+                                             'failed.')
+
+                    for worker in workers:
+                        drain_step('request-worker-stop-request',
+                                   worker.request_shutdown)
                     drain_step(
-                        'request-worker-fail-stop',
-                        lambda: _request_worker_shutdown(
-                            workers, terminate_children=True))
-                if background is not None:
-                    drain_step('background-loop-stop', background.stop)
-                drain_step('queue-server-stop',
-                           lambda: _stop_queue_server(queue_server))
+                        'capacity-projector-stop',
+                        lambda: capacity_projector_lib.
+                        stop_controller_projector(capacity_projector))
+                    drain_step(
+                        'local-controller-child-fail-stop', lambda:
+                        _kill_local_controller_children(fail_closed=True))
+                    if workers:
+                        drain_step(
+                            'request-worker-fail-stop',
+                            lambda: _request_worker_shutdown(
+                                workers, terminate_children=True))
+                    if background is not None:
+                        drain_step('background-loop-stop', background.stop)
+                    drain_step('queue-server-stop',
+                               lambda: _stop_queue_server(queue_server))
 
-                if drain_errors:
-                    # Never release the durable generation after an unproven
-                    # projector/child shutdown. Immediate process exit closes
-                    # the leadership session and every remaining DB socket.
-                    logger.critical('Controller drain could not prove all '
-                                    'leader-owned work stopped; fail-stopping '
-                                    'the process before lease release.')
-                    os._exit(1)  # pylint: disable=protected-access
-                try:
-                    lease.release()
-                finally:
-                    os.environ.pop(
-                        request_postgres.CONTROLLER_GENERATION_ENV_VAR, None)
-                    os.environ.pop(
-                        request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR, None)
+                    if drain_errors:
+                        # Never release the durable generation after an
+                        # unproven projector/child shutdown. Immediate process
+                        # exit closes the leadership session and every
+                        # remaining DB socket.
+                        logger.critical(
+                            'Controller drain could not prove all leader-owned '
+                            'work stopped; fail-stopping the process before '
+                            'lease release.')
+                        os._exit(1)  # pylint: disable=protected-access
+                    try:
+                        lease.release()
+                    finally:
+                        os.environ.pop(
+                            request_postgres.CONTROLLER_GENERATION_ENV_VAR,
+                            None)
+                        os.environ.pop(
+                            request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
+                            None)
         finally:
             try:
                 try:
