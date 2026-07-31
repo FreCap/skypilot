@@ -1779,7 +1779,7 @@ class RetryingVmProvisioner:
             if retry_cnt > 1:
                 sleep = backoff.current_backoff()
                 logger.info(f'Retrying launching in {sleep:.1f} seconds.')
-                time.sleep(sleep)
+                context_utils.sleep_with_cancellation(sleep)
             # TODO(zhwu): when we retry ray up, it is possible that the ray
             # cluster fail to start because --no-restart flag is used.
             ray_up_return_value = ray_up()
