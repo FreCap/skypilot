@@ -6,6 +6,7 @@
 import ast
 import hashlib
 import inspect
+import pickle
 import textwrap
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ import fastapi
 import pytest
 
 from sky.serve import load_balancer
+from sky.serve import load_balancer_request_metadata
 
 _CALLABLE_CONTRACT = {
     '_priority_header_error': (
@@ -72,6 +74,14 @@ def test_request_metadata_callable_contract(name: str) -> None:
     assert str(inspect.signature(function)) == expected_signature
     assert function.__module__ == 'sky.serve.load_balancer'
     assert function.__qualname__ == f'SkyServeLoadBalancer.{name}'
+    assert function is getattr(load_balancer_request_metadata, name)
+    if name == '_parse_request_priority':
+        # Historical classmethod functions are not directly picklable because
+        # attribute lookup returns a bound method rather than the function.
+        with pytest.raises(pickle.PicklingError):
+            pickle.dumps(function)
+    else:
+        assert pickle.loads(pickle.dumps(function)) is function
     assert _normalized_ast_sha256(function) == expected_fingerprint
 
 

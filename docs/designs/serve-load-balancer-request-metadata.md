@@ -159,3 +159,37 @@ publication.  Relevant tests must not be excluded by path filters.  A live
 cloud smoke test is not expected for a structurally identical local HTTP
 metadata extraction, but test collection and the exact rationale will be
 recorded in the PR.
+
+## Validation evidence
+
+The extraction was developed against exact base
+`25f62b0911f488073b99af22e9571d908b1bcbcd`.  The facade decreased from 4,805
+to 4,647 lines and the implementation module is 187 lines.  The
+characterization commit preceded the production move.
+
+- The five normalized function AST fingerprints are unchanged.  The facade
+  descriptors, signatures, historical module/qualified names, implementation
+  identities, prior pickling behavior, and both import orders are pinned.
+- The complete 16-file load-balancer matrix collected 447 tests and exited
+  successfully in both parallel and serial runs.  It covers request metadata,
+  queue admission, capacity/demand/occupancy, proxy retry and eviction, auth,
+  HA, TLS, rollout, synchronization, launcher, HTTP runtime, and local async
+  routing lifecycle.
+- `format.sh --files` passed YAPF, isort, full mypy over 812 source files,
+  Pylint 10.00, and dashboard lint/format.  Ruff, isolated CI-equivalent
+  BasedPyright 1.39.9 with zero findings, import-linter with all three contracts
+  kept, Python 3.11 and 3.14 compileall, and `git diff --check` passed.
+- Ten balanced CPU-time import samples measured a 0.7917685-second base median
+  and 0.761356-second branch median, a favorable 3.84 percent delta.
+  Eight balanced samples of 200,000 iterations, each performing priority
+  parsing, accelerator parsing, and header stripping, measured 0.413762 seconds
+  on the base and 0.4201715 seconds on the branch, a 1.55 percent delta.  Direct
+  function identity adds no wrapper frame, and identical AST bodies add no
+  lock, copy, request-body read, query, or network operation.
+
+`.github/workflows/pytest.yml`, `static-analysis.yml`, `format.yml`, `mypy.yml`,
+and `pylint.yml` all trigger for pull requests to `improvements` without paths
+or paths-ignore filters.  The Unit Tests job collects the entire changed test
+surface.  Limited-dependency Serve imports, Resource Lifetime's load-balancer
+sync tests, Ruff, BasedPyright, import-linter, worker-floor import, format,
+mypy, and Pylint cover the implementation and facade boundary in CI.
