@@ -57,7 +57,7 @@ resource "aws_iam_role" "vm" {
   tags                 = merge(var.tags, local.base_tags, { Name = var.instance_profile_name })
 
   # Fail-closed guard: error if the controller role to trust is unset. Rides on
-  # this always-created role (mirrors skypilot_pool_eks's precondition on
+  # this always-created role (mirrors the EKS workspace pool's precondition on
   # aws_eks_access_entry.pool) rather than a dedicated no-op resource.
   lifecycle {
     precondition {

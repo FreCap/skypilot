@@ -51,7 +51,7 @@ resource "aws_eks_access_entry" "pool" {
 }
 
 module "rbac" {
-  source   = "../skypilot-pool-rbac"
+  source   = "../skypilot-spoke-workspace-pool-rbac"
   for_each = local.partitions_by_namespace
 
   providers = {

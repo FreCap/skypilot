@@ -7,9 +7,10 @@
 ## Context
 
 SkyPilot deployment Terraform currently lives in `boltz-bio/boltz-platform`.
-That makes generally useful control-plane and compute-pool building blocks depend
-on an application repository, encourages consumers to copy them, and prevents a
-SkyPilot release from carrying the infrastructure contract needed to deploy it.
+That makes generally useful control-plane and spoke-workspace-pool building
+blocks depend on an application repository, encourages consumers to copy them,
+and prevents a SkyPilot release from carrying the infrastructure contract needed
+to deploy it.
 
 The modules move to SkyPilot's existing `infra/terraform/modules` tree. The
 first consumer remains `boltz-platform`, but the module APIs and documentation
@@ -27,9 +28,9 @@ comparison, or history source unless a user explicitly requests it.
 
 - Publish the four currently deployed modules from stable, reusable paths:
   - `infra/terraform/modules/skypilot-control-plane`
-  - `infra/terraform/modules/skypilot-pool-aws-vm`
-  - `infra/terraform/modules/skypilot-pool-eks`
-  - `infra/terraform/modules/skypilot-pool-rbac`
+  - `infra/terraform/modules/skypilot-spoke-workspace-pool-aws-vm`
+  - `infra/terraform/modules/skypilot-spoke-workspace-pool-eks`
+  - `infra/terraform/modules/skypilot-spoke-workspace-pool-rbac`
 - Preserve the existing `boltz-platform` Terraform resource addresses and
   effective provider configuration and defaults while changing the module
   package source.
@@ -61,16 +62,33 @@ comparison, or history source unless a user explicitly requests it.
 
 ### Package and source contract
 
-The module directories above are the public package paths. Cross-repository
-callers use an immutable Git source:
+The module directories above are the public package paths. “Spoke workspace
+pool” is package terminology for spoke-side infrastructure where workspace
+workloads execute. It does not imply a one-to-one binding: one pool can serve
+multiple workspaces, and one workspace can target more than one pool. Existing
+Terraform labels, public inputs, persisted names, and SkyPilot `pool` vocabulary
+remain unchanged. “Spoke” describes the logical workload side of the topology;
+these modules do not require a physically separate account or cluster. A spoke
+workspace pool is infrastructure packaging and is unrelated to a managed Job
+Pool operated through `sky jobs pool`.
+
+This package-directory rename happens before the draft module stack merges or
+becomes a supported consumer contract. It does not rename module/resource labels
+or create Terraform `moved` blocks. Existing immutable commits that expose the
+earlier paths remain valid for callers pinned to those commits; the draft
+`boltz-platform` migration is repinned atomically to a commit containing the new
+paths. No moving-branch source or compatibility symlink is introduced.
+
+Cross-repository callers use an immutable Git source:
 
 ```hcl
-source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-pool-aws-vm?ref=<full-commit-sha>"
+source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-spoke-workspace-pool-aws-vm?ref=<full-commit-sha>"
 ```
 
-The EKS pool module's relative `../skypilot-pool-rbac` dependency is part of the
-package contract. Callers must use Git's `//subdirectory` syntax so Terraform
-downloads the repository package and the sibling module remains available.
+The EKS pool module's relative
+`../skypilot-spoke-workspace-pool-rbac` dependency is part of the package
+contract. Callers must use Git's `//subdirectory` syntax so Terraform downloads
+the repository package and the sibling module remains available.
 
 Moving a caller between a local and remote source does not change Terraform
 addresses. Resource and nested-module labels therefore remain unchanged in
@@ -141,12 +159,13 @@ The API-server role name is configurable and defaults to the current
 `skypilot-api-${host_cluster_name}` value. The resulting name is validated
 against IAM's 64-character limit.
 
-### `skypilot-pool-aws-vm`
+### `skypilot-spoke-workspace-pool-aws-vm`
 
-This module registers an AWS account for direct EC2 workloads by creating the
-provisioner role, VM role and instance profile, optional Session Manager access,
-optional SkyServe controller permissions, and explicitly supplied dataset and
-KMS grants.
+This module prepares a spoke AWS account in which SkyPilot workspace VMs run by
+creating the provisioner role, VM role and instance profile, optional Session
+Manager access, optional SkyServe controller permissions, and explicitly
+supplied dataset and KMS grants. It does not create a VM during Terraform apply;
+SkyPilot launches VMs into the prepared account later.
 
 Role names retain their existing defaults but are caller-configurable. A
 nullable permissions-boundary ARN is accepted and attached to every role the
@@ -163,12 +182,13 @@ permission to create the EC2 Spot service-linked role, and optional Session
 Manager access. Dataset grants and extra policy inputs can broaden that surface
 and must be reviewed by the caller.
 
-### `skypilot-pool-eks`
+### `skypilot-spoke-workspace-pool-eks`
 
-This module registers an existing EKS cluster, maps a control-plane IAM
-principal through an EKS access entry, creates one RBAC partition per namespace,
-and optionally creates Pod Identity associations, exact-priority admission
-policies, static FSx volumes, and a SkyServe probe ingress rule.
+This module connects workspace workloads to an existing spoke EKS cluster, maps
+a control-plane IAM principal through an EKS access entry, creates one RBAC
+partition per namespace, and optionally creates Pod Identity associations,
+exact-priority admission policies, static FSx volumes, and a SkyServe probe
+ingress rule. It does not provision the EKS cluster.
 
 The controller role ARN is a required, nonempty input.
 
@@ -195,7 +215,7 @@ change. EKS access-entry mode, the Pod Identity agent, CSI drivers, storage
 classes, VPC CNI routing, and service availability remain caller
 prerequisites.
 
-### `skypilot-pool-rbac`
+### `skypilot-spoke-workspace-pool-rbac`
 
 This cloud-neutral module creates the namespace when requested, the workload
 service account, read-only cluster visibility, namespaced workload lifecycle
@@ -218,14 +238,16 @@ existing EKS host
   └── skypilot-control-plane
         ├── Helm release + PostgreSQL config seed
         └── API-server Pod Identity role
-              ├── assumes skypilot-pool-aws-vm provisioner role
-              └── maps into skypilot-pool-eks access entry
-                    └── skypilot-pool-rbac[partition namespace]
+              ├── assumes skypilot-spoke-workspace-pool-aws-vm provisioner role
+              └── maps into skypilot-spoke-workspace-pool-eks access entry
+                    └── skypilot-spoke-workspace-pool-rbac[partition namespace]
 ```
 
 - Child resource and module labels are preserved from the deployed modules.
 - Existing `count` and `for_each` shapes, partition keys, and volume keys are
   preserved.
+- The package-directory rename does not rename internal Terraform labels,
+  variables, outputs, physical defaults, tags, service accounts, or namespaces.
 - Defaults produce the same commercial-AWS names, policies, tags, and Helm
   values as the local modules they replace.
 - Optional permissions boundaries default to `null`, preserving existing plans.
@@ -340,6 +362,22 @@ Required before opening the pull requests:
   cloud credentials are available
 - repository searches proving no deployment-specific account, hostname,
   repository, workspace, or image remains in the reusable module package
+- a stale-reference gate proving published module code, the module catalog and
+  READMEs, Terraform tests, and CI contain none of the old hyphenated package
+  paths `skypilot-pool-aws-vm`, `skypilot-pool-eks`,
+  `skypilot-pool-rbac`, or the old nested source
+  `../skypilot-pool-rbac`; the temporary underscore-form `boltz-platform`
+  rollback directories and `../skypilot_pool_rbac` source are the only
+  pre-Phase-3 exception and are validated separately
+
+The SkyPilot stale-reference gate is:
+
+```bash
+if rg -n 'skypilot-pool-(aws-vm|eks|rbac)|\.\./skypilot-pool-rbac' \
+    infra/terraform .github/workflows; then
+  exit 1
+fi
+```
 
 Manual verification for the eventual rollout:
 
@@ -354,7 +392,8 @@ Manual verification for the eventual rollout:
 
 ## Verification evidence
 
-Phase 1 was verified on 2026-07-31 with Terraform 1.14.8:
+The pre-rename Phase 1 implementation was verified on 2026-07-31 with Terraform
+1.14.8:
 
 - `terraform fmt -check -recursive infra/terraform` passed.
 - `terraform init -backend=false -test-directory=terraform-tests`,
@@ -369,8 +408,27 @@ Phase 1 was verified on 2026-07-31 with Terraform 1.14.8:
   shapes, commercial-AWS effective values, and seed-script bytes. The seed
   script SHA-256 is
   `b87765a0f58db47b8cade97a8ebf6224e7558b31ba105478e3493f4615a1ca74`.
-- The exact design passed adversarial review after the Spot service-name and
-  output-only plan contracts were clarified.
+- The pre-rename design passed adversarial review after the Spot service-name
+  and output-only plan contracts were clarified.
+
+The rename-specific verification also completed on 2026-07-31:
+
+- Terraform 1.14.8 formatting, initialization, validation, and all 155 tests
+  passed across the eight published module roots. The four modules in this
+  design contributed 9 control-plane, 11 AWS VM, 16 EKS, and 10 RBAC tests.
+- Terraform-docs 0.20.0 checks passed for all four modules, and no module-root
+  dependency lockfiles remain in the package tree.
+- The seed suite passed all 24 tests and retained the SHA-256 recorded above.
+- The stale-reference gate, actionlint 1.7.7, and working-tree/index diff checks
+  passed.
+- An independent comparison against both pre-rename SkyPilot commit
+  `fe2938b71cd0559199909d5a31147cd93fad8c5d` and untouched
+  `boltz-platform@origin/main` confirmed that the only executable rename change
+  is the EKS sibling module source. Managed resource/module labels,
+  `count`/`for_each` expressions, variable defaults, outputs, tags, physical
+  names, commercial-AWS effective values, and seed bytes are unchanged.
+- The rename contract passed adversarial review before implementation and again
+  against the completed verification evidence.
 
 Phase 2 commands and PR descriptions must record their exact results. No live
 plan or apply evidence is claimed until the corresponding command has run

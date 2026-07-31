@@ -1,9 +1,12 @@
-# SkyPilot pool RBAC
+# Kubernetes RBAC for SkyPilot spoke workspace pools
 
 Creates the Kubernetes service account and least-privilege RBAC used by a
-SkyPilot compute pool. This module is cloud-neutral: the caller configures the
-Kubernetes provider and maps its cloud or human identity to one or more
-Kubernetes `User` or `Group` subjects.
+SkyPilot spoke workspace pool. This module is cloud-neutral: the caller
+configures the Kubernetes provider and maps its cloud or human identity to one
+or more Kubernetes `User` or `Group` subjects. A pool may serve multiple
+workspaces; this module does not create a one-to-one workspace binding. “Spoke”
+is logical, and this infrastructure package is unrelated to a managed Job Pool
+operated through `sky jobs pool`.
 
 The module grants:
 
@@ -31,8 +34,8 @@ for every module instance in a cluster.
 Pin cross-repository consumers to an immutable commit:
 
 ```hcl
-module "skypilot_pool_rbac" {
-  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-pool-rbac?ref=<full-commit-sha>"
+module "skypilot_spoke_workspace_pool_rbac" {
+  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-spoke-workspace-pool-rbac?ref=<full-commit-sha>"
 
   name                 = "skypilot-gpu-pool"
   namespace            = "skypilot-gpu"

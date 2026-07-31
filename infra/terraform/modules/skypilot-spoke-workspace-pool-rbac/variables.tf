@@ -1,8 +1,8 @@
-# Cloud-agnostic Kubernetes RBAC for a SkyPilot compute pool.
+# Cloud-agnostic Kubernetes RBAC for a SkyPilot spoke workspace pool.
 #
 # This is pure Kubernetes — identical for an EKS or GKE pool — so the cloud-
 # specific identity wiring (e.g. an EKS access entry, or GCP IAM for a future GKE
-# pool) lives in the calling module (skypilot_pool_eks), which passes a
+# pool) lives in the calling EKS workspace-pool module, which passes a
 # `kubernetes` provider already pointed at the target cluster plus the RBAC
 # subject(s) that represent the control plane's identity there.
 

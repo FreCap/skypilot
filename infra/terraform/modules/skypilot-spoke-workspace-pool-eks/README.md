@@ -1,9 +1,13 @@
-# SkyPilot EKS pool
+# SkyPilot EKS spoke workspace pool
 
-Register an existing Amazon EKS cluster as a SkyPilot compute pool. The module
+Connect workspace workloads to an existing spoke Amazon EKS cluster. The module
 maps one SkyPilot control-plane IAM role to namespaced Kubernetes RBAC and can
 optionally create Pod Identity associations, exact-priority admission policies,
-static FSx volumes, and a one-port SkyServe probe ingress rule.
+static FSx volumes, and a one-port SkyServe probe ingress rule. It does not
+provision the cluster. A pool may serve multiple workspaces, and a workspace may
+target more than one pool. “Spoke” is logical and does not require a separate
+cluster. This infrastructure package is unrelated to a managed Job Pool operated
+through `sky jobs pool`.
 
 This is a provider-neutral child module. It declares provider requirements but
 does not configure credentials or cluster authentication.
@@ -35,8 +39,8 @@ Pod Identity, or a selected FSx driver is available in every region.
 Pin cross-repository consumers to an immutable commit:
 
 ```hcl
-module "pool" {
-  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-pool-eks?ref=<full-commit-sha>"
+module "spoke_workspace_pool" {
+  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-spoke-workspace-pool-eks?ref=<full-commit-sha>"
 
   providers = {
     aws        = aws
@@ -71,8 +75,8 @@ module "pool" {
 ```
 
 The Git `//subdirectory` syntax is required: the EKS module depends on the
-sibling `../skypilot-pool-rbac` module, so Terraform must download the
-repository package rather than only one directory.
+sibling `../skypilot-spoke-workspace-pool-rbac` module, so Terraform must
+download the repository package rather than only one directory.
 
 Configure the Kubernetes provider in the root module. For example:
 
@@ -167,7 +171,7 @@ replacement, deletion, namespace recreation, or PV recreation.
 
 | Name | Source | Version |
 |------|--------|---------|
-| <a name="module_rbac"></a> [rbac](#module\_rbac) | ../skypilot-pool-rbac | n/a |
+| <a name="module_rbac"></a> [rbac](#module\_rbac) | ../skypilot-spoke-workspace-pool-rbac | n/a |
 
 ## Resources
 

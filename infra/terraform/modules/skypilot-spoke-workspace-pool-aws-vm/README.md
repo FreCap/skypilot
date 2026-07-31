@@ -1,8 +1,12 @@
-# SkyPilot AWS VM pool
+# SkyPilot AWS direct-VM spoke workspace pool
 
-Registers an AWS account as a SkyPilot direct-VM (EC2) backend. The module is
-pure IAM: it does not create a VPC, subnet, security group, EKS cluster, or
-SkyPilot control plane.
+Prepares a spoke AWS account as a SkyPilot workspace pool for direct VMs (EC2).
+The module is pure IAM: it does not create a VM, VPC, subnet, security group,
+EKS cluster, or SkyPilot control plane. SkyPilot launches workspace VMs into the
+prepared account later. A pool may serve multiple workspaces; the name does not
+imply a one-to-one workspace binding. “Spoke” is logical and does not require a
+separate AWS account. This infrastructure package is unrelated to a managed Job
+Pool operated through `sky jobs pool`.
 
 The module creates:
 
@@ -31,8 +35,8 @@ Extra policies and dataset grants can broaden that surface.
 Pin cross-repository consumers to an immutable commit:
 
 ```hcl
-module "skypilot_pool_aws_vm" {
-  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-pool-aws-vm?ref=<full-commit-sha>"
+module "skypilot_spoke_workspace_pool_aws_vm" {
+  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-spoke-workspace-pool-aws-vm?ref=<full-commit-sha>"
 
   controller_role_arn     = "arn:aws:iam::111122223333:role/skypilot-api"
   permissions_boundary_arn = "arn:aws:iam::444455556666:policy/platform-boundary"
@@ -51,7 +55,7 @@ module "skypilot_pool_aws_vm" {
 Apply the control plane first, pass its API-server role ARN as
 `controller_role_arn`, and add the resulting `provisioner_role_arn` to the
 control-plane role's `sts:AssumeRole` policy. Configure a standard AWS profile
-for the matching SkyPilot workspace:
+for the matching SkyPilot workspace or workspaces:
 
 ```ini
 [profile compute]

@@ -5,8 +5,8 @@ Consume a module locally from this repository or pin a full commit from the
 authoritative fork:
 
 ```hcl
-module "pool" {
-  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-pool-aws-vm?ref=<full-commit-sha>"
+module "spoke_workspace_pool" {
+  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-spoke-workspace-pool-aws-vm?ref=<full-commit-sha>"
   # ...
 }
 ```
@@ -15,14 +15,18 @@ Provider configuration and backend state belong to the root caller. Module
 directories do not commit dependency lock files; executable root configurations
 do.
 
+“Spoke workspace pool” is an infrastructure package term for the logical
+workload side of a deployment. It does not require a separate account or cluster
+and is unrelated to a managed Job Pool operated through `sky jobs pool`.
+
 ## Module catalog
 
 | Module | Purpose |
 | --- | --- |
 | [`skypilot-control-plane`](modules/skypilot-control-plane) | Install a PostgreSQL-backed SkyPilot control plane on an existing EKS cluster |
-| [`skypilot-pool-aws-vm`](modules/skypilot-pool-aws-vm) | Register an AWS account for direct EC2 workloads |
-| [`skypilot-pool-eks`](modules/skypilot-pool-eks) | Register an existing EKS cluster with namespace, identity, priority, storage, and probe partitions |
-| [`skypilot-pool-rbac`](modules/skypilot-pool-rbac) | Create cloud-neutral Kubernetes RBAC for a SkyPilot pool |
+| [`skypilot-spoke-workspace-pool-aws-vm`](modules/skypilot-spoke-workspace-pool-aws-vm) | Prepare a spoke AWS account where SkyPilot workspace VMs run |
+| [`skypilot-spoke-workspace-pool-eks`](modules/skypilot-spoke-workspace-pool-eks) | Connect workspace workloads to an existing spoke EKS cluster with namespace, identity, priority, storage, and probe partitions |
+| [`skypilot-spoke-workspace-pool-rbac`](modules/skypilot-spoke-workspace-pool-rbac) | Create cloud-neutral Kubernetes RBAC for spoke workspace pools |
 | [`aws-image-distribution`](modules/aws-image-distribution) | Create managed-image ECR shard rings and target roles |
 | [`aws-image-worker-identity`](modules/aws-image-worker-identity) | Create worker identities for managed image operations |
 | [`aws-image-canary-account`](modules/aws-image-canary-account) | Bootstrap account-global image-canary prerequisites |
