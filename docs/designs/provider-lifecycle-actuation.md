@@ -1,7 +1,9 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: M1 merged; M2 S1 implemented and locally qualified; exact-head CI and
-deployment pending; M3 requires a dedicated review
+Status: M1 and M2 S1 merged; S1 exact-head CI, revision 34 deployment, canary,
+cleanup, and monitor qualified; responsibility-deduplication review accepted
+for planning; M2 S2 is next; M3 and M4 implementation require dedicated
+exact-design adversarial reviews
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -73,13 +75,329 @@ SkyPilot already has stronger reusable foundations:
 The migration generalizes these mechanics while preserving their stronger
 contracts.
 
+## Responsibility Deduplication Review
+
+This review compares the current SkyPilot tree with
+`dstackai/dstack@ccef71f46b8e61ce3c139d3c147911b6dd19f8a2`. It extends the
+original three concepts with the ownership changes required to remove
+duplication rather than only type it.
+
+At this snapshot SkyPilot has 23 `sky/provision/*/instance.py` modules and all
+23 implement `run_instances()`. Twenty of those modules contain blocking
+`time.sleep()` polling and twenty contain provider-local status maps. The
+Lambda, DigitalOcean, and Fluidstack implementations each own variants of the
+same algorithm:
+
+- drain or wait for pending instances;
+- discover the current cluster and select or repair the head;
+- compare observed and desired node counts;
+- resume or create the missing nodes;
+- poll until the desired count is ready;
+- construct the same `ProvisionRecord` projection.
+
+M1 gives this existing method group one typed owner. It deliberately does not
+claim that 23 copies of the algorithm are the desired final architecture.
+
+dstack demonstrates three useful responsibility boundaries:
+
+1. `ComputeWithCreateInstanceSupport.run_job()` is a template method that
+   converts domain configuration once and delegates only `create_instance()` to
+   a provider.
+2. Provider mutations return quickly, while later
+   `update_provisioning_data()` calls observe readiness.
+3. `Pipeline`, `Fetcher`, `Heartbeater`, `Worker`, and
+   `PipelineModelMixin` reuse claim, lease, heartbeat, queue, wakeup, and
+   guarded-update mechanics across resource types.
+
+SkyPilot will adopt those boundaries, not those exact implementations.
+dstack's mutable offer handoff, import-time mixin capability lists, coarse
+provider exceptions, application-clock leases, and database-only stale-worker
+fence are weaker than SkyPilot's required contracts. A stale worker that loses
+its database lease may already have caused an external effect. Therefore a
+guarded state update alone is not sufficient provider-call fencing.
+
+The next architecture has three additional workstreams.
+
+### Shared cluster reconciler over provider primitives
+
+`InstanceLifecycleV1` remains the compatibility facet for the existing bulk
+entry points. M4 introduces a separately versioned, opt-in node-actuation facet
+for promoted providers. The exact M4 interface requires its own design review,
+but its responsibility boundary is fixed here:
+
+- the provider facet owns raw discovery, one bounded mutation submission,
+  provider-native identity, raw operation observation, status translation,
+  and exact absence evidence;
+- a core cluster planner owns desired roles, target count, resume policy, and
+  the ordered actions to request;
+- a core cluster reconciler owns head selection, adoption rules, sequencing,
+  waiting, deadlines, retry timing, `ProvisionRecord` construction, and
+  cleanup ordering;
+- domain policy owns whether typed capacity, quota, authentication,
+  throttling, or ambiguous-effect evidence permits retry, failover,
+  compensation, or quarantine.
+
+The provider contract is command/query separated. A mutation method returns
+without polling for terminal readiness and yields bounded typed evidence with a
+serializable provider operation handle when one exists. Observation is a
+separate method. A logical cluster action may require several provider effects,
+such as an Azure NIC followed by a VM, a Kubernetes PVC followed by a
+Deployment, or an AWS instance batch followed by role tags. The runtime, not an
+in-memory provider call, must journal progress between those effects. The
+minimum semantic operations are:
+
+```text
+discover(identity, scope) -> NodeInventory
+prepare(exact_action, inventory) -> ProviderEffectPlan
+submit_effect(exact_effect, idempotency_key) -> EffectEvidence
+observe_effect(effect_handle, identity) -> EffectObservation
+prove_absent(identity) -> AbsenceEvidence
+```
+
+`exact_action` has a closed operation kind and the exact deterministic names,
+roles, identities, or requested create count chosen by the core planner.
+`prepare()` is pure and emits a bounded deterministic DAG of exact provider
+effects, identities, and dependencies. The runtime persists that whole plan
+before external I/O, then persists each effect intent before calling
+`submit_effect()`. A returned effect may use a provider-supported batch only
+when every target has deterministic identity and per-target evidence. The
+facet cannot own cluster target-count policy, select a head, choose a new
+placement offer, select a compensation, sleep until ready, or project a domain
+terminal status. A compensation is another exact action selected by domain
+policy. Provider code only prepares and submits its effects.
+
+`EffectEvidence` records per-target and aggregate provider request or operation
+identity, effect certainty, affected provider locus, and bounded redacted
+diagnostics. A crash after an effect and before evidence persistence therefore
+leaves a durable effect intent that must enter readback. A provider with no
+safe operation identity must return deterministic resource identity sufficient
+for readback or an ambiguous-effect result that enters quarantine. If one SDK
+request unavoidably creates several resource types with provider-assigned IDs,
+that request is one effect only when an exact readback locator was persisted
+before submission. The locator contains the provider idempotency token when
+available, an unforgeable attempt and incarnation ownership label or tag,
+provider scope, expected resource kinds, and bounded cardinality. Returned
+child IDs are persisted as soon as they exist. Literal preknown child IDs are
+required only where the provider supports them. If post-loss readback cannot
+enumerate a complete bounded owned child set from the locator, the effect is
+quarantined rather than treated as absent or replayed.
+
+The shared reconciler first runs in shadow mode. It consumes the same frozen
+provider inventory as the legacy implementation and compares:
+
+- selected head identity and role assignment;
+- existing, resumed, created, stopped, and terminated identity sets;
+- next requested action;
+- pending and terminal status projection;
+- final `ProvisionRecord`;
+- cleanup obligations and absence evidence.
+
+Shadow mode never executes both mutation paths. A live shadow comparison is
+valid only after the provider exposes one raw immutable inventory consumed by
+both a side-effect-free legacy projection adapter and the new planner. Where
+the legacy method performs hidden reads that cannot yet consume the snapshot,
+only an offline frozen-inventory corpus may compare plans; it is not live
+parity evidence.
+
+The shadow wrapper captures the caller-visible `ProvisionRecord` returned by
+the actual legacy `run_instances()` call, or its raised error and bounded
+mutation evidence, before any projection adapter runs. After that sole mutation
+owner returns, both final projection adapters may consume one new immutable
+post-mutation inventory. The new projection is compared directly with the
+captured legacy return, including head identity, resumed and created counts,
+provider region and zone, and every caller-visible field, as well as with the
+actual post-mutation identity set. A reconstructed legacy post projection is
+diagnostic only and can never substitute for the actual return in a promotion
+or removal gate.
+
+Promotion is per provider and per dependency-closed operation subset. Read-only
+discovery may promote independently. A mutating subset cannot promote unless
+its observation, retry/readback, cleanup, compensation, and absence-proof
+dependencies are promoted with it, or a characterized compatibility adapter
+proves that every legacy stop, down, and recovery path can consume the new
+resource identities. New create behind new evidence with legacy-only teardown
+is not a valid promotion unit. A provider stays on `InstanceLifecycleV1` until
+the characterized partial-create, lost-response, restart, scale, stop,
+termination, and same-name-recreation corpus passes. Lack of live credentials
+permits an additive contract or offline shadow adapter to land, but never
+permits authoritative promotion or legacy removal.
+
+### Durable action runtime as a declarative kernel
+
+M3 adopts dstack's reusable leased-work shape but must not require a new
+Fetcher, Heartbeater, and Worker subclass for every SkyPilot domain. One
+PostgreSQL action store and worker kernel own the mechanics. The action table
+itself owns one generic runnable-state and `next_attempt_at` due query for
+already-admitted actions. Domain-specific admission queries and reconcilers
+remain in the domain. Domain code records priority and requested timing when it
+admits or reduces an action; it does not supply custom due-work SQL or a
+Fetcher subclass to the worker kernel. A domain adapter declaratively supplies:
+
+- action kind, resource identity, incarnation, and desired-generation fence;
+- planner and reducer callbacks;
+- the provider facet operation to invoke;
+- retry, compensation, quarantine, and retention policy;
+- connection-borrowing transactional state and event mutations.
+
+The generic kernel does not own domain admission. Before an action becomes
+runnable, the domain command or reconciler locks and validates its own
+generation, controller or owner fence, capacity or scheduling reservation, and
+legal transition. That domain-owned admission transaction writes the
+reservation and generic action row together. The action retains the exact
+reservation and fence identities. Retries reuse them; they never reserve the
+same capacity again. The kernel claims only already-admitted rows and
+revalidates those durable identities immediately before external I/O.
+
+The kernel uses a fresh PostgreSQL statement clock after blocking locks, one
+unique claim token per action attempt, `FOR UPDATE SKIP LOCKED`, bounded
+queueing, wake hints, heartbeat, and a synchronous live-fence assertion
+immediately before provider mutation. It
+persists intent and cleanup identity before external I/O. Lost leases,
+timeouts, or broad exceptions never imply that an external effect did not
+happen. They enter readback or quarantine according to typed evidence.
+
+This kernel reuses mechanics without defining a universal resource status enum
+or a universal reducer. Volumes, clusters, Serve, pools, managed jobs, and
+managed images retain their legal domain transitions and generation fences.
+
+### Provider registration projection, descriptor, and generated conformance
+
+M1 still leaves provider identity represented in parallel places:
+`CLOUD_REGISTRY`, Cloud subclasses, lifecycle version switches, the
+provisioner registry, the built-in provisioner inventory, configuration
+schemas, service-catalog ownership, and plugin hooks.
+
+The current registries cannot directly produce an authoritative
+`ProviderDescriptorV1`. They have no common transaction or replacement
+generation, and valid registrations are intentionally asymmetric: strict or
+legacy provisioner-only plugins may have no Cloud entry, while IBM has a Cloud
+entry but remains outside the new provisioner path.
+
+M4 therefore starts with an immutable read-only
+`ProviderRegistryAuditSnapshotV1`, captured only after a quiescent plugin
+registration barrier. It takes the union rather than the intersection of the
+current registries and records a typed present or absent state for every
+legacy facet. It has no dispatch authority and claims no historical replacement
+generation. The audit snapshot joins:
+
+- canonical name and compatibility aliases;
+- Cloud planning facet;
+- strict provisioner bundle;
+- optional offer source;
+- optional node-actuation, volume, port, diagnostics, and configuration
+  facets;
+- positive provider-wide capabilities;
+- typed resource-dependent support predicates;
+- current plugin implementation identity and registration source.
+
+The service catalog remains an external planning facet in V1. Moving catalog
+registration into the descriptor would combine two migrations and is deferred
+until lifecycle ownership is stable.
+
+The audit explicitly classifies expected partial providers and proves
+one-to-one identity only where two old registries are both expected to own a
+facet. An unexpected partial entry is a conformance failure, not an import
+failure.
+
+After the inventory is characterized, a transaction-like
+`ProviderRegistrationV1` coordinator becomes the only path for newly migrated
+registrations. One coordinator call validates an immutable
+`ProviderDescriptorV1`, publishes one immutable registry snapshot, and updates
+all compatibility views under the same coordinator lock. A monotonic
+process-local snapshot generation exists only for cache invalidation.
+
+Each descriptor instead carries a stable `implementation_digest` over its
+canonical facet contract versions and executable artifact fingerprints. The
+digest is identical across replicas of the same implementation and changes
+when a facet implementation or semantic contract changes. Built-ins derive
+artifact fingerprints from the release build manifest. Plugins must supply an
+installed-artifact or entry-point fingerprint that the registrar can verify.
+A dynamic plugin without a stable verifiable fingerprint remains audit-only
+and cannot receive authoritative promotion.
+
+A direct legacy registration for a migrated provider immediately forces that
+provider back to legacy routing and invalidates its promotions. An audit may
+diagnose the mutation but cannot re-enable authority. Only an explicit
+`ProviderRegistrationV1` adoption that republishes every migrated facet under a
+new stable implementation digest can restore eligibility. Bootstrap state
+never fabricates history that the legacy registries did not retain.
+
+After one compatibility release with zero unexplained audit mismatches and no
+direct legacy registration for migrated providers, the descriptor snapshot may
+become dispatch-authoritative and legacy registry views may be derived from it.
+Only that later commit can remove parallel inventories or lifecycle version
+switches.
+
+Promotion and durable actuation bind to stable implementation identity, not the
+process-local snapshot generation. A promotion record is keyed by canonical
+provider, facet contract version, dependency-closed operation subset, realized
+actuation mode, control-plane and durable-store mode, and
+`implementation_digest`. V1 authority is limited to
+`central_postgresql`; `local_sqlite` and `controller_sqlite` remain separate
+legacy bindings. Every durable effect plan and attempt stores that binding.
+Immediately before each external effect, dispatch must resolve the current
+descriptor and prove exact digest, realized mode, and control-plane/store-mode
+compatibility. Replacement invalidates promotion and cannot inherit prior live
+qualification. An implementation may read back or continue an older binding
+only through an explicitly declared cross-digest compatibility adapter that
+passes the same conformance and live gates; otherwise the action enters legacy
+readback or quarantine.
+
+Resource-dependent support is evaluated into an immutable
+`ActuationBindingV1` before the first create effect. It records the realized
+provider mode, such as GCP MIG versus unmanaged instances, and the exact
+control-plane and durable-store mode. It does not re-evaluate mutable config or
+requested `Resources` during later stop, down, or recovery. Existing resources
+with no proven binding remain on the legacy path unless complete provider
+discovery establishes and durably records every binding axis. A config, plugin,
+or store-mode change therefore cannot silently route an old cluster into a
+newly claimed capability.
+
+Each declared descriptor facet and operation-dependency edge selects an
+executable conformance matrix. The matrix is not satisfied by descriptor
+self-assertion: every promoted provider supplies a deterministic fake, recorded
+provider fixture, or contract adapter that can drive every declared scenario,
+plus live qualification for the authoritative operation subset. The matrix
+covers:
+
+- exact signatures and no silent fallback;
+- import without optional provider dependencies;
+- positive and resource-dependent capability behavior;
+- durable realized-mode binding independent of later configuration changes;
+- pre-effect implementation-digest equality and replacement invalidation;
+- idempotent adoption and stable external identity;
+- pending observation without blocking;
+- partial create and lost response;
+- typed capacity, quota, authentication, authorization, throttling, and
+  invalid-request evidence;
+- stop and restart behavior;
+- idempotent termination and complete absence proof;
+- dependency-closed activation and legacy readback or teardown compatibility;
+- redaction, plugin replacement, aliasing, and old/new client compatibility.
+
+Datadog remains the observation plane for shadow mismatch, fallback, and
+legacy-usage counters. No new statistics store is introduced.
+
+### Patterns explicitly not ported
+
+- Mutable offers or provider-private unbounded payloads.
+- Import-time capability lists derived only from class inheritance.
+- Capability presence as a replacement for resource-dependent support.
+- Broad provider exceptions that authorize blind replay or immediate failover.
+- A lease heartbeat that fences only the database commit and not the external
+  effect.
+- Per-domain copies of fetcher, worker-construction, heartbeat, and backoff
+  boilerplate.
+- One universal state machine for unrelated resource domains.
+
 ## Goals
 
 - Give every provider capability one explicit, typed owner.
 - Prohibit accidental mixing of plugin and built-in lifecycle methods.
 - Carry one immutable placement decision from discovery through provisioning.
 - Separate provider mutation from waiting and status projection.
-- Reuse due-work, lease, heartbeat, retry, and fenced-commit mechanics.
+- Reuse admitted-action due-work, lease, heartbeat, retry, and fenced-commit
+  mechanics.
 - Persist mutation intent and stable identity before provider I/O.
 - Make ambiguous outcomes recoverable through readback or quarantine.
 - Commit state transitions and lifecycle events atomically when they share a
@@ -112,7 +430,7 @@ contracts.
 | Desired state, autoscaling, recovery, rollout, and cleanup policy | Domain planner |
 | Offer production and provider-private placement evidence | Provider offer facet |
 | Cross-provider offer filtering and ranking | Optimizer |
-| Due selection, claim, lease, heartbeat, attempt, backoff, deadline | Durable action runtime |
+| Due selection for admitted actions, claim, lease, heartbeat, attempt, backoff, deadline | Durable action runtime |
 | Provider API mutation and raw observation | Provider lifecycle facet |
 | Failure kind, affected provider locus, request or operation ID, and effect certainty evidence | Provider lifecycle facet |
 | Retry, failover, or quarantine decision | Domain policy using typed evidence |
@@ -147,9 +465,9 @@ group implemented by all 24 built-in new-provisioner packages:
 
 The facet signatures omit the public facade's `provider_name` because the
 facade consumes that argument before dispatch. The facet remains synchronous
-in M1. The future nonblocking `start_or_reconcile()` and `observe()` contract
-is a separately versioned actuator facet introduced only when cluster
-actuation migrates.
+in M1. The future nonblocking `prepare()`, `submit_effect()`, and
+`observe_effect()` contract is a separately versioned actuator facet introduced
+only when cluster actuation migrates.
 
 Granular optional provisioner facets are added only when an immediate consumer
 migrates:
@@ -1925,17 +2243,22 @@ removed based on a Kubernetes-only gate.
 ## Provisioning Attempt and Provider Outcome
 
 Provider mutation becomes nonblocking from the orchestration perspective.
-`start_or_reconcile()` returns a durable `ProvisioningAttempt`; `observe()`
-returns a typed snapshot; `stop_or_terminate()` returns complete or in
-progress.
+The runtime durably creates a `ProvisioningAttempt`, persists the provider
+facet's pure `ProviderEffectPlan`, and journals each effect intent before
+calling `submit_effect(exact_effect, idempotency_key)`. `observe_effect()`
+returns a typed snapshot. Start, create, stop, terminate, and compensation are
+closed exact-action kinds rather than provider-selected orchestration.
 
 An attempt contains:
 
 - stable attempt ID and idempotency key;
 - resource type, resource ID, incarnation, and desired generation;
 - selected offer ID and provider payload version;
+- immutable provider-effect plan version and dependency graph;
 - requested, existing, resumed, and created counts and IDs;
-- provider request or operation IDs;
+- per-effect intent, idempotency key, exact readback locator, expected resource
+  kinds and cardinality, all known returned child IDs, and provider request or
+  operation IDs;
 - phase and observation completeness;
 - retry disposition and scope;
 - external-effect certainty;
@@ -1977,7 +2300,8 @@ evidence, then decides whether to retry, fail over, compensate, or quarantine.
 
 The shared runtime owns:
 
-- selecting due work with database time;
+- selecting due admitted actions with a fresh database statement clock
+  acquired after blocking locks;
 - claiming with `FOR UPDATE SKIP LOCKED`;
 - lease token, owner, expiry, heartbeat, and attempt count;
 - synchronous ownership assertion immediately before provider mutation;
@@ -1989,12 +2313,102 @@ The shared runtime owns:
 
 The runtime does not own:
 
+- domain admission, controller leadership, or capacity reservation;
 - legal domain transitions;
 - desired-state policy;
 - resource incarnation construction;
 - provider observation mapping to domain status;
 - compensation selection;
 - exact deletion proof.
+
+### Admission and transaction boundary
+
+A domain action is eligible for the generic due query only after a
+domain-owned admission transaction has:
+
+1. locked and checked the current resource incarnation and desired generation;
+2. acquired or referenced any domain capacity, scheduling, controller, owner,
+   or handoff reservation;
+3. run the pure planner and validated the requested legal transition;
+4. inserted the action with the exact fence and reservation identities.
+
+For central PostgreSQL migrations, these writes use one physical connection
+and transaction. At admission, the domain command or reconciler owns that
+transaction and calls an action-store insert that must not commit, close, or
+open a nested session. During worker execution, the kernel owns each
+transaction and calls domain mutations that borrow the supplied connection and
+likewise cannot commit, close, or open a nested session. Completion or
+supersession updates the domain state, releases or transfers the reservation,
+writes the deterministic event, and closes the action in one transaction.
+
+The generic kernel never reconstructs domain eligibility in its due-work SQL.
+If a later domain change invalidates admitted work, the desired-generation or
+reservation fence fails and the action is superseded, replanned, or retained
+for cleanup according to domain policy. Existing image, job, Serve, and
+controller reservations are semantic inputs to admission, not second
+reservations to be reacquired by the kernel.
+
+Every transaction that touches more than one ownership class uses this global
+lock order:
+
+1. database ownership-epoch row for the exact domain, dependency-closed
+   operation subset, and store mode;
+2. controller, leadership, or domain-owner fence rows;
+3. domain parent and resource-incarnation rows;
+4. capacity, scheduling, handoff, and reservation rows;
+5. action rows;
+6. child-request and action-to-child binding rows;
+7. the global operational-event sequence row.
+
+Multiple rows within one class are locked in canonical resource-key order.
+Action claim may lock only an action row and commit; any later transaction that
+also needs domain state reacquires locks from the beginning in the global
+order and validates the claim token. No provider I/O occurs while any of these
+locks are held. A PostgreSQL deadlock abort retries the whole effect-free
+transaction with bounded jitter; it never retries across external I/O.
+
+### Nested request binding
+
+An action that delegates to another SkyPilot API request must bind that child
+before dispatch. The outer effect intent stores a deterministic child request
+ID derived in the action namespace. If parent and child use the same
+PostgreSQL store, child creation and the action-to-child binding commit in one
+transaction. Across an HTTP or process boundary, the internal API accepts an
+authenticated caller-supplied idempotency and child request ID and atomically
+upserts that binding before acknowledging dispatch.
+
+The binding stores the parent action and effect IDs, resource incarnation,
+desired generation, canonical request-payload digest, workspace, and
+authenticated actor digest. Reusing the child ID is idempotent only when every
+bound field matches exactly. The same ID with a different parent, payload,
+generation, workspace, or actor fails closed as a conflict and never overwrites
+or joins the existing child.
+
+Middleware must not replace the bound ID with an unrelated UUID. A successor
+observes, joins, or cancels the exact child request and consumes its terminal
+result; it never submits a second anonymous SDK call because the first HTTP
+response was lost. A domain whose existing nested API path cannot expose this
+binding is not eligible to migrate to the action kernel. Controller action
+reservations remain until this parent-child hierarchy and recovery path are
+qualified.
+
+### Database clock and connection budget
+
+Lease issue, renewal, expiry, and due-time comparisons use a fresh
+`clock_timestamp()` statement executed after any blocking row lock. PostgreSQL
+transaction-start time, application wall clocks, and a timestamp read before a
+lock wait are forbidden for lease safety.
+
+No database transaction or connection is held across provider or nested API
+I/O. The `IN_FLIGHT` intent transaction commits before bytes may be sent.
+Heartbeats and synchronous fences use a reserved connection budget or
+dedicated bounded pool that worker concurrency cannot consume. If that reserve
+cannot obtain a connection before the lease safety margin, the worker stops
+starting new effects. An effect whose call may already have occurred follows
+the same `READBACK` or quarantine rule; pool starvation never licenses replay.
+Provider SDK deadlines and hidden retries are bounded and included in the
+lease and ambiguity-horizon calculation. The live fence is rechecked after any
+provider-side rate-limit wait and before each underlying SDK attempt.
 
 ### External-effect phases
 
@@ -2014,6 +2428,16 @@ A lease protects database ownership. It is not proof that a provider side
 effect ran once. A stale owner may discard its computation, but the system
 must never discard the only known external resource identity.
 
+Reclaim is phase-sensitive. `PRE_INTENT` with no effect intent may be claimed
+and planned normally. Once any effect has an `IN_FLIGHT` intent, a new owner
+must enter `READBACK` for that exact effect before it can consider another
+submission. Lease expiry, a negative point-in-time query, or a worker heartbeat
+failure alone can never authorize replay. Replay requires provider-native
+idempotency or deterministic conflict adoption plus complete no-effect evidence
+after the provider-specific ambiguity horizon. Without that proof, the action
+remains in readback or quarantine. This also covers an old process that passed
+its final database fence and resumed its network call after losing the lease.
+
 ### Store boundary
 
 The runtime is a mechanics library with a PostgreSQL implementation and a
@@ -2026,25 +2450,34 @@ for:
 
 - action versus attempt table identity, keys, generations, phases, and
   retention;
-- the one component that owns the caller-supplied SQLAlchemy
-  `Session` or `Connection`;
+- the exact admission-owned and kernel-owned transaction APIs and enforcement
+  that borrowed SQLAlchemy connections cannot commit, close, or nest;
+- schema-specific realization of the global lock order and bounded
+  effect-free deadlock retry;
 - migration lineage and downgrade compatibility;
-- the generic deterministic event key and uniqueness constraint;
-- activation epoch and minimum-compatible-reader fields;
+- the exact versioned event source union, M3 volume kind and target enums,
+  endpoint negotiation, API version bump, and old-client filtering contract;
+- deterministic action-to-child-request keys, authenticated idempotent API
+  admission, and child retention;
+- lease duration, fresh-statement clock queries, reserved heartbeat connection
+  budget, and bounded provider SDK attempt timeouts;
+- domain, dependency-closed operation-subset, and store-mode scoped ownership
+  epoch and minimum-compatible-reader fields;
 - a compatibility reconciler that is shipped and tested before the new writer
   can be enabled;
 - backfill and coexistence with `api_controller_action_reservations`;
-- rollback-on-event-failure proof;
-- draining, reconciling, or quarantining every live action before image
-  rollback.
+- schema and transaction tests for the lifecycle-event contract below;
+- proving zero unresolved, quarantined, or cleanup-bearing action before any
+  pre-N rollback, or retaining a compatible pinned reconciler while pre-N
+  mutation ownership stays excluded.
 
 The deployed server resolves global state and API request engines to the same
 PostgreSQL URI but intentionally uses distinct process-local pools. Atomicity
-is therefore permitted only when one caller-owned connection writes the action
-row, volume row, and generalized event tables. Opening nested sessions or
-performing cross-connection best-effort writes is forbidden. If one connection
-cannot own all three writes, the updated design must specify a durable outbox
-and idempotent reducer before M3 can be approved.
+is therefore permitted only when the transaction owner passes one physical
+connection to every action, domain, reservation, and generalized-event write.
+Opening nested sessions or performing cross-connection best-effort writes is
+forbidden. If one connection cannot own all required writes, the updated design
+must specify a durable outbox and idempotent reducer before M3 can be approved.
 
 The volume pilot is central-PostgreSQL-only, disabled by default behind a
 server-side gate. The synchronous public `volumes apply` and `volumes delete`
@@ -2054,7 +2487,21 @@ controller SQLite operation until a separate product deprecation gate closes.
 
 Managed container images remain the semantic reference. They move onto the
 shared interface only after equivalence tests prove no loss of provider-call
-fencing, quarantine, or exact cleanup.
+fencing, quarantine, exact cleanup, or scheduler semantics. Their domain
+admission reconciler continues to own the two-level due order of shard
+`(copy_next_at, id)` then location `(copy_claimable_at, id)`, recovery before
+fresh work, and due-shard rotation through `last_dispatch_at`. It atomically
+reserves a shard slot and enqueues an action; the generic kernel must not
+replace those queries with global action-table policy.
+
+Equivalence also preserves shard `max_in_flight`, exact increment only for a
+fresh claim, no increment for lease recovery, exactly-once decrement or
+transfer on every terminal path, and publication or capacity reservations.
+Crash injection covers `COPY`, `VERIFY`, `EVICT`, and `READBACK` before and
+after provider I/O and state commit. Promotion requires the scoped ownership
+epoch to prove zero legacy claim owner and zero dual due, lease, heartbeat, or
+retry owner. Only the duplicate execution mechanics move to the kernel; image
+fairness and reservation policy remain domain admission.
 
 ## Domain Planner and Reducer
 
@@ -2094,6 +2541,67 @@ Datadog remains the telemetry plane.
 For domains whose state and action share a PostgreSQL transaction, one helper
 validates expected state, generation, domain fence, and action lease token,
 then writes the new state and deterministic lifecycle event together.
+
+The expand migration generalizes `resource_events` without overloading request
+identity:
+
+- `source_type` is closed to `api_request` or `lifecycle_action`;
+- request events require `source_request_id`,
+  `source_execution_generation`, and phase while action-source columns are
+  null;
+- action events require `source_action_id`, desired generation,
+  transition ordinal, and `source_transition_id` while request-source columns
+  are null;
+- `correlation_root_request_id` optionally links an action and its nested child
+  requests to the initiating API request;
+- database check constraints enforce those mutually exclusive source shapes.
+
+Storage expansion alone does not change the current event wire. Release N
+backfills `source_type=api_request`, adds nullable action-source columns and the
+new checks and partial indexes, and updates every event reader before any
+action event can be inserted. Only after all event readers are compatible may
+N+1 relax the current request-column `NOT NULL` constraints and enable the
+scoped action writer.
+
+The existing events endpoint and `OperationalEvent` model remain V1 and return
+only `api_request` rows with the exact required `request_id`,
+`execution_generation`, cluster-only kinds, and cluster target type. M3 adds a
+separate V2 endpoint and bumps the server API version. `OperationalEventV2`
+uses a discriminated `source` union:
+
+```text
+ApiRequestEventSourceV2(request_id, execution_generation)
+LifecycleActionEventSourceV2(action_id, desired_generation,
+                             transition_id, correlation_root_request_id)
+```
+
+V2 has a closed M3 vocabulary containing the existing cluster kinds plus the
+volume create, register, refresh, and delete kinds, and cluster and volume
+target types. Its cursor query fingerprint includes `event_schema_version=2`.
+Future domain kind or target additions require a new negotiated event schema
+version rather than sending an unknown closed enum to an older V2 client.
+
+Old clients against a new server remain on V1 and never see action rows or new
+enum values. A new client uses V2 only when the remote API version advertises
+it and otherwise falls back to V1 with action events explicitly unavailable.
+Mixed-reader, pagination, filtered-cursor, and old-client tests are required
+before action event insertion is enabled.
+
+The action transaction locks the action row, allocates its next transition
+ordinal, and derives `source_transition_id` as UUIDv5 over canonical action ID,
+resource incarnation, desired generation, ordinal, phase, and outcome. A
+unique action-source index covers action ID, desired generation, transition
+ordinal, and phase. The existing request-source uniqueness remains a separate
+partial index. Retrying the same transition is therefore a no-op; a different
+legal transition cannot collide.
+
+Request and action events share the existing globally serialized
+`event_sequence` allocator so current cursor ordering remains valid. Action
+emission is mandatory: invalid context or an event insert failure raises and
+rolls back the action state, domain state, reservation release, and event
+together through the same borrowed physical connection. Request emission may
+retain its existing optional-context behavior. High-frequency heartbeats and
+provider observations never allocate operational-event sequence numbers.
 
 The durable event answers:
 
@@ -2186,7 +2694,8 @@ rollback, and cleanup on the exact image digest.
 - add volume desired generation, incarnation, tombstone, observation, and
   deletion proof;
 - remove force-purge success on ambiguous provider errors;
-- emit the volume lifecycle transition atomically.
+- add the negotiated V2 action-event wire and emit the volume lifecycle
+  transition atomically while preserving the request-only V1 endpoint.
 
 The new writer is disabled by default. The compatibility reconciler must be
 deployed and exercised before the writer can be enabled. The pilot covers only
@@ -2198,23 +2707,54 @@ ambiguous provider response, readback, and cleanup.
 
 ### M4: Cluster provisioning and teardown
 
-- adapt launch, start, stop, down, port reconciliation, and status observation;
+- update this file with the exact node-actuation facet, operation evidence,
+  provider descriptor, shared cluster planner, reconciler transaction,
+  activation, and rollback contracts and pass a dedicated adversarial review
+  before implementation;
+- add the read-only `ProviderRegistryAuditSnapshotV1`, classify expected
+  partial registrations, and prove one-to-one identity where legacy registries
+  overlap without adding a second registration owner;
+- add `ProviderRegistrationV1` and an immutable `ProviderDescriptorV1` snapshot
+  only after the audit is characterized, then migrate registrations through
+  the coordinator before making descriptor dispatch authoritative;
+- add the opt-in provider node-actuation facet and a shared cluster planner and
+  reconciler;
+- compare pre-mutation launch, start, stop, down, port, head-selection,
+  target-count, and cleanup plans from one frozen raw inventory only where a
+  side-effect-free legacy projection exists; otherwise use the offline frozen
+  corpus and do not call it live parity;
+- after only the authoritative legacy mutation runs, capture its actual
+  caller-visible return and compare the new status, identities,
+  `ProvisionRecord`, and cleanup projection from one new frozen post-mutation
+  inventory against that return and the observed provider state;
+- promote one characterized provider and dependency-closed operation subset at
+  a time;
 - preserve cluster hash or successor incarnation fencing;
 - shadow-compare status projection;
-- route failover through typed provider outcomes.
+- route failover through typed provider outcomes;
+- generate conformance from descriptor capabilities and keep providers without
+  live promotion evidence on the legacy bulk facet.
 
 ### M5: Serve and pools
 
-- extract pure planners and reducers;
-- persist replica launch and down attempts;
+- extract pure planners and reducers for the central PostgreSQL deployment;
+- persist central replica launch and down attempts;
 - keep lifecycle epoch, immutable versions, and incarnation inventory;
-- make the jobs and Serve pool handoff an explicit fenced contract.
+- make the jobs and Serve pool handoff an explicit fenced contract;
+- retain the officially supported SQLite Serve path until a separate
+  dialect-capable runtime or product deprecation closes its ledger row.
 
 ### M6: Managed jobs
 
-- migrate recovery and cleanup actions last;
+- migrate central PostgreSQL recovery and cleanup actions last;
 - retain controller generation and admission fencing;
-- remove process-local retry ownership only after recovery equivalence tests.
+- remove central process-local retry ownership only after recovery equivalence
+  tests;
+- retain controller-local SQLite retry ownership until a separate
+  dialect-capable runtime or product deprecation closes its ledger row;
+- after the kernel is proven across the migrated domains, move only duplicate
+  managed-image execution mechanics onto it while retaining image shard
+  fairness, rotation, and reservation accounting in domain admission.
 
 ### M7: Compatibility removal
 
@@ -2244,15 +2784,21 @@ Removal is part of completion, not optional follow-up.
 | M2 first-provider-attempt-only authoritative fence and `RETRY_AFTER_PROVIDER_ATTEMPT` fallback | M4 carries typed complete cleanup and provider-absence evidence across every failover provider and resets the cluster record atomically | cross-provider lost-response, partial-create, teardown, absence, and stale-record corpus passes with no blind replay |
 | M2 handle-backed `placement_attempt_fence`, reconciler, and `QUARANTINE_FENCED` path | M4 stores every cluster attempt and UID inventory in the durable action runtime and the pre-M2 rollback window is closed | crash and UID-replacement tests prove foreign objects survive, every owned child reaches proved absence, no generic label/name delete is reachable, and repository search finds no handle-backed fence writer |
 | provider-agnostic region and zone reconstruction in `resources_utils.py` and backend launch loops | every supported provider is authoritative through a placement-offer source or is explicitly frozen behind a declared legacy adapter | provider-wide corpus and bounded observation gates pass, repository and plugin inventory find zero migrated callers, and old/new client-server compatibility passes |
-| blocking provider wait ownership inside `run_instances()` implementations | `ProvisioningAttempt.observe()` owns progress | provider conformance proves pending, success, timeout, and partial-create behavior |
+| blocking provider wait ownership inside `run_instances()` implementations | `ProvisioningAttempt` effect observation owns progress | provider conformance proves pending, success, timeout, and partial-create behavior |
+| provider-local target-count, head-selection, resume, readiness, and `ProvisionRecord` algorithms inside `run_instances()` | the shared cluster planner and reconciler are authoritative for that provider and dependency-closed operation subset | frozen-inventory plans and post-mutation projections match the captured caller-visible legacy return or are explicitly safer, live create/restart/scale/down qualification passes, and repository search finds no promoted-provider orchestration in its primitive facet |
+| parallel canonical-name and alias inventories across Cloud and provisioner registration | all migrated registrations flow through `ProviderRegistrationV1`, descriptor dispatch is authoritative, and both legacy views are derived | one compatibility release records zero unexplained audit mismatch, expected partial providers remain explicit, plugin replacement and alias conformance pass, and no independent mutable inventory remains |
+| import-time or hand-maintained provider-wide capability matrices for migrated facets | the immutable provider descriptor generates positive capability views and resource-dependent predicates | every declared capability has executable conformance and repository search finds no migrated parallel list |
 | generic retry, cache update, and failure classification in `RetryingVmProvisioner` | typed attempts and domain retry policy are authoritative | old and new failover traces agree on the characterization corpus |
 | central-PostgreSQL volume mutation `FileLock`, synchronous provider calls, and refresh daemon ownership in `sky/volumes/server/core.py` | M3 action worker owns central volume lifecycle | HA stale-worker, readback, and cleanup tests pass and the server gate is promoted |
 | local or controller SQLite volume mutation path and `FileLock` | the product separately deprecates that officially supported path | deprecation window and local compatibility inventory are complete |
 | volume `--purge` row deletion after provider error | durable cleanup incident is deployed | ambiguous-delete test retains provider identity and eventually proves absence |
-| cluster process-local provisioning and teardown retry loops | M4 action runtime owns them | crash-at-every-phase tests and test-cluster cleanup pass |
-| Serve in-memory replica request retry ownership and duplicate scheduling loops | M5 action runtime owns mechanics | lifecycle-epoch, same-name recreation, rollout, scale, and failed-cleanup tests pass |
-| managed-job process-local recovery and cleanup retry ownership | M6 action runtime owns mechanics | controller handoff, preemption, cancellation, and cleanup conformance passes |
-| duplicate managed-image lease and scheduling mechanics | shared interface proves semantic equivalence | image fencing, quarantine, exact absence, and canary qualification remain green |
+| central-PostgreSQL cluster process-local provisioning and teardown retry loops | M4 action runtime owns them | crash-at-every-phase tests and test-cluster cleanup pass |
+| local or controller SQLite cluster provisioning and teardown retry loops | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and repository inventory finds no supported SQLite caller |
+| central-PostgreSQL Serve in-memory replica request retry ownership and duplicate scheduling loops | M5 action runtime owns mechanics | lifecycle-epoch, same-name recreation, rollout, scale, and failed-cleanup tests pass |
+| local or controller SQLite Serve retry and scheduling ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite Serve qualification is retired |
+| central-PostgreSQL managed-job process-local recovery and cleanup retry ownership | M6 action runtime owns mechanics | controller handoff, preemption, cancellation, and cleanup conformance passes |
+| controller-local SQLite managed-job recovery and cleanup ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite jobs qualification is retired |
+| duplicate managed-image worker lease, heartbeat, retry, and provider-call mechanics | the shared kernel executes already-admitted image actions while image domain admission retains shard fairness and reservations | shard `max_in_flight`, two-level due rotation, fresh-versus-recovery accounting, publication reservations, `COPY`/`VERIFY`/`EVICT`/`READBACK` crash recovery, fencing, quarantine, exact absence, and canary qualification pass with zero dual due or lease owner |
 | `api_controller_action_reservations` and `_reserve_controller_action()` / `_mark_controller_action_state()` | generalized action ledger preserves controller-generation fencing and active reservations are backfilled | compatibility reconciler observes zero unmigrated active reservations and rollback qualification passes |
 
 The fleet-gated M5 compatibility paths in
@@ -2271,10 +2817,34 @@ Every declared facet generates conformance tests for:
 
 - complete registration and no silent fallback;
 - import without provider extras installed;
+- audit-snapshot canonical-name, alias, current plugin-identity, expected
+  partial-state, and overlapping legacy-view agreement;
+- coordinator-era process-local snapshot generation, atomic replacement,
+  direct-legacy invalidation, and derived compatibility-view agreement;
+- stable implementation digest agreement across replicas, digest change on
+  facet replacement, pre-effect equality fencing, and rejection of an
+  unverified dynamic plugin;
+- provider-wide positive capabilities and resource-dependent predicates;
+- persisted realized actuation mode survives configuration changes and keeps
+  unbound legacy resources on legacy routing;
+- central PostgreSQL promotion never activates the same provider and operation
+  binding in local or controller SQLite modes;
 - stable create adoption or idempotency;
 - typed capacity, quota, authentication, authorization, throttling, and
   invalid-request evidence;
 - pending operations remain nonterminal;
+- `prepare()` is deterministic and side-effect-free, and the mutation
+  submission path contains no readiness polling or domain-status projection;
+- compound effects are dependency ordered, individually journaled, and
+  readback-safe across a crash after every effect;
+- activated mutation subsets include observation, cleanup, compensation, and
+  absence-proof dependencies or a characterized legacy compatibility adapter;
+- frozen inventories produce deterministic head, role, target-count, and next
+  action plans;
+- shared and legacy cluster traces agree on existing, resumed, created,
+  stopped, and terminated identity sets, and the new projection matches the
+  actual caller-visible legacy `ProvisionRecord`, not only a reconstructed
+  adapter result;
 - absent-resource termination is idempotent;
 - ambiguous outcomes enter readback;
 - provider request and operation IDs are preserved;
@@ -2347,14 +2917,45 @@ owned by the named test rather than left implicit:
 
 ### Action runtime
 
+- admission atomically writes the existing domain reservation, exact fence
+  identities, and generic action without acquiring capacity twice;
+- a domain change invalidates admitted work through its generation or
+  reservation fence without domain-specific due-work SQL;
+- borrowed transaction callbacks cannot commit, close, or open a nested
+  session;
+- admission, supersession, completion, child binding, and event emission obey
+  the global lock order; injected inverse concurrency either completes without
+  deadlock or retries only the aborted effect-free transaction;
 - two workers cannot own one live lease;
 - lease expiry permits a new owner but fences the stale owner;
-- heartbeat uses database time and matching token;
+- delayed row locks prove lease issue and renewal use a fresh post-lock
+  `clock_timestamp()`, independent of application clock skew;
+- pool-starvation tests prove the reserved heartbeat budget stops new effects
+  before it loses the fence;
 - the pre-provider-call fence rejects stale work;
+- pause after the final fence, request-bytes-sent with response lost, lease
+  expiry during an SDK call, and a hidden SDK retry all enter readback or
+  recheck the fence without duplicate submission;
 - retry timing is bounded and jittered;
 - provider result loss enters readback;
+- a lost nested API response recovers through the prebound child request ID,
+  observes or cancels that child, and never creates a second request;
+- reuse of a child request ID with a different parent, payload, generation,
+  workspace, or actor digest fails closed;
+- every `IN_FLIGHT` reclaim enters readback and a negative point query alone
+  cannot authorize replay;
+- crash injection after every compound provider effect retains its intent,
+  exact readback locator, expected resource kinds and cardinality, all known
+  returned child IDs, and exact next dependency;
 - transition and event commit or roll back together;
-- deterministic transition IDs prevent duplicate events;
+- action and request source constraints, deterministic transition IDs, partial
+  uniqueness, correlation, and the shared event sequence prevent malformed or
+  duplicate events;
+- V1 event readers see only request-sourced cluster events with their existing
+  required fields, while negotiated V2 readers round-trip both source variants,
+  volume kinds and targets, and schema-versioned cursors;
+- an event insertion failure rolls back action state, domain state,
+  reservation release, and sequence allocation on the same connection;
 - desired generation changes supersede old work without losing cleanup.
 
 ### Domain qualification
@@ -2366,15 +2967,30 @@ owned by the named test rather than left implicit:
 - Serve and pools: lifecycle epoch, replica inventory, rolling update,
   autoscaling, pool handoff, failed cleanup, and service recreation;
 - managed jobs: admission generation, preemption recovery, cancellation,
-  controller handoff, and cleanup.
+  controller handoff, and cleanup;
+- managed images: shard `max_in_flight`, shard and location due-order rotation,
+  recovery-before-fresh fairness, exact in-flight and publication-reservation
+  accounting, `COPY`, `VERIFY`, `EVICT`, and `READBACK` crash recovery, and
+  zero dual scheduler, lease, heartbeat, or retry owner.
 
 ### Compatibility
 
+- mixed N and N+1 roles cannot enable one scoped writer before every owner of
+  that domain, operation subset, and store mode is compatible, `DRAINING`
+  closes only that admission scope, a paused legacy mutation remains a counted
+  intent, and the scoped database epoch fences stale writers in the same
+  transaction without disturbing other domains;
+- rollback is exercised from every action phase, both with a separately pinned
+  reconciler and with full pre-N rollback refusal while any quarantined action,
+  unresolved effect, cleanup obligation, legacy intent, or new-reader resource
+  remains;
 - old client with new server;
 - new client with old server where the API version permits;
 - serialized handles without new metadata;
 - legacy plugin registration during the compatibility window;
 - rollback to the previous image before irreversible schema activation.
+- supported SQLite cluster, Serve, and managed-job paths remain on their
+  characterized legacy owners until their separate ledger gates close.
 
 #### M2 placement-offer handle qualification
 
@@ -2461,12 +3077,51 @@ identity evidence.
 - New schema is expand-first. Old readers ignore new tables and columns.
 - Mutation ownership switches behind a server-side gate and can return to the
   old writer only before the new writer performs an irreversible action.
-- The compatibility reconciler is deployed and proven before the writer gate
-  can create an action. Once an action enters `IN_FLIGHT`, rollback preserves
-  the action store and keeps that reconciler active until every action is
-  completed or quarantined.
-- The activation epoch and minimum-compatible-reader fence prevent an older
-  image from becoming mutation owner while newer live actions exist.
+- Ownership epochs are independent rows keyed by domain, dependency-closed
+  operation subset, and store mode. M3 can therefore cut over only central
+  PostgreSQL volume operations without changing cluster, Serve, jobs, image,
+  or SQLite ownership. A later milestone repeats the same protocol for its own
+  scope.
+- Release N expands the schema for the selected scope and ships a compatibility
+  reader and reconciler with that scope's gate disabled. Every API, controller,
+  executor, or worker role capable of executing that scope must run N or later
+  and pass mixed-version qualification before release N+1 may enable its
+  writer.
+- Release N also makes every legacy mutation admission in the selected scope
+  lock and check that scope's database ownership epoch and persist an active
+  legacy intent before external I/O. The intent contains its resource
+  incarnation, request identity, deterministic readback locator, and effect
+  certainty. It becomes terminal only after the provider call and required
+  readback finish. A wait or hidden SDK retry rechecks the epoch and intent
+  token before its next underlying attempt.
+- N+1 cutover first moves only the selected scope from `LEGACY_OPEN` to
+  `DRAINING` in one transaction. That closes new legacy and action admission
+  for the scope. The compatibility reconciler then proves its counted active
+  and ambiguous legacy-intent set is empty. `DRAINING` permits only the exact
+  already-registered intent token to finish or read back; it cannot create
+  another logical mutation. Only a second epoch transaction may verify that
+  empty set, the minimum compatible reader, and the selected scope's deployed
+  mutation-role set, then record the exact writer implementation and move the
+  scope to `ACTION_OPEN`.
+- Every action admission, claim, effect-intent, and terminal mutation checks
+  its scope's `ACTION_OPEN` epoch in its own state transaction. A process-local
+  flag cannot grant ownership. A release N process paused after its legacy
+  guard remains in the scoped counted intent set, so cutover cannot pass it
+  silently.
+- A pre-N image cannot enforce a field it does not understand. After N+1 has
+  admitted any action, a full image rollback to pre-N or replacement of the
+  only compatible reconciler is forbidden until the current image proves zero
+  nonterminal or quarantined actions, zero unresolved effects or cleanup
+  obligations, zero active legacy intents, and zero live resource incarnation
+  that requires the new reader. Only then may it disable every activated scope
+  in final database transactions. Quarantine is unresolved evidence, not a
+  safe drain result.
+- A role-specific rollback of stateless readers is allowed only while a
+  separately deployed compatible reconciler and worker image remains pinned
+  and every activated scoped ownership epoch excludes the rolled-back role.
+  The Helm
+  preflight records that retained deployment. Otherwise the system rolls
+  forward rather than replacing the reconciler.
 - Schema contraction occurs only in M7 after the rollback window closes.
 - A rollback never deletes action, event, provider identity, or cleanup
   evidence.
@@ -2479,7 +3134,9 @@ This migration is complete only when:
 - every stacked commit has a recorded successful `skypilot-ha` deployment and
   milestone-specific live proof;
 - provider conformance covers every strict built-in facet;
-- all domains use the shared mechanics without losing their domain fences;
+- every migrated central-PostgreSQL domain path uses the shared mechanics
+  without losing its domain fences, while retained SQLite paths remain named
+  legacy ledger rows rather than being counted as migrated;
 - every removal-ledger row is deleted or has an explicit externally owned
   blocker and is not falsely reported complete;
 - repository search finds no superseded version branches, silent plugin
@@ -2609,3 +3266,59 @@ support endpoints. S1 remains additive: it activates no provider source,
 changes no mutation owner, and closes no removal-ledger row. Exact-head CI,
 image qualification, deployment, canary, and monitoring remain required before
 S1 is recorded as deployed.
+
+### Review 6
+
+Verdict: `MERGE` completed for M2 S1.
+
+Exact head `8721dd9f968cd1cdf5d5eb228c3f8d92ead54d6a` passed all 24
+GitHub checks and resolved to linux/amd64 image digest
+`sha256:62a781c80cf9fac78e8fcdf7c6fca79484efc3c470e1d992da0da8c39fac0f30`.
+Helm revision 34 ran that exact runtime commit, version `1.1.0`, and build
+`7972` in all six API, controller, and executor pods. Its migration Job
+succeeded 1/1 with zero failures.
+
+Canary `m2-s1-8721dd-canary` passed launch, exec, status, down, and complete
+temporary resource cleanup. Six explicit monitor samples from `03:20:01Z`
+through `03:23:16Z` were clean, and the independent audit found no later
+candidate warning before unrelated revision 35 superseded it. The revision 34
+migration Job was removed after audit. Revision 35 was assessed separately and
+is not represented as S1 live-state evidence.
+
+PR #1080 merged at
+`53973b18a6e214b37b0ac3985d148886eb422a01`. Its first parent is
+`9b909c44205dbd584a54f9d3ece751e69a43f480`; its second parent is the exact
+tested and deployed S1 head. The remote feature branch was deleted after the
+merge.
+
+### Review 7
+
+Verdict: `PURSUE` for the responsibility-deduplication architecture.
+
+The review compared SkyPilot with
+`dstackai/dstack@ccef71f46b8e61ce3c139d3c147911b6dd19f8a2` and selected three
+additional boundaries: a shared cluster reconciler over journaled provider
+effects, a generic kernel for already-admitted durable actions, and a staged
+provider registry audit and authoritative descriptor coordinator.
+
+Provider-specific challenge returned `PURSUE` after the design added
+provider-assigned-ID readback locators, stable implementation digests,
+realized actuation and store-mode bindings, dependency-closed promotion, and
+provider-scoped legacy fallback. Two independent final reviews reloaded exact
+contract SHA-256
+`04a5daade6267c316a5c547ce423fe502f2e593f0a699b217587326e9422fe65`
+and returned `PURSUE` after the design closed:
+
+- domain-owned admission and global transaction lock ordering;
+- nested child-request identity and fail-closed idempotency;
+- fresh post-lock database time and reserved heartbeat capacity;
+- scoped legacy-intent drain and N then N+1 ownership cutover;
+- versioned request and action event wires;
+- PostgreSQL versus retained SQLite scope;
+- actual legacy `ProvisionRecord` shadow comparison;
+- managed-image fairness, accounting, phase recovery, and zero-dual-owner
+  gates.
+
+This verdict accepts the architecture and removal ledger. It does not approve
+M3 schema or M4 actuation implementation. Each still requires the dedicated
+exact-design review named in its milestone before code is written.
