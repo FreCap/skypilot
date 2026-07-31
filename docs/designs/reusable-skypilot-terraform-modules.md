@@ -363,7 +363,7 @@ Phase 1 was verified on 2026-07-31 with Terraform 1.14.8:
   modules under `infra/terraform/modules` (155 tests total; the four modules in
   this design contributed 46 tests).
 - `uv run --no-project --with 'PyYAML>=6,<7' --with 'SQLAlchemy>=2,<3'
-  python -m unittest -v test_seed_config.py` passed all 12 tests.
+  python -m unittest -v test_seed_config.py` passed all 24 tests.
 - An independent comparison against untouched `boltz-platform@origin/main`
   confirmed identical managed-resource/module labels, collection identity
   shapes, commercial-AWS effective values, and seed-script bytes. The seed
