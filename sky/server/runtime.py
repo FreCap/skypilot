@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Callable
 from collections.abc import Coroutine
 import dataclasses
 import multiprocessing
@@ -23,6 +24,9 @@ from sky import global_user_state
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
+from sky.physical_capacity import config as physical_capacity_config
+from sky.physical_capacity import projector as capacity_projector_lib
+from sky.serve import serve_utils
 from sky.server import clean_env as clean_env_module
 from sky.server import config as server_config
 from sky.server import constants as server_constants
@@ -67,6 +71,8 @@ class RuntimeState:
     config: server_config.ServerConfig
     instance_lease: request_postgres.ServerInstanceLease | None
     requests_recovered: bool
+    physical_capacity_config: physical_capacity_config.CapacityConfig | None = (
+        None)
 
 
 def init_or_restore_server_user_hash() -> None:
@@ -101,6 +107,19 @@ def _controller_cutover_quiescence_seconds() -> float:
     return seconds
 
 
+def _ordinary_db_connections_after_capacity_reservation(
+    config: physical_capacity_config.CapacityConfig,
+    usable_connections: int | None,
+) -> int | None:
+    """Reserve exactly one isolated connection only for controller shadow."""
+    if config.mode is physical_capacity_config.CapacityMode.DISABLED:
+        return usable_connections
+    if usable_connections is None or usable_connections < 2:
+        raise RuntimeError('Physical-capacity shadow mode requires at least '
+                           'two usable PostgreSQL connections.')
+    return usable_connections - 1
+
+
 def _start_surface_interrupted_cluster_launches() -> None:
     try:
         scan_delay = float(
@@ -120,6 +139,13 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
         plugins.ExtensionContext(context=plugins.PluginContext.MAIN))
     usage_lib.maybe_show_privacy_policy()
 
+    capacity_config = physical_capacity_config.load_config()
+    physical_capacity_config.validate_common_runtime_environment(
+        capacity_config,
+        server_role=role,
+        request_backend=os.environ.get(
+            request_postgres.REQUEST_BACKEND_ENV_VAR))
+
     db_utils.set_max_connections(1)
     logger.info('Initializing database engines')
     database_migrations.initialize_central_databases()
@@ -134,6 +160,13 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     init_or_restore_server_user_hash()
     if role in ('all', 'controller'):
         managed_job_utils.setup_consolidation_mode_on_startup(deploy)
+    if capacity_config.mode is physical_capacity_config.CapacityMode.SHADOW:
+        if (not managed_job_utils.is_consolidation_mode() or
+                not serve_utils.is_consolidation_mode(pool=False) or
+                not serve_utils.is_consolidation_mode(pool=True)):
+            raise RuntimeError('Physical-capacity shadow mode requires '
+                               'consolidated Serve, pool, and managed-jobs '
+                               'state.')
 
     logger.info('Pre-loading plugin RBAC rules + viewer allowlist')
     plugins.load_plugin_rbac_rules()
@@ -144,6 +177,14 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
 
     max_db_connections = global_user_state.get_max_db_connections()
     logger.info(f'Max db connections: {max_db_connections}')
+    ordinary_max_db_connections = (
+        _ordinary_db_connections_after_capacity_reservation(
+            capacity_config, max_db_connections))
+    if capacity_config.mode is physical_capacity_config.CapacityMode.SHADOW:
+        assert ordinary_max_db_connections is not None
+        logger.info('Reserved one PostgreSQL connection for physical-capacity '
+                    f'evidence; {ordinary_max_db_connections} remain for '
+                    'ordinary server configuration.')
     reserved_memory_mb: float = 0
     if role in ('all', 'controller'):
         reserved_memory_mb = (
@@ -153,7 +194,9 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
                 reserve_extra_for_pool=not os.environ.get(
                     constants.IS_SKYPILOT_SERVE_CONTROLLER)))
     config = server_config.compute_server_config(
-        deploy, max_db_connections, reserved_memory_mb=reserved_memory_mb)
+        deploy,
+        ordinary_max_db_connections,
+        reserved_memory_mb=reserved_memory_mb)
     if role in ('all', 'controller'):
         server_config.publish_serve_launch_parallelism(config)
 
@@ -161,7 +204,8 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     if _uses_postgres_requests():
         instance_lease = request_postgres.ServerInstanceLease(role)
         instance_lease.start()
-    return RuntimeState(role, config, instance_lease, requests_recovered)
+    return RuntimeState(role, config, instance_lease, requests_recovered,
+                        capacity_config)
 
 
 async def _schedule_on_boot_check_async() -> None:
@@ -437,10 +481,7 @@ def _kill_local_controller_children() -> None:
     # durable local process records in addition to walking the worker tree.
     # pylint: disable=import-outside-toplevel
     from sky.jobs import scheduler as managed_job_scheduler
-    try:
-        managed_job_scheduler.fail_stop_local_job_controllers()
-    except Exception:  # pylint: disable=broad-except
-        logger.exception('Failed to fail-stop local managed-job controllers.')
+    managed_job_scheduler.fail_stop_local_job_controllers()
 
 
 def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
@@ -456,9 +497,11 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
     background: _BackgroundLoop | None = None
     queue_server: multiprocessing.Process | None = None
     workers: list[executor.RequestWorker] = []
+    capacity_projector: capacity_projector_lib.EvidenceProjector | None = None
     shutdown = threading.Event()
     became_leader = False
     leadership_lost = False
+    capacity_projector_failed = False
     cutover_regressed = False
     waiting_for_cutover = False
     cutover_ready = False
@@ -501,6 +544,14 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                     cutover_ready = True
                 if lease.try_acquire():
                     try:
+                        acquiring_generation = lease.generation
+                        assert acquiring_generation is not None
+                        state.instance_lease.set_ready(
+                            False,
+                            health_detail={
+                                'phase': 'activating-controller',
+                                'controller_generation': acquiring_generation,
+                            })
                         blockers = (
                             request_postgres.recent_legacy_controller_consumers(
                                 cutover_quiescence_seconds))
@@ -549,6 +600,14 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                     f'{generation} fenced {fenced["replayed"]} replayable and '
                     f'{fenced["interrupted"]} ambiguous stale claim(s).')
 
+        configured_capacity = state.physical_capacity_config
+        if configured_capacity is None:
+            configured_capacity = physical_capacity_config.load_config()
+        capacity_projector = capacity_projector_lib.start_controller_projector(
+            configured_capacity,
+            controller_instance_id=lease.instance_id,
+            controller_generation=generation)
+
         # The snapshot must include the immutable leader identity before any
         # worker or controller subprocess can be spawned.
         clean_env_module.capture_clean_server_env()
@@ -578,6 +637,22 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
         logger.info(f'Controller generation {generation} is ready.')
 
         while not shutdown.wait(_CONTROLLER_LEADERSHIP_PROBE_SECONDS):
+            if (capacity_projector is not None and
+                    not capacity_projector.healthy):
+                capacity_projector_failed = True
+                logger.error('Physical-capacity evidence projector became '
+                             'unhealthy; fencing controller work and exiting.')
+                try:
+                    state.instance_lease.set_ready(
+                        False,
+                        health_detail={
+                            'phase': 'capacity-projector-failed',
+                            'controller_generation': generation,
+                        })
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        'Failed to publish capacity projector failure.')
+                break
             blockers = request_postgres.recent_legacy_controller_consumers(
                 cutover_quiescence_seconds)
             if blockers:
@@ -617,7 +692,8 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
         try:
             if became_leader:
                 assert generation is not None
-                if not leadership_lost and not cutover_regressed:
+                if (not leadership_lost and not cutover_regressed and
+                        not capacity_projector_failed):
                     try:
                         state.instance_lease.set_ready(
                             False,
@@ -632,26 +708,49 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                 # before releasing the leadership session so no
                 # old-generation provider work survives into the replacement
                 # generation.
-                try:
-                    for worker in workers:
-                        worker.request_shutdown()
-                    _kill_local_controller_children()
-                    if workers:
-                        _request_worker_shutdown(workers,
-                                                 terminate_children=True)
-                    if background is not None:
-                        background.stop()
-                    _stop_queue_server(queue_server)
-                finally:
+                drain_errors: list[BaseException] = []
+
+                def drain_step(name: str, operation: Callable[[], Any]) -> None:
                     try:
-                        lease.release()
-                    finally:
-                        os.environ.pop(
-                            request_postgres.CONTROLLER_GENERATION_ENV_VAR,
-                            None)
-                        os.environ.pop(
-                            request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
-                            None)
+                        operation()
+                    except BaseException as e:  # pylint: disable=broad-except
+                        drain_errors.append(e)
+                        logger.exception(f'Controller drain step {name} '
+                                         'failed.')
+
+                for worker in workers:
+                    drain_step('request-worker-stop-request',
+                               worker.request_shutdown)
+                drain_step(
+                    'capacity-projector-stop', lambda: capacity_projector_lib.
+                    stop_controller_projector(capacity_projector))
+                drain_step('local-controller-child-fail-stop',
+                           _kill_local_controller_children)
+                if workers:
+                    drain_step(
+                        'request-worker-fail-stop',
+                        lambda: _request_worker_shutdown(
+                            workers, terminate_children=True))
+                if background is not None:
+                    drain_step('background-loop-stop', background.stop)
+                drain_step('queue-server-stop',
+                           lambda: _stop_queue_server(queue_server))
+
+                if drain_errors:
+                    # Never release the durable generation after an unproven
+                    # projector/child shutdown. Immediate process exit closes
+                    # the leadership session and every remaining DB socket.
+                    logger.critical('Controller drain could not prove all '
+                                    'leader-owned work stopped; fail-stopping '
+                                    'the process before lease release.')
+                    os._exit(1)  # pylint: disable=protected-access
+                try:
+                    lease.release()
+                finally:
+                    os.environ.pop(
+                        request_postgres.CONTROLLER_GENERATION_ENV_VAR, None)
+                    os.environ.pop(
+                        request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR, None)
         finally:
             try:
                 try:
@@ -668,6 +767,8 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
         raise RuntimeError('Controller leadership session was lost.')
     if cutover_regressed:
         raise RuntimeError('A legacy controller consumer reappeared.')
+    if capacity_projector_failed:
+        raise RuntimeError('Physical-capacity evidence projector failed.')
 
 
 def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
