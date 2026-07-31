@@ -816,6 +816,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     pod_spec = copy.deepcopy(config.node_config)
     create_pods_start = datetime.datetime.now(datetime.timezone.utc)
 
+    deployment_spec: dict[str, Any] | None = None
+    pvc_spec: dict[str, Any] | None = None
     to_create_deployment = 'deployment_spec' in pod_spec
     if to_create_deployment:
         deployment_spec = pod_spec.pop('deployment_spec')
@@ -1013,8 +1015,10 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 # If the pod is already running, we skip creating it.
                 return
 
-        deployment_name = (deployment_spec['metadata']['name']
-                           if to_create_deployment else None)
+        deployment_name = None
+        if to_create_deployment:
+            assert deployment_spec is not None
+            deployment_name = deployment_spec['metadata']['name']
         pod_spec_copy = pod_spec_lib.finalize_pod_spec(
             pod_spec,
             role=role,
@@ -1035,6 +1039,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         )
 
         if to_create_deployment:
+            assert deployment_spec is not None
+            assert pvc_spec is not None
             volume.create_persistent_volume_claim(namespace, context, pvc_spec)
 
             # It's safe to directly modify the template spec in the deployment spec

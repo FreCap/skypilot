@@ -881,8 +881,8 @@ class Kubernetes(clouds.Cloud):
                 region=context,
                 keys=('autoscaler',),
                 default_value=None)
-            if (autoscaler_type !=
-                    kubernetes_enums.KubernetesAutoscalerType.GKE.value):
+            if (autoscaler_type
+                    != kubernetes_enums.KubernetesAutoscalerType.GKE.value):
                 raise ValueError(
                     f'DWS is only supported in GKE, but the autoscaler type '
                     f'for context {context} is {autoscaler_type}')
@@ -1561,8 +1561,8 @@ class Kubernetes(clouds.Cloud):
                                     k8s_resource_key
                                     not in node.status.allocatable or
                                     int(node.status.
-                                        allocatable[k8s_resource_key]) <
-                                    acc_count):
+                                        allocatable[k8s_resource_key])
+                                    < acc_count):
                                 continue
                             # Calculate EFA count proportionally
                             if AWS_EFA_RESOURCE_KEY in node.status.allocatable:
@@ -1657,8 +1657,8 @@ class Kubernetes(clouds.Cloud):
             region=context,
             keys=('autoscaler',),
             default_value=None)
-        if (autoscaler_type !=
-                kubernetes_enums.KubernetesAutoscalerType.GKE.value):
+        if (autoscaler_type
+                != kubernetes_enums.KubernetesAutoscalerType.GKE.value):
             return KubernetesHighPerformanceNetworkType.NONE, None
         autoscaler = kubernetes_utils.get_autoscaler(
             kubernetes_enums.KubernetesAutoscalerType(autoscaler_type))

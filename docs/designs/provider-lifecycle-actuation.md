@@ -3529,3 +3529,51 @@ Pylint 2.14.5 at 10.00/10 for production and new tests, and
 `check_instance_fits()` predate and are outside every changed hunk. Exact-head
 CI, review state, and merge proof remain required before this slice advances to
 S2a.2.
+
+### Review 12
+
+Verdict: `PURSUE` for the final rebased S2a.1 implementation and its CI
+corrections.
+
+Review 11 records the pre-rebase implementation review. This review supersedes
+it as the merge evidence after rebasing onto exact base
+`7ad9483f62a5da58d18cb8d09e564411ce8b1757` and applying the current CI
+contracts. The final independent read-only architecture review returned
+`PASS`. It confirmed that YAPF 0.43 changes are AST-identical formatting, the
+explicit `ASYNC103` and `ASYNC104` annotations preserve the designed
+cleanup and credential exception-containment boundaries, optional deployment
+state is only statically narrowed, and tests now mock the canonical snapshot
+configuration owner instead of relying on the removed ambient-read seam.
+
+The reviewed leaf hashes are:
+
+- `.basedpyright-baseline.json`:
+  `a403cf78e495487b59687e1f0cb3a2f557348b064a598392f0fe9a9421bbdd7c`;
+- `sky/adaptors/kubernetes.py`:
+  `3e58acfe82f3dc2deddfc2747a122ceabda11b212ba347c0a6505883dfca2b6a`;
+- `sky/clouds/kubernetes.py`:
+  `33022b2315ec85921b932c56c51f1239f2f95be95dc9f42ceb55282f87a004ea`;
+- `sky/provision/kubernetes/instance.py`:
+  `dbe15d4de0cef17d0eff1d4a1101fd42e221ef4005e40ca71eccfabf9a53044b`;
+- `sky/provision/kubernetes/utils.py`:
+  `69df95a4f6581f7184faacfef2dccd773537bb4d431a32c4f91fb92b456dab2e`;
+- `tests/unit_tests/test_sky/adaptors/test_kubernetes_observation_primitives.py`:
+  `ec43408de6bd7d7a981d6052a61b3c2de94481604acfef0a92272788d9d2d178`;
+- `tests/unit_tests/kubernetes/test_kubernetes_node_observation_primitives.py`:
+  `5dced105a72a17e6bd0c4ca002dad6edc7f849c52b96084d22e8dd84bd7078b9`;
+- `tests/unit_tests/test_sky/clouds/test_kubernetes.py`:
+  `c5ad057fbf2e856f53b1062c1c79b62e66df0b045a9f666d1671976bf37282a4`;
+- `tests/unit_tests/test_sky/test_check.py`:
+  `44f7c5374b712b308714a7c1b1f475c82252a47556dc57a3727002249d706c32`.
+
+Local acceptance imported the intended worktree and passed 741 affected serial
+tests, 3 subtests, YAPF 0.43, isort 5.12, Python compilation, and exact Pylint
+2.14.5 at 10.00/10 for production and new tests. Exact basedpyright 1.39.9 on
+Python 3.14 reported zero errors, warnings, or notes and removed exactly five
+resolved baseline entries. The flake8 7.3.0 and flake8-async 27.7.1 output
+remained byte-identical to the 17-line repository baseline at SHA-256
+`145746a05f5781e3d6654ca963172382f87b9a10abb5cd08d92fea8c987a8d11`.
+The corrective diff adds no placement offer, classifier, aggregate-deadline or
+orchestration activation, provider mutation, retry owner, or statistics
+storage. Exact-head CI, review state, merge proof, and live rollout evidence
+remain required.

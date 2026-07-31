@@ -1720,8 +1720,8 @@ class KubernetesObservationBudget:
                              self._reserved_response_bytes)
                 if remaining > 0:
                     break
-                if (self._consumed_response_bytes >=
-                        self._maximum_response_bytes):
+                if (self._consumed_response_bytes
+                        >= self._maximum_response_bytes):
                     raise _KubernetesObservationAcceptedByteLimitExhausted(
                         'Kubernetes observation aggregate byte bound is '
                         'exhausted.')
@@ -2754,7 +2754,7 @@ def _close_kubernetes_observation_response(response: Any) -> None:
         close = getattr(response, 'close', None)
         if callable(close):
             close()
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         pass
 
 
@@ -2798,7 +2798,7 @@ def get_kubernetes_node_observation_uncached_bounded(
         _close_kubernetes_observation_response(response)
         try:
             response.release_conn()
-        except BaseException:  # pylint: disable=broad-exception-caught
+        except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             pass
         raise
 

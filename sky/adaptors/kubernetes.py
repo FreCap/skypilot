@@ -164,15 +164,15 @@ def _best_effort_getattr(obj: Any, name: str) -> Any | None:
     """Read one cleanup input without blocking independent cleanup phases."""
     try:
         return getattr(obj, name, None)
-    except BaseException:  # pylint: disable=broad-exception-caught
-        return None
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
+        return None  # noqa: ASYNC104
 
 
 def _best_effort_setattr(obj: Any, name: str, value: Any) -> None:
     """Detach one cleanup reference without replacing the primary result."""
     try:
         setattr(obj, name, value)
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         pass
 
 
@@ -182,7 +182,7 @@ def _best_effort_call(callback: Any) -> None:
         return
     try:
         callback()
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         pass
 
 
@@ -193,7 +193,7 @@ def _best_effort_clear_dict_attribute(obj: Any, name: str) -> None:
         try:
             value.clear()
             return
-        except BaseException:  # pylint: disable=broad-exception-caught
+        except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             pass
     _best_effort_setattr(obj, name, None)
 
@@ -260,7 +260,7 @@ def _scrub_kubernetes_configuration_credentials(
     if isinstance(configuration_attributes, dict):
         try:
             configuration_attributes.pop('get_api_key_with_prefix', None)
-        except BaseException:  # pylint: disable=broad-exception-caught
+        except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
             pass
 
     refresh_hook = _best_effort_getattr(configuration, 'refresh_api_key_hook')
@@ -276,7 +276,7 @@ def _scrub_kubernetes_configuration_credentials(
         if isinstance(value, dict):
             try:
                 value.clear()
-            except BaseException:  # pylint: disable=broad-exception-caught
+            except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
                 pass
         _best_effort_setattr(configuration, name, None)
 
@@ -304,11 +304,11 @@ def _close_api_client_resources(  # pylint: disable=redefined-outer-name
     """Shared scrub, transport-close, and TLS-file ownership boundary."""
     try:
         _scrub_bounded_api_client_credentials(api_client)
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         pass
     try:
         api_client.close()
-    except BaseException:  # pylint: disable=broad-exception-caught
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         pass
     if owned_files is not None:
         _best_effort_call(_best_effort_getattr(owned_files, 'close'))
@@ -743,11 +743,11 @@ def _read_bounded_kubeconfig_token_file(
     """Isolation boundary for a live, externally rotated token file."""
     try:
         return _read_bounded_kubeconfig_token_file_impl(path)
-    except BaseException as error:  # pylint: disable=broad-exception-caught
+    except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         error = error.with_traceback(None)
         error.__cause__ = None
         error.__context__ = None
-        return _token_file_read_failure(
+        return _token_file_read_failure(  # noqa: ASYNC104
             'Kubernetes token file could not be read safely.')
 
 
@@ -1070,13 +1070,13 @@ def _new_api_client_target_isolated(
     """Total isolation boundary for credential-bearing target construction."""
     try:
         return _new_api_client_target_isolated_impl(session, context_name)
-    except BaseException as error:  # pylint: disable=broad-exception-caught
+    except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # Drop the originating traceback and all exception links before the
         # sensitive inner frame can leave this boundary.
         error = error.with_traceback(None)
         error.__cause__ = None
         error.__context__ = None
-        return _api_client_target_failure(
+        return _api_client_target_failure(  # noqa: ASYNC104
             'Kubernetes observation client target could not be created safely.')
 
 
@@ -1170,11 +1170,11 @@ def _capture_kubeconfig_isolated(config_file: str) -> _KubeconfigCaptureResult:
         error.__cause__ = None
         error.__context__ = None
         return _empty_kubeconfig_capture()
-    except BaseException as error:  # pylint: disable=broad-exception-caught
+    except BaseException as error:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # Preserve cancellation and process-control semantics without exporting
         # the credential-bearing merger or upstream frames.
-        return _KubeconfigCaptureResult(None, (), None, {},
-                                        _detach_control_error(error))
+        return _KubeconfigCaptureResult(  # noqa: ASYNC104
+            None, (), None, {}, _detach_control_error(error))
 
 
 def load_kubernetes_contexts_uncached() -> KubernetesContextLoadSession:
@@ -2033,8 +2033,8 @@ class ProviderFencedCoreApi:
 
     def call_with_provider_fence(self, method_name: str,
                                  provider_fence: Callable[[], None],
-                                 on_start: Callable[[], None] | None,
-                                 *args: Any, **kwargs: Any) -> Any:
+                                 on_start: Callable[[], None] | None, *args:
+                                 Any, **kwargs: Any) -> Any:
         control_error = _capture_provider_fence(provider_fence)
         if control_error is not None:
             self._invalidate()
