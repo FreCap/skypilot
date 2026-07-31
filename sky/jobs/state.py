@@ -27,6 +27,7 @@ from sky.jobs.state_schema import api_access_token_table
 from sky.jobs.state_schema import ha_recovery_script_table
 from sky.jobs.state_schema import job_info_table
 from sky.jobs.state_schema import spot_table
+from sky.jobs.status_types import ControllerLogFollowState
 from sky.jobs.status_types import ControllerPidRecord
 from sky.jobs.status_types import JobCancellationState
 from sky.jobs.status_types import JobLogStreamSnapshot
@@ -1623,6 +1624,35 @@ def get_latest_log_stream_snapshot(job_id: int) -> JobLogStreamSnapshot:
         row.current_cluster_name,
         row.job_id_on_pool_cluster,
         row.task_name,
+    )
+
+
+@db_retries.retry
+def get_controller_log_follow_state(job_id: int) -> ControllerLogFollowState:
+    """Return the lifecycle snapshot that drives controller-log following."""
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    latest_task = _latest_task_status_query([job_id],
+                                            terminal_status_values).subquery()
+    query = sqlalchemy.select(
+        latest_task.c.status,
+        job_info_table.c.schedule_state,
+    ).select_from(
+        latest_task.outerjoin(
+            job_info_table,
+            job_info_table.c.spot_job_id == latest_task.c.spot_job_id))
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(query).fetchone()
+    if row is None:
+        return ControllerLogFollowState(None, None)
+    schedule_state = (None if row.schedule_state is None else
+                      ManagedJobScheduleState(row.schedule_state))
+    return ControllerLogFollowState(
+        ManagedJobStatus(row.status),
+        schedule_state,
     )
 
 

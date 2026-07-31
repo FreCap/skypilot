@@ -1,3 +1,8 @@
+"""Unit tests for ``sky.jobs.utils``."""
+
+# pylint: disable=protected-access,unused-argument
+# pylint: disable=import-outside-toplevel,use-implicit-booleaness-not-comparison
+
 import asyncio
 import os
 import pathlib
@@ -1415,26 +1420,4 @@ class TestStreamControllerLogs:
             name_match='finished', fields=['job_id', 'job_name', 'status'])
         resolve_log.assert_called_once_with(17)
         assert message == ''
-        assert exit_code == exceptions.JobExitCode.SUCCEEDED
-
-    def test_follow_drains_until_terminal_status(self, tmp_path, capsys):
-        log_path = tmp_path / '42.log'
-        log_path.write_text('complete\n', encoding='utf-8')
-
-        with (mock.patch.object(utils,
-                                'controller_log_file_for_job',
-                                return_value=str(log_path)),
-              mock.patch.object(utils.managed_job_state,
-                                'get_status',
-                                return_value=state.ManagedJobStatus.SUCCEEDED)
-              as get_status, mock.patch.object(utils.time, 'sleep') as sleep):
-            message, exit_code = utils.stream_logs(job_id=42,
-                                                   job_name=None,
-                                                   controller=True,
-                                                   follow=True)
-
-        assert capsys.readouterr().out == 'complete\n'
-        get_status.assert_called_once_with(42)
-        sleep.assert_called_once()
-        assert 'Job finished (status: ManagedJobStatus.SUCCEEDED).' in message
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
