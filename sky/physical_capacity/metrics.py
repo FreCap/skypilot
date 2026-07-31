@@ -1,6 +1,6 @@
 """Low-cardinality metrics for the temporary capacity evidence pilot."""
 
-from typing import Mapping
+from collections.abc import Mapping
 
 import prometheus_client as prom
 
