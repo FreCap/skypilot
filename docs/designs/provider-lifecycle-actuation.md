@@ -1,10 +1,13 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: M1 and M2 S1 merged; S1 exact-head CI, revision 34 deployment, canary,
-cleanup, and monitor qualified; responsibility-deduplication review accepted
-for planning; the first M2 S2 prototype was rejected because it duplicated
-placement policy, so S2 is being reshaped around shared production owners; M3
-and M4 implementation require dedicated exact-design adversarial reviews
+Status: M1, M2 S1, and M2 S2a.1 merged; S1 exact-head CI, revision 34
+deployment, canary, cleanup, and monitor qualified; S2a.1 exact-head CI and
+merge qualified; responsibility-deduplication review accepted for planning;
+the first M2 S2 prototype was rejected because it duplicated placement policy,
+and the bounded S2a.2 production-owner contract passed exact design review;
+S2a.2 implementation remains gated on reconciliation with the live physical
+capacity branch; M3 and M4 implementation require dedicated exact-design
+adversarial reviews
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -973,7 +976,7 @@ untouched legacy feasibility path; it does not query excluded systems merely to
 manufacture a comparison snapshot. The later under-lock binding and
 pre-mutation revalidation are distinct captures with distinct IDs. Outside
 shadow mode, the legacy path retains its existing observation behavior until
-its authoritative promotion commit.
+the M4 descriptor-owned authoritative promotion commit.
 
 Optimizer shadow capture uses `ALLOW_REQUEST_CACHE` so the two projections can
 share the request's existing provider read. Pre-mutation revalidation must call
@@ -999,8 +1002,9 @@ For `FRESH_CREATE`, `_check_existing_cluster()` captures a new observation and
 binds an exact offer to the concrete `to_provision` winner before constructing
 `ToProvisionConfig`. `REUSE` and `RESTART` return
 `NOT_REPRESENTABLE(UNSUPPORTED_OPERATION)` and clear any optimizer shadow
-decision. M2 authoritative binding is limited to the first provider mutation
-attempt of a locked provisioning entry. `RetryingVmProvisioner` carries a
+decision. When M4 enables authoritative binding, it is limited to the first
+provider mutation attempt of a locked provisioning entry.
+`RetryingVmProvisioner` carries a
 monotonic process-local `provider_attempt_count`, incremented immediately before
 calling `bulk_provision()`. Once that call starts, any return or exception
 permanently makes later candidates in that entry
@@ -1721,14 +1725,1304 @@ API create remain outside it. Inputs outside the V1 subset still use the same
 function in production, while V1 supplies the characterized single-node CPU
 facts.
 
-The base Pod is likewise rendered by one production-shared
-`render_kubernetes_base_pod_spec()` owner extracted from deploy-variable,
-template, and pod-config combination. It accepts resolved immutable inputs and
-captured bounded template text; neither the offer source nor provisioning may
-reimplement its Jinja variable set or merge order. A new template variable or
-a changed reviewed template digest fails closed until its placement semantics
-are characterized. The V1 classifier rejects managed container-image paths
-whose later resolution could add a node selector outside that captured render.
+#### S2a.2 shared built-in Kubernetes base-Pod materialization
+
+S2a.2 replaces the duplicated built-in Kubernetes base-Pod materialization and
+merge boundary. It does not make an arbitrary full cluster template pure. That
+broader boundary
+would pull credential paths, plugin callbacks, and unrelated provider objects
+into placement capture and would still be superseded by reuse. Instead, one
+authoritative built-in fragment, one initial recomposed render and
+pre-combination parse owner, and one pure post-parse owner remove production
+merge duplication without claiming a safe offer-time renderer. A temporary
+digest-locked monolith remains only as a downstream compatibility mirror until
+its removal gate closes.
+
+The source boundary is exact. At the S2a.1 merge baseline
+`06ce2213526652621d7d7ae37137221f16b798c4`, the semantic `node_config`
+fragment is the UTF-8 byte range `[10652, 78464)` of
+`sky/templates/kubernetes-ray.yml.j2`, current lines 277 through 1715. It is
+67,812 bytes and has SHA-256
+`09ea5d743a09286649c56f26c5b737764b81730b90fefae2bd561e0707a72e04`.
+Implementation copies those exact bytes into the new authoritative
+`sky/templates/kubernetes-ray-node-config.yml.j2`; runtime never slices a
+template by a line or byte range. During the compatibility window the new
+authoritative outer is
+`sky/templates/kubernetes-ray-outer.yml.j2`. It retains
+`head_node_type`, `available_node_types`, and `ray_head_default`, and replaces
+the old inline body with exactly one reserved source-marker line:
+
+```jinja
+{{ skypilot_kubernetes_node_config_fragment_v1 }}
+```
+
+That literal marker line is 50 UTF-8 bytes including LF. The expected physical
+outer source is 16,028 bytes with SHA-256
+`3f9343f8ff289711d931af2915391338ac628d30d96fb10e66b4808578eadcd1`.
+Recomposing it with the raw fragment must recover the current 83,790-byte
+monolith at SHA-256
+`988b6d5e2afd7e96b3a6d7e0091c661a3d05d5a61d23fd7efa138ab75d55a6f8`.
+The existing `sky/templates/kubernetes-ray.yml.j2` remains byte-for-byte at
+that monolith digest only as a temporary compatibility mirror for a replacement
+renderer that opens its received `template_ref` directly. It is never edited
+independently, and build and test gates verify that it equals the recomposed
+source. Exact built-in runtime rendering never reads the mirror: it validates
+the authoritative outer, fragment, and recomposed digests only. After the
+downstream gate closes, a separate removal commit replaces that path atomically
+with the validated outer, removes the temporary `-outer` path, and makes the
+facade compose directly from the final outer plus fragment.
+
+One `compose_builtin_kubernetes_template_source(outer_text, fragment_text)`
+owner
+requires that exact marker once, validates the outer and fragment digests, and
+replaces the complete raw marker line with the raw fragment bytes. The resulting
+UTF-8 source must equal the 83,790-byte monolith and exact digest above before
+Jinja compilation. The ordinary built-in path renders that one recomposed
+source once and safe-parses the complete rendered YAML once at the existing
+pre-combination parse point. It never renders or parses the outer and fragment
+independently. Existing later auth, restore, name-read, hashing, and file-mount
+optimization parses remain outside this invariant. Consequently anchors,
+aliases, directives, plain-scalar injection, Jinja evaluation order, YAML
+source coordinates, and initial render/parse error precedence remain those of
+the current monolith.
+
+An initial behavior-preserving source-composer staging commit adds the outer
+and fragment while retaining the compatibility monolith. The established
+`common_utils.fill_template(template_ref, variables, output_path)` callable and
+its exact three arguments remain the rendering facade. When the logical
+reference is the built-in Kubernetes template, the built-in facade selects the
+authoritative temporary `-outer` path, composes it with the fragment, and passes
+the validated result to the current single Jinja render instead of opening the
+mirror. A wrapper that delegates to the facade receives the same three
+arguments and the facade composes internally; a replacement that opens
+`template_ref` sees the unchanged compatibility monolith. Other templates
+retain their current read and render path. This makes the composer the only
+authoritative built-in source owner while leaving mutable Pod and metadata
+combination authoritative, and is deployed before strict-merge shadowing
+begins. The validated mirror is temporary compatibility data, not a second
+independently editable source owner.
+
+The initial pre-combination parse wrapper preserves
+`yaml_utils.safe_load()` fallback behavior
+and returns the loader class actually used together with the parsed object. An
+initial `CSafeLoader` `AttributeError` flips the same process flag and retries
+once with `SafeLoader`; an already-fallen-back process uses `SafeLoader`
+directly. The complete renderer identity records that returned loader and the
+current Jinja2 and PyYAML versions without triggering a second initial parse.
+
+"One initial parse" never means one parse for the complete writer request.
+S2a.2 retains every later YAML parse and serialization at its current call
+site. For dry run, and for non-dry paths whose first file-mount optimization
+attempt succeeds, the exact Kubernetes/SSH parse stages and top-level
+serialization stages are:
+
+| Path | Parse stages in order | Top-level serialization stages in order |
+| --- | --- | --- |
+| dry run | initial rendered `safe_load`; deterministic-hash `read_yaml` | combined-object `dump_yaml`; deterministic-hash `dump_yaml_str` |
+| non-dry, no restore | initial rendered `safe_load`; auth `read_yaml`; restored-name `read_yaml`; deterministic-hash `read_yaml`; file-mount optimization `read_yaml`; post-optimization usage-redaction `read_yaml_all` | combined-object `dump_yaml`; auth `dump_yaml`; deterministic-hash `dump_yaml_str`; file-mount optimization `dump_yaml` |
+| non-dry restore | the no-restore sequence plus `_replace_yaml_dicts` `safe_load` of new YAML and old YAML between auth and restored-name read | the no-restore sequence plus `_replace_yaml_dicts` `dump_yaml_str` between auth and deterministic hash |
+| non-dry managed-image restore | the restore sequence plus `_restore_managed_container_image_fields` `safe_load` of fresh and restored YAML before restored-name read | the restore sequence plus its `dump_yaml_str` before deterministic hash |
+
+Thus the ordinary successful totals are two parse operations for dry run, six
+for non-dry without restore, eight for restore, and ten for managed-image
+restore. The final non-dry operation is `read_yaml_all()` through
+`read_yaml_all_str()` and `safe_load_all()` for usage redaction. Because every
+`yaml_utils.dump_yaml()` internally calls the public `dump_yaml_str()`, a
+wrapper on the latter also observes nested calls. Before file-mount retries,
+the exact successful serialization wrapper totals are one `dump_yaml()` and
+two total `dump_yaml_str()` calls for dry run; three and four for non-dry
+without restore; three and five for restore; and three and six for managed-image
+restore, respectively. The serialization column lists top-level stages, not
+all nested wrapper invocations.
+The existing hash exception handling remains, and each current
+`_optimize_file_mounts()` retry retains its own `read_yaml` and successful
+`dump_yaml`. Each parse stage identifies the public entry point reached by the
+writer; nested helpers retain their current calls, and the one-time C-extension
+fallback can make two loader attempts inside one parse operation. No later
+parse is reused, memoized, or routed through the base-Pod owner.
+
+The complete rendered cluster object remains an impure process-local assembly
+result. Credential paths, plugin objects, and unrelated provider fields never
+enter the immutable base-Pod input, offer payload, or renderer identity. After
+the initial full pre-combination parse, the assembler freezes only the built-in `node_config`
+subtree and already-resolved effective Pod config, and passes those detached
+values to the pure owner below. S2a.2 is production-only. S2b may neither invoke
+the full assembly nor independently render or parse the fragment. Authoritative
+offer projection remains blocked until a separate exact design proves a bounded
+source-safe projection that reads no credential, private-key, logging-agent,
+plugin, or unrelated outer-template input and introduces no second policy
+owner.
+
+The current fragment has exactly these 71 context-visible Jinja names, sorted
+here as the closed V1 contract:
+
+```text
+accelerator_count
+avoid_label_keys
+cluster_name_on_cloud
+conda_installation_commands
+cpus
+disk_size
+ha_recovery_log_path
+high_availability
+image_id
+k8s_acc_label_key
+k8s_acc_label_values
+k8s_apt_mirrors
+k8s_automount_sa_token
+k8s_cpu_limit
+k8s_docker_buildkit_image
+k8s_docker_dind_image
+k8s_efa_count
+k8s_enable_docker_all
+k8s_enable_docker_build
+k8s_enable_flex_start
+k8s_enable_gpudirect_rdma
+k8s_enable_gpudirect_rdma_a4
+k8s_enable_gpudirect_tcpx
+k8s_enable_gpudirect_tcpxo
+k8s_enable_oci_roce
+k8s_env_vars
+k8s_ephemeral_storage
+k8s_ephemeral_storage_limit
+k8s_fuse_device_required
+k8s_fusermount_setup_command
+k8s_fusermount_shared_dir
+k8s_high_availability_deployment_run_script_dir
+k8s_high_availability_deployment_setup_script_path
+k8s_high_availability_deployment_volume_mount_name
+k8s_high_availability_deployment_volume_mount_path
+k8s_high_availability_restarting_signal_file
+k8s_high_availability_storage_class_name
+k8s_host_network
+k8s_ipc_lock_capability
+k8s_kueue_local_queue_name
+k8s_max_run_duration_seconds
+k8s_memory_limit
+k8s_namespace
+k8s_network_type
+k8s_resource_key
+k8s_service_account_name
+k8s_spot_label_key
+k8s_spot_label_value
+k8s_topology_label_key
+k8s_topology_label_value
+labels
+memory
+node_id
+num_nodes
+original_user
+preemption_hook_timeout
+priority_class
+ray_dashboard_port
+ray_head_start_command
+ray_installation_commands
+ray_port
+ray_worker_start_command
+runcmd
+sky_python_cmd
+sky_unset_pythonpath_and_set_cwd
+skypilot_ray_port
+user
+uv_installation_commands
+volume_mount_rw_paths
+volume_mounts
+workspace
+```
+
+Their canonical newline-delimited name digest is
+`458bb234308e1ac0afc20945c24c10e524d29dc813253347943a9af8184819fe`.
+The test that derives this set removes Jinja default globals before parsing, so
+a future use of a shadowable global such as `range` cannot escape the contract.
+A source, name-set, Jinja, PyYAML-loader, merge-contract, or validation-contract
+change produces a new production renderer identity and invalidates the
+source-safe projector's parity evidence. S2b remains ineligible until that
+separate projector and differential corpus are reviewed against the new
+identity. The initial characterized runtime identity is Jinja2 3.1.6, PyYAML
+6.0.3, and `CSafeLoader`; production can continue to support the repository
+dependency range. The base-render identity never enters an offer payload,
+provider identity, or stable offer ID.
+
+The pure owner has this conceptual interface:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class FrozenRenderSequenceV1:
+    kind: typing.Literal['list', 'tuple']
+    values: tuple['FrozenRenderValueV1', ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenRenderMapV1:
+    # Unique string keys in original insertion order.
+    items: tuple[tuple[str, 'FrozenRenderValueV1'], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenVolumeInfoV1:
+    name: str
+    path: str
+    volume_name_on_cloud: str | None
+    volume_id_on_cloud: str | None
+    sub_path: str | None
+    volume_type: str | None
+    host_path: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenDateV1:
+    year: int
+    month: int
+    day: int
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenDateTimeV1:
+    year: int
+    month: int
+    day: int
+    hour: int
+    minute: int
+    second: int
+    microsecond: int
+    utc_offset_microseconds: int | None
+    fold: int
+
+
+FrozenRenderValueV1 = typing.Union[
+    None,
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    FrozenDateV1,
+    FrozenDateTimeV1,
+    FrozenRenderSequenceV1,
+    FrozenRenderMapV1,
+    FrozenVolumeInfoV1,
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class KubernetesBaseRendererIdentityV1:
+    schema_version: typing.Literal[1]
+    fragment_sha256: str
+    outer_sha256: str
+    monolith_sha256: str
+    binding_names_sha256: str
+    jinja2_version: str
+    pyyaml_version: str
+    yaml_loader: typing.Literal['CSafeLoader', 'SafeLoader']
+    merge_contract_version: typing.Literal[1]
+    source_composition_contract_version: typing.Literal[1]
+    custom_metadata_contract_version: typing.Literal[1]
+    pod_validation_contract_version: typing.Literal[1]
+
+
+class KubernetesRenderErrorCodeV1(enum.Enum):
+    INVALID_INPUT = 'invalid_input'
+    THAW_FAILED = 'thaw_failed'
+
+
+@dataclasses.dataclass(frozen=True)
+class KubernetesBasePodRenderInputV1:
+    schema_version: typing.Literal[1]
+    renderer_identity: KubernetesBaseRendererIdentityV1
+    base_node_config: FrozenRenderMapV1
+    effective_pod_config: FrozenRenderMapV1
+
+
+@dataclasses.dataclass(frozen=True)
+class FrozenOptionalNodeConfigFieldV1:
+    present: bool
+    value: FrozenRenderValueV1 | None
+
+
+@dataclasses.dataclass(frozen=True)
+class KubernetesBasePodRenderResultV1:
+    schema_version: typing.Literal[1]
+    renderer_identity: KubernetesBaseRendererIdentityV1
+    node_config: FrozenRenderMapV1
+    base_pod: FrozenRenderMapV1
+    pvc_spec: FrozenOptionalNodeConfigFieldV1
+    deployment_spec: FrozenOptionalNodeConfigFieldV1
+
+
+def build_kubernetes_base_pod_spec(
+    render_input: KubernetesBasePodRenderInputV1,
+) -> KubernetesBasePodRenderResultV1:
+    ...
+```
+
+An invalid frozen envelope or impossible thaw raises
+`InvalidCloudConfigs` with exact value-free message
+`Invalid Kubernetes render: <code>.` and no cause, where `<code>` is one of the
+two closed enum values above. Production-value merge exceptions are not
+translated into this contract category.
+
+`FrozenRenderMapV1` is deliberately not `FrozenJSONDict`: sorting keys would
+change YAML serialization and the cluster config hash. Freeze and thaw perform
+recursive detached copies, retain list-versus-tuple and insertion order, reject
+duplicate or non-string map keys, reject non-finite floats and arbitrary
+objects, and snapshot every mutable `VolumeInfo`. They preserve all scalar
+types currently produced by the safe-YAML config path, including `bytes`,
+`datetime.date`, naive `datetime.datetime`, and fixed-offset aware
+`datetime.datetime`. Every accepted container, scalar, and `VolumeInfo` has the
+exact closed runtime type, rather than a subclass with user methods. An aware
+datetime is accepted only when
+`type(value.tzinfo) is datetime.timezone` and its built-in `tzname(None)` equals
+the canonical name produced by `datetime.timezone(value.utcoffset())`; a custom
+timezone name or any other `tzinfo` takes compatibility. The closed exact type
+check makes both built-in calls non-user code. The frozen value stores the full
+signed offset in microseconds, so fractional-second offsets round-trip. Date and
+datetime thawing recreates the exact safe-YAML value, including microseconds,
+offset, and `fold`; it never calls a user `tzinfo`. The impure assembler
+validates the strict UTF-8 outer, fragment, and recomposed-source sizes and
+digests in the complete renderer identity before rendering. No repeated
+alias-emitting identity found by one traversal of the parsed full object or by
+the subsequent detached render-config traversal crosses the strict boundary.
+The full object is traversed exactly once with its active `node_config` subtree
+in place; that subtree is never registered as a second root. The classifier
+derives the frozen base-node value from that in-place path, then traverses the
+detached effective Pod config with the same seen-identity set so a genuine
+cross-root alias still fails closed.
+
+An exact `VolumeInfo` type is not sufficient by itself because the current
+dataclass is not slotted. Strict admission calls `vars(value)` and requires its
+keys to be exactly `name`, `path`, `volume_name_on_cloud`,
+`volume_id_on_cloud`, `sub_path`, `volume_type`, and `host_path`. `name` and
+`path` must have exact runtime type `str`; each other field must have exact
+runtime type `str` or be `None`. An extra instance attribute or any other field
+value selects mutable compatibility. The freezer neither silently drops extra
+programmatic state nor traverses an arbitrary object stored in a declared
+field.
+
+Freeze validation is iterative, identity-based, cycle-safe, and capped at
+100,000 graph edges and 64 nested containers. The edge cap matches the existing
+safe-YAML graph check. It does not call user equality, hashing, iteration
+protocols outside the closed built-in types, `repr`, or serialization.
+Overflow, a cycle, or a repeated identity for any alias-emitting supported
+value selects the fixed compatibility reason without retaining a partial
+snapshot. Identity tracking includes maps, lists, tuples, `VolumeInfo`, dates,
+and datetimes; it excludes only these PyYAML alias-ignored primitives: `None`,
+strings, bytes, booleans, integers, and floats. This preserves anchors for
+repeated nonempty tuple, date, and datetime identities by keeping those
+identity-admitted graphs on the private typed-mutable path. PyYAML also ignores aliases for exact empty tuples;
+the V1 classifier conservatively identity-tracks `()` anyway, so repeated empty
+tuple identity also takes compatibility rather than depending on that
+representer special case.
+
+Safe-YAML graphs outside that closed grammar, including sets, cycles, shared
+aliases whose identity would change dump output, non-string mapping keys, and
+custom tagged or programmatic objects, take an explicit
+`UNFREEZABLE_KUBERNETES_RENDER_INPUT` private typed-mutable path after identity
+admission. That path is always authoritative-offer-ineligible. It emits only the fixed reason code
+through existing Datadog observability, never a type name, key, value, or
+rendered cluster. Shadow inventory must prove which officially accepted
+shapes remain before the strict owner cuts over; the typed-mutable path has its
+own removal gate below. Public mutable compatibility does not run this
+classifier.
+
+The same diagnostic applies when the initial full pre-combination parse yields a
+graph outside the frozen grammar, a cycle, or any actual repeated
+alias-emitting identity during that single full-object traversal or the
+subsequent detached effective-Pod traversal. Merely reaching the embedded
+`node_config` at its ordinary path is not a repeated identity. Input
+classification selects mutable combination before the pure owner; a
+parsed-graph classification reuses the already rendered and parsed full object.
+Neither case performs a second Jinja render or YAML parse. The compatibility
+result cannot feed offer projection.
+
+`UNFREEZABLE_KUBERNETES_RENDER_INPUT` is an internal render-dispatch diagnostic,
+not a new `OfferReasonCodeV1`. If offer classification can reach such an input,
+it returns `NOT_REPRESENTABLE(CUSTOM_PLACEMENT_CONFIG)` before rendering.
+
+The private typed-mutable Pod-combination adapter consumes the same resolved mutable Pod
+config that the strict freezer inspected plus the initially parsed full object. If
+selected, it performs the first full-object deep copy before merging. After
+either Pod path succeeds, the assembler performs the second full-object deep
+copy before invoking the metadata projector. The one ownership-transfer
+metadata applicator then consumes that later resolved metadata and the solely
+owned post-Pod copy. Together these paths preserve the current two deep copies,
+shared merge-algorithm semantics, recursive call topology, alias graph,
+arbitrary supported objects, and declared error ordering. Every
+identity-admitted private base, config, typed-mutable, and metadata path uses
+the factored closed implementation; only public mutable compatibility invokes
+the late-bound `merge_k8s_configs()` facade. The adapter and applicator perform no ambient config,
+workspace, context, resource-override, template, or YAML read. Freeze
+classification changes only the current stage's combination dispatch or
+detached metadata representation, never selected values or source rendering.
+
+The ordinary full variable mapping retains current presence semantics for each
+of the 71 fragment-visible names. An absent key remains absent from Jinja's
+context and is distinct from a present key whose value is `None`; no owner
+materializes defaults. In the current built-in producer, `k8s_cpu_limit`,
+`k8s_docker_buildkit_image`,
+`k8s_docker_dind_image`, `k8s_ephemeral_storage`,
+`k8s_ephemeral_storage_limit`, `k8s_memory_limit`, and
+`preemption_hook_timeout` can be absent. The first, ephemeral-storage, its
+limit, and preemption timeout are explicitly guarded by `is defined`.
+`node_id` is intentionally absent and appears only in a source comment.
+Docker image bindings may be absent only with both enable flags false, and
+CPU and memory limit presence remains correlated. `k8s_apt_mirrors: None`
+retains built-in mirrors while `[]` disables them; freeze and thaw must not
+collapse those states. The derived 71-name contract is static evidence and a
+renderer-identity gate, not a second offer-owned variable mapping.
+
+The owner performs the following operations in order:
+
+1. Validate the schema, complete renderer identity, frozen grammar, and
+   detached-value invariants.
+2. Thaw fresh order-preserving base-node and effective-Pod-config values.
+3. Merge the already-resolved effective Pod config into `node_config` with the
+   existing `merge_k8s_configs()` semantics.
+4. Freeze the complete `node_config` with `pvc_spec` and `deployment_spec`
+   retained. Independently copy the base Pod and remove those two keys only from
+   that copy. Project each removed field with an explicit presence bit and its
+   exact frozen safe-YAML value, so absent, present-null, mapping, scalar, and
+   sequence remain distinct. Return no aliases. Validation is deliberately not
+   part of this pure owner.
+
+An explicit Kubernetes cloud-variable core executes the existing cloud-specific
+steps in their current order. At the current host-network decision point, and
+not earlier, it captures one raw config, override, cloud, and context snapshot.
+It immediately projects effective Pod config exactly once, derives configured
+`hostNetwork` and related probe environment values, and returns the snapshot,
+cloud variables, and detached projection. This preserves any config reference
+replacement completed by a generic-prefix or earlier cloud step before the
+first current Pod read. A shared
+deploy-variable orchestration owner retains the exact
+`Resources.make_deploy_variables()` sequence: generic prefix, cloud callback at
+the current call slot, then generic suffix. Production supplies the
+explicit Kubernetes core as that callback; all other providers use their
+existing callback in the same slot. Generic-prefix and earlier Kubernetes
+failures therefore retain precedence over Pod resolution.
+
+The orchestration returns a private identity-carrying
+`DeployVariableAssemblyV1` with the final template-variable mapping and an
+optional `KubernetesDeployVariableProjectionV1`. Their conceptual interface is:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class KubernetesDeployVariableProjectionV1:
+    schema_version: typing.Literal[1]
+    render_config_snapshot: 'KubernetesRenderConfigSnapshotV1'
+    effective_pod_config: dict[str, typing.Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class KubernetesPrivateDeployContextV1:
+    schema_version: typing.Literal[1]
+    writer_attempt_token: object
+    resolved_owners: 'ResolvedKubernetesRenderOwnersV1'
+
+
+@dataclasses.dataclass(frozen=True)
+class KubernetesCloudDeployVariableResultV1:
+    schema_version: typing.Literal[1]
+    cloud_specific_variables: dict[str, typing.Any]
+    kubernetes_projection: KubernetesDeployVariableProjectionV1 | None
+
+
+@dataclasses.dataclass(frozen=True)
+class DeployVariableAssemblyV1:
+    schema_version: typing.Literal[1]
+    template_variables: dict[str, typing.Any]
+    kubernetes_projection: KubernetesDeployVariableProjectionV1 | None
+```
+
+The private call protocol is local to one production config write. The exact
+built-in `_retry_zones()` caller resolves
+`backend_utils.write_cluster_config`, requires its import-time built-in
+identity, creates an exact `object()` token, and invokes that same checked
+reference with a private keyword-only writer token whose default is `None`.
+Replacements receive only the current public arguments. At built-in writer
+entry, a token must have `type(token) is object`; token-`None`, direct, and
+delegating-writer calls stay on public mutable compatibility. After the
+physical built-in template and writer-entry `fill_template` gate pass, the
+writer resolves the bound `Resources.make_deploy_variables()` method at its
+current call slot. If that gate passes, it creates one
+`KubernetesPrivateDeployContextV1` containing the token and process-local
+resolved-owner record and invokes that same checked bound method with the new keyword-only
+`_kubernetes_deploy_context`; its default is `None`. In private mode, the exact
+Resources method preserves generic-prefix, cloud-slot, and generic-suffix order
+and returns `DeployVariableAssemblyV1`. All generic-prefix and generic-suffix
+`skypilot_config.get_nested` calls remain the current dynamically resolved
+public calls; S2a.2 neither closes nor gates them. Immediately before the cloud
+slot the Resources method resolves the bound cloud callback. If that gate
+passes, it calls the same
+checked callback with the same private keyword. At the exact current first
+Pod-read stage, the Kubernetes callback resolves and gates the historical Pod
+resolver, combined Pod/metadata facade, effective-region getter, Kubernetes
+merge primitive, `config_utils.get_cloud_config_value_from_dict`, and
+the composite `Config` projection owner. That composite gate requires both
+`config_utils.Config` and its `get_nested` method to retain their captured
+built-in identities. Only if all six projection and combination owner gates
+pass does it enter the closed projector. A class or class-method replacement or
+any seam failure invokes the currently resolved
+historical public Pod path with legacy arguments and returns no projection.
+When all six gates pass, the exact Kubernetes callback returns
+`KubernetesCloudDeployVariableResultV1`. If the cloud gate fails, the
+exact Resources method calls the replacement with the exact legacy arguments
+and no new keyword, accepts its ordinary mapping, completes generic suffix
+assembly, and returns a typed assembly whose `kubernetes_projection` is `None`.
+
+The writer-created context contains the token, resolved writer, checked
+`fill_template`, and Resources bound method; its later slots are absent. The exact
+Resources method does not mutate that frozen record. At each later gate it
+creates a frozen enriched owner record and context containing the same token,
+cloud bound reference, and seven callable identities across six Pod-stage
+projection/combination owner gates
+as they become available. It passes only the applicable
+enriched context to the next exact built-in owner. All contexts are discarded
+before the writer returns. A
+missing, extra, mismatched-token, or wrong-type private field raises
+`InvalidCloudConfigs` with fixed message
+`Invalid Kubernetes deploy-variable context.` and no cause before any provider
+mutation or Resources/cloud replacement callback.
+
+When the private context is absent, both exact built-in methods retain their
+current signatures at invocation, ambient resolution behavior, and ordinary
+dict return. If the Resources bound-method gate fails, the writer likewise
+calls that checked replacement with the exact legacy arguments and no new
+keyword and accepts its ordinary mapping. No replacement, wrapper, subclass,
+inherited SSH override, or inventoried direct caller receives
+`_kubernetes_deploy_context` or a typed return. A delegating replacement enters
+the built-in default-`None` path. The private context is an exact-type,
+identity-checked, process-local envelope; it and the resolved-owner record are
+never durable, logged, hashed, or exposed through the public SDK.
+
+The envelopes prevent field rebinding, but the mappings deliberately retain
+the exact mutable objects and nested identities produced by the current
+callback; only the Pod projection is guaranteed detached by its existing
+config-copy boundaries. Only the physical built-in Kubernetes or SSH-node-pool
+template path creates a projection. Other providers and arbitrary full-template
+plugins retain their current callback contract in this slice. The writer
+consumes the snapshot and Pod projection completely during render, combination,
+and metadata application. Nothing crosses the config-write return boundary.
+Final-variable construction retains the current shallow
+`dict(cloud_specific_variables, **generic_suffix)` behavior and does not mutate
+or copy the separately carried Kubernetes mapping. The existing public
+`Resources.make_deploy_variables()` surface is a compatibility projection of
+only the final mapping. The built-in production writer uses the private result,
+keeps the Pod projection unchanged through the one exactly recomposed
+full-source render and parse, and returns the same ordinary config mapping as
+today. `write_cluster_config()` gains only the private default-`None` token and
+no alternate return type. Direct and delegated calls retain their current
+arguments, public deploy-variable dispatch, mutable combination, and ordinary
+mapping return. A writer wrapper or replacement is still invoked by its caller
+with the exact current arguments and no private keyword.
+
+S2a.2 deliberately does not bind provider mutation ownership and does not
+carry the first cloud-variable result across provisioning. The existing
+post-`bulk_provision()` `make_deploy_resources_variables()` callback remains at
+its current stage for Kubernetes, SSH node pools, every other provider, and all
+plugin paths. It is re-resolved there and receives the current arguments,
+including restored `handle.cluster_name_on_cloud` when reuse changes the name.
+Its config reloads, provider reads, values, errors, and side effects remain
+authoritative for post-provision runtime setup. Removing that second lifecycle
+callback requires the M4 immutable provider descriptor and a provider-wide
+freshness inventory; S2a.2 introduces no Kubernetes-only lifecycle facet,
+private bulk keyword, or process-local handoff.
+
+After the initial full pre-combination parse, the identity-admitted private path
+has two combination branches. The strict branch classifies and freezes the
+parsed `node_config` and same private Pod projection, calls the pure owner,
+performs the first legacy-equivalent deep copy of the full object, thaws the
+returned `node_config`, and replaces only that existing value; assignment
+retains its insertion position. If the parsed or projected value is explicitly
+unfreezable, the private typed-mutable adapter instead passes the same parsed
+object and already-projected mutable Pod config to the mutable combination
+algorithm, which performs the current first full-object deep copy before
+merging. This typed-mutable branch retains the private snapshot and one
+writer-time Pod projection; it differs from public compatibility only in the
+declared per-attempt coherence behavior.
+
+After either identity-admitted branch succeeds, the assembler performs the
+current second deep copy of the entire post-Pod object. Only after that copy
+succeeds may it project effective custom metadata from the same snapshot. It
+classifies the metadata while retaining the already-detached second copy.
+Freezeable metadata is thawed to a fresh mutable value; unfreezeable metadata
+retains the detached typed-mutable value. The assembler then transfers
+exclusive ownership of the second copy and selected metadata value to the
+single deterministic full-object metadata applicator. That applicator mutates
+and returns the same solely owned full object and performs no further
+full-object copy.
+
+Public mutable compatibility is separate. Any owner or template gate failure,
+token-`None` direct or delegating-writer call, Resources or cloud override,
+registered template owner, custom template variables, custom failover override,
+or arbitrary full-template plugin creates no private config snapshot, Pod
+projection, or typed cloud result. A cloud-method gate can fail only after the
+transient writer context has reached the exact Resources method, but the
+replacement cloud method receives no context and no context survives the
+writer. The writer invokes the resolved
+public methods with legacy arguments. After the initial parse it invokes the
+currently resolved public combined Pod/metadata facade once at its current call
+site. The exact historical facade performs the first full-object copy and
+second ambient Pod resolution, then the second full-object copy and ambient
+metadata resolution; a replacement's output, exception, calls, and side effects
+remain authoritative. The later post-provision cloud callback is outside this
+dispatch and remains unchanged on both private and public config-write paths.
+
+The resulting full object from any branch then passes to the existing late
+managed-image owner when needed and the existing full YAML dump. Only after
+that call returns, the assembler resolves `head_node_type` from the same full
+object with the current default, takes the exact active post-managed-image
+`node_config` mapping by reference, pops `deployment_spec` and then `pvc_spec`
+from that same mapping, and passes that same mapping to `check_pod_config()`.
+There is no validation copy. A wrapped `dump_yaml` that retains its argument
+therefore observes those later pops just as it does today. This preserves the
+current second-copy-before-metadata ordering, merge-error,
+dump-before-validation, object identity, post-dump mutation, exact pre-dump
+value type, and managed-image precedence.
+`check_pod_config()` stays outside the pure owner because its Kubernetes model
+loading and caches are ambient runtime behavior. The assembler preserves the
+top-level and nested insertion positions used by the monolith; no sorting or
+canonicalization is introduced in S2a.2.
+
+The pure owner performs no Jinja rendering, YAML parsing or serialization,
+filesystem, config, workspace, environment, provider, catalog, registry,
+plugin, database, clock, randomness, cache, logging, warning, or externally
+visible mutation operation. Contract-validation and impossible-after-validation
+thaw errors identify only the contract field and renderer identity. They never
+include values, metadata, commands, environment values, or Pod configuration,
+and have no cause chain. The factored strict merge core does not catch or
+translate merge failures; their production exception class, message, cause,
+and stage remain exact.
+The impure full-source render and single YAML parse deliberately retain the
+current renderer, loader fallback, exception class, message, source coordinate,
+and evaluation order because their source bytes are identical.
+
+S2a.2 has exactly two intentional compatibility deltas. First, its prerequisite
+replaces the time-bearing host-network probe gzip member from the S2a.1 merge
+baseline `06ce2213526652621d7d7ae37137221f16b798c4` with the specified portable
+deterministic member. Every built-in Kubernetes and SSH-node-pool render embeds
+the runtime-gated probe in its Ray start commands, even when effective
+`hostNetwork` is false. Their rendered bytes and cluster hashes are therefore
+compared against the deterministic-gzip prerequisite head, not that older
+merge. Second, each identity-admitted exact built-in Kubernetes or SSH-node-pool
+private config-write attempt reuses its first effective-Pod projection for both
+host-network variables and the later Pod merge. A config reference replacement,
+stateful `__deepcopy__`, changing external fact, or Pod-projector side effect
+between those two writer stages can no longer produce a different Pod value or
+a second writer-only failure. The first current Pod projection's value or error
+is intentionally authoritative for that config write. Gate-failed, token-`None`,
+direct, delegating-writer, method-override, custom-template/failover, and
+arbitrary full-template public mutable
+paths retain the historical ambient host-network Pod read, later combined-facade
+Pod and metadata reads. Deferred custom
+metadata is also selected from the raw loaded-config and override references
+captured at that first Pod-read point. Replacing or reloading either reference
+after capture is intentionally not observed, whereas an in-place mutation of a
+captured object remains visible when the deferred metadata projector runs
+because capture is shallow and reference-only.
+
+The existing post-`bulk_provision()` cloud callback is explicitly outside this
+coherence delta. It is re-resolved at its current stage, performs its current
+fresh Pod and provider reads, and controls runtime `custom_resources`. Its value
+may differ from the render-time mapping, and its error or side effect remains
+observable after provider mutation. Successful built-in Kubernetes and SSH
+new-provisioner paths therefore retain two cloud callbacks: one during config
+writing and one after bulk provisioning. Pod resolution changes only within the
+writer, so that end-to-end path changes from three Pod reads to two.
+
+Callable check-and-call coherence is part of the same bounded render-attempt
+delta. The eleven callable identities across ten declared render/config owner
+gates are observed at their defined slots; every undeclared config read remains
+dynamic. On an
+identity-admitted private config write, the four
+execution owners use the same checked reference for invocation, while the six
+Pod projection, metadata, region, and merge seams are admission-only identities
+that the closed projection/combination unit does not invoke or reread. A
+replacement installed after one of those six gates cannot enter that closed
+unit and is observed there on the next config write. It remains visible at any
+unrelated historical generic or cloud config call later in the same writer.
+Replacements already installed when the Pod-boundary slots are reached select
+public mutable compatibility for combination. All pinning ends when
+`write_cluster_config()` returns; the retained post-provision callback performs
+its ordinary late lookup.
+
+Public compatibility deliberately has no blanket once-resolved guarantee. The
+writer reference already selected by `_retry_zones()` and the first bound-method
+call at its gate slot use those checked references, but historical Pod,
+metadata, and config stages perform their current late lookups. Public
+`merge_k8s_configs()` also rereads its facade at every recursive edge. Thus a
+separate gate failure or nonidentity public cause allows a later module/class
+replacement to remain visible at the same current stage exactly as
+characterized below. The writer is captured at `_retry_zones()` admission and
+invoked through that same reference. `fill_template` is captured without
+invocation at built-in writer entry. The bound `Resources` and cloud methods
+are captured immediately before their respective current call sites. The six
+projection/combination seams are captured together immediately before the
+first current Pod read. Capturing the combined facade there is intentionally
+earlier than its legacy post-parse lookup; the corpus below locks that bounded
+timing. Unrelated config calls before and after this unit remain dynamically
+resolved. This removes check-versus-call races only from the shared closed unit
+while preserving ordinary wrapper, replacement, and subclass behavior at
+config-write boundaries.
+
+On the post-prerequisite baseline, stable officially accepted config and
+resource inputs plus stable provider facts retain exact successful tree, dump,
+hash, and validation behavior. Every other production render, parse,
+projection, merge, dump, validation, and compatibility failure retains its
+stage, exception class, message, cause, source coordinate, and ordering. The
+stateful and mid-request-mutation corpus proves the bounded coherence delta
+rather than claiming impossible byte or error equivalence for the removed
+second reads. Fixed contract errors are reachable only for an invalid internal
+frozen envelope or implementation defect and fail before provider effects.
+Old-client, new-client, CLI, server error-wire, and rollback corpora prove the
+remaining boundary.
+
+Effective `pod_config` and `custom_metadata` come from one already-authorized
+request snapshot. A new `KubernetesRenderConfigSnapshotV1` captures request-owned
+raw loaded-config and resource-override references, cloud kind, and context once
+without recursively traversing or projecting either value. Capture occurs at
+the existing first Pod-resolution point inside the Kubernetes cloud callback,
+after every generic-prefix and earlier cloud step. Its conceptual shape is:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class KubernetesRenderConfigSnapshotV1:
+    schema_version: typing.Literal[1]
+    loaded_config: config_utils.Config
+    cluster_config_overrides: dict[str, typing.Any]
+    cloud_kind: typing.Literal['kubernetes', 'ssh']
+    context: str | None
+```
+
+The envelope is frozen but both config fields are deliberately captured by
+reference. Two snapshot-fed functions,
+`resolve_effective_kubernetes_pod_config_from_snapshot()` and
+`resolve_effective_kubernetes_custom_metadata_from_snapshot()`, reproduce the
+two current helpers exactly. The Pod projector runs once at the current
+host-network point inside Kubernetes deploy-variable construction and its
+result is reused after the full parse;
+the metadata projector runs only after Pod combination and the second
+legacy-equivalent full-object deep copy both succeed. For Pod
+config, the cloud object selects `ssh` only when it is an
+`SSH` cloud; a non-null SSH context retains the current required `ssh-` prefix
+and assertion, then strips that prefix. Otherwise Pod config selects
+`kubernetes` and leaves the context unchanged. For custom metadata, the raw
+context alone selects `ssh` and loses its prefix when it starts with `ssh-`;
+otherwise it selects `kubernetes`. The projection owners compute these values
+separately, so even their historical behavior for a null or
+mismatched cloud/context pair is unchanged. For each projection and for each of
+the captured server config and `Resources.cluster_config_overrides`, the
+Kubernetes algorithm merges a
+non-null `context_configs.<context>` mapping over the cloud-level mapping with
+`merge_k8s_configs()`. The SSH algorithm instead uses the entire non-null
+context value in place of the cloud-level value; even an empty context mapping
+replaces it. Either algorithm falls back to the cloud-level value only when the
+context value is absent. Finally, it merges the resulting resource projection
+over the resulting server-config projection with `merge_k8s_configs()`, as the
+current Pod-config and metadata helpers do. Thus Kubernetes retains recursive
+global-plus-context merge semantics, SSH retains whole-projection context
+replacement, and resource overrides retain their final merge semantics.
+Patch-keyed and ordinary lists keep their exact existing behavior rather than
+being summarized as scalar precedence.
+
+Each projector reproduces the exact current `Config` and `get_nested()` call
+graph at the moment that stage is reached. Server config and resource overrides
+have separate `Config` views; within each view, context and cloud-level
+`get_nested()` calls return independent deep copies before precedence merge.
+No projector replaces those calls with two reads from one copied subtree or
+memoizes across them. The Pod and metadata projectors likewise share no detached
+view. Thus an alias between global and context values or between raw
+`pod_config` and `custom_metadata` is broken at the same boundaries as today,
+while aliases within one returned value retain that call's current copy
+behavior.
+
+The projection owners perform no workspace lookup or workspace precedence.
+Workspace `pod_config` or `custom_metadata` is semantically ignored by the
+production render as it is today and remains explicitly offer-ineligible when
+present. Exact whole-`Config` deep-copy behavior can still traverse a workspace
+subtree; this is not a physical no-read claim. The live
+helpers delegate to the corresponding snapshot projection instead of retaining
+ambient reads. The deploy-variable owner accepts the already-projected Pod
+config and performs no config read. Pod projection does not semantically
+select, merge, classify, or apply custom metadata before Pod combination. Its
+exact `Config.get_nested()` implementation still deep-copies the complete
+`Config`, so a programmatic sibling metadata object can be traversed or fail at
+the same Pod-projection boundary as today; S2a.2 does not claim path-local copy
+isolation. The base owner consumes only that same frozen effective Pod config.
+After the initial full-object pre-combination parse, successful Pod combination, and second
+legacy full-object deep copy, one snapshot-fed deterministic ownership-transfer
+`apply_kubernetes_custom_metadata()` owner consumes the selected detached
+custom metadata and that already-detached full cluster object. The freezeable
+path thaws metadata exactly once before transfer; compatibility transfers its
+already-detached mutable value. The applicator receives exclusive ownership of
+the full-object reference from the assembler and applies that same mutable
+metadata object through the single factored closed merge implementation with
+the existing semantics. It intentionally mutates and returns
+the same full-object reference without another copy; no other component may
+retain or observe the transferred input. The exact
+destination order is autoscaler service-account metadata, role metadata,
+role-binding metadata, the same service-account metadata a second time, Pod
+metadata, then Service metadata in provider order. It returns the resulting
+detached full object, including the legacy cross-destination aliases and
+source-mutation effects, without an ambient config read.
+
+That order is observable behavior, not an accident that S2a.2 may normalize.
+For example, schema-accepted `custom_metadata: {finalizers: ['x']}` causes the
+second service-account merge to extend the shared list, so the Pod and all outer
+destinations receive `['x', 'x']`; shared mappings likewise produce PyYAML
+anchors and aliases. The single applicator preserves the parsed tree, alias
+graph, dump bytes, and cluster hash. The base owner never applies custom
+metadata, and no disjoint Pod-versus-outer metadata applicator exists. Neither
+production nor S2b may independently resolve or merge either effective value.
+
+The process-local full render and detached base result are sensitive. `runcmd`,
+literal Pod environment values, annotations, and Pod config may contain secrets
+or personal data. S2a.2 adds no rendered cluster, full `node_config`, or base
+Pod to an offer payload, Datadog field, new log, internal contract error,
+database column, durable event, config hash input beyond the existing cluster
+hash, or persistent fingerprint. Legacy Jinja, YAML, merge, dump, and validation
+exceptions remain byte-for-byte compatible and may retain their current source
+excerpt or value behavior; S2a.2 does not broaden or sanitize them. S2b may not
+consume this full materialization, synthesize a second
+71-name context, or copy scheduling-field extraction. Its separate source-safe
+projection design must prove parity against this production owner for the
+closed eligible subset while reading none of the forbidden outer inputs. Until
+that review passes, S2b remains non-authoritative and no base-render identity
+enters an offer.
+
+Production dispatch is explicit. The source composer is selected only when the
+logical template reference resolves to the built-in
+`sky/templates/kubernetes-ray.yml.j2` path and the authoritative outer and
+fragment have their exact identities, for either Kubernetes or its
+SSH-node-pool use. During the compatibility window that logical path is the
+validated monolith mirror; after its removal gate it is the final outer. The
+private deploy-variable
+projection requires ten owner gates: the
+resolved `backend_utils.write_cluster_config` and
+`common_utils.fill_template` callables, the resolved bound
+`Resources.make_deploy_variables()` on an exact `Resources` instance, and the
+resolved bound cloud callback on an exact built-in `Kubernetes` or `SSH`
+instance. At the Pod boundary, the historical
+`kubernetes_utils.resolve_effective_pod_config` and
+`kubernetes_utils.combine_pod_config_fields_and_metadata` facade aliases must
+be their import-time captured built-in implementations,
+`skypilot_config.get_effective_region_config` must likewise retain its captured
+built-in identity, `config_utils.merge_k8s_configs` must retain its import-time
+captured built-in identity, and
+`config_utils.get_cloud_config_value_from_dict` and
+the composite Config projection owner must retain their captured public
+built-in identities. That composite checks both the `config_utils.Config` class
+object and its `get_nested` method. The private writer token
+must also be present. A class replacement,
+instance attribute replacement, subclass override, or inherited SSH override at
+any seam fails that gate. In that case production calls the existing resolved
+public rendering and deploy-variable callables, retains mutable Pod/metadata
+combination, emits only fixed internal diagnostic
+`CUSTOM_RENDER_OR_DEPLOY_OWNER`, and remains offer-ineligible. The source
+composer may still reconstruct a physical built-in template on that
+compatibility path, but the private projection and strict merge owner
+are unreachable.
+
+`ResolvedKubernetesRenderOwnersV1` is the conceptual, process-local record of
+those resolutions. It is not an eagerly constructed public dataclass: each slot
+is populated once at its defined gate point as the built-in writer path
+advances, then is immutable for that config write. `_retry_zones()` invokes the
+same resolved writer reference it checked. On an identity-admitted private
+write, the writer invokes the same resolved `fill_template` reference it
+checked. Exact `Resources` and cloud instances
+resolve their bound methods once; the gate checks the receiver and the bound
+method's `__func__` by identity, and the checked bound reference is the one
+invoked. At writer entry only `fill_template` is checked directly with `is`.
+At the first current Pod read, the six projection/combination seams are checked
+together. They are admission identities only: exact identities admit the
+closed Pod, deferred-metadata, base-merge, and
+metadata-merge unit, while any failure selects the public mutable path that
+invokes the currently resolved facades at their historical stages. The closed
+unit never invokes or rereads those six public seams. Their unrelated call sites
+elsewhere in Resources or the cloud callback remain dynamically resolved and
+may observe a later replacement. The conceptual record,
+callable references, and receiver references are never persisted, hashed,
+logged, sent to Datadog, placed in an offer, or retained after the writer
+returns. On public compatibility, the admission observations do not pin later
+facade calls: the historical renderer, Pod, metadata, config, and recursive
+merge stages perform their current dynamic lookups.
+
+Closed Pod/metadata config resolution does not call the captured public
+facades. One shared
+`_merge_k8s_configs_impl()` contains the existing merge algorithm and accepts
+an explicit recursion function. The public `merge_k8s_configs()` facade calls
+that implementation with a late-binding resolver that looks up the public
+facade again on every recursive edge, preserving current wrapper replacement,
+exception, and nested-call behavior on mutable compatibility. The strict
+`merge_k8s_configs_closed_v1()` entry passes a closure over itself instead. Its
+nested mapping, `imagePullSecrets`, named-list, unnamed-container, and all other
+recursive edges therefore use only the closed implementation even if the
+public module attribute changes during the operation. This factors one merge
+algorithm rather than copying it.
+
+Likewise, one factored Pod/metadata config-projection implementation accepts
+explicit loaded-config, nested-get, recursive-update, and Kubernetes-merge
+dependencies. Public `Config.get_nested()`,
+`get_cloud_config_value_from_dict()`, and
+`skypilot_config.get_effective_region_config()` retain their current dynamic
+facades and call ordering for compatibility. The strict
+`resolve_effective_region_config_v1()` path supplies only the closed recursive
+update and closed merge dependencies through resource-override application and
+Kubernetes general-plus-context combination. Generic Resources variable reads
+continue to invoke the dynamically resolved public
+`skypilot_config.get_nested()` at every current call site. All Kubernetes cloud
+callback config reads outside the Pod/deferred-metadata projection likewise
+retain their current public call graph before and after the Pod boundary. At the first current
+Pod read, the private projector captures the raw loaded-config reference into
+`KubernetesRenderConfigSnapshotV1` before performing the same closed projection;
+deferred metadata projects from that captured reference as specified below.
+The current Pod and metadata projection passes each raw mapping to
+`get_cloud_config_value_from_dict()`, which constructs a fresh
+`config_utils.Config(dict_config)` before any `get_nested()` call. It therefore
+does not dispatch through an instance attribute or subclass method on the
+active loaded-config object. The composite gate locks the actual module-level
+constructor and its class method; replacing `config_utils.Config` with a
+subclass fails even when that subclass inherits the original method object.
+Instance-level behavior of the active loaded config remains observable only at
+the unrelated public `skypilot_config.get_nested()` call sites that S2a.2 leaves
+dynamic.
+The private loaded-config accessor is a source-closed factoring of the current
+ContextVar/global-context selection and invokes no replaceable config facade.
+No strict nested config or merge edge performs a module attribute lookup.
+Underscore-prefixed projection implementation helpers such as `_recursive_update()` and
+`_get_loaded_config()` remain factored implementation details, not supported
+replacement seams; the public gates above own compatibility. The strict and
+public entries share their exact algorithm bodies, but a direct monkeypatch of
+an underscore helper is outside the declared extension contract.
+
+The dispatcher emits one such diagnostic for each failed gate that it actually
+resolves, bounded by the ten owner gates per config write. The fixed
+`owner_seam` enum
+can name the built-in writer,
+`fill_template`, Pod resolver, combined Pod/metadata facade, effective-region
+getter, Kubernetes merge primitive, cloud-config projector, Config projection
+owner, resource deploy-variable method, or cloud
+deploy-variable callback. It never contains a callable name, module, type, key,
+value, or rendered input. This bounded discriminator makes each
+compatibility-removal gate observable in existing Datadog collection without
+adding a statistics store. On an identity-admitted private write, the built-in
+writer resolves and checks `fill_template` at its writer-entry admission slot,
+then invokes that same reference at the actual rendering call. A token-`None`
+direct or delegating write, or a write that selects public compatibility at a
+later gate, instead re-resolves `fill_template` at the current render stage, so
+a post-entry replacement remains authoritative. A
+replacement writer that never delegates cannot reach that facade;
+out-of-facade physical template reads remain governed by repository and
+downstream-package inventory.
+
+Public compatibility can also be selected with every callable identity intact.
+The dispatcher emits one additional value-free event for each present fixed
+cause: `NO_PRIVATE_WRITER_CONTEXT`, `REGISTERED_TEMPLATE_OWNER`,
+`CUSTOM_TEMPLATE_VARIABLES`, or `CUSTOM_FAILOVER_OVERRIDE`. These causes do not
+encode the plugin, variable, key, or value and bring the total bound to fourteen
+events per config write. Per-cause events prevent one compatibility reason from
+masking another during removal observation.
+
+The pure owner is selected after the initial pre-combination parse only when all
+ten owner gates pass, no
+registered template override owns the attempt, and the
+parsed object plus resolved configs satisfy the frozen grammar. The final
+variable mapping preserves existing precedence:
+Kubernetes deploy variables, generic resource variables, common variables,
+then cloud-specific failover overrides. Registered `TemplateSpec.variables`
+never enter the strict path. A nonempty or unfreezable custom failover override
+remains on public mutable compatibility. Any registered Kubernetes provisioner or
+template ownership is
+`CUSTOM_PLACEMENT_CONFIG` for offers, even when its callback returns `None`.
+Provisioner registration without template ownership does not by itself select
+mutable render compatibility; lifecycle dispatch remains outside S2a.2.
+A `TemplateSpec` that supplies custom full-template content or variables keeps
+the current full-template renderer and mutable combination. It does not call,
+wrap, or partly reuse the strict base-Pod owner. If it selects the logical
+built-in template reference whose authoritative source is the private
+outer, the same source composer reconstructs the monolith
+before the plugin's final-precedence variables render. A plugin-shipped full
+template renders its own captured source as it does today.
+
+That plugin path is an explicit compatibility adapter, not a second
+authoritative built-in owner. Removing it requires a structured template
+extension that can express additions without replacing the base Pod owner, an
+inventory of downstream plugins, exact conformance for every inventoried
+extension, one compatibility release with zero legacy-only use, and a separate
+removal commit. Plugin registration can never expand offer eligibility by
+itself.
+
+Managed-image enforcement, authentication, reuse restoration, and S2a.1 final
+Pod mutation remain after the base owner. `_enforce_managed_kubernetes_image()`
+stays the single managed-image mutation body before and after reuse; the restore
+helper delegates to it. Any non-null `resolved_container_image` is
+authoritative-offer-ineligible in V1 until a later shared post-reuse finalizer
+is designed and characterized. `REUSE` and `RESTART` remain unsupported offer
+operations because restoration can replace `node_config`. Authentication may
+still globally replace the historical `skypilot:ssh_user` and
+`skypilot:ssh_public_key_content` sentinels, so S2a.2 does not claim that it is
+placement-inert for every legacy input. Before offer projection, V1 scans every
+allowlisted scheduling string and rejects either reserved sentinel with
+`NOT_REPRESENTABLE(CUSTOM_PLACEMENT_CONFIG)` and the internal fixed diagnostic
+`AUTH_RESERVED_SENTINEL`. This is defense in depth beyond V1's rejection of
+explicit Pod config. The final pre-create fingerprint is taken after
+authentication, so an escaped replacement cannot match an offer.
+The S2a.1 `finalize_pod_spec()` owner consumes a detached copy of the post-reuse,
+post-authentication Pod and remains the only owner of final pre-admission
+scheduling mutations.
+
+The split cannot cut over on object similarity alone. A test-only legacy
+monolith oracle and the new split path run against a frozen corpus covering CPU,
+accelerators, host networking, every optional binding as absent, present-null,
+and present-value, volumes, Docker sidecars, HA, Pod config, custom metadata,
+duplicate-list custom metadata, cross-destination aliases, safe-YAML date,
+naive datetime, canonical fixed-offset datetime including a fractional-second
+offset, custom-named-timezone compatibility, and binary scalars, repeated tuple,
+including empty and nonempty cases, date, and datetime aliases,
+unfreezable compatibility cases, SSH node pools, plugin bypass, managed images,
+authentication sentinels in every scheduling string class, absent, null,
+mapping, scalar, and sequence PVC and Deployment siblings, fresh create, and
+reuse. Tests prove all of the following:
+
+- the physical fragment source and derived 71-name set match their exact
+  digests;
+- raw source composition recovers the exact monolith before Jinja, invokes one
+  current full-template render and one current initial full-document
+  pre-combination safe parse, and preserves spontaneous-environment cache and
+  YAML fallback effects exactly;
+- the established `common_utils.fill_template` facade is called once with the
+  exact current template-reference string, identical variables object, and
+  output path. A wrapper receives those same arguments and, when it delegates,
+  the built-in facade internally consumes the recomposed source. A replacement
+  that opens the template reference sees the unchanged compatibility monolith,
+  and its output, exception, and side effects remain authoritative on the
+  public mutable compatibility path;
+- the reserved physical marker occurs exactly once; exact built-in and
+  delegating-facade paths never read or render the compatibility monolith; only
+  an identity-gated replacement renderer that opens its received
+  `template_ref` directly may do so during the compatibility window; and no
+  built-in or supported facade path renders or parses the fragment
+  independently;
+- cross-boundary anchors and aliases synthesized by accepted plain strings,
+  duplicate anchors across the physical split, directives, and quoted path
+  parse failures have exact legacy success, tree, exception, source-coordinate,
+  and stage precedence behavior;
+- parsed cluster trees, post-merge object order, final dumped YAML bytes,
+  deterministic cluster hashes, and post-managed-image validation outcomes are
+  identical for successful strict renders;
+- global, selected-context, and resource-override config precedence is exact,
+  including Kubernetes recursive context merge, SSH whole-context replacement,
+  the distinct Pod-versus-metadata cloud selection and SSH prefix rules, null
+  and mismatched cloud/context pairs, and both clouds' final resource-override
+  merge;
+  workspace-only Pod config or metadata remains ignored in production and
+  offer-ineligible;
+- the identity-admitted exact built-in private path invokes the Pod projector
+  exactly once at the current
+  host-network point in deploy-variable construction; the same detached result
+  controls configured `hostNetwork`, probe environment variables, and the
+  post-parse Pod merge, while OCI RoCE retains its independent
+  forced-host-network branch. The public direct-call compatibility path retains
+  its current ambient host-network Pod read and ordinary dict return;
+- each identity-admitted exact built-in Kubernetes or SSH-node-pool private
+  config-write attempt invokes its cloud-variable callback once and uses that
+  mapping only for rendering. A successful built-in Kubernetes or SSH
+  new-provisioner attempt invokes the unchanged cloud callback again after
+  `bulk_provision()`; that second result controls runtime `custom_resources`.
+  Stateful value, error, side-effect, config-reload, provider-read, reuse,
+  skip, dry-run, legacy, failover, failure, and other-provider fixtures lock the
+  current callback stage and count. The ordinary successful path retains two
+  cloud callbacks and changes only from three Pod reads to two;
+- paired stateful sentinels for every gate-failed, token-`None`, direct,
+  delegating-writer, method-override, custom-template/failover, and full-template
+  public path prove the first
+  ambient Pod read controls host networking, the later historical combined
+  facade performs its own Pod and metadata reads, the post-provision callback
+  is reached at its current stage when applicable, and the current value,
+  error, and side-effect precedence is unchanged. No private snapshot or typed
+  projection is constructed; no private context reaches a replacement or
+  survives the writer;
+- freeze-rejected config and parsed-graph fixtures reached after exact private
+  admission prove the typed-mutable adapter reuses the one Pod projection and
+  raw snapshot, invokes the closed mutable merge adapter without rerendering, and
+  retains private writer-local projection behavior without invoking the public
+  combined facade;
+- direct exact calls to `Resources.make_deploy_variables()` and
+  `Kubernetes.make_deploy_resources_variables()` receive no private keyword and
+  return the same ordinary dict type and object graph as today. Exact private
+  calls return the typed assembly and cloud result with the same underlying
+  mappings. Exact-signature Resources and cloud replacements assert they
+  receive only legacy arguments, return ordinary dicts, and retain current call
+  count, exception, and side-effect behavior. Provisioner registration without
+  template ownership and lifecycle-function replacement do not change
+  render-owner admission or lifecycle dispatch;
+- class and instance monkeypatches plus subclass overrides at both
+  `Resources.make_deploy_variables()` and the Kubernetes cloud callback,
+  including an SSH override, preserve their current output, exception,
+  side-effect, and characterized call count, including the current second call
+  when the post-provision stage is reached, through the public mutable
+  compatibility path; module-level writer, `fill_template`, historical Pod resolver, and
+  combined Pod/metadata facade wrappers and replacements, plus replacements of
+  `config_utils.merge_k8s_configs` and
+  `skypilot_config.get_effective_region_config`,
+  `config_utils.get_cloud_config_value_from_dict`, and
+  the composite `config_utils.Config` class plus `Config.get_nested` owner, are characterized at the same
+  boundary. An exact-signature replacement writer asserts that it receives no
+  private token or new keyword and returns the ordinary mapping; a delegating
+  writer reaches the built-in default-`None` mutable path. A merge replacement
+  present at the Pod boundary selects and remains authoritative on mutable
+  compatibility. Exact built-in callable identity checks use `is` and
+  invoke no user equality or descriptor beyond the already-resolved bound
+  call;
+- a stateful race corpus replaces each gated module or class attribute after
+  its resolution and proves that no unchecked custom callable enters the closed
+  projection/combination unit. The checked writer, fill, Resources, and cloud
+  execution references remain authoritative only at their specified stages.
+  The six Pod-boundary owner gates remain authoritative only inside the closed
+  unit; a later replacement is visible to unrelated dynamic config calls in the
+  same writer and selects mutable compatibility at the next Pod boundary.
+  Wrappers prove that writer-entry fill capture performs no early invocation,
+  later calls retain their current order and count, every strict
+  effective-region projection uses the source-closed config core, all six
+  boundary owners are gated immediately before the first Pod read, exact and
+  inherited-method replacement Config classes fail the composite gate, and bound
+  methods are not resolved before their current call slots. Nested-map, named-list, unnamed
+  container, `imagePullSecrets`, Kubernetes override, and context-merge
+  fixtures replace the public merge attribute after outer entry and prove that
+  strict recursion reaches only the closed merge core, while the next attempt
+  selects mutable compatibility. Public-facade fixtures prove the same
+  replacement remains visible at the exact current nested edge on the mutable
+  path. Stateful `skypilot_config.get_nested` replacements and nonprojection
+  uses of the six boundary facades remain dynamically visible at their current
+  generic and cloud call sites on both private and public writer paths. A
+  replacement installed after writer return remains visible to the
+  retained post-provision callback in the same physical attempt;
+- a reuse fixture whose restored YAML `cluster_name_on_cloud` differs from the
+  fresh writer-generated name proves the retained post-provision callback still
+  receives the restored handle name;
+- on the identity-admitted private path, a Pod projector that would return a
+  different value or fail on a second writer-time invocation proves that only
+  the first current projection is observed and authoritative within the writer.
+  A stateful cloud callback then returns a different value or fails at the
+  retained post-provision invocation and proves that later value, side effect,
+  or error remains observable at its current stage;
+- an earlier cloud-step sentinel that replaces the loaded-config reference is
+  observed by snapshot capture at the current first Pod-read point. After that
+  capture, replacing or reloading the global config or override reference is
+  not observed; an in-place mutation of custom metadata through the captured
+  reference remains visible to the deferred metadata projector, while the
+  already-detached Pod projection remains unchanged;
+- a paired generic-prefix failure and Pod-projection failure preserves the
+  generic-prefix winner, and paired earlier-Kubernetes-step and Pod failures
+  preserve the current cloud-specific winner;
+- a malformed Pod projection or merge fails before custom metadata is projected
+  or semantically selected, merged, classified, or applied, including a paired
+  malformed-metadata case. A separate sentinel fails during the second
+  legacy-equivalent full-object deep copy and proves the metadata projector is
+  not invoked first. Whole-`Config` deep-copy traversal of sibling metadata at
+  the Pod boundary remains characterized rather than forbidden;
+- YAML aliases shared between global and context values and between raw Pod
+  config and custom metadata are independently copied at the exact current
+  `Config.get_nested()` boundaries within each staged projection, with
+  identical merged identities, dump anchors, and bytes for a stable snapshot;
+- the custom-metadata applicator preserves the exact historical destination
+  order, shared-object graph, duplicate service-account self-extension, Pod
+  values, PyYAML anchors and aliases, and provider-order Service effects;
+- every exact built-in or delegating-`fill_template` facade path invokes exactly
+  one composed full render and one initial pre-combination full parse. A
+  replacement renderer that successfully writes output retains its own render,
+  exception, and side-effect behavior and then reaches the one current initial
+  parse without any composer-call requirement. On the identity-admitted private
+  path, a freezeable parsed graph invokes only the strict base-Pod owner and an
+  unfreezable input or parsed graph invokes only typed-mutable combination
+  without a rerender; a custom full-template plugin invokes only its declared
+  public compatibility path;
+- a normal rendered monolith proves that visiting its embedded active
+  `node_config` once at the ordinary path is not classified as an alias;
+  separate fixtures with a real identity shared inside the full object or
+  across the full object and detached Pod config select mutable compatibility;
+- dry-run, non-dry fresh, restore, and managed-image restore fixtures lock the
+  exact later parse and serialization order and successful totals above,
+  including hash exception behavior and file-mount optimization retries;
+- `build_kubernetes_base_pod_spec()` input-mutation, returned-input-alias,
+  ambient-read, sensitive-error, and logging sentinels stay silent; separate
+  applicator tests prove sole-reference ownership transfer, same-object return,
+  and no ambient read or retained input reference;
+- exact `VolumeInfo` values with an extra instance attribute or a declared
+  field whose runtime value is not exact `str` or `None` select mutable
+  compatibility without dropping or traversing that extra state;
+- internal contract-validation and impossible thaw errors are fixed and
+  value-free. Against the deterministic-gzip prerequisite head and a stable
+  officially accepted snapshot, production config-projection, merge,
+  full-render, full-parse, final-dump, validation, and compatibility failures
+  retain exact legacy class, message, cause, coordinate, stage, and
+  old/new-client wire behavior; the stateful corpora separately lock the
+  declared projection and per-attempt callable coherence deltas;
+- managed-image and reuse cases prove their late owners still supersede the
+  fresh base result exactly as today, including a tuple-valued effective Pod
+  `containers` sequence that must retain the legacy managed-image error, and a
+  Pod `VolumeInfo` plus selector conflict that must retain conflict-before-dump
+  error precedence;
+- wrapped `dump_yaml` and `check_pod_config` callables prove the full object is
+  dumped first, the exact active `node_config` reference is then mutated by
+  popping `deployment_spec` followed by `pvc_spec`, the retained dump argument
+  observes those pops, and validation receives that same mapping object;
+- each reserved auth sentinel in a scheduling field returns the fixed typed
+  fallback before offer creation, while every eligible post-authentication
+  scheduling projection remains unchanged.
+
+The first prerequisite makes the current host-network binding deterministic.
+`ray_commands.host_network_probe_b64()` replaces time-bearing
+`gzip.compress()` with `gzip.GzipFile(filename='', mode='wb', fileobj=...,
+compresslevel=9, mtime=0)`. Bare `gzip.compress(..., mtime=0)` is forbidden
+because Python 3.11 and 3.12 may expose a platform-specific gzip OS byte. The
+test asserts header `1f8b08000000000002ff`, byte identity in separate
+processes on Python 3.10 through 3.14, round-trip, actual probe compilation,
+cache-clear stability, and Base64 ASCII output. Built-in Kubernetes and SSH
+render goldens cover effective `hostNetwork` false and true plus OCI RoCE and
+prove that the only prerequisite-relative byte/hash delta is the embedded gzip
+member before any later render golden is accepted.
+
+Rollout has seven gates. First, the deterministic-gzip prerequisite passes and
+becomes the byte/hash comparison baseline. Second, a source-composer staging
+commit adds the authoritative fragment and outer, retains the digest-locked
+monolith mirror and exact three-argument `fill_template` seam, installs the
+built-in facade's temporary-outer selection, and makes the exact composer authoritative for the
+built-in path while mutable combination remains unchanged. Relative to the
+prerequisite head, its exact differential corpus, mirror-equality and dispatch
+searches, exact-head CI, and rollback-image qualification pass before that image
+is deployed and monitored.
+Third, a separate coherence commit introduces the identity-admitted private
+writer-local deploy-variable assembly, raw config snapshot, reused Pod
+projection, staged metadata projection, and exact render/config owner gates
+while its typed-mutable combination remains authoritative. Public mutable
+compatibility stays on the historical writer-time ambient reads. The existing
+post-provision callback remains unchanged on every path. Built-in
+Kubernetes/SSH private-path stable-input parity and regression coverage lock
+two cloud callbacks and two Pod reads on the successful new-provisioner path,
+while retaining current read/callback counts for every gate-failed, token-`None`, direct,
+delegating-writer, method-override, custom-template/failover,
+full-template-plugin, and other-provider path,
+first-projection mutation sentinels, replacement-after-capture sentinels for all
+ten owner gates, post-writer replacement and post-provision freshness
+sentinels, exact call counts, no-retention checks, exact-head CI,
+rollback qualification, and a bounded deployment pass before strict shadowing.
+Fourth, on that image, a
+temporary comparator computes strict and private typed-mutable combination from detached
+copies of the same single rendered and parsed object and staged config
+projections. Existing Datadog observability, without a statistics store,
+records zero unexplained tree, byte, hash, validation, error-stage, or dispatch
+mismatch; it never emits config or rendered data. Fifth, after exact-head CI,
+minimum-client qualification, plugin inventory, and dedicated implementation
+review, a separate promotion commit makes strict combination authoritative for
+freezeable built-in inputs while the closed mutable and custom-plugin adapters
+remain. That image is deployed and monitored independently. Sixth, after the
+required downstream window, a separate source-layout commit replaces
+the compatibility monolith atomically with the validated outer, deletes the
+temporary outer path and selection branch, and passes its direct-reader removal
+gate before deployment. Seventh, each remaining adapter is removed only through
+its own ledger gate and separate deployment. Every stage rolls back to its
+immediately preceding image rather than an untracked dual-render fallback or an
+unvalidated source copy.
+
 Immediately before the Kubernetes create call, production fingerprints the
 exact output of the shared finalizer and compares it with the selected offer.
 Since the complete identity object enters the stable offer ID, same-name
@@ -1771,6 +3065,10 @@ The server-side gate is:
 
 The default is `off`. Invalid values fail closed to `off` and emit one warning.
 This is an operator-controlled server setting, not a client request field.
+Until the M4 descriptor/actuation readiness bit is built and true,
+`authoritative` is a recognized but unavailable value: startup/readiness fails
+with a fixed value-free configuration error instead of silently weakening it to
+shadow or allowing mutation.
 
 In `shadow` mode, an eligible source projects candidates from the same raw
 observation snapshot used by the legacy adapter. The current optimizer objective
@@ -1904,8 +3202,14 @@ class PlacementOfferHandoffV1:
     reason_code: OfferReasonCodeV1
 ```
 
-`provisioner.bulk_provision()` gains one optional keyword-only
-`placement_offer_handoff: PlacementOfferHandoffV1 | None`. `off` passes null.
+S2b shadow instrumentation gives `provisioner.bulk_provision()` an optional
+keyword-only `placement_offer_handoff: PlacementOfferHandoffV1 | None` on the
+exact built-in path. This is independent of S2a.2, which creates no lifecycle
+bridge or bulk argument. A replacement bulk owner receives no new keyword until
+it adopts a reviewed structured extension. `off` passes null. Before M4's
+immutable provider descriptor and pinned actuation owner exist, bulk accepts
+only `off`, `SHADOW`, or `SHADOW_LEGACY_FALLBACK`; the authoritative
+dispositions below are a dormant contract and fail before mutation if selected.
 Shadow passes mode `SHADOW`, a valid recursively immutable offer, a null context,
 `reason_code=NONE`, and the current positive attempt ordinal. If any shadow
 classification, listing, binding, or revalidation outcome has no valid offer,
@@ -1970,7 +3274,8 @@ the capture; it rejects a missing, non-fresh, reused selection, or
 cross-provider context before mutation.
 `_retry_zones()` passes the revalidated immutable offer and the pinned context
 from that capture in the frozen handoff.
-`bulk_provision()` re-reads the server gate. Under an authoritative gate it
+`bulk_provision()` re-reads the server gate. Under an authoritative gate, and
+only after the M4 descriptor/actuation readiness gate passes, it
 accepts only `AUTHORITATIVE` with attempt ordinal one, the exact allowlisted
 first-attempt fallback, or the exact typed legacy-retry combination above.
 Under a shadow gate it accepts only `SHADOW` or
@@ -2009,7 +3314,10 @@ context name for every `kubectl` invocation through READY.
 If the pinned configuration cannot be represented safely for `kubectl`, the
 request is not authoritative. `make_deploy_resources_variables()` consumes the
 already frozen placement/configuration inputs and performs no later context
-lookup. `get_cluster_info()`, port-forward or exec setup, runtime setup, final
+lookup only after M4 removes the retained post-bulk callback in favor of the
+descriptor-owned deploy-variable snapshot. Before that migration, the current
+second callback and its ambient lookup remain authoritative and therefore keep
+the placement gate in shadow. `get_cluster_info()`, port-forward or exec setup, runtime setup, final
 UID/scope fencing, and failure cleanup all use either facades from the pinned
 client or this exact-target transport. Immediately before READY, the backend
 re-reads scope and all attempt-owned UIDs through the pinned client.
@@ -2261,10 +3569,11 @@ fence exists, which is enforced by the rollback preflight rather than reader
 compatibility. A later durable action migration stores the offer and attempt
 inventory in its action row.
 
-### Shadow and Promotion Gates
+### Shadow and Deferred Promotion Gates
 
-The shadow implementation, authoritative promotion, and legacy removal are
-separate commits and deployments.
+The M2 shadow implementation, M4 authoritative promotion, and later legacy
+removal are separate commits and deployments. M2 cannot enable the
+authoritative server mode.
 
 The frozen Kubernetes characterization corpus must cover:
 
@@ -2308,7 +3617,10 @@ The frozen Kubernetes characterization corpus must cover:
   reconciliation;
 - envelope size, redaction, and identity invariants.
 
-Promotion requires all of the following on the exact pushed SHA:
+Promotion is dormant until M4 has made immutable descriptor dispatch,
+provider-wide deploy-variable freshness, and pinned actuation authoritative.
+After that prerequisite, promotion requires all of the following on the exact
+pushed SHA:
 
 1. Full focused and compatibility CI passes.
 2. The frozen corpus has zero unexplained safety, placement-set, optimizer-winner,
@@ -2337,13 +3649,13 @@ Promotion requires all of the following on the exact pushed SHA:
    error logs, request execution, cluster cleanup, and absence of orphaned pods
    are re-read and recorded.
 
-The authoritative commit changes only the eligible Kubernetes subset to use the
+The M4 authoritative commit changes only the eligible Kubernetes subset to use the
 offer projection and exact selected offer. All other Kubernetes requests retain
 the typed legacy fallback, except provider-object conflicts and unresolved
 attempt fences, which always fail closed. Rollback changes the server mode to
 `shadow` or `off`; an image rollback additionally requires the current-image
-preflight to prove every attempt fence is null. No database schema is introduced
-by M2.
+preflight to prove every attempt fence is null. M2 introduces no database schema
+and leaves both handle fields null in production shadow mode.
 
 Kubernetes-specific shadow and fallback code remains for one full compatibility
 release after authoritative promotion. Generic placement reconstruction is not
@@ -2762,16 +4074,17 @@ identically.
 - adapt the initial single-node CPU Kubernetes subset;
 - independently shadow-project the old and new placement sets from one raw
   observation snapshot while legacy `Resources` remains mutation owner;
-- carry an exactly matched selected offer only through the first provider
-  mutation attempt, then use a typed legacy retry until M4 can prove complete
-  cleanup and atomically reset the cluster record;
-- revalidate immediately before mutation and compare the selected offer with the
-  actual provider result;
-- persist the optional envelope only on a successful READY handle;
+- carry an exactly matched selected offer through the first provider mutation
+  attempt in shadow only, while the legacy path remains sole mutation owner;
+- exercise pre-mutation revalidation and compare the selected offer with the
+  actual provider result without enabling offer-owned mutation;
+- define the optional successful-READY envelope and authoritative retry fence,
+  but gate their activation on M4 descriptor-owned actuation;
 - pass the frozen corpus, bounded Datadog observation, stale-offer,
   minimum-compatible-client, and rollback-image gates;
-- promote the eligible Kubernetes subset in a separate commit and retain all
-  other Kubernetes requests on the typed legacy fallback.
+- leave every Kubernetes request on legacy mutation in M2; M4 promotes the
+  eligible subset only after descriptor and deploy-variable freshness gates
+  pass.
 
 M2 implementation is split into reviewed slices:
 
@@ -2788,19 +4101,36 @@ M2 implementation is split into reviewed slices:
   primitives, and the production-shared final pre-admission Pod-spec owner.
   It removes the corresponding policy and mutation bodies from legacy callers
   before adding an offer source.
-- S2a.2 owns the production-shared base-Pod renderer and its exact legacy
-  characterization corpus. The rejected independent template renderer is not
-  carried forward. S2a.2 implementation cannot begin until this file names the
-  exact immutable resolved-input schema and passes a dedicated exact-design
-  review; the current text establishes ownership but not that input contract.
+- S2a.2 owns the physically extracted built-in Kubernetes `node_config`
+  fragment, exact source composer and one initial production render and
+  pre-combination parse, frozen
+  post-parse base-Pod merge owner, one identity-admitted private pre-render
+  snapshot-fed Pod projection reused by host-network deploy variables and
+  merge, deferred metadata projection, full-object exact-order metadata
+  applicator, exact render/config owner gates,
+  deterministic host-network probe encoding, and a characterization corpus
+  that locks stable-input parity and all declared compatibility deltas. The
+  rejected offer-time full renderer, independent fragment renderer, and
+  arbitrary full-template purity boundary are not carried forward. Custom
+  full-template plugins remain on public mutable compatibility; explicitly
+  unfreezable inputs reached after private admission use the typed-mutable
+  adapter. Both are offer-ineligible. Implementation
+  begins only after the exact contract above passes its dedicated design review
+  and the live physical-capacity branch is reconciled with the deployment base.
 - S2b owns the Kubernetes observation source, payload schema, closed
-  resource/config classifiers, aggregate deadline, and
+  resource/config classifiers, aggregate deadline, and a separately reviewed
+  bounded source-safe scheduling projection. S2b may not invoke S2a.2 full
+  materialization or become authoritative before that projection proves parity
+  without credential, private-key, logging-agent, plugin, or unrelated outer
+  reads. It then owns
   `validate_kubernetes_offer_v1()`, with no mutation ownership change. It must
-  call the S2a owners and contains no candidate, precedence, or Pod-rendering
-  policy of its own.
-- S3 owns orchestration propagation and use of the already-defined handoff,
-  shadow comparison, actual-placement evidence, persistence, and the guarded
-  authoritative promotion.
+  call the applicable S2a.1 policy owners and the reviewed source-safe
+  projector, and contains no candidate, precedence, or full Pod-rendering policy
+  of its own.
+- S3 owns orchestration propagation and shadow use of the already-defined
+  placement-offer handoff, shadow comparison, actual-placement evidence, and
+  dormant persistence/fence qualification. Authoritative promotion is gated on
+  the M4 descriptor and actuation contract.
 
 Deployment proves candidate safety, optimizer winner, selected placement,
 pre-mutation revalidation, actual provisioning result, handle compatibility,
@@ -2839,6 +4169,12 @@ ambiguous provider response, readback, and cleanup.
   the coordinator before making descriptor dispatch authoritative;
 - add the opt-in provider node-actuation facet and a shared cluster planner and
   reconciler;
+- inventory each provider's deploy-variable inputs and freshness semantics,
+  introduce a descriptor-owned typed snapshot, and remove the post-bulk
+  `make_deploy_resources_variables()` callback one promoted provider at a time;
+- activate the qualified placement-offer handoff only after descriptor dispatch
+  pins the selected provider facet and all post-provision reads to that same
+  actuation context;
 - compare pre-mutation launch, start, stop, down, port, head-selection,
   target-count, and cleanup plans from one frozen raw inventory only where a
   side-effect-free legacy projection exists; otherwise use the offline frozen
@@ -2904,9 +4240,20 @@ Removal is part of completion, not optional follow-up.
 | candidate selection body in `Kubernetes.existing_allowed_contexts()` and provisional `resolve_kubernetes_candidate_contexts_v1()` | shared pure context policy is authoritative | legacy characterization is exact, offer tests call the same owner, and repository search finds no second selector |
 | duplicated workspace, context, and global precedence in the provisional Kubernetes offer source | snapshot getter is authoritative | live and frozen-input corpora agree and no offer-owned effective-value helper remains |
 | pre-admission Pod mutation body inside Kubernetes `_create_pods()` | shared final Pod-spec owner is called immediately before create | head, worker, CPU, GPU, TPU, allowed-node, Docker-cache, single-node, and multi-node corpus is exact and repository search finds no second mutation body |
-| independent Kubernetes offer template renderer and hand-maintained Jinja variable set | production-shared base-Pod renderer is authoritative | legacy rendered YAML corpus and offer projection are identical, changed template input fails closed, and no offer-only renderer remains |
-| M2 first-provider-attempt-only authoritative fence and `RETRY_AFTER_PROVIDER_ATTEMPT` fallback | M4 carries typed complete cleanup and provider-absence evidence across every failover provider and resets the cluster record atomically | cross-provider lost-response, partial-create, teardown, absence, and stale-record corpus passes with no blind replay |
-| M2 handle-backed `placement_attempt_fence`, reconciler, and `QUARANTINE_FENCED` path | M4 stores every cluster attempt and UID inventory in the durable action runtime and the pre-M2 rollback window is closed | crash and UID-replacement tests prove foreign objects survive, every owned child reaches proved absence, no generic label/name delete is reachable, and repository search finds no handle-backed fence writer |
+| time-bearing `gzip.compress()` in `host_network_probe_b64()` | before any S2a.2 render golden is accepted | `GzipFile` output has the exact portable header, is byte-identical across Python 3.10 through 3.14 and separate processes, round-trips, and compiles the actual probe |
+| authoritative inline built-in Kubernetes `node_config` body and raw one-file built-in render | the physical fragment, single source composer behind the established facade, one initial render/pre-combination parse, and `build_kubernetes_base_pod_spec()` are authoritative | against the deterministic-gzip prerequisite head, outer, fragment, monolith, and name digests, exact facade arguments, wrapper behavior, anchor and error-coordinate corpus, initial parsed tree, exact later parse/serialization sequence, dumped YAML, validation, deterministic hash, SSH use, managed-image, reuse, and rollback behavior are exact; exact built-in and delegating-facade dispatch has no composer bypass or independent fragment render, and the old monolith is only the validated compatibility mirror tracked by its own row |
+| digest-locked `kubernetes-ray.yml.j2` compatibility monolith and temporary-outer selection branch | direct physical-template readers have completed their inventory and deprecation window | delegating wrappers remain green; the identity-gated custom-`fill_template` compatibility diagnostic records zero dispatches for one compatibility release; repository and downstream-package inventory find no reader that opens the physical path outside the facade; all inventoried readers migrate to the facade or a structured extension; and a separate commit replaces the mirror path atomically with the validated outer, removes the temporary `-outer` path and selection branch, and leaves repository search with no inline monolith or second physical source copy |
+| post-`bulk_provision()` `make_deploy_resources_variables()` callback for Kubernetes, SSH, and other providers | the M4 immutable provider descriptor supplies an inventoried typed deploy-variable snapshot with an explicit freshness contract to every promoted provider | per-provider config, credential, catalog, API-read, side-effect, mutable-value, plugin, failover, reuse-name, and post-mutation semantics are characterized; identity-admitted Kubernetes/SSH writer paths retain two cloud callbacks and two Pod reads, while public mutable paths retain their three Pod reads until their separate gate closes; each promoted provider passes stable-input and intentional-delta conformance; repository search finds no promoted-provider second callback, while unpromoted providers remain behind an explicit compatibility branch |
+| module, facade, class, instance, and subclass render/config/deploy-variable compatibility dispatch | downstream replacements use reviewed structured template, config-projection, and deploy-variable extensions over the shared owners | exact writer, `fill_template`, effective-region getter, cloud-config projector, composite exact `Config` class and `get_nested` owner, Kubernetes merge primitive, historical Pod resolver, and combined Pod/metadata facade replacements plus `Resources`, Kubernetes, and SSH class, instance, inherited, and subclass override corpora pass; dynamically resolved generic `skypilot_config.get_nested` calls remain unchanged; replacement-after-resolution tests prove check-and-call identity for execution gates, admission-only facade isolation, closed strict recursion, and exact public late-bound nested merge behavior; downstream inventory and one compatibility release record zero per-gate or nonidentity public-compatibility event and zero unstructured use; a separate removal commit deletes the identity-gated public/mutable path without changing direct-call public behavior until its own deprecation closes |
+| ambient Pod-config resolution inside `Kubernetes.make_deploy_resources_variables()` | shared generic-prefix/cloud-slot/generic-suffix orchestration and the snapshot-producing Kubernetes core are authoritative for the identity-admitted private writer path, and every public mutable caller has migrated | within the identity-admitted writer the Pod projector runs exactly once and the same detached projection controls configured host networking and post-parse merge; the intentionally retained post-bulk callback performs its separate current Pod read until the provider-freshness ledger row closes; generic-prefix, earlier-cloud-step, OCI RoCE, SSH, first-projection mutation-sentinel, and error-order corpora pass; public gate-failed, token-`None`, direct, delegating-writer, method-override, custom-template/failover, and full-template paths retain the characterized ambient host-network and later combined-facade Pod reads until every inventoried caller supplies explicit input and a separate removal commit deletes the ambient compatibility body |
+| ambient `pod_config` and `custom_metadata` reads inside built-in Kubernetes combine helpers | one raw render-config snapshot feeds sequential Pod and metadata projectors, the base-Pod owner, and one full-object metadata applicator on the identity-admitted private path, and public mutable compatibility has closed | on the private path, Pod failure precedes metadata semantic selection, merge, classification, and application; whole-`Config` deep-copy traversal remains exact, and a second-full-copy failure precedes the metadata projector; Kubernetes recursive context merge, SSH whole-context replacement, distinct Pod-versus-metadata cloud selection, SSH prefix and mismatched-context behavior, per-`get_nested()` and per-projection deep-copy boundaries, final resource-override merge, and semantically ignored workspace behavior are exact; capture occurs at the first current Pod read, later reference replacement is ignored, and later in-place mutation remains visible to deferred metadata; the base owner and ownership-transfer applicator perform no ambient reads; the exact SA, role, role-binding, SA, Pod, Services order and shared alias graph are preserved; public compatibility retains historical ambient reads until its gate closes, after which repository search finds no second resolver or metadata merge owner |
+| `UNFREEZABLE_KUBERNETES_RENDER_INPUT` private typed-mutable adapter | the frozen grammar covers every officially accepted and observed safe-YAML parsed object and render-config input | one compatibility release records zero typed-mutable dispatch after private admission; date, datetime, binary, intra-object and cross-object alias, cycle, set, non-string-key, and downstream config conformance passes; a separate removal commit deletes the private mutable combination owner without changing the single source composer or public compatibility gates |
+| independent Kubernetes offer template renderer and hand-maintained Jinja variable set | a separately reviewed bounded source-safe projector is authoritative and parity-gated against the production base-Pod owner | the closed eligible corpus has identical scheduling projections, changed template input fails closed, no credential, private-key, logging-agent, plugin, or unrelated outer read is reachable, and no offer-only full-template or fragment renderer remains |
+| arbitrary full-template Kubernetes plugin compatibility renderer | every inventoried plugin uses a reviewed structured extension over the shared base-Pod owner | downstream inventory and conformance pass, one compatibility release records zero legacy-only plugin render, and a separate removal commit deletes the adapter |
+| V1 managed-image, reuse, and restart offer exclusions | a reviewed shared post-reuse finalizer owns managed-image and restoration placement semantics | fresh, reuse, restart, image, selector-conflict, old/new client, hash, and actual-placement corpora pass and the schema-versioned eligibility change has a closed rollback window |
+| V1 `AUTH_RESERVED_SENTINEL` placement exclusion | authentication replaces placeholders only at reviewed template-owned paths | every scheduling-string sentinel corpus passes, post-authentication projection is exact, the schema-versioned eligibility change and old/new client qualification pass, and repository search finds no global replacement that can reach placement fields |
+| first-provider-attempt-only placement-offer fence and `RETRY_AFTER_PROVIDER_ATTEMPT` fallback activated with M4 | M4 carries typed complete cleanup and provider-absence evidence across every failover provider and resets the cluster record atomically | cross-provider lost-response, partial-create, teardown, absence, and stale-record corpus passes with no blind replay |
+| M4 handle-backed `placement_attempt_fence`, reconciler, and `QUARANTINE_FENCED` path | the durable action runtime stores every cluster attempt and UID inventory and the pre-authoritative rollback window is closed | crash and UID-replacement tests prove foreign objects survive, every owned child reaches proved absence, no generic label/name delete is reachable, and repository search finds no handle-backed fence writer |
 | provider-agnostic region and zone reconstruction in `resources_utils.py` and backend launch loops | every supported provider is authoritative through a placement-offer source or is explicitly frozen behind a declared legacy adapter | provider-wide corpus and bounded observation gates pass, repository and plugin inventory find zero migrated callers, and old/new client-server compatibility passes |
 | blocking provider wait ownership inside `run_instances()` implementations | `ProvisioningAttempt` effect observation owns progress | provider conformance proves pending, success, timeout, and partial-create behavior |
 | provider-local target-count, head-selection, resume, readiness, and `ProvisionRecord` algorithms inside `run_instances()` | the shared cluster planner and reconciler are authoritative for that provider and dependency-closed operation subset | frozen-inventory plans and post-mutation projections match the captured caller-visible legacy return or are explicitly safer, live create/restart/scale/down qualification passes, and repository search finds no promoted-provider orchestration in its primitive facet |
@@ -3577,3 +4924,66 @@ The corrective diff adds no placement offer, classifier, aggregate-deadline or
 orchestration activation, provider mutation, retry owner, or statistics
 storage. Exact-head CI, review state, merge proof, and live rollout evidence
 remain required.
+
+### Review 13
+
+Verdict: `RESHAPE` for the initial S2a.2 full-template proposal.
+
+The adversarial review rejected treating the entire Kubernetes cluster template
+as the pure placement boundary. `TemplateSpec.variables` accepts arbitrary
+plugin objects, the full template includes credential and path bindings that an
+offer must not acquire, managed-image policy runs after render and again after
+reuse, and reuse can replace the newly rendered `node_config`. A full-template
+owner would therefore either break plugin compatibility or claim placement
+authority over state it does not own.
+
+This finding supersedes Review 9's provisional requirement that production and
+offer capture call the same base renderer. They must share characterized policy
+and scheduling semantics, but S2b must prove those semantics through the bounded
+source-safe projector gate above rather than invoking production full
+materialization.
+
+The review accepted the built-in-only fragment direction subject to an exact
+canonical contract. The S2a.2 section above now records the physical outer,
+fragment, monolith, and 71-name digests; one exact source composer and current
+initial full render/pre-combination parse plus preserved later parse sequence; a
+frozen post-parse merge input; missing-versus-null
+semantics; one identity-admitted private pre-render snapshot-fed Pod projection
+shared by host-network variables and merge, followed by deferred metadata
+resolution; public mutable compatibility for owner/template gates; full-object
+exact-order metadata ownership; safe-YAML scalar and alias preservation through
+typed mutable-combination fallback; the sensitive-data boundary; plugin compatibility
+adapter; authentication-sentinel, managed-image, reuse, and S2b full-render
+exclusions; post-managed-image validation order; deterministic-gzip
+prerequisite; rollout; and removal gates. This edit still requires adversarial
+review against the exact file digest before implementation is approved.
+
+### Review 14
+
+Verdict: `PURSUE` for the bounded S2a.2 semantic contract at SHA-256
+`cdd29b4ea099b1635725cee2dafccbbbe63f9ea4aeff05e529a8193a0115e830`.
+
+The exact source review and compatibility review returned `PASS`, and the
+adversarial architecture review returned `PURSUE`. They independently verified
+the file digest and clean diff. The source review rechecked the physical
+template offsets and digests, 71-name presence contract, parse and serialization
+counts, Pod and metadata merge order, private and public callback counts, and
+the retained post-bulk boundary.
+
+The review rejected the intermediate Kubernetes-only pinned lifecycle facet,
+private bulk keyword, and post-provision deploy-variable handoff. That design
+duplicated the provider authority reserved for M4 and failed to cover existing
+dynamic bulk helper and teardown seams without further expansion. The accepted
+contract ends at `write_cluster_config()`: one writer-time Pod projection feeds
+host-network variables and post-parse merge, deferred metadata uses the same
+shallow raw-reference snapshot, and the existing post-bulk callback remains
+authoritative for fresh runtime setup.
+
+The accepted dispatch has eleven callable identities across ten owner gates.
+Its composite Config projection owner checks both the exact module-level
+`config_utils.Config` class and exact `Config.get_nested` method, so a replacement
+class cannot inherit the method and evade compatibility dispatch. Unrelated
+generic and Kubernetes config reads remain dynamically resolved. Authoritative
+placement and provider-wide deploy-variable freshness remain disabled until M4
+supplies immutable descriptor-owned actuation. Implementation may begin only
+after the live physical-capacity branch is reconciled with the deployment base.
