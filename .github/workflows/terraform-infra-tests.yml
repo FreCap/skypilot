@@ -1,7 +1,7 @@
 name: Terraform Infra Tests
 
-# Enforces the "Required verification" for the managed container-image
-# distribution Terraform modules: fmt-check, validate, and the
+# Enforces the required verification for every reusable Terraform module:
+# fmt-check, validate, and the
 # `terraform test -test-directory=terraform-tests` suites that pin the exact
 # AWS ARN / partition / trust-policy boundaries (PR #907). Without this gate
 # those suites never run in CI, so a loosened validation regex would merge green.
@@ -37,6 +37,9 @@ jobs:
           terraform_version: '1.14.8'
           terraform_wrapper: false
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+
       - name: Terraform fmt (check)
         run: terraform fmt -check -recursive infra/terraform
 
@@ -47,6 +50,14 @@ jobs:
           export TF_PLUGIN_CACHE_DIR="${RUNNER_TEMP}/tf-plugin-cache"
           mkdir -p "$TF_PLUGIN_CACHE_DIR"
           shopt -s nullglob
+          module_roots=(infra/terraform/modules/*)
+          for module in "${module_roots[@]}"; do
+            tests=("$module"/terraform-tests/*.tftest.hcl)
+            if [ ! -d "$module/terraform-tests" ] || [ ${#tests[@]} -eq 0 ]; then
+              echo "${module} must provide terraform-tests/*.tftest.hcl" >&2
+              exit 1
+            fi
+          done
           modules=(infra/terraform/modules/*/terraform-tests)
           # The suites live in the non-default `terraform-tests/` directory, so a
           # bare `terraform test` silently runs zero tests. Fail loudly if the
@@ -67,3 +78,11 @@ jobs:
             terraform -chdir="$module" test -test-directory=terraform-tests -no-color
             echo "::endgroup::"
           done
+
+      - name: Test control-plane config seed
+        run: |
+          cd infra/terraform/modules/skypilot-control-plane/scripts
+          uv run --no-project \
+            --with 'PyYAML>=6,<7' \
+            --with 'SQLAlchemy>=2,<3' \
+            python -m unittest -v test_seed_config.py

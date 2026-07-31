@@ -1,4 +1,46 @@
-# Managed container image infrastructure
+# SkyPilot Terraform modules
+
+Reusable Terraform modules for deploying and operating SkyPilot infrastructure.
+Consume a module locally from this repository or pin a full commit from the
+authoritative fork:
+
+```hcl
+module "pool" {
+  source = "git::https://github.com/boltz-bio/skypilot.git//infra/terraform/modules/skypilot-pool-aws-vm?ref=<full-commit-sha>"
+  # ...
+}
+```
+
+Provider configuration and backend state belong to the root caller. Module
+directories do not commit dependency lock files; executable root configurations
+do.
+
+## Module catalog
+
+| Module | Purpose |
+| --- | --- |
+| [`skypilot-control-plane`](modules/skypilot-control-plane) | Install a PostgreSQL-backed SkyPilot control plane on an existing EKS cluster |
+| [`skypilot-pool-aws-vm`](modules/skypilot-pool-aws-vm) | Register an AWS account for direct EC2 workloads |
+| [`skypilot-pool-eks`](modules/skypilot-pool-eks) | Register an existing EKS cluster with namespace, identity, priority, storage, and probe partitions |
+| [`skypilot-pool-rbac`](modules/skypilot-pool-rbac) | Create cloud-neutral Kubernetes RBAC for a SkyPilot pool |
+| [`aws-image-distribution`](modules/aws-image-distribution) | Create managed-image ECR shard rings and target roles |
+| [`aws-image-worker-identity`](modules/aws-image-worker-identity) | Create worker identities for managed image operations |
+| [`aws-image-canary-account`](modules/aws-image-canary-account) | Bootstrap account-global image-canary prerequisites |
+| [`aws-image-canary-target`](modules/aws-image-canary-target) | Create region-specific image qualification targets |
+
+Every module documents prerequisites, security boundaries, inputs, outputs,
+upgrade risks, and validation commands in its own README. Run:
+
+```bash
+terraform fmt -check -recursive infra/terraform
+terraform -chdir=infra/terraform/modules/<module> init \
+  -test-directory=terraform-tests
+terraform -chdir=infra/terraform/modules/<module> validate
+terraform -chdir=infra/terraform/modules/<module> test \
+  -test-directory=terraform-tests
+```
+
+## Managed container image infrastructure
 
 These modules provision the AWS infrastructure required by the managed
 container image distribution design. They are an extension for an existing
