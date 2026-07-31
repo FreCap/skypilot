@@ -1,10 +1,10 @@
 # Unified Physical-Capacity Evidence Scan
 
 Status: C1 foundation implemented and verified; C2 evidence-scan contract
-exact-file accepted after coherence, implementability, and rollback review;
-C2.1 implementation and disabled deployment are authorized, shadow activation
-remains gated by verification and the canary manifest protocol, and every
-materialized or authoritative capacity phase remains blocked
+accepted; C2.1 implementation and local verification recorded with an exact
+removal ledger; disabled deployment is the next gate, shadow activation
+remains gated by the canary manifest and audit protocol, and every materialized
+or authoritative capacity phase remains blocked
 
 Last updated: 2026-07-31
 
@@ -1039,32 +1039,153 @@ Missing evidence or a missed decision deadline counts as no gate. All C2-only
 code must be removed from the deployed controller no later than 45 calendar
 days after expiry.
 
-Removal is explicit regardless of whether one product gate passes:
+### Exact C2 removal ledger
 
-- Delete the C2 selector/pilot parser, summary scheduler, cursor/digest scan
-  publication, runtime start-stop hooks, pilot metrics, and their dedicated
-  tests by that release deadline.
-- A product-specific canonical design accepted by the 14-day decision deadline
-  may retain only exact pure adapter/hashing symbols that it names, owns, and
-  tests, with a dated replacement/removal milestone. Passing an unrelated
-  provider-read or occupancy gate retains no Serve/jobs scan daemon code.
-- Any C2 symbol not explicitly owned by such an accepted design is deleted,
-  even when another product gate passes. A later design cannot use an
-  indefinite "evaluation" state to postpone cleanup.
-- Keep revision `001` migration files immutable. Existing summaries remain
-  inert; a separate PostgreSQL migration may later drop all five unused C1
-  tables, but ordinary rollback never does.
-- If exact identity transport is later accepted, mapping version 1 remains
-  read-only historical evidence. A new mapping version runs separately; it
-  never rewrites a legacy association into exact identity.
-- Observation-cache, action-journal, and occupancy-ledger code cannot be added
-  under the label of C2 cleanup. Each needs its own migration, rollout,
-  rollback, and removal ledger.
+Unless a separately accepted product design names and owns an exact pure
+symbol before the 14-day decision deadline, remove the following no later than
+45 calendar days after pilot expiry.
 
-The implementation PR updates this list with exact file/symbol names before
-activation and keeps it synchronized with later code moves.
+#### Delete these C2-only files in full
+
+- `sky/physical_capacity/contracts.py`
+- `sky/physical_capacity/hashing.py`
+- `sky/physical_capacity/adapters.py`
+- `sky/physical_capacity/source_queries.py`
+- `sky/physical_capacity/metrics.py`
+- `sky/physical_capacity/projector.py`
+- `sky/physical_capacity/repository.py`
+- `tests/unit_tests/test_physical_capacity_config.py`
+- `tests/unit_tests/test_physical_capacity_hashing.py`
+- `tests/unit_tests/test_physical_capacity_adapters.py`
+- `tests/unit_tests/test_physical_capacity_projector.py`
+- `tests/unit_tests/test_physical_capacity_scan_pg.py`
+
+A later accepted product design may retain only the exact pure
+contract/adapter/hash symbols it explicitly lists, tests, and gives a dated
+replacement/removal milestone. It may not retain `EvidenceProjector`,
+`ScanRepository`, source-query execution, metrics, scheduling, publication, or
+runtime lifecycle hooks merely because one payoff gate passed.
+
+#### Remove these C2 additions from shared files
+
+- `sky/physical_capacity/canonical.py`
+  - Remove `CanonicalDomain.SCOPE_ENTRY`.
+  - Remove `CanonicalDomain.EVIDENCE_RECORD`.
+  - Restore the C1-only module/class documentation.
+- `sky/physical_capacity/config.py`
+  - Remove imports `datetime` and `contracts`.
+  - Remove `PHYSICAL_CAPACITY_SOURCES_ENV_VAR`,
+    `PHYSICAL_CAPACITY_PILOT_END_ENV_VAR`, `SOURCES_ENV_VAR`, and
+    `PILOT_END_ENV_VAR`.
+  - Remove `API_SERVER_ROLE_ENV_VAR`, `API_REQUEST_BACKEND_ENV_VAR`,
+    `CONTROLLER_SERVER_ROLE`, and `POSTGRES_REQUEST_BACKEND`.
+  - Remove `MAX_SOURCES_JSON_BYTES`, `MAX_SOURCE_SELECTORS`,
+    `MAX_SOURCE_PARTITIONS`, `_SERVE_SELECTOR_FIELDS`,
+    `_MANAGED_SELECTOR_FIELDS`, and `_PILOT_END_PATTERN`.
+  - Remove `CapacityConfig.sources`, `CapacityConfig.pilot_end_utc`, and
+    `CapacityConfig.partitions`.
+  - Remove `_selector_sort_key`, `_parse_selector`, `_parse_sources`,
+    `parse_pilot_end_utc`, `pilot_end_datetime`, and
+    `_validate_selector_allowlists`.
+  - Remove the source-selector and pilot-end parsing/validation additions from
+    `load_config`.
+  - Remove `validate_common_runtime_environment`.
+  - Retain the C1 mode/allowlist parser, `CapacityConfig.mode`,
+    `CapacityConfig.allowlist`, `load_config`, and
+    `validate_runtime_capability`.
+- `sky/physical_capacity/models.py`
+  - Remove `ProjectionScanPhase`.
+  - Remove `ProjectionScanErrorCode`.
+  - Restore the C1-only module documentation.
+  - Retain `ProjectionSourceKind`, `ProjectionScanState`, and all other
+    revision-001 row enums.
+- `sky/server/runtime.py`
+  - Remove imports `Callable`, `physical_capacity_config`,
+    `capacity_projector_lib`, and the C2-only `serve_utils` import.
+  - Remove `RuntimeState.physical_capacity_config`.
+  - Remove `_ordinary_db_connections_after_capacity_reservation`.
+  - From `initialize_common_runtime`, remove the C2 config load/common-runtime
+    validation, Serve/pool/jobs consolidation gate, isolated-connection
+    reservation/logging, reduced connection count passed to
+    `compute_server_config`, and capacity config stored in `RuntimeState`.
+  - From `_run_controller_role`, remove `capacity_projector`,
+    `capacity_projector_failed`, the C2 `activating-controller` readiness hook,
+    `start_controller_projector`, projector-health fencing and
+    `capacity-projector-failed` readiness state, `stop_controller_projector`,
+    the capacity failure guard on normal draining, and the final
+    `Physical-capacity evidence projector failed` exception.
+  - Remove the C2-originated generic drain-step/fail-stop rewrite and the
+    corresponding `_kill_local_controller_children` behavior change unless
+    another accepted design independently owns those exact controller-hardening
+    changes.
+- `sky/utils/db/db_utils.py`
+  - Remove `_ISOLATED_POSTGRES_CONNECT_TIMEOUT_SECONDS`.
+  - Remove `_ISOLATED_POSTGRES_POOL_TIMEOUT_SECONDS`.
+  - Remove `_postgres_isolated_engine_cache`.
+  - Remove `_isolated_postgres_engine_key`.
+  - Remove `get_isolated_postgres_engine`.
+  - Remove `isolated_postgres_engine_checked_out`.
+  - Remove `dispose_isolated_postgres_engine`.
+- `sky/physical_capacity/__init__.py`
+  - Restore the C1 foundation documentation stating that revision 001 exposes
+    no production projector or mutation path.
+
+#### Retain the C1 foundation unchanged
+
+Do not alter or delete these as ordinary C2 cleanup:
+
+- `sky/schemas/db/capacity_state/001_initial_schema.py`, including all five
+  tables and its `upgrade`/`downgrade` contract.
+- `sky/physical_capacity/schema.py`, including `PROJECTION_SCANS`, `GROUPS`,
+  `GROUP_INTENTS`, `ALLOCATIONS`, and `ALLOCATION_DESIRES`.
+- `sky/physical_capacity/state.py`.
+- The capacity initialization hook in `sky/server/database_migrations.py`.
+- `[capacity_state_db]` in `sky/setup_files/alembic.ini`.
+- `CAPACITY_STATE_DB_NAME` and `CAPACITY_STATE_VERSION` in
+  `sky/utils/db/migration_utils.py`.
+- The C1 portions of `canonical.py`, `config.py`, and `models.py`.
+- `tests/unit_tests/test_physical_capacity_models.py`,
+  `tests/unit_tests/test_physical_capacity_schema_pg.py`,
+  `tests/unit_tests/test_physical_capacity_state.py`, and the C1 migration
+  coverage in `test_migration_utils.py` and
+  `container_images/test_postgres.py`.
+
+Ordinary rollback or C2 removal does not delete scan summaries or run a schema
+migration. Existing summaries become inert. Dropping any of the five C1 tables
+requires a separate PostgreSQL migration, rollout, and rollback design. If
+exact identity transport is later accepted, mapping version 1 remains
+read-only historical evidence; a new version runs separately and never
+rewrites legacy association. Observation-cache, action-journal, and
+occupancy-ledger code cannot be added under the label of C2 cleanup.
 
 ## Verification
+
+### C2.1 verification evidence
+
+Implementation anchors:
+
+- `67259d80f`: strict selectors, evidence contracts, and canonical hashing.
+- `14c7c3a4b`: bounded read-only source queries and pure adapters.
+- `2497b690d`: scan repository, metrics, projector, controller lifecycle
+  integration, and PostgreSQL/runtime tests.
+
+Observed against the exact implementation on 2026-07-31:
+
+- all 165 non-PostgreSQL C2 tests passed: 29 selector/config, 20 hashing,
+  93 source-adapter, and 23 projector/runtime cases;
+- all 39 tests passed against disposable PostgreSQL 14: 20 C1 transaction
+  repository, 14 C1 schema, and five C2 scan-repository cases;
+- the existing 52-case C1 model suite passed;
+- existing `sky.server.runtime` and `sky.utils.db.db_utils` unit-test files
+  passed;
+- mypy checked 804 source files clean, pylint reported 10.00/10, and formatting
+  plus `git diff --check` were clean; and
+- independent adversarial implementation review found no remaining C2.1
+  contract blocker after the final fencing and committed-metric fixes.
+
+This evidence authorizes only C2.2. No disabled-deployment, live selector,
+provider-call audit, source-write audit, restart/handoff, or measurement-cohort
+evidence is recorded at this revision.
 
 Automated tests cover:
 
@@ -1119,11 +1240,25 @@ Manual test:
 
 ## Implementation phases and open gates
 
-- C2.1: strict configuration, pure adapters, digest/counters, scan repository,
-  controller daemon, and unit/PostgreSQL tests.
-- C2.2: disabled deployment and zero-write verification.
-- C2.3: one isolated selector plus restart/handoff validation.
-- C2.4: typed Serve/pool/jobs cohort and 30-day decision record.
+- C2.1 complete: strict configuration, pure adapters, digest/counters, scan
+  repository, controller daemon, and unit/PostgreSQL tests.
+- C2.2 next: deploy this exact binary on every role with mode `disabled`; prove
+  no projector starts and all five C1 table counts remain unchanged.
+- C2.3 gated: set all three variables only through
+  `controllerService.extraEnvs`; run one real isolated service selector for
+  three scans spanning a restart and leadership handoff, with independent
+  proof of zero provider calls, zero source writes, and no rows in the four
+  materialized C1 tables. Finish this canary within three days. Do not add pool
+  or managed-task selectors until the audits pass.
+- C2.4 gated: freeze the exact typed Serve/pool/jobs selector and scope-hash
+  manifest, prove the preceding 30-day baseline exists and a complete following
+  30-day window fits before the immutable pilot end, then collect the signed
+  decision record.
+
+The decision is due no later than 14 days after expiry. Unowned C2 code is due
+for removal no later than 45 days after expiry. Missing live-selector or
+external provider-call evidence blocks C2.3 rather than being replaced by a
+synthetic selector or internal log inference.
 
 No materialized inventory, provider observation cache, identity transport,
 action journal, occupancy ledger, read cutover, or mutation authority is
