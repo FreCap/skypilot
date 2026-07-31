@@ -27,22 +27,15 @@ def _normalize_timestamp(
         timestamp: datetime.datetime | None = None) -> datetime.datetime:
     """Return a UTC-aware timestamp for managed job event persistence.
 
-    Migration 010 interprets legacy persisted naive job-event timestamps as
-    UTC. For new writes, explicit naive timestamps are assumed to be in the
-    local timezone and normalized to UTC before persistence so retention and
-    cross-dialect ordering use one consistent timescale.
+    Migration 010 interprets legacy naive job-event timestamps as UTC. Keep the
+    same contract for explicit timestamps while ensuring new timestamps carry
+    their timezone through PostgreSQL's ``TIMESTAMP WITH TIME ZONE`` binding.
     """
     if timestamp is None:
         return datetime.datetime.now(datetime.timezone.utc)
     if timestamp.tzinfo is None:
-        return timestamp.astimezone().astimezone(datetime.timezone.utc)
+        return timestamp.replace(tzinfo=datetime.timezone.utc)
     return timestamp.astimezone(datetime.timezone.utc)
-
-
-def _normalize_sqlite_timestamp(
-        timestamp: datetime.datetime) -> datetime.datetime:
-    """Match SQLite's timezone-less DateTime storage while keeping UTC."""
-    return _normalize_timestamp(timestamp).replace(tzinfo=None)
 
 
 def add_job_event(job_id: int,
@@ -252,8 +245,6 @@ async def cleanup_job_events_with_retention_async(
     engine = await _db_manager.get_async_engine()
     cutoff_time = (datetime.datetime.now(datetime.timezone.utc) -
                    datetime.timedelta(hours=retention_hours))
-    if engine.dialect.name == 'sqlite':
-        cutoff_time = _normalize_sqlite_timestamp(cutoff_time)
 
     async with sql_async.AsyncSession(engine) as session:
         result = await session.execute(

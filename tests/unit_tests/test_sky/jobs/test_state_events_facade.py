@@ -55,8 +55,8 @@ def test_event_facade_uses_direct_repository_aliases():
 
 def test_job_event_timestamp_normalization_is_utc_aware():
     naive = datetime.datetime(2026, 7, 21, 12, 0)
-    expected_naive = naive.astimezone().astimezone(datetime.timezone.utc)
-    assert state_events._normalize_timestamp(naive) == expected_naive
+    assert state_events._normalize_timestamp(naive) == datetime.datetime(
+        2026, 7, 21, 12, 0, tzinfo=datetime.timezone.utc)
 
     offset = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
     aware = datetime.datetime(2026, 7, 21, 12, 0, tzinfo=offset)

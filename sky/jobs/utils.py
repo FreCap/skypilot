@@ -7,7 +7,6 @@ ManagedJobCodeGen.
 import asyncio
 import contextlib
 from datetime import datetime
-import enum
 import os
 import pathlib
 import re
@@ -146,13 +145,6 @@ _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS = 120
 
 # Content written to the jobs cancel signal file.
 _JOBS_GRACEFUL_CANCEL_SIGNAL = 'graceful'
-
-
-class UserSignal(enum.Enum):
-    """The signal to be sent to the user."""
-    CANCEL = 'CANCEL'
-    # NOTE: We can have more communication signals here if needed
-    # in the future.
 
 
 # ====== internal functions ======

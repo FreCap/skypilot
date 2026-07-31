@@ -920,10 +920,9 @@ def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
     #    inconsistent state).
     #
     # Legacy single-job controllers have NULL schedule_state. They are not
-    # manageable through the consolidated refresh sweep, which only knows how
-    # to reason about modern schedule-state rows. Fence them out here so
-    # cancellation and refresh can fall through to the dedicated legacy signal
-    # path instead of crashing while decoding a NULL enum.
+    # manageable through the consolidated refresh sweep or cancellation path,
+    # which only know how to reason about modern schedule-state rows. Fence
+    # them out here instead of crashing while decoding a NULL enum.
     condition1 = sqlalchemy.and_(
         job_info_table.c.schedule_state.is_not(None),
         job_info_table.c.schedule_state != ManagedJobScheduleState.DONE.value)
