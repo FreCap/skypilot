@@ -375,7 +375,6 @@ class JobCancellationState(typing.NamedTuple):
     """State needed to authorize and route a managed-job cancellation."""
     status: ManagedJobStatus
     workspace: str
-    is_legacy_controller: bool
 
 
 class JobLogStreamSnapshot(typing.NamedTuple):

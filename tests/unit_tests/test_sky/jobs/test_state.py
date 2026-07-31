@@ -981,11 +981,9 @@ def test_get_job_cancellation_states_batches_lifecycle_snapshot(
 
     assert snapshots == {
         active_job: state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                               'team-a', False),
+                                               'team-a'),
         completed_job: state.JobCancellationState(state.ManagedJobStatus.FAILED,
-                                                  'team-b', False),
-        legacy_job: state.JobCancellationState(state.ManagedJobStatus.STARTING,
-                                               'default', True),
+                                                  'team-b'),
     }
     assert counts['n'] == 1, counts
 
@@ -1037,12 +1035,8 @@ def test_get_job_cancellation_state_rows_use_latest_task_only(
             [active_job, completed_job, legacy_job, 999999, active_job])
 
     assert rows == [
-        (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a', 101,
-         1001.5),
-        (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b', -202,
-         None),
-        (legacy_job, 0, state.ManagedJobStatus.STARTING.value, None, None,
-         None),
+        (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a'),
+        (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b'),
     ]
     assert counts['n'] == 1, counts
 

@@ -983,7 +983,10 @@ class TestGetLatestRecoveryReasons:
 
 def test_job_event_timeline_async_write_and_retention(
         _mock_managed_jobs_db_conn):
-    now = datetime.datetime.now()
+    # Use an explicit timezone so this retention assertion is independent of
+    # the developer machine's local timezone. Naive timestamps intentionally
+    # follow the legacy UTC persistence contract.
+    now = datetime.datetime.now(datetime.timezone.utc)
     old = now - datetime.timedelta(hours=2)
     state.add_job_event(1,
                         None,
