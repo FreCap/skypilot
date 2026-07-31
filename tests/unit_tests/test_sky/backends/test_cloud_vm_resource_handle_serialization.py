@@ -1,5 +1,8 @@
 """Characterization tests for Cloud VM resource-handle serialization."""
 
+# The compatibility contract includes the handle's durable private fields.
+# pylint: disable=protected-access
+
 import copy
 import inspect
 import os
@@ -8,6 +11,7 @@ from unittest import mock
 
 from sky import resources as resources_lib
 from sky.backends import cloud_vm_ray_backend
+from sky.backends import cloud_vm_resource_handle_serialization
 from sky.provision import common as provision_common
 
 
@@ -57,6 +61,19 @@ def test_serialization_hook_contract() -> None:
         assert function.__qualname__ == qualname
 
     assert isinstance(cls.__dict__['from_dict'], classmethod)
+
+
+def test_serialization_hooks_are_direct_implementation_methods() -> None:
+    cls = cloud_vm_ray_backend.CloudVmRayResourceHandle
+
+    assert cls.__dict__[
+        'to_dict'] is cloud_vm_resource_handle_serialization.to_dict
+    assert (cls.__dict__['from_dict'].__func__
+            is cloud_vm_resource_handle_serialization.from_dict)
+    assert cls.__dict__[
+        '__getstate__'] is cloud_vm_resource_handle_serialization.__getstate__
+    assert cls.__dict__[
+        '__setstate__'] is cloud_vm_resource_handle_serialization.__setstate__
 
 
 def test_dict_round_trip_preserves_fields_and_input() -> None:
