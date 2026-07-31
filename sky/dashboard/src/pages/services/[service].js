@@ -39,6 +39,7 @@ import { ServeHistorySection } from '@/components/serve-history';
 import { ServiceVersionHistory } from '@/components/service-version-history';
 import { ServicePlacement } from '@/components/service-placement';
 import { useMobile } from '@/hooks/useMobile';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import { formatYaml } from '@/lib/yamlUtils';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
 import { CLOUD_CANONICALIZATIONS } from '@/data/connectors/constants';
@@ -363,17 +364,22 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
     [fetchData]
   );
 
-  useEffect(() => {
-    if (!serviceName) return undefined;
-    const interval = setInterval(() => {
-      if (window.document.visibilityState === 'visible') {
-        fetchData({ invalidate: true, source: 'poll' });
-      }
-    }, 60 * 1000);
-    return () => {
-      clearInterval(interval);
-    };
-  }, [fetchData, serviceName]);
+  const refreshWhenVisible = useCallback(
+    (refreshSource) => {
+      void fetchData({
+        invalidate: true,
+        source: refreshSource === 'visibilitychange' ? 'visibility' : 'poll',
+        supersede: refreshSource === 'visibilitychange',
+      });
+    },
+    [fetchData]
+  );
+
+  useVisibleRefreshInterval(
+    Boolean(serviceName),
+    60 * 1000,
+    refreshWhenVisible
+  );
 
   return {
     serviceData,
