@@ -614,10 +614,12 @@ def get_daily_request_summary(
     count_sum = sqlalchemy.func.sum(daily.c.request_count)
     try:
         with engine.connect() as connection:
+            earliest_day = sqlalchemy.select(
+                sqlalchemy.func.min(daily.c.day_start)).scalar_subquery()
             coverage_start = connection.execute(
                 sqlalchemy.select(
-                    sqlalchemy.func.min(
-                        daily.c.first_bucket_start))).scalar_one_or_none()
+                    sqlalchemy.func.min(daily.c.first_bucket_start)).
+                where(daily.c.day_start == earliest_day)).scalar_one_or_none()
             service_rows = connection.execute(
                 sqlalchemy.select(
                     daily.c.service_name,
