@@ -1,6 +1,6 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: M1 merged; M2 approved for shadow implementation; M3 requires a dedicated review
+Status: M1 merged; M2 S1 approved for implementation; M3 requires a dedicated review
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -310,6 +310,17 @@ class ObservationCaptureV1:
     observation: ProviderObservationSnapshotV1
     actuation_context: ProviderActuationContextV1 | None
 
+    def __post_init__(self) -> None:
+        # Protocol conformance and the provider, capture-ID, and UTC timestamp
+        # grammars are checked before these equality checks.
+        if self.actuation_context is not None:
+            if (self.actuation_context.provider !=
+                    self.observation.provider):
+                raise ValueError('Observation and context providers differ.')
+            if (self.actuation_context.capture_id !=
+                    self.observation.capture_id):
+                raise ValueError('Observation and context captures differ.')
+
 
 @typing.runtime_checkable
 class OfferSourceV1(typing.Protocol):
@@ -350,6 +361,17 @@ logged, or sent to Datadog, and rejects access by a source for a different
 provider or observation time. Its random `capture_id` distinguishes provider
 reads without entering offer identity.
 
+Every observation, context, and selection capture ID is exactly the canonical
+lowercase string form of an RFC 4122 UUIDv4 generated with `uuid.uuid4()`:
+`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`.
+No braces, uppercase letters, alternate UUID versions, nil UUID, compact form,
+or provider-native ID is accepted.
+
+`ObservationCaptureV1.__post_init__()` requires `observation` to implement
+`ProviderObservationSnapshotV1`, validates its provider, capture ID, and aware
+whole-second UTC timestamp, and, when a context is present, requires it to
+implement `ProviderActuationContextV1` and validates the same provider and
+capture-ID grammars before enforcing the equalities shown above.
 `ObservationCaptureV1` keeps any provider client outside that frozen snapshot.
 Optimizer-only captures close and discard their actuation context before
 ranking. Kubernetes `REQUIRE_FRESH` returns a
@@ -366,14 +388,260 @@ offer, and is closed by its current owner on every terminal success or
 exception path. The only credential copy is the private exact-target transport
 described below.
 
-The generic offer and evidence modules are leaf modules. They import only the
-standard library and existing leaf JSON typing helpers. `Resources` and `Cloud`
-annotations are quoted and imported only under `TYPE_CHECKING`; the generic
-modules do not import clouds, optimizer, backend, provisioner, server, or
-Kubernetes modules. `Cloud.get_offer_source()` likewise uses a quoted return
-annotation and performs no provider SDK, kubeconfig, or plugin work at import
-time. Placement types are not re-exported from `sky.__init__` or
-`sky.clouds.__init__`.
+The generic offer and evidence modules are leaf modules. S1 is the generic
+offer contract foundation in `sky/placement/offer.py`; the separate
+`ActualPlacementEvidenceV1` leaf and `ProvisionRecord` field are deferred to
+S3. Both leaves import only the standard library and existing leaf JSON typing
+helpers. `Resources` and `Cloud` annotations are quoted and imported only under
+`TYPE_CHECKING`; the generic modules do not import clouds, optimizer, backend,
+provisioner, server, or Kubernetes modules. `Cloud.get_offer_source()` likewise
+uses a quoted return annotation and performs no provider SDK, kubeconfig, or
+plugin work at import time. Placement types are not re-exported from
+`sky.__init__` or `sky.clouds.__init__`.
+
+The two S1 leaf files remain importable on the repository's supported Python
+3.10 through 3.14 range. They use `from __future__ import annotations` and the
+PEP 585 and PEP 604 forms required by the repository's Ruff `py310` target.
+`FrozenJSONDict` is declared before the recursive `FrozenJSONValue` runtime
+alias. Its runtime base is
+`collections.abc.Mapping[str, 'FrozenJSONValue']`; after that class exists,
+`FrozenJSONValue` may include the class object in a PEP 604 union. The leaf
+never evaluates `UnionType | 'FrozenJSONDict'`, which raises `TypeError` on
+Python 3.10 through 3.13. The existing `worker-floor-import` CI job explicitly
+imports both leaves on Python 3.10 and compile-checks the whole package; normal
+CI imports and tests them on the deployed Python 3.14 ceiling.
+
+#### Exact V1 leaf types
+
+`Cloud.get_offer_source()` is an instance method. The generic leaf defines
+these additional closed enums and exact wire values:
+
+| Enum | V1 members and wire values |
+|---|---|
+| `OfferSetStatusV1` | `OK='ok'`, `NO_OFFERS='no_offers'`, `NOT_REPRESENTABLE='not_representable'` |
+| `OfferRevalidationStatusV1` | `VALID='valid'`, `UNAVAILABLE='unavailable'`, `NOT_REPRESENTABLE='not_representable'` |
+| `OfferPriceBasisV1` | `NODE_HOUR='node_hour'` |
+| `OfferCurrencyV1` | `USD='USD'` |
+| `OfferPurchaseModeV1` | `ON_DEMAND='on_demand'` |
+| `OfferAvailabilityV1` | `UNKNOWN='unknown'`, `UNAVAILABLE='unavailable'` |
+| `OfferRevalidationPolicyV1` | `BEFORE_MUTATION='before_mutation'` |
+| `OfferReservationEvidenceV1` | `NOT_APPLICABLE='not_applicable'` |
+| `OfferQuotaEvidenceV1` | `UNKNOWN='unknown'`, `UNAVAILABLE='unavailable'` |
+| `OfferCapacityEvidenceV1` | `SHAPE_FITS_EXISTING_NODE='shape_fits_existing_node'`, `CONTEXT_UNREACHABLE='context_unreachable'`, `SHAPE_NO_LONGER_SUPPORTED='shape_no_longer_supported'`, `CAPACITY_UNAVAILABLE='capacity_unavailable'`, `PROVIDER_OBJECT_CONFLICT='provider_object_conflict'` |
+
+These generic V1 sets intentionally equal the values needed by the Kubernetes
+pilot. A later provider does not silently extend them; a new wire value requires
+an explicit schema-version design update.
+
+The in-memory offer has exactly these frozen nested dataclasses and fields:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class OfferScopeV1:
+    kind: str
+    id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferAcceleratorV1:
+    name: str
+    count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferResourcesV1:
+    instance_type: str
+    cpus: str
+    memory_gib: str
+    accelerators: tuple[OfferAcceleratorV1, ...]
+    disk_tier: str | None
+    network_tier: str | None
+    placement_constraints_digest: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferPriceV1:
+    amount: str
+    basis: OfferPriceBasisV1
+    currency: OfferCurrencyV1
+
+
+@dataclasses.dataclass(frozen=True)
+class OfferEvidenceV1:
+    reservation: OfferReservationEvidenceV1
+    quota: OfferQuotaEvidenceV1
+    capacity: OfferCapacityEvidenceV1
+    requested_nodes: int
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class OfferProviderPayloadV1:
+    version: int
+    identity: FrozenJSONDict
+    observation: FrozenJSONDict
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class PlacementOfferV1:
+    schema_version: int
+    operation: OfferOperationV1
+    actuation_kind: OfferActuationKindV1
+    offer_id: str
+    observation_id: str
+    provider: str
+    scope: OfferScopeV1
+    resources: OfferResourcesV1
+    region: str
+    candidate_zones: tuple[str, ...]
+    batching_scope: str
+    price: OfferPriceV1
+    purchase_mode: OfferPurchaseModeV1
+    availability: OfferAvailabilityV1
+    observed_at: datetime.datetime
+    ttl_seconds: int
+    revalidation_policy: OfferRevalidationPolicyV1
+    evidence: OfferEvidenceV1
+    provider_payload: OfferProviderPayloadV1
+```
+
+`FrozenJSONDict` is a detached, recursively immutable mapping. Objects are
+stored with keys sorted by Unicode code point; arrays become tuples. Equal
+frozen objects therefore have equal hashes regardless of input insertion
+order. Thawing always produces a fresh tree of JSON built-ins.
+
+`OfferProviderPayloadV1` has only one supported construction path:
+
+```python
+@classmethod
+def create(
+    cls,
+    *,
+    identity: dict[str, JSONValue],
+    observation: dict[str, JSONValue],
+    payload_schema: ProviderPayloadSchemaV1,
+) -> OfferProviderPayloadV1:
+    ...
+```
+
+`PlacementOfferV1` has only these three supported construction paths:
+
+```python
+@classmethod
+def create(
+    cls,
+    *,
+    operation: OfferOperationV1,
+    actuation_kind: OfferActuationKindV1,
+    provider: str,
+    scope: OfferScopeV1,
+    resources: OfferResourcesV1,
+    region: str,
+    candidate_zones: tuple[str, ...],
+    batching_scope: str,
+    price: OfferPriceV1,
+    purchase_mode: OfferPurchaseModeV1,
+    availability: OfferAvailabilityV1,
+    observed_at: datetime.datetime,
+    ttl_seconds: int,
+    revalidation_policy: OfferRevalidationPolicyV1,
+    evidence: OfferEvidenceV1,
+    provider_payload: OfferProviderPayloadV1,
+    payload_schema: ProviderPayloadSchemaV1,
+) -> PlacementOfferV1:
+    ...
+
+
+@classmethod
+def from_envelope(
+    cls,
+    envelope: dict[str, JSONValue],
+    *,
+    payload_schema: ProviderPayloadSchemaV1,
+) -> PlacementOfferV1:
+    ...
+
+
+@classmethod
+def from_json(
+    cls,
+    serialized: str | bytes,
+    *,
+    payload_schema: ProviderPayloadSchemaV1,
+) -> PlacementOfferV1:
+    ...
+```
+
+Both dataclasses use `init=False`. Callers never supply `version`,
+`schema_version`, `offer_id`, or `observation_id`; the factory fixes the
+versions and computes both IDs. All three placement-offer paths apply the
+generic envelope validators and injected payload schema. `observed_at` is an
+aware UTC `datetime` with whole-second precision. Candidate-zone order is
+preserved because it enters stable identity. Accelerator names must be unique
+and arrive in normalized sorted order; the parser rejects an unsorted or
+duplicate list rather than silently changing a provider decision.
+
+Only `PLAN_CREATE` and `FRESH_CREATE` offers may be constructed.
+`PLAN_CREATE` is process-local and cannot be enveloped or handed off.
+`REUSE` and `RESTART` are request classifications only and return
+`NOT_REPRESENTABLE(UNSUPPORTED_OPERATION)` in V1.
+
+The leaf also defines an injected, recursively immutable payload allowlist:
+
+```python
+class ProviderPayloadNodeKindV1(enum.Enum):
+    STRING = 'string'
+    DIGEST = 'digest'
+    INTEGER = 'integer'
+    BOOLEAN = 'boolean'
+    NULL = 'null'
+    OBJECT = 'object'
+    ARRAY = 'array'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPayloadSchemaNodeV1:
+    kind: ProviderPayloadNodeKindV1
+    fields: tuple[tuple[str, 'ProviderPayloadSchemaNodeV1'], ...] = ()
+    item: 'ProviderPayloadSchemaNodeV1 | None' = None
+    allowed_strings: tuple[str, ...] = ()
+    allow_empty: bool = False
+
+    def __post_init__(self) -> None:
+        # Enforce the closed shape rules below before an instance is usable.
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPayloadSchemaV1:
+    provider: str
+    identity: ProviderPayloadSchemaNodeV1
+    observation: ProviderPayloadSchemaNodeV1
+
+    def __post_init__(self) -> None:
+        # Enforce the provider grammar and object roots described below.
+        ...
+```
+
+`ProviderPayloadSchemaNodeV1.__post_init__()` requires `fields` to be an exact
+tuple of exact two-tuples, every key to satisfy the provider-payload key bound,
+every child to be a schema node, and keys to be unique and already sorted by
+Unicode code point. An `OBJECT` node has no `item`, `allowed_strings`, or
+`allow_empty`. An `ARRAY` node has exactly one schema-node `item` and has no
+fields, `allowed_strings`, or `allow_empty`. Every scalar node has no fields or
+item. Only `STRING` may have `allowed_strings` or `allow_empty`;
+`allowed_strings` is an exact tuple of valid fixed-`NFC_V1` strings that is
+unique and already sorted by Unicode code point. An empty allowed string is
+valid only when `allow_empty` is true.
+
+`ProviderPayloadSchemaV1.__post_init__()` requires `provider` to match
+`^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$`, requires both roots to be exact
+`ProviderPayloadSchemaNodeV1` instances, and requires both root kinds to be
+`OBJECT`.
+The schema is passed explicitly to payload creation and envelope parsing, and
+its provider must equal the offer provider. This is not a global registry and
+does not import provider code into the generic leaf. The Kubernetes source owns
+and passes its exact schema. Unknown keys are rejected by this schema at every
+payload level.
 
 For each eligible optimizer comparison in shadow mode the orchestrator calls
 `capture_observation()` exactly once. The provider's legacy projection adapter
@@ -434,34 +702,49 @@ after every provider has typed absence evidence and an atomic cluster-record
 reset. A control path that releases either lock must reacquire both and return
 to `_check_existing_cluster()`. Dry run always remains `PLAN_CREATE`.
 
-`OfferReasonCodeV1` is a closed enum with exactly these V1 values:
+`OfferReasonCodeV1` is a closed enum with exactly these member names and wire
+values:
 
-- `NONE`;
-- `NO_FEASIBLE_SHAPE`;
-- `UNSUPPORTED_OPERATION`;
-- `UNSUPPORTED_ACTUATION_KIND`;
-- `UNSUPPORTED_NODE_COUNT`;
-- `UNSUPPORTED_ACCELERATOR`;
-- `UNSUPPORTED_RESOURCE_MODE`;
-- `UNSUPPORTED_NETWORK_TIER`;
-- `VOLUME_OR_STORAGE_MOUNT`;
-- `KUEUE_ENABLED`;
-- `RESERVATION_REQUESTED`;
-- `CUSTOM_PLACEMENT_CONFIG`;
-- `UNRESOLVED_SCOPE`;
-- `CONTEXT_UNREACHABLE`;
-- `SCOPE_CHANGED`;
-- `CONFIGURATION_CHANGED`;
-- `SHAPE_NO_LONGER_SUPPORTED`;
-- `CAPACITY_UNAVAILABLE`;
-- `QUOTA_UNAVAILABLE`;
-- `OFFER_IDENTITY_CHANGED`;
-- `OBSERVATION_LIMIT_EXCEEDED`;
-- `PROVIDER_OBJECT_CONFLICT`;
-- `SOURCE_ERROR`;
-- `RETRY_AFTER_PROVIDER_ATTEMPT`.
+```python
+class OfferReasonCodeV1(enum.Enum):
+    NONE = 'none'
+    NO_FEASIBLE_SHAPE = 'no_feasible_shape'
+    UNSUPPORTED_OPERATION = 'unsupported_operation'
+    UNSUPPORTED_ACTUATION_KIND = 'unsupported_actuation_kind'
+    UNSUPPORTED_NODE_COUNT = 'unsupported_node_count'
+    UNSUPPORTED_ACCELERATOR = 'unsupported_accelerator'
+    UNSUPPORTED_RESOURCE_MODE = 'unsupported_resource_mode'
+    UNSUPPORTED_NETWORK_TIER = 'unsupported_network_tier'
+    VOLUME_OR_STORAGE_MOUNT = 'volume_or_storage_mount'
+    KUEUE_ENABLED = 'kueue_enabled'
+    RESERVATION_REQUESTED = 'reservation_requested'
+    CUSTOM_PLACEMENT_CONFIG = 'custom_placement_config'
+    UNRESOLVED_SCOPE = 'unresolved_scope'
+    CONTEXT_UNREACHABLE = 'context_unreachable'
+    SCOPE_CHANGED = 'scope_changed'
+    CONFIGURATION_CHANGED = 'configuration_changed'
+    SHAPE_NO_LONGER_SUPPORTED = 'shape_no_longer_supported'
+    CAPACITY_UNAVAILABLE = 'capacity_unavailable'
+    QUOTA_UNAVAILABLE = 'quota_unavailable'
+    OFFER_IDENTITY_CHANGED = 'offer_identity_changed'
+    OBSERVATION_LIMIT_EXCEEDED = 'observation_limit_exceeded'
+    PROVIDER_OBJECT_CONFLICT = 'provider_object_conflict'
+    SOURCE_ERROR = 'source_error'
+    RETRY_AFTER_PROVIDER_ATTEMPT = 'retry_after_provider_attempt'
+```
 
-`OfferSetResultV1` contains exactly `status`, `offers`, and `reason_code`.
+`OfferSetResultV1` is a validated direct-construction dataclass with this exact
+field order:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class OfferSetResultV1:
+    status: OfferSetStatusV1
+    offers: tuple[PlacementOfferV1, ...]
+    reason_code: OfferReasonCodeV1
+```
+
+Its `__post_init__()` enforces the disposition matrix below.
 `OfferSetResultV1.status` is exactly one of:
 
 - `OK`, with a nonempty ordered tuple of offers;
@@ -471,10 +754,27 @@ to `_check_existing_cluster()`. Dry run always remains `PLAN_CREATE`.
 
 `OK` requires `reason_code=NONE`. `NO_OFFERS` requires an empty offer tuple and
 `NO_FEASIBLE_SHAPE`. `NOT_REPRESENTABLE` requires an empty offer tuple and one
-of the bounded unsupported-input or unresolved-scope codes above.
+of exactly `UNSUPPORTED_OPERATION`, `UNSUPPORTED_ACTUATION_KIND`,
+`UNSUPPORTED_NODE_COUNT`, `UNSUPPORTED_ACCELERATOR`,
+`UNSUPPORTED_RESOURCE_MODE`, `UNSUPPORTED_NETWORK_TIER`,
+`VOLUME_OR_STORAGE_MOUNT`, `KUEUE_ENABLED`, `RESERVATION_REQUESTED`,
+`CUSTOM_PLACEMENT_CONFIG`, `UNRESOLVED_SCOPE`, or
+`OBSERVATION_LIMIT_EXCEEDED`. `SOURCE_ERROR` and
+`RETRY_AFTER_PROVIDER_ATTEMPT` are orchestration outcomes, not source result
+dispositions.
 
-`OfferRevalidationResultV1` contains exactly `status`, `offer`, and
-`reason_code`. Its `status` is exactly one of:
+`OfferRevalidationResultV1` has this exact field order and blocks direct
+construction:
+
+```python
+@dataclasses.dataclass(frozen=True, init=False)
+class OfferRevalidationResultV1:
+    status: OfferRevalidationStatusV1
+    offer: PlacementOfferV1 | None
+    reason_code: OfferReasonCodeV1
+```
+
+Its `status` is exactly one of:
 
 - `VALID`, with a new observation of the same stable offer;
 - `UNAVAILABLE`, with typed quota, capacity, reachability, or reservation
@@ -495,6 +795,29 @@ and requires
 revalidation that computes a different stable identity returns
 `NOT_REPRESENTABLE` with `OFFER_IDENTITY_CHANGED`; only orchestration may
 explicitly replan.
+
+`OfferRevalidationResultV1` is `init=False` and has only these supported
+factories:
+
+- `valid(original, replacement)`;
+- `unavailable(original, replacement, reason_code)`;
+- `not_representable(reason_code)`.
+
+The first two factories enforce the same `offer_id`, requested-node count, and
+nondecreasing `observed_at` against `original`. The full evidence state is
+closed, not just the reason-associated field:
+
+| Factory and reason | Availability | Reservation | Quota | Capacity |
+|---|---|---|---|---|
+| `valid()` | `UNKNOWN` | `NOT_APPLICABLE` | `UNKNOWN` | `SHAPE_FITS_EXISTING_NODE` |
+| `unavailable(CONTEXT_UNREACHABLE)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `CONTEXT_UNREACHABLE` |
+| `unavailable(SHAPE_NO_LONGER_SUPPORTED)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `SHAPE_NO_LONGER_SUPPORTED` |
+| `unavailable(CAPACITY_UNAVAILABLE)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `CAPACITY_UNAVAILABLE` |
+| `unavailable(QUOTA_UNAVAILABLE)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNAVAILABLE` | `SHAPE_FITS_EXISTING_NODE` |
+| `unavailable(PROVIDER_OBJECT_CONFLICT)` | `UNAVAILABLE` | `NOT_APPLICABLE` | `UNKNOWN` | `PROVIDER_OBJECT_CONFLICT` |
+
+`not_representable()` accepts exactly `SCOPE_CHANGED`,
+`CONFIGURATION_CHANGED`, or `OFFER_IDENTITY_CHANGED` and stores no offer.
 
 Expected absence and unsupported-shape results use these typed outcomes rather
 than exceptions. Unexpected provider, credential, or programming failures retain
@@ -579,35 +902,105 @@ strings, never JSON floats. Timestamps are UTC RFC 3339 values normalized to
 `Z`. Object keys are sorted for canonical JSON; array order is significant
 except where the schema explicitly requires sorting.
 
-A provider-namespaced native offer ID may be used only when the provider
-contract declares it stable, nonsecret, and bounded. Otherwise `offer_id` is
-`<provider>:sha256:<digest>` over canonical JSON containing only:
+M2 V1 accepts only the derived offer-ID grammar. No pilot provider declares a
+native offer-ID grammar. Adding one requires a later explicit policy and
+schema-version design update rather than an inferred provider-name special
+case. `offer_id` is `<provider>:sha256:<digest>` over a canonical object whose
+keys and nesting are exactly:
 
-- schema version and canonical provider name;
-- operation;
-- actuation kind;
-- opaque scope kind and ID;
-- region and ordered candidate-zone batch;
-- batching scope;
-- normalized per-node resource identity;
-- purchase mode;
-- provider payload version and its allowlisted `identity` object.
+```text
+schema_version
+provider
+operation
+actuation_kind
+scope {kind, id}
+region
+candidate_zones
+batching_scope
+resources {
+  instance_type, cpus, memory_gib, accelerators,
+  disk_tier, network_tier, placement_constraints_digest
+}
+purchase_mode
+provider_payload {version, identity}
+```
 
 Price, availability, observation time, TTL, revalidation policy, evidence, and
 the provider payload `observation` object are excluded from the stable ID.
-`observation_id` is the SHA-256 digest of the stable offer ID plus all of those
-observation fields. Changing requested node count changes the observation ID
-through evidence but does not change the per-placement stable ID.
+`observation_id` is `sha256:<digest>` over a canonical object whose keys and
+nesting are exactly:
 
-The parser recomputes every digest it can verify and rejects a mismatch. A V1
-provider payload is constructed only from a provider-specific allowlist. Raw
-SDK responses, kubeconfigs, credentials, tokens, environment variables, pod
-configuration, labels, annotations, or admission payloads are never accepted as
-generic payload data. Suspicious secret-like keys are rejected as
-defense-in-depth, but key-name filtering is not considered redaction.
+```text
+offer_id
+price {amount, basis, currency}
+availability
+observed_at
+ttl_seconds
+revalidation_policy
+evidence {reservation, quota, capacity, requested_nodes}
+provider_payload {observation}
+```
+
+Changing requested node count changes the observation ID through evidence but
+does not change the per-placement stable ID.
+
+`canonical_json_bytes_v1(value)` is exactly:
+
+```python
+json.dumps(
+    value,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(',', ':'),
+    allow_nan=False,
+).encode('utf-8')
+```
+
+There is no trailing newline. Every string is already NFC-normalized before
+this call. `NFC_V1` is fixed to
+`unicodedata.ucd_3_2_0.normalize('NFC', value)`, never the interpreter's
+default `unicodedata.normalize()`. Ingestion accepts a string only when it
+equals that fixed normalization. It rejects every surrogate code point
+`U+D800` through `U+DFFF` and every C0 or C1 control code point in the explicit
+ranges `U+0000` through `U+001F` and `U+007F` through `U+009F`; control
+validation does not consult a runtime Unicode category database. The parser
+recomputes both digest preimages with this function and rejects a mismatch.
+Cross-version golden fixtures lock both
+`NFC_V1('\u0301\U00016ff0') == '\U00016ff0\u0301'` and
+`NFC_V1('\u0301\U00016ff1') == '\U00016ff1\u0301'`; the left-hand input forms
+are rejected as non-normalized and the right-hand forms are accepted.
+
+The persistence-ingestion entry point is exactly the `from_json()` signature
+above, where `serialized` is `str` or strict UTF-8 `bytes`; `bytearray` and
+every other type are rejected. It uses `object_pairs_hook` to reject a duplicate
+key before dictionary materialization and rejects JSON constants and floats.
+`from_envelope()` accepts an already-materialized in-process dictionary only;
+it cannot prove that upstream text had no duplicate keys and is not a
+persistence-ingestion API. The `bulk_provision()` validation path calls
+`to_envelope()`, canonical-serializes that fresh dictionary, and then calls
+`from_json()` with the provider schema.
+
+A V1 provider payload is constructed only through the injected provider
+allowlist. Raw SDK responses, kubeconfigs, credentials, tokens, environment
+variables, pod configuration, labels, annotations, or admission payloads are
+never accepted as generic payload data. Suspicious secret-like keys are
+rejected as defense-in-depth, but key-name filtering is not considered
+redaction.
+
+Secret-key matching is exact and recursive. Lowercase the printable ASCII key,
+split it on one or more `_` or `-` characters, and reject if any segment is
+`secret`, `password`, `passwd`, `token`, `credential`, `credentials`,
+`kubeconfig`, `authorization`, or `cookie`; if any adjacent pair is `api_key`,
+`access_key`, `private_key`, or `client_secret`; or if the unsplit lowercase
+key is `apikey`, `accesskey`, `privatekey`, or `clientsecret`. Substrings do
+not match, so `tokenizer`, `credentialed`, `monkey`, and `key_count` are
+allowed by this defense-in-depth filter, subject to the provider allowlist.
 
 The canonical provider payload is limited to 4 KiB and the full canonical
-envelope to 16 KiB. V1 has these closed per-field bounds:
+envelope to 16 KiB. Exactly 4,096 UTF-8 bytes is accepted for the complete
+canonical provider payload and 4,097 is rejected. Exactly 16,384 UTF-8 bytes is
+accepted for the full canonical envelope and 16,385 is rejected. V1 has these
+closed per-field bounds:
 
 | Field | V1 bound |
 |---|---|
@@ -615,17 +1008,17 @@ envelope to 16 KiB. V1 has these closed per-field bounds:
 | `operation` | exactly `fresh_create` for a provisionable or persisted envelope; `plan_create` is process-local and cannot be enveloped |
 | `actuation_kind` | exact closed enum; Kubernetes V1 envelopes require `direct_pod` |
 | `provider` | 1 to 63 lowercase ASCII letters, digits, `.`, `_`, or `-`, starting and ending with a letter or digit |
-| `offer_id` | 1 to 256 ASCII characters and either the declared provider-native grammar or `<provider>:sha256:` plus exactly 64 lowercase hexadecimal characters |
+| `offer_id` | `<provider>:sha256:` plus exactly 64 lowercase hexadecimal characters, with a total maximum of 256 ASCII characters |
 | `observation_id`, scope ID, optional constraint digest, and provider identity digests | `sha256:` plus exactly 64 lowercase hexadecimal characters |
 | scope kind and batching scope | 1 to 128 lowercase ASCII letters, digits, or `_`; Kubernetes V1 values are exact enums |
-| instance type | 1 to 256 UTF-8 bytes after NFC normalization, with control characters forbidden |
-| CPU and memory decimal strings | canonical, nonnegative, non-exponent decimal; at most 38 integral and 18 fractional digits; no sign, leading zero, or trailing fractional zero |
+| instance type | 1 to 256 UTF-8 bytes after fixed `NFC_V1` validation, with the explicit control ranges forbidden |
+| CPU and memory decimal strings | exact regex `(?:0|[1-9][0-9]{0,37})(?:\.[0-9]{0,17}[1-9])?`; canonical, nonnegative, and non-exponent |
 | accelerators | at most 8 entries; normalized name 1 to 128 UTF-8 bytes; count integer 1 through 2,147,483,647 |
 | disk and network tier | null or 1 to 64 lowercase ASCII letters, digits, `_`, or `-` |
-| region and each zone | 1 to 1,024 UTF-8 bytes after NFC normalization, with control characters forbidden |
+| region and each zone | 1 to 1,024 UTF-8 bytes after fixed `NFC_V1` validation, with the explicit control ranges forbidden |
 | candidate zones | at most 32 unique entries |
-| price amount | the same decimal grammar and digit bounds as CPU and memory; nonnegative |
-| price basis, currency, purchase mode, availability, revalidation policy, and evidence values | exact closed enums; currency is exactly three uppercase ASCII letters |
+| price amount | the same exact decimal regex as CPU and memory |
+| price basis, currency, purchase mode, availability, revalidation policy, and evidence values | exact closed enums; V1 currency is `OfferCurrencyV1.USD` |
 | observed time | exactly 20 ASCII bytes in `YYYY-MM-DDTHH:MM:SSZ` form and a valid UTC datetime |
 | TTL | integer 1 through 300 seconds; Kubernetes V1 emits exactly 15 |
 | requested nodes | integer 1 through 10,000; the Kubernetes authoritative V1 subset requires exactly 1 |
@@ -635,11 +1028,18 @@ Each provider-payload object has at most 32 keys, each key is 1 to 64 printable
 ASCII characters, and the combined `identity` and `observation` trees have at
 most 64 keys and 128 array elements. Maximum nesting depth is four below either
 payload root and each array has at most 32 elements. Payload strings are at most
-1,024 UTF-8 bytes after NFC normalization; integers are in the signed 64-bit
+1,024 UTF-8 bytes after fixed `NFC_V1` validation; integers are in the signed 64-bit
 range; only strings, integers, booleans, nulls, bounded arrays, and bounded
 objects are allowed. JSON floats are forbidden. Empty strings are allowed only
 for a provider field whose allowlist explicitly declares them meaningful;
 Kubernetes V1 declares none.
+
+For these counts, each `identity` and `observation` root object is depth zero;
+a directly nested container is depth one and a container at depth four is the
+deepest accepted container. Root keys count toward the combined 64-key limit,
+and every member of every array counts toward the combined 128-element limit.
+The 4 KiB limit covers the complete canonical `provider_payload` object,
+including `version`, `identity`, and `observation`.
 
 V1 ingestion rejects unknown keys at every level, duplicate object keys before
 dictionary materialization, non-JSON values, invalid normalization, nonfinite
@@ -662,9 +1062,52 @@ The Kubernetes V1 parser narrows the generic enums to these exact values:
 | quota evidence | `unknown`, `unavailable` |
 | capacity evidence | `shape_fits_existing_node`, `context_unreachable`, `shape_no_longer_supported`, `capacity_unavailable`, `provider_object_conflict` |
 
+The injected Kubernetes payload schema has exactly these leaf paths:
+
+| Payload root and field | Schema node |
+|---|---|
+| `identity.rendered_pod_placement_fingerprint` | `DIGEST` |
+| `identity.service_account_identity_digest` | `DIGEST` |
+| `observation.capacity_evidence` | `STRING`, allowed strings exactly `shape_fits_existing_node`, `context_unreachable`, `shape_no_longer_supported`, `capacity_unavailable`, `provider_object_conflict` |
+| `observation.configuration_fingerprint` | `DIGEST` |
+
+Both roots reject every other key and no string field permits an empty value.
+
 Kubernetes V1 additionally requires an empty accelerator list, null disk and
 network tiers, and an empty candidate-zone list. No sample value implicitly
 extends these enums.
+
+Payload-schema validation narrows only `provider_payload`; it is not allowed to
+stand in for provider-wide envelope policy. The Kubernetes-owned leaf therefore
+defines this exact post-validator:
+
+```python
+def validate_kubernetes_offer_v1(
+    offer: PlacementOfferV1,
+) -> PlacementOfferV1:
+    ...
+```
+
+The validator returns the identical object after requiring provider
+`kubernetes`; operation `PLAN_CREATE` or `FRESH_CREATE`; actuation kind
+`DIRECT_POD`; scope kind
+`kubernetes_context_endpoint_identity_namespace_v1`; batching scope `context`;
+price basis `NODE_HOUR`; currency `USD`; purchase mode `ON_DEMAND`;
+revalidation policy `BEFORE_MUTATION`; TTL 15; one requested node; empty
+accelerators and candidate zones; null disk, network, and placement-constraint
+tiers or digests; and one of exactly the six complete availability,
+reservation, quota, and capacity tuples in the revalidation matrix above.
+There is no cross-product between rows: in particular, quota `UNAVAILABLE`
+requires capacity `SHAPE_FITS_EXISTING_NODE`, and every capacity-derived
+unavailable value requires quota `UNKNOWN`. It also requires the allowlisted
+`provider_payload.observation.capacity_evidence` to equal
+`evidence.capacity.value`.
+
+The Kubernetes source calls this validator after every generic `create()`,
+`from_envelope()`, and `from_json()` result. Orchestration and
+`bulk_provision()` call it again before placing any Kubernetes offer in an
+actuation handoff. Generic parsing alone never establishes Kubernetes
+eligibility.
 
 An offer expires when
 `now >= observed_at + ttl_seconds`. Provisioning revalidates an expired offer or
@@ -952,12 +1395,30 @@ class OptimizationOfferPlanV1:
     decisions: tuple[TaskPlacementDecisionV1, ...]
 ```
 
+`TaskPlacementDecisionV1` is a validated direct-construction dataclass. Its
+`task_index` is nonnegative, its fingerprint has the exact SHA-256 grammar, and
+its operation is exactly `PLAN_CREATE`. A non-null offer must also have
+operation `PLAN_CREATE`, must equal the decision operation, and requires a
+non-null canonical UUIDv4 `selection_capture_id`. A null offer may carry either
+a null selection capture ID when classification ended before a provider
+capture, or a non-null canonical UUIDv4 ID when the captured observation
+produced no selected offer. Thus offer presence implies capture-ID presence,
+but capture-ID presence does not imply offer presence. `FRESH_CREATE`, `REUSE`,
+and `RESTART` decisions are rejected because their authoritative state is
+carried separately after the locks.
+
+`OptimizationOfferPlanV1` accepts only an exact tuple of decisions, preserves
+their supplied order, and rejects any negative or duplicate `task_index`.
+
 Immediately after every successful pre-lock `Optimizer.optimize()` call, the
 internal placement runtime builds a fresh `OptimizationOfferPlanV1` for the
 returned DAG and current optimize target using `operation=PLAN_CREATE`.
 `task_index` is the task's position in that exact DAG.
 `resources_fingerprint` is the canonical normalized placement class and
-requested node count, excluding runtime-only image resolution. The runtime
+requested node count, excluding runtime-only image resolution, serialized with
+`canonical_json_bytes_v1()` and encoded as `sha256:<64-lowercase-hex>`.
+`task_index` is a nonnegative integer and decision indices are unique within a
+plan. The runtime
 independently ranks the offer projection and compares it with
 `task.best_resources`. This plan is comparison evidence only: no
 `PLAN_CREATE` decision is copied into `ToProvisionConfig`, `_retry_zones()`, or
@@ -1031,8 +1492,30 @@ later attempts and never creates or clears a fence. Thus an offer-side
 disagreement cannot alter legacy mutation.
 
 An authoritative first attempt passes mode `AUTHORITATIVE`, a valid offer, a
-non-null context, `provider_attempt_count=1`, and `reason_code=NONE`; its
-provider and revalidation capture IDs must match.
+non-null context, `provider_attempt_count=1`, and `reason_code=NONE`.
+`PlacementOfferHandoffV1` deliberately has no capture-ID field and the offer
+identity deliberately excludes request-local capture IDs, so this dataclass
+cannot prove capture provenance by itself. `_retry_zones()` must call
+this exact leaf helper immediately before constructing the handoff:
+
+```python
+def validate_authoritative_capture_v1(
+    offer: PlacementOfferV1,
+    capture: ObservationCaptureV1,
+    *,
+    freshness: ObservationFreshnessV1,
+    selection_capture_id: str,
+) -> ProviderActuationContextV1:
+    ...
+```
+
+It requires `freshness is REQUIRE_FRESH`, validates
+`selection_capture_id`, requires a non-null context, requires observation and
+context provider and capture ID equality, rejects a capture ID equal to
+`selection_capture_id`, requires `offer.provider` to equal that provider, and
+requires `offer.observed_at` to equal the observation's supplied
+`observed_at`. It returns that exact validated context object. Only the
+returned object may be put in the handoff.
 
 A deterministic first-attempt legacy fallback passes mode
 `LEGACY_FIRST_ATTEMPT`, null offer and context, attempt ordinal one, and the
@@ -1054,9 +1537,9 @@ an authoritative retry passes mode
 `LEGACY_RETRY_AFTER_PROVIDER_ATTEMPT`, null offer and context, an attempt
 ordinal of at least two, and reason `RETRY_AFTER_PROVIDER_ATTEMPT`. No other field
 combination beyond the dispositions above is valid. Before an authoritative
-call to `bulk_provision()`, `_retry_zones()` requires
-`capture.observation.capture_id == capture.actuation_context.capture_id`; it
-rejects a missing, reused selection, or cross-provider context before mutation.
+call to `bulk_provision()`, `_retry_zones()` requires the helper above to accept
+the capture; it rejects a missing, non-fresh, reused selection, or
+cross-provider context before mutation.
 `_retry_zones()` passes the revalidated immutable offer and the pinned context
 from that capture in the frozen handoff.
 `bulk_provision()` re-reads the server gate. Under an authoritative gate it
@@ -1224,8 +1707,9 @@ failure to propagate it forces explicit replanning and never mutates with the
 stale offer.
 
 The existing `ProvisionRecord.region` and `zone` fields are input echoes for
-Kubernetes and are not accepted as actual-placement evidence. M2 adds this
-leaf-type contract and an optional final `ProvisionRecord.placement_evidence`
+Kubernetes and are not accepted as actual-placement evidence. This contract is
+implemented in M2 S3, not in the S1 generic offer foundation. S3 adds the
+separate leaf type and an optional final `ProvisionRecord.placement_evidence`
 field defaulting to null:
 
 ```python
@@ -1671,6 +2155,24 @@ identically.
 - promote the eligible Kubernetes subset in a separate commit and retain all
   other Kubernetes requests on the typed legacy fallback.
 
+M2 implementation is split into three reviewed slices:
+
+- S1, named `generic offer contract foundation`, owns
+  `sky/utils/json_types.py`, `sky/placement/offer.py`, the docstring-only
+  `sky/placement/__init__.py`, the side-effect-free default
+  `Cloud.get_offer_source()`, `PlacementOfferHandoffV1`,
+  `validate_authoritative_capture_v1()`, their focused leaf tests, and the
+  narrow `.github/workflows/static-analysis.yml` edit that imports both leaves
+  and executes the fixed-Unicode goldens in the existing Python 3.10
+  `worker-floor-import` job. It does not add Kubernetes policy, orchestration
+  wiring, `ActualPlacementEvidenceV1`, or a `ProvisionRecord` field.
+- S2 owns the Kubernetes observation source, payload schema, closed
+  resource/config classifiers, and `validate_kubernetes_offer_v1()`, with no
+  mutation ownership change.
+- S3 owns orchestration propagation and use of the already-defined handoff,
+  shadow comparison, actual-placement evidence, persistence, and the guarded
+  authoritative promotion.
+
 Deployment proves candidate safety, optimizer winner, selected placement,
 pre-mutation revalidation, actual provisioning result, handle compatibility,
 rollback, and cleanup on the exact image digest.
@@ -1776,6 +2278,71 @@ Every declared facet generates conformance tests for:
 - ambiguous outcomes enter readback;
 - provider request and operation IDs are preserved;
 - terminal deletion requires complete absence proof.
+
+### Placement offer
+
+- exact enum member names and wire values, protocol method signatures and
+  order, dataclass field order, and factory-only constructors;
+- equal recursively frozen payload objects have equal hashes regardless of
+  input insertion order, and mutation of the source or thawed output cannot
+  mutate the offer;
+- a golden canonical-byte fixture locks both digest preimages and IDs;
+- the injected payload schema rejects unknown, missing, unsorted, wrongly
+  typed, disallowed-string, and empty fields at every depth;
+- JSON text rejects duplicates before materialization, floats, constants,
+  lone surrogates, explicit C0/C1 controls, invalid fixed `NFC_V1`, and unknown
+  envelope keys;
+- the locked secret-key deny and allow corpus matches exactly;
+- scalar, per-container, combined-tree, 4 KiB payload, and 16 KiB envelope
+  boundaries test the accepted value and the first rejected value;
+- offer-set, revalidation-factory, capture/context, plan, and handoff
+  disposition matrices cover every closed enum member;
+- plan tests reject duplicate `task_index` values and accept unique
+  nonnegative indices without reordering decisions;
+- stable-field changes change both IDs, observation-only changes preserve the
+  offer ID and change the observation ID, and requested node count remains
+  observation-only;
+- import tests prove the generic leaf has no runtime cloud, optimizer,
+  backend, provisioner, server, or Kubernetes import and no public root
+  re-export;
+- the default `Cloud.get_offer_source()` is side-effect-free and returns null.
+
+The S1 suite has these 15 named acceptance tests, with the noted assertions
+owned by the named test rather than left implicit:
+
+1. `test_v1_enum_value_sets_are_exact` also inspects exact protocol method
+   declaration order and signatures, dataclass field order, factory signatures,
+   and disabled direct constructors.
+2. `test_offer_payload_is_recursively_immutable_and_detached` also constructs
+   every invalid schema-node shape, unsorted or duplicate field and string
+   allowlist, invalid provider grammar, and non-object root.
+3. `test_observation_capture_requires_matching_provider_and_capture_id` covers
+   canonical UUIDv4 acceptance and rejects every provider, context, freshness,
+   selection-reuse, UUID case, version, variant, and shape mismatch.
+4. `test_offer_set_result_disposition_matrix`.
+5. `test_offer_revalidation_result_disposition_matrix` covers every exact
+   availability, reservation, quota, and capacity tuple and rejects the full
+   invalid cross-product.
+6. `test_stable_and_observation_identity_field_partition` includes golden
+   canonical bytes and both IDs.
+7. `test_envelope_round_trip_returns_fresh_json_builtins`.
+8. `test_envelope_recomputes_and_rejects_mismatched_digests`.
+9. `test_plan_create_cannot_be_enveloped_or_handed_off` also covers every
+   `TaskPlacementDecisionV1` combination, rejects negative and duplicate plan
+   indices, and proves unique decision order is preserved.
+10. `test_envelope_rejects_unknown_duplicate_float_and_secret_like_values`.
+11. `test_envelope_scalar_collection_depth_and_byte_boundaries` also runs
+    fixed-`NFC_V1` golden cases containing `U+16FF0` and `U+16FF1` beside the
+    older combining mark `U+0301`, and proves C0/C1 rejection is independent of
+    the runtime Unicode database. The same goldens execute without pytest in
+    the Python 3.10 worker-floor import job.
+12. `test_handoff_disposition_matrix`.
+13. `test_offer_module_has_only_allowed_leaf_imports` also runs the leaf import
+    and runtime-alias compatibility check on Python 3.10 in the existing
+    worker-floor job and on Python 3.14 in normal CI; package metadata and
+    classifiers cover the supported 3.10 through 3.14 range.
+14. `test_placement_types_are_not_publicly_reexported`.
+15. `test_cloud_offer_source_default_is_none_and_side_effect_free`.
 
 ### Action runtime
 
@@ -1978,3 +2545,30 @@ They verified:
 
 No confirmed M2 safety, compatibility, or implementation blocker remained.
 M3 was out of scope and remains explicitly unapproved.
+
+### Review 4
+
+Verdict: `PURSUE` for M2 S1.
+
+Three independent reviews reloaded the complete generic offer contract at exact
+SHA-256
+`3877665d095e330ff55ad96c72b4241b3d838d9f91506d5fb0c64d23f6c6938e`.
+The final review verified:
+
+- exact wire enums, dataclass and protocol order, factory-only construction,
+  canonical bytes, digest preimages, and bounds;
+- an immutable injected payload-schema DSL with constructor-time invariants;
+- fixed Unicode 3.2 normalization, explicit control ranges, and deterministic
+  behavior on the Python 3.10 through 3.14 support range;
+- canonical UUIDv4 capture provenance and a distinct fresh authoritative
+  capture;
+- closed offer-set, revalidation evidence, plan-decision, and handoff
+  disposition matrices;
+- provider-owned Kubernetes envelope narrowing without importing provider code
+  into the generic leaf;
+- explicit S1 ownership of the generic handoff contract and existing Python
+  3.10 worker-floor qualification, while S2 and S3 retain provider and
+  orchestration ownership.
+
+No confirmed S1 wire, compatibility, ownership, or implementation blocker
+remained. M3 was out of scope and remains explicitly unapproved.
