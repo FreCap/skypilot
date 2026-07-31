@@ -1389,6 +1389,9 @@ SkyServe Service
 
 To define a YAML for use for :ref:`services <sky-serve>`, use previously mentioned fields to describe each replica, then add a service section to describe the entire service.
 
+If neither ``replicas`` nor ``replica_policy`` is specified, SkyServe defaults
+to zero replicas.
+
 Syntax
 
 .. parsed-literal::

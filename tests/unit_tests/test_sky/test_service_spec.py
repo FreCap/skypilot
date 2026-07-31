@@ -9,6 +9,12 @@ from sky.serve import serve_utils
 from sky.serve import service_spec
 
 
+def test_default_min_replicas_is_zero():
+    spec = service_spec.SkyServiceSpec.from_yaml_config({})
+
+    assert spec.min_replicas == 0
+
+
 class TestLoadBalancerHighAvailability:
     """The mode is derived from pool-ness; the YAML field is ignored."""
 
