@@ -65,7 +65,11 @@ class TestSkyPilotReplicaManagerInitOrdering:
     scratch: a controller crash-loop, observed live at ~860 rows / ~520
     interrupted launches)."""
 
-    def _build(self, recovery_body, started_records, resource_scope=None):
+    def _build(self,
+               recovery_body,
+               started_records,
+               resource_scope=None,
+               supervisor_calls=None):
         import threading as threading_mod
 
         with mock.patch.object(
@@ -94,6 +98,8 @@ class TestSkyPilotReplicaManagerInitOrdering:
             def _record(target, *_args, **_kwargs):
                 started_records.append(getattr(target, '__name__',
                                                repr(target)))
+                if supervisor_calls is not None:
+                    supervisor_calls.append((target, _kwargs))
                 return mock.Mock()
 
             mock_supervised.side_effect = _record
@@ -154,6 +160,14 @@ class TestSkyPilotReplicaManagerInitOrdering:
         assert '_job_status_fetcher' in started
         assert '_replica_prober' in started
 
+    def test_all_three_daemon_threads_share_ownership_stop_event(self):
+        calls = []
+        mgr = self._build(lambda self_: None, [], supervisor_calls=calls)
+
+        assert len(calls) == 3
+        assert all(
+            kwargs['stop_event'] is mgr._ownership_lost for _, kwargs in calls)
+
     def test_legacy_per_gpu_yaml_uses_persisted_physical_semantics(self):
         legacy_yaml = """
 resources:
@@ -211,6 +225,71 @@ run: echo hi
         assert manager._uses_logical_replicas is False
         assert manager._version_specs == {7: persisted_spec}
         assert manager._default_planned_capacity == 1
+
+
+class TestBackgroundDutyOwnershipLifecycle:
+
+    @staticmethod
+    def _stopped_manager():
+        mgr = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        mgr._ownership_lost = threading.Event()
+        mgr._ownership_lost.set()
+        return mgr
+
+    @pytest.mark.parametrize(('loop_name', 'work_name'), [
+        ('_thread_pool_refresher', '_refresh_thread_pool'),
+        ('_job_status_fetcher', '_fetch_job_status'),
+    ])
+    def test_stopped_duty_does_not_start_new_round(self, loop_name, work_name):
+        mgr = self._stopped_manager()
+        work = mock.Mock()
+        setattr(mgr, work_name, work)
+
+        with mock.patch.object(
+                replica_managers.time,
+                'sleep',
+                side_effect=AssertionError('stale duty tried to sleep')):
+            getattr(mgr, loop_name)()
+
+        work.assert_not_called()
+
+    def test_stopped_prober_does_not_start_new_round(self):
+        mgr = self._stopped_manager()
+        mgr._probe_all_replicas = mock.Mock()
+        mgr._service_name = 'svc'
+        mgr._update_mode = None
+        mgr._tick_version_spec_cache = {}
+        mgr._db_fence_kwargs = mock.Mock(return_value={})
+        mgr._get_endpoint_probe_interval_seconds = mock.Mock(return_value=1)
+
+        with mock.patch.object(
+                replica_managers.serve_utils,
+                'set_service_status_and_active_versions_from_replica'), \
+             mock.patch.object(
+                replica_managers.time,
+                'sleep',
+                side_effect=AssertionError('stale prober tried to sleep')):
+            mgr._replica_prober()
+
+        mgr._probe_all_replicas.assert_not_called()
+
+    def test_ownership_loss_interrupts_interval_before_next_round(self):
+        mgr = self._stopped_manager()
+        mgr._ownership_lost = mock.Mock(spec=threading.Event)
+        mgr._ownership_lost.is_set.return_value = False
+        mgr._ownership_lost.wait.return_value = True
+        mgr._refresh_thread_pool = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.time,
+                'sleep',
+                side_effect=AssertionError('interval must be interruptible')):
+            mgr._thread_pool_refresher()
+
+        mgr._refresh_thread_pool.assert_called_once_with()
+        mgr._ownership_lost.wait.assert_called_once_with(
+            replica_managers._PROCESS_POOL_REFRESH_INTERVAL)
 
 
 class TestGetResourcesPorts:
