@@ -794,41 +794,6 @@ def get_job_controller_process(job_id: int) -> ControllerPidRecord | None:
     return get_job_controller_processes([job_id]).get(job_id)
 
 
-def _is_legacy_controller_record(pid: int | None,
-                                 started_at: float | None) -> bool:
-    if pid is None:
-        # Job is from before #4485, so controller_pid is not set.
-        return True
-    if started_at is not None:
-        # controller_pid_started_at is only set after #7847.
-        return False
-    # Between #7051 and #7847, a negative pid identified the consolidated
-    # controller. Positive pids without a start time belong to legacy
-    # single-job controllers.
-    return pid >= 0
-
-
-def is_legacy_controller_process(job_id: int) -> bool:
-    """Check if the controller process is a legacy single-job controller process
-
-    After #7051, the controller process pid is negative to indicate a new
-    multi-job controller process.
-    After #7847, the controller process pid is changed back to positive, but
-    controller_pid_started_at will also be set.
-    """
-    # TODO(cooperc): Remove this function for 0.13.0
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(
-                job_info_table.c.controller_pid,
-                job_info_table.c.controller_pid_started_at).where(
-                    job_info_table.c.spot_job_id == job_id)).fetchone()
-        if row is None:
-            raise ValueError(f'Job {job_id} not found')
-        return _is_legacy_controller_record(row[0], row[1])
-
-
 def get_status(job_id: int) -> ManagedJobStatus | None:
     _, status = get_latest_task_id_status(job_id)
     return status
@@ -955,10 +920,9 @@ def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
     #    inconsistent state).
     #
     # Legacy single-job controllers have NULL schedule_state. They are not
-    # manageable through the consolidated refresh sweep, which only knows how
-    # to reason about modern schedule-state rows. Fence them out here so
-    # cancellation and refresh can fall through to the dedicated legacy signal
-    # path instead of crashing while decoding a NULL enum.
+    # manageable through the consolidated refresh sweep or cancellation path,
+    # which only know how to reason about modern schedule-state rows. Fence
+    # them out here instead of crashing while decoding a NULL enum.
     condition1 = sqlalchemy.and_(
         job_info_table.c.schedule_state.is_not(None),
         job_info_table.c.schedule_state != ManagedJobScheduleState.DONE.value)
@@ -1331,23 +1295,27 @@ def get_job_cancellation_states(
     """Return slim, batched snapshots for managed-job cancellation.
 
     Cancellation needs the currently executable task's status together with
-    workspace authorization and the controller generation used to choose the
-    signal path. Reading those fields together avoids three point queries per
-    job and prevents decisions assembled from different lifecycle snapshots.
-    Only the latest task row per job matters for cancellation, so the query
-    keeps the row volume bounded by job count instead of total task count.
+    workspace authorization. Reading those fields together avoids separate
+    point queries and prevents decisions assembled from different lifecycle
+    snapshots. Only the latest task row per job matters for cancellation, so
+    the query keeps the row volume bounded by job count instead of total task
+    count.
+
+    Only jobs with durable modern lifecycle fields (workspace and
+    schedule_state) participate in this snapshot. Legacy single-job
+    controllers used a separate signal transport; without backward-compatibility
+    support, modern cancellation excludes those rows instead of carrying a
+    second delivery path.
     """
     if not job_ids:
         return {}
 
     snapshots: dict[int, JobCancellationState] = {}
-    for job_id, _, status, workspace, pid, started_at in (
-            _fetch_job_cancellation_state_rows(job_ids)):
+    for job_id, _, status, workspace in _fetch_job_cancellation_state_rows(
+            job_ids):
         snapshots[job_id] = JobCancellationState(
             status=ManagedJobStatus(status),
-            workspace=(constants.SKYPILOT_DEFAULT_WORKSPACE
-                       if workspace is None else workspace),
-            is_legacy_controller=_is_legacy_controller_record(pid, started_at),
+            workspace=workspace,
         )
     return snapshots
 
@@ -1406,7 +1374,9 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
 
     Cancellation follows ``get_latest_task_id_from_statuses`` semantics:
     pick the first non-terminal task if one exists, otherwise the last
-    terminal task.
+    terminal task. Only jobs with durable modern ``job_info`` fields are
+    cancellable through the consolidated signal path, so legacy rows are
+    excluded here.
     """
     unique_job_ids = list(dict.fromkeys(job_ids))
     if not unique_job_ids:
@@ -1426,18 +1396,18 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
             latest_task_ids.c.task_id,
             spot_table.c.status,
             job_info_table.c.workspace,
-            job_info_table.c.controller_pid,
-            job_info_table.c.controller_pid_started_at,
         ).select_from(
             latest_task_ids.join(
                 spot_table,
                 sqlalchemy.and_(
                     spot_table.c.spot_job_id == latest_task_ids.c.spot_job_id,
-                    spot_table.c.task_id ==
-                    latest_task_ids.c.task_id)).outerjoin(
+                    spot_table.c.task_id == latest_task_ids.c.task_id)).join(
                         job_info_table, latest_task_ids.c.spot_job_id ==
-                        job_info_table.c.spot_job_id)).order_by(
-                            latest_task_ids.c.spot_job_id.asc())
+                        job_info_table.c.spot_job_id)).where(
+                            job_info_table.c.workspace.is_not(None),
+                            job_info_table.c.schedule_state.is_not(
+                                None)).order_by(
+                                    latest_task_ids.c.spot_job_id.asc())
         with orm.Session(engine) as session:
             rows.extend(session.execute(query).fetchall())
     return rows
