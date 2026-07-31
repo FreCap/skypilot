@@ -2,10 +2,9 @@
 
 Status: C1 foundation implemented and verified; C2 evidence-scan contract
 accepted; C2.1 implementation and local verification recorded with an exact
-removal ledger; a pre-curation disabled deployment is recorded as supporting
-evidence, but C2.2 remains open for an exact build of the corrected stacked-PR
-tip; C2.3 shadow activation is additionally blocked on a real Serve selector
-and independent provider-call audit evidence, and every materialized or
+removal ledger; C2.2 exact-merge deployment is complete and verified in
+disabled mode; C2.3 shadow activation is blocked on a real Serve selector and
+independent provider-call audit evidence, and every materialized or
 authoritative capacity phase remains blocked
 
 Last updated: 2026-07-31
@@ -1011,7 +1010,8 @@ selector-days and missing intervals, and never claims fleet coverage.
 ## Deployment and rollback
 
 1. Merge and deploy the implementation with mode `disabled` on every role.
-   No database migration runs and the four materialized C1 tables remain
+   C2 adds no schema revision; an ordinary consolidated-server migration
+   verification hook may run, and the four materialized C1 tables remain
    empty.
 2. Commit baseline queries, owners, pilot end, and unavailable-signal
    declarations, but do not start gate arithmetic.
@@ -1169,6 +1169,10 @@ occupancy-ledger code cannot be added under the label of C2 cleanup.
 
 ## Verification
 
+Foundation PR #1089 merged as
+`5008c5f553d0b73b3b5d4e42ff124630e34a8cec` before the consolidated C2
+implementation.
+
 ### C2.1 verification evidence
 
 Curated stacked-PR implementation anchors:
@@ -1177,12 +1181,19 @@ Curated stacked-PR implementation anchors:
 - `89963c1fb`: bounded read-only source queries and pure adapters.
 - `2dabe0717`: scan repository, metrics, projector, controller lifecycle
   integration, and PostgreSQL/runtime tests.
+- `f33666aa41eaa3815cee8cc77465db9f15be754b`: final reviewed PR head after
+  cancellation and strict shadow-drain corrections.
+- `73d80feb938c123a76b3b822ccfcd3d9588ed993`: merge commit for consolidated
+  implementation PR #1094 and the source commit reported by the deployed
+  image.
 
 These commits were cleanly reconstructed on `improvements` commit
 `004c7b2bc`. Every feature-path blob at the curated projector tip matched the
-reviewed pre-replay tree before the disabled-path correction in this PR; the
-rejected design and rollout-helper commits are absent from the stack. The
-curated commits above are the only implementation anchors for review.
+reviewed pre-replay tree before the final disabled-path corrections; the
+rejected design and rollout-helper commits are absent from the stack. PR #1094
+carried those corrections through exact-tree adversarial review and merged
+them together. The curated commits and final PR head above are the only
+implementation anchors for review.
 
 Observed against the pre-replay implementation on 2026-07-31:
 
@@ -1198,7 +1209,7 @@ Observed against the pre-replay implementation on 2026-07-31:
 - independent adversarial implementation review found no remaining C2.1
   contract blocker after the final fencing and committed-metric fixes.
 
-### C2.2 pre-curation disabled-deployment evidence
+### Historical C2.2 pre-curation disabled-deployment evidence
 
 The pre-curation local implementation build reported source commit
 `0aae14884482642523ed96227a42523c5c0a1583`. It was packaged as one
@@ -1208,11 +1219,12 @@ The deployed digest is
 The packaged chart SHA-256 remained
 `ad803ece8c15eed01eed86b51376dbecd192167f6f0a52c33eeeceb953cc604b`.
 
-This is supporting disabled-mode evidence, not exact deployment evidence for
-the current curated implementation parent `383822caf`. The curated stack adds
-the reviewed disabled-path correction and newer `improvements` commits, so
-C2.2 remains open until the final candidate SHA is built, pushed, deployed
-disabled, and verified with a new immutable image digest.
+This was supporting disabled-mode evidence, not exact deployment evidence for
+the then-pending curated implementation parent `383822caf`. The curated stack
+added the reviewed disabled-path correction and newer `improvements` commits,
+so at this checkpoint C2.2 remained open until the final candidate SHA was
+built, pushed, deployed disabled, and verified with a new immutable image
+digest.
 
 On 2026-07-31, account `361913687221`, EKS cluster
 `boltz-platform-test-eks-cluster`, namespace and release `skypilot-ha`:
@@ -1253,9 +1265,10 @@ On 2026-07-31, account `361913687221`, EKS cluster
 
 Release 35 was the binary rollback anchor for this pre-curation rollout. No
 rollback was required, and the deployed pre-curation implementation remains
-disabled. A curated-candidate deployment must capture its own rollback anchor.
+disabled. At this checkpoint a curated-candidate deployment still had to
+capture its own rollback anchor.
 
-### C2.3 pre-curation activation gate result
+### Historical C2.3 pre-curation activation-gate result
 
 C2.3 was not activated. The fresh pre- and post-deployment source audits found
 zero Serve services and zero Serve replicas, so there is no real isolated
@@ -1268,8 +1281,9 @@ resources and is outside this deployment's existing-state verification scope.
 Consequently, there is no claim of zero provider calls, source-write safety
 under an active scan, digest stability, three completed slots, or
 restart/handoff behavior. All three C2 variables remain absent. C2.3 stays
-blocked until an exact curated disabled deployment, a real selector, and an
-independent provider-call audit are supplied and frozen in the canary manifest.
+blocked at this historical checkpoint until an exact curated disabled
+deployment, a real selector, and an independent provider-call audit are
+supplied and frozen in the canary manifest.
 
 ### Curated-stack verification after clean replay
 
@@ -1277,13 +1291,142 @@ After clean replay and the disabled-path correction, all 219
 non-PostgreSQL capacity cases (the 52 C1 model cases plus 167 C2 cases,
 including 25 projector/runtime cases) and the existing runtime,
 database-utility, and migration unit-test files passed on the curated stack.
-Mypy checked 810 source files clean and pylint reported 10.00/10. The live
-PostgreSQL results above apply to the feature implementation before replay.
-An exact curated-image build and disabled deployment remain the next gate.
+Mypy checked 810 source files clean and pylint reported 10.00/10. The
+pre-curation live PostgreSQL results above remain supporting historical
+evidence; the exact merged deployment below is the authoritative C2.2 gate.
 
-This evidence authorizes only C2.2. No exact curated-candidate disabled
-deployment, live selector, provider-call audit, source-write audit,
-restart/handoff, or measurement-cohort evidence is recorded at this revision.
+### C2.2 exact merged disabled-deployment evidence
+
+Consolidated implementation PR #1094 had reviewed head
+`f33666aa41eaa3815cee8cc77465db9f15be754b` and merged as
+`73d80feb938c123a76b3b822ccfcd3d9588ed993`. The exact merged
+`linux/amd64` image reports version `1.1.939`, build `8041`, and source commit
+`73d80feb938c123a76b3b822ccfcd3d9588ed993`. Its immutable ECR digest is
+`sha256:5d23dfd0a6ad113eb88cc36f1b85584f8a8120ca030d9fc761c5926a9b1ac603`;
+the convenience tag was `test-capacity-c2-73d80feb9`.
+
+The registry vulnerability report was attributed by image layer. Every
+reported high or critical finding mapped to an inherited base-image layer;
+none mapped to the new application overlay
+`sha256:9f8d6409fb7f2c3badab580b8858cb3928834f58ae01d97cb6278067723a2088`.
+This is causal attribution, not a waiver or remediation claim: inherited base
+image debt remains independently open.
+
+On 2026-07-31, in account `361913687221`, EKS cluster
+`boltz-platform-test-eks-cluster`, namespace and release `skypilot-ha`:
+
+- release 38 and digest
+  `sha256:a349f24a81f1c37d85bc0fb896a05541b57cf4c142716d98948502603b73fa02`
+  were recorded as the binary rollback anchor;
+- the exact merged digest was rolled out with no physical-capacity variables
+  in three bounded stages: API at revision 39, executor at revision 40, and
+  controller at revision 41. Every normal PostgreSQL migration/verification
+  hook succeeded;
+- release 41 finished with API, executor, and controller each 2/2, all six
+  role pods on the exact digest, zero restarts, and disruption allowance one
+  for each role. The API, executor, and controller pod-template SHA-256 values
+  were respectively
+  `9436bc77cfe5ca631fef664dd4bdbb9ea78650a03dfad9e66b6c10e92c848979`,
+  `64c0b8062430570ecd74c95817a8924345b004ac13ebfc3dd8fa46fa97fd73c2`,
+  and
+  `c83455a7704db1593a27add2ba795c4a3748c36eba52ba68ea74c3eb5639f51e`;
+- a post-deployment audit found a pre-existing chart gap: externally managed
+  service account `skypilot-ha-api` had no RBAC bindings, and API startup
+  ConfigMap synchronization was receiving `403`. PR #1100 added explicit
+  `rbac.bindExistingServiceAccount` support and an exact-name ConfigMap
+  `get`/`patch` role without rendering or adopting the ServiceAccount. All 251
+  Helm unit tests, strict lint, schema checks, exact server-side dry run, and
+  independent adversarial review passed;
+- PR #1100 merged as
+  `8ce4aaecb7b4a960cc8be807a19e33a833ea4ee7`. The chart packaged from that
+  exact merge had SHA-256
+  `aa5589afd5cf75be8c04f78853e04150afb52c02582fbce55627abd53d600432`
+  and deployed atomically as revision 42. Its migration hook succeeded and it
+  did not roll any role pod: all three template hashes, all six pod names,
+  the image digest, readiness, and zero-restart state remained unchanged;
+- the external ServiceAccount retained UID
+  `53e4e62f-08d1-49d4-8559-3c5d9fccd42e` and remained free of Helm ownership
+  metadata. The workload namespace and release/workload/system RBAC are
+  Helm-owned. Impersonation checks proved exact ConfigMap `get`/`patch`, denied
+  release-namespace ConfigMap list/create/delete, and allowed the intended
+  workload pod, node-read, and RBAC-policy operations. Both API replicas then
+  completed the real startup ConfigMap-sync read path; a server-side dry-run
+  patch succeeded without changing the ConfigMap resource version;
+- every role pod independently loaded mode `disabled`, no allowlist, zero
+  selectors, and no pilot end. None of the mode, allowlist, selector, or
+  pilot-end environment variables was present;
+- both API replicas returned `healthy` and `ready` with the exact version,
+  build, and commit, while Kubernetes pod status reported the exact digest.
+  Every controller and executor liveness/readiness endpoint returned `ok`;
+  recent logs contained no traceback, fatal,
+  forbidden/`403`, ConfigMap-sync failure, or physical-capacity failure
+  signature;
+- PostgreSQL reported zero connections with application name
+  `skypilot-physical-capacity-evidence` and zero rows in each of
+  `capacity_projection_scans`, `capacity_groups`, `capacity_group_intents`,
+  `capacity_allocations`, and `capacity_allocation_desires`. Central revisions
+  remained state `027`, Serve `031`, jobs `026`, requests `004`, and capacity
+  `001`; and
+- the final source audit found zero active cluster, Serve service, or Serve
+  replica rows. The only managed-job rows were terminal: two `CANCELLED` and
+  one `FAILED_CONTROLLER`. Initial and repeated post-deployment checks found
+  no capacity-state drift or role-health regression.
+
+No rollback was required. Release 38 remains the exact binary rollback anchor.
+Release 41 is the immediate chart rollback target for the revision-42 RBAC
+change, but returning to it would deliberately restore the pre-existing
+external-ServiceAccount permission gap, so it is a chart-regression containment
+point rather than a healthy steady state. The external ServiceAccount is never
+owned or deleted by either path. A binary-only rollback should therefore pin
+the release-38 digest through the current external-ServiceAccount binding chart
+contract instead of removing that contract with an unqualified Helm rollback.
+
+### C2.2 follow-on current-state qualification
+
+After the clean revision-42 checkpoint, a separate staged rollout for already
+merged PR #1099 superseded the release. Its image tag
+`pr1099-1bf168a800`, digest
+`sha256:36fe70700a797101dbec0fd31c5b324e41e5ab72d1848d4f72d4d2f19c4a6324`,
+and reported commit `1bf168a800ebbee77d76172f5c2d4d6ea46e4eee` are descendants of the
+C2 merge. The exact diff from `73d80feb938c123a76b3b822ccfcd3d9588ed993`
+through `1bf168a800ebbee77d76172f5c2d4d6ea46e4eee` contains no capacity
+implementation, runtime-integration, capacity-schema, or capacity-test path.
+
+The follow-on used revision 43 for API, 44 for executor, and 45 for controller.
+It retained the revision-42 external-ServiceAccount binding contract and kept
+all physical-capacity variables absent. All three migration hooks succeeded.
+Karpenter supplied each bounded surge and later rescheduled a temporary
+controller surge pod; scheduling, CNI, and startup/readiness warnings were
+transient, while the PDBs kept at least one healthy replica per role. The final
+revision-45 qualification found every role 2/2 on the new immutable digest
+with zero restarts and disruption allowance restored to one per role. Both API
+replicas reported healthy/ready, version `1.1.0`, build `8057`, and the exact
+commit; all executor/controller endpoints returned `ok`.
+
+Every final role process still loaded mode `disabled`, no allowlist, zero
+selectors/partitions, no pilot end, and no physical-capacity environment
+variable. The external ServiceAccount identity and exact ConfigMap permissions
+were unchanged, and both newly started API replicas completed the actual
+startup ConfigMap-sync path without `403`. PostgreSQL again had zero projector
+connections, zero rows in all five capacity tables, the same five central
+revisions, no active cluster/service/replica, and only the same three terminal
+managed jobs. This later rollout does not replace or blur the exact
+revision-41/42 C2.2 evidence; it proves the currently deployed descendant kept
+that disabled-path and RBAC state intact.
+
+### C2.3 current activation-gate result
+
+C2.3 was not activated. The exact post-deployment source audit still has no
+real isolated Serve service or replica selector, and no independently owned
+provider-call audit exporter, query, owner, or baseline has been supplied.
+Creating a paid workload solely to manufacture a selector is not authorized.
+No physical-capacity variable or pilot end is configured, so the canary,
+measurement, decision, expiry, and removal clocks have not started.
+
+This completes C2.2 only. There is still no claim of provider-call or
+source-write safety under an active scan, digest stability, three completed
+slots, restart/handoff behavior, or measurement-cohort value. C2.3 remains
+blocked only on the real selector and independent audit prerequisites above.
 
 Automated tests cover:
 
@@ -1317,7 +1460,7 @@ Automated tests cover:
   DML outside `capacity_projection_scans`; and
 - metric/committed-counter parity with no high-cardinality labels.
 
-Manual test:
+Remaining C2.3 manual activation test:
 
 ```text
 1. Deploy with mode disabled.
@@ -1341,12 +1484,15 @@ Manual test:
 
 - C2.1 complete: strict configuration, pure adapters, digest/counters, scan
   repository, controller daemon, and unit/PostgreSQL tests.
-- C2.2 open: build and deploy the exact final curated implementation SHA with
-  mode `disabled`; reverify zero projector connections, unchanged counts in all
-  five C1 tables, role health, and a current rollback anchor. The pre-curation
-  deployment above is supporting evidence only.
-- C2.3 blocked: after C2.2, supply and freeze one real isolated Serve selector
-  plus an independently owned provider-call audit. Then set all three variables
+- C2.2 complete: implementation merge `73d80feb9`, immutable digest
+  `sha256:5d23dfd0a6ad113eb88cc36f1b85584f8a8120ca030d9fc761c5926a9b1ac603`,
+  chart-fix merge `8ce4aaecb`, and releases 39 through 42 are verified in mode
+  `disabled`, including zero projector connections, zero rows in all five C1
+  tables, role health, external-ServiceAccount RBAC, and rollback anchors. The
+  later revision-45 descendant qualification is recorded separately; the
+  earlier pre-curation deployment remains supporting evidence only.
+- C2.3 blocked: supply and freeze one real isolated Serve selector plus an
+  independently owned provider-call audit. Then set all three variables
   only through `controllerService.extraEnvs`; run one real isolated service
   selector for three scans spanning a restart and leadership handoff, with
   independent proof of zero provider calls, zero source writes, and no rows in
