@@ -2997,6 +2997,556 @@ class ProviderKubernetesServerAllocationV1(_CanonicalContract):
         }
 
 
+_PROVIDER_KUBERNETES_SERVICE_ALLOCATION_POINTERS_V1 = (
+    '/spec/clusterIP',
+    '/spec/clusterIPs',
+    '/spec/ipFamilies',
+    '/spec/ipFamilyPolicy',
+)
+_PROVIDER_KUBERNETES_POD_ALLOCATION_POINTERS_V1 = ('/spec/nodeName',)
+
+
+def _validate_provider_kubernetes_role_allocations_v1(
+    role: ProviderObjectRoleV1,
+    allocations: Any,
+    *,
+    name: str,
+    require_pod_node_name: bool = False,
+) -> tuple[ProviderKubernetesServerAllocationV1, ...]:
+    """Validate one role's atomic, canonically ordered server allocations."""
+
+    if not isinstance(allocations, tuple):
+        raise TypeError(f'{name} must be a tuple.')
+    if role in (ProviderObjectRoleV1.HEAD_SSH_SERVICE,
+                ProviderObjectRoleV1.HEAD_SERVICE):
+        if len(allocations) != len(
+                _PROVIDER_KUBERNETES_SERVICE_ALLOCATION_POINTERS_V1):
+            raise ValueError(f'{name} must contain the complete Service '
+                             'allocation quartet in canonical order.')
+    elif role is ProviderObjectRoleV1.HEAD_POD:
+        allowed_lengths = (1,) if require_pod_node_name else (0, 1)
+        if len(allocations) not in allowed_lengths:
+            requirement = ('the scheduler nodeName allocation'
+                           if require_pod_node_name else
+                           'no allocation or the scheduler nodeName allocation')
+            raise ValueError(f'{name} Pod must contain {requirement}.')
+    else:
+        raise ValueError(f'{name} has an unsupported object role.')
+    if any(not isinstance(allocation, ProviderKubernetesServerAllocationV1)
+           for allocation in allocations):
+        raise TypeError(f'{name} must contain typed server allocations.')
+    pointers = tuple(allocation.json_pointer for allocation in allocations)
+    if role in (ProviderObjectRoleV1.HEAD_SSH_SERVICE,
+                ProviderObjectRoleV1.HEAD_SERVICE):
+        if pointers != _PROVIDER_KUBERNETES_SERVICE_ALLOCATION_POINTERS_V1:
+            raise ValueError(f'{name} must contain the complete Service '
+                             'allocation quartet in canonical order.')
+        cluster_ip = allocations[0].value.canonical_value()
+        cluster_ips = allocations[1].value.canonical_value()
+        ip_families = allocations[2].value.canonical_value()
+        ip_family_policy = allocations[3].value.canonical_value()
+        if ip_family_policy != 'SingleStack':
+            raise ValueError(f'{name} must use SingleStack.')
+        if role is ProviderObjectRoleV1.HEAD_SSH_SERVICE:
+            if cluster_ip == 'None':
+                raise ValueError(f'{name} SSH Service must have a cluster IP.')
+            canonical_ip = _canonical_ip_text(
+                cluster_ip, name=f'{name} SSH Service cluster IP')
+            expected_family = ('IPv4'
+                               if ipaddress.ip_address(canonical_ip).version
+                               == 4 else 'IPv6')
+            if cluster_ips != [canonical_ip
+                              ] or ip_families != [expected_family]:
+                raise ValueError(f'{name} SSH Service allocations disagree on '
+                                 'IP value or address family.')
+        elif (cluster_ip != 'None' or cluster_ips != ['None'] or
+              ip_families not in (['IPv4'], ['IPv6'])):
+            raise ValueError(f'{name} headless Service allocations are '
+                             'inconsistent.')
+        return allocations
+
+    if require_pod_node_name:
+        valid_pointers = (
+            pointers == _PROVIDER_KUBERNETES_POD_ALLOCATION_POINTERS_V1)
+    else:
+        valid_pointers = pointers in (
+            (), _PROVIDER_KUBERNETES_POD_ALLOCATION_POINTERS_V1)
+    if not valid_pointers:
+        requirement = ('the scheduler nodeName allocation'
+                       if require_pod_node_name else
+                       'no allocation or the scheduler nodeName allocation')
+        raise ValueError(f'{name} Pod must contain {requirement}.')
+    return allocations
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesResolvedObjectV1(_CanonicalContract):
+    """One write-once admitted Kubernetes object commitment."""
+
+    role: ProviderObjectRoleV1
+    kind: ProviderPodTopologyMutableObjectKindV1
+    namespace: str
+    name: str
+    uid: str
+    observed_semantic_sha256: str
+    server_allocations: tuple[ProviderKubernetesServerAllocationV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'role', 'kind', 'namespace', 'name', 'uid', 'observed_semantic_sha256',
+        'server_allocations'
+    })
+
+    def __post_init__(self) -> None:
+        role = _enum_value(ProviderObjectRoleV1,
+                           self.role,
+                           name='resolved_object.role')
+        kind = _enum_value(ProviderPodTopologyMutableObjectKindV1,
+                           self.kind,
+                           name='resolved_object.kind')
+        role_entry = next(
+            entry for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1
+            if entry.role is role)
+        if kind is not role_entry.kind:
+            raise ValueError('resolved object role and kind do not match.')
+        object.__setattr__(self, 'role', role)
+        object.__setattr__(self, 'kind', kind)
+        object.__setattr__(
+            self, 'namespace',
+            _text(self.namespace,
+                  name='resolved_object.namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(self, 'name',
+                           _dns_label(self.name, name='resolved_object.name'))
+        object.__setattr__(self, 'uid',
+                           _text(self.uid, name='resolved_object.uid'))
+        object.__setattr__(
+            self, 'observed_semantic_sha256',
+            _sha256(self.observed_semantic_sha256,
+                    name='resolved_object.observed_semantic_sha256'))
+        object.__setattr__(
+            self, 'server_allocations',
+            _validate_provider_kubernetes_role_allocations_v1(
+                role,
+                self.server_allocations,
+                name='resolved_object.server_allocations'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesResolvedObjectV1':
+        shallow = _closed_object_shallow(value,
+                                         name='Kubernetes resolved object',
+                                         keys=cls._KEYS)
+        raw_allocations = shallow['server_allocations']
+        if not isinstance(raw_allocations, list):
+            raise TypeError('resolved object server_allocations must be a '
+                            'list.')
+        role = _enum_value(ProviderObjectRoleV1,
+                           shallow['role'],
+                           name='resolved_object.role')
+        if role in (ProviderObjectRoleV1.HEAD_SSH_SERVICE,
+                    ProviderObjectRoleV1.HEAD_SERVICE):
+            valid_length = len(raw_allocations) == len(
+                _PROVIDER_KUBERNETES_SERVICE_ALLOCATION_POINTERS_V1)
+        else:
+            valid_length = len(raw_allocations) in (0, 1)
+        if not valid_length:
+            if role in (ProviderObjectRoleV1.HEAD_SSH_SERVICE,
+                        ProviderObjectRoleV1.HEAD_SERVICE):
+                raise ValueError('resolved object server_allocations must '
+                                 'contain the complete Service allocation '
+                                 'quartet in canonical order.')
+            raise ValueError('resolved object Pod server_allocations has '
+                             'invalid role-specific cardinality.')
+        allocations = tuple(
+            ProviderKubernetesServerAllocationV1.from_value(allocation)
+            for allocation in raw_allocations)
+        return cls(role=role,
+                   kind=shallow['kind'],
+                   namespace=shallow['namespace'],
+                   name=shallow['name'],
+                   uid=shallow['uid'],
+                   observed_semantic_sha256=shallow['observed_semantic_sha256'],
+                   server_allocations=allocations)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'role': self.role.value,
+            'kind': self.kind.value,
+            'namespace': self.namespace,
+            'name': self.name,
+            'uid': self.uid,
+            'observed_semantic_sha256': self.observed_semantic_sha256,
+            'server_allocations': [
+                allocation.canonical_value()
+                for allocation in self.server_allocations
+            ],
+        }
+
+    @property
+    def has_complete_allocations(self) -> bool:
+        """Whether this role has every allocation required at launch success."""
+
+        return (self.role is not ProviderObjectRoleV1.HEAD_POD or
+                bool(self.server_allocations))
+
+
+class ProviderKubernetesResolvedObjectSlotDispositionV1(str, enum.Enum):
+    """Whether one canonical object-role slot has a write-once commitment."""
+
+    UNKNOWN = 'unknown'
+    COMMITTED = 'committed'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesResolvedObjectSlotV1(_CanonicalContract):
+    """One explicit slot in the canonical launch create order."""
+
+    sequence: int
+    role: ProviderObjectRoleV1
+    disposition: ProviderKubernetesResolvedObjectSlotDispositionV1
+    object: ProviderKubernetesResolvedObjectV1 | None
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'sequence', 'role', 'disposition', 'object'})
+
+    def __post_init__(self) -> None:
+        sequence = _nonnegative_integer(self.sequence,
+                                        name='resolved_object_slot.sequence')
+        role_entry = _PROVIDER_KUBERNETES_OBJECT_ROLE_BY_SEQUENCE_V1.get(
+            sequence)
+        if role_entry is None:
+            raise ValueError('resolved object slot sequence is unsupported.')
+        role = _enum_value(ProviderObjectRoleV1,
+                           self.role,
+                           name='resolved_object_slot.role')
+        disposition = _enum_value(
+            ProviderKubernetesResolvedObjectSlotDispositionV1,
+            self.disposition,
+            name='resolved_object_slot.disposition')
+        if role is not role_entry.role:
+            raise ValueError('resolved object slot sequence and role do not '
+                             'match.')
+        if self.object is not None and not isinstance(
+                self.object, ProviderKubernetesResolvedObjectV1):
+            raise TypeError('resolved object slot object has an invalid type.')
+        if ((disposition
+             is ProviderKubernetesResolvedObjectSlotDispositionV1.COMMITTED)
+                != (self.object is not None)):
+            raise ValueError('committed resolved object slots require an '
+                             'object; unknown slots require null.')
+        if self.object is not None and self.object.role is not role:
+            raise ValueError('resolved object slot and object roles do not '
+                             'match.')
+        object.__setattr__(self, 'sequence', sequence)
+        object.__setattr__(self, 'role', role)
+        object.__setattr__(self, 'disposition', disposition)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesResolvedObjectSlotV1':
+        shallow = _closed_object_shallow(value,
+                                         name='Kubernetes resolved object slot',
+                                         keys=cls._KEYS)
+        return cls(sequence=shallow['sequence'],
+                   role=shallow['role'],
+                   disposition=shallow['disposition'],
+                   object=(None if shallow['object'] is None else
+                           ProviderKubernetesResolvedObjectV1.from_value(
+                               shallow['object'])))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'sequence': self.sequence,
+            'role': self.role.value,
+            'disposition': self.disposition.value,
+            'object':
+                (None if self.object is None else self.object.canonical_value()
+                ),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PartialResolvedProviderTargetV1(_CanonicalContract):
+    """Canonical explicit-prefix Kubernetes launch progress."""
+
+    version: int
+    requested_target_sha256: str
+    kubernetes_objects: tuple[ProviderKubernetesResolvedObjectSlotV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'requested_target_sha256', 'kubernetes_objects'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='partial resolved target version')
+        object.__setattr__(
+            self, 'requested_target_sha256',
+            _sha256(self.requested_target_sha256,
+                    name='partial_target.requested_target_sha256'))
+        if (not isinstance(self.kubernetes_objects, tuple) or
+                len(self.kubernetes_objects)
+                != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or
+                any(not isinstance(slot, ProviderKubernetesResolvedObjectSlotV1)
+                    for slot in self.kubernetes_objects)):
+            raise ValueError('partial target requires exactly three typed '
+                             'Kubernetes object slots.')
+        expected = tuple((entry.plan_sequence, entry.role)
+                         for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1)
+        actual = tuple(
+            (slot.sequence, slot.role) for slot in self.kubernetes_objects)
+        if actual != expected:
+            raise ValueError('partial target object slots have invalid order.')
+        dispositions = tuple(
+            slot.disposition for slot in self.kubernetes_objects)
+        seen_unknown = False
+        for disposition in dispositions:
+            if disposition is (
+                    ProviderKubernetesResolvedObjectSlotDispositionV1.UNKNOWN):
+                seen_unknown = True
+            elif seen_unknown:
+                raise ValueError('partial target committed slots must form a '
+                                 'prefix of create order.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'PartialResolvedProviderTargetV1':
+        shallow = _closed_object_shallow(value,
+                                         name='partial resolved target',
+                                         keys=cls._KEYS)
+        raw_objects = shallow['kubernetes_objects']
+        if not isinstance(raw_objects, list):
+            raise TypeError('partial target kubernetes_objects must be a list.')
+        if len(raw_objects) != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1):
+            raise ValueError('partial target requires exactly three '
+                             'Kubernetes object slots.')
+        objects = tuple(
+            ProviderKubernetesResolvedObjectSlotV1.from_value(slot)
+            for slot in raw_objects)
+        return cls(version=shallow['version'],
+                   requested_target_sha256=shallow['requested_target_sha256'],
+                   kubernetes_objects=objects)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'requested_target_sha256': self.requested_target_sha256,
+            'kubernetes_objects': [
+                slot.canonical_value() for slot in self.kubernetes_objects
+            ],
+        }
+
+    def validate_requested_target(self, target: ProviderLocatorV1) -> None:
+        if self.requested_target_sha256 != target.sha256:
+            raise ValueError('Partial target does not match requested target.')
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesHandleProviderConfigV1(_CanonicalContract):
+    """Closed provider block persisted in one Kubernetes cluster handle."""
+
+    context_mode: str
+    scope_sha256: str
+    namespace: str
+    port_mode: str
+    use_internal_ips: bool
+    application_port: str
+    pod_name: str
+    pod_uid: str
+    node_name: str
+    pod_ip: str
+    head_service_uid: str
+    head_ssh_service_uid: str
+    ambient_fallback: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'context_mode', 'scope_sha256', 'namespace', 'port_mode',
+        'use_internal_ips', 'application_port', 'pod_name', 'pod_uid',
+        'node_name', 'pod_ip', 'head_service_uid', 'head_ssh_service_uid',
+        'ambient_fallback'
+    })
+
+    def __post_init__(self) -> None:
+        if self.context_mode != 'in_cluster':
+            raise ValueError('handle provider_config context_mode must be '
+                             'in_cluster.')
+        object.__setattr__(
+            self, 'scope_sha256',
+            _sha256(self.scope_sha256,
+                    name='handle.provider_config.scope_sha256'))
+        object.__setattr__(
+            self, 'namespace',
+            _text(self.namespace,
+                  name='handle.provider_config.namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        if self.port_mode != 'podip':
+            raise ValueError('handle provider_config port_mode must be podip.')
+        if not _boolean(self.use_internal_ips,
+                        name='handle.provider_config.use_internal_ips'):
+            raise ValueError('handle provider_config use_internal_ips must be '
+                             'true.')
+        object.__setattr__(
+            self, 'application_port',
+            _decimal_port_text(self.application_port,
+                               name='handle.provider_config.application_port'))
+        object.__setattr__(
+            self, 'pod_name',
+            _dns_label(self.pod_name, name='handle.provider_config.pod_name'))
+        object.__setattr__(
+            self, 'node_name',
+            _dns_subdomain(self.node_name,
+                           name='handle.provider_config.node_name'))
+        object.__setattr__(
+            self, 'pod_ip',
+            _canonical_ip_text(self.pod_ip,
+                               name='handle.provider_config.pod_ip'))
+        for field in ('pod_uid', 'head_service_uid', 'head_ssh_service_uid'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field),
+                      name=f'handle.provider_config.{field}'))
+        if _boolean(self.ambient_fallback,
+                    name='handle.provider_config.ambient_fallback'):
+            raise ValueError('handle provider_config ambient_fallback must be '
+                             'false.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesHandleProviderConfigV1':
+        shallow = _closed_object_shallow(
+            value, name='Kubernetes handle provider config', keys=cls._KEYS)
+        return cls(**shallow)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'context_mode': 'in_cluster',
+            'scope_sha256': self.scope_sha256,
+            'namespace': self.namespace,
+            'port_mode': 'podip',
+            'use_internal_ips': True,
+            'application_port': self.application_port,
+            'pod_name': self.pod_name,
+            'pod_uid': self.pod_uid,
+            'node_name': self.node_name,
+            'pod_ip': self.pod_ip,
+            'head_service_uid': self.head_service_uid,
+            'head_ssh_service_uid': self.head_ssh_service_uid,
+            'ambient_fallback': False,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesHandleV1(_CanonicalContract):
+    """Exact nonambient Kubernetes provider handle."""
+
+    version: int
+    cluster_record_uuid: uuid.UUID
+    cluster_name: str
+    cluster_name_on_cloud: str
+    requested_target_sha256: str
+    launched_resources_sha256: str
+    provider_config: ProviderKubernetesHandleProviderConfigV1
+    provider_config_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'cluster_record_uuid', 'cluster_name',
+        'cluster_name_on_cloud', 'requested_target_sha256',
+        'launched_resources_sha256', 'provider_config', 'provider_config_sha256'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Kubernetes handle version')
+        object.__setattr__(
+            self, 'cluster_record_uuid',
+            _uuid(self.cluster_record_uuid, name='handle.cluster_record_uuid'))
+        object.__setattr__(
+            self, 'cluster_name',
+            _text(self.cluster_name,
+                  name='handle.cluster_name',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(
+            self, 'cluster_name_on_cloud',
+            _dns_label(self.cluster_name_on_cloud,
+                       name='handle.cluster_name_on_cloud'))
+        object.__setattr__(
+            self, 'requested_target_sha256',
+            _sha256(self.requested_target_sha256,
+                    name='handle.requested_target_sha256'))
+        object.__setattr__(
+            self, 'launched_resources_sha256',
+            _sha256(self.launched_resources_sha256,
+                    name='handle.launched_resources_sha256'))
+        if not isinstance(self.provider_config,
+                          ProviderKubernetesHandleProviderConfigV1):
+            raise TypeError('handle provider_config has an invalid type.')
+        if self.provider_config.pod_name != f'{self.cluster_name_on_cloud}-head':
+            raise ValueError('handle Pod name does not match '
+                             'cluster_name_on_cloud.')
+        provider_config_sha256 = _sha256(self.provider_config_sha256,
+                                         name='handle.provider_config_sha256')
+        if provider_config_sha256 != self.provider_config.sha256:
+            raise ValueError('handle provider_config hash does not match.')
+        object.__setattr__(self, 'provider_config_sha256',
+                           provider_config_sha256)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesHandleV1':
+        shallow = _closed_object_shallow(value,
+                                         name='Kubernetes handle',
+                                         keys=cls._KEYS)
+        return cls(
+            version=shallow['version'],
+            cluster_record_uuid=_uuid(shallow['cluster_record_uuid'],
+                                      name='handle.cluster_record_uuid'),
+            cluster_name=shallow['cluster_name'],
+            cluster_name_on_cloud=shallow['cluster_name_on_cloud'],
+            requested_target_sha256=shallow['requested_target_sha256'],
+            launched_resources_sha256=shallow['launched_resources_sha256'],
+            provider_config=ProviderKubernetesHandleProviderConfigV1.from_value(
+                shallow['provider_config']),
+            provider_config_sha256=shallow['provider_config_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'cluster_record_uuid': str(self.cluster_record_uuid),
+            'cluster_name': self.cluster_name,
+            'cluster_name_on_cloud': self.cluster_name_on_cloud,
+            'requested_target_sha256': self.requested_target_sha256,
+            'launched_resources_sha256': self.launched_resources_sha256,
+            'provider_config': self.provider_config.canonical_value(),
+            'provider_config_sha256': self.provider_config_sha256,
+        }
+
+    def validate_requested_target(self, target: ProviderLocatorV1) -> None:
+        """Bind the handle to the locator fields available in this scaffold."""
+
+        if (self.requested_target_sha256 != target.sha256 or
+                self.cluster_record_uuid != target.sky_cluster_record_uuid or
+                self.cluster_name != target.sky_cluster_name or
+                target.kubernetes is None or
+                self.provider_config.namespace != target.kubernetes.namespace or
+                self.provider_config.pod_name
+                != target.kubernetes.workload_name):
+            raise ValueError('Kubernetes handle does not match the requested '
+                             'target.')
+
+    def validate_launched_resources(
+            self, resources: ProviderPodResourceSnapshotV1) -> None:
+        if self.launched_resources_sha256 != resources.sha256:
+            raise ValueError('Kubernetes handle does not match launched '
+                             'resources.')
+
+    def validate_workspace_identity(
+            self, workspace: 'ProviderWorkspaceIdentityV1') -> None:
+        if (self.provider_config.scope_sha256
+                != workspace.kubernetes_scope.sha256 or
+                self.provider_config.namespace
+                != workspace.kubernetes_scope.namespace):
+            raise ValueError('Kubernetes handle does not match workspace '
+                             'scope.')
+
+
 @dataclasses.dataclass(frozen=True)
 class ProviderPodImageV1(_CanonicalContract):
     """Fixed explicit digest-qualified workload image contract."""
@@ -4834,6 +5384,377 @@ class ProviderKubernetesObjectPlanV1(_CanonicalContract):
             'normalization_profile':
                 self.normalization_profile.canonical_value(),
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderWorkspaceIdentityV1(_CanonicalContract):
+    """Complete bounded workspace and Kubernetes scope identity."""
+
+    version: int
+    workspace: str
+    kubernetes_scope: ProviderKubernetesScopeV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'workspace', 'kubernetes_scope'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='workspace identity version')
+        object.__setattr__(
+            self, 'workspace',
+            _text(self.workspace, name='workspace_identity.workspace'))
+        if not isinstance(self.kubernetes_scope, ProviderKubernetesScopeV1):
+            raise TypeError('workspace Kubernetes scope has an invalid type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderWorkspaceIdentityV1':
+        shallow = _closed_object_shallow(value,
+                                         name='workspace identity',
+                                         keys=cls._KEYS)
+        return cls(version=shallow['version'],
+                   workspace=shallow['workspace'],
+                   kubernetes_scope=ProviderKubernetesScopeV1.from_value(
+                       shallow['kubernetes_scope']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'workspace': self.workspace,
+            'kubernetes_scope': self.kubernetes_scope.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesCleanupObjectV1(_CanonicalContract):
+    """One immutable plan plus its optional write-once launch commitment."""
+
+    sequence: int
+    role: ProviderObjectRoleV1
+    plan: ProviderKubernetesObjectPlanV1
+    committed_uid: str | None
+    committed_server_allocations: tuple[ProviderKubernetesServerAllocationV1,
+                                        ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'sequence', 'role', 'plan', 'committed_uid',
+        'committed_server_allocations'
+    })
+
+    def __post_init__(self) -> None:
+        sequence = _nonnegative_integer(self.sequence,
+                                        name='cleanup_object.sequence')
+        role_entry = _PROVIDER_KUBERNETES_OBJECT_ROLE_BY_SEQUENCE_V1.get(
+            sequence)
+        if role_entry is None:
+            raise ValueError('cleanup object sequence is unsupported.')
+        role = _enum_value(ProviderObjectRoleV1,
+                           self.role,
+                           name='cleanup_object.role')
+        if role is not role_entry.role:
+            raise ValueError('cleanup object sequence and role do not match.')
+        if not isinstance(self.plan, ProviderKubernetesObjectPlanV1):
+            raise TypeError('cleanup object plan has an invalid type.')
+        if (self.plan.sequence != sequence or self.plan.role is not role or
+                self.plan.kind is not role_entry.kind):
+            raise ValueError('cleanup object does not match its embedded plan.')
+        committed_uid = _optional_text(self.committed_uid,
+                                       name='cleanup_object.committed_uid')
+        if committed_uid is None:
+            if self.committed_server_allocations:
+                raise ValueError('cleanup object without a committed UID '
+                                 'cannot retain server allocations.')
+            if not isinstance(self.committed_server_allocations, tuple):
+                raise TypeError('cleanup object committed allocations must be '
+                                'a tuple.')
+            allocations = self.committed_server_allocations
+        else:
+            allocations = _validate_provider_kubernetes_role_allocations_v1(
+                role,
+                self.committed_server_allocations,
+                name='cleanup_object.committed_server_allocations')
+        object.__setattr__(self, 'sequence', sequence)
+        object.__setattr__(self, 'role', role)
+        object.__setattr__(self, 'committed_uid', committed_uid)
+        object.__setattr__(self, 'committed_server_allocations', allocations)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesCleanupObjectV1':
+        shallow = _closed_object_shallow(value,
+                                         name='Kubernetes cleanup object',
+                                         keys=cls._KEYS)
+        plan = ProviderKubernetesObjectPlanV1.from_value(shallow['plan'])
+        raw_allocations = shallow['committed_server_allocations']
+        if not isinstance(raw_allocations, list):
+            raise TypeError('cleanup object committed_server_allocations must '
+                            'be a list.')
+        role = _enum_value(ProviderObjectRoleV1,
+                           shallow['role'],
+                           name='cleanup_object.role')
+        committed_uid = _optional_text(shallow['committed_uid'],
+                                       name='cleanup_object.committed_uid')
+        if committed_uid is None:
+            valid_length = len(raw_allocations) == 0
+        elif role in (ProviderObjectRoleV1.HEAD_SSH_SERVICE,
+                      ProviderObjectRoleV1.HEAD_SERVICE):
+            valid_length = len(raw_allocations) == len(
+                _PROVIDER_KUBERNETES_SERVICE_ALLOCATION_POINTERS_V1)
+        else:
+            valid_length = len(raw_allocations) in (0, 1)
+        if not valid_length:
+            if committed_uid is None:
+                raise ValueError('cleanup object without a committed UID '
+                                 'cannot retain server allocations.')
+            raise ValueError('cleanup object committed allocations has '
+                             'invalid role-specific cardinality.')
+        allocations = tuple(
+            ProviderKubernetesServerAllocationV1.from_value(allocation)
+            for allocation in raw_allocations)
+        return cls(sequence=shallow['sequence'],
+                   role=role,
+                   plan=plan,
+                   committed_uid=committed_uid,
+                   committed_server_allocations=allocations)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'sequence': self.sequence,
+            'role': self.role.value,
+            'plan': self.plan.canonical_value(),
+            'committed_uid': self.committed_uid,
+            'committed_server_allocations': [
+                allocation.canonical_value()
+                for allocation in self.committed_server_allocations
+            ],
+        }
+
+    @property
+    def delete_sequence(self) -> int:
+        """Return emission order without changing canonical plan order."""
+
+        return _PROVIDER_KUBERNETES_OBJECT_ROLE_BY_SEQUENCE_V1[
+            self.sequence].delete_sequence
+
+    @property
+    def has_complete_allocations(self) -> bool:
+        return (self.committed_uid is not None and
+                (self.role is not ProviderObjectRoleV1.HEAD_POD or
+                 bool(self.committed_server_allocations)))
+
+
+class ProviderKubernetesCleanupBasisKindV1(str, enum.Enum):
+    """Closed cleanup-address source variants."""
+
+    COMPLETED_LAUNCH = 'completed_launch'
+    PARTIAL_LAUNCH_CLEANUP = 'partial_launch_cleanup'
+
+
+class ProviderKubernetesClusterRowDispositionV1(str, enum.Enum):
+    """Exact same-UUID cluster-row read disposition."""
+
+    EXACT_HANDLE = 'exact_handle'
+    NOT_FOUND = 'not_found'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesCleanupTargetV1(_CanonicalContract):
+    """Complete immutable down-addressing preimage for one launch basis."""
+
+    version: int
+    basis_kind: ProviderKubernetesCleanupBasisKindV1
+    requested_target_sha256: str
+    cluster_name: str
+    cluster_record_uuid: uuid.UUID
+    objects: tuple[ProviderKubernetesCleanupObjectV1, ...]
+    cluster_row_disposition: ProviderKubernetesClusterRowDispositionV1
+    handle: ProviderKubernetesHandleV1 | None
+    observed_at: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'basis_kind', 'requested_target_sha256', 'cluster_name',
+        'cluster_record_uuid', 'objects', 'cluster_row_disposition', 'handle',
+        'observed_at'
+    })
+    _DISPLAY_LABEL: ClassVar[str] = 'skypilot-cluster-name'
+    _CLUSTER_UUID_LABEL: ClassVar[str] = 'skypilot.co/cluster-record-uuid'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Kubernetes cleanup target version')
+        basis_kind = _enum_value(ProviderKubernetesCleanupBasisKindV1,
+                                 self.basis_kind,
+                                 name='cleanup_target.basis_kind')
+        disposition = _enum_value(ProviderKubernetesClusterRowDispositionV1,
+                                  self.cluster_row_disposition,
+                                  name='cleanup_target.cluster_row_disposition')
+        object.__setattr__(self, 'basis_kind', basis_kind)
+        object.__setattr__(self, 'cluster_row_disposition', disposition)
+        object.__setattr__(
+            self, 'requested_target_sha256',
+            _sha256(self.requested_target_sha256,
+                    name='cleanup_target.requested_target_sha256'))
+        object.__setattr__(
+            self, 'cluster_name',
+            _text(self.cluster_name,
+                  name='cleanup_target.cluster_name',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(
+            self, 'cluster_record_uuid',
+            _uuid(self.cluster_record_uuid,
+                  name='cleanup_target.cluster_record_uuid'))
+        self._validate_objects()
+        if self.handle is not None and not isinstance(
+                self.handle, ProviderKubernetesHandleV1):
+            raise TypeError('cleanup target handle has an invalid type.')
+        if ((disposition
+             is ProviderKubernetesClusterRowDispositionV1.EXACT_HANDLE)
+                != (self.handle is not None)):
+            raise ValueError('exact_handle requires a handle; not_found '
+                             'requires null.')
+        if (basis_kind is ProviderKubernetesCleanupBasisKindV1.COMPLETED_LAUNCH
+                and disposition
+                is not ProviderKubernetesClusterRowDispositionV1.EXACT_HANDLE):
+            raise ValueError('completed cleanup target requires an exact '
+                             'handle.')
+        if (basis_kind is ProviderKubernetesCleanupBasisKindV1.COMPLETED_LAUNCH
+                or self.handle is not None):
+            self._validate_complete_commitments()
+        if self.handle is not None:
+            self._validate_handle()
+        object.__setattr__(
+            self, 'observed_at',
+            _timestamp(self.observed_at, name='cleanup_target.observed_at'))
+        _ = self.canonical_bytes
+
+    def _validate_objects(self) -> None:
+        if (not isinstance(self.objects, tuple) or len(
+                self.objects) != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or
+                any(not isinstance(item, ProviderKubernetesCleanupObjectV1)
+                    for item in self.objects)):
+            raise ValueError('cleanup target requires exactly three typed '
+                             'objects.')
+        expected = tuple((entry.plan_sequence, entry.role)
+                         for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1)
+        actual = tuple((item.sequence, item.role) for item in self.objects)
+        if actual != expected:
+            raise ValueError('cleanup target objects have invalid plan order.')
+        seen_unknown = False
+        for item in self.objects:
+            if item.committed_uid is None:
+                seen_unknown = True
+            elif seen_unknown:
+                raise ValueError('cleanup target UID commitments must form a '
+                                 'prefix of create order.')
+        plans = tuple(item.plan for item in self.objects)
+        namespaces = {plan.namespace for plan in plans}
+        label_maps = tuple(plan.required_identity_labels for plan in plans)
+        if len(namespaces) != 1 or len(set(label_maps)) != 1:
+            raise ValueError('cleanup target plans must share namespace and '
+                             'identity labels.')
+        ssh_plan, service_plan, pod_plan = plans
+        if (service_plan.name != pod_plan.name or
+                ssh_plan.name != f'{pod_plan.name}-ssh'):
+            raise ValueError('cleanup target object names do not form the '
+                             'canonical Pod/two-Service group.')
+        identity_labels = {
+            label.key: label.value
+            for label in pod_plan.required_identity_labels
+        }
+        if identity_labels[self._CLUSTER_UUID_LABEL] != str(
+                self.cluster_record_uuid):
+            raise ValueError('cleanup target cluster UUID does not match its '
+                             'object plans.')
+
+    def _validate_complete_commitments(self) -> None:
+        if any(item.committed_uid is None for item in self.objects):
+            raise ValueError('complete cleanup target requires all three '
+                             'committed UIDs.')
+        for item in self.objects:
+            _validate_provider_kubernetes_role_allocations_v1(
+                item.role,
+                item.committed_server_allocations,
+                name='cleanup target committed allocations',
+                require_pod_node_name=True)
+
+    def _validate_handle(self) -> None:
+        assert self.handle is not None
+        handle = self.handle
+        ssh_object, service_object, pod_object = self.objects
+        config = handle.provider_config
+        display_label = {
+            label.key: label.value
+            for label in pod_object.plan.required_identity_labels
+        }[self._DISPLAY_LABEL]
+        pod_allocations = pod_object.committed_server_allocations
+        node_name = pod_allocations[0].value.canonical_value()
+        if (handle.requested_target_sha256 != self.requested_target_sha256 or
+                handle.cluster_name != self.cluster_name or
+                handle.cluster_record_uuid != self.cluster_record_uuid or
+                handle.cluster_name_on_cloud != display_label or
+                config.namespace != pod_object.plan.namespace or
+                config.pod_name != pod_object.plan.name or
+                config.pod_uid != pod_object.committed_uid or
+                config.node_name != node_name or
+                config.head_service_uid != service_object.committed_uid or
+                config.head_ssh_service_uid != ssh_object.committed_uid):
+            raise ValueError('cleanup target exact handle conflicts with its '
+                             'object commitments.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesCleanupTargetV1':
+        shallow = _closed_object_shallow(value,
+                                         name='Kubernetes cleanup target',
+                                         keys=cls._KEYS)
+        raw_objects = shallow['objects']
+        if not isinstance(raw_objects, list):
+            raise TypeError('cleanup target objects must be a list.')
+        if len(raw_objects) != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1):
+            raise ValueError('cleanup target requires exactly three objects.')
+        objects = tuple(
+            ProviderKubernetesCleanupObjectV1.from_value(item)
+            for item in raw_objects)
+        handle = (None if shallow['handle'] is None else
+                  ProviderKubernetesHandleV1.from_value(shallow['handle']))
+        return cls(version=shallow['version'],
+                   basis_kind=shallow['basis_kind'],
+                   requested_target_sha256=shallow['requested_target_sha256'],
+                   cluster_name=shallow['cluster_name'],
+                   cluster_record_uuid=_uuid(
+                       shallow['cluster_record_uuid'],
+                       name='cleanup_target.cluster_record_uuid'),
+                   objects=objects,
+                   cluster_row_disposition=shallow['cluster_row_disposition'],
+                   handle=handle,
+                   observed_at=shallow['observed_at'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'basis_kind': self.basis_kind.value,
+            'requested_target_sha256': self.requested_target_sha256,
+            'cluster_name': self.cluster_name,
+            'cluster_record_uuid': str(self.cluster_record_uuid),
+            'objects': [item.canonical_value() for item in self.objects],
+            'cluster_row_disposition': self.cluster_row_disposition.value,
+            'handle': None
+                      if self.handle is None else self.handle.canonical_value(),
+            'observed_at': self.observed_at,
+        }
+
+    @property
+    def objects_in_delete_order(
+            self) -> tuple[ProviderKubernetesCleanupObjectV1, ...]:
+        """Project mutation order without changing stored plan order."""
+
+        return tuple(sorted(self.objects,
+                            key=lambda item: item.delete_sequence))
+
+    def validate_requested_target(self, target: ProviderLocatorV1) -> None:
+        if (self.requested_target_sha256 != target.sha256 or
+                self.cluster_name != target.sky_cluster_name or
+                self.cluster_record_uuid != target.sky_cluster_record_uuid):
+            raise ValueError('Cleanup target does not match requested target.')
+        if self.handle is not None:
+            self.handle.validate_requested_target(target)
 
 
 @dataclasses.dataclass(frozen=True)
