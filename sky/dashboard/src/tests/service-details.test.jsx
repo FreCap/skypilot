@@ -1693,6 +1693,46 @@ describe('ServiceDetails route ownership rendering', () => {
       detailFullArgs('svc')
     );
   });
+
+  it('reuses an existing full snapshot when overview is revisited', async () => {
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'initial-full', replicas: ['r1'] }],
+      });
+
+    const { result, rerender } = renderHook(
+      ({ loadFull }) => useServiceDetails({ serviceName: 'svc', loadFull }),
+      { initialProps: { loadFull: true } }
+    );
+
+    await waitFor(() =>
+      expect(result.current.serviceData.status).toBe('initial-full')
+    );
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      rerender({ loadFull: false });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-full');
+    expect(result.current.serviceData.replicas).toEqual(['r1']);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      rerender({ loadFull: true });
+      await Promise.resolve();
+    });
+
+    expect(result.current.serviceData.status).toBe('initial-full');
+    expect(result.current.serviceData.replicas).toEqual(['r1']);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('ServiceDetailCard cost and request estimates', () => {
