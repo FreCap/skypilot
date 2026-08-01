@@ -25,8 +25,10 @@ independently verified; the policy-free request-identity, scheduling, storage,
 metadata, security, object-mutation-effect, and exact launch/down mutation
 contract leaves are implemented and independently verified, while contextual
 action-bound submit comparison, launch-only server-effective identity
-canonicalization/projector and down-current-identity absence, enclosing capsule and execution-config
-composition, and live preflight remain pending; runtime provider propagation,
+canonicalization/projector and down-current-identity absence, enclosing capsule
+and execution-config composition, and live preflight remain pending; shared
+leaf-validator, named raw-field, and bounded canonical-JSON exact-type
+hardening is frozen below and code-pending; runtime provider propagation,
 observation, and shadow instrumentation remain pending
 
 Last updated: 2026-08-01
@@ -2767,17 +2769,80 @@ CanonicalPositiveDecimalText = canonical ASCII text matching
   `.5`, `1.0`, `1.230`, and `0.000` are not.
 
 CanonicalJsonValue and CanonicalJsonObject use the existing NFC canonical JSON
-domain but add mandatory pre-serialization bounds. An object variant has a JSON
-object root. Each string/key is 1..1,024 UTF-8 bytes, every integer fits signed
-64-bit, floats and reference cycles are forbidden, and each object/list has at
-most 256 members. Container depth is at most 16 with a root container counted
-as depth one, and the aggregate sum of object members plus list elements is at
-most 4,096. Each standalone canonical value and the enclosing typed object are
-at most 65,536 canonical UTF-8 bytes. Validation is iterative and applies these
-bounds before calling the generic recursive serializer; arrays preserve order
-and objects use the canonical key ordering. Empty strings, mappings with
+domain but add mandatory pre-serialization bounds and an exact parsed-value
+type boundary. The only accepted runtime types are the exact built-ins
+`NoneType`, `bool`, `int`, `str`, `list`, and `dict`; subclasses and arbitrary
+`Mapping` implementations are invalid at the root and every nested position.
+An object variant has an exact built-in `dict` root, and every object key is an
+exact built-in `str`. Each string/key is 1..1,024 UTF-8 bytes, every integer
+fits signed 64-bit, floats and reference cycles are forbidden, and each
+object/list has at most 256 members. Container depth is at most 16 with a root
+container counted as depth one, and the aggregate sum of object members plus
+list elements is at most 4,096. Each standalone canonical value and the
+enclosing typed object are at most 65,536 canonical UTF-8 bytes. Validation is
+iterative and checks a container's exact type and cardinality before copying or
+iterating its members. It constructs a detached validated graph, rechecks the
+copied cardinality, and calls the generic recursive serializer only on that
+detached graph. Mutation of the caller's original graph after a node is copied,
+including during or after serialization, cannot change that detached node or
+introduce an unvalidated value into the committed bytes. Concurrent mutation
+while different nodes are being copied may cause rejection or determine which
+fully validated values enter the snapshot; a caller requiring an atomic
+multi-node point-in-time view must synchronize its own graph. Arrays preserve
+order and objects use the canonical key ordering. Empty strings,
 nontext/duplicate-after-NFC keys, noncanonical text, tuples masquerading as
-parsed JSON arrays, and any value outside this domain are invalid.
+parsed JSON arrays, scalar or container subclasses, and any value outside this
+domain are invalid. Rejected container/`Mapping` subclasses are rejected on
+their runtime type before invoking their iterator, `items()`, `len()`, or other
+overridable method.
+
+The shared scalar leaf validators, when a value is presented to them directly,
+likewise accept exact built-in strings, integers, and Booleans rather than
+subclasses or coercible values. A shared enum leaf accepts either an exact
+member of its declared enum class or an exact built-in string with the
+canonical member value. A UUID leaf accepts an exact `uuid.UUID` or exact
+canonical built-in string. An action-kind leaf accepts an exact `ActionKind` or
+exact canonical built-in string. Typed enum/UUID/action-kind positives are
+process-local helper/direct-constructor inputs; a JSON-wire field still uses
+its displayed canonical string spelling.
+
+The literal `context_mode="in_cluster"` and `port_mode="podip"` fields in
+`ProviderKubernetesHandleProviderConfigV1` use exact raw-string gates because
+that parser deliberately preserves its shallow input. The raw JSON-wire
+`action_kind` fields in `ProviderLifecycleInvocationV1`,
+`ProviderLifecyclePlanV1`, and `ServeShadowProjectionV1` are exact built-in
+strings and are checked before their existing canonical encode/reparse step;
+their direct constructors then use the shared exact action-kind gate. The same
+gate also protects `ProviderResourceIdentityV1.action_identity()` before it
+delegates deterministic action-ID construction to the generic kernel. Exact
+`CanonicalJsonValue` is required at the server-allocation embedding, and exact
+`CanonicalJsonObject` is required for both object-plan body embeddings; wrapper
+subclasses cannot override bytes or hashes at those persisted seams.
+Equality-, hash-, length-, or bound-spoofing subclasses cannot satisfy any of
+these named gates.
+
+Existing invalid-value categories remain stable. Shared text, enum, UUID, and
+action-kind wrong-type failures retain their current `TypeError` text; unknown
+exact enum/action-kind strings retain their current `ValueError` unsupported
+text. Hash, integer, timestamp, and their format/range failures retain their
+current `ValueError` messages, while Boolean wrong types retain their current
+`TypeError` message. The three action-kind DTO constructors still translate
+either shared-gate failure to their existing class-specific `ValueError`
+message, and `action_identity()` retains the generic kernel's existing
+`ValueError("action_kind must be launch or down.")`. Newly rejected subclasses
+use the same category as a non-exact value at that gate. This hardening adds no
+coercion or alternate wire spelling.
+
+This is a bounded shared-helper and named-call-site contract, not a claim that
+every older direct DTO constructor in this module already rejects every scalar,
+container, or typed-child subclass. It also does not change legacy
+`from_value()` paths that intentionally pass through `_closed_object`, whose
+canonical encode/reparse may turn otherwise valid JSON-like subclasses into
+built-ins before a leaf validator receives them. Only the three raw
+action-kind fields named above add a pre-normalization gate. A constructor,
+parser field, or wrapper embedding not routed through one of these helpers or
+named gates remains governed by its separately reviewed contract until it is
+explicitly migrated and tested.
 
 DigestPinnedOCIReference = canonical secret-free OCI reference accepted
   byte-for-byte by `sky.container_images.models.validate_oci_reference`, with
@@ -4600,6 +4665,11 @@ mutation is permitted afterward.
   Kubernetes review/prerequisite projections, exact same-client facade
   inventory, versioned worker cohort/image identity, launch/down execution
   capsules, and closed discriminated preflight wire contract.
+- Harden the shared scalar helpers, detached bounded canonical-JSON wrappers,
+  three persisted wrapper embeddings, Handle provider-config literals, three
+  named raw/direct action-kind conversion sites, and action-ID delegation to
+  the exact-type contract above without broadening the claim to unrelated
+  constructors or canonicalizing parsers.
 - Add no provider mutation call sites.
 - Build golden fixtures from current provider results with secrets removed.
 
@@ -4728,6 +4798,20 @@ Contract tests must cover:
   and the cutover changes hashes/goldens without changing deterministic action
   UUIDs;
 - canonical plan/locator bytes and identity mismatch rejection;
+- exact built-in acceptance and subclass rejection at the shared text, hash,
+  integer, timestamp, enum, UUID, and action-kind helpers; exact-Boolean
+  acceptance plus integer/`IntEnum` rejection; exact typed enum/UUID/
+  action-kind direct-input positive controls; equality/hash/length/
+  bound-spoofing rejection at both Handle literals, all three named raw/direct
+  action-kind conversion sites, and action-ID delegation; and preservation of
+  the explicit invalid-value exception/message categories above;
+- exact built-in root, key, scalar, list, and dict acceptance for bounded
+  canonical JSON; rejection of root and nested scalar/container/key subclasses
+  and arbitrary `Mapping` implementations without invoking their overridden
+  methods; serialization of only a detached validated graph under a
+  deterministic mutation-at-serialization probe; exact-wrapper enforcement at
+  the three persisted embedding fields; and retention of normal integer, text,
+  member-count, aggregate, byte-size, depth, and cycle boundaries;
 - literal frozen transport/scope bytes/hash, pure user-hash naming, and the
   actual suffixed head-Pod/two-Service names;
 - prior-launch basis lookup, mutated-basis/down-digest rejection, embedded
