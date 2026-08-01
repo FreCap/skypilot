@@ -512,43 +512,85 @@ export function ImageDetail() {
     if (!hasNonterminal || !viewingFirstCollectionPages) return undefined;
     let active = true;
     let timer = null;
-
-    const schedule = () => {
-      if (!active) return;
+    let nextPollAt = performance.now() + IMAGE_DETAIL_POLL_MS;
+    const clearTimer = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const scheduleAfter = (delay) => {
+      nextPollAt = performance.now() + delay;
+      clearTimer();
+      if (!active || window.document.visibilityState !== 'visible') {
+        return;
+      }
+      timer = setTimeout(run, delay);
+    };
+    const scheduleFromLastStart = (fallbackDelay = IMAGE_DETAIL_POLL_MS) => {
       const lastStart = lastRequestStart.current;
-      const elapsed =
+      const delay =
         lastStart?.scope === requestScope
-          ? performance.now() - lastStart.startedAt
-          : IMAGE_DETAIL_POLL_MS;
-      timer = setTimeout(run, Math.max(0, IMAGE_DETAIL_POLL_MS - elapsed));
+          ? Math.max(
+              0,
+              IMAGE_DETAIL_POLL_MS - (performance.now() - lastStart.startedAt)
+            )
+          : fallbackDelay;
+      scheduleAfter(delay);
     };
 
     const run = async () => {
       if (!active) return;
+      clearTimer();
+      if (window.document.visibilityState !== 'visible') {
+        return;
+      }
       const lastStart = lastRequestStart.current;
       if (lastStart?.scope === requestScope) {
         const remaining =
           IMAGE_DETAIL_POLL_MS - (performance.now() - lastStart.startedAt);
         if (remaining > 0) {
-          timer = setTimeout(run, remaining);
+          scheduleAfter(remaining);
           return;
         }
       }
       if (Object.keys(collectionControllers.current).length > 0) {
-        timer = setTimeout(run, IMAGE_DETAIL_POLL_MS);
+        scheduleAfter(IMAGE_DETAIL_POLL_MS);
         return;
       }
       const owner = requestOwner.current;
       const request =
         owner?.scope === requestScope ? owner.promise : startLoad('poll');
       await request;
-      schedule();
+      scheduleFromLastStart();
     };
 
-    timer = setTimeout(run, IMAGE_DETAIL_POLL_MS);
+    const handleVisibilityChange = () => {
+      clearTimer();
+      if (window.document.visibilityState === 'visible') {
+        const remaining = Math.max(0, nextPollAt - performance.now());
+        if (remaining === 0) {
+          void run();
+          return;
+        }
+        timer = setTimeout(run, remaining);
+      }
+    };
+
+    if (window.document.visibilityState === 'visible') {
+      timer = setTimeout(run, IMAGE_DETAIL_POLL_MS);
+    }
+    window.document.addEventListener(
+      'visibilitychange',
+      handleVisibilityChange
+    );
     return () => {
       active = false;
-      if (timer !== null) clearTimeout(timer);
+      clearTimer();
+      window.document.removeEventListener(
+        'visibilitychange',
+        handleVisibilityChange
+      );
       const owner = requestOwner.current;
       if (owner?.scope === requestScope && owner.source === 'poll') {
         owner.revoked = true;

@@ -52,6 +52,13 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
 function detailFor(workspace, imageId, digestCharacter) {
   return {
     artifact: {
@@ -734,6 +741,157 @@ describe('Image artifact detail', () => {
       jest.advanceTimersByTime(10_000);
     });
     expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+  });
+
+  it('pauses hidden image-detail polls and catches up once when visibility restores after the due boundary', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    getImageCapabilities.mockResolvedValue({
+      workspace: 'research',
+      publish: false,
+    });
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+    expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+
+    try {
+      setDocumentVisibility('hidden');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        jest.advanceTimersByTime(20_000);
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(4999);
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(3);
+    } finally {
+      view.unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('does not fire an early image-detail poll when visibility returns before the due boundary', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    getImageCapabilities.mockResolvedValue({
+      workspace: 'research',
+      publish: false,
+    });
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+    expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+
+    try {
+      setDocumentVisibility('hidden');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        jest.advanceTimersByTime(4999);
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(2);
+    } finally {
+      view.unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('removes image-detail visibility listeners and timers on unmount', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    getImageCapabilities.mockResolvedValue({
+      workspace: 'research',
+      publish: false,
+    });
+    getImageArtifactDetail.mockResolvedValue(nonterminalDetailFor());
+
+    const view = render(<ImageDetail />);
+    expect(await screen.findByText('Image artifact')).toBeVisible();
+    expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+
+    try {
+      view.unmount();
+      setDocumentVisibility('hidden');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        jest.advanceTimersByTime(20_000);
+        await Promise.resolve();
+      });
+      expect(getImageCapabilities).toHaveBeenCalledTimes(1);
+    } finally {
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
   });
 
   it('hides the previous compound route scope before replacement detail loads', async () => {
