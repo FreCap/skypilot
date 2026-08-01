@@ -6718,6 +6718,73 @@ DigitalOcean responsibilities, but this slice neither introduces nor removes
 those owners. The next slice may add a provider-local diagnostic facet only
 after its exact one-traversal contract and failure containment are accepted.
 
+#### M4 DigitalOcean authoritative query projection extraction
+
+This slice applies the smallest durable part of dstack's provider boundary:
+one provider read followed by one deterministic provider-local translation.
+It does not introduce a generic inventory or shared reconciler yet. It removes
+the inline DigitalOcean status translation from the effectful query entry
+point so later observation work has one explicit, independently testable
+translation owner.
+
+`sky.provision.do.query_projection` adds one internal
+`project_query_instances(instances)` function. It receives the exact object
+returned by `utils.filter_instances()` and returns the existing ordered
+`dict[str, tuple[ClusterStatus | None, str | None]]`. The function owns the
+current native-state map:
+
+```text
+new -> INIT
+archive -> INIT
+active -> UP
+off -> STOPPED
+```
+
+It performs no provider call, retry, sleep, logging, telemetry, configuration
+lookup, clock read, random generation, or mutation of its input. It constructs
+one new result dictionary and otherwise reproduces the current loop exactly.
+For each value from `instances.values()`, evaluation order remains:
+
+1. read `instance_meta['status']`;
+2. map that value through the current native-state map;
+3. read `instance_meta['name']`; and
+4. assign `(mapped_status, None)` to that name in the result.
+
+The map remains function-local and is built from the current `status_lib`
+members on every invocation, preserving the existing late-bound module seam
+without adding mutable module state. Duplicate projected names retain Python
+dictionary first-insertion position and last-value-wins value semantics.
+
+`sky.provision.do.instance.query_instances()` retains all argument deletion,
+provider-config assertion, and the single exact `utils.filter_instances()`
+call with positional `cluster_name_on_cloud` and keyword
+`status_filters=None`. It then calls `project_query_instances()` exactly once
+and directly returns that dictionary. Direct provider calls, facade calls,
+helper replacements, exported aliases, strict and legacy plugin precedence,
+and every non-DigitalOcean route keep their existing resolver path. No V2
+diagnostic metadata, context state, hook, shadow event, database state, feature
+flag, or removal-manifest row is added.
+
+Characterization tests prove the empty result, every mapped native state,
+ordered values, duplicate projected names, and exact returned value shape.
+Recording mappings prove the four-step per-row access order. Failure tests
+prove an unknown state raises before reading the name, missing keys and
+unhashable names retain their ordinary exception type and message, and neither
+the projector nor query retries. Query integration tests prove one helper
+lookup and call with the exact arguments, one projector invocation with the
+helper's exact return object, and direct return of the projector's exact result
+object. Existing provider-facet, full provision, backend-status, import,
+formatting, type, and lint gates also run.
+
+This extraction is authoritative immediately because its finite mapping and
+ordering semantics are fully characterized without a second live execution
+path. Rollback is the ordinary exact-image rollback; there is no compatibility
+artifact to age out. It grants no raw pagination, completeness, provider ID,
+region, ownership, incarnation, absence, head selection, create, resume, stop,
+terminate, wait, cleanup, retry, `ProvisionRecord`, planner, or reconciliation
+authority. The next shared-reconciler slice still requires a typed immutable
+node observation with deterministic identity and effect/incarnation fencing.
+
 ### M5: Serve and pools
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
@@ -8210,3 +8277,30 @@ pylint, dashboard lint, and dashboard formatting pass on the scoped files.
 This review still grants no provider diagnostic binding or provider behavior
 claim. It authorizes only the generic typed resolver and the unused private
 built-in facet seam for exact-image control-plane regression rollout.
+
+### Review 30
+
+Verdict: `PURSUE` for the M4 DigitalOcean authoritative query projection
+extraction at contract SHA-256
+`25c07b38e40cb1c5f762d500e898b7e8f6a9b17863476bff4c28de143ff0331c`.
+The unchanged locator-only removal manifest remains at SHA-256
+`712420900df178e7f166b21a43d23304e016a4e80a8453a04c480ae2ac1a6ce5`.
+
+Two diagnostic proposals were rejected before implementation. The first
+mistook a non-atomic, name-collapsed DigitalOcean traversal for an inventory
+and used a writable closure rather than a pinned authoritative query. The
+second corrected those faults but required a new V2 resolver branch, immutable
+context capture chain, cross-thread lease, shadow comparison, telemetry event,
+and removal lifecycle to validate a finite four-state translation. Its
+`DEBUG` event would not reach the default production log stream, and its sole
+V2 consumer would disappear at promotion while the generic contract remained.
+
+The accepted replacement has one effectful provider read followed by one
+authoritative provider-local pure translation. It adds no parallel runtime
+path, resolver capability, context state, telemetry, feature flag, or removal
+debt. Independent runtime and simplicity re-reviews of the exact section both
+returned `PURSUE` with no confirmed blocker. Implementation must additionally
+prove that `values()` is evaluated once and the input mapping remains
+unmodified. This verdict authorizes only the DigitalOcean query projection
+extraction and its characterization tests. It grants no provider inventory,
+node actuation, retry, cleanup, planning, or reconciliation authority.
