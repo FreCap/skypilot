@@ -892,6 +892,16 @@ before scanning the window, so an admission that waited behind promotion must
 revalidate the mode and cannot appear after the scan with a pre-window
 timestamp.
 
+The lifecycle epoch is the current fencing token of an API lifecycle
+operation, not a stable controller-owner credential: ordinary updates may
+advance it without changing the service hash or controller owner. A controller
+snapshots the current nonnull epoch from the exact owner row immediately before
+action admission, and the admission transaction revalidates that optimistic
+snapshot under the service-row lock. A concurrent advance rejects and retries
+that admission; it does not permanently cancel the still-current controller.
+The controller bootstrap or recovery-script epoch must never be cached as the
+expected epoch for later replica actions.
+
 `launch_shadow_sample_id` and `down_shadow_sample_id` are incarnation-scoped,
 not both constrained to the row's current generation. The launch link retains
 the most recent launch parent and therefore may name generation N after
