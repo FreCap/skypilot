@@ -1974,6 +1974,7 @@ class TestGetServiceStatusSnapshot:
             'hash': row['hash'],
             'lifecycle_epoch': row['lifecycle_epoch'],
             'resource_scope': 'scope-a',
+            'workspace': None,
             'uptime': row['uptime'],
             'policy': 'policy',
             'requested_resources_str': '1x[CPU:1+]',
