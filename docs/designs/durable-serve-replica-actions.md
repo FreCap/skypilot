@@ -5,8 +5,10 @@ review; M1a inert schema and dark M1b typed store implemented and locally
 verified; the frozen M2 Serve032 foundation, cluster identity, immutable
 provider contracts, typed shadow store, additive Serve033 coverage schema and
 promotion audit, and generic API006 progress substrate are implemented and
-locally verified, while the newly frozen Serve033 preparation-capability
-commitment/endpoint validation delta is code-pending; the immutable effect-origin, closed handler-return,
+locally verified; the Serve033 preparation-capability commitment schema/typed-
+store delta is implemented and locally verified, while runtime capability
+generation and endpoint validation remain pending; the immutable effect-origin,
+closed handler-return,
 pre-I/O representability, and reducer-owned quiescence contract is frozen in
 design while its Serve validator/reducer, dedicated return codec, and shadow-
 outcome parser alignment remain pending; the candidate-only Kubernetes
@@ -1371,6 +1373,13 @@ empty. A nonempty installation fails closed for a separately reviewed
 backfill; migration never synthesizes coverage for prior samples. Revision 032
 is not rewritten and neither revision supports schema down.
 
+Revision 033 remains unshipped while this schema is being authored, so its
+fresh-table definition is updated in place. Deployment preflight must prove
+that no target database was stamped with an earlier 033 shape. If that premise
+is false, rollout stops and uses a new revision 034 that requires an empty
+worker-reference table before adding the nonnull column; no default or
+synthetic capability commitment is truthful.
+
 The two nonexecuting cohort-retention tables are:
 
 ```text
@@ -2322,8 +2331,12 @@ M2 foundation verification evidence on 2026-08-01:
   coverage-only attempts, actual-effect trace columns, the explicit parent FK,
   and replica coverage links; fresh and 032-upgrade catalog/constraint tests,
   fail-closed nonempty-032 refusal, and downgrade refusal pass locally;
-  the preparation-capability commitment newly frozen above must be added to
-  that still-dark revision and those fixtures before runtime activation;
+  the still-dark revision now includes the nonnull, no-default lowercase
+  preparation-capability SHA-256 commitment. Typed reference decoding,
+  persistence, exact adoption, binding, launch/down fixture coverage, invalid-
+  row rejection, and lost-migration-acknowledgement catalog convergence pass
+  locally. This evidence does not claim runtime CSPRNG generation, raw-
+  capability discard, or endpoint validation;
 - global-user-state revision 028 installs a nullable portable cluster-record
   UUID and partial unique index, leaves historical rows null, and provides the
   PostgreSQL-only exact insert/adopt/reject primitive without changing ordinary

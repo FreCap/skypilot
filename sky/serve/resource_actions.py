@@ -2291,11 +2291,13 @@ class WorkerCohortReferenceInputV1(_CanonicalContract):
     action_type: kernel_actions.ActionKind
     controller_owner_fence: str
     lifecycle_epoch: int
+    preparation_capability_sha256: str
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
         'version', 'decision_id', 'cohort_id', 'service_hash',
         'replica_incarnation', 'desired_generation', 'action_type',
-        'controller_owner_fence', 'lifecycle_epoch'
+        'controller_owner_fence', 'lifecycle_epoch',
+        'preparation_capability_sha256'
     })
 
     def __post_init__(self) -> None:
@@ -2328,10 +2330,21 @@ class WorkerCohortReferenceInputV1(_CanonicalContract):
             self, 'lifecycle_epoch',
             _positive_integer(self.lifecycle_epoch,
                               name='cohort_reference.lifecycle_epoch'))
+        object.__setattr__(
+            self, 'preparation_capability_sha256',
+            _sha256(self.preparation_capability_sha256,
+                    name=('cohort_reference.'
+                          'preparation_capability_sha256')))
 
     @classmethod
     def from_value(cls, value: Any) -> 'WorkerCohortReferenceInputV1':
-        raw = _closed_object(value,
+        shallow = _closed_object_shallow(value,
+                                         name='worker cohort reference input',
+                                         keys=cls._KEYS)
+        _sha256(shallow['preparation_capability_sha256'],
+                name=('cohort_reference.'
+                      'preparation_capability_sha256'))
+        raw = _closed_object(shallow,
                              name='worker cohort reference input',
                              keys=cls._KEYS)
         return cls(**raw)
@@ -2347,6 +2360,7 @@ class WorkerCohortReferenceInputV1(_CanonicalContract):
             'action_type': self.action_type.value,
             'controller_owner_fence': self.controller_owner_fence,
             'lifecycle_epoch': self.lifecycle_epoch,
+            'preparation_capability_sha256': self.preparation_capability_sha256,
         }
 
     def validate_coverage(self, coverage: CoverageDecisionV1) -> None:

@@ -247,6 +247,18 @@ def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
     assert parent_foreign_keys[0][
         'referred_table'] == action_schema.SHADOW_COVERAGE.name
     assert parent_foreign_keys[0]['options']['ondelete'] == 'RESTRICT'
+    reference_columns = {
+        column['name']: column for column in inspector.get_columns(
+            action_schema.WORKER_COHORT_REFS.name)
+    }
+    capability_column = reference_columns['preparation_capability_sha256']
+    assert capability_column['nullable'] is False
+    assert capability_column['default'] is None
+    reference_checks = {
+        constraint['name'] for constraint in inspector.get_check_constraints(
+            action_schema.WORKER_COHORT_REFS.name)
+    }
+    assert 'ck_serve_ra_worker_cohort_refs_capability' in reference_checks
 
     with engine.connect() as connection:
         legacy = connection.execute(

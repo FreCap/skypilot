@@ -309,7 +309,12 @@ def _reference(
     identity: actions.CoverageDecisionIdentityV1,
     *,
     owner_fence: str = 'owner-fence-7',
+    capability_sha256: str | None = None,
 ) -> actions.WorkerCohortReferenceInputV1:
+    if capability_sha256 is None:
+        capability_sha256 = actions.canonical_sha256({
+            'test_preparation_capability_for': str(identity.decision_id),
+        })
     return actions.WorkerCohortReferenceInputV1(
         version=1,
         decision_id=identity.decision_id,
@@ -319,7 +324,8 @@ def _reference(
         desired_generation=identity.desired_generation,
         action_type=identity.action_type,
         controller_owner_fence=owner_fence,
-        lifecycle_epoch=4)
+        lifecycle_epoch=4,
+        preparation_capability_sha256=capability_sha256)
 
 
 def _insert_request(
@@ -578,7 +584,22 @@ def test_reference_coverage_and_terminal_release_are_owner_fenced(
 
     prepared = store.prepare_worker_cohort_reference(reference)
     assert not prepared.adopted
+    assert prepared.record.reference.preparation_capability_sha256 == (
+        reference.preparation_capability_sha256)
+    assert store.get_worker_cohort_reference(
+        reference.decision_id).reference == reference
     assert store.prepare_worker_cohort_reference(reference).adopted
+    changed_capability = dataclasses.replace(reference,
+                                             preparation_capability_sha256='e' *
+                                             64)
+    with pytest.raises(kernel_actions.ActionConflict,
+                       match='different preparation reference bytes'):
+        store.prepare_worker_cohort_reference(changed_capability)
+    with pytest.raises(kernel_actions.ClaimLost, match='identity changed'):
+        with orm.Session(engine) as session, session.begin():
+            store.bind_worker_cohort_reference_in_session(
+                session, changed_capability, 1,
+                actions.WorkerCohortReferenceState.SHADOW_ACTIVE)
     coverage = _unsupported_coverage(identity,
                                      worker_cohort_ref_id=identity.decision_id)
     with orm.Session(engine) as session, session.begin():
@@ -623,6 +644,15 @@ def test_reference_coverage_and_terminal_release_are_owner_fenced(
     assert released.record.reference_state is actions.WorkerCohortReferenceState.RELEASED
     assert store.release_worker_cohort_reference(reference, 2).adopted
 
+    down_identity = _coverage_identity(
+        generation=4, action_type=kernel_actions.ActionKind.DOWN)
+    down_reference = _reference(down_identity)
+    assert down_reference.preparation_capability_sha256 != (
+        reference.preparation_capability_sha256)
+    down_prepared = store.prepare_worker_cohort_reference(down_reference)
+    assert down_prepared.record.reference.preparation_capability_sha256 == (
+        down_reference.preparation_capability_sha256)
+
     preparing_identity = _coverage_identity(replica_id=8, generation=4)
     preparing_reference = _reference(preparing_identity)
     store.prepare_worker_cohort_reference(preparing_reference)
@@ -640,6 +670,25 @@ def test_reference_coverage_and_terminal_release_are_owner_fenced(
     with pytest.raises(kernel_actions.StaleRevision,
                        match='Only the expected SHADOW_ACTIVE'):
         store.release_worker_cohort_reference(action_reference, 2)
+
+
+def test_reference_reader_rejects_invalid_capability_commitment(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    _accept_cohort(engine, store)
+    reference = _reference(_coverage_identity())
+    store.prepare_worker_cohort_reference(reference)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'ALTER TABLE serve_resource_action_worker_cohort_refs '
+            'DROP CONSTRAINT ck_serve_ra_worker_cohort_refs_capability')
+        connection.execute(
+            sqlalchemy.update(
+                resource_action_state_schema.WORKER_COHORT_REFS).values(
+                    preparation_capability_sha256='invalid'))
+    with pytest.raises(kernel_actions.InvariantViolation,
+                       match='Invalid Serve worker cohort reference row'):
+        store.get_worker_cohort_reference(reference.decision_id)
 
 
 def test_coverage_is_immutable_deterministic_and_revalidates_raw_rows(

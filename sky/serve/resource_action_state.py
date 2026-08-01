@@ -642,6 +642,8 @@ def _worker_cohort_reference_record(
             'action_type': row['action_type'],
             'controller_owner_fence': row['controller_owner_fence'],
             'lifecycle_epoch': row['lifecycle_epoch'],
+            'preparation_capability_sha256':
+                row['preparation_capability_sha256'],
         })
         state = actions.WorkerCohortReferenceState(row['reference_state'])
         revision = _positive_integer(row['revision'], name='revision')
@@ -1571,6 +1573,8 @@ class PostgresServeResourceActionStateStore:
                 action_type=reference.action_type.value,
                 controller_owner_fence=reference.controller_owner_fence,
                 lifecycle_epoch=reference.lifecycle_epoch,
+                preparation_capability_sha256=(
+                    reference.preparation_capability_sha256),
                 reference_state=(
                     actions.WorkerCohortReferenceState.PREPARING.value),
                 revision=1,

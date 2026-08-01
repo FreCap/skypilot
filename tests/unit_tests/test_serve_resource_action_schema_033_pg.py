@@ -248,6 +248,20 @@ def test_revision_033_postgres_upgrade_catalog_and_constraints(
         column['name'] for column in inspector.get_columns(
             'serve_resource_action_shadow_attempts')
     }
+    cohort_reference_columns = {
+        column['name']: column for column in inspector.get_columns(
+            'serve_resource_action_worker_cohort_refs')
+    }
+    assert not cohort_reference_columns['preparation_capability_sha256'][
+        'nullable']
+    assert cohort_reference_columns['preparation_capability_sha256'][
+        'default'] is None
+    cohort_reference_checks = {
+        constraint['name'] for constraint in inspector.get_check_constraints(
+            'serve_resource_action_worker_cohort_refs')
+    }
+    assert 'ck_serve_ra_worker_cohort_refs_capability' in (
+        cohort_reference_checks)
     assert _foreign_keys(inspector, 'serve_resource_action_shadow_samples'
                         )['fk_serve_ra_shadow_samples_coverage'] == (
                             'serve_resource_action_shadow_coverage',
@@ -320,6 +334,7 @@ def test_revision_033_postgres_checks_restrict_and_cascade(
             action_type='launch',
             controller_owner_fence='123:10.0.0.1',
             lifecycle_epoch=1,
+            preparation_capability_sha256='d' * 64,
             reference_state='PREPARING'))
         connection.execute(action_schema.SHADOW_COVERAGE.insert().values(
             decision_id=decision_id,
@@ -405,6 +420,64 @@ def test_revision_033_postgres_checks_restrict_and_cascade(
                     action_schema.SHADOW_COVERAGE_ATTEMPTS.c.decision_id ==
                     coverage_only_id)).scalar_one()
     assert remaining == 0
+
+
+@pytest.mark.parametrize('capability_sha256', [None, 'D' * 64, 'd' * 63])
+def test_revision_033_postgres_requires_exact_capability_commitment(
+        postgres_engine, capability_sha256: str | None) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '033')
+    with engine.begin() as connection:
+        connection.execute(action_schema.WORKER_COHORTS.insert().values(
+            cohort_id='cohort-v1',
+            deployment_uid='deployment-uid-v1',
+            cohort_identity={},
+            cohort_identity_sha256='a' * 64,
+            registration_attestations={},
+            registration_attestations_sha256='b' * 64,
+            lifecycle_state='REGISTERING'))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(action_schema.WORKER_COHORT_REFS.insert().values(
+                decision_id=uuid.uuid4(),
+                cohort_id='cohort-v1',
+                service_hash=str(_SERVICE_UUID),
+                replica_incarnation=_REPLICA_UUID,
+                desired_generation=1,
+                action_type='down',
+                controller_owner_fence='123:10.0.0.1',
+                lifecycle_epoch=1,
+                preparation_capability_sha256=capability_sha256,
+                reference_state='PREPARING'))
+
+
+def test_revision_033_postgres_does_not_synthesize_capability_commitment(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '033')
+    with engine.begin() as connection:
+        connection.execute(action_schema.WORKER_COHORTS.insert().values(
+            cohort_id='cohort-v1',
+            deployment_uid='deployment-uid-v1',
+            cohort_identity={},
+            cohort_identity_sha256='a' * 64,
+            registration_attestations={},
+            registration_attestations_sha256='b' * 64,
+            lifecycle_state='REGISTERING'))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(action_schema.WORKER_COHORT_REFS.insert().values(
+                decision_id=uuid.uuid4(),
+                cohort_id='cohort-v1',
+                service_hash=str(_SERVICE_UUID),
+                replica_incarnation=_REPLICA_UUID,
+                desired_generation=1,
+                action_type='launch',
+                controller_owner_fence='123:10.0.0.1',
+                lifecycle_epoch=1,
+                reference_state='PREPARING'))
 
 
 def test_revision_033_postgres_nonempty_shadow_fails_before_catalog_change(

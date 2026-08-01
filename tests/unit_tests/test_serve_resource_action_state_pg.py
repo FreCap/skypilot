@@ -575,7 +575,10 @@ def _prepare_worker_cohort_reference(
         controller_owner_fence=(f'{_OWNER[0]}:{_OWNER[1]}'
                                 if controller_owner_fence is None else
                                 controller_owner_fence),
-        lifecycle_epoch=_LIFECYCLE_EPOCH)
+        lifecycle_epoch=_LIFECYCLE_EPOCH,
+        preparation_capability_sha256=actions.canonical_sha256({
+            'test_preparation_capability_for': str(sample.action_id),
+        }))
     prepared = store.prepare_worker_cohort_reference(reference)
     assert prepared.record.reference_state is actions.WorkerCohortReferenceState.PREPARING
     return reference

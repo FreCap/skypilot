@@ -518,6 +518,9 @@ worker_cohort_refs_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_owner_fence', sqlalchemy.Text,
                       nullable=False),
     sqlalchemy.Column('lifecycle_epoch', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('preparation_capability_sha256',
+                      sqlalchemy.Text,
+                      nullable=False),
     sqlalchemy.Column('reference_state', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('revision',
                       sqlalchemy.BigInteger,
@@ -543,6 +546,9 @@ worker_cohort_refs_table = sqlalchemy.Table(
     sqlalchemy.CheckConstraint(
         'desired_generation > 0 AND lifecycle_epoch > 0 AND revision > 0',
         name='ck_serve_ra_worker_cohort_refs_counters'),
+    sqlalchemy.CheckConstraint(
+        f"preparation_capability_sha256 ~ '{_SHA256_PATTERN}'",
+        name='ck_serve_ra_worker_cohort_refs_capability'),
     sqlalchemy.CheckConstraint("action_type IN ('launch', 'down')",
                                name='ck_serve_ra_worker_cohort_refs_action'),
     sqlalchemy.CheckConstraint(

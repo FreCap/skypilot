@@ -1,4 +1,5 @@
 """Pure Serve033 coverage and authority-worker contract tests."""
+# pylint: disable=protected-access
 
 import dataclasses
 import datetime
@@ -187,6 +188,7 @@ def _reference() -> dict:
         'action_type': 'launch',
         'controller_owner_fence': 'owner-fence-7',
         'lifecycle_epoch': 4,
+        'preparation_capability_sha256': 'd' * 64,
     }
 
 
@@ -692,6 +694,8 @@ def test_registration_set_relation_sorting_readiness_hash_and_freshness(
 @pytest.mark.parametrize('mutate,match', [
     (lambda value: value.update({'extra': None}), 'unknown or missing'),
     (lambda value: value.pop('cohort_id'), 'unknown or missing'),
+    (lambda value: value.pop('preparation_capability_sha256'),
+     'unknown or missing'),
     (lambda value: value.update({'decision_id': 'not-a-uuid'}), 'UUID'),
     (lambda value: value.update(
         {'service_hash': 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA'}),
@@ -699,6 +703,16 @@ def test_registration_set_relation_sorting_readiness_hash_and_freshness(
     (lambda value: value.update({'action_type': 'restart'}), 'unsupported'),
     (lambda value: value.update({'controller_owner_fence': 'x' * 1025}),
      '1..1024'),
+    (lambda value: value.update({'preparation_capability_sha256': 'D' * 64}),
+     'lowercase SHA-256'),
+    (lambda value: value.update({'preparation_capability_sha256': 'd' * 63}),
+     'lowercase SHA-256'),
+    (lambda value: value.update({'preparation_capability_sha256': None}),
+     'lowercase SHA-256'),
+    (lambda value: value.update({
+        'preparation_capability_sha256': type('HashSubclass', (str,), {})
+                                         ('d' * 64)
+    }), 'lowercase SHA-256'),
 ])
 def test_cohort_reference_is_closed_and_bounded(mutate, match: str) -> None:
     value = _reference()
@@ -709,6 +723,12 @@ def test_cohort_reference_is_closed_and_bounded(mutate, match: str) -> None:
 
 def test_cohort_reference_requires_exact_coverage_identity() -> None:
     reference = actions.WorkerCohortReferenceInputV1.from_value(_reference())
+    assert reference.canonical_value() == _reference()
+    changed_capability = dataclasses.replace(reference,
+                                             preparation_capability_sha256='e' *
+                                             64)
+    assert changed_capability.canonical_bytes != reference.canonical_bytes
+    assert changed_capability.sha256 != reference.sha256
     coverage = actions.CoverageDecisionV1.from_value(_coverage())
     reference.validate_coverage(coverage)
     changed = _reference()
