@@ -26,6 +26,7 @@ from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import asyncio as sql_async
 
 from sky import global_user_state_cloud_checks
+from sky import global_user_state_cluster_yaml
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
 from sky import global_user_state_service_account_tokens
@@ -3513,12 +3514,11 @@ def get_cluster_yaml_str(cluster_yaml_path: str | None) -> str | None:
         raise ValueError('Attempted to read a None YAML.')
     cluster_file_name = os.path.basename(cluster_yaml_path)
     cluster_name, _ = os.path.splitext(cluster_file_name)
-    with orm.Session(engine) as session:
-        row = session.query(cluster_yaml_table).filter_by(
-            cluster_name=cluster_name).first()
-    if row is None:
+    found, yaml_str = global_user_state_cluster_yaml.get_cluster_yaml(
+        engine, orm.Session, cluster_yaml_table, cluster_name)
+    if not found:
         return _set_cluster_yaml_from_file(cluster_yaml_path, cluster_name)
-    return row.yaml
+    return yaml_str
 
 
 def get_cluster_yaml_str_multiple(
@@ -3536,12 +3536,8 @@ def get_cluster_yaml_str_multiple(
         cluster_names_to_yaml_paths[cluster_name] = cluster_yaml_path
 
     unique_cluster_names = list(cluster_names_to_yaml_paths)
-    with orm.Session(engine) as session:
-        rows = session.query(cluster_yaml_table).filter(
-            cluster_yaml_table.c.cluster_name.in_(unique_cluster_names)).all()
-    cluster_names_to_yaml: dict[str, str | None] = {
-        row.cluster_name: row.yaml for row in rows
-    }
+    cluster_names_to_yaml = global_user_state_cluster_yaml.get_cluster_yamls(
+        engine, orm.Session, cluster_yaml_table, unique_cluster_names)
 
     for cluster_name in unique_cluster_names:
         if cluster_name not in cluster_names_to_yaml:
@@ -3604,30 +3600,20 @@ def get_cluster_yaml_dict_multiple(
 def set_cluster_yaml(cluster_name: str, yaml_str: str) -> None:
     """Set the cluster yaml in the database."""
     engine = _db_manager.get_engine()
-    with orm.Session(_db_manager.get_engine()) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(cluster_yaml_table).values(
-            cluster_name=cluster_name, yaml=yaml_str)
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[cluster_yaml_table.c.cluster_name],
-            set_={cluster_yaml_table.c.yaml: yaml_str})
-        session.execute(do_update_stmt)
-        session.commit()
+    global_user_state_cluster_yaml.set_cluster_yaml(engine,
+                                                    _db_manager.get_engine(),
+                                                    orm.Session, sqlite,
+                                                    postgresql,
+                                                    cluster_yaml_table,
+                                                    cluster_name, yaml_str)
 
 
 @metrics_lib.time_me
 def remove_cluster_yaml(cluster_name: str):
     engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(cluster_yaml_table).filter_by(
-            cluster_name=cluster_name).delete()
-        session.commit()
+    global_user_state_cluster_yaml.remove_cluster_yaml(engine, orm.Session,
+                                                       cluster_yaml_table,
+                                                       cluster_name)
 
 
 @metrics_lib.time_me
