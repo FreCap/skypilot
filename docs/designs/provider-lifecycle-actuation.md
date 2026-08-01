@@ -6986,6 +6986,242 @@ The tag is not removed during rollback. The slice adds no database schema,
 feature flag, metric, event, persisted report, dual execution path, or
 temporary removal-ledger owner.
 
+#### M4 DigitalOcean complete inventory capture foundation
+
+Status: proposed implementation boundary. This slice is pinned to SkyPilot
+`612197aa45add7242187bf8338fbfd256255b9d4` and dstack
+`c9ebdaad6bbaa3105061d79f6ab52af9d609e99d`.
+
+dstack's DigitalOcean backend preserves the provider-generated droplet ID at
+create time and later performs an exact-ID read to complete provisioning data.
+Its shared server pipeline, rather than the provider adapter, owns repeated
+readiness checks and state transitions. SkyPilot will retain that separation as
+the target, but it cannot promote a shared reconciler over its current
+DigitalOcean discovery path. The current path collapses rows by mutable name
+and omits GPU droplets before any shared policy can inspect canonical identity.
+
+DigitalOcean documents two disjoint list families. A request filtered by
+`tag_name` returns tagged non-GPU droplets because the default list excludes
+GPU droplets. A request with `type=gpus` returns GPU droplets, but `type` cannot
+be combined with `tag_name`. See the official
+[Droplet API](https://docs.digitalocean.com/products/droplets/reference/api/droplets/)
+and
+[PyDo list reference](https://docs.digitalocean.com/reference/pydo/reference/droplets/list/).
+SkyPilot currently calls only the first family. A GPU cluster can therefore be
+created successfully and then remain invisible to readiness, status, stop,
+termination, and cleanup polling.
+
+This slice introduces one private provider-local capture as the sole droplet
+list I/O owner beneath `sky.provision.do.utils.filter_instances()`. It fixes
+inventory coverage and preserves duplicate provider rows before the existing
+legacy projection. It does not add a generic provider observation facet, a
+planner, a retry loop, a mutation callback, a database record, a telemetry
+path, or a feature flag.
+
+##### Exact capture and compatibility contract
+
+The private `_capture_cluster_droplets()` accepts the existing exact
+`cluster_name_on_cloud` value and `status_filters` value. It resolves the
+current `client()` binding exactly once and pins that exact client and its
+`droplets` operations object for the complete capture. It returns one private
+linear carrier with two values:
+
+1. `raw_rows`, an ordered tuple containing the exact provider row objects for
+   every visible droplet bearing the exact cluster tag, including duplicate
+   names; and
+2. `legacy_instances`, the exact mutable name-keyed dictionary that the
+   current `filter_instances()` contract returns.
+
+The carrier is request-local and private. `raw_rows` is structurally immutable
+only at the tuple boundary. Its provider mappings are retained by identity for
+the later normalization slice and are not recursively immutable, serializable,
+persistable, loggable, or safe as actuation evidence. No caller may mutate a
+row through the carrier. The carrier itself exposes no provider client,
+credential, callback, continuation, or mutation handle.
+
+`filter_instances()` keeps its public signature and remains the only seam used
+by all thirteen current DigitalOcean lifecycle call sites. It calls
+`_capture_cluster_droplets()` exactly once and returns the carrier's exact
+`legacy_instances` dictionary object. Existing callers, direct monkeypatches of
+`filter_instances`, provider facade routing, and the authoritative query
+projector remain unchanged.
+
+The capture builds `legacy_instances` inline while each provider page is being
+consumed. For every tagged non-GPU row it preserves the current field-access
+and failure order:
+
+1. append the exact row object to `raw_rows` without inspecting it;
+2. read `status` exactly once;
+3. if the status is excluded, read no name and continue;
+4. otherwise read `name` exactly once and assign the exact row object to that
+   key in `legacy_instances`; and
+5. only after all rows on the page are consumed, parse that page's pagination
+   evidence and request another page.
+
+This keeps the current normal-path mapping behavior, status-filter behavior,
+row identity, per-page failure timing, dictionary first-insertion position,
+and last-value-wins collision behavior. Start, stop, down, head selection,
+resumed-ID ordering, query projection, and `get_cluster_info()` continue to
+consume that same dictionary contract. The new GPU family necessarily adds a
+new field access: it reads each account-visible GPU row's `tags` to determine
+exact cluster membership before retaining or projecting that row. A retained
+GPU row then follows the same status and name steps above. A malformed GPU row
+whose tags cannot establish non-membership fails the whole capture; partial
+GPU inventory is never projected as cluster absence.
+
+The exact cluster tag is
+`skypilot-cluster-name:<cluster_name_on_cloud>`, using the existing
+`TAG_SKYPILOT_CLUSTER_NAME` constant and exact case-sensitive string
+membership in the provider row's tag array. The capture does not reinterpret
+case, normalize Unicode, infer membership from the droplet name, or accept a
+marker-only match. The cluster-incarnation marker is retained in `tags` but is
+not classified by this slice.
+
+##### Two-family pagination contract
+
+One shared private family-capture helper owns page-number traversal, raw-row
+retention, and legacy projection for both families. It accepts only the pinned
+droplet operations object, a closed family enum, the exact cluster tag, the
+existing status filter, and the two local output containers. It exposes no
+arbitrary callback. Keeping list I/O and row consumption inside this helper
+preserves the current exception boundary: an `HttpResponseError` raised by the
+list call or by a row's status or name access is wrapped, while pagination-link
+parsing remains outside that wrapper. The complete capture invokes the helper
+sequentially in this fixed order:
+
+1. `droplets.list(tag_name=<exact cluster tag>, per_page=200, page=<page>)`
+   for tagged non-GPU droplets; then
+2. `droplets.list(type='gpus', per_page=200, page=<page>)` for all GPU
+   droplets visible to the pinned client, filtering exact cluster-tag members
+   locally.
+
+The family order also defines the intentional legacy collision rule across
+families: a later GPU row with a duplicate name replaces the dictionary value
+without moving the first insertion position. `raw_rows` retains both rows.
+Names never deduplicate the capture.
+
+Each family starts at page 1, reapplies its original filter arguments on every
+call, and derives only the next integer page number from
+`links.pages.next`. It never follows an arbitrary returned URL and never drops
+the family filter on a later page. The walker rejects a missing, non-integer,
+non-positive, repeated, or non-increasing next page instead of looping or
+returning a partial result.
+
+Every response must contain a droplet array, pagination links, and an exact
+non-negative integer `meta.total`. Boolean totals are rejected. The first page
+pins the family total; every later page must report the same total. The walker
+counts all rows returned by the provider before local GPU tag filtering. A
+family is accepted only when traversal terminates without a next link and the
+row count equals the pinned total. Early termination, extra rows, a changing
+total, a repeated page, or any malformed pagination component fails the whole
+capture. No accumulated row or legacy dictionary escapes on failure.
+
+The capture does not claim an atomic provider snapshot. DigitalOcean exposes
+page-number pagination without a documented snapshot token. Stable totals and
+a closed traversal establish bounded pagination consistency, not proof that
+membership was unchanged between pages. This distinction is permanent in the
+carrier: it has `authority=NONE` by contract and cannot prove absence for a
+mutation. The later immutable observer must retain this limitation, and the
+future actuation slice must perform exact-ID pre-effect revalidation plus its
+separately persisted effect fence.
+
+An ID may appear more than once in the raw carrier because this slice does not
+read `id` on the legacy path. Canonical positive-integer ID validation,
+duplicate-ID rejection, region validation, marker classification, native-state
+normalization, and recursive immutability belong to the next pure observer
+projection. That projection will consume this single capture without another
+provider read. Until it lands, `raw_rows` has no production consumer other
+than the legacy projection owner and no authority outside its private module.
+
+##### SDK, error, and rate-limit contract
+
+SkyPilot raises the DigitalOcean extra from `pydo>=0.3.0` to `pydo>=0.6.0`.
+PyDo v0.6.0 is the first released generated client whose documented
+`droplets.list()` signature contains the explicit `type` parameter. The
+implementation uses `type='gpus'` directly and does not depend on the older
+generated client's undocumented `params` escape hatch. Dependency
+qualification installs and imports both the new minimum and the latest
+allowed PyDo version on every supported SkyPilot Python floor exercised by CI.
+The change adds no upper bound.
+
+Every provider list call and its page's legacy row consumption retain the
+current `HttpResponseError` translation to `DigitalOceanError` with the exact
+status, reason, and provider error message. There is no fallback call shape,
+SDK-version probe, or retry after a `TypeError`. Native malformed-response
+exceptions that occur during the existing status, name, or next-link access
+retain their ordinary exception type and message. New closed
+pagination-consistency failures raise
+`DigitalOceanError` with a bounded reason code and family name, never a raw
+response, URL, credential, cluster row, or tag list.
+
+The walker uses DigitalOcean's documented maximum page size of 200 and makes
+sequential calls only. One single-page capture therefore costs exactly two
+requests. It adds no provider-local sleep, backoff, deadline, or retry loop;
+those are lifecycle policy and remain the responsibility of the future shared
+coordinator. A 429 is returned immediately through the existing wrapped error
+path. DigitalOcean currently documents per-token limits of 5,000 requests per
+hour and 250 requests per minute in its
+[public API rate-limit reference](https://docs.digitalocean.com/reference/api/reference/public-apis/#rate-limit).
+The current five-second lifecycle polling can therefore consume 24 list calls
+per minute per active single-page cluster after this correction. That bounded
+but increased cost is explicit rollout evidence and a reason to move repeated
+polling into the shared reconciler, not a reason to preserve incomplete GPU
+inventory.
+
+The pinned client scopes the capture to one credential context, but this slice
+does not call `/v2/account`, persist a token-derived identity, or claim all-team
+visibility. The current client selector chooses the default or first valid
+doctl token and discards account identity. A future mutation-grade observation
+must bind an explicit team UUID when `account:read` is available and otherwise
+remain authority-free. dstack also validates `/v2/account` but discards its
+response, so SkyPilot deliberately does not copy that gap into durable state.
+
+##### Characterization, rollout, and next boundary
+
+The focused suite must prove:
+
+1. the existing public signature, exact single private-capture call, exact
+   dictionary result identity, and all thirteen unchanged caller sites;
+2. one-page and multi-page tagged non-GPU traversal with exact call arguments,
+   page order, row identity, status filtering, and name-collision semantics;
+3. one-page and multi-page account-wide GPU traversal, exact local tag
+   membership, non-member exclusion, and deterministic cross-family ordering;
+4. duplicate names remain present in `raw_rows` while the legacy dictionary
+   keeps first position and last value, including a collision across families;
+5. existing status and name access order and failure timing occur before
+   next-link parsing or later-page I/O for the non-GPU family;
+6. every closed pagination failure, including missing or changing totals,
+   short or overfull traversal, missing or repeated next pages, invalid page
+   values, malformed GPU tags, and partial second-family failure, returns no
+   capture;
+7. HTTP failures in either family retain the exact wrapped provider error,
+   while existing native row and link failures keep their ordinary type and
+   message and cause no retry;
+8. a minimum-version environment with PyDo v0.6.0 accepts the exact GPU call,
+   while the normal environment exercises the latest resolved version;
+9. the authoritative DigitalOcean query projection, cluster-incarnation byte
+   oracles, provider facets, full provision suite, import gates, formatter,
+   mypy, and pylint remain green; and
+10. no database, generic provider facet, action runtime, planner, callback,
+    telemetry, feature flag, cleanup authority, or removal-ledger entry is
+    introduced.
+
+This is a runtime provider-read change and requires an exact-image test-cluster
+deployment. The deployment proves migration completion, import safety, API,
+controller, and executor health, stable restarts, Datadog coverage, clean
+logs, and physical-capacity disablement. Without credentialed DigitalOcean
+access it remains control-plane regression evidence and cannot claim the two
+live list families were exercised. Rollback is the prior exact image. No
+provider resource is mutated by the capture itself, but rollback restores the
+known GPU omission and must be reported as such.
+
+The next slice defines a pure `DigitalOceanNodeObservationV1` projector over
+the exact `raw_rows` tuple. It will validate canonical provider ID, native
+state, region, tags, and cluster-incarnation classification into immutable
+values while retaining `authority=NONE`. Only after that observer and an
+effect-attempt locator are separately reviewed may any DigitalOcean mutation
+move behind a shared planner.
+
 ### M5: Serve and pools
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
