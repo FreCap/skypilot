@@ -861,6 +861,10 @@ canonical hash. Each ID permanently names one Deployment UID and identity and
 is never reused. `registration_attestations` is the companion's bounded
 `ProviderAuthorityWorkerRegistrationSetV1`; typed writes recompute its hash and
 permit only distinct, current Pod registrations for the immutable cohort.
+At an activation or rollback transition, both each registration's
+`registered_at` and its embedded worker identity's `observed_at` must be at or
+before the transaction's fresh PostgreSQL `clock_timestamp()` and no more than
+five minutes old. The bound is server-owned and not configurable in M2/M3.
 Insertion creates `REGISTERING`, never `ACCEPTING`. `REGISTERING -> ACCEPTING`
 requires exactly two matching ready-worker attestations and the exact
 Deployment's current observed generation with desired/ready/available replicas

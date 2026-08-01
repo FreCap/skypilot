@@ -2561,8 +2561,11 @@ Registration workers are canonically sorted by distinct Pod UID. A
 exactly two. Every worker identity must match the row's complete cohort,
 manifest/artifact/callable/handler hashes, Deployment observed generation, and
 ServiceAccount UID. Registration evidence must be fresh against PostgreSQL time
-at the transition; unknown, stale, duplicate, unready, or mixed evidence cannot
-activate the cohort.
+at the transition: both each registration's `registered_at` and its embedded
+worker identity's `observed_at` must be at or before the transaction's fresh
+`clock_timestamp()` and no more than five minutes old. This server-owned bound
+is not configurable in M2/M3. Unknown, stale, duplicate, unready, or mixed
+evidence cannot activate the cohort.
 
 Only `complete` has all four evidence fields; only `not_representable` has a
 reason and all four evidence fields null. The `action_kind` discriminator
