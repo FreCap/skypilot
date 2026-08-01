@@ -1,6 +1,7 @@
 """Tests for AWS capacity classification and cache scoping."""
 # pylint: disable=protected-access
 import inspect
+import os
 import pickle
 import unittest.mock as mock
 
@@ -993,17 +994,62 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
                                                 bulk_error=None):
     """Configures one isolated current new-provisioner attempt."""
     provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
-    provisioner._local_wheel_path = None
-    provisioner._wheel_hash = None
     provisioner._active_cluster_hash = None
     provisioner._is_managed = False
     provisioner._workload_type = 'service'
     provisioner._extra_launch_context = None
     provisioner._is_launched_by_jobs_controller = False
-    to_provision = _to_provision(use_spot=False)
+    to_provision = resources_lib.Resources(cloud=clouds.DO(),
+                                           region='nyc3',
+                                           instance_type='g-2vcpu-8gb',
+                                           use_spot=False)
     outcomes = iter(provider_outcomes)
     provider_call_count = 0
     writer_results = []
+
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    skypilot_config = backend.backend_utils.skypilot_config
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+
+    input_dir = tmp_path / 'do-writer-inputs'
+    input_dir.mkdir(exist_ok=True)
+    private_key_path = input_dir / 'test-key'
+    private_key_path.write_text('test-private-key', encoding='utf-8')
+    public_key_path = input_dir / 'test-key.pub'
+    public_key_path.write_text('test-public-key', encoding='utf-8')
+    wheel_path = input_dir / 'sky.whl'
+    wheel_path.write_bytes(b'test-wheel')
+    provisioner._local_wheel_path = wheel_path
+    provisioner._wheel_hash = 'b1bd84059bc0342f7843fcbe04ab563e'
+
+    monkeypatch.setattr(backend.backend_utils.auth_utils,
+                        'get_or_generate_keys', lambda:
+                        (str(private_key_path), str(public_key_path)))
+    monkeypatch.setattr(backend.backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_: {})
+    monkeypatch.setattr(backend.backend_utils.logs, 'get_logging_agent',
+                        lambda: None)
+    monkeypatch.setattr(backend.backend_utils.common_utils, 'get_user_hash',
+                        lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend.backend_utils.sky, '__version__', '1.0.0')
+    output_path = tmp_path / 'do-callback-attempt' / 'cluster.yaml'
+    monkeypatch.setattr(backend.backend_utils,
+                        '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    monkeypatch.setattr(backend.backend_utils.global_user_state,
+                        'get_cluster_yaml_str', lambda *_: None)
+    monkeypatch.setattr(backend.backend_utils.global_user_state,
+                        'set_cluster_yaml', lambda *_, **__: None)
+    monkeypatch.setattr(backend.backend_utils, '_optimize_file_mounts',
+                        lambda *_: None)
+    monkeypatch.setattr(backend.backend_utils.usage_lib.messages.usage,
+                        'update_ray_yaml', lambda *_: None)
 
     def make_deploy_resources_variables(self,
                                         resources,
@@ -1024,33 +1070,27 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
             raise outcome
         return outcome
 
-    def write_cluster_config(resources, num_nodes, template, cluster_name,
-                             local_wheel_path, wheel_hash, *, region, zones,
-                             dryrun, volume_mounts, **kwargs):
-        del template, local_wheel_path, wheel_hash, kwargs
+    real_make_deploy_variables = resources_lib.Resources.make_deploy_variables
+
+    def make_deploy_variables(self, *args, **kwargs):
+        events.append('resources_deploy_vars')
+        result = real_make_deploy_variables(self, *args, **kwargs)
+        writer_results.append(result)
+        return result
+
+    real_write_cluster_config = backend.backend_utils.write_cluster_config
+
+    def write_cluster_config(*args, **kwargs):
         events.append('config_writer')
-        writer_results.append(
-            resources.cloud.make_deploy_resources_variables(
-                resources,
-                backend.resources_utils.ClusterName(cluster_name,
-                                                    'test-cluster-on-cloud'),
-                region,
-                zones,
-                num_nodes,
-                dryrun,
-                volume_mounts,
-            ))
-        return {
-            'ray': '/tmp/cluster.yaml',
-            'cluster_name_on_cloud': 'test-cluster-on-cloud',
-            'config_hash': config_hash,
-        }
+        result = real_write_cluster_config(*args, **kwargs)
+        result['config_hash'] = config_hash
+        return result
 
     provision_record = provision_common.ProvisionRecord(
-        provider_name='aws',
-        region='us-east-1',
-        zone='us-east-1a',
-        cluster_name='test-cluster-on-cloud',
+        provider_name='do',
+        region='nyc3',
+        zone=None,
+        cluster_name='test-cluster',
         head_instance_id='head',
         resumed_instance_ids=['head'],
         created_instance_ids=[],
@@ -1065,13 +1105,12 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
 
     bulk_provision_mock = mock.Mock(side_effect=bulk_provision)
     cleanup_mock = mock.Mock()
-    monkeypatch.setattr(clouds.AWS, 'make_deploy_resources_variables',
+    monkeypatch.setattr(resources_lib.Resources, 'make_deploy_variables',
+                        make_deploy_variables)
+    monkeypatch.setattr(clouds.DO, 'make_deploy_resources_variables',
                         make_deploy_resources_variables)
-    monkeypatch.setattr(clouds.AWS, 'get_accelerators_from_instance_type',
-                        lambda *_: {'L4': 1})
-    monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
-    monkeypatch.setattr(provisioner, '_yield_zones',
-                        lambda *_: iter([[clouds.Zone('us-east-1a')]]))
+    monkeypatch.setattr(clouds.DO, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones', lambda *_: iter([None]))
     monkeypatch.setattr(provisioner, '_insufficient_resources_msg',
                         lambda *_, **__: 'test resources unavailable')
     monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
@@ -1082,8 +1121,6 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
                         lambda resources, **_: resources)
     monkeypatch.setattr(backend.provision_lib,
                         'get_provisioner_template_override', lambda *_: None)
-    monkeypatch.setattr(backend, '_get_cluster_config_template',
-                        lambda *_: '/tmp/template')
     monkeypatch.setattr(backend.backend_utils, 'write_cluster_config',
                         write_cluster_config)
     monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
@@ -1097,7 +1134,7 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
     monkeypatch.setattr(backend.usage_lib.messages.usage,
                         'update_final_cluster_status', lambda *_: None)
     monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
-                        lambda *_: None)
+                        lambda *_, **__: None)
     monkeypatch.setattr(backend.provisioner, 'bulk_provision',
                         bulk_provision_mock)
     monkeypatch.setattr(backend.CloudVmRayBackend, 'post_teardown_cleanup',
@@ -1114,8 +1151,16 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
 def test_new_provisioner_post_bulk_callback_is_authoritative(
         tmp_path, monkeypatch):
     events = []
-    writer_variables = {'custom_resources': 'writer-value'}
-    post_bulk_variables = {'custom_resources': 'post-bulk-value'}
+    writer_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'writer-value',
+        'region': 'nyc3',
+    }
+    post_bulk_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'post-bulk-value',
+        'region': 'nyc3',
+    }
     (provisioner, to_provision, provision_record, bulk_provision, cleanup,
      writer_results) = _configure_new_provisioner_callback_attempt(
          tmp_path,
@@ -1128,11 +1173,14 @@ def test_new_provisioner_post_bulk_callback_is_authoritative(
 
     assert events == [
         'config_writer',
+        'resources_deploy_vars',
         'deploy_vars:writer',
         'bulk_provision',
         'deploy_vars:post_bulk',
     ]
-    assert writer_results == [writer_variables]
+    assert {
+        key: writer_results[0][key] for key in writer_variables
+    } == writer_variables
     assert result['resources_vars'] == post_bulk_variables
     assert result['provision_record'] is provision_record
     bulk_provision.assert_called_once()
@@ -1151,7 +1199,11 @@ def test_new_provisioner_short_circuit_skips_bulk_and_post_bulk_callback(
         tmp_path, monkeypatch, dryrun, config_hash, matching_hash,
         provisioning_skipped):
     events = []
-    writer_variables = {'custom_resources': 'writer-value'}
+    writer_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'writer-value',
+        'region': 'nyc3',
+    }
     (provisioner, to_provision, _, bulk_provision, cleanup,
      writer_results) = _configure_new_provisioner_callback_attempt(
          tmp_path,
@@ -1168,8 +1220,14 @@ def test_new_provisioner_short_circuit_skips_bulk_and_post_bulk_callback(
         skip_if_config_hash_matches=matching_hash,
     )
 
-    assert events == ['config_writer', 'deploy_vars:writer']
-    assert writer_results == [writer_variables]
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+    ]
+    assert {
+        key: writer_results[0][key] for key in writer_variables
+    } == writer_variables
     assert result['provisioning_skipped'] is provisioning_skipped
     bulk_provision.assert_not_called()
     cleanup.assert_not_called()
@@ -1185,7 +1243,9 @@ def test_new_provisioner_bulk_failure_skips_post_bulk_callback_and_cleans_up(
          monkeypatch,
          events,
          [{
-             'custom_resources': 'writer-value'
+             'instance_type': 'g-2vcpu-8gb',
+             'custom_resources': 'writer-value',
+             'region': 'nyc3',
          }],
          bulk_error=bulk_error,
      )
@@ -1195,6 +1255,7 @@ def test_new_provisioner_bulk_failure_skips_post_bulk_callback_and_cleans_up(
 
     assert events == [
         'config_writer',
+        'resources_deploy_vars',
         'deploy_vars:writer',
         'bulk_provision',
     ]
@@ -1214,7 +1275,9 @@ def test_new_provisioner_post_bulk_callback_failure_is_after_mutation_and_cleans
          events,
          [
              {
-                 'custom_resources': 'writer-value'
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'writer-value',
+                 'region': 'nyc3',
              },
              callback_error,
          ],
@@ -1225,6 +1288,7 @@ def test_new_provisioner_post_bulk_callback_failure_is_after_mutation_and_cleans
 
     assert events == [
         'config_writer',
+        'resources_deploy_vars',
         'deploy_vars:writer',
         'bulk_provision',
         'deploy_vars:post_bulk',
