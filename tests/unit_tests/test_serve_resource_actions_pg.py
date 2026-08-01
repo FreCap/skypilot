@@ -121,9 +121,26 @@ def _attempt_values(action_id: uuid.UUID) -> dict:
     }
 
 
+def _coverage_values(sample: dict) -> dict:
+    return {
+        'decision_id': sample['would_be_action_id'],
+        'service_name': sample['service_name'],
+        'service_hash': sample['service_hash'],
+        'service_incarnation': sample['service_incarnation'],
+        'replica_id': sample['replica_id'],
+        'replica_incarnation': sample['replica_incarnation'],
+        'desired_generation': sample['desired_generation'],
+        'action_type': sample['action_type'],
+        'normalizer_contract_version': 1,
+        'normalization_outcome': 'REPRESENTABLE',
+    }
+
+
 def _drop_serve032_common_columns(engine) -> None:
     """Make a revision-031 catalog look like an actually historical one."""
     replica_columns = (
+        'down_shadow_coverage_id',
+        'launch_shadow_coverage_id',
         'down_shadow_sample_id',
         'launch_shadow_sample_id',
         'down_action_id',
@@ -167,14 +184,14 @@ def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
     # Simulate a lost migration acknowledgement: retain all DDL/data, move
-    # only Alembic's marker back, and prove revision 032 converges exactly.
+    # only Alembic's marker back, and prove revisions 032/033 converge exactly.
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
     alembic_command.stamp(config, '031')
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '032'
+        engine, migration_utils.SERVE_DB_NAME) == '033'
 
     inspector = sqlalchemy.inspect(engine)
     assert {
@@ -195,6 +212,8 @@ def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
         'sky_cluster_record_uuid',
         'launch_action_id',
         'down_action_id',
+        'launch_shadow_coverage_id',
+        'down_shadow_coverage_id',
         'launch_shadow_sample_id',
         'down_shadow_sample_id',
     }
@@ -222,7 +241,12 @@ def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
     assert foreign_keys[0][
         'referred_table'] == action_schema.SHADOW_SAMPLES.name
     assert foreign_keys[0]['options']['ondelete'] == 'CASCADE'
-    assert inspector.get_foreign_keys(action_schema.SHADOW_SAMPLES.name) == []
+    parent_foreign_keys = inspector.get_foreign_keys(
+        action_schema.SHADOW_SAMPLES.name)
+    assert len(parent_foreign_keys) == 1
+    assert parent_foreign_keys[0][
+        'referred_table'] == action_schema.SHADOW_COVERAGE.name
+    assert parent_foreign_keys[0]['options']['ondelete'] == 'RESTRICT'
 
     with engine.connect() as connection:
         legacy = connection.execute(
@@ -233,6 +257,7 @@ def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
             sqlalchemy.text(
                 'SELECT replica_incarnation, desired_generation, '
                 'sky_cluster_record_uuid, launch_action_id, down_action_id, '
+                'launch_shadow_coverage_id, down_shadow_coverage_id, '
                 'launch_shadow_sample_id, down_shadow_sample_id FROM replicas '
                 "WHERE service_name = 'legacy' AND replica_id = 1")).one()
     assert legacy == ('legacy', None)
@@ -245,6 +270,8 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
                                          migration_utils.SERVE_VERSION)
     sample = _sample_values()
     with engine.begin() as connection:
+        connection.execute(sqlalchemy.insert(action_schema.SHADOW_COVERAGE),
+                           _coverage_values(sample))
         connection.execute(sqlalchemy.insert(action_schema.SHADOW_SAMPLES),
                            sample)
         connection.execute(sqlalchemy.insert(action_schema.SHADOW_ATTEMPTS),
@@ -263,11 +290,15 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
     invalid_parent['immutable_spec'] = []
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         with engine.begin() as connection:
+            connection.execute(sqlalchemy.insert(action_schema.SHADOW_COVERAGE),
+                               _coverage_values(invalid_parent))
             connection.execute(sqlalchemy.insert(action_schema.SHADOW_SAMPLES),
                                invalid_parent)
 
     sample = _sample_values()
     with engine.begin() as connection:
+        connection.execute(sqlalchemy.insert(action_schema.SHADOW_COVERAGE),
+                           _coverage_values(sample))
         connection.execute(sqlalchemy.insert(action_schema.SHADOW_SAMPLES),
                            sample)
     invalid_attempt = _attempt_values(sample['would_be_action_id'])
@@ -301,7 +332,7 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
     with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
         alembic_command.downgrade(config, '031')
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '032'
+        engine, migration_utils.SERVE_DB_NAME) == '033'
 
 
 def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
@@ -321,6 +352,8 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
             'sky_cluster_record_uuid',
             'launch_action_id',
             'down_action_id',
+            'launch_shadow_coverage_id',
+            'down_shadow_coverage_id',
             'launch_shadow_sample_id',
             'down_shadow_sample_id',
         } <= {column['name'] for column in inspector.get_columns('replicas')}
@@ -335,7 +368,7 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
                            match='additive and cannot be downgraded'):
             alembic_command.downgrade(config, '031')
         assert migration_utils.get_current_alembic_revision(
-            engine, migration_utils.SERVE_DB_NAME) == '032'
+            engine, migration_utils.SERVE_DB_NAME) == '033'
     finally:
         engine.dispose()
 
@@ -364,6 +397,12 @@ def test_pg_generic_replica_upserts_preserve_action_owned_columns(
                 ),
             'down_action_id':
                 (uuid.UUID(int=replica_id * 100 + 4) if replica_id % 2 else None
+                ),
+            'launch_shadow_coverage_id':
+                (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 5)
+                ),
+            'down_shadow_coverage_id':
+                (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 6)
                 ),
             'launch_shadow_sample_id':
                 (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 5)

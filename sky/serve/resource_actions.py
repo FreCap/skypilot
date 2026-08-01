@@ -17,16 +17,31 @@ import re
 from typing import Any, ClassVar, TypeVar
 import uuid
 
+from sky.container_images import models as container_image_models
 from sky.server.requests import resource_actions as kernel_actions
 
 _MAX_OBJECT_BYTES = 65_536
 _MAX_TEXT_BYTES = 1_024
 _MAX_SHORT_TEXT_BYTES = 253
+_MAX_SERVICE_NAME_BYTES = 256
+_MAX_REQUEST_ID_BYTES = 128
 _MAX_LIST_ITEMS = 256
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+_SHA256_DIGEST_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
+_DNS_LABEL_RE = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+_MAX_POSTGRES_BIGINT = 2**63 - 1
+_MAX_POSTGRES_INTEGER = 2**31 - 1
 _UTC_TIMESTAMP_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:'
                                r'[0-9]{2}\.[0-9]{6}Z$')
 _DECIMAL_INTEGER_RE = re.compile(r'^(0|[1-9][0-9]*)$')
+WORKER_REGISTRATION_MAX_AGE = datetime.timedelta(minutes=5)
+
+PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1 = (
+    'serve_shadow_candidate_launch',
+    'serve_shadow_candidate_down',
+    'serve_resource_action_launch',
+    'serve_resource_action_down',
+)
 
 JsonObject = dict[str, Any]
 _EnumT = TypeVar('_EnumT', bound=enum.Enum)
@@ -51,6 +66,115 @@ class ProfileEligibility(str, enum.Enum):
 
     ELIGIBLE = 'ELIGIBLE'
     UNSUPPORTED = 'UNSUPPORTED'
+
+
+class NormalizationOutcome(str, enum.Enum):
+    """Closed result persisted for every admitted normalization decision."""
+
+    REPRESENTABLE = 'REPRESENTABLE'
+    NOT_REPRESENTABLE = 'NOT_REPRESENTABLE'
+
+
+class ProviderLaunchNotRepresentableReasonV1(str, enum.Enum):
+    """Closed launch failures, declared in deterministic precedence order."""
+
+    REQUEST_CONTRACT = 'request_contract'
+    SECRET_OR_TLS_MATERIAL = 'secret_or_tls_material'
+    SOURCE_MISMATCH = 'source_mismatch'
+    POLICY_CONFIGURED_OR_MUTATED = 'policy_configured_or_mutated'
+    MANAGED_SECRETS = 'managed_secrets'
+    MULTI_TASK = 'multi_task'
+    MULTI_NODE = 'multi_node'
+    MULTI_RESOURCE = 'multi_resource'
+    MOUNT_OR_STORAGE = 'mount_or_storage'
+    NON_KUBERNETES = 'non_kubernetes'
+    SPOT = 'spot'
+    NON_DIRECT_POD_TOPOLOGY = 'non_direct_pod_topology'
+    PORT_CONTRACT = 'port_contract'
+    RESERVED_LABEL_COLLISION = 'reserved_label_collision'
+    MUTABLE_IMAGE = 'mutable_image'
+    CUSTOM_PROVIDER_IMPLEMENTATION = 'custom_provider_implementation'
+    PREFLIGHT_UNAVAILABLE_OR_INVALID = 'preflight_unavailable_or_invalid'
+    AUTHORITY_WORKER_ATTESTATION = 'authority_worker_attestation'
+    AUTHORIZATION_OR_PRINCIPAL_DRIFT = 'authorization_or_principal_drift'
+    PREREQUISITE_OR_NETWORK_DRIFT = 'prerequisite_or_network_drift'
+    ADMITTED_OBJECT_CONTRACT = 'admitted_object_contract'
+    RUNTIME_OR_JOB_CONTRACT = 'runtime_or_job_contract'
+    UNREPRESENTED_EXECUTION_CONFIG = 'unrepresented_execution_config'
+    UNREPRESENTED_RESOURCE = 'unrepresented_resource'
+    UNFROZEN_PLACEMENT = 'unfrozen_placement'
+    UNFROZEN_IDENTITY = 'unfrozen_identity'
+    UNFROZEN_KUBERNETES_SCOPE = 'unfrozen_kubernetes_scope'
+    TARGET_MISMATCH = 'target_mismatch'
+
+    @property
+    def precedence(self) -> int:
+        """Return the zero-based precedence committed by this enum."""
+
+        return tuple(type(self)).index(self)
+
+
+class ProviderDownNotRepresentableReasonV1(str, enum.Enum):
+    """Closed down failures, declared in deterministic precedence order."""
+
+    REQUEST_CONTRACT = 'request_contract'
+    PRIOR_LAUNCH_BASIS = 'prior_launch_basis'
+    TARGET_MISMATCH = 'target_mismatch'
+    PREFLIGHT_UNAVAILABLE_OR_INVALID = 'preflight_unavailable_or_invalid'
+    AUTHORITY_WORKER_ATTESTATION = 'authority_worker_attestation'
+    AUTHORIZATION_OR_PRINCIPAL_DRIFT = 'authorization_or_principal_drift'
+    PREREQUISITE_OR_NETWORK_DRIFT = 'prerequisite_or_network_drift'
+    POLICY_CONFIGURED_OR_MUTATED = 'policy_configured_or_mutated'
+    UNREPRESENTED_EXECUTION_CONFIG = 'unrepresented_execution_config'
+    UNFROZEN_KUBERNETES_SCOPE = 'unfrozen_kubernetes_scope'
+
+    @property
+    def precedence(self) -> int:
+        """Return the zero-based precedence committed by this enum."""
+
+        return tuple(type(self)).index(self)
+
+
+PROVIDER_LAUNCH_NOT_REPRESENTABLE_REASON_PRECEDENCE = tuple(
+    ProviderLaunchNotRepresentableReasonV1)
+PROVIDER_DOWN_NOT_REPRESENTABLE_REASON_PRECEDENCE = tuple(
+    ProviderDownNotRepresentableReasonV1)
+
+
+class WorkerCohortLifecycleState(str, enum.Enum):
+    """Closed lifecycle of one immutable authority-worker cohort."""
+
+    REGISTERING = 'REGISTERING'
+    ACCEPTING = 'ACCEPTING'
+    DRAINING = 'DRAINING'
+    REMOVAL_AUTHORIZED = 'REMOVAL_AUTHORIZED'
+    RETIRED = 'RETIRED'
+
+
+class WorkerCohortReferenceState(str, enum.Enum):
+    """Closed retention-reference lifecycle for one decision."""
+
+    PREPARING = 'PREPARING'
+    SHADOW_ACTIVE = 'SHADOW_ACTIVE'
+    ACTION_ACTIVE = 'ACTION_ACTIVE'
+    RELEASED = 'RELEASED'
+
+
+class CoverageAttemptTerminalStatus(str, enum.Enum):
+    """Closed terminal status copied from a bound legacy request."""
+
+    SUCCEEDED = 'SUCCEEDED'
+    FAILED = 'FAILED'
+    CANCELLED = 'CANCELLED'
+
+
+class CoverageAttemptRetryDisposition(str, enum.Enum):
+    """Closed next-step decision for one completed coverage-only request."""
+
+    RETRY_SAME_DECISION = 'RETRY_SAME_DECISION'
+    TERMINAL = 'TERMINAL'
+    REPLAN_NEW_GENERATION = 'REPLAN_NEW_GENERATION'
+    BLOCK = 'BLOCK'
 
 
 class ShadowParentPhase(str, enum.Enum):
@@ -79,6 +203,12 @@ class ShadowRequestRole(str, enum.Enum):
     PRIMARY_LAUNCH = 'PRIMARY_LAUNCH'
     PRIMARY_DOWN = 'PRIMARY_DOWN'
     LAUNCH_CLEANUP_DOWN = 'LAUNCH_CLEANUP_DOWN'
+
+
+# Coverage-only attempts deliberately share the represented ledger's phase
+# and role vocabulary.  Aliases prevent the two tables from drifting.
+CoverageAttemptPhase = ShadowAttemptPhase
+CoverageAttemptRequestRole = ShadowRequestRole
 
 
 class PlannedExecutionKind(str, enum.Enum):
@@ -259,6 +389,8 @@ def _text(value: Any,
           maximum_bytes: int = _MAX_TEXT_BYTES) -> str:
     if not isinstance(value, str):
         raise TypeError(f'{name} must be text.')
+    if '\x00' in value:
+        raise ValueError(f'{name} cannot contain U+0000.')
     size = len(value.encode('utf-8'))
     if size == 0 or size > maximum_bytes:
         raise ValueError(f'{name} must be 1..{maximum_bytes} UTF-8 bytes.')
@@ -287,6 +419,13 @@ def _sha256(value: Any, *, name: str) -> str:
     return value
 
 
+def _sha256_digest(value: Any, *, name: str) -> str:
+    if (not isinstance(value, str) or
+            _SHA256_DIGEST_RE.fullmatch(value) is None):
+        raise ValueError(f'{name} must be sha256:<64 lowercase hex>.')
+    return value
+
+
 def _uuid(value: Any, *, name: str) -> uuid.UUID:
     if isinstance(value, uuid.UUID):
         return value
@@ -301,15 +440,41 @@ def _uuid(value: Any, *, name: str) -> uuid.UUID:
     return parsed
 
 
-def _nonnegative_integer(value: Any, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f'{name} must be a nonnegative integer.')
+def _schema_uuid(value: Any, *, name: str) -> uuid.UUID:
+    """Return the UUID subset accepted by Serve033 text CHECK constraints."""
+    parsed = _uuid(value, name=name)
+    if (parsed.variant != uuid.RFC_4122 or parsed.version is None or
+            parsed.version < 1 or parsed.version > 5):
+        raise ValueError(f'{name} must be an RFC 4122 version 1..5 UUID.')
+    return parsed
+
+
+def _dns_label(value: Any, *, name: str) -> str:
+    normalized = _text(value, name=name, maximum_bytes=_MAX_TEXT_BYTES)
+    if _DNS_LABEL_RE.fullmatch(normalized) is None:
+        raise ValueError(f'{name} must be a DNS label.')
+    return normalized
+
+
+def _nonnegative_integer(value: Any,
+                         *,
+                         name: str,
+                         maximum: int = _MAX_POSTGRES_BIGINT) -> int:
+    if (not isinstance(value, int) or isinstance(value, bool) or value < 0 or
+            value > maximum):
+        raise ValueError(
+            f'{name} must be a nonnegative integer no greater than {maximum}.')
     return value
 
 
-def _positive_integer(value: Any, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f'{name} must be a positive integer.')
+def _positive_integer(value: Any,
+                      *,
+                      name: str,
+                      maximum: int = _MAX_POSTGRES_BIGINT) -> int:
+    if (not isinstance(value, int) or isinstance(value, bool) or value <= 0 or
+            value > maximum):
+        raise ValueError(
+            f'{name} must be a positive integer no greater than {maximum}.')
     return value
 
 
@@ -344,6 +509,16 @@ def _timestamp(value: Any, *, name: str) -> str:
     return value
 
 
+def _action_kind(value: Any, *, name: str) -> kernel_actions.ActionKind:
+    if not isinstance(value, (str, kernel_actions.ActionKind)):
+        raise TypeError(f'{name} must be text.')
+    try:
+        return (value if isinstance(value, kernel_actions.ActionKind) else
+                kernel_actions.ActionKind(value))
+    except ValueError as e:
+        raise ValueError(f'{name} is unsupported.') from e
+
+
 class _CanonicalContract:
     """Common encoding helpers for immutable closed contracts."""
 
@@ -365,6 +540,779 @@ class _CanonicalContract:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderRepoArtifactRefV1:
+    """Content-addressed reference to one checked-in repository artifact."""
+
+    repo_path: str
+    byte_size: int
+    sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'repo_path', 'byte_size', 'sha256'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'repo_path',
+                           _text(self.repo_path, name='artifact.repo_path'))
+        object.__setattr__(
+            self, 'byte_size',
+            _positive_integer(self.byte_size, name='artifact.byte_size'))
+        object.__setattr__(self, 'sha256',
+                           _sha256(self.sha256, name='artifact.sha256'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderRepoArtifactRefV1':
+        raw = _closed_object(value, name='artifact reference', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        encoded = canonical_json_bytes(self.canonical_value())
+        if len(encoded) > _MAX_OBJECT_BYTES:
+            raise ValueError('ProviderRepoArtifactRefV1 exceeds 65536 bytes.')
+        return encoded
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderOCIImageQualificationV1(_CanonicalContract):
+    """Digest-qualified immutable OCI image identity."""
+
+    requested_reference: str
+    oci_manifest_digest: str
+    oci_config_digest: str
+    qualification_artifact: ProviderRepoArtifactRefV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'requested_reference', 'oci_manifest_digest', 'oci_config_digest',
+        'qualification_artifact'
+    })
+
+    def __post_init__(self) -> None:
+        reference = _text(self.requested_reference,
+                          name='image.requested_reference')
+        try:
+            canonical_reference = container_image_models.validate_oci_reference(
+                reference, 'image.requested_reference')
+            _, requested_manifest_digest = container_image_models.split_digest(
+                canonical_reference)
+        except (TypeError, ValueError) as e:
+            raise ValueError('image.requested_reference is not a canonical '
+                             'secret-free OCI reference.') from e
+        if (canonical_reference != reference or
+                requested_manifest_digest is None):
+            raise ValueError('image.requested_reference must be digest-pinned.')
+        object.__setattr__(self, 'requested_reference', reference)
+        for field in ('oci_manifest_digest', 'oci_config_digest'):
+            object.__setattr__(
+                self, field,
+                _sha256_digest(getattr(self, field), name=f'image.{field}'))
+        if requested_manifest_digest != self.oci_manifest_digest:
+            raise ValueError('image requested reference digest must equal the '
+                             'qualified OCI manifest digest.')
+        if not isinstance(self.qualification_artifact,
+                          ProviderRepoArtifactRefV1):
+            raise TypeError('image qualification artifact has an invalid type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderOCIImageQualificationV1':
+        raw = _closed_object(value,
+                             name='OCI image qualification',
+                             keys=cls._KEYS)
+        return cls(requested_reference=raw['requested_reference'],
+                   oci_manifest_digest=raw['oci_manifest_digest'],
+                   oci_config_digest=raw['oci_config_digest'],
+                   qualification_artifact=ProviderRepoArtifactRefV1.from_value(
+                       raw['qualification_artifact']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'requested_reference': self.requested_reference,
+            'oci_manifest_digest': self.oci_manifest_digest,
+            'oci_config_digest': self.oci_config_digest,
+            'qualification_artifact':
+                self.qualification_artifact.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderRuntimeImageIdentityV1(_CanonicalContract):
+    """Runtime image evidence tied to one qualified OCI image."""
+
+    raw_image_id: str
+    runtime_image_id_scheme: str
+    runtime_image_id_digest: str
+    qualified_oci_manifest_digest: str
+    qualified_oci_config_digest: str
+    qualification_artifact_sha256: str
+    runtime_id_contract: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'raw_image_id', 'runtime_image_id_scheme', 'runtime_image_id_digest',
+        'qualified_oci_manifest_digest', 'qualified_oci_config_digest',
+        'qualification_artifact_sha256', 'runtime_id_contract'
+    })
+    _SCHEMES: ClassVar[frozenset[str]] = frozenset(
+        {'containerd', 'cri-o', 'docker-pullable'})
+
+    def __post_init__(self) -> None:
+        raw_image_id = _text(self.raw_image_id,
+                             name='runtime_image.raw_image_id')
+        object.__setattr__(self, 'raw_image_id', raw_image_id)
+        scheme = _text(self.runtime_image_id_scheme,
+                       name='runtime_image.runtime_image_id_scheme')
+        if scheme not in self._SCHEMES:
+            raise ValueError('runtime image ID scheme is unsupported.')
+        object.__setattr__(self, 'runtime_image_id_scheme', scheme)
+        for field in ('runtime_image_id_digest',
+                      'qualified_oci_manifest_digest',
+                      'qualified_oci_config_digest'):
+            object.__setattr__(
+                self, field,
+                _sha256_digest(getattr(self, field),
+                               name=f'runtime_image.{field}'))
+        prefix = f'{scheme}://'
+        if not raw_image_id.startswith(prefix):
+            raise ValueError('raw runtime image ID does not match its declared '
+                             'scheme.')
+        raw_body = raw_image_id[len(prefix):]
+        raw_digest: str | None
+        if scheme in ('containerd', 'cri-o'):
+            raw_digest = raw_body
+        else:
+            try:
+                canonical_raw_reference = (
+                    container_image_models.validate_oci_reference(
+                        raw_body, 'runtime_image.raw_image_id'))
+                _, raw_digest = container_image_models.split_digest(
+                    canonical_raw_reference)
+            except (TypeError, ValueError) as e:
+                raise ValueError('raw runtime image ID is not a canonical '
+                                 'docker-pullable reference.') from e
+            if canonical_raw_reference != raw_body or raw_digest is None:
+                raise ValueError('raw runtime image ID is not a canonical '
+                                 'docker-pullable reference.')
+        if _SHA256_DIGEST_RE.fullmatch(raw_digest) is None:
+            raise ValueError('raw runtime image ID does not contain one '
+                             'canonical SHA-256 digest under its scheme.')
+        if raw_digest != self.runtime_image_id_digest:
+            raise ValueError('raw runtime image ID digest does not match its '
+                             'parsed runtime digest.')
+        object.__setattr__(
+            self, 'qualification_artifact_sha256',
+            _sha256(self.qualification_artifact_sha256,
+                    name='runtime_image.qualification_artifact_sha256'))
+        if self.runtime_id_contract != 'qualified_oci_config_digest_v1':
+            raise ValueError('runtime image ID contract is unsupported.')
+        if self.runtime_image_id_digest != self.qualified_oci_config_digest:
+            raise ValueError('runtime image ID must equal the qualified OCI '
+                             'config digest.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderRuntimeImageIdentityV1':
+        raw = _closed_object(value,
+                             name='runtime image identity',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerImageV1(_CanonicalContract):
+    """Qualified configured and observed image identity for one worker."""
+
+    qualification: ProviderOCIImageQualificationV1
+    runtime: ProviderRuntimeImageIdentityV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'qualification', 'runtime'})
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.qualification, ProviderOCIImageQualificationV1):
+            raise TypeError('worker image qualification has an invalid type.')
+        if not isinstance(self.runtime, ProviderRuntimeImageIdentityV1):
+            raise TypeError('worker runtime image has an invalid type.')
+        if (self.runtime.qualified_oci_manifest_digest
+                != self.qualification.oci_manifest_digest or
+                self.runtime.qualified_oci_config_digest
+                != self.qualification.oci_config_digest or
+                self.runtime.qualification_artifact_sha256
+                != self.qualification.qualification_artifact.sha256):
+            raise ValueError('worker runtime image differs from its qualified '
+                             'OCI image.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerImageV1':
+        raw = _closed_object(value, name='worker image', keys=cls._KEYS)
+        return cls(qualification=ProviderOCIImageQualificationV1.from_value(
+            raw['qualification']),
+                   runtime=ProviderRuntimeImageIdentityV1.from_value(
+                       raw['runtime']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'qualification': self.qualification.canonical_value(),
+            'runtime': self.runtime.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
+    """Static release-rendered identity for an authority-worker cohort."""
+
+    version: int
+    cohort_id: str
+    namespace: str
+    deployment_name: str
+    service_account_name: str
+    container_name: str
+    image: ProviderOCIImageQualificationV1
+    pod_template_contract: ProviderRepoArtifactRefV1
+    artifact_inventory: ProviderRepoArtifactRefV1
+    callable_inventory: ProviderRepoArtifactRefV1
+    claim_contract: str
+    handler_allowlist: tuple[str, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'cohort_id', 'namespace', 'deployment_name',
+        'service_account_name', 'container_name', 'image',
+        'pod_template_contract', 'artifact_inventory', 'callable_inventory',
+        'claim_contract', 'handler_allowlist'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='cohort manifest version')
+        cohort_id = _dns_label(self.cohort_id, name='cohort_manifest.cohort_id')
+        object.__setattr__(self, 'cohort_id', cohort_id)
+        for field in ('namespace', 'deployment_name', 'service_account_name'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field),
+                      name=f'cohort_manifest.{field}',
+                      maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        if self.container_name != 'skypilot-authority-worker':
+            raise ValueError('cohort manifest container name is unsupported.')
+        if not isinstance(self.image, ProviderOCIImageQualificationV1):
+            raise TypeError('cohort manifest image has an invalid type.')
+        for field in ('pod_template_contract', 'artifact_inventory',
+                      'callable_inventory'):
+            if not isinstance(getattr(self, field), ProviderRepoArtifactRefV1):
+                raise TypeError(f'cohort manifest {field} has an invalid type.')
+        if self.claim_contract != 'frozen_action_cohort_join_v1':
+            raise ValueError('cohort manifest claim contract is unsupported.')
+        if self.handler_allowlist != (
+                PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1):
+            raise ValueError('cohort manifest handler allowlist must be the '
+                             'ordered v1 allowlist.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderAuthorityWorkerCohortManifestV1':
+        raw = _closed_object(value,
+                             name='authority-worker cohort manifest',
+                             keys=cls._KEYS)
+        handlers = raw['handler_allowlist']
+        if not isinstance(handlers, list):
+            raise TypeError('cohort manifest handler_allowlist must be a list.')
+        return cls(version=raw['version'],
+                   cohort_id=raw['cohort_id'],
+                   namespace=raw['namespace'],
+                   deployment_name=raw['deployment_name'],
+                   service_account_name=raw['service_account_name'],
+                   container_name=raw['container_name'],
+                   image=ProviderOCIImageQualificationV1.from_value(
+                       raw['image']),
+                   pod_template_contract=ProviderRepoArtifactRefV1.from_value(
+                       raw['pod_template_contract']),
+                   artifact_inventory=ProviderRepoArtifactRefV1.from_value(
+                       raw['artifact_inventory']),
+                   callable_inventory=ProviderRepoArtifactRefV1.from_value(
+                       raw['callable_inventory']),
+                   claim_contract=raw['claim_contract'],
+                   handler_allowlist=tuple(handlers))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'cohort_id': self.cohort_id,
+            'namespace': self.namespace,
+            'deployment_name': self.deployment_name,
+            'service_account_name': self.service_account_name,
+            'container_name': 'skypilot-authority-worker',
+            'image': self.image.canonical_value(),
+            'pod_template_contract':
+                self.pod_template_contract.canonical_value(),
+            'artifact_inventory': self.artifact_inventory.canonical_value(),
+            'callable_inventory': self.callable_inventory.canonical_value(),
+            'claim_contract': 'frozen_action_cohort_join_v1',
+            'handler_allowlist': list(self.handler_allowlist),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerCohortV1(_CanonicalContract):
+    """Complete resolved identity retained for one immutable cohort."""
+
+    version: int
+    manifest: ProviderAuthorityWorkerCohortManifestV1
+    manifest_sha256: str
+    deployment_uid: str
+    service_account_uid: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'manifest', 'manifest_sha256', 'deployment_uid',
+        'service_account_uid'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='worker cohort version')
+        if not isinstance(self.manifest,
+                          ProviderAuthorityWorkerCohortManifestV1):
+            raise TypeError('worker cohort manifest has an invalid type.')
+        object.__setattr__(
+            self, 'manifest_sha256',
+            _sha256(self.manifest_sha256, name='cohort.manifest_sha256'))
+        if self.manifest_sha256 != self.manifest.sha256:
+            raise ValueError('worker cohort manifest hash does not match.')
+        for field in ('deployment_uid', 'service_account_uid'):
+            object.__setattr__(
+                self, field, _text(getattr(self, field),
+                                   name=f'cohort.{field}'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerCohortV1':
+        raw = _closed_object(value,
+                             name='authority-worker cohort identity',
+                             keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   manifest=ProviderAuthorityWorkerCohortManifestV1.from_value(
+                       raw['manifest']),
+                   manifest_sha256=raw['manifest_sha256'],
+                   deployment_uid=raw['deployment_uid'],
+                   service_account_uid=raw['service_account_uid'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'manifest': self.manifest.canonical_value(),
+            'manifest_sha256': self.manifest_sha256,
+            'deployment_uid': self.deployment_uid,
+            'service_account_uid': self.service_account_uid,
+        }
+
+    @property
+    def cohort_id(self) -> str:
+        return self.manifest.cohort_id
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesControllerOwnerV1(_CanonicalContract):
+    """Closed Kubernetes controller-owner identity."""
+
+    api_version: str
+    kind: str
+    name: str
+    uid: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'api_version', 'kind', 'name', 'uid'})
+
+    def __post_init__(self) -> None:
+        if self.api_version != 'apps/v1':
+            raise ValueError('controller owner api_version must be apps/v1.')
+        if self.kind not in ('ReplicaSet', 'Deployment'):
+            raise ValueError('controller owner kind is unsupported.')
+        object.__setattr__(
+            self, 'name',
+            _text(self.name,
+                  name='controller_owner.name',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(self, 'uid',
+                           _text(self.uid, name='controller_owner.uid'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesControllerOwnerV1':
+        raw = _closed_object(value, name='controller owner', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerIdentityV1(_CanonicalContract):
+    """Bounded live Kubernetes identity attested by one authority worker."""
+
+    namespace: str
+    pod_name: str
+    pod_uid: str
+    pod_resource_version: str
+    pod_service_account_name: str
+    pod_controller_owner: ProviderKubernetesControllerOwnerV1
+    replica_set_name: str
+    replica_set_uid: str
+    replica_set_resource_version: str
+    replica_set_controller_owner: ProviderKubernetesControllerOwnerV1
+    deployment_name: str
+    deployment_uid: str
+    deployment_resource_version: str
+    deployment_generation: int
+    deployment_observed_generation: int
+    pod_template_contract_sha256: str
+    image: ProviderAuthorityWorkerImageV1
+    service_account_uid: str
+    artifact_inventory_sha256: str
+    callable_inventory_sha256: str
+    handler_allowlist_sha256: str
+    observed_at: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'namespace', 'pod_name', 'pod_uid', 'pod_resource_version',
+        'pod_service_account_name', 'pod_controller_owner', 'replica_set_name',
+        'replica_set_uid', 'replica_set_resource_version',
+        'replica_set_controller_owner', 'deployment_name', 'deployment_uid',
+        'deployment_resource_version', 'deployment_generation',
+        'deployment_observed_generation', 'pod_template_contract_sha256',
+        'image', 'service_account_uid', 'artifact_inventory_sha256',
+        'callable_inventory_sha256', 'handler_allowlist_sha256', 'observed_at'
+    })
+
+    def __post_init__(self) -> None:
+        for field in ('namespace', 'pod_name', 'pod_service_account_name',
+                      'replica_set_name', 'deployment_name'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field),
+                      name=f'worker.{field}',
+                      maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        for field in ('pod_uid', 'pod_resource_version', 'replica_set_uid',
+                      'replica_set_resource_version', 'deployment_uid',
+                      'deployment_resource_version', 'service_account_uid'):
+            object.__setattr__(
+                self, field, _text(getattr(self, field),
+                                   name=f'worker.{field}'))
+        if not isinstance(self.pod_controller_owner,
+                          ProviderKubernetesControllerOwnerV1):
+            raise TypeError('worker Pod controller owner has an invalid type.')
+        if not isinstance(self.replica_set_controller_owner,
+                          ProviderKubernetesControllerOwnerV1):
+            raise TypeError('worker ReplicaSet owner has an invalid type.')
+        if self.pod_controller_owner.kind != 'ReplicaSet':
+            raise ValueError('worker Pod owner must be a ReplicaSet.')
+        if self.replica_set_controller_owner.kind != 'Deployment':
+            raise ValueError('worker ReplicaSet owner must be a Deployment.')
+        if (self.pod_controller_owner.name != self.replica_set_name or
+                self.pod_controller_owner.uid != self.replica_set_uid or
+                self.replica_set_controller_owner.name != self.deployment_name
+                or
+                self.replica_set_controller_owner.uid != self.deployment_uid):
+            raise ValueError('worker controller-owner chain is inconsistent.')
+        for field in ('deployment_generation',
+                      'deployment_observed_generation'):
+            object.__setattr__(
+                self, field,
+                _positive_integer(getattr(self, field), name=f'worker.{field}'))
+        for field in ('pod_template_contract_sha256',
+                      'artifact_inventory_sha256', 'callable_inventory_sha256',
+                      'handler_allowlist_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field), name=f'worker.{field}'))
+        if not isinstance(self.image, ProviderAuthorityWorkerImageV1):
+            raise TypeError('worker image has an invalid type.')
+        object.__setattr__(
+            self, 'observed_at',
+            _timestamp(self.observed_at, name='worker.observed_at'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerIdentityV1':
+        raw = _closed_object(value,
+                             name='authority-worker identity',
+                             keys=cls._KEYS)
+        return cls(
+            namespace=raw['namespace'],
+            pod_name=raw['pod_name'],
+            pod_uid=raw['pod_uid'],
+            pod_resource_version=raw['pod_resource_version'],
+            pod_service_account_name=raw['pod_service_account_name'],
+            pod_controller_owner=ProviderKubernetesControllerOwnerV1.from_value(
+                raw['pod_controller_owner']),
+            replica_set_name=raw['replica_set_name'],
+            replica_set_uid=raw['replica_set_uid'],
+            replica_set_resource_version=raw['replica_set_resource_version'],
+            replica_set_controller_owner=(
+                ProviderKubernetesControllerOwnerV1.from_value(
+                    raw['replica_set_controller_owner'])),
+            deployment_name=raw['deployment_name'],
+            deployment_uid=raw['deployment_uid'],
+            deployment_resource_version=raw['deployment_resource_version'],
+            deployment_generation=raw['deployment_generation'],
+            deployment_observed_generation=(
+                raw['deployment_observed_generation']),
+            pod_template_contract_sha256=raw['pod_template_contract_sha256'],
+            image=ProviderAuthorityWorkerImageV1.from_value(raw['image']),
+            service_account_uid=raw['service_account_uid'],
+            artifact_inventory_sha256=raw['artifact_inventory_sha256'],
+            callable_inventory_sha256=raw['callable_inventory_sha256'],
+            handler_allowlist_sha256=raw['handler_allowlist_sha256'],
+            observed_at=raw['observed_at'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'namespace': self.namespace,
+            'pod_name': self.pod_name,
+            'pod_uid': self.pod_uid,
+            'pod_resource_version': self.pod_resource_version,
+            'pod_service_account_name': self.pod_service_account_name,
+            'pod_controller_owner': self.pod_controller_owner.canonical_value(),
+            'replica_set_name': self.replica_set_name,
+            'replica_set_uid': self.replica_set_uid,
+            'replica_set_resource_version': self.replica_set_resource_version,
+            'replica_set_controller_owner':
+                self.replica_set_controller_owner.canonical_value(),
+            'deployment_name': self.deployment_name,
+            'deployment_uid': self.deployment_uid,
+            'deployment_resource_version': self.deployment_resource_version,
+            'deployment_generation': self.deployment_generation,
+            'deployment_observed_generation':
+                self.deployment_observed_generation,
+            'pod_template_contract_sha256': self.pod_template_contract_sha256,
+            'image': self.image.canonical_value(),
+            'service_account_uid': self.service_account_uid,
+            'artifact_inventory_sha256': self.artifact_inventory_sha256,
+            'callable_inventory_sha256': self.callable_inventory_sha256,
+            'handler_allowlist_sha256': self.handler_allowlist_sha256,
+            'observed_at': self.observed_at,
+        }
+
+    def validate_for_cohort(self,
+                            cohort: ProviderAuthorityWorkerCohortV1) -> None:
+        """Require every immutable worker field to match ``cohort``."""
+
+        if not isinstance(cohort, ProviderAuthorityWorkerCohortV1):
+            raise TypeError('worker cohort has an invalid type.')
+        manifest = cohort.manifest
+        if (self.namespace != manifest.namespace or
+                self.pod_service_account_name != manifest.service_account_name
+                or self.deployment_name != manifest.deployment_name or
+                self.deployment_uid != cohort.deployment_uid or
+                self.service_account_uid != cohort.service_account_uid or
+                self.pod_template_contract_sha256
+                != manifest.pod_template_contract.sha256 or
+                self.artifact_inventory_sha256
+                != manifest.artifact_inventory.sha256 or
+                self.callable_inventory_sha256
+                != manifest.callable_inventory.sha256 or
+                self.handler_allowlist_sha256 != canonical_sha256(
+                    list(manifest.handler_allowlist)) or
+                self.image.qualification.canonical_bytes
+                != manifest.image.canonical_bytes):
+            raise ValueError('worker identity does not match its cohort.')
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerRegistrationV1(_CanonicalContract):
+    """One current ready-worker registration attestation."""
+
+    worker: ProviderAuthorityWorkerIdentityV1
+    pod_ready: bool
+    deployment_spec_replicas: int
+    deployment_status_observed_generation: int
+    deployment_ready_replicas: int
+    deployment_available_replicas: int
+    registered_at: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'worker', 'pod_ready', 'deployment_spec_replicas',
+        'deployment_status_observed_generation', 'deployment_ready_replicas',
+        'deployment_available_replicas', 'registered_at'
+    })
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.worker, ProviderAuthorityWorkerIdentityV1):
+            raise TypeError('worker registration identity has an invalid type.')
+        _boolean(self.pod_ready, name='registration.pod_ready')
+        if not self.pod_ready:
+            raise ValueError('worker registration requires a ready Pod.')
+        for field in ('deployment_spec_replicas', 'deployment_ready_replicas',
+                      'deployment_available_replicas'):
+            if _positive_integer(getattr(self, field),
+                                 name=f'registration.{field}') != 2:
+                raise ValueError(f'registration.{field} must equal 2.')
+        observed = _positive_integer(
+            self.deployment_status_observed_generation,
+            name='registration.deployment_status_observed_generation')
+        if (observed != self.worker.deployment_observed_generation or
+                observed != self.worker.deployment_generation):
+            raise ValueError('registration Deployment generation is not '
+                             'current and consistently observed.')
+        object.__setattr__(self, 'deployment_status_observed_generation',
+                           observed)
+        object.__setattr__(
+            self, 'registered_at',
+            _timestamp(self.registered_at, name='registration.registered_at'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerRegistrationV1':
+        raw = _closed_object(value,
+                             name='authority-worker registration',
+                             keys=cls._KEYS)
+        return cls(
+            worker=ProviderAuthorityWorkerIdentityV1.from_value(raw['worker']),
+            pod_ready=raw['pod_ready'],
+            deployment_spec_replicas=raw['deployment_spec_replicas'],
+            deployment_status_observed_generation=raw[
+                'deployment_status_observed_generation'],
+            deployment_ready_replicas=raw['deployment_ready_replicas'],
+            deployment_available_replicas=raw['deployment_available_replicas'],
+            registered_at=raw['registered_at'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'worker': self.worker.canonical_value(),
+            'pod_ready': True,
+            'deployment_spec_replicas': 2,
+            'deployment_status_observed_generation':
+                self.deployment_status_observed_generation,
+            'deployment_ready_replicas': 2,
+            'deployment_available_replicas': 2,
+            'registered_at': self.registered_at,
+        }
+
+    @property
+    def pod_uid(self) -> str:
+        return self.worker.pod_uid
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerRegistrationSetV1(_CanonicalContract):
+    """Canonical one-or-two-worker registration set for a cohort."""
+
+    version: int
+    cohort_identity_sha256: str
+    workers: tuple[ProviderAuthorityWorkerRegistrationV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'cohort_identity_sha256', 'workers'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='worker registration set version')
+        object.__setattr__(
+            self, 'cohort_identity_sha256',
+            _sha256(self.cohort_identity_sha256,
+                    name='registration_set.cohort_identity_sha256'))
+        if (not isinstance(self.workers, tuple) or
+                not 1 <= len(self.workers) <= 2 or
+                any(not isinstance(worker,
+                                   ProviderAuthorityWorkerRegistrationV1)
+                    for worker in self.workers)):
+            raise ValueError('registration workers must be a tuple of one or '
+                             'two typed attestations.')
+        pod_uids = tuple(worker.pod_uid for worker in self.workers)
+        if pod_uids != tuple(sorted(set(pod_uids))):
+            raise ValueError('registration workers must be sorted by distinct '
+                             'Pod UID.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderAuthorityWorkerRegistrationSetV1':
+        raw = _closed_object(value,
+                             name='authority-worker registration set',
+                             keys=cls._KEYS)
+        workers = raw['workers']
+        if not isinstance(workers, list):
+            raise TypeError('registration_set.workers must be a list.')
+        return cls(version=raw['version'],
+                   cohort_identity_sha256=raw['cohort_identity_sha256'],
+                   workers=tuple(
+                       ProviderAuthorityWorkerRegistrationV1.from_value(worker)
+                       for worker in workers))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'cohort_identity_sha256': self.cohort_identity_sha256,
+            'workers': [worker.canonical_value() for worker in self.workers],
+        }
+
+    @property
+    def registrations(
+            self) -> tuple[ProviderAuthorityWorkerRegistrationV1, ...]:
+        return self.workers
+
+    @property
+    def count(self) -> int:
+        return len(self.workers)
+
+    def validate_for_cohort(
+            self,
+            cohort: ProviderAuthorityWorkerCohortV1,
+            *,
+            require_two: bool = False,
+            database_now: datetime.datetime | None = None) -> None:
+        """Verify the set's hash and every worker against ``cohort``."""
+
+        if not isinstance(cohort, ProviderAuthorityWorkerCohortV1):
+            raise TypeError('worker cohort has an invalid type.')
+        if self.cohort_identity_sha256 != cohort.sha256:
+            raise ValueError('registration set cohort hash does not match.')
+        if require_two and len(self.workers) != 2:
+            raise ValueError('accepting a cohort requires two workers.')
+        for registration in self.workers:
+            registration.worker.validate_for_cohort(cohort)
+        deployment_versions = {
+            (registration.worker.deployment_resource_version,
+             registration.worker.deployment_generation,
+             registration.worker.deployment_observed_generation,
+             registration.deployment_status_observed_generation)
+            for registration in self.workers
+        }
+        if len(deployment_versions) != 1:
+            raise ValueError('registration workers observe different '
+                             'Deployment versions.')
+        if database_now is not None:
+            self.validate_freshness(database_now)
+
+    def validate_freshness(self, database_now: datetime.datetime) -> None:
+        """Enforce the nonconfigurable five-minute DB-clock transition gate."""
+
+        if (not isinstance(database_now, datetime.datetime) or
+                database_now.tzinfo is None or
+                database_now.utcoffset() is None):
+            raise TypeError('database_now must be a timezone-aware datetime.')
+        normalized_now = database_now.astimezone(datetime.timezone.utc)
+        oldest = normalized_now - WORKER_REGISTRATION_MAX_AGE
+        for registration in self.workers:
+            for name, value in (('registered_at', registration.registered_at),
+                                ('worker.observed_at',
+                                 registration.worker.observed_at)):
+                parsed = datetime.datetime.strptime(
+                    value, '%Y-%m-%dT%H:%M:%S.%fZ').replace(
+                        tzinfo=datetime.timezone.utc)
+                if parsed > normalized_now:
+                    raise ValueError(f'registration {name} is in the database '
+                                     'future.')
+                if parsed < oldest:
+                    raise ValueError(f'registration {name} is older than five '
+                                     'minutes.')
+
+
+# Storage-facing aliases retain the provider contract's exact canonical shape.
+WorkerCohortIdentityV1 = ProviderAuthorityWorkerCohortV1
+WorkerCohortRegistrationSetV1 = ProviderAuthorityWorkerRegistrationSetV1
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderResourceIdentityV1(_CanonicalContract):
     """Provider-facing subset of one Serve replica action identity."""
 
@@ -382,7 +1330,7 @@ class ProviderResourceIdentityV1(_CanonicalContract):
     def __post_init__(self) -> None:
         service_hash = _text(self.service_hash,
                              name='resource_identity.service_hash')
-        service_incarnation = _uuid(
+        service_incarnation = _schema_uuid(
             self.service_incarnation,
             name='resource_identity.service_incarnation')
         replica_incarnation = _uuid(
@@ -434,6 +1382,439 @@ class ProviderResourceIdentityV1(_CanonicalContract):
             replica_incarnation=self.replica_incarnation,
             desired_generation=self.desired_generation,
             action_kind=action_kind)
+
+
+@dataclasses.dataclass(frozen=True)
+class CoverageDecisionIdentityV1(_CanonicalContract):
+    """Provider-independent identity of one immutable coverage decision."""
+
+    version: int
+    service_hash: str
+    service_incarnation: uuid.UUID
+    replica_id: int
+    replica_incarnation: uuid.UUID
+    desired_generation: int
+    action_type: kernel_actions.ActionKind
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'service_hash', 'service_incarnation', 'replica_id',
+        'replica_incarnation', 'desired_generation', 'action_type'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='coverage identity version')
+        resource_identity = ProviderResourceIdentityV1(
+            service_hash=self.service_hash,
+            service_incarnation=self.service_incarnation,
+            replica_id=self.replica_id,
+            replica_incarnation=self.replica_incarnation,
+            desired_generation=self.desired_generation)
+        object.__setattr__(self, 'service_hash', resource_identity.service_hash)
+        object.__setattr__(self, 'service_incarnation',
+                           resource_identity.service_incarnation)
+        object.__setattr__(self, 'replica_id', resource_identity.replica_id)
+        object.__setattr__(self, 'replica_incarnation',
+                           resource_identity.replica_incarnation)
+        object.__setattr__(self, 'desired_generation',
+                           resource_identity.desired_generation)
+        object.__setattr__(
+            self, 'action_type',
+            _action_kind(self.action_type, name='coverage.action_type'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'CoverageDecisionIdentityV1':
+        raw = _closed_object(value,
+                             name='coverage decision identity',
+                             keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   service_hash=raw['service_hash'],
+                   service_incarnation=raw['service_incarnation'],
+                   replica_id=raw['replica_id'],
+                   replica_incarnation=raw['replica_incarnation'],
+                   desired_generation=raw['desired_generation'],
+                   action_type=raw['action_type'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'service_hash': self.service_hash,
+            'service_incarnation': str(self.service_incarnation),
+            'replica_id': self.replica_id,
+            'replica_incarnation': str(self.replica_incarnation),
+            'desired_generation': self.desired_generation,
+            'action_type': self.action_type.value,
+        }
+
+    @property
+    def resource_identity(self) -> ProviderResourceIdentityV1:
+        return ProviderResourceIdentityV1(
+            service_hash=self.service_hash,
+            service_incarnation=self.service_incarnation,
+            replica_id=self.replica_id,
+            replica_incarnation=self.replica_incarnation,
+            desired_generation=self.desired_generation)
+
+    @property
+    def kernel_identity(self) -> kernel_actions.ResourceActionIdentity:
+        return self.resource_identity.action_identity(self.action_type)
+
+    @property
+    def decision_id(self) -> uuid.UUID:
+        """Return the exact resource-action UUIDv5; no second namespace."""
+
+        return self.kernel_identity.action_id
+
+
+@dataclasses.dataclass(frozen=True)
+class CoverageDecisionV1(_CanonicalContract):
+    """Immutable canonical value of one Serve033 coverage row."""
+
+    decision_id: uuid.UUID
+    service_name: str
+    service_hash: str
+    service_incarnation: uuid.UUID
+    replica_id: int
+    replica_incarnation: uuid.UUID
+    desired_generation: int
+    action_type: kernel_actions.ActionKind
+    normalizer_contract_version: int
+    normalization_outcome: NormalizationOutcome
+    not_representable_reason: (ProviderLaunchNotRepresentableReasonV1 |
+                               ProviderDownNotRepresentableReasonV1 | None)
+    worker_cohort_ref_id: uuid.UUID | None
+    admitted_at: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'decision_id', 'service_name', 'service_hash', 'service_incarnation',
+        'replica_id', 'replica_incarnation', 'desired_generation',
+        'action_type', 'normalizer_contract_version', 'normalization_outcome',
+        'not_representable_reason', 'worker_cohort_ref_id', 'admitted_at'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'service_name',
+            _text(self.service_name,
+                  name='coverage.service_name',
+                  maximum_bytes=_MAX_SERVICE_NAME_BYTES))
+        identity = CoverageDecisionIdentityV1(
+            version=1,
+            service_hash=self.service_hash,
+            service_incarnation=self.service_incarnation,
+            replica_id=self.replica_id,
+            replica_incarnation=self.replica_incarnation,
+            desired_generation=self.desired_generation,
+            action_type=self.action_type)
+        for field in ('service_hash', 'service_incarnation', 'replica_id',
+                      'replica_incarnation', 'desired_generation',
+                      'action_type'):
+            object.__setattr__(self, field, getattr(identity, field))
+        decision_id = _uuid(self.decision_id, name='coverage.decision_id')
+        if decision_id != identity.decision_id:
+            raise ValueError('coverage decision ID does not match UUIDv5 '
+                             'identity.')
+        object.__setattr__(self, 'decision_id', decision_id)
+        _version_one(self.normalizer_contract_version,
+                     name='normalizer contract version')
+        outcome = (self.normalization_outcome if isinstance(
+            self.normalization_outcome, NormalizationOutcome) else _enum_value(
+                NormalizationOutcome,
+                self.normalization_outcome,
+                name='coverage.normalization_outcome'))
+        object.__setattr__(self, 'normalization_outcome', outcome)
+        reason = self.not_representable_reason
+        if outcome is NormalizationOutcome.REPRESENTABLE:
+            if reason is not None:
+                raise ValueError('representable coverage requires null reason.')
+        else:
+            if reason is None:
+                raise ValueError('not-representable coverage requires a '
+                                 'closed reason.')
+            expected_type: type[ProviderLaunchNotRepresentableReasonV1] | type[
+                ProviderDownNotRepresentableReasonV1]
+            expected_type = (ProviderLaunchNotRepresentableReasonV1
+                             if identity.action_type
+                             is kernel_actions.ActionKind.LAUNCH else
+                             ProviderDownNotRepresentableReasonV1)
+            if isinstance(reason, (ProviderLaunchNotRepresentableReasonV1,
+                                   ProviderDownNotRepresentableReasonV1)):
+                if not isinstance(reason, expected_type):
+                    raise ValueError('coverage reason has the wrong action '
+                                     'kind.')
+            else:
+                reason = _enum_value(expected_type,
+                                     reason,
+                                     name='coverage.not_representable_reason')
+            object.__setattr__(self, 'not_representable_reason', reason)
+        if self.worker_cohort_ref_id is not None:
+            cohort_ref_id = _uuid(self.worker_cohort_ref_id,
+                                  name='coverage.worker_cohort_ref_id')
+            if cohort_ref_id != decision_id:
+                raise ValueError('coverage cohort reference must use the '
+                                 'decision ID.')
+            object.__setattr__(self, 'worker_cohort_ref_id', cohort_ref_id)
+        object.__setattr__(
+            self, 'admitted_at',
+            _timestamp(self.admitted_at, name='coverage.admitted_at'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'CoverageDecisionV1':
+        raw = _closed_object(value, name='coverage decision', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        reason = self.not_representable_reason
+        return {
+            'decision_id': str(self.decision_id),
+            'service_name': self.service_name,
+            'service_hash': self.service_hash,
+            'service_incarnation': str(self.service_incarnation),
+            'replica_id': self.replica_id,
+            'replica_incarnation': str(self.replica_incarnation),
+            'desired_generation': self.desired_generation,
+            'action_type': self.action_type.value,
+            'normalizer_contract_version': 1,
+            'normalization_outcome': self.normalization_outcome.value,
+            'not_representable_reason':
+                (None if reason is None else reason.value),
+            'worker_cohort_ref_id': (None if self.worker_cohort_ref_id is None
+                                     else str(self.worker_cohort_ref_id)),
+            'admitted_at': self.admitted_at,
+        }
+
+    @property
+    def identity(self) -> CoverageDecisionIdentityV1:
+        return CoverageDecisionIdentityV1(
+            version=1,
+            service_hash=self.service_hash,
+            service_incarnation=self.service_incarnation,
+            replica_id=self.replica_id,
+            replica_incarnation=self.replica_incarnation,
+            desired_generation=self.desired_generation,
+            action_type=self.action_type)
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkerCohortReferenceInputV1(_CanonicalContract):
+    """Bounded immutable identity presented when preparing a reference."""
+
+    version: int
+    decision_id: uuid.UUID
+    cohort_id: str
+    service_hash: str
+    replica_incarnation: uuid.UUID
+    desired_generation: int
+    action_type: kernel_actions.ActionKind
+    controller_owner_fence: str
+    lifecycle_epoch: int
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'decision_id', 'cohort_id', 'service_hash',
+        'replica_incarnation', 'desired_generation', 'action_type',
+        'controller_owner_fence', 'lifecycle_epoch'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='worker cohort reference version')
+        object.__setattr__(
+            self, 'decision_id',
+            _uuid(self.decision_id, name='cohort_reference.decision_id'))
+        object.__setattr__(
+            self, 'cohort_id',
+            _dns_label(self.cohort_id, name='cohort_reference.cohort_id'))
+        service_hash = _schema_uuid(self.service_hash,
+                                    name='cohort_reference.service_hash')
+        object.__setattr__(self, 'service_hash', str(service_hash))
+        object.__setattr__(
+            self, 'replica_incarnation',
+            _uuid(self.replica_incarnation,
+                  name='cohort_reference.replica_incarnation'))
+        object.__setattr__(
+            self, 'desired_generation',
+            _positive_integer(self.desired_generation,
+                              name='cohort_reference.desired_generation'))
+        object.__setattr__(
+            self, 'action_type',
+            _action_kind(self.action_type, name='cohort_reference.action_type'))
+        object.__setattr__(
+            self, 'controller_owner_fence',
+            _text(self.controller_owner_fence,
+                  name='cohort_reference.controller_owner_fence'))
+        object.__setattr__(
+            self, 'lifecycle_epoch',
+            _positive_integer(self.lifecycle_epoch,
+                              name='cohort_reference.lifecycle_epoch'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'WorkerCohortReferenceInputV1':
+        raw = _closed_object(value,
+                             name='worker cohort reference input',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'decision_id': str(self.decision_id),
+            'cohort_id': self.cohort_id,
+            'service_hash': self.service_hash,
+            'replica_incarnation': str(self.replica_incarnation),
+            'desired_generation': self.desired_generation,
+            'action_type': self.action_type.value,
+            'controller_owner_fence': self.controller_owner_fence,
+            'lifecycle_epoch': self.lifecycle_epoch,
+        }
+
+    def validate_coverage(self, coverage: CoverageDecisionV1) -> None:
+        if not isinstance(coverage, CoverageDecisionV1):
+            raise TypeError('coverage decision has an invalid type.')
+        if (self.decision_id != coverage.decision_id or
+                coverage.worker_cohort_ref_id != self.decision_id or
+                self.service_hash != coverage.service_hash or
+                self.replica_incarnation != coverage.replica_incarnation or
+                self.desired_generation != coverage.desired_generation or
+                self.action_type is not coverage.action_type):
+            raise ValueError('cohort reference does not match coverage.')
+
+
+@dataclasses.dataclass(frozen=True)
+class CoverageAttemptV1(_CanonicalContract):
+    """Canonical coverage-only one-use legacy submission fence."""
+
+    decision_id: uuid.UUID
+    request_sequence: int
+    logical_attempt: int
+    request_role: ShadowRequestRole
+    phase: ShadowAttemptPhase
+    legacy_request_id: str | None
+    terminal_request_status: CoverageAttemptTerminalStatus | None
+    retry_disposition: CoverageAttemptRetryDisposition | None
+    admitted_at: str
+    request_bound_at: str | None
+    completed_at: str | None
+    updated_at: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'decision_id', 'request_sequence', 'logical_attempt', 'request_role',
+        'phase', 'legacy_request_id', 'terminal_request_status',
+        'retry_disposition', 'admitted_at', 'request_bound_at', 'completed_at',
+        'updated_at'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'decision_id',
+            _uuid(self.decision_id, name='coverage_attempt.decision_id'))
+        for field in ('request_sequence', 'logical_attempt'):
+            object.__setattr__(
+                self, field,
+                _positive_integer(getattr(self, field),
+                                  name=f'coverage_attempt.{field}',
+                                  maximum=_MAX_POSTGRES_INTEGER))
+        role = (self.request_role
+                if isinstance(self.request_role, ShadowRequestRole) else
+                _enum_value(ShadowRequestRole,
+                            self.request_role,
+                            name='coverage_attempt.request_role'))
+        phase = (self.phase if isinstance(
+            self.phase, ShadowAttemptPhase) else _enum_value(
+                ShadowAttemptPhase, self.phase, name='coverage_attempt.phase'))
+        object.__setattr__(self, 'request_role', role)
+        object.__setattr__(self, 'phase', phase)
+        object.__setattr__(
+            self, 'legacy_request_id',
+            _optional_text(self.legacy_request_id,
+                           name='coverage_attempt.legacy_request_id',
+                           maximum_bytes=_MAX_REQUEST_ID_BYTES))
+        terminal = self.terminal_request_status
+        if terminal is not None:
+            terminal = (terminal if isinstance(
+                terminal, CoverageAttemptTerminalStatus) else _enum_value(
+                    CoverageAttemptTerminalStatus,
+                    terminal,
+                    name='coverage_attempt.terminal_request_status'))
+            object.__setattr__(self, 'terminal_request_status', terminal)
+        retry = self.retry_disposition
+        if retry is not None:
+            retry = (retry
+                     if isinstance(retry, CoverageAttemptRetryDisposition) else
+                     _enum_value(CoverageAttemptRetryDisposition,
+                                 retry,
+                                 name='coverage_attempt.retry_disposition'))
+            object.__setattr__(self, 'retry_disposition', retry)
+        admitted_at = _timestamp(self.admitted_at,
+                                 name='coverage_attempt.admitted_at')
+        request_bound_at = (None
+                            if self.request_bound_at is None else _timestamp(
+                                self.request_bound_at,
+                                name='coverage_attempt.request_bound_at'))
+        completed_at = (None if self.completed_at is None else _timestamp(
+            self.completed_at, name='coverage_attempt.completed_at'))
+        updated_at = _timestamp(self.updated_at,
+                                name='coverage_attempt.updated_at')
+        object.__setattr__(self, 'admitted_at', admitted_at)
+        object.__setattr__(self, 'request_bound_at', request_bound_at)
+        object.__setattr__(self, 'completed_at', completed_at)
+        object.__setattr__(self, 'updated_at', updated_at)
+        if (updated_at < admitted_at or
+            (request_bound_at is not None and request_bound_at < admitted_at) or
+            (completed_at is not None and completed_at < admitted_at)):
+            raise ValueError('coverage attempt timestamps are out of order.')
+        if phase is ShadowAttemptPhase.PRE_SUBMIT:
+            if any(value is not None
+                   for value in (self.legacy_request_id, terminal, retry,
+                                 request_bound_at, completed_at)):
+                raise ValueError('pre-submit coverage attempt has later '
+                                 'evidence.')
+        elif phase is ShadowAttemptPhase.REQUEST_BOUND:
+            if (self.legacy_request_id is None or request_bound_at is None or
+                    any(value is not None
+                        for value in (terminal, retry, completed_at))):
+                raise ValueError('request-bound coverage attempt has invalid '
+                                 'evidence.')
+        elif phase is ShadowAttemptPhase.COMPLETE:
+            if (self.legacy_request_id is None or request_bound_at is None or
+                    completed_at is None or terminal is None or retry is None):
+                raise ValueError('complete coverage attempt lacks terminal '
+                                 'evidence.')
+        elif phase is ShadowAttemptPhase.ABANDONED_PRE_SUBMIT:
+            if (completed_at is None or
+                    any(value is not None
+                        for value in (self.legacy_request_id, terminal, retry,
+                                      request_bound_at))):
+                raise ValueError('abandoned coverage attempt has mutation '
+                                 'evidence.')
+        elif (completed_at is None or
+              any(value is not None
+                  for value in (self.legacy_request_id, terminal, retry,
+                                request_bound_at))):
+            raise ValueError('unknown request association has invalid shape.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'CoverageAttemptV1':
+        raw = _closed_object(value, name='coverage attempt', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'decision_id': str(self.decision_id),
+            'request_sequence': self.request_sequence,
+            'logical_attempt': self.logical_attempt,
+            'request_role': self.request_role.value,
+            'phase': self.phase.value,
+            'legacy_request_id': self.legacy_request_id,
+            'terminal_request_status':
+                (None if self.terminal_request_status is None else
+                 self.terminal_request_status.value),
+            'retry_disposition': (None if self.retry_disposition is None else
+                                  self.retry_disposition.value),
+            'admitted_at': self.admitted_at,
+            'request_bound_at': self.request_bound_at,
+            'completed_at': self.completed_at,
+            'updated_at': self.updated_at,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1161,6 +2542,100 @@ class ProviderLifecycleInvocationV1(_CanonicalContract):
         return self.resource_identity.action_identity(
             self.action_kind).action_id
 
+    def require_launch(self) -> ProviderLaunchInvocationV1:
+        """Return the launch member or reject a wrong-kind access."""
+
+        if (self.action_kind is not kernel_actions.ActionKind.LAUNCH or
+                self.launch is None):
+            raise ValueError('provider lifecycle invocation is not launch.')
+        return self.launch
+
+    def require_down(self) -> ProviderDownInvocationV1:
+        """Return the down member or reject a wrong-kind access."""
+
+        if (self.action_kind is not kernel_actions.ActionKind.DOWN or
+                self.down is None):
+            raise ValueError('provider lifecycle invocation is not down.')
+        return self.down
+
+    def as_launch(self) -> 'ProviderLaunchLifecycleInvocationV1':
+        """Return a statically refined launch view with identical bytes."""
+
+        self.require_launch()
+        return ProviderLaunchLifecycleInvocationV1.from_value(
+            self.canonical_value())
+
+    def as_down(self) -> 'ProviderDownLifecycleInvocationV1':
+        """Return a statically refined down view with identical bytes."""
+
+        self.require_down()
+        return ProviderDownLifecycleInvocationV1.from_value(
+            self.canonical_value())
+
+    def refined(
+        self
+    ) -> (ProviderLaunchLifecycleInvocationV1 |
+          ProviderDownLifecycleInvocationV1):
+        """Refine the closed discriminator without changing serialization."""
+
+        if self.action_kind is kernel_actions.ActionKind.LAUNCH:
+            return self.as_launch()
+        return self.as_down()
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchLifecycleInvocationV1(ProviderLifecycleInvocationV1):
+    """Kind-refined launch invocation; canonical shape equals the base union."""
+
+    action_kind: kernel_actions.ActionKind
+    launch: ProviderLaunchInvocationV1
+    down: None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.action_kind is not kernel_actions.ActionKind.LAUNCH:
+            raise ValueError('refined launch invocation requires launch kind.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderLaunchLifecycleInvocationV1':
+        base = ProviderLifecycleInvocationV1.from_value(value)
+        base.require_launch()
+        return cls(version=base.version,
+                   profile=base.profile,
+                   redaction_profile=base.redaction_profile,
+                   action_kind=base.action_kind,
+                   resource_identity=base.resource_identity,
+                   requested_target=base.requested_target,
+                   launch=base.require_launch(),
+                   down=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderDownLifecycleInvocationV1(ProviderLifecycleInvocationV1):
+    """Kind-refined down invocation; canonical shape equals the base union."""
+
+    action_kind: kernel_actions.ActionKind
+    launch: None
+    down: ProviderDownInvocationV1
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.action_kind is not kernel_actions.ActionKind.DOWN:
+            raise ValueError('refined down invocation requires down kind.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderDownLifecycleInvocationV1':
+        base = ProviderLifecycleInvocationV1.from_value(value)
+        base.require_down()
+        return cls(version=base.version,
+                   profile=base.profile,
+                   redaction_profile=base.redaction_profile,
+                   action_kind=base.action_kind,
+                   resource_identity=base.resource_identity,
+                   requested_target=base.requested_target,
+                   launch=None,
+                   down=base.require_down())
+
 
 @dataclasses.dataclass(frozen=True)
 class ProviderLifecyclePlanV1(_CanonicalContract):
@@ -1345,7 +2820,8 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
             raise ValueError('parent provider plan is not byte-equal to the '
                              'immutable spec provider plan.')
 
-    def launch_cleanup_down_invocation(self) -> ProviderLifecycleInvocationV1:
+    def launch_cleanup_down_invocation(
+            self) -> ProviderDownLifecycleInvocationV1:
         """Derive the sole non-primary invocation allowed by this wrapper."""
 
         if self.invocation.action_kind is not kernel_actions.ActionKind.LAUNCH:
@@ -1354,7 +2830,7 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
         if launch is None:
             raise ValueError('cleanup down requires a launch invocation.')
         target = self.invocation.requested_target
-        return ProviderLifecycleInvocationV1(
+        return ProviderDownLifecycleInvocationV1(
             version=1,
             profile=self.invocation.profile,
             redaction_profile=self.invocation.redaction_profile,
@@ -1379,6 +2855,7 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
             raise TypeError('shadow request role has an invalid type.')
         if not isinstance(invocation, ProviderLifecycleInvocationV1):
             raise TypeError('child invocation has an invalid type.')
+        expected: ProviderLifecycleInvocationV1
         if role is ShadowRequestRole.LAUNCH_CLEANUP_DOWN:
             expected = self.launch_cleanup_down_invocation()
         else:
