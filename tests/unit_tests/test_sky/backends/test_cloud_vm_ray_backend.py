@@ -140,12 +140,35 @@ def test_add_job_retries_target_not_connected():
     with patch.object(
             backend, 'run_on_head',
             side_effect=[target_not_connected, success]) as run_on_head, patch(
-                'sky.backends.cloud_vm_ray_backend.time.sleep') as sleep:
+                'sky.backends.cloud_vm_ray_backend.context_utils.'
+                'sleep_with_cancellation') as sleep:
         job_id, log_dir = backend._add_job(  # pylint: disable=protected-access
             handle, 'job', '{}', '{}')
 
     assert (job_id, log_dir) == (7, '~/sky_logs/7-job')
     assert run_on_head.call_count == 2
+    sleep.assert_called_once()
+
+
+def test_add_job_stops_target_not_connected_retry_after_cancellation():
+    backend = cloud_vm_ray_backend.CloudVmRayBackend()
+    handle = MagicMock()
+    handle.is_grpc_enabled_with_flag = False
+    handle.cluster_name = 'test-cluster'
+    target_not_connected = (
+        255, '',
+        'An error occurred (TargetNotConnected) when calling StartSession')
+
+    with patch.object(backend, 'run_on_head',
+                      return_value=target_not_connected) as run_on_head, patch(
+                          'sky.backends.cloud_vm_ray_backend.context_utils.'
+                          'sleep_with_cancellation',
+                          side_effect=asyncio.CancelledError) as sleep:
+        with pytest.raises(asyncio.CancelledError):
+            backend._add_job(  # pylint: disable=protected-access
+                handle, 'job', '{}', '{}')
+
+    run_on_head.assert_called_once()
     sleep.assert_called_once()
 
 
@@ -158,10 +181,10 @@ def test_add_job_bounds_target_not_connected_retries():
         255, '',
         'An error occurred (TargetNotConnected) when calling StartSession')
 
-    with patch.object(
-            backend, 'run_on_head',
-            return_value=target_not_connected) as run_on_head, patch(
-                'sky.backends.cloud_vm_ray_backend.time.sleep') as sleep:
+    with patch.object(backend, 'run_on_head',
+                      return_value=target_not_connected) as run_on_head, patch(
+                          'sky.backends.cloud_vm_ray_backend.context_utils.'
+                          'sleep_with_cancellation') as sleep:
         with pytest.raises(exceptions.CommandError,
                            match='Failed to fetch job id'):
             backend._add_job(  # pylint: disable=protected-access
@@ -184,7 +207,8 @@ def test_add_job_does_not_retry_ambiguous_failures(returncode, stderr):
     with patch.object(
             backend, 'run_on_head',
             return_value=(returncode, '', stderr)) as run_on_head, patch(
-                'sky.backends.cloud_vm_ray_backend.time.sleep') as sleep:
+                'sky.backends.cloud_vm_ray_backend.context_utils.'
+                'sleep_with_cancellation') as sleep:
         with pytest.raises(exceptions.CommandError,
                            match='Failed to fetch job id'):
             backend._add_job(  # pylint: disable=protected-access
