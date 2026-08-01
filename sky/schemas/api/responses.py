@@ -77,9 +77,15 @@ class APIHealthResponse(ResponseBaseModel):
     version: str = ''
     version_on_disk: str = ''
     commit: str = ''
+    # ISO 8601 committer timestamp for the exact release commit. None when
+    # source-control metadata was unavailable while building the package.
+    commit_timestamp: str | None = None
     # Monotonic build number (git commit count); auto-increments with every
     # commit. None when unknown (e.g. no git metadata at build time).
     build: str | None = None
+    # ISO 8601 initialization time of the API process serving this response.
+    # This advances after either a rollout or a process restart.
+    deployment_timestamp: str | None = None
     # Whether basic auth on api server is enabled
     basic_auth_enabled: bool = False
     user: models.User | None = None

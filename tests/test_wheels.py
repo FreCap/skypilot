@@ -1,4 +1,6 @@
+import importlib.util
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -11,6 +13,16 @@ import pytest
 import sky
 from sky.backends import wheel_utils
 from sky.server import common
+
+
+def _load_setup_module():
+    setup_path = Path('setup.py').absolute()
+    spec = importlib.util.spec_from_file_location('_skypilot_setup_test',
+                                                  setup_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture
@@ -57,6 +69,9 @@ def test_build_wheels():
         with zipfile.ZipFile(built_wheel) as wheel:
             init_content = wheel.read('sky/__init__.py').decode('utf-8')
         assert (f"_SKYPILOT_COMMIT_COUNT = '{sky.__build__}'" in init_content)
+        if sky.__commit_timestamp__ is not None:
+            assert (f"_SKYPILOT_COMMIT_TIMESTAMP = "
+                    f"'{sky.__commit_timestamp__}'" in init_content)
     duration = time.time() - start
 
     start = time.time()
@@ -78,6 +93,63 @@ def test_build_wheels():
     assert wheel_path.exists()
 
     shutil.rmtree(wheel_utils.WHEEL_DIR, ignore_errors=True)
+
+
+def test_build_wheel_without_commit_timestamp_ignores_ambient_git(tmp_path):
+    isolated_wheel_dir = tmp_path / 'wheels'
+    isolated_lock_path = tmp_path / 'wheels.lock'
+    with mock.patch.object(wheel_utils, 'WHEEL_DIR', isolated_wheel_dir), \
+         mock.patch.object(wheel_utils, '_WHEEL_LOCK_PATH',
+                           isolated_lock_path), \
+         mock.patch.object(sky, '__commit_timestamp__', None):
+        built_wheel = wheel_utils._build_sky_wheel()
+
+    unrelated_repo = tmp_path / 'unrelated'
+    unrelated_repo.mkdir()
+    subprocess.run(['git', 'init', '--quiet'], cwd=unrelated_repo, check=True)
+    (unrelated_repo / 'marker').write_text('unrelated', encoding='utf-8')
+    subprocess.run(['git', 'add', 'marker'], cwd=unrelated_repo, check=True)
+    commit_env = os.environ.copy()
+    commit_env.update({
+        'GIT_AUTHOR_NAME': 'SkyPilot Test',
+        'GIT_AUTHOR_EMAIL': 'test@skypilot.co',
+        'GIT_COMMITTER_NAME': 'SkyPilot Test',
+        'GIT_COMMITTER_EMAIL': 'test@skypilot.co',
+    })
+    subprocess.run(['git', 'commit', '--quiet', '-m', 'unrelated'],
+                   cwd=unrelated_repo,
+                   env=commit_env,
+                   check=True)
+
+    import_env = os.environ.copy()
+    import_env['PYTHONPATH'] = str(built_wheel)
+    imported = subprocess.run([
+        sys.executable, '-c', 'import sky; print(sky.__file__); '
+        'print(repr(sky.__commit_timestamp__))'
+    ],
+                              cwd=unrelated_repo,
+                              env=import_env,
+                              capture_output=True,
+                              text=True,
+                              check=False)
+    assert imported.returncode == 0, imported.stderr
+    output_lines = imported.stdout.strip().splitlines()
+    assert str(built_wheel) in output_lines[-2]
+    assert output_lines[-1] == 'None'
+
+
+def test_setup_uses_explicit_absent_timestamp_without_git(tmp_path):
+    setup_module = _load_setup_module()
+    init_path = tmp_path / '__init__.py'
+    init_path.write_text(
+        "_SKYPILOT_COMMIT_TIMESTAMP = '{{SKYPILOT_COMMIT_TIMESTAMP}}'\n",
+        encoding='utf-8')
+
+    with mock.patch.object(setup_module, 'INIT_FILE_PATH', str(init_path)), \
+         mock.patch.object(setup_module.subprocess,
+                           'check_output',
+                           side_effect=FileNotFoundError('git unavailable')):
+        assert setup_module.get_commit_timestamp() == ''
 
 
 def test_pip_missing_uv_environment(_current_version_guard):
