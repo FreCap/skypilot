@@ -2029,7 +2029,7 @@ def wait_until_ray_cluster_ready(
             if remaining_progress_wait is not None:
                 poll_interval = min(poll_interval,
                                     max(0, remaining_progress_wait))
-            time.sleep(poll_interval)
+            context_utils.sleep_with_cancellation(poll_interval)
     return True, docker_user  # success
 
 

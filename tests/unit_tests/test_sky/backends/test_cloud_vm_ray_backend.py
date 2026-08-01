@@ -1,5 +1,6 @@
 """Unit tests for CloudVmRayBackend task configuration redaction and locking."""
 
+import asyncio
 import multiprocessing
 import socket
 import subprocess
@@ -232,6 +233,86 @@ def test_gang_schedule_uses_worker_readiness_result(workers_ready,
                                             num_nodes=2,
                                             log_path='/tmp/provision.log',
                                             nodes_launching_progress_timeout=90)
+
+
+def test_gang_schedule_cancellation_stops_before_next_ray_up():
+    handle = MagicMock(cluster_name='test-cluster', launched_nodes=2)
+    logging_info = {'region_name': 'us-east-1', 'zone_str': ''}
+    retryable_failure = (
+        1, 'Processing file mounts',
+        'Failed to setup head node. ConnectionResetError: [Errno 54] '
+        'Connection reset by peer')
+
+    with patch.object(
+            cloud_vm_ray_backend,
+            'write_ray_up_script_with_patched_launch_hash_fn',
+            return_value='/tmp/ray-up.py'), patch.object(
+                cloud_vm_ray_backend.log_lib,
+                'run_with_log',
+                side_effect=[
+                    retryable_failure,
+                    AssertionError('ray up retried after cancellation'),
+                ]) as ray_up, patch.object(
+                    cloud_vm_ray_backend.context_utils,
+                    'sleep_with_cancellation',
+                    side_effect=asyncio.CancelledError(),
+                    create=True) as wait, patch.object(
+                        cloud_vm_ray_backend.time, 'sleep'), patch.object(
+                            cloud_vm_ray_backend.common_utils,
+                            'Backoff') as backoff_cls:
+        backoff_cls.return_value.current_backoff.return_value = 17
+        with pytest.raises(asyncio.CancelledError):
+            RetryingVmProvisioner._gang_schedule_ray_up(  # pylint: disable=protected-access
+                MagicMock(),
+                cloud_vm_ray_backend.clouds.AWS(),
+                '/tmp/cluster.yaml',
+                handle,
+                '/tmp/provision.log',
+                stream_logs=False,
+                logging_info=logging_info,
+                use_spot=False)
+
+    wait.assert_called_once_with(17)
+    ray_up.assert_called_once()
+
+
+def test_gang_schedule_retry_preserves_backoff_and_call_count():
+    handle = MagicMock(cluster_name='test-cluster', launched_nodes=2)
+    logging_info = {'region_name': 'us-east-1', 'zone_str': ''}
+    retryable_failure = (
+        1, 'Processing file mounts',
+        'Failed to setup head node. ConnectionResetError: [Errno 54] '
+        'Connection reset by peer')
+
+    with patch.object(cloud_vm_ray_backend,
+                      'write_ray_up_script_with_patched_launch_hash_fn',
+                      return_value='/tmp/ray-up.py'), patch.object(
+                          cloud_vm_ray_backend.log_lib,
+                          'run_with_log',
+                          side_effect=[
+                              retryable_failure, (0, 'head ready', '')
+                          ]) as ray_up, patch.object(
+                              cloud_vm_ray_backend.context_utils,
+                              'sleep_with_cancellation') as wait, patch.object(
+                                  cloud_vm_ray_backend.backend_utils,
+                                  'wait_until_ray_cluster_ready',
+                                  return_value=(True, None)), patch.object(
+                                      cloud_vm_ray_backend.common_utils,
+                                      'Backoff') as backoff_cls:
+        backoff_cls.return_value.current_backoff.return_value = 17
+        status, _, _, _, _ = RetryingVmProvisioner._gang_schedule_ray_up(  # pylint: disable=protected-access
+            MagicMock(),
+            cloud_vm_ray_backend.clouds.AWS(),
+            '/tmp/cluster.yaml',
+            handle,
+            '/tmp/provision.log',
+            stream_logs=False,
+            logging_info=logging_info,
+            use_spot=False)
+
+    assert status is GangSchedulingStatus.CLUSTER_READY
+    wait.assert_called_once_with(17)
+    assert ray_up.call_count == 2
 
 
 def test_wait_service_registration_rpc_covers_both_phase_budgets():

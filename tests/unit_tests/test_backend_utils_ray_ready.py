@@ -1,5 +1,6 @@
 """Tests for multi-node Ray readiness lifecycle handling."""
 
+import asyncio
 import contextlib
 from unittest import mock
 
@@ -37,6 +38,12 @@ def _fake_time(*, monotonic_values):
     fake.monotonic.side_effect = monotonic_values
     fake.time.side_effect = AssertionError('read wall time for an interval')
     return fake
+
+
+def _install_fake_time(monkeypatch, fake_time):
+    monkeypatch.setattr(backend_utils, 'time', fake_time)
+    monkeypatch.setattr(backend_utils.context_utils, 'sleep_with_cancellation',
+                        fake_time.sleep)
 
 
 class _RunnerFactory:
@@ -123,7 +130,7 @@ def test_wait_until_ray_cluster_ready_returns_when_workers_ready(
     monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
                         mock.MagicMock(return_value=(1, 1)))
     fake_time = _fake_time(monotonic_values=[100.0])
-    monkeypatch.setattr(backend_utils, 'time', fake_time)
+    _install_fake_time(monkeypatch, fake_time)
 
     result = backend_utils.wait_until_ray_cluster_ready('/tmp/cluster.yaml', 2,
                                                         '/tmp/launch.log')
@@ -198,7 +205,7 @@ def test_wait_until_ray_cluster_ready_uses_monotonic_progress_timeout(
     fake_time = _fake_time(monotonic_values=[100.0, 101.0])
     fake_time.sleep.side_effect = AssertionError(
         'slept after the progress timeout expired')
-    monkeypatch.setattr(backend_utils, 'time', fake_time)
+    _install_fake_time(monkeypatch, fake_time)
 
     result = backend_utils.wait_until_ray_cluster_ready(
         '/tmp/cluster.yaml',
@@ -218,7 +225,7 @@ def test_wait_until_ray_cluster_ready_clamps_final_progress_sleep(
     monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
                         mock.MagicMock(return_value=(0, 0)))
     fake_time = _fake_time(monotonic_values=[100.0, 100.25, 100.5, 100.75])
-    monkeypatch.setattr(backend_utils, 'time', fake_time)
+    _install_fake_time(monkeypatch, fake_time)
 
     result = backend_utils.wait_until_ray_cluster_ready(
         '/tmp/cluster.yaml',
@@ -237,7 +244,7 @@ def test_wait_until_ray_cluster_ready_accepts_ready_deadline_snapshot(
     monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
                         mock.MagicMock(side_effect=[(0, 0), (1, 1)]))
     fake_time = _fake_time(monotonic_values=[100.0, 100.25])
-    monkeypatch.setattr(backend_utils, 'time', fake_time)
+    _install_fake_time(monkeypatch, fake_time)
 
     result = backend_utils.wait_until_ray_cluster_ready(
         '/tmp/cluster.yaml',
@@ -258,7 +265,7 @@ def test_wait_until_ray_cluster_ready_resets_progress_timeout(
         mock.MagicMock(side_effect=[(1, 0), (1, 0), (1, 1), (1, 1), (1, 1)]))
     fake_time = _fake_time(
         monotonic_values=[100.0, 100.0, 100.8, 100.9, 101.5, 102.0])
-    monkeypatch.setattr(backend_utils, 'time', fake_time)
+    _install_fake_time(monkeypatch, fake_time)
 
     result = backend_utils.wait_until_ray_cluster_ready(
         '/tmp/cluster.yaml',
@@ -281,7 +288,7 @@ def test_wait_until_ray_cluster_ready_without_timeout_skips_clock(
                         mock.MagicMock(side_effect=[(0, 0), (1, 1)]))
     fake_time = _fake_time(
         monotonic_values=AssertionError('read an unused progress clock'))
-    monkeypatch.setattr(backend_utils, 'time', fake_time)
+    _install_fake_time(monkeypatch, fake_time)
 
     result = backend_utils.wait_until_ray_cluster_ready('/tmp/cluster.yaml', 2,
                                                         '/tmp/launch.log')
@@ -291,3 +298,26 @@ def test_wait_until_ray_cluster_ready_without_timeout_skips_clock(
     fake_time.monotonic.assert_not_called()
     fake_time.sleep.assert_called_once_with(10)
     fake_time.time.assert_not_called()
+
+
+def test_wait_until_ray_cluster_ready_cancellation_stops_before_next_probe(
+        monkeypatch, ray_ready_dependencies):
+    monkeypatch.setattr(backend_utils, '_count_healthy_nodes_from_ray',
+                        mock.MagicMock(return_value=(0, 0)))
+    ray_ready_dependencies.run.side_effect = [
+        (0, 'workers still booting', ''),
+        AssertionError('SSH status probed after cancellation'),
+    ]
+    wait = mock.Mock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(backend_utils.context_utils,
+                        'sleep_with_cancellation',
+                        wait,
+                        raising=False)
+    monkeypatch.setattr(backend_utils.time, 'sleep', mock.Mock())
+
+    with pytest.raises(asyncio.CancelledError):
+        backend_utils.wait_until_ray_cluster_ready('/tmp/cluster.yaml', 2,
+                                                   '/tmp/launch.log')
+
+    wait.assert_called_once_with(10)
+    ray_ready_dependencies.run.assert_called_once()

@@ -9,6 +9,7 @@ import os
 import select
 import subprocess
 import sys
+import threading
 import time
 import typing
 from typing import Any, IO, TypeVar
@@ -212,6 +213,22 @@ def cancellation_guard(func: F) -> F:
         return func(*args, **kwargs)
 
     return typing.cast(F, wrapper)
+
+
+def sleep_with_cancellation(seconds: float) -> None:
+    """Sleep synchronously, waking early when the request is cancelled."""
+    ctx = context.get()
+    if ctx is None:
+        time.sleep(seconds)
+        return
+
+    cancelled = threading.Event()
+    ctx.register_cancel_callback(cancelled.set)
+    try:
+        if cancelled.wait(seconds) or ctx.is_canceled():
+            raise asyncio.CancelledError('Request cancelled during wait')
+    finally:
+        ctx.unregister_cancel_callback(cancelled.set)
 
 
 P = ParamSpec('P')
