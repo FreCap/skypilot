@@ -1652,6 +1652,12 @@ def test_timeout_and_cancellation_remove_waiters():
         history = lb._request_aggregator.request_history_snapshot()
         assert history is not None
         assert history['buckets'][0]['request_count'] == 1
+        assert lb._request_aggregator.request_classification_history_snapshot(
+        )['buckets'][0] == {
+            'bucket_start': history['buckets'][0]['bucket_start'],
+            'classified_request_count': 1,
+            'counted_rejected_count': 1,
+        }
 
         lb._request_queue_config = {
             **(lb._request_queue_config or {}),
@@ -1665,6 +1671,27 @@ def test_timeout_and_cancellation_remove_waiters():
             await waiter
         assert lb._waiting_request_count == 0
         assert lb._request_aggregator.request_history_snapshot() == history
+
+    asyncio.run(_run())
+
+
+def test_full_queue_classifies_the_terminal_rejection():
+
+    async def _run():
+        lb = _make_lb(min_size=1, max_size=1)
+        lb._waiting_request_count = 1
+
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await lb._acquire_request_slot(_request())
+
+        assert exc.value.status_code == 503
+        assert lb._request_aggregator.request_classification_history_snapshot(
+        )['buckets'][0] == {
+            'bucket_start': lb._request_aggregator.request_history_snapshot()
+                            ['buckets'][0]['bucket_start'],
+            'classified_request_count': 1,
+            'counted_rejected_count': 1,
+        }
 
     asyncio.run(_run())
 

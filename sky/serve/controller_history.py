@@ -15,6 +15,10 @@ from sky.utils import common_utils
 logger = logging.getLogger('sky.serve.controller')
 
 
+class _UnsupportedRequestClassificationVersion(ValueError):
+    """A newer LB protocol that this controller must not acknowledge."""
+
+
 async def _persist_request_history(self: Any, request_data: dict[str,
                                                                  Any]) -> bool:
     """Persist history without allowing observability to fail sync."""
@@ -65,6 +69,73 @@ def _record_request_history(self: Any, request_data: dict[str, Any]) -> bool:
         service_hash,
         reporter_session_id,
         request_history,
+    )
+    return True
+
+
+async def _persist_request_classification_history(
+        self: Any, request_data: dict[str, Any]) -> bool:
+    """Persist terminal classifications independently from arrival history."""
+    if request_data.get('request_classification_history') is None:
+        return True
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(
+            None, self._record_request_classification_history, request_data)
+    except _UnsupportedRequestClassificationVersion as e:
+        # A future LB must retain and retry its snapshot until a capable
+        # controller is rolled out. A boolean acknowledgement would otherwise
+        # make the newer data irrecoverable.
+        logger.warning('Cannot accept load balancer request classification '
+                       f'history for {self._service_name!r}: '
+                       f'{common_utils.format_exception(e)}')
+        return False
+    except ValueError as e:
+        # A malformed cumulative snapshot cannot become valid by retrying.
+        logger.warning('Dropping invalid load balancer request '
+                       f'classification history for {self._service_name!r}: '
+                       f'{common_utils.format_exception(e)}')
+        return True
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning('Failed to persist load balancer request '
+                       f'classification history for {self._service_name!r}: '
+                       f'{common_utils.format_exception(e)}')
+        return False
+
+
+def _record_request_classification_history(
+        self: Any, request_data: dict[str, Any]) -> bool:
+    """Persist one LB process's cumulative terminal-classification pairs."""
+    classification_history = request_data.get('request_classification_history')
+    if classification_history is None:
+        return True
+    declared_version = (classification_history.get('classification_version')
+                        if isinstance(classification_history, dict) else None)
+    if (isinstance(declared_version, int) and
+            not isinstance(declared_version, bool) and declared_version
+            > serve_history.REQUEST_CLASSIFICATION_PROTOCOL_VERSION):
+        raise _UnsupportedRequestClassificationVersion(
+            'Request classification protocol version '
+            f'{declared_version} is newer than supported version '
+            f'{serve_history.REQUEST_CLASSIFICATION_PROTOCOL_VERSION}.')
+    service_hash = getattr(self, '_service_hash', None)
+    if service_hash is None:
+        return True
+    lb_session_id = request_data.get('lb_session_id')
+    process_session_id = request_data.get('request_history_session_id')
+    if (not isinstance(lb_session_id, str) or not lb_session_id or
+            not isinstance(process_session_id, str) or
+            len(process_session_id) != 32 or
+            any(character not in '0123456789abcdef'
+                for character in process_session_id)):
+        raise ValueError('Invalid request classification reporter session.')
+    reporter_session_id = f'{lb_session_id}:{process_session_id}'
+    serve_history.record_request_classification(
+        self._service_name,
+        service_hash,
+        reporter_session_id,
+        classification_history,
+        request_history=request_data.get('request_history'),
     )
     return True
 
@@ -296,6 +367,8 @@ def _get_accelerator_history_breakdown(
 for _method_name in (
         '_persist_request_history',
         '_record_request_history',
+        '_persist_request_classification_history',
+        '_record_request_classification_history',
         '_persist_response_time_history',
         '_record_response_time_history',
         '_persist_prediction_time_history',

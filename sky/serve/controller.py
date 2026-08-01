@@ -49,6 +49,17 @@ logger = sky_logging.init_logger(__name__)
 serve_history = controller_history.serve_history
 
 
+def _uses_current_request_classification_protocol(
+        request_data: dict[str, Any]) -> bool:
+    """Whether one LB payload declares the controller's current protocol."""
+    classification_history = request_data.get('request_classification_history')
+    if not isinstance(classification_history, dict):
+        return False
+    version = classification_history.get('classification_version')
+    return (isinstance(version, int) and not isinstance(version, bool) and
+            version == serve_history.REQUEST_CLASSIFICATION_PROTOCOL_VERSION)
+
+
 class _PreparedLoadBalancerReport(NamedTuple):
     authority: tuple[bool, bool, bool]
     effective_request_data: dict[str, Any]
@@ -1234,9 +1245,11 @@ class SkyServeController:
                 None, self._get_replica_counts, replica_infos)
             history_capacity_hint = self._get_capacity_hint(
                 replica_infos, logical_versions, replica_counts=replica_counts)
-            (request_history_accepted, response_time_history_accepted,
-             prediction_time_history_accepted, _) = await asyncio.gather(
-                 self._persist_request_history(request_data),
+            ((request_history_accepted,
+              request_classification_history_accepted),
+             response_time_history_accepted, prediction_time_history_accepted,
+             _) = await asyncio.gather(
+                 self._persist_request_histories(request_data),
                  self._persist_response_time_history(request_data),
                  self._persist_prediction_time_history(request_data),
                  self._persist_autoscaler_history(replica_counts,
@@ -1366,6 +1379,7 @@ class SkyServeController:
                 'routing_spec': routing_spec,
                 'capacity_hint': capacity_hint,
                 'request_history_accepted': request_history_accepted,
+                'request_classification_history_accepted': request_classification_history_accepted,
                 'response_time_history_accepted': response_time_history_accepted,
                 'prediction_time_history_accepted': prediction_time_history_accepted,
                 # Additive protocol negotiation for mixed-version rollouts.
@@ -2157,23 +2171,52 @@ class SkyServeController:
             None, self._lb_report_authority, request_data.get('lb_session_id'))
         if not authority[0]:
             return fastapi.Response(status_code=503)
-        (request_accepted, response_time_accepted,
+        ((request_accepted, classification_accepted), response_time_accepted,
          prediction_time_accepted) = await asyncio.gather(
-             self._persist_request_history(request_data),
+             self._persist_request_histories(request_data),
              self._persist_response_time_history(request_data),
              self._persist_prediction_time_history(request_data),
          )
         return responses.JSONResponse(content={
             'request_history_accepted': request_accepted,
+            'request_classification_history_accepted': classification_accepted,
             'response_time_history_accepted': response_time_accepted,
             'prediction_time_history_accepted': prediction_time_accepted,
         },
                                       status_code=200)
 
+    async def _persist_request_histories(
+            self, request_data: dict[str, Any]) -> tuple[bool, bool]:
+        """Persist arrivals only after current-v1 support is durable."""
+        if _uses_current_request_classification_protocol(request_data):
+            classification_accepted = (
+                await
+                self._persist_request_classification_history(request_data))
+            if not classification_accepted:
+                # Do not expose positive arrival rows without the paired
+                # support fields. The load balancer retains both snapshots and
+                # retries the classification transaction first.
+                return False, False
+            request_accepted = await self._persist_request_history(request_data)
+            return request_accepted, True
+
+        # Legacy and future-version payloads keep independent acknowledgement:
+        # their attempt history remains useful even when this controller cannot
+        # understand the classification envelope.
+        request_accepted, classification_accepted = await asyncio.gather(
+            self._persist_request_history(request_data),
+            self._persist_request_classification_history(request_data),
+        )
+        return request_accepted, classification_accepted
+
     # These functions intentionally bind as methods on the controller facade.
     # pylint: disable=protected-access
     _persist_request_history = controller_history._persist_request_history
     _record_request_history = controller_history._record_request_history
+    _persist_request_classification_history = (
+        controller_history._persist_request_classification_history)
+    _record_request_classification_history = (
+        controller_history._record_request_classification_history)
     _persist_response_time_history = (
         controller_history._persist_response_time_history)
     _record_response_time_history = (

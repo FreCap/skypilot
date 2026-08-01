@@ -273,15 +273,14 @@ function ServiceRequestsCard({
   todayUtc,
 }) {
   const totalRequestCount = Number(serviceRequests?.total_request_count || 0);
+  const requestCoverage = serviceRequests?.coverage || 'unavailable';
   const coveragePartial =
     serviceRequests?.coverage_start_utc &&
     serviceRequests.coverage_start_utc >
       Date.parse(`${startDate}T00:00:00Z`) / 1000;
-  const ratioCoverageStartUtc =
-    serviceRequests?.services?.[0]?.ratio_coverage_start_utc;
-  const ratioCoveragePartial =
-    ratioCoverageStartUtc &&
-    ratioCoverageStartUtc > Date.parse(`${startDate}T00:00:00Z`) / 1000;
+  const hasIncompleteDays = (serviceRequests?.complete_by_day || []).some(
+    (complete) => !complete
+  );
   const chartData = useMemo(() => {
     const series = serviceRequests?.series || [];
     return {
@@ -330,7 +329,7 @@ function ServiceRequestsCard({
               const labels = [
                 `${context.dataset.label}: ${formatRequestCount(
                   context.parsed.y
-                )} requests`,
+                )} non-rejected requests`,
               ];
               if (context.dataset.isOther) return labels;
               const estimatedCost =
@@ -347,7 +346,7 @@ function ServiceRequestsCard({
                 }`
               );
               labels.push(
-                `Est. compute cost / request: ${formatCostPerRequest(
+                `Est. compute cost / non-rejected request: ${formatCostPerRequest(
                   costPerRequest
                 )}`
               );
@@ -378,14 +377,15 @@ function ServiceRequestsCard({
           <div>
             <CardTitle className="flex items-center gap-2 text-lg">
               <Activity className="h-5 w-5 text-blue-600" />
-              Daily requests by service
+              Daily non-rejected requests by service
             </CardTitle>
             <CardDescription className="mt-1">
-              One admitted or capacity-rejected inbound request counts once.
-              Internal replica retries do not add requests; client retries are
-              separate requests. Cost/request is estimated replica compute, with
-              reserved Kubernetes capacity valued at zero; genuinely unknown
-              pricing remains unavailable.{' '}
+              Requests rejected by the load balancer are excluded. This is not a
+              success count: replica errors and post-admission transport or
+              client errors still count once. Internal replica retries do not
+              add requests; client retries are separate requests. Cost/request
+              is estimated replica compute, with reserved Kubernetes capacity
+              valued at zero; genuinely unknown pricing remains unavailable.{' '}
               {endDate === todayUtc && 'The current UTC day is partial.'}
             </CardDescription>
           </div>
@@ -395,7 +395,9 @@ function ServiceRequestsCard({
                 {formatRequestCount(totalRequestCount)}
               </p>
               <p className="text-xs text-muted-foreground">
-                Requests in selected range
+                {requestCoverage === 'partial'
+                  ? 'Known non-rejected requests in selected range'
+                  : 'Non-rejected requests in selected range'}
               </p>
             </div>
           )}
@@ -404,7 +406,8 @@ function ServiceRequestsCard({
       <CardContent className="space-y-6">
         {!serviceRequests.available ? (
           <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
-            Daily service request history is unavailable on this server.
+            Exact non-rejected request history is unavailable on this server or
+            for this range. Rejected attempts are never used as a fallback.
           </div>
         ) : (
           <>
@@ -417,27 +420,19 @@ function ServiceRequestsCard({
                   timeZone: 'UTC',
                   timeZoneName: 'short',
                 })}
-                . The earlier portion of this range has no retained request
-                data.
+                . The earlier portion of this range has no exact non-rejected
+                request data.
               </div>
             )}
-            {ratioCoveragePartial && (
+            {hasIncompleteDays && (
               <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
-                Cost/request uses complete request-history days beginning{' '}
-                {new Date(ratioCoverageStartUtc * 1000).toLocaleDateString(
-                  undefined,
-                  {
-                    timeZone: 'UTC',
-                    timeZoneName: 'short',
-                  }
-                )}
-                . Its request denominator can be smaller than the selected-range
-                request total.
+                Days with legacy or mixed load balancers are omitted. Their
+                rejected attempts are not treated as completed requests.
               </div>
             )}
             {totalRequestCount === 0 ? (
               <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
-                No service requests recorded in this range.
+                No non-rejected service requests recorded in the covered days.
               </div>
             ) : (
               <div className="h-80">
@@ -449,9 +444,11 @@ function ServiceRequestsCard({
                 <TableHeader>
                   <TableRow>
                     <TableHead>Service</TableHead>
-                    <TableHead className="text-right">Requests</TableHead>
                     <TableHead className="text-right">
-                      Est. compute cost / request
+                      Non-rejected requests
+                    </TableHead>
+                    <TableHead className="text-right">
+                      Est. compute cost / non-rejected request
                     </TableHead>
                     <TableHead className="text-right">Share</TableHead>
                   </TableRow>
@@ -463,12 +460,19 @@ function ServiceRequestsCard({
                         colSpan={4}
                         className="py-8 text-center text-muted-foreground"
                       >
-                        No services with request activity in this range.
+                        No services with non-rejected request activity in the
+                        covered days.
                       </TableCell>
                     </TableRow>
                   ) : (
                     serviceRequests.services.map((service) => {
                       const count = Number(service.request_count || 0);
+                      const coverageUnavailable =
+                        service.coverage === 'unavailable';
+                      const ratioCoveragePartial =
+                        service.ratio_coverage_start_utc &&
+                        service.ratio_coverage_start_utc >
+                          Date.parse(`${startDate}T00:00:00Z`) / 1000;
                       const share =
                         totalRequestCount > 0
                           ? (count / totalRequestCount) * 100
@@ -479,7 +483,22 @@ function ServiceRequestsCard({
                             {service.service_name}
                           </TableCell>
                           <TableCell className="text-right font-medium">
-                            {formatRequestCount(count)}
+                            <div>
+                              {coverageUnavailable
+                                ? 'N/A'
+                                : formatRequestCount(count)}
+                            </div>
+                            {coverageUnavailable ? (
+                              <div className="text-xs font-normal text-muted-foreground">
+                                request history unavailable
+                              </div>
+                            ) : (
+                              service.coverage === 'partial' && (
+                                <div className="text-xs font-normal text-muted-foreground">
+                                  partial coverage
+                                </div>
+                              )
+                            )}
                           </TableCell>
                           <TableCell className="text-right font-medium">
                             <div>
@@ -502,9 +521,22 @@ function ServiceRequestsCard({
                                   requests
                                 </div>
                               )}
+                            {ratioCoveragePartial && (
+                              <div className="text-xs font-normal text-muted-foreground">
+                                request denominator since{' '}
+                                {utcDateString(
+                                  new Date(
+                                    service.ratio_coverage_start_utc * 1000
+                                  )
+                                )}{' '}
+                                UTC
+                              </div>
+                            )}
                           </TableCell>
                           <TableCell className="text-right text-muted-foreground">
-                            {share.toFixed(1)}%
+                            {requestCoverage === 'complete'
+                              ? `${share.toFixed(1)}%`
+                              : 'N/A'}
                           </TableCell>
                         </TableRow>
                       );
@@ -748,7 +780,17 @@ export function EstimatedSpend() {
     supportsBreakdowns && displayedGroupBy !== 'purchase_option';
   const clouds = data?.clouds || [];
   const totalCost = Number(totals.estimated_cost || 0);
-  const serviceRequests = data?.service_requests;
+  const serviceRequestEnvelope = data?.service_requests;
+  const serviceRequests = serviceRequestEnvelope
+    ? serviceRequestEnvelope.non_rejected || {
+        available: false,
+        coverage_start_utc: null,
+        complete_by_day: [],
+        total_request_count: 0,
+        services: [],
+        series: [],
+      }
+    : null;
   const hasOtherSeries = (data?.series || []).some((series) => series.is_other);
   const todayUtc = utcDateString();
   const earliestDate = shiftUtcDate(todayUtc, -(MAX_RANGE_DAYS - 1));
