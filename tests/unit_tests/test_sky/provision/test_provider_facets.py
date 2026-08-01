@@ -1180,13 +1180,23 @@ def test_code_derived_validation_ignores_signature_overrides(
         assert override_kind == 'partialmethod'
         wrong_implementation._partialmethod = functools.partialmethod(  # type: ignore[attr-defined]
             valid_diagnostic)
-    assert tuple(inspect.signature(wrong_implementation).parameters) == (
+    apparent_parameters = tuple(
+        inspect.signature(wrong_implementation).parameters)
+    spoofed_parameters = (
         'cluster_name',
         'cluster_name_on_cloud',
         'provider_config',
         'non_terminated_only',
         'retry_if_missing',
     )
+    if override_kind == 'partialmethod':
+        # Python 3.14 stopped interpreting a function's private
+        # ``_partialmethod`` attribute. Older supported versions still use it
+        # to synthesize the apparent signature, so accept both inspector
+        # behaviors while proving that validation rejects the metadata.
+        assert apparent_parameters in (spoofed_parameters, ('only_argument',))
+    else:
+        assert apparent_parameters == spoofed_parameters
 
     implementations = {
         'authoritative_implementation': authoritative,
