@@ -132,7 +132,11 @@ resource "terraform_data" "reconcile_api_server" {
       set -euo pipefail
       KUBECONFIG_TMP="$(mktemp)"
       trap 'rm -f "$KUBECONFIG_TMP"' EXIT
-      aws eks update-kubeconfig --name ${var.host_cluster_name} --region ${var.aws_region} --kubeconfig "$KUBECONFIG_TMP" >/dev/null
+      proxy_args=()
+      if [[ -n "$${KUBE_PROXY_URL:-}" ]]; then
+        proxy_args=(--proxy-url "$KUBE_PROXY_URL")
+      fi
+      aws eks update-kubeconfig --name ${var.host_cluster_name} --region ${var.aws_region} --kubeconfig "$KUBECONFIG_TMP" "$${proxy_args[@]}" >/dev/null
       kubectl --kubeconfig "$KUBECONFIG_TMP" -n ${var.namespace} rollout restart deployment/${var.release_name}-api-server
       kubectl --kubeconfig "$KUBECONFIG_TMP" -n ${var.namespace} rollout status deployment/${var.release_name}-api-server --timeout=${local.api_server_rollout_timeout_seconds}s
     EOT

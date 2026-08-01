@@ -79,10 +79,12 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Test control-plane config seed
+      - name: Test control-plane scripts
         run: |
           cd infra/terraform/modules/skypilot-control-plane/scripts
           uv run --no-project \
             --with 'PyYAML>=6,<7' \
             --with 'SQLAlchemy>=2,<3' \
-            python -m unittest -v test_seed_config.py
+            python -m unittest -v \
+              test_seed_config.py \
+              test_reconcile_api_server.py
