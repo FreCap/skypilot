@@ -262,7 +262,8 @@ def query_instances(
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     instances = utils.filter_instances(cluster_name_on_cloud,
                                        status_filters=None)
-    return query_projection.project_query_instances(instances)
+    return query_projection.project_query_instances(instances,
+                                                    status_lib.ClusterStatus)
 
 
 def open_ports(
