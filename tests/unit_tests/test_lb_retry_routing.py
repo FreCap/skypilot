@@ -340,11 +340,14 @@ class TestRetryShortCircuit(unittest.TestCase):
         async def _proxy(url, request):
             raise AssertionError('must not be called')
 
-        sleeps, exc = self._run(self._balancer([], _proxy))
+        balancer = self._balancer([], _proxy)
+        sleeps, exc = self._run(balancer)
         self.assertEqual(sleeps, [])  # zero backoff sleeps
         self.assertEqual(exc.status_code, 503)
         self.assertEqual(exc.headers['Retry-After'],
                          str(lb_module.constants.LB_503_RETRY_AFTER_SECONDS))
+        balancer._request_aggregator.add_request_classification.assert_called_once_with(
+            rejected=True)
 
     def test_all_replicas_shedding_short_circuits(self):
         attempts = []
@@ -354,13 +357,15 @@ class TestRetryShortCircuit(unittest.TestCase):
             attempts.append(url)
             return lb_module._RetriableStatusError(503, url)
 
-        sleeps, exc = self._run(
-            self._balancer(['http://a:8080', 'http://b:8080'], _proxy))
+        balancer = self._balancer(['http://a:8080', 'http://b:8080'], _proxy)
+        sleeps, exc = self._run(balancer)
         # One shed per replica, then out — not 5 attempts / 4 sleeps.
         self.assertEqual(len(attempts), 2)
         self.assertEqual(len(sleeps), 1)
         self.assertEqual(exc.status_code, 503)
         self.assertIn('Retry-After', exc.headers)
+        balancer._request_aggregator.add_request_classification.assert_called_once_with(
+            rejected=True)
 
     def test_retry_budget_exhausted_on_shedding_is_unavailable(self):
         attempts = []

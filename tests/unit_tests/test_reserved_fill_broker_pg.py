@@ -2650,6 +2650,23 @@ class TestMigrationChainPG:
                 assert request_columns['rejected_count']['default'] is not None
                 assert request_columns['rejection_count_available'][
                     'default'] is not None
+                assert {
+                    'classified_request_count',
+                    'counted_rejected_count',
+                }.issubset(request_columns)
+                daily_request_columns = {
+                    column['name']: column for column in inspector.get_columns(
+                        'serve_request_activity_daily')
+                }
+                assert {
+                    'classified_request_count',
+                    'counted_rejected_count',
+                    'classified_first_bucket_start',
+                    'classified_last_bucket_start',
+                    'classification_incomplete',
+                }.issubset(daily_request_columns)
+                assert daily_request_columns['classification_incomplete'][
+                    'default'] is not None
                 response_columns = {
                     column['name'] for column in inspector.get_columns(
                         'serve_response_time_history')
@@ -2784,6 +2801,75 @@ class TestMigrationChainPG:
                         'SELECT version_num FROM '
                         'alembic_version_serve_state_db')).scalar_one()
             assert revision == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    def test_revision_032_latches_preexisting_attempt_history(self, pg_server):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '031')
+            day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        'INSERT INTO serve_request_activity_daily '
+                        '(day_start, service_name, service_hash, '
+                        'first_bucket_start, last_bucket_start, request_count, '
+                        'observed_at) VALUES '
+                        '(:day, :name, :hash, :day, :day, 7, :day)'), {
+                            'day': day,
+                            'name': 'legacy',
+                            'hash': 'legacy-hash',
+                        })
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT classified_request_count, '
+                        'counted_rejected_count, classification_incomplete '
+                        'FROM serve_request_activity_daily')).one()
+                constraints = {
+                    constraint['name']
+                    for constraint in sqlalchemy.inspect(engine).
+                    get_check_constraints('serve_request_activity_daily')
+                }
+            assert row == (None, None, True)
+            assert 'serve_request_activity_daily_classified_pair' in constraints
+            with pytest.raises(sqlalchemy.exc.IntegrityError):
+                with engine.begin() as connection:
+                    connection.execute(
+                        sqlalchemy.text(
+                            'INSERT INTO serve_request_activity_daily '
+                            '(day_start, service_name, service_hash, '
+                            'first_bucket_start, last_bucket_start, '
+                            'request_count, classified_request_count, '
+                            'counted_rejected_count, '
+                            'classified_first_bucket_start, '
+                            'classified_last_bucket_start, observed_at) VALUES '
+                            '(:day, :name, :hash, :day, :day, 1, 1, NULL, '
+                            ':day, :day, :day)'), {
+                                'day': day + datetime.timedelta(days=1),
+                                'name': 'invalid',
+                                'hash': 'invalid-hash',
+                            })
+
+            config = migration_utils.get_alembic_config(
+                engine, migration_utils.SERVE_DB_NAME)
+            alembic_command.downgrade(config, '031')
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+            with engine.connect() as connection:
+                assert connection.execute(
+                    sqlalchemy.text(
+                        'SELECT classification_incomplete FROM '
+                        'serve_request_activity_daily')).scalar_one() is True
         finally:
             engine.dispose()
 
@@ -3719,6 +3805,318 @@ class TestServeStatusHistoryPG:
         assert not current['request_samples']
         assert current['requests_last_hour'] == 0
 
+    def test_request_classification_is_exact_monotonic_and_version_safe(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        timestamp = day.timestamp() + 30
+        bucket_start = int(day.timestamp())
+
+        def request_history(count):
+            return {
+                'bucket_seconds': 60,
+                'buckets': [{
+                    'bucket_start': bucket_start,
+                    'request_count': count,
+                    'rejected_count': 0,
+                }],
+            }
+
+        def classification_history(classified, rejected):
+            return {
+                'classification_version': 1,
+                'bucket_seconds': 60,
+                'buckets': [{
+                    'bucket_start': bucket_start,
+                    'classified_request_count': classified,
+                    'counted_rejected_count': rejected,
+                }],
+            }
+
+        assert serve_history.record_request_activity('svc', 'hash-a', 'current',
+                                                     request_history(3),
+                                                     timestamp) == 1
+        raw = serve_history.serve_request_activity_history_table
+        with history_engine.connect() as connection:
+            unclassified = connection.execute(
+                sqlalchemy.select(raw.c.classified_request_count,
+                                  raw.c.counted_rejected_count)).one()
+        assert unclassified == (None, None)
+        assert serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'current',
+            classification_history(3, 1),
+            timestamp + 1,
+            request_history=request_history(3)) == 1
+        # Independent stale deliveries cannot lower either component.
+        serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'current',
+            classification_history(2, 0),
+            timestamp + 2,
+            request_history=request_history(3))
+        # A legacy reporter remains distinguishable from a capable reporter.
+        serve_history.record_request_activity('mixed', 'hash-b', 'legacy',
+                                              request_history(4), timestamp)
+
+        with history_engine.connect() as connection:
+            rows = connection.execute(
+                sqlalchemy.select(
+                    raw.c.service_name,
+                    raw.c.request_count,
+                    raw.c.classified_request_count,
+                    raw.c.counted_rejected_count,
+                    raw.c.rejection_count_available,
+                ).order_by(raw.c.service_name)).fetchall()
+        assert rows == [('mixed', 4, None, None, True), ('svc', 3, 3, 1, True)]
+
+        assert serve_history.rollup_request_activity_daily(timestamp + 60) == 2
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            bucket_start,
+            bucket_start, [{
+                'day_start_utc': bucket_start
+            }],
+            table_limit=50,
+            chart_limit=1)
+        exact = summary['non_rejected']
+        assert exact['available']
+        assert exact['coverage'] == 'partial'
+        assert exact['complete_by_day'] == [False]
+        assert exact['total_request_count'] == 2
+        assert exact['services'] == [{
+            'service_name': 'svc',
+            'request_count': 2,
+            'coverage': 'complete',
+            'complete_by_day': [True],
+        }, {
+            'service_name': 'mixed',
+            'request_count': 0,
+            'coverage': 'unavailable',
+            'complete_by_day': [False],
+        }]
+        assert exact['series'] == [{
+            'service_name': 'svc',
+            'request_count_by_day': [2],
+        }, {
+            'is_other': True,
+            'request_count_by_day': [None],
+        }]
+
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.delete(raw))
+        assert serve_history.rollup_request_activity_daily(timestamp + 120) == 0
+        with history_engine.connect() as connection:
+            daily_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.service_name,
+                    daily.c.classified_request_count,
+                    daily.c.counted_rejected_count,
+                    daily.c.classification_incomplete,
+                ).order_by(daily.c.service_name)).fetchall()
+        assert daily_rows == [('mixed', None, None, True), ('svc', 3, 1, False)]
+
+    def test_request_classification_constraints_reject_one_sided_nulls(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        raw = serve_history.serve_request_activity_history_table
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with history_engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.insert(raw).values(
+                        service_name='svc',
+                        service_hash='hash-a',
+                        reporter_session_id='reporter',
+                        bucket_start=day,
+                        observed_at=day,
+                        request_count=1,
+                        classified_request_count=1,
+                        counted_rejected_count=None))
+
+        daily = serve_history.serve_request_activity_daily_table
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with history_engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.insert(daily).values(
+                        day_start=day,
+                        service_name='svc',
+                        service_hash='hash-a',
+                        first_bucket_start=day,
+                        last_bucket_start=day,
+                        request_count=1,
+                        classified_request_count=1,
+                        counted_rejected_count=None,
+                        classified_first_bucket_start=day,
+                        classified_last_bucket_start=day,
+                        observed_at=day))
+
+    def test_empty_classification_atomically_promotes_support_buckets(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        timestamp = day.timestamp() + 30
+        bucket_start = int(day.timestamp())
+        request_history = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'request_count': 2,
+                'rejected_count': 0,
+            }],
+        }
+        empty_classification = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [],
+        }
+        serve_history.record_request_activity('svc', 'hash-a', 'reporter',
+                                              request_history, timestamp)
+        assert serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'reporter',
+            empty_classification,
+            timestamp,
+            request_history=request_history) == 1
+
+        raw = serve_history.serve_request_activity_history_table
+        with history_engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(raw.c.request_count,
+                                  raw.c.classified_request_count,
+                                  raw.c.counted_rejected_count)).one()
+        assert row == (2, 0, 0)
+
+        bad_classification = {
+            **empty_classification,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'classified_request_count': 1,
+                'counted_rejected_count': 2,
+            }],
+        }
+        with pytest.raises(ValueError, match='cannot exceed'):
+            serve_history.validate_request_classification_history(
+                bad_classification, timestamp)
+        with pytest.raises(ValueError, match='unsupported'):
+            serve_history.validate_request_classification_history(
+                {
+                    **empty_classification,
+                    'classification_version': True,
+                }, timestamp)
+
+    def test_daily_incomplete_latch_survives_late_classification_support(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        timestamp = day.timestamp() + 30
+        bucket_start = int(day.timestamp())
+        request_history = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'request_count': 1,
+                'rejected_count': 0,
+            }],
+        }
+        classification_history = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [],
+        }
+
+        serve_history.record_request_activity('svc', 'hash-a', 'reporter',
+                                              request_history, timestamp)
+        assert serve_history.rollup_request_activity_daily(timestamp) == 1
+
+        serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'reporter',
+            classification_history,
+            timestamp + 1,
+            request_history=request_history)
+        assert serve_history.rollup_request_activity_daily(timestamp + 2) == 1
+
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(daily.c.request_count,
+                                  daily.c.classified_request_count,
+                                  daily.c.counted_rejected_count,
+                                  daily.c.classification_incomplete)).one()
+        assert row == (1, 0, 0, True)
+
+    def test_non_rejected_zero_range_after_coverage_is_available(
+            self, history_engine):
+        first_day = datetime.datetime(2026, 7, 30, tzinfo=datetime.timezone.utc)
+        selected_day = first_day + datetime.timedelta(days=1)
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(daily),
+                [
+                    {
+                        'day_start': first_day,
+                        'service_name': 'svc',
+                        'service_hash': 'hash-a',
+                        'first_bucket_start': first_day,
+                        'last_bucket_start': first_day,
+                        'request_count': 1,
+                        'classified_request_count': 1,
+                        'counted_rejected_count': 0,
+                        'classified_first_bucket_start': first_day,
+                        'classified_last_bucket_start': first_day,
+                        'classification_incomplete': False,
+                        'observed_at': first_day,
+                    },
+                    {
+                        # This is the durable shape of a legacy pre-admission
+                        # rejection-only minute. It has no attempt to classify and
+                        # must remain an exact zero after service coverage begins.
+                        'day_start': selected_day,
+                        'service_name': 'svc',
+                        'service_hash': 'hash-a',
+                        'first_bucket_start': selected_day,
+                        'last_bucket_start': selected_day,
+                        'request_count': 0,
+                        'classified_request_count': None,
+                        'counted_rejected_count': None,
+                        'classified_first_bucket_start': None,
+                        'classified_last_bucket_start': None,
+                        'classification_incomplete': False,
+                        'observed_at': selected_day,
+                    }
+                ])
+
+        selected_epoch = int(selected_day.timestamp())
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            selected_epoch,
+            selected_epoch, [{
+                'day_start_utc': selected_epoch
+            }],
+            table_limit=50,
+            chart_limit=8)
+        assert summary['non_rejected'] == {
+            'available': True,
+            'definition': 'non_rejected_inbound_requests',
+            'coverage_start_utc': int(first_day.timestamp()),
+            'coverage': 'complete',
+            'complete_by_day': [True],
+            'total_request_count': 0,
+            'services': [{
+                'service_name': 'svc',
+                'request_count': 0,
+                'coverage': 'complete',
+                'complete_by_day': [True],
+            }],
+            'series': [{
+                'service_name': 'svc',
+                'request_count_by_day': [0],
+            }],
+        }
+
     def test_daily_request_rollup_is_monotonic_and_groups_incarnations(
             self, history_engine):
         day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
@@ -3903,7 +4301,13 @@ class TestServeStatusHistoryPG:
                     'service_hash': 'hash-a',
                     'first_bucket_start': day,
                     'last_bucket_start': day + datetime.timedelta(minutes=59),
-                    'request_count': 4,
+                    'request_count': 5,
+                    'classified_request_count': 5,
+                    'counted_rejected_count': 1,
+                    'classified_first_bucket_start': day,
+                    'classified_last_bucket_start':
+                        day + datetime.timedelta(minutes=59),
+                    'classification_incomplete': False,
                     'observed_at': observed_at,
                 }, {
                     'day_start': day,
@@ -3912,6 +4316,12 @@ class TestServeStatusHistoryPG:
                     'first_bucket_start': day,
                     'last_bucket_start': day + datetime.timedelta(minutes=59),
                     'request_count': 2,
+                    'classified_request_count': 2,
+                    'counted_rejected_count': 0,
+                    'classified_first_bucket_start': day,
+                    'classified_last_bucket_start':
+                        day + datetime.timedelta(minutes=59),
+                    'classification_incomplete': False,
                     'observed_at': observed_at,
                 }, {
                     'day_start': day,
@@ -3920,6 +4330,12 @@ class TestServeStatusHistoryPG:
                     'first_bucket_start': day,
                     'last_bucket_start': day + datetime.timedelta(minutes=59),
                     'request_count': 1,
+                    'classified_request_count': 1,
+                    'counted_rejected_count': 0,
+                    'classified_first_bucket_start': day,
+                    'classified_last_bucket_start':
+                        day + datetime.timedelta(minutes=59),
+                    'classification_incomplete': False,
                     'observed_at': observed_at,
                 }])
             connection.execute(
@@ -3990,9 +4406,18 @@ class TestServeStatusHistoryPG:
 
         response = estimated_spend.get_estimated_spend(days=1)
 
-        services = {
+        attempt_services = {
             service['service_name']: service
             for service in response['service_requests']['services']
+        }
+        assert attempt_services['svc']['request_count'] == 5
+        assert attempt_services['svc']['ratio_request_count'] == 0
+        assert attempt_services['svc']['estimated_cost_per_request'] is None
+        assert attempt_services['svc']['cost_coverage'] == 'unavailable'
+
+        exact = response['service_requests']['non_rejected']
+        services = {
+            service['service_name']: service for service in exact['services']
         }
         service = services['svc']
         assert service['service_name'] == 'svc'
@@ -4003,8 +4428,7 @@ class TestServeStatusHistoryPG:
         assert service['cost_coverage'] == 'complete'
         assert service['priced_machine_seconds'] == 7200
         assert service['excluded_machine_seconds'] == 0
-        assert response['service_requests']['series'][0][
-            'estimated_cost_per_request_by_day'] == [0.5]
+        assert exact['series'][0]['estimated_cost_per_request_by_day'] == [0.5]
         zero_service = services['zero-svc']
         assert zero_service['estimated_cost'] == 0
         assert zero_service['estimated_cost_per_request'] == 0

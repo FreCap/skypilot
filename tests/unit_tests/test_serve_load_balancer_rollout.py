@@ -72,6 +72,55 @@ def test_begin_draining_flushes_pending_request_history_once():
     asyncio.run(_scenario())
 
 
+def test_drain_history_flush_reschedules_for_late_classifications():
+
+    async def _scenario():
+        lb = _make_lb()
+        first_flush_started = asyncio.Event()
+        release_first_flush = asyncio.Event()
+        flush_count = 0
+
+        async def _flush():
+            nonlocal flush_count
+            flush_count += 1
+            if flush_count == 1:
+                first_flush_started.set()
+                await release_first_flush.wait()
+
+        def _classify() -> None:
+            request = mock.MagicMock()
+            lb._mark_request_classification_eligible(request)
+            lb._record_request_classification_once(request, rejected=False)
+
+        with mock.patch.object(lb,
+                               '_flush_request_history_on_drain',
+                               side_effect=_flush):
+            lb._begin_draining()
+            await asyncio.wait_for(first_flush_started.wait(), timeout=1)
+
+            # A classification during the first send advances the generation,
+            # so the existing task must perform another pass.
+            _classify()
+            release_first_flush.set()
+            while flush_count < 2:
+                await asyncio.sleep(0)
+            while lb._drain_history_flush_task is not None:
+                await asyncio.sleep(0)
+
+            # A classification after the coalesced task cleared must install a
+            # successor instead of being stranded during process drain.
+            _classify()
+            while flush_count < 3:
+                await asyncio.sleep(0)
+            while lb._background_tasks:
+                await asyncio.sleep(0)
+
+        assert flush_count == 3
+        assert lb._drain_history_flush_task is None
+
+    asyncio.run(_scenario())
+
+
 def test_background_loops_are_owned_until_completion():
 
     async def _scenario():

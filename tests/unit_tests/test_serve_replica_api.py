@@ -24,8 +24,12 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert (server_constants.MIN_SERVE_DASHBOARD_DIRECT_READS_API_VERSION ==
             server_constants.MIN_SERVE_DASHBOARD_HISTORY_API_VERSION)
     assert server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION == 67
-    assert (server_constants.API_VERSION ==
-            server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION)
+    spend_request_version = (
+        server_constants.MIN_ESTIMATED_SPEND_NON_REJECTED_REQUESTS_API_VERSION)
+    assert spend_request_version == 68
+    assert (server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION
+            < server_constants.API_VERSION)
+    assert server_constants.API_VERSION == spend_request_version
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():

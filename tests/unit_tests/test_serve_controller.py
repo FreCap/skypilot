@@ -2952,6 +2952,58 @@ class TestAuthoritativeLbReportIngestion:
         assert (json.loads(response.body)['request_history_accepted']
                 is history_accepted)
 
+    def test_v1_classification_failure_retains_both_history_snapshots(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
+        report.update({
+            'request_history_session_id': 'a' * 32,
+            'request_history': {
+                'bucket_seconds': 60,
+                'buckets': [{
+                    'bucket_start': 120,
+                    'request_count': 3,
+                }],
+            },
+            'request_classification_history': {
+                'classification_version': 1,
+                'bucket_seconds': 60,
+                'buckets': [],
+            },
+        })
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 controller.lb_k8s,
+                 'get_lb_pod_authority',
+                 return_value=controller.lb_k8s.LbPodAuthority(
+                     {'lb-a'}, {'lb-a'})), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl, '_get_lb_replica_info', return_value=({}, 1)), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}), \
+             mock.patch.object(
+                 ctrl, '_record_request_history', return_value=True), \
+             mock.patch.object(
+                 ctrl,
+                 '_record_request_classification_history',
+                 side_effect=RuntimeError('database unavailable')):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        assert body['request_classification_history_accepted'] is False
+        assert body['request_history_accepted'] is False
+
     def test_sync_with_mid_snapshot_update_withholds_mixed_routing_epoch(self):
         ctrl, info, report = self._controller_and_report()
         ctrl._routing_spec = {'catalog': ['A100']}  # pylint: disable=protected-access
@@ -3972,6 +4024,7 @@ class TestLbSyncBlockingReadsOffLoop:
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
             'capacity_hint', 'request_history_accepted',
+            'request_classification_history_accepted',
             'response_time_history_accepted',
             'prediction_time_history_accepted',
             'queued_compatibility_demand_supported', 'service_version'
@@ -4504,6 +4557,7 @@ class TestLbSyncOwnershipFences:
         assert response.status_code == 200
         assert json.loads(response.body) == {
             'request_history_accepted': True,
+            'request_classification_history_accepted': True,
             'response_time_history_accepted': True,
             'prediction_time_history_accepted': True,
         }

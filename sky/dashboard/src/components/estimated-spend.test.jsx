@@ -148,30 +148,35 @@ test('renders reserved zero-cost service capacity as available', async () => {
   const estimate = response(1, 0);
   estimate.service_requests = {
     available: true,
-    definition: 'admitted_inbound_requests',
-    coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
-    total_request_count: 4,
-    services: [
-      {
-        service_name: 'reserved-service',
-        request_count: 4,
-        estimated_cost: 0,
-        estimated_cost_per_request: 0,
-        ratio_request_count: 4,
-        ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
-        priced_machine_seconds: 3600,
-        excluded_machine_seconds: 0,
-        cost_coverage: 'complete',
-      },
-    ],
-    series: [
-      {
-        service_name: 'reserved-service',
-        request_count_by_day: [4],
-        estimated_cost_by_day: [0],
-        estimated_cost_per_request_by_day: [0],
-      },
-    ],
+    non_rejected: {
+      available: true,
+      definition: 'non_rejected_inbound_requests',
+      coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+      coverage: 'complete',
+      complete_by_day: [true],
+      total_request_count: 4,
+      services: [
+        {
+          service_name: 'reserved-service',
+          request_count: 4,
+          estimated_cost: 0,
+          estimated_cost_per_request: 0,
+          ratio_request_count: 4,
+          ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+          priced_machine_seconds: 3600,
+          excluded_machine_seconds: 0,
+          cost_coverage: 'complete',
+        },
+      ],
+      series: [
+        {
+          service_name: 'reserved-service',
+          request_count_by_day: [4],
+          estimated_cost_by_day: [0],
+          estimated_cost_per_request_by_day: [0],
+        },
+      ],
+    },
   };
   getEstimatedSpend.mockResolvedValue(estimate);
 
@@ -182,7 +187,7 @@ test('renders reserved zero-cost service capacity as available', async () => {
   expect(screen.queryByText('unpriced capacity')).not.toBeTruthy();
   expect(screen.getAllByTestId('chart')[1]).toHaveAttribute(
     'data-tooltip-label',
-    'reserved-service: 4 requests,Est. compute: $0.00,Est. compute cost / request: $0.0000'
+    'reserved-service: 4 non-rejected requests,Est. compute: $0.00,Est. compute cost / non-rejected request: $0.0000'
   );
 });
 
@@ -647,64 +652,78 @@ test('renders daily per-service request volume and counting semantics', async ()
   ];
   estimate.service_requests = {
     available: true,
-    definition: 'admitted_inbound_requests',
-    coverage_start_utc: Date.parse('2023-11-14T00:01:00Z') / 1000,
-    total_request_count: 20,
-    services: [
-      {
-        service_name: 'service-a',
-        request_count: 15,
-        estimated_cost: 0.0288,
-        estimated_cost_per_request: 0.0032,
-        ratio_request_count: 9,
-        ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
-        priced_machine_seconds: 3600,
-        excluded_machine_seconds: 0,
-        cost_coverage: 'complete',
-      },
-      {
-        service_name: 'service-b',
-        request_count: 5,
-        estimated_cost: 0.01,
-        estimated_cost_per_request: null,
-        ratio_request_count: 3,
-        ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
-        priced_machine_seconds: 3600,
-        excluded_machine_seconds: 1800,
-        cost_coverage: 'partial',
-      },
-    ],
-    series: [
-      {
-        service_name: 'service-a',
-        request_count_by_day: [6, 9],
-        estimated_cost_by_day: [0.0192, 0.0288],
-        estimated_cost_per_request_by_day: [0.0032, 0.0032],
-      },
-      {
-        service_name: 'service-b',
-        request_count_by_day: [2, 3],
-        estimated_cost_by_day: [0, 0.01],
-        estimated_cost_per_request_by_day: [null, null],
-      },
-    ],
+    non_rejected: {
+      available: true,
+      definition: 'non_rejected_inbound_requests',
+      coverage_start_utc: Date.parse('2023-11-14T00:01:00Z') / 1000,
+      coverage: 'partial',
+      complete_by_day: [false, true],
+      total_request_count: 20,
+      services: [
+        {
+          service_name: 'service-a',
+          request_count: 15,
+          estimated_cost: 0.0288,
+          estimated_cost_per_request: 0.0032,
+          ratio_request_count: 9,
+          ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+          priced_machine_seconds: 3600,
+          excluded_machine_seconds: 0,
+          cost_coverage: 'complete',
+        },
+        {
+          service_name: 'service-b',
+          request_count: 5,
+          estimated_cost: 0.01,
+          estimated_cost_per_request: null,
+          ratio_request_count: 3,
+          ratio_coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+          priced_machine_seconds: 3600,
+          excluded_machine_seconds: 1800,
+          cost_coverage: 'partial',
+        },
+      ],
+      series: [
+        {
+          service_name: 'service-a',
+          request_count_by_day: [6, 9],
+          estimated_cost_by_day: [0.0192, 0.0288],
+          estimated_cost_per_request_by_day: [0.0032, 0.0032],
+        },
+        {
+          service_name: 'service-b',
+          request_count_by_day: [2, 3],
+          estimated_cost_by_day: [0, 0.01],
+          estimated_cost_per_request_by_day: [null, null],
+        },
+      ],
+    },
   };
   getEstimatedSpend.mockResolvedValue(estimate);
 
   render(<EstimatedSpend />);
 
-  expect(await screen.findByText('Daily requests by service')).toBeTruthy();
-  expect(screen.getByText('Requests in selected range')).toBeTruthy();
   expect(
-    screen.getByText('Internal replica retries do not add requests;', {
+    await screen.findByText('Daily non-rejected requests by service')
+  ).toBeTruthy();
+  expect(
+    screen.getByText('Known non-rejected requests in selected range')
+  ).toBeTruthy();
+  expect(
+    screen.getByText('Requests rejected by the load balancer are excluded.', {
+      exact: false,
+    })
+  ).toBeTruthy();
+  expect(
+    screen.getByText('Days with legacy or mixed load balancers are omitted.', {
       exact: false,
     })
   ).toBeTruthy();
   expect(screen.getByText('service-a')).toBeTruthy();
-  expect(screen.getByText('75.0%')).toBeTruthy();
+  expect(screen.queryByText('75.0%')).not.toBeTruthy();
   expect(
     screen.getByRole('columnheader', {
-      name: 'Est. compute cost / request',
+      name: 'Est. compute cost / non-rejected request',
     })
   ).toBeTruthy();
   expect(screen.getByText('$0.0032')).toBeTruthy();
@@ -715,8 +734,108 @@ test('renders daily per-service request volume and counting semantics', async ()
   );
   expect(screen.getAllByTestId('chart')[1]).toHaveAttribute(
     'data-tooltip-label',
-    'service-a: 6 requests,Est. compute: $0.02,Est. compute cost / request: $0.0032'
+    'service-a: 6 non-rejected requests,Est. compute: $0.02,Est. compute cost / non-rejected request: $0.0032'
   );
+});
+
+test('shows each service request denominator coverage independently', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  const estimate = response(30, 1);
+  const { startDate } = rollingRange(30);
+  const firstServiceStart = shiftUtcDate(startDate, 1);
+  const secondServiceStart = shiftUtcDate(startDate, 2);
+  estimate.service_requests = {
+    available: true,
+    non_rejected: {
+      available: true,
+      definition: 'non_rejected_inbound_requests',
+      coverage_start_utc: Date.parse(`${startDate}T00:00:00Z`) / 1000,
+      coverage: 'complete',
+      complete_by_day: [true],
+      total_request_count: 3,
+      services: [
+        {
+          service_name: 'service-a',
+          coverage: 'complete',
+          request_count: 2,
+          estimated_cost_per_request: 0.5,
+          ratio_request_count: 2,
+          ratio_coverage_start_utc:
+            Date.parse(`${firstServiceStart}T00:00:00Z`) / 1000,
+          cost_coverage: 'complete',
+        },
+        {
+          service_name: 'service-b',
+          coverage: 'complete',
+          request_count: 1,
+          estimated_cost_per_request: 1,
+          ratio_request_count: 1,
+          ratio_coverage_start_utc:
+            Date.parse(`${secondServiceStart}T00:00:00Z`) / 1000,
+          cost_coverage: 'complete',
+        },
+      ],
+      series: [],
+    },
+  };
+  getEstimatedSpend.mockResolvedValue(estimate);
+
+  render(<EstimatedSpend />);
+
+  expect(await screen.findByText('service-a')).toBeTruthy();
+  expect(
+    screen.getByText(`request denominator since ${firstServiceStart} UTC`)
+  ).toBeTruthy();
+  expect(
+    screen.getByText(`request denominator since ${secondServiceStart} UTC`)
+  ).toBeTruthy();
+  expect(
+    screen.queryByText('Cost/request uses complete request-history days', {
+      exact: false,
+    })
+  ).not.toBeTruthy();
+});
+
+test('renders unavailable service request coverage as N/A, not zero', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  const estimate = response(1, 1);
+  estimate.service_requests = {
+    available: true,
+    non_rejected: {
+      available: true,
+      definition: 'non_rejected_inbound_requests',
+      coverage_start_utc: Date.parse('2023-11-15T00:00:00Z') / 1000,
+      coverage: 'partial',
+      complete_by_day: [false],
+      total_request_count: 0,
+      services: [
+        {
+          service_name: 'legacy-service',
+          coverage: 'unavailable',
+          request_count: 0,
+          estimated_cost_per_request: null,
+          ratio_request_count: 0,
+          ratio_coverage_start_utc: null,
+          cost_coverage: 'complete',
+        },
+      ],
+      series: [
+        {
+          service_name: 'legacy-service',
+          request_count_by_day: [null],
+        },
+      ],
+    },
+  };
+  getEstimatedSpend.mockResolvedValue(estimate);
+
+  render(<EstimatedSpend />);
+
+  const serviceName = await screen.findByText('legacy-service');
+  const row = serviceName.closest('tr');
+  expect(within(row).getByText('request history unavailable')).toBeTruthy();
+  expect(within(row).getAllByText('N/A')).toHaveLength(3);
+  expect(within(row).queryByText('0')).not.toBeTruthy();
 });
 
 test('shows request volume while the first spend estimate is pending', async () => {
@@ -726,17 +845,54 @@ test('shows request volume while the first spend estimate is pending', async () 
   estimate.last_successful_refresh_at = null;
   estimate.service_requests = {
     available: true,
-    definition: 'admitted_inbound_requests',
-    coverage_start_utc: Date.parse('2023-11-15T00:01:00Z') / 1000,
-    total_request_count: 3,
-    services: [{ service_name: 'service-a', request_count: 3 }],
-    series: [{ service_name: 'service-a', request_count_by_day: [3] }],
+    non_rejected: {
+      available: true,
+      definition: 'non_rejected_inbound_requests',
+      coverage_start_utc: Date.parse('2023-11-15T00:01:00Z') / 1000,
+      coverage: 'partial',
+      complete_by_day: [false],
+      total_request_count: 3,
+      services: [{ service_name: 'service-a', request_count: 3 }],
+      series: [{ service_name: 'service-a', request_count_by_day: [3] }],
+    },
   };
   getEstimatedSpend.mockResolvedValue(estimate);
 
   render(<EstimatedSpend />);
 
   expect(await screen.findByText('Preparing the first estimate')).toBeTruthy();
-  expect(screen.getByText('Daily requests by service')).toBeTruthy();
+  expect(
+    screen.getByText('Daily non-rejected requests by service')
+  ).toBeTruthy();
   expect(screen.getByText('service-a')).toBeTruthy();
+});
+
+test('does not fall back to legacy attempt counts for cost per request', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  const estimate = response(1, 1);
+  estimate.service_requests = {
+    available: true,
+    definition: 'admitted_inbound_requests',
+    total_request_count: 100,
+    services: [
+      {
+        service_name: 'legacy-attempts',
+        request_count: 100,
+        estimated_cost_per_request: 0.0001,
+      },
+    ],
+    series: [],
+  };
+  getEstimatedSpend.mockResolvedValue(estimate);
+
+  render(<EstimatedSpend />);
+
+  expect(
+    await screen.findByText(
+      'Exact non-rejected request history is unavailable on this server or for this range.',
+      { exact: false }
+    )
+  ).toBeTruthy();
+  expect(screen.queryByText('legacy-attempts')).not.toBeTruthy();
+  expect(screen.queryByText('$0.0001')).not.toBeTruthy();
 });

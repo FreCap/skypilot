@@ -19,6 +19,7 @@ logger = sky_logging.init_logger(__name__)
 DEFAULT_HISTORY_HOURS = 12
 RETENTION_HOURS = 72
 BUCKET_SECONDS = 60
+REQUEST_CLASSIFICATION_PROTOCOL_VERSION = 1
 ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION = 2
 STATUS_HISTORY_SECTIONS = frozenset(
     {'requests', 'replicas', 'prediction', 'autoscaler'})
@@ -131,12 +132,26 @@ serve_request_activity_history_table = sqlalchemy.Table(
                       sqlalchemy.Boolean,
                       nullable=False,
                       server_default=sqlalchemy.false()),
+    sqlalchemy.Column('classified_request_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('counted_rejected_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
     sqlalchemy.CheckConstraint(
         'request_count >= 0',
         name='serve_request_activity_history_nonnegative'),
     sqlalchemy.CheckConstraint(
         'rejected_count >= 0',
         name='serve_request_activity_history_rejected_nonnegative'),
+    sqlalchemy.CheckConstraint(
+        '(classified_request_count IS NULL AND '
+        'counted_rejected_count IS NULL) OR '
+        '(classified_request_count IS NOT NULL AND '
+        'counted_rejected_count IS NOT NULL AND '
+        'classified_request_count >= 0 AND counted_rejected_count >= 0 AND '
+        'counted_rejected_count <= classified_request_count)',
+        name='serve_request_activity_history_classified_pair'),
 )
 sqlalchemy.Index('serve_request_activity_history_lookup_idx',
                  serve_request_activity_history_table.c.service_name,
@@ -160,11 +175,40 @@ serve_request_activity_daily_table = sqlalchemy.Table(
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
     sqlalchemy.Column('request_count', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('classified_request_count',
+                      sqlalchemy.BigInteger,
+                      nullable=True),
+    sqlalchemy.Column('counted_rejected_count',
+                      sqlalchemy.BigInteger,
+                      nullable=True),
+    sqlalchemy.Column('classified_first_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=True),
+    sqlalchemy.Column('classified_last_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=True),
+    sqlalchemy.Column('classification_incomplete',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
     sqlalchemy.Column('observed_at',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
     sqlalchemy.CheckConstraint('request_count >= 0',
                                name='serve_request_activity_daily_nonnegative'),
+    sqlalchemy.CheckConstraint(
+        '(classified_request_count IS NULL AND '
+        'counted_rejected_count IS NULL AND '
+        'classified_first_bucket_start IS NULL AND '
+        'classified_last_bucket_start IS NULL) OR '
+        '(classified_request_count IS NOT NULL AND '
+        'counted_rejected_count IS NOT NULL AND '
+        'classified_request_count >= 0 AND counted_rejected_count >= 0 AND '
+        'counted_rejected_count <= classified_request_count AND '
+        'classified_first_bucket_start IS NOT NULL AND '
+        'classified_last_bucket_start IS NOT NULL AND '
+        'classified_first_bucket_start <= classified_last_bucket_start)',
+        name='serve_request_activity_daily_classified_pair'),
 )
 sqlalchemy.Index('serve_request_activity_daily_day_idx',
                  serve_request_activity_daily_table.c.day_start)
@@ -525,6 +569,29 @@ def rollup_request_activity_daily(timestamp: float | None = None) -> int:
     day_start = sqlalchemy.func.timezone(
         'UTC', sqlalchemy.func.date_trunc('day',
                                           utc_bucket_start)).label('day_start')
+    classification_supported = sqlalchemy.and_(
+        request_history.c.classified_request_count.is_not(None),
+        request_history.c.counted_rejected_count.is_not(None))
+    classified_request_count = sqlalchemy.func.sum(
+        sqlalchemy.cast(
+            request_history.c.classified_request_count,
+            sqlalchemy.BigInteger)).filter(classification_supported).label(
+                'classified_request_count')
+    counted_rejected_count = sqlalchemy.func.sum(
+        sqlalchemy.cast(
+            request_history.c.counted_rejected_count,
+            sqlalchemy.BigInteger)).filter(classification_supported).label(
+                'counted_rejected_count')
+    classified_first_bucket_start = sqlalchemy.func.min(
+        request_history.c.bucket_start).filter(classification_supported).label(
+            'classified_first_bucket_start')
+    classified_last_bucket_start = sqlalchemy.func.max(
+        request_history.c.bucket_start).filter(classification_supported).label(
+            'classified_last_bucket_start')
+    classification_incomplete = sqlalchemy.func.bool_or(
+        sqlalchemy.and_(request_history.c.request_count > 0,
+                        sqlalchemy.not_(classification_supported))).label(
+                            'classification_incomplete')
     query = (sqlalchemy.select(
         day_start,
         request_history.c.service_name,
@@ -536,6 +603,11 @@ def rollup_request_activity_daily(timestamp: float | None = None) -> int:
         sqlalchemy.func.sum(
             sqlalchemy.cast(request_history.c.request_count,
                             sqlalchemy.BigInteger)).label('request_count'),
+        classified_request_count,
+        counted_rejected_count,
+        classified_first_bucket_start,
+        classified_last_bucket_start,
+        classification_incomplete,
     ).group_by(day_start, request_history.c.service_name,
                request_history.c.service_hash))
 
@@ -561,6 +633,13 @@ def rollup_request_activity_daily(timestamp: float | None = None) -> int:
         values = [{
             **dict(row),
             'request_count': int(row['request_count']),
+            'classified_request_count':
+                (int(row['classified_request_count'])
+                 if row['classified_request_count'] is not None else None),
+            'counted_rejected_count':
+                (int(row['counted_rejected_count'])
+                 if row['counted_rejected_count'] is not None else None),
+            'classification_incomplete': bool(row['classification_incomplete']),
             'observed_at': observed_at,
         } for row in rows]
         insert = postgresql.insert(serve_request_activity_daily_table).values(
@@ -581,6 +660,21 @@ def rollup_request_activity_daily(timestamp: float | None = None) -> int:
                         daily.c.last_bucket_start, excluded.last_bucket_start),
                     'request_count': sqlalchemy.func.greatest(
                         daily.c.request_count, excluded.request_count),
+                    'classified_request_count': _greatest_nullable(
+                        daily.c.classified_request_count,
+                        excluded.classified_request_count),
+                    'counted_rejected_count': _greatest_nullable(
+                        daily.c.counted_rejected_count,
+                        excluded.counted_rejected_count),
+                    'classified_first_bucket_start': _least_nullable(
+                        daily.c.classified_first_bucket_start,
+                        excluded.classified_first_bucket_start),
+                    'classified_last_bucket_start': _greatest_nullable(
+                        daily.c.classified_last_bucket_start,
+                        excluded.classified_last_bucket_start),
+                    'classification_incomplete': sqlalchemy.or_(
+                        daily.c.classification_incomplete,
+                        excluded.classification_incomplete),
                     'observed_at': sqlalchemy.func.greatest(
                         daily.c.observed_at, excluded.observed_at),
                 }))
@@ -596,6 +690,16 @@ def get_daily_request_summary(
     chart_limit: int,
 ) -> dict[str, Any]:
     """Return bounded daily service request aggregates for a UTC range."""
+    non_rejected_empty = {
+        'available': False,
+        'definition': 'non_rejected_inbound_requests',
+        'coverage_start_utc': None,
+        'coverage': 'unavailable',
+        'complete_by_day': [False for _ in days],
+        'total_request_count': 0,
+        'services': [],
+        'series': [],
+    }
     empty = {
         'available': False,
         'definition': 'admitted_inbound_requests',
@@ -603,6 +707,7 @@ def get_daily_request_summary(
         'total_request_count': 0,
         'services': [],
         'series': [],
+        'non_rejected': non_rejected_empty,
     }
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         return empty
@@ -615,6 +720,18 @@ def get_daily_request_summary(
     base_filter = sqlalchemy.and_(daily.c.day_start >= first_day,
                                   daily.c.day_start < end_exclusive)
     count_sum = sqlalchemy.func.sum(daily.c.request_count)
+    classification_supported = sqlalchemy.and_(
+        daily.c.classified_request_count.is_not(None),
+        daily.c.counted_rejected_count.is_not(None))
+    classified_sum = sqlalchemy.func.sum(
+        daily.c.classified_request_count).filter(classification_supported)
+    counted_rejected_sum = sqlalchemy.func.sum(
+        daily.c.counted_rejected_count).filter(classification_supported)
+    service_day_incomplete = sqlalchemy.func.bool_or(
+        sqlalchemy.or_(
+            daily.c.classification_incomplete,
+            sqlalchemy.and_(daily.c.request_count > 0,
+                            sqlalchemy.not_(classification_supported))))
     try:
         with engine.connect() as connection:
             earliest_day = sqlalchemy.select(
@@ -652,6 +769,45 @@ def get_daily_request_summary(
                                 top_service_names))).group_by(
                                     daily.c.day_start,
                                     daily.c.service_name)).fetchall()
+            classified_earliest_day = sqlalchemy.select(
+                sqlalchemy.func.min(daily.c.day_start)).where(
+                    daily.c.classified_first_bucket_start.is_not(
+                        None)).scalar_subquery()
+            classified_coverage_start = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.min(
+                        daily.c.classified_first_bucket_start)).where(
+                            daily.c.day_start ==
+                            classified_earliest_day)).scalar_one_or_none()
+            service_day_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.day_start,
+                    daily.c.service_name,
+                    count_sum.label('request_count'),
+                    classified_sum.label('classified_request_count'),
+                    counted_rejected_sum.label('counted_rejected_count'),
+                    sqlalchemy.func.min(
+                        daily.c.classified_first_bucket_start).filter(
+                            classification_supported).label(
+                                'classified_first_bucket_start'),
+                    service_day_incomplete.label('classification_incomplete'),
+                ).where(base_filter).group_by(daily.c.day_start,
+                                              daily.c.service_name)).fetchall()
+            observed_service_names = sorted(
+                {str(row.service_name) for row in service_day_rows})
+            service_coverage_rows = []
+            if observed_service_names:
+                service_coverage_rows = connection.execute(
+                    sqlalchemy.select(
+                        daily.c.service_name,
+                        sqlalchemy.func.min(
+                            daily.c.classified_first_bucket_start).label(
+                                'coverage_start'),
+                    ).where(
+                        sqlalchemy.and_(
+                            daily.c.service_name.in_(observed_service_names),
+                            daily.c.classified_first_bucket_start.is_not(None),
+                        )).group_by(daily.c.service_name)).fetchall()
     except sqlalchemy.exc.SQLAlchemyError:
         # During a rolling API-server upgrade the reader may briefly run
         # before the Serve migration has created the optional table.
@@ -692,6 +848,152 @@ def get_daily_request_summary(
             'request_count_by_day': other_by_day,
         })
 
+    classified_coverage_start_utc = (int(classified_coverage_start.timestamp())
+                                     if classified_coverage_start is not None
+                                     else None)
+    service_coverage_starts = {
+        str(row.service_name): int(row.coverage_start.timestamp())
+        for row in service_coverage_rows
+        if row.coverage_start is not None
+    }
+    observed_by_service_day = {
+        (str(row.service_name), int(row.day_start.timestamp())): row
+        for row in service_day_rows
+    }
+
+    seconds_per_day = 24 * 60 * 60
+
+    def first_complete_day(coverage_start_utc: int | None) -> int | None:
+        if coverage_start_utc is None:
+            return None
+        coverage_day = coverage_start_utc // seconds_per_day * seconds_per_day
+        if coverage_start_utc > coverage_day:
+            coverage_day += seconds_per_day
+        return coverage_day
+
+    complete_by_service: dict[str, list[bool]] = {}
+    counts_by_service: dict[str, list[int | None]] = {}
+    observed_days_by_service: dict[str, set[int]] = {}
+    for service_name in observed_service_names:
+        coverage_day = first_complete_day(
+            service_coverage_starts.get(service_name))
+        complete_cells = []
+        count_cells: list[int | None] = []
+        observed_days = set()
+        for day_start_epoch in day_starts:
+            row = observed_by_service_day.get((service_name, day_start_epoch))
+            if row is not None:
+                observed_days.add(day_start_epoch)
+            complete = coverage_day is not None and day_start_epoch >= coverage_day
+            if row is not None:
+                pair_available = (row.classified_request_count is not None and
+                                  row.counted_rejected_count is not None)
+                pair_required = int(row.request_count or 0) > 0
+                complete = (complete and
+                            not bool(row.classification_incomplete) and
+                            (not pair_required or pair_available))
+            complete_cells.append(complete)
+            if not complete:
+                count_cells.append(None)
+            elif row is None:
+                count_cells.append(0)
+            elif row.classified_request_count is None:
+                count_cells.append(0)
+            else:
+                count_cells.append(
+                    max(
+                        0,
+                        int(row.classified_request_count) -
+                        int(row.counted_rejected_count)))
+        complete_by_service[service_name] = complete_cells
+        counts_by_service[service_name] = count_cells
+        observed_days_by_service[service_name] = observed_days
+
+    service_records: list[dict[str, Any]] = []
+    for service_name in observed_service_names:
+        complete_cells = complete_by_service[service_name]
+        count_cells = counts_by_service[service_name]
+        complete_count = sum(1 for complete in complete_cells if complete)
+        if complete_count == 0:
+            service_coverage = 'unavailable'
+        elif complete_count == len(complete_cells):
+            service_coverage = 'complete'
+        else:
+            service_coverage = 'partial'
+        service_records.append({
+            'service_name': service_name,
+            'request_count': sum(count or 0 for count in count_cells),
+            'coverage': service_coverage,
+            'complete_by_day': complete_cells,
+        })
+    service_records.sort(key=lambda service: (-int(service['request_count']),
+                                              str(service['service_name'])))
+
+    global_first_complete_day = first_complete_day(
+        classified_coverage_start_utc)
+    classified_complete_by_day = []
+    for index, day_start_epoch in enumerate(day_starts):
+        complete = (global_first_complete_day is not None and
+                    day_start_epoch >= global_first_complete_day)
+        if complete:
+            complete = all(
+                complete_by_service[service_name][index]
+                for service_name in observed_service_names
+                if day_start_epoch in observed_days_by_service[service_name])
+        classified_complete_by_day.append(complete)
+
+    has_complete_cell = (any(classified_complete_by_day) or any(
+        any(complete_cells) for complete_cells in complete_by_service.values()))
+    if not has_complete_cell:
+        classified_coverage = 'unavailable'
+    elif all(classified_complete_by_day):
+        classified_coverage = 'complete'
+    else:
+        classified_coverage = 'partial'
+
+    classified_top_services = service_records[:table_limit]
+    classified_top_names = [
+        str(service['service_name'])
+        for service in service_records[:chart_limit]
+    ]
+    classified_series: list[dict[str, Any]] = [{
+        'service_name': service_name,
+        'request_count_by_day': counts_by_service[service_name],
+    } for service_name in classified_top_names]
+    remainder_names = [
+        service_name for service_name in observed_service_names
+        if service_name not in set(classified_top_names)
+    ]
+    other_counts: list[int | None] = []
+    for index, day_start_epoch in enumerate(day_starts):
+        incomplete_remainder = any(
+            day_start_epoch in observed_days_by_service[service_name] and
+            not complete_by_service[service_name][index]
+            for service_name in remainder_names)
+        if incomplete_remainder:
+            other_counts.append(None)
+        else:
+            other_counts.append(
+                sum((counts_by_service[service_name][index] or 0)
+                    for service_name in remainder_names))
+    if any(count is None or count > 0 for count in other_counts):
+        classified_series.append({
+            'is_other': True,
+            'request_count_by_day': other_counts,
+        })
+
+    non_rejected = {
+        'available': has_complete_cell,
+        'definition': 'non_rejected_inbound_requests',
+        'coverage_start_utc': classified_coverage_start_utc,
+        'coverage': classified_coverage,
+        'complete_by_day': classified_complete_by_day,
+        'total_request_count': sum(
+            int(service['request_count']) for service in service_records),
+        'services': classified_top_services,
+        'series': classified_series,
+    }
+
     return {
         'available': True,
         'definition': 'admitted_inbound_requests',
@@ -703,6 +1005,7 @@ def get_daily_request_summary(
             'request_count': int(row.request_count or 0),
         } for row in service_rows],
         'series': series,
+        'non_rejected': non_rejected,
     }
 
 
@@ -828,6 +1131,198 @@ def record_request_activity(
                     'rejection_count_available': sqlalchemy.or_(
                         rejection_available,
                         excluded.rejection_count_available),
+                }))
+    return len(rows)
+
+
+def _greatest_nullable(left: Any, right: Any) -> Any:
+    """Return a SQL expression that preserves null only when both are null."""
+    return sqlalchemy.case((left.is_(None), right), (right.is_(None), left),
+                           else_=sqlalchemy.func.greatest(left, right))
+
+
+def _least_nullable(left: Any, right: Any) -> Any:
+    """Return a SQL expression that preserves null only when both are null."""
+    return sqlalchemy.case((left.is_(None), right), (right.is_(None), left),
+                           else_=sqlalchemy.func.least(left, right))
+
+
+def _request_classification_rows(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    request_classification_history: dict[str, Any],
+    observed_at: datetime.datetime,
+) -> list[dict[str, Any]]:
+    """Validate one independent terminal-classification minute snapshot."""
+    if not isinstance(request_classification_history, dict):
+        raise ValueError('request_classification_history must be an object.')
+    classification_version = request_classification_history.get(
+        'classification_version')
+    if (not isinstance(classification_version, int) or
+            isinstance(classification_version, bool) or
+            classification_version != REQUEST_CLASSIFICATION_PROTOCOL_VERSION):
+        raise ValueError(
+            'request_classification_history classification_version '
+            'is unsupported.')
+    if request_classification_history.get('bucket_seconds') != BUCKET_SECONDS:
+        raise ValueError(
+            'request_classification_history bucket_seconds must be '
+            f'{BUCKET_SECONDS}.')
+    buckets = request_classification_history.get('buckets')
+    if not isinstance(buckets, list):
+        raise ValueError('request_classification_history buckets must be a '
+                         'list.')
+    max_buckets = constants.LB_REQUEST_HISTORY_MAX_BUCKETS
+    if len(buckets) > max_buckets:
+        raise ValueError('request_classification_history may contain at most '
+                         f'{max_buckets} buckets.')
+
+    current_bucket = observed_at.replace(second=0, microsecond=0)
+    oldest_bucket = current_bucket - datetime.timedelta(
+        seconds=constants.LB_REQUEST_HISTORY_WINDOW_SECONDS +
+        2 * BUCKET_SECONDS)
+    newest_bucket = current_bucket + datetime.timedelta(seconds=2 *
+                                                        BUCKET_SECONDS)
+    seen_bucket_starts: set[int] = set()
+    rows = []
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            raise ValueError('request_classification_history bucket must be an '
+                             'object.')
+        bucket_start = bucket.get('bucket_start')
+        classified_request_count = bucket.get('classified_request_count')
+        counted_rejected_count = bucket.get('counted_rejected_count')
+        if (not isinstance(bucket_start, int) or
+                isinstance(bucket_start, bool) or
+                bucket_start % BUCKET_SECONDS != 0):
+            raise ValueError('request_classification_history bucket_start must '
+                             'be an aligned integer epoch timestamp.')
+        if bucket_start in seen_bucket_starts:
+            raise ValueError('request_classification_history bucket_start must '
+                             'be unique.')
+        seen_bucket_starts.add(bucket_start)
+        if (not isinstance(classified_request_count, int) or
+                isinstance(classified_request_count, bool) or
+                classified_request_count < 0):
+            raise ValueError(
+                'request_classification_history classified_request_count must '
+                'be a nonnegative integer.')
+        if (not isinstance(counted_rejected_count, int) or
+                isinstance(counted_rejected_count, bool) or
+                counted_rejected_count < 0):
+            raise ValueError(
+                'request_classification_history counted_rejected_count must '
+                'be a nonnegative integer.')
+        if counted_rejected_count > classified_request_count:
+            raise ValueError('request_classification_history '
+                             'counted_rejected_count cannot exceed '
+                             'classified_request_count.')
+        if classified_request_count == 0:
+            raise ValueError('request_classification_history bucket must '
+                             'contain a classified request.')
+        bucket_datetime = _utc_datetime(bucket_start)
+        if not oldest_bucket <= bucket_datetime <= newest_bucket:
+            raise ValueError('request_classification_history bucket_start is '
+                             'outside the accepted recent window.')
+        rows.append({
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'reporter_session_id': reporter_session_id,
+            'bucket_start': bucket_datetime,
+            'observed_at': observed_at,
+            'request_count': 0,
+            'rejected_count': 0,
+            'rejection_count_available': True,
+            'classified_request_count': classified_request_count,
+            'counted_rejected_count': counted_rejected_count,
+        })
+    return rows
+
+
+def validate_request_classification_history(
+    request_classification_history: dict[str, Any],
+    timestamp: float | None = None,
+) -> None:
+    """Validate a classification envelope without reading or writing state."""
+    _request_classification_rows('', '', '', request_classification_history,
+                                 _utc_datetime(timestamp))
+
+
+def record_request_classification(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    request_classification_history: dict[str, Any] | None,
+    timestamp: float | None = None,
+    request_history: dict[str, Any] | None = None,
+) -> int:
+    """Atomically persist support evidence and terminal classifications."""
+    if request_classification_history is None:
+        return 0
+    observed_at = _utc_datetime(timestamp)
+    classification_rows = _request_classification_rows(
+        service_name, service_hash, reporter_session_id,
+        request_classification_history, observed_at)
+    support_rows = []
+    if request_history is not None:
+        support_rows = _request_history_rows(service_name, service_hash,
+                                             reporter_session_id,
+                                             request_history, observed_at)
+        for support_row in support_rows:
+            support_row['request_count'] = 0
+            support_row['rejected_count'] = 0
+            support_row['rejection_count_available'] = True
+            support_row['classified_request_count'] = 0
+            support_row['counted_rejected_count'] = 0
+
+    # A bucket can exist in both snapshots. Merge before INSERT because one
+    # PostgreSQL ON CONFLICT statement cannot affect the same key twice.
+    rows_by_bucket = {row['bucket_start']: row for row in support_rows}
+    for classification_row in classification_rows:
+        bucket_start = classification_row['bucket_start']
+        existing_row = rows_by_bucket.get(bucket_start)
+        if existing_row is None:
+            rows_by_bucket[bucket_start] = classification_row
+            continue
+        existing_row['classified_request_count'] = max(
+            int(existing_row['classified_request_count']),
+            int(classification_row['classified_request_count']))
+        existing_row['counted_rejected_count'] = max(
+            int(existing_row['counted_rejected_count']),
+            int(classification_row['counted_rejected_count']))
+    rows = list(rows_by_bucket.values())
+    engine = _postgres_engine()
+    if engine is None or not rows:
+        return 0
+    history = serve_request_activity_history_table
+    with engine.begin() as connection:
+        insert = postgresql.insert(history).values(rows)
+        excluded = insert.excluded
+        connection.execute(
+            insert.on_conflict_do_update(
+                index_elements=[
+                    history.c.service_name,
+                    history.c.service_hash,
+                    history.c.reporter_session_id,
+                    history.c.bucket_start,
+                ],
+                set_={
+                    'observed_at': sqlalchemy.func.greatest(
+                        history.c.observed_at, excluded.observed_at),
+                    'request_count': sqlalchemy.func.greatest(
+                        history.c.request_count, excluded.request_count),
+                    'rejected_count': sqlalchemy.func.greatest(
+                        history.c.rejected_count, excluded.rejected_count),
+                    'rejection_count_available': sqlalchemy.or_(
+                        history.c.rejection_count_available,
+                        excluded.rejection_count_available),
+                    'classified_request_count': _greatest_nullable(
+                        history.c.classified_request_count,
+                        excluded.classified_request_count),
+                    'counted_rejected_count': _greatest_nullable(
+                        history.c.counted_rejected_count,
+                        excluded.counted_rejected_count),
                 }))
     return len(rows)
 

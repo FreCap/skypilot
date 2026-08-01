@@ -936,6 +936,16 @@ def test_rollup_is_idempotent_and_query_returns_daily_breakdown(
         'total_request_count': 0,
         'services': [],
         'series': [],
+        'non_rejected': {
+            'available': False,
+            'definition': 'non_rejected_inbound_requests',
+            'coverage_start_utc': None,
+            'coverage': 'unavailable',
+            'complete_by_day': [False, False, False],
+            'total_request_count': 0,
+            'services': [],
+            'series': [],
+        },
     }
     assert response['stale'] is False
     assert response['backfill_complete'] is True
@@ -1018,18 +1028,22 @@ def test_service_cost_per_request_aligns_complete_request_days():
             {
                 'service_name': 'complete',
                 'request_count': 21,
+                'complete_by_day': [False, True, True],
             },
             {
                 'service_name': 'partial',
                 'request_count': 3,
+                'complete_by_day': [False, True, True],
             },
             {
                 'service_name': 'unavailable',
                 'request_count': 2,
+                'complete_by_day': [False, True, True],
             },
             {
                 'service_name': 'zero-cost',
                 'request_count': 5,
+                'complete_by_day': [False, True, True],
             },
         ],
         'series': [{
@@ -1182,6 +1196,7 @@ def test_service_cost_per_request_waits_for_spend_backfill():
         'services': [{
             'service_name': 'service',
             'request_count': 2,
+            'complete_by_day': [True],
         }],
         'series': [{
             'service_name': 'service',

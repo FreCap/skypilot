@@ -75,6 +75,10 @@ _REQUEST_PRIORITY_ATTR = '_skyserve_request_priority'
 _REQUEST_ACCELERATORS_ATTR = '_skyserve_compatible_accelerators'
 _REQUEST_GRANTED_ACCELERATOR_ATTR = '_skyserve_granted_accelerator'
 _REQUEST_DEMAND_RECORDED_ATTR = '_skyserve_request_demand_recorded'
+_REQUEST_CLASSIFICATION_ELIGIBLE_ATTR = (
+    '_skyserve_request_classification_eligible')
+_REQUEST_CLASSIFICATION_RECORDED_ATTR = (
+    '_skyserve_request_classification_recorded')
 _REQUEST_ACTION_ATTR = '_skyserve_request_action'
 
 _ASYNC_ACTION_PREDICT = 'async_predict'
@@ -214,6 +218,8 @@ class SkyServeLoadBalancer:
     # pauses between admission and selection.
     _occupancy_unassigned_reservations: int = 0
     _ha_runtime_stats: lb_ha_obs.LbHaRuntimeStats | None = None
+    _drain_history_flush_task: asyncio.Task | None = None
+    _drain_history_flush_generation: int = 0
 
     def __init__(
         self,
@@ -255,6 +261,12 @@ class SkyServeLoadBalancer:
         # Strong references to owned background tasks (the event loop only
         # holds weak references to tasks).
         self._background_tasks: set[asyncio.Task] = set()
+        # Drain-history sends are coalesced behind one task. The generation
+        # closes both races: a terminal classification arriving while a send
+        # is in flight forces another pass, while one arriving after task
+        # completion starts a fresh task.
+        self._drain_history_flush_task = None
+        self._drain_history_flush_generation = 0
         # Use the registry to create the load balancing policy. Track the
         # resolved policy name so a sync only rebuilds the policy object when
         # the name actually changes (a policy swap is rare -- only on an
@@ -1241,6 +1253,24 @@ class SkyServeLoadBalancer:
         self._request_aggregator.add(request)
         setattr(request, _REQUEST_DEMAND_RECORDED_ATTR, True)
 
+    @staticmethod
+    def _mark_request_classification_eligible(request: fastapi.Request) -> None:
+        """Open the terminal classification fence for one inbound request."""
+        setattr(request, _REQUEST_CLASSIFICATION_ELIGIBLE_ATTR, True)
+
+    def _record_request_classification_once(self, request: fastapi.Request, *,
+                                            rejected: bool) -> None:
+        """Commit exactly one terminal outcome after the eligibility fence."""
+        request_state = vars(request)
+        if (not request_state.get(_REQUEST_CLASSIFICATION_ELIGIBLE_ATTR, False)
+                or request_state.get(_REQUEST_CLASSIFICATION_RECORDED_ATTR,
+                                     False)):
+            return
+        self._request_aggregator.add_request_classification(rejected=rejected)
+        setattr(request, _REQUEST_CLASSIFICATION_RECORDED_ATTR, True)
+        if self._draining:
+            self._schedule_drain_history_flush()
+
     def _set_queued_compatibility_demand_support(self, supported: bool) -> None:
         """Apply controller queue-gauge capability and rollback fallback."""
         previous = getattr(self, '_queued_compatibility_demand_supported',
@@ -1474,6 +1504,7 @@ class SkyServeLoadBalancer:
                     # rejections, recording them helps the controller grow the
                     # exact compatible fleet instead of hiding overload.
                     self._record_request_demand_once(request)
+                    self._mark_request_classification_eligible(request)
                     self._record_rejection(request)
                     raise fastapi.HTTPException(
                         status_code=503,
@@ -1533,6 +1564,7 @@ class SkyServeLoadBalancer:
                         self._remove_request_queue_waiter_locked(waiter)
                         self._resolve_request_queue_waiter_locked(waiter)
                         self._record_request_demand_once(request)
+                        self._mark_request_classification_eligible(request)
                         self._record_rejection(request)
                         self._dispatch_request_queue_locked()
                         raise self._queue_timeout_error()
@@ -1703,11 +1735,39 @@ class SkyServeLoadBalancer:
             return
         self._retain_background_task(
             loop.create_task(self._notify_request_queue()))
-        if (self._request_aggregator.request_history_snapshot() is not None or
-                self._request_aggregator.prediction_time_history_snapshot()
-                is not None):
-            self._retain_background_task(
-                loop.create_task(self._flush_request_history_on_drain()))
+        self._schedule_drain_history_flush()
+
+    def _schedule_drain_history_flush(self) -> None:
+        """Coalesce drain-time history flushes without stranding late data."""
+        if not self._draining:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._drain_history_flush_generation += 1
+        existing = self._drain_history_flush_task
+        if existing is not None and not existing.done():
+            return
+        task = loop.create_task(self._flush_drain_history_until_quiet())
+        self._drain_history_flush_task = task
+
+        def _clear(done: asyncio.Task) -> None:
+            # A late classification may have observed ``done()`` and already
+            # installed the successor before this callback runs.
+            if self._drain_history_flush_task is done:
+                self._drain_history_flush_task = None
+
+        task.add_done_callback(_clear)
+        self._retain_background_task(task)
+
+    async def _flush_drain_history_until_quiet(self) -> None:
+        """Repeat until no classification arrived during the last send."""
+        while True:
+            generation = self._drain_history_flush_generation
+            await self._flush_request_history_on_drain()
+            if generation == self._drain_history_flush_generation:
+                return
 
     def _get_lb_session_id(self) -> str:
         """Return the durable external LB identity, failing closed if absent."""
@@ -1962,6 +2022,7 @@ class SkyServeLoadBalancer:
             profiles.pop(key, None)
         request_aggregator = getattr(self, '_request_aggregator', None)
         if request_aggregator is not None:
+            self._record_request_classification_once(request, rejected=True)
             request_aggregator.add_rejection()
 
     def _clear_rejection(self, request: fastapi.Request) -> None:
@@ -3224,6 +3285,9 @@ class SkyServeLoadBalancer:
             request_batch = self._request_aggregator.drain()
             request_history = (
                 self._request_aggregator.request_history_snapshot())
+            request_classification_history = (
+                self._request_aggregator.
+                request_classification_history_snapshot())
             prediction_time_history = (
                 self._request_aggregator.prediction_time_history_snapshot())
             request_batch_accepted = False
@@ -3234,6 +3298,7 @@ class SkyServeLoadBalancer:
                 'routing_version': self._routing_version,
                 'request_aggregator': request_batch,
                 'request_history': request_history,
+                'request_classification_history': request_classification_history,
                 'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'in_flight': in_flight,
@@ -3306,6 +3371,12 @@ class SkyServeLoadBalancer:
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
+                        classification_accepted = response_json.get(
+                            'request_classification_history_accepted')
+                        if classification_accepted is True:
+                            (self._request_aggregator.
+                             mark_request_classification_history_accepted(
+                                 request_classification_history))
                         if response_json.get(
                                 'prediction_time_history_accepted') is True:
                             self._request_aggregator.mark_prediction_time_history_accepted(
@@ -3900,15 +3971,20 @@ class SkyServeLoadBalancer:
     async def _flush_request_history_on_drain(self) -> None:
         """Best-effort bounded history flush that cannot report demand."""
         request_history = self._request_aggregator.request_history_snapshot()
+        request_classification_history = (
+            self._request_aggregator.request_classification_history_snapshot())
         prediction_time_history = (
             self._request_aggregator.prediction_time_history_snapshot())
-        if request_history is None and prediction_time_history is None:
+        if (request_history is None and
+                not request_classification_history.get('buckets') and
+                prediction_time_history is None):
             return
         try:
             sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
             session_id = self._get_lb_session_id()
             payload = {
                 'request_history': request_history,
+                'request_classification_history': request_classification_history,
                 'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'lb_session_id': session_id,
@@ -3943,6 +4019,12 @@ class SkyServeLoadBalancer:
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
+                        classification_accepted = response_json.get(
+                            'request_classification_history_accepted')
+                        if classification_accepted is True:
+                            (self._request_aggregator.
+                             mark_request_classification_history_accepted(
+                                 request_classification_history))
                         if response_json.get(
                                 'prediction_time_history_accepted') is True:
                             self._request_aggregator.mark_prediction_time_history_accepted(
@@ -4200,7 +4282,15 @@ class SkyServeLoadBalancer:
             # so an empty compatible fleet can still launch without leaving a
             # phantom arrival behind when this LB drains during admission.
             self._record_request_demand_once(request)
-            response = await self._proxy_with_retries_inner(request)
+            self._mark_request_classification_eligible(request)
+            try:
+                response = await self._proxy_with_retries_inner(request)
+            finally:
+                # A terminal rejection classifies itself before raising. Every
+                # other return, exception, or cancellation after the final
+                # admission fence is part of the non-rejected subset.
+                self._record_request_classification_once(request,
+                                                         rejected=False)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):
                 response.hold_cleanup_until_complete(

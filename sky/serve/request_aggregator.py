@@ -23,6 +23,10 @@ class RequestsAggregator:
         """Record one terminal load-balancer rejection."""
         raise NotImplementedError
 
+    def add_request_classification(self, *, rejected: bool) -> None:
+        """Record one terminal classification for an eligible request."""
+        raise NotImplementedError
+
     def clear(self) -> None:
         """Clear all current request aggregator."""
         raise NotImplementedError
@@ -50,6 +54,15 @@ class RequestsAggregator:
     def mark_request_history_accepted(self,
                                       snapshot: dict[str, Any] | None) -> None:
         """Mark a request-history snapshot as durably accepted."""
+        raise NotImplementedError
+
+    def request_classification_history_snapshot(self) -> dict[str, Any]:
+        """Return independently acknowledged terminal classifications."""
+        raise NotImplementedError
+
+    def mark_request_classification_history_accepted(
+            self, snapshot: dict[str, Any] | None) -> None:
+        """Mark a classification snapshot as durably accepted."""
         raise NotImplementedError
 
     def add_prediction_time(self, duration_seconds: float,
@@ -93,6 +106,14 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_request_history: dict[int, int] = {}
         self._rejection_history: dict[int, int] = {}
         self._acknowledged_rejection_history: dict[int, int] = {}
+        # Terminal classifications intentionally use a separate cumulative
+        # report and acknowledgement from arrival history. A new LB talking to
+        # an old controller must retain these counters when only the legacy
+        # request-history snapshot is acknowledged.
+        self._classified_request_history: dict[int, int] = {}
+        self._counted_rejection_history: dict[int, int] = {}
+        self._acknowledged_classified_request_history: dict[int, int] = {}
+        self._acknowledged_counted_rejection_history: dict[int, int] = {}
         self._prediction_time_history: dict[int, dict[str, list[int]]] = {}
         self._acknowledged_prediction_time_history: dict[int,
                                                          dict[str,
@@ -133,6 +154,25 @@ class RequestTimestamp(RequestsAggregator):
         if bucket_start != self._last_pruned_request_history_bucket:
             self._prune_request_history(bucket_start)
 
+    def add_request_classification(self, *, rejected: bool) -> None:
+        """Record one eligible request outcome in its terminal minute.
+
+        A rejected outcome advances both components in one synchronous
+        operation. Their difference is therefore the exact, monotonic count of
+        non-rejected requests even when snapshots are retried or arrive out of
+        order at the controller.
+        """
+        timestamp = time.time()
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
+        self._classified_request_history[bucket_start] = (
+            self._classified_request_history.get(bucket_start, 0) + 1)
+        if rejected:
+            self._counted_rejection_history[bucket_start] = (
+                self._counted_rejection_history.get(bucket_start, 0) + 1)
+        if bucket_start != self._last_pruned_request_history_bucket:
+            self._prune_request_history(bucket_start)
+
     def add_prediction_time(self, duration_seconds: float,
                             outcome: str) -> None:
         """Record one completed prediction in its observation minute."""
@@ -165,6 +205,10 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_request_history.clear()
         self._rejection_history.clear()
         self._acknowledged_rejection_history.clear()
+        self._classified_request_history.clear()
+        self._counted_rejection_history.clear()
+        self._acknowledged_classified_request_history.clear()
+        self._acknowledged_counted_rejection_history.clear()
         self._prediction_time_history.clear()
         self._acknowledged_prediction_time_history.clear()
         self._last_pruned_request_history_bucket = None
@@ -191,6 +235,28 @@ class RequestTimestamp(RequestsAggregator):
         self._acknowledged_rejection_history = {
             bucket: count
             for bucket, count in self._acknowledged_rejection_history.items()
+            if bucket >= oldest_bucket
+        }
+        self._classified_request_history = {
+            bucket: count
+            for bucket, count in self._classified_request_history.items()
+            if bucket >= oldest_bucket
+        }
+        self._counted_rejection_history = {
+            bucket: count
+            for bucket, count in self._counted_rejection_history.items()
+            if bucket >= oldest_bucket
+        }
+        self._acknowledged_classified_request_history = {
+            bucket: count
+            for bucket, count in
+            self._acknowledged_classified_request_history.items()
+            if bucket >= oldest_bucket
+        }
+        self._acknowledged_counted_rejection_history = {
+            bucket: count
+            for bucket, count in
+            self._acknowledged_counted_rejection_history.items()
             if bucket >= oldest_bucket
         }
         self._prediction_time_history = {
@@ -261,6 +327,70 @@ class RequestTimestamp(RequestsAggregator):
                 self._acknowledged_rejection_history[bucket_start] = max(
                     accepted_rejected,
                     self._acknowledged_rejection_history.get(bucket_start, 0))
+
+    def request_classification_history_snapshot(self) -> dict[str, Any]:
+        """Return terminal counters changed since durable acceptance.
+
+        Unlike legacy request history, this always returns the versioned
+        envelope. An empty v1 snapshot is capability evidence during a rolling
+        upgrade and lets the controller mark request-history rows with a valid
+        zero pair instead of mistaking the reporter for a legacy LB.
+        """
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
+        self._prune_request_history(newest_bucket)
+        bucket_starts = sorted(
+            set(self._classified_request_history) |
+            set(self._counted_rejection_history))
+        buckets = []
+        for bucket_start in bucket_starts:
+            classified_count = self._classified_request_history.get(
+                bucket_start, 0)
+            rejected_count = self._counted_rejection_history.get(
+                bucket_start, 0)
+            if (classified_count
+                    <= self._acknowledged_classified_request_history.get(
+                        bucket_start, 0) and rejected_count
+                    <= self._acknowledged_counted_rejection_history.get(
+                        bucket_start, 0)):
+                continue
+            buckets.append({
+                'bucket_start': bucket_start,
+                'classified_request_count': classified_count,
+                'counted_rejected_count': rejected_count,
+            })
+        return {
+            'classification_version': 1,
+            'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
+            'buckets': buckets,
+        }
+
+    def mark_request_classification_history_accepted(
+            self, snapshot: dict[str, Any] | None) -> None:
+        """Acknowledge only terminal counters in one accepted snapshot."""
+        if snapshot is None or snapshot.get('classification_version') != 1:
+            return
+        for bucket in snapshot.get('buckets', []):
+            bucket_start = bucket.get('bucket_start')
+            classified_count = bucket.get('classified_request_count')
+            rejected_count = bucket.get('counted_rejected_count')
+            current_classified = self._classified_request_history.get(
+                bucket_start)
+            if current_classified is not None:
+                accepted_classified = min(current_classified, classified_count)
+                self._acknowledged_classified_request_history[bucket_start] = (
+                    max(
+                        accepted_classified,
+                        self._acknowledged_classified_request_history.get(
+                            bucket_start, 0)))
+            current_rejected = self._counted_rejection_history.get(bucket_start)
+            if current_rejected is not None:
+                accepted_rejected = min(current_rejected, rejected_count)
+                self._acknowledged_counted_rejection_history[bucket_start] = (
+                    max(
+                        accepted_rejected,
+                        self._acknowledged_counted_rejection_history.get(
+                            bucket_start, 0)))
 
     @staticmethod
     def _prediction_counts_advance(

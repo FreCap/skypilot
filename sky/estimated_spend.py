@@ -931,12 +931,20 @@ def _get_service_request_and_cost_rows(
         first_day, datetime.timezone.utc)
     end_exclusive_datetime = datetime.datetime.fromtimestamp(
         last_day + SECONDS_PER_DAY, datetime.timezone.utc)
+    classification_supported = sqlalchemy.and_(
+        request_daily.c.classified_request_count.is_not(None),
+        request_daily.c.counted_rejected_count.is_not(None))
+    classified_count = sqlalchemy.func.coalesce(
+        sqlalchemy.func.sum(request_daily.c.classified_request_count).filter(
+            classification_supported), 0)
+    counted_rejected_count = sqlalchemy.func.coalesce(
+        sqlalchemy.func.sum(request_daily.c.counted_rejected_count).filter(
+            classification_supported), 0)
     request_rows = session.execute(
         sqlalchemy.select(
             request_daily.c.day_start,
             request_daily.c.service_name,
-            _sum_expression(
-                request_daily.c.request_count).label('request_count'),
+            (classified_count - counted_rejected_count).label('request_count'),
         ).where(
             sqlalchemy.and_(
                 request_daily.c.day_start >= first_day_datetime,
@@ -995,28 +1003,32 @@ def _enrich_service_requests_with_costs(
             'excluded_machine_seconds': int(row.excluded_machine_seconds or 0),
         } for row in cost_rows
     }
-    request_coverage_start = _first_complete_coverage_day(
-        service_requests.get('coverage_start_utc'))
     spend_coverage_start = _first_complete_coverage_day(
         spend_coverage_start_utc)
-    ratio_coverage_start = None
-    if request_coverage_start is not None and spend_coverage_start is not None:
-        ratio_coverage_start = max(request_coverage_start, spend_coverage_start)
-        if day_starts:
-            ratio_coverage_start = max(day_starts[0], ratio_coverage_start)
 
     services_by_name = {
         str(service['service_name']): service
         for service in service_requests.get('services', [])
     }
     for service_name, service in services_by_name.items():
+        complete_by_day = service.get('complete_by_day')
+        if (not isinstance(complete_by_day, list) or
+                len(complete_by_day) != len(day_starts)):
+            complete_by_day = [False for _ in day_starts]
+        included_days = [
+            day_start
+            for day_start, complete in zip(day_starts, complete_by_day)
+            if complete and spend_coverage_start is not None and
+            day_start >= spend_coverage_start
+        ]
+        ratio_coverage_start = min(included_days) if included_days else None
         ratio_request_count = 0
         estimated_cost = 0.0
         priced_machine_seconds = 0
         excluded_machine_seconds = 0
-        for day_start in day_starts:
-            if (ratio_coverage_start is None or
-                    day_start < ratio_coverage_start):
+        for day_start, complete in zip(day_starts, complete_by_day):
+            if (not complete or spend_coverage_start is None or
+                    day_start < spend_coverage_start):
                 continue
             ratio_request_count += request_counts.get((service_name, day_start),
                                                       0)
@@ -1051,23 +1063,52 @@ def _enrich_service_requests_with_costs(
         if series.get('is_other'):
             continue
         service_name = str(series['service_name'])
+        service = services_by_name.get(service_name, {})
+        complete_by_day = service.get('complete_by_day')
+        if (not isinstance(complete_by_day, list) or
+                len(complete_by_day) != len(day_starts)):
+            complete_by_day = [False for _ in day_starts]
         daily_costs = []
         daily_ratios = []
-        for day_start in day_starts:
+        for index, day_start in enumerate(day_starts):
             request_count = request_counts.get((service_name, day_start), 0)
             day_cost = costs.get((service_name, day_start), {})
             estimated_cost = float(day_cost.get('estimated_cost', 0))
             priced_seconds = int(day_cost.get('priced_machine_seconds', 0))
             excluded_seconds = int(day_cost.get('excluded_machine_seconds', 0))
             daily_costs.append(estimated_cost)
-            ratio_available = (ratio_coverage_start is not None and
-                               day_start >= ratio_coverage_start and
+            ratio_available = (bool(complete_by_day[index]) and
+                               spend_coverage_start is not None and
+                               day_start >= spend_coverage_start and
                                request_count > 0 and priced_seconds > 0 and
                                excluded_seconds == 0)
             daily_ratios.append(estimated_cost /
                                 request_count if ratio_available else None)
         series['estimated_cost_by_day'] = daily_costs
         series['estimated_cost_per_request_by_day'] = daily_ratios
+
+
+def _mark_legacy_service_request_costs_unavailable(service_requests: dict[str,
+                                                                          Any],
+                                                   day_count: int) -> None:
+    """Keep attempt counts compatible without exposing an invalid ratio."""
+    for service in service_requests.get('services', []):
+        service.update({
+            'estimated_cost': 0.0,
+            'estimated_cost_per_request': None,
+            'ratio_request_count': 0,
+            'ratio_coverage_start_utc': None,
+            'priced_machine_seconds': 0,
+            'excluded_machine_seconds': 0,
+            'cost_coverage': 'unavailable',
+        })
+    for series in service_requests.get('series', []):
+        if series.get('is_other'):
+            continue
+        series['estimated_cost_by_day'] = [0.0 for _ in range(day_count)]
+        series['estimated_cost_per_request_by_day'] = [
+            None for _ in range(day_count)
+        ]
 
 
 def get_estimated_spend(
@@ -1184,10 +1225,14 @@ def get_estimated_spend(
         table_limit=GROUP_TABLE_LIMIT,
         chart_limit=GROUP_CHART_LIMIT,
     )
-    if service_requests.get('available'):
+    _mark_legacy_service_request_costs_unavailable(service_requests,
+                                                   len(days_response))
+    non_rejected_requests = service_requests.get('non_rejected')
+    if (isinstance(non_rejected_requests, dict) and
+            non_rejected_requests.get('available')):
         service_names = [
             str(service['service_name'])
-            for service in service_requests.get('services', [])
+            for service in non_rejected_requests.get('services', [])
         ]
         request_rows: list[Any] = []
         service_cost_rows: list[Any] = []
@@ -1201,8 +1246,9 @@ def get_estimated_spend(
             # Keep the independently useful request totals available during a
             # rolling upgrade or transient best-effort spend read failure.
             logger.exception('Failed to read daily service request costs.')
-        _enrich_service_requests_with_costs(service_requests, days_response,
-                                            request_rows, service_cost_rows,
+        _enrich_service_requests_with_costs(non_rejected_requests,
+                                            days_response, request_rows,
+                                            service_cost_rows,
                                             spend_coverage_start)
     return {
         'currency': 'USD',

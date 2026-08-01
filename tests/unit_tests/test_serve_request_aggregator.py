@@ -48,6 +48,58 @@ def test_request_timestamp_accounts_and_acknowledges_one_bucket(monkeypatch):
     assert aggregator.prediction_time_history_snapshot() is None
 
 
+def test_request_classification_snapshot_always_advertises_v1(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    aggregator = serve_utils.RequestTimestamp()
+
+    assert aggregator.request_classification_history_snapshot() == {
+        'classification_version': 1,
+        'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
+        'buckets': [],
+    }
+
+
+def test_request_classification_records_paired_terminal_counters(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    aggregator = serve_utils.RequestTimestamp()
+
+    aggregator.add_request_classification(rejected=False)
+    aggregator.add_request_classification(rejected=True)
+
+    snapshot = aggregator.request_classification_history_snapshot()
+    assert snapshot['buckets'] == [{
+        'bucket_start': 120,
+        'classified_request_count': 2,
+        'counted_rejected_count': 1,
+    }]
+    aggregator.mark_request_classification_history_accepted(snapshot)
+    assert not aggregator.request_classification_history_snapshot()['buckets']
+
+
+def test_request_classification_ack_is_independent_and_in_flight_safe(
+        monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    aggregator = serve_utils.RequestTimestamp()
+    aggregator.add(None)
+    aggregator.add_request_classification(rejected=True)
+    request_snapshot = aggregator.request_history_snapshot()
+    classification_snapshot = (
+        aggregator.request_classification_history_snapshot())
+
+    aggregator.mark_request_history_accepted(request_snapshot)
+    assert aggregator.request_classification_history_snapshot(
+    )['buckets'] == classification_snapshot['buckets']
+
+    aggregator.add_request_classification(rejected=False)
+    aggregator.mark_request_classification_history_accepted(
+        classification_snapshot)
+    assert aggregator.request_classification_history_snapshot()['buckets'] == [{
+        'bucket_start': 120,
+        'classified_request_count': 2,
+        'counted_rejected_count': 1,
+    }]
+
+
 def test_request_timestamp_restore_keeps_newest_bounded_batch():
     aggregator = serve_utils.RequestTimestamp()
     cap = constants.LB_REQUEST_TIMESTAMP_CAP
