@@ -2,8 +2,9 @@
 
 Status: bounded M0 and M1b contract accepted after independent adversarial
 review; M1a inert schema and dark M1b typed store implemented and locally
-verified; M2 shadow contract accepted after independent exact-file review and
-implementation pending
+verified; M2 schema, cluster identity, immutable provider contracts, and typed
+shadow-store foundations implemented and locally verified; runtime shadow
+instrumentation pending
 
 Last updated: 2026-07-31
 
@@ -818,6 +819,17 @@ denial commits neither intent nor sample. Teardown admission advances the
 generation and inserts the down sample in the transaction that durably commits
 the teardown intent.
 
+Paid-capacity and reserved-fill admission preserve the global lock order rather
+than appending shadow writes to their current capacity-first transactions. The
+combined PostgreSQL helper locks the service, then locks an existing identified
+replica or inserts a provisional fully identified replica row, and only then
+takes capacity/reservation locks. On denial it removes only the provisional row
+before committing any existing waiter/capacity bookkeeping; it creates no
+shadow parent or link. On approval it finishes the replica/capacity mutation,
+inserts or exactly adopts the parent, and writes the replica link before one
+commit. Recovery never turns an older name-only replica into that provisional
+form.
+
 Immediately before each `sdk.launch()` or `sdk.down()` call, including an
 in-process legacy retry and its cleanup down, the worker commits the next
 `PRE_SUBMIT` child. After the SDK returns a request ID it binds that real ID in
@@ -1020,6 +1032,27 @@ M1b verification evidence on 2026-08-01:
   parent transactionally with the legacy Serve projection. Route direct
   teardown through `sdk.down()` before collecting the promotion window.
 - Preserve legacy autoscaling and provider mutation authority.
+
+M2 foundation verification evidence on 2026-08-01:
+
+- Serve032 installs the inert mode, replica-identity/link, logical-sample, and
+  per-attempt schema while preserving portable inert columns for supported
+  local controller databases;
+- global-user-state revision 028 installs a nullable portable cluster-record
+  UUID and partial unique index, leaves historical rows null, and provides the
+  PostgreSQL-only exact insert/adopt/reject primitive without changing ordinary
+  cluster updates;
+- closed, bounded provider locator, invocation, observation, outcome, shadow
+  projection, and retry contracts have canonical byte/hash fixtures and
+  action-specific success proof; and
+- the PostgreSQL typed shadow store passes its full 21-test suite, including
+  exact parent/child replay, retry-chain closure, activation-window fencing,
+  action-specific projection proof, retention protection, and lock races. Its
+  exact source received independent contract and concurrency acceptance.
+
+Runtime admission/linking, legacy SDK instrumentation, provider identity
+propagation/readback, and live shadow evaluation remain M2 gates; no service is
+eligible for authority yet.
 
 ### M3: dark dispatcher and recovery
 

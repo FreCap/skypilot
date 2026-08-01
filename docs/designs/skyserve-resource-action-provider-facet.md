@@ -1,8 +1,9 @@
 # SkyServe Resource-Action Provider Facet
 
 Status: bounded M0 accepted after independent adversarial review; parent M1
-kernel complete; M2 identity and shadow contract accepted after independent
-exact-file review and implementation pending
+kernel complete; M2 cluster identity, immutable provider contracts, and typed
+shadow-store foundations implemented and locally verified; runtime provider
+propagation, observation, and shadow instrumentation pending
 
 Last updated: 2026-08-01
 
