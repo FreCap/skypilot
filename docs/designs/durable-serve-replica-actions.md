@@ -1,7 +1,8 @@
 # Durable SkyServe Replica Actions
 
-Status: bounded M0 accepted after independent adversarial review; M1a inert
-schema implemented and locally verified; M1b typed store pending
+Status: bounded M0 and M1b contract accepted after independent adversarial
+review; M1a inert schema and dark M1b typed store implemented and locally
+verified; M2 contract refinement pending
 
 Last updated: 2026-07-31
 
@@ -262,6 +263,69 @@ mutation boundary, and typed outcome must be snapshotted into the attempt.
 Request retention skips a correlated terminal request whose attempt is not yet
 `SETTLED`.
 
+Attempt `n` uses request ID `str(uuid.uuid5(action_id, f'attempt:{n}'))`.
+`request_input_sha256` is SHA-256 of canonical `ResourceActionRequestInputV1`
+bytes, not of the mutable request row:
+
+```text
+{
+  version: 1, action_id, attempt, request_id,
+  name, handler_name, payload_type, payload_format, payload_version,
+  producer_version, payload_json, execution_class,
+  cluster_name, schedule_type, user_id, file_mounts_blob_id,
+  ignore_return_value, retryable,
+  precondition_type, precondition_payload, precondition_deadline,
+  initial_status: "PENDING", should_enqueue: true, queue_priority: 0
+}
+```
+
+The same canonical JSON rules used for action identity apply. The deadline is
+null or UTC RFC 3339 with exactly six fractional digits and `Z`.
+Materialization rejects a caller request unless the ID matches, it is a
+pristine `PENDING` request with `should_enqueue=true`, and all runtime,
+terminal, and claim fields have their initial null/zero/false values.
+V1 action requests must use the normal executor, `ignore_return_value=false`,
+`retryable=false`, `ReplayPolicy.NEVER`, and no queue precondition or
+precondition deadline. Validation is closed over the exact key set above: the
+embedded version/action/attempt/request identity and every fixed flag are
+checked independently of the caller-supplied hash, so a self-consistent hash
+over a malformed or extended object is not accepted. The generic executor
+currently requeues `ExecutionRetryableError` and
+`ExecutionPausedError` independently of the `retryable` field, so the action
+handler/facet must catch both families and return a closed typed
+retry/uncertain outcome before either can escape. One request attempt therefore
+terminalizes once; only the action reducer can schedule attempt `n+1`.
+`created_at`, database timestamps, queue sequence, delivery/claim state,
+request result/error/status after creation, and execution generation after
+claim are deliberately excluded. Mutable operational-event context is also
+excluded because it is audit enrichment rather than execution input.
+`producer_version` is intentionally frozen as an internal payload-ABI field;
+mixed action-aware images that would produce a different value fail closed.
+The action request payload is a minimal immutable action/attempt reference; the
+handler loads the frozen action spec from PostgreSQL instead of reserializing
+ambient configuration into the request.
+
+On an insert conflict, materialization resolves both possible unique targets:
+the `(action_id, attempt)` row and any row that already owns the deterministic
+`request_id`. It locks the complete conflicting attempt set in canonical key
+order, then its request and queue rows, and never overwrites any of them. A
+foreign request-ID owner or more than one resolved binding is corruption and
+moves the intended action to `BLOCKED`. For the one expected binding, the store
+requires the caller's full canonical input hash to equal the attempt's durable
+`request_input_sha256`, then compares the exact correlation and every surviving
+immutable request column with the caller's input. A nonterminal adopted request
+must still have its original queue row and byte-equal immutable queue inputs. A
+terminal request may have no queue row because normal terminalization deletes
+it; in that case the attempt hash is the authoritative commitment for
+queue-only precondition/priority fields that can no longer be reconstructed,
+while every surviving request field is still compared. This is safe because
+attempt, request, and initial queue were inserted atomically from that same
+hash. A missing request, an
+uncorrelated/cross-correlated request, a missing nonterminal delivery, or any
+byte mismatch moves the action to `BLOCKED` with a bounded conflict result and
+creates no delivery. This is fail-closed adoption after a lost materialization
+acknowledgement, not request refresh.
+
 The durable action states are:
 
 - `READY`: due now or later according to `next_attempt_at`;
@@ -307,11 +371,23 @@ byte equality.
 
 Before the existing high-level launch/down handler can enter provider I/O, it
 must claim-fenced-write `INTENT_COMMITTED` on the correlated attempt and verify
-the immutable provider plan/locator already committed by admission. If the
-provider returns an operation ID, the handler claim-fenced-writes it as soon as
-it is known. The ID is optional because some providers do not expose one; the
-immutable requested locator and readback contract are mandatory for
-authoritative eligibility.
+the immutable provider plan/locator already committed by admission. These
+attempt writes lock action, attempt, and correlated request in that order.
+After any lock wait they use a fresh database-clock statement and revalidate
+the exact correlation, `RUNNING` state, execution generation, claim token,
+worker, current owner fence, and unexpired lease. They update and commit before
+provider I/O; no path locks a request and then reaches backward to an action.
+If terminalization wins the request lock, the evidence writer wakes and
+rejects. If the evidence writer wins, its journal state linearizes before
+terminalization. If the provider returns an operation ID, the handler writes
+it under the same fence as soon as it is known. The ID is optional because some
+providers do not expose one; the immutable requested locator and readback
+contract are mandatory for authoritative eligibility. Submission evidence is
+write-once: null means that this call learned no new ID and preserves an
+existing ID; two different non-null IDs conflict. At settlement, the journaled
+ID is injected into a missing/null typed-outcome field before canonical hashing,
+while a different non-null typed ID conflicts. The attempt column and persisted
+typed outcome therefore cannot disagree.
 
 The v1 typed outcome is:
 
@@ -359,10 +435,17 @@ then does exactly one of:
 - commit a terminal error/cancellation and the legal Serve failure projection.
 
 The reducer borrows the caller's SQLAlchemy `Connection`; it never opens a
-second transaction for Serve state. Same-state replay with byte-equal terminal
-evidence is idempotent. A different outcome for a settled attempt rejects. It
-does not commit a `REDUCING` state: a crash rolls the transaction back to
-`QUEUED`, where another reducer can retry.
+second transaction for Serve state. Same-state replay with the same committed
+request-input identity is idempotent. A settled replay does not supply or derive
+a second proposed outcome: the canonical typed outcome and result already
+committed in the attempt/action rows are the authority and are revalidated
+against their stored hashes. Re-running the callback after a commit would both
+risk duplicate Serve writes and make recovery depend on code-version drift, and
+request GC may already have removed the terminal source row. APIs that do
+accept an explicit expected settled-outcome commitment must reject a different
+hash, but this v1 replay API intentionally exposes only adoption of the stored
+projection. It does not commit a `REDUCING` state: a crash rolls the transaction
+back to `QUEUED`, where another reducer can retry.
 
 Backoff is database-clock based. Jitter, when used, is deterministic from
 `(action_id,attempt)` so a process restart cannot move the deadline. Serve—not
@@ -507,6 +590,21 @@ M1a verification evidence on 2026-07-31:
   skip and deletion after the terminal snapshot.
 - Do not import Serve modules into the generic store.
 - Keep dispatcher and Serve activation disabled.
+
+M1b verification evidence on 2026-08-01:
+
+- pure canonical identity/request/reduction tests and real-PostgreSQL store
+  tests pass with 22 tests, including both evidence-versus-terminalization race
+  directions, lease expiry during a request-row lock wait, two-dispatcher
+  materialization, deterministic request-ID collision quarantine, and
+  callback-free retry-deadline replay;
+- the full PostgreSQL request suite passes with 47 tests, including API005
+  migration/catalog coverage and correlated-request retention before and after
+  attempt settlement;
+- SQLite request-retention coverage passes with 15 tests and the API/GC race
+  regression passes with one test; and
+- YAPF, isort, mypy across 818 source files, pylint at 10.00/10, dashboard lint
+  and formatting, and `git diff --check` pass.
 
 ### M2: Serve shadow journal
 
