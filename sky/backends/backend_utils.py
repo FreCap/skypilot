@@ -2273,7 +2273,7 @@ def _query_head_ip_with_retries(cluster_yaml: str,
                     reason=exceptions.FetchClusterInfoError.Reason.HEAD) from e
             # Retry if the cluster is not up yet.
             logger.debug('Retrying to get head ip.')
-            time.sleep(backoff.current_backoff())
+            context_utils.sleep_with_cancellation(backoff.current_backoff())
     raise exceptions.FetchClusterInfoError(
         reason=exceptions.FetchClusterInfoError.Reason.HEAD)
 
@@ -2360,7 +2360,7 @@ def get_node_ips(cluster_yaml: str,
                 logger.debug('Retrying to get worker ip '
                              f'[{retry_cnt}/{worker_ip_max_attempts}] in '
                              f'{backoff_time} seconds.')
-                time.sleep(backoff_time)
+                context_utils.sleep_with_cancellation(backoff_time)
         else:
             raise exceptions.FetchClusterInfoError(
                 exceptions.FetchClusterInfoError.Reason.WORKER)
