@@ -18,7 +18,10 @@ import {
   TableBody,
   TableCell,
 } from '@/components/ui/table';
-import { getServices } from '@/data/connectors/services';
+import {
+  getServiceReplicaSummaries,
+  getServices,
+} from '@/data/connectors/services';
 import { REFRESH_INTERVALS } from '@/lib/config';
 import { sortData } from '@/data/utils';
 import { RotateCwIcon, CopyIcon, CheckIcon } from 'lucide-react';
@@ -36,6 +39,7 @@ import dashboardCache from '@/lib/cache';
 const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
 const SERVICE_METADATA_ARGS = [{ metadataOnly: true }];
 const SERVICE_SUMMARY_ARGS = [{ summaryOnly: true, includeEndpoints: true }];
+const SERVICE_REPLICA_SUMMARY_ARGS = [{}];
 
 const PAST_ATTEMPT_STATUSES = new Set([
   'FAILED',
@@ -68,6 +72,9 @@ function countStatuses(service, statuses) {
 }
 
 export function getPastAttemptCount(service) {
+  if (Number.isInteger(service.pastAttemptCount)) {
+    return service.pastAttemptCount;
+  }
   return countStatuses(service, PAST_ATTEMPT_STATUSES);
 }
 
@@ -105,7 +112,7 @@ export function getServiceOperationalState(service) {
         'The service controller is in a terminal failure state. Inspect the service logs and placement details.',
     };
   }
-  if (service.metadataOnly || service.replicasReady == null) {
+  if (service.replicasReady == null) {
     const enrichmentUnavailable = service.enrichmentUnavailable === true;
     if (rawStatus === 'READY') {
       return {
@@ -199,7 +206,19 @@ function mergeMetadataWithPrevious(metadataRows, previousRows) {
   );
   return (metadataRows || []).map((metadata) => {
     const previous = previousByName.get(metadata.name);
-    if (!previous || previous.metadataOnly) return metadata;
+    if (
+      previous?.serviceHash &&
+      metadata.serviceHash &&
+      previous.serviceHash !== metadata.serviceHash
+    ) {
+      return metadata;
+    }
+    if (
+      !previous ||
+      (previous.metadataOnly && !previous.replicaSummaryLoaded)
+    ) {
+      return metadata;
+    }
     return {
       ...metadata,
       ...previous,
@@ -213,7 +232,7 @@ function mergeMetadataWithPrevious(metadataRows, previousRows) {
       version: metadata.version,
       electedVersion: metadata.electedVersion,
       tlsEncrypted: metadata.tlsEncrypted,
-      metadataOnly: false,
+      metadataOnly: previous.controllerSummaryLoaded !== true,
     };
   });
 }
@@ -221,13 +240,87 @@ function mergeMetadataWithPrevious(metadataRows, previousRows) {
 function mergeServiceRows(baseRows, enrichedRows) {
   const merged = new Map((baseRows || []).map((row) => [row.name, row]));
   (enrichedRows || []).forEach((row) => {
+    const previous = merged.get(row.name);
+    const identityChanged =
+      previous?.serviceHash &&
+      row.serviceHash &&
+      previous.serviceHash !== row.serviceHash;
     merged.set(row.name, {
-      ...(merged.get(row.name) || {}),
+      ...(identityChanged ? {} : previous || {}),
       ...row,
+      controllerSummaryLoaded: true,
       enrichmentUnavailable: false,
     });
   });
   return Array.from(merged.values());
+}
+
+function mergeReplicaSummaryRows(baseRows, summaries) {
+  const merged = new Map((baseRows || []).map((row) => [row.name, row]));
+  (summaries || []).forEach((summary) => {
+    const previous = merged.get(summary.name);
+    // A replica-only projection has no lifecycle status. Buffer it until an
+    // identity-bearing metadata/controller row exists so the UI never invents
+    // an UNKNOWN service state during an arrival-order race.
+    if (!previous) return;
+    if (
+      previous?.serviceHash &&
+      summary.serviceHash &&
+      previous.serviceHash !== summary.serviceHash
+    ) {
+      return;
+    }
+    const liveReplicaFields = previous?.controllerSummaryLoaded
+      ? {
+          replicaUnit: previous.replicaUnit,
+          replicaStatusCounts: previous.replicaStatusCounts,
+          replicasReady: previous.replicasReady,
+          replicasTotal: previous.replicasTotal,
+          replicasFailed: previous.replicasFailed,
+          physicalReplicasReady: previous.physicalReplicasReady,
+          physicalReplicasTotal: previous.physicalReplicasTotal,
+          physicalReplicasFailed: previous.physicalReplicasFailed,
+        }
+      : {};
+    merged.set(summary.name, {
+      ...(previous || {}),
+      ...summary,
+      ...liveReplicaFields,
+      name: summary.name,
+      serviceHash: previous?.serviceHash || summary.serviceHash,
+      metadataOnly: previous?.metadataOnly ?? true,
+      replicaSummaryLoaded: true,
+      replicaSummaryUnavailable: false,
+    });
+  });
+  return Array.from(merged.values());
+}
+
+function clearDirectReplicaSummary(rows) {
+  return (rows || []).map((row) => {
+    if (!row.replicaSummaryLoaded) return row;
+    const cleared = {
+      ...row,
+      replicaSummaryLoaded: false,
+      replicaSummaryUnavailable: false,
+    };
+    delete cleared.currentOrUncertainCount;
+    delete cleared.pastAttemptCount;
+    delete cleared.replicaCapacityCounts;
+    delete cleared.observedAt;
+    if (!row.controllerSummaryLoaded) {
+      Object.assign(cleared, {
+        replicaStatusCounts: null,
+        replicasReady: null,
+        replicasTotal: null,
+        replicasFailed: null,
+        physicalReplicasReady: null,
+        physicalReplicasTotal: null,
+        physicalReplicasFailed: null,
+      });
+    }
+    return cleared;
+  });
 }
 
 function LoadingValue({ label, unavailable = false }) {
@@ -310,6 +403,7 @@ export function Services() {
     // The cache is args-keyed; drop every getServices variant
     // (summary and full) so refresh always refetches.
     dashboardCache.invalidateFunction(getServices);
+    dashboardCache.invalidateFunction(getServiceReplicaSummaries);
     if (refreshDataRef.current) {
       refreshDataRef.current();
     }
@@ -381,6 +475,7 @@ export function ServicesTable({
   const [pageSize, setPageSize] = useState(10);
   const requestVersionRef = useRef(0);
   const activeRequestRef = useRef(null);
+  const replicaSummariesRef = useRef([]);
 
   const runFetch = useCallback(
     async (requestVersion) => {
@@ -388,18 +483,23 @@ export function ServicesTable({
         requestVersionRef.current === requestVersion;
 
       setLoading(true);
-      // Both projections are independent. Start them together and make each
-      // arrival useful: metadata paints the cheapest persisted state, while a
-      // summary that wins the race paints the complete list row immediately.
-      // mergeMetadataWithPrevious() is monotonic, so later metadata refreshes
-      // persisted fields without erasing replica counts or endpoints.
+      // All projections are independent. Metadata paints identity, the direct
+      // persisted projection paints replica health, and the controller summary
+      // remains authoritative for live targets, request pressure, and endpoints.
       const metadataPromise = dashboardCache
         .get(getServices, SERVICE_METADATA_ARGS)
         .then((metadataResponse) => {
           if (!isCurrentRequest()) return;
-          setData((previous) =>
-            mergeMetadataWithPrevious(metadataResponse.services || [], previous)
-          );
+          setData((previous) => {
+            const metadataRows = mergeMetadataWithPrevious(
+              metadataResponse.services || [],
+              previous
+            );
+            return mergeReplicaSummaryRows(
+              metadataRows,
+              replicaSummariesRef.current
+            );
+          });
           setControllerStopped(metadataResponse.controllerStopped || false);
           setIsInitialLoad(false);
         });
@@ -407,20 +507,43 @@ export function ServicesTable({
         .get(getServices, SERVICE_SUMMARY_ARGS)
         .then((servicesResponse) => {
           if (!isCurrentRequest()) return;
-          setData((previous) =>
-            mergeServiceRows(previous, servicesResponse.services || [])
-          );
+          setData((previous) => {
+            const liveRows = mergeServiceRows(
+              previous,
+              servicesResponse.services || []
+            );
+            return mergeReplicaSummaryRows(
+              liveRows,
+              replicaSummariesRef.current
+            );
+          });
           setControllerStopped(servicesResponse.controllerStopped || false);
           setIsInitialLoad(false);
           if (onFetched) {
             onFetched(new Date());
           }
         });
+      const replicaSummaryPromise = dashboardCache
+        .get(getServiceReplicaSummaries, SERVICE_REPLICA_SUMMARY_ARGS)
+        .then((response) => {
+          if (!isCurrentRequest()) return;
+          if (response.legacyFallback) {
+            replicaSummariesRef.current = [];
+            setData(clearDirectReplicaSummary);
+            return;
+          }
+          replicaSummariesRef.current = response.summaries || [];
+          setData((previous) =>
+            mergeReplicaSummaryRows(previous, response.summaries || [])
+          );
+        });
 
-      const [metadataResult, summaryResult] = await Promise.allSettled([
-        metadataPromise,
-        summaryPromise,
-      ]);
+      const [metadataResult, summaryResult, replicaSummaryResult] =
+        await Promise.allSettled([
+          metadataPromise,
+          summaryPromise,
+          replicaSummaryPromise,
+        ]);
       if (!isCurrentRequest()) return;
       if (metadataResult.status === 'rejected') {
         console.error(
@@ -439,6 +562,18 @@ export function ServicesTable({
               ? { ...service, enrichmentUnavailable: true }
               : service
           )
+        );
+      }
+      if (replicaSummaryResult.status === 'rejected') {
+        console.error(
+          'Failed to fetch persisted replica summaries:',
+          replicaSummaryResult.reason
+        );
+        setData((previous) =>
+          previous.map((service) => ({
+            ...service,
+            replicaSummaryUnavailable: true,
+          }))
         );
       }
       setLoading(false);
@@ -501,6 +636,10 @@ export function ServicesTable({
         }
         dashboardCache.invalidate(getServices, SERVICE_SUMMARY_ARGS);
         dashboardCache.invalidate(getServices, SERVICE_METADATA_ARGS);
+        dashboardCache.invalidate(
+          getServiceReplicaSummaries,
+          SERVICE_REPLICA_SUMMARY_ARGS
+        );
         void fetchData({ kind: 'visibility' });
         return;
       }

@@ -3,6 +3,7 @@ import {
   API_VERSION_HEADER,
   CLUSTER_NOT_UP_ERROR,
   SERVE_DASHBOARD_DIRECT_READS_API_VERSION,
+  SERVE_DASHBOARD_REPLICA_READS_API_VERSION,
 } from '@/data/connectors/constants';
 
 // Normalize a raw replica_info entry from the /serve/status response.
@@ -28,6 +29,11 @@ export function normalizeReplica(replica) {
     rawTimeToReadySeconds === null || rawTimeToReadySeconds === undefined
       ? null
       : Number(rawTimeToReadySeconds);
+  const rawCreatedAt = replica.created_at;
+  const createdAt =
+    rawCreatedAt === null || rawCreatedAt === undefined
+      ? null
+      : Number(rawCreatedAt);
   return {
     id: replica.replica_id,
     status: replica.status,
@@ -35,6 +41,7 @@ export function normalizeReplica(replica) {
     endpoint: replica.endpoint || null,
     is_spot: replica.is_spot,
     launched_at: replica.launched_at || null,
+    createdAt: Number.isFinite(createdAt) ? createdAt : null,
     ready_at: Number.isFinite(readyAt) ? readyAt : null,
     timeToReadySeconds: Number.isFinite(timeToReadySeconds)
       ? timeToReadySeconds
@@ -799,6 +806,219 @@ export async function getServiceHistory({
   return {
     ...history,
     legacyFallback: history?.reason === 'non_consolidated',
+  };
+}
+
+const PAST_ATTEMPT_REPLICA_STATUSES = new Set([
+  'FAILED',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+]);
+
+function countReplicaStatuses(counts, statuses) {
+  return Object.entries(counts || {}).reduce(
+    (total, [status, count]) =>
+      statuses.has(status) ? total + Number(count || 0) : total,
+    0
+  );
+}
+
+function totalReplicaCounts(counts) {
+  return Object.values(counts || {}).reduce(
+    (total, count) => total + Number(count || 0),
+    0
+  );
+}
+
+// Normalize the compact persisted projection returned by
+// GET /serve/replica-summaries. Physical row counts and logical planned
+// capacity stay separate so callers cannot accidentally label one as the
+// other.
+export function normalizeServiceReplicaSummary(summary) {
+  if (!summary || typeof summary !== 'object') return null;
+  const name = summary.service_name;
+  const serviceHash = summary.service_hash;
+  if (typeof name !== 'string' || !name || typeof serviceHash !== 'string') {
+    return null;
+  }
+  const replicaStatusCounts = summary.replica_status_counts || {};
+  const replicaCapacityCounts = summary.replica_capacity_counts || {};
+  const usesLogicalReplicas = ['logical', 'logical_slot'].includes(
+    summary.replica_unit
+  );
+  const physicalReplicasReady = Number(replicaStatusCounts.READY || 0);
+  const physicalReplicasFailed = countReplicaStatuses(
+    replicaStatusCounts,
+    FAILED_REPLICA_STATUSES
+  );
+  const physicalReplicasTotal =
+    totalReplicaCounts(replicaStatusCounts) - physicalReplicasFailed;
+  const logicalReplicasReady = Number(replicaCapacityCounts.READY || 0);
+  const logicalReplicasFailed = countReplicaStatuses(
+    replicaCapacityCounts,
+    FAILED_REPLICA_STATUSES
+  );
+  const logicalReplicasTotal =
+    totalReplicaCounts(replicaCapacityCounts) - logicalReplicasFailed;
+  const currentOrUncertainCount = Number(summary.current_or_uncertain_count);
+  const pastAttemptCount = Number(summary.past_attempt_count);
+  return {
+    name,
+    serviceHash,
+    replicaUnit: usesLogicalReplicas ? 'logical' : 'physical',
+    replicaStatusCounts: { ...replicaStatusCounts },
+    replicaCapacityCounts: { ...replicaCapacityCounts },
+    replicasReady: usesLogicalReplicas
+      ? logicalReplicasReady
+      : physicalReplicasReady,
+    replicasTotal: usesLogicalReplicas
+      ? logicalReplicasTotal
+      : physicalReplicasTotal,
+    replicasFailed: usesLogicalReplicas
+      ? logicalReplicasFailed
+      : physicalReplicasFailed,
+    physicalReplicasReady,
+    physicalReplicasTotal,
+    physicalReplicasFailed,
+    currentOrUncertainCount: Number.isInteger(currentOrUncertainCount)
+      ? currentOrUncertainCount
+      : 0,
+    pastAttemptCount: Number.isInteger(pastAttemptCount)
+      ? pastAttemptCount
+      : countReplicaStatuses(
+          replicaStatusCounts,
+          PAST_ATTEMPT_REPLICA_STATUSES
+        ),
+  };
+}
+
+function directReadFallback(
+  response,
+  minimumVersion = SERVE_DASHBOARD_DIRECT_READS_API_VERSION
+) {
+  const serverApiVersion = Number(response.headers?.get?.(API_VERSION_HEADER));
+  return (
+    !Number.isInteger(serverApiVersion) || serverApiVersion < minimumVersion
+  );
+}
+
+export async function getServiceReplicaSummaries({ serviceNames = null } = {}) {
+  const params = new URLSearchParams();
+  (serviceNames || []).forEach((name) => params.append('service_name', name));
+  const query = params.toString();
+  const response = await apiClient.get(
+    `/serve/replica-summaries${query ? `?${query}` : ''}`
+  );
+  if (response.status === 404) {
+    const legacyFallback = directReadFallback(
+      response,
+      SERVE_DASHBOARD_REPLICA_READS_API_VERSION
+    );
+    return {
+      available: false,
+      reason: legacyFallback ? 'unsupported' : 'not_found',
+      legacyFallback,
+      summaries: [],
+    };
+  }
+  if (response.status === 409) {
+    const error = new Error('The service incarnation changed.');
+    error.code = 'SERVICE_HASH_MISMATCH';
+    throw error;
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Service replica summary request failed with status ${response.status}`
+    );
+  }
+  const payload = await response.json();
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Service replica summary response was malformed');
+  }
+  const available = payload.available !== false;
+  const observedAt = finiteOrNull(payload.observed_at);
+  const summaries = (
+    Array.isArray(payload.summaries)
+      ? payload.summaries
+      : Array.isArray(payload.services)
+        ? payload.services
+        : []
+  )
+    .map(normalizeServiceReplicaSummary)
+    .filter(Boolean)
+    .map((summary) => ({ ...summary, observedAt }));
+  return {
+    available,
+    reason: payload.reason || null,
+    legacyFallback: !available && payload.reason === 'non_consolidated',
+    observedAt,
+    summaries,
+  };
+}
+
+export async function getServiceReplicas({
+  serviceName,
+  serviceHash,
+  scope,
+  limit = 50,
+  cursor = null,
+}) {
+  const params = new URLSearchParams({
+    scope,
+    limit: String(limit),
+    expected_service_hash: serviceHash,
+  });
+  if (cursor) params.set('cursor', cursor);
+  const response = await apiClient.get(
+    `/serve/${encodeURIComponent(serviceName)}/replicas?${params.toString()}`
+  );
+  if (response.status === 404) {
+    const legacyFallback = directReadFallback(
+      response,
+      SERVE_DASHBOARD_REPLICA_READS_API_VERSION
+    );
+    return {
+      available: false,
+      reason: legacyFallback ? 'unsupported' : 'not_found',
+      legacyFallback,
+      replicas: [],
+      total: 0,
+      nextCursor: null,
+    };
+  }
+  if (response.status === 409) {
+    const error = new Error('The service incarnation changed.');
+    error.code = 'SERVICE_HASH_MISMATCH';
+    throw error;
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Service replicas request failed with status ${response.status}`
+    );
+  }
+  const payload = await response.json();
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Service replicas response was malformed');
+  }
+  const available = payload.available !== false;
+  const total = Number(payload.total);
+  return {
+    available,
+    reason: payload.reason || null,
+    legacyFallback: !available && payload.reason === 'non_consolidated',
+    serviceName: payload.service_name || serviceName,
+    serviceHash: payload.service_hash || serviceHash,
+    replicaUnit: ['logical', 'logical_slot'].includes(payload.replica_unit)
+      ? 'logical'
+      : 'physical',
+    scope: payload.scope || scope,
+    observedAt: finiteOrNull(payload.observed_at),
+    total: Number.isInteger(total) && total >= 0 ? total : 0,
+    nextCursor: payload.next_cursor || null,
+    replicas: (Array.isArray(payload.replicas) ? payload.replicas : []).map(
+      (replica) => ({ ...normalizeReplica(replica), directProjection: true })
+    ),
   };
 }
 

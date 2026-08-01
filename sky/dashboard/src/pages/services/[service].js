@@ -26,7 +26,12 @@ import {
 } from '@/components/ui/table';
 import { Card } from '@/components/ui/card';
 import { StatusBadge } from '@/components/elements/StatusBadge';
-import { getServiceHistory, getServices } from '@/data/connectors/services';
+import {
+  getServiceHistory,
+  getServiceReplicaSummaries,
+  getServiceReplicas,
+  getServices,
+} from '@/data/connectors/services';
 import dashboardCache from '@/lib/cache';
 import {
   CustomTooltip as Tooltip,
@@ -648,6 +653,628 @@ export function useServiceHistory({
   };
 }
 
+const REPLICA_PAGE_SIZE = 50;
+const CURRENT_REPLICA_SCOPE = 'current_or_uncertain';
+const PAST_REPLICA_SCOPE = 'past_attempts';
+
+function emptyReplicaPage() {
+  return {
+    replicas: [],
+    total: null,
+    nextCursor: null,
+    observedAt: null,
+    loading: false,
+    loadingMore: false,
+    unavailable: false,
+    refreshUnavailable: false,
+  };
+}
+
+function dedupeReplicas(previous, incoming) {
+  const rows = new Map();
+  [...(previous || []), ...(incoming || [])].forEach((replica) => {
+    rows.set(String(replica.id), replica);
+  });
+  return Array.from(rows.values());
+}
+
+// Owns the v1c replica projections. The controller summary stays independent
+// because it is the fresh authority for targets, request pressure, and the
+// endpoint. Persisted replica counts/pages are hash-anchored and never delay it.
+export function useServiceReplicaData({
+  serviceName,
+  serviceHash,
+  metadataReady,
+  enabled = true,
+  onServiceHashMismatch,
+}) {
+  const hasMetadata = metadataReady ?? Boolean(serviceHash);
+  const [liveService, setLiveService] = useState(null);
+  const [liveSummaryLoading, setLiveSummaryLoading] = useState(false);
+  const [liveSummaryUnavailable, setLiveSummaryUnavailable] = useState(false);
+  const [replicaSummary, setReplicaSummary] = useState(null);
+  const [replicaSummaryLoading, setReplicaSummaryLoading] = useState(false);
+  const [replicaSummaryUnavailable, setReplicaSummaryUnavailable] =
+    useState(false);
+  const [currentPage, setCurrentPage] = useState(emptyReplicaPage);
+  const [pastPage, setPastPage] = useState(emptyReplicaPage);
+  const [legacyService, setLegacyService] = useState(null);
+  const identityRef = useRef(null);
+  const generationRef = useRef(0);
+  const modeRef = useRef('direct');
+  const liveRequestRef = useRef(0);
+  const summaryRequestRef = useRef(0);
+  const currentRequestRef = useRef(0);
+  const pastRequestRef = useRef(0);
+  const legacyRequestRef = useRef(0);
+  const fallbackRequestRef = useRef(null);
+  const pastRequestedRef = useRef(false);
+  const currentPageRef = useRef(currentPage);
+  const pastPageRef = useRef(pastPage);
+
+  useEffect(() => {
+    currentPageRef.current = currentPage;
+  }, [currentPage]);
+  useEffect(() => {
+    pastPageRef.current = pastPage;
+  }, [pastPage]);
+
+  const identityIsCurrent = useCallback(
+    (identity, generation) =>
+      identityRef.current === identity && generationRef.current === generation,
+    []
+  );
+
+  const reportHashMismatch = useCallback(
+    (identity, generation) => {
+      if (!identityIsCurrent(identity, generation)) return;
+      generationRef.current += 1;
+      setReplicaSummaryUnavailable(true);
+      setCurrentPage((previous) => ({
+        ...previous,
+        loading: false,
+        loadingMore: false,
+        unavailable: previous.replicas.length === 0,
+        refreshUnavailable: previous.replicas.length > 0,
+      }));
+      setPastPage((previous) => ({
+        ...previous,
+        loading: false,
+        loadingMore: false,
+        unavailable: previous.replicas.length === 0,
+        refreshUnavailable: previous.replicas.length > 0,
+      }));
+      void onServiceHashMismatch?.();
+    },
+    [identityIsCurrent, onServiceHashMismatch]
+  );
+
+  const fetchLegacyFull = useCallback(
+    ({ identity, generation, force = false }) => {
+      if (!identityIsCurrent(identity, generation)) return Promise.resolve();
+      const existing = fallbackRequestRef.current;
+      if (existing?.identity === identity && !force) return existing.promise;
+      modeRef.current = 'legacy';
+      const requestVersion = legacyRequestRef.current + 1;
+      legacyRequestRef.current = requestVersion;
+      summaryRequestRef.current += 1;
+      currentRequestRef.current += 1;
+      pastRequestRef.current += 1;
+      const args = [
+        {
+          serviceNames: [serviceName],
+          includeTargetReplicas: true,
+        },
+      ];
+      if (force) dashboardCache.invalidate(getServices, args);
+      setReplicaSummaryLoading(true);
+      setCurrentPage((previous) => ({
+        ...previous,
+        loading: true,
+        refreshUnavailable: false,
+      }));
+      let promise;
+      promise = dashboardCache
+        .get(getServices, args)
+        .then(({ services }) => {
+          if (
+            !identityIsCurrent(identity, generation) ||
+            legacyRequestRef.current !== requestVersion
+          ) {
+            return;
+          }
+          const service = (services || []).find(
+            (candidate) => candidate.name === serviceName
+          );
+          if (
+            service?.serviceHash &&
+            serviceHash &&
+            service.serviceHash !== serviceHash
+          ) {
+            reportHashMismatch(identity, generation);
+            return;
+          }
+          if (!service) throw new Error('Service not found');
+          const current = (service.replicas || []).filter(
+            (replica) =>
+              !REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
+          );
+          const past = (service.replicas || []).filter((replica) =>
+            REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
+          );
+          setLegacyService(service);
+          setReplicaSummary(service);
+          setReplicaSummaryUnavailable(false);
+          setCurrentPage({
+            replicas: current,
+            total: current.length,
+            nextCursor: null,
+            observedAt: null,
+            loading: false,
+            loadingMore: false,
+            unavailable: false,
+            refreshUnavailable: false,
+          });
+          setPastPage({
+            replicas: past,
+            total: past.length,
+            nextCursor: null,
+            observedAt: null,
+            loading: false,
+            loadingMore: false,
+            unavailable: false,
+            refreshUnavailable: false,
+          });
+        })
+        .catch((error) => {
+          if (
+            !identityIsCurrent(identity, generation) ||
+            legacyRequestRef.current !== requestVersion
+          ) {
+            return;
+          }
+          console.error('Failed to fetch legacy service replicas:', error);
+          setReplicaSummaryUnavailable(true);
+          setCurrentPage((previous) => ({
+            ...previous,
+            loading: false,
+            unavailable: previous.replicas.length === 0,
+            refreshUnavailable: previous.replicas.length > 0,
+          }));
+          setPastPage((previous) => ({
+            ...previous,
+            loading: false,
+            unavailable: previous.replicas.length === 0,
+            refreshUnavailable: previous.replicas.length > 0,
+          }));
+        })
+        .finally(() => {
+          if (
+            identityIsCurrent(identity, generation) &&
+            legacyRequestRef.current === requestVersion
+          ) {
+            setReplicaSummaryLoading(false);
+          }
+          if (fallbackRequestRef.current?.promise === promise) {
+            fallbackRequestRef.current = null;
+          }
+        });
+      fallbackRequestRef.current = { identity, promise };
+      return promise;
+    },
+    [identityIsCurrent, reportHashMismatch, serviceHash, serviceName]
+  );
+
+  const fetchLiveSummary = useCallback(
+    async ({ identity, generation, force = false }) => {
+      if (!identityIsCurrent(identity, generation)) return;
+      const requestVersion = liveRequestRef.current + 1;
+      liveRequestRef.current = requestVersion;
+      const args = [
+        {
+          serviceNames: [serviceName],
+          summaryOnly: true,
+          includeTargetReplicas: true,
+          includeEndpoints: true,
+        },
+      ];
+      if (force) dashboardCache.invalidate(getServices, args);
+      setLiveSummaryLoading(true);
+      setLiveSummaryUnavailable(false);
+      try {
+        const { services } = await dashboardCache.get(getServices, args);
+        if (
+          !identityIsCurrent(identity, generation) ||
+          liveRequestRef.current !== requestVersion
+        ) {
+          return;
+        }
+        const service = (services || []).find(
+          (candidate) => candidate.name === serviceName
+        );
+        if (
+          service?.serviceHash &&
+          serviceHash &&
+          service.serviceHash !== serviceHash
+        ) {
+          reportHashMismatch(identity, generation);
+          return;
+        }
+        if (!service) throw new Error('Service not found');
+        setLiveService(service);
+      } catch (error) {
+        if (
+          !identityIsCurrent(identity, generation) ||
+          liveRequestRef.current !== requestVersion
+        ) {
+          return;
+        }
+        console.error('Failed to fetch live service summary:', error);
+        setLiveSummaryUnavailable(true);
+      } finally {
+        if (
+          identityIsCurrent(identity, generation) &&
+          liveRequestRef.current === requestVersion
+        ) {
+          setLiveSummaryLoading(false);
+        }
+      }
+    },
+    [identityIsCurrent, reportHashMismatch, serviceHash, serviceName]
+  );
+
+  const fetchReplicaSummary = useCallback(
+    async ({ identity, generation }) => {
+      if (!identityIsCurrent(identity, generation) || !serviceHash) return;
+      const requestVersion = summaryRequestRef.current + 1;
+      summaryRequestRef.current = requestVersion;
+      setReplicaSummaryLoading(true);
+      setReplicaSummaryUnavailable(false);
+      try {
+        const response = await getServiceReplicaSummaries({
+          serviceNames: [serviceName],
+        });
+        if (
+          !identityIsCurrent(identity, generation) ||
+          summaryRequestRef.current !== requestVersion ||
+          modeRef.current === 'legacy'
+        ) {
+          return;
+        }
+        if (response.legacyFallback) {
+          await fetchLegacyFull({ identity, generation });
+          return;
+        }
+        if (!response.available) {
+          if (response.reason === 'not_found') {
+            reportHashMismatch(identity, generation);
+            return;
+          }
+          throw new Error(
+            `Persisted replica summary unavailable: ${response.reason || 'unknown'}`
+          );
+        }
+        const summary = (response.summaries || []).find(
+          (candidate) => candidate.name === serviceName
+        );
+        if (!summary) {
+          throw new Error('Persisted replica summary was not found');
+        }
+        if (summary.serviceHash !== serviceHash) {
+          reportHashMismatch(identity, generation);
+          return;
+        }
+        setReplicaSummary(summary);
+      } catch (error) {
+        if (
+          !identityIsCurrent(identity, generation) ||
+          summaryRequestRef.current !== requestVersion
+        ) {
+          return;
+        }
+        if (error?.code === 'SERVICE_HASH_MISMATCH') {
+          reportHashMismatch(identity, generation);
+          return;
+        }
+        console.error('Failed to fetch persisted replica summary:', error);
+        setReplicaSummaryUnavailable(true);
+      } finally {
+        if (
+          identityIsCurrent(identity, generation) &&
+          summaryRequestRef.current === requestVersion
+        ) {
+          setReplicaSummaryLoading(false);
+        }
+      }
+    },
+    [
+      fetchLegacyFull,
+      identityIsCurrent,
+      reportHashMismatch,
+      serviceHash,
+      serviceName,
+    ]
+  );
+
+  const fetchReplicaPage = useCallback(
+    async ({ identity, generation, scope, cursor = null, append = false }) => {
+      if (!identityIsCurrent(identity, generation) || !serviceHash) return;
+      const isPast = scope === PAST_REPLICA_SCOPE;
+      const requestRef = isPast ? pastRequestRef : currentRequestRef;
+      const setPage = isPast ? setPastPage : setCurrentPage;
+      const requestVersion = requestRef.current + 1;
+      requestRef.current = requestVersion;
+      setPage((previous) => ({
+        ...previous,
+        loading: !append,
+        loadingMore: append,
+        refreshUnavailable: false,
+      }));
+      try {
+        const response = await getServiceReplicas({
+          serviceName,
+          serviceHash,
+          scope,
+          limit: REPLICA_PAGE_SIZE,
+          cursor,
+        });
+        if (
+          !identityIsCurrent(identity, generation) ||
+          requestRef.current !== requestVersion ||
+          modeRef.current === 'legacy'
+        ) {
+          return;
+        }
+        if (response.legacyFallback) {
+          await fetchLegacyFull({ identity, generation });
+          return;
+        }
+        if (!response.available) {
+          if (response.reason === 'not_found') {
+            reportHashMismatch(identity, generation);
+            return;
+          }
+          throw new Error(
+            `Persisted replicas unavailable: ${response.reason || 'unknown'}`
+          );
+        }
+        if (response.serviceHash !== serviceHash) {
+          reportHashMismatch(identity, generation);
+          return;
+        }
+        const incomingIds = new Set(
+          response.replicas.map((replica) => String(replica.id))
+        );
+        const setOtherPage = isPast ? setCurrentPage : setPastPage;
+        setOtherPage((previous) => {
+          const replicas = previous.replicas.filter(
+            (replica) => !incomingIds.has(String(replica.id))
+          );
+          const removedCount = previous.replicas.length - replicas.length;
+          const total =
+            previous.total == null
+              ? null
+              : Math.max(replicas.length, previous.total - removedCount);
+          const next = {
+            ...previous,
+            replicas,
+            total,
+          };
+          if (isPast) currentPageRef.current = next;
+          else pastPageRef.current = next;
+          return next;
+        });
+        setPage((previous) => {
+          const next = {
+            replicas: append
+              ? dedupeReplicas(previous.replicas, response.replicas)
+              : response.replicas,
+            total: response.total,
+            nextCursor: response.nextCursor,
+            observedAt: response.observedAt,
+            loading: false,
+            loadingMore: false,
+            unavailable: false,
+            refreshUnavailable: false,
+          };
+          if (isPast) pastPageRef.current = next;
+          else currentPageRef.current = next;
+          return next;
+        });
+      } catch (error) {
+        if (
+          !identityIsCurrent(identity, generation) ||
+          requestRef.current !== requestVersion
+        ) {
+          return;
+        }
+        if (error?.code === 'SERVICE_HASH_MISMATCH') {
+          reportHashMismatch(identity, generation);
+          return;
+        }
+        console.error(`Failed to fetch ${scope} replicas:`, error);
+        setPage((previous) => ({
+          ...previous,
+          loading: false,
+          loadingMore: false,
+          unavailable: previous.replicas.length === 0,
+          refreshUnavailable: previous.replicas.length > 0,
+        }));
+      }
+    },
+    [
+      fetchLegacyFull,
+      identityIsCurrent,
+      reportHashMismatch,
+      serviceHash,
+      serviceName,
+    ]
+  );
+
+  useEffect(() => {
+    const identity =
+      serviceName && hasMetadata
+        ? `${serviceName}:${serviceHash ?? '<legacy>'}`
+        : null;
+    generationRef.current += 1;
+    const generation = generationRef.current;
+    identityRef.current = identity;
+    modeRef.current = serviceHash ? 'direct' : 'legacy';
+    fallbackRequestRef.current = null;
+    pastRequestedRef.current = false;
+    setLiveService(null);
+    setLiveSummaryUnavailable(false);
+    setReplicaSummary(null);
+    setReplicaSummaryUnavailable(false);
+    setLegacyService(null);
+    setCurrentPage(emptyReplicaPage());
+    setPastPage(emptyReplicaPage());
+    if (!enabled || !identity) {
+      setLiveSummaryLoading(false);
+      setReplicaSummaryLoading(false);
+      return undefined;
+    }
+    void fetchLiveSummary({ identity, generation });
+    if (!serviceHash) {
+      void fetchLegacyFull({ identity, generation });
+    } else {
+      void fetchReplicaSummary({ identity, generation });
+      void fetchReplicaPage({
+        identity,
+        generation,
+        scope: CURRENT_REPLICA_SCOPE,
+      });
+    }
+    return () => {
+      generationRef.current += 1;
+      fallbackRequestRef.current = null;
+    };
+  }, [
+    enabled,
+    fetchLegacyFull,
+    fetchLiveSummary,
+    fetchReplicaPage,
+    fetchReplicaSummary,
+    hasMetadata,
+    serviceHash,
+    serviceName,
+  ]);
+
+  const refreshReplicas = useCallback(() => {
+    const identity = identityRef.current;
+    const generation = generationRef.current;
+    if (!enabled || !identity) return Promise.resolve();
+    const requests = [fetchLiveSummary({ identity, generation, force: true })];
+    if (modeRef.current === 'legacy' || !serviceHash) {
+      requests.push(fetchLegacyFull({ identity, generation, force: true }));
+    } else {
+      requests.push(
+        fetchReplicaSummary({ identity, generation }),
+        fetchReplicaPage({
+          identity,
+          generation,
+          scope: CURRENT_REPLICA_SCOPE,
+        })
+      );
+      if (pastRequestedRef.current) {
+        requests.push(
+          fetchReplicaPage({
+            identity,
+            generation,
+            scope: PAST_REPLICA_SCOPE,
+          })
+        );
+      }
+    }
+    return Promise.allSettled(requests);
+  }, [
+    enabled,
+    fetchLegacyFull,
+    fetchLiveSummary,
+    fetchReplicaPage,
+    fetchReplicaSummary,
+    serviceHash,
+  ]);
+
+  const openPastAttempts = useCallback(() => {
+    pastRequestedRef.current = true;
+    if (
+      modeRef.current === 'legacy' ||
+      !serviceHash ||
+      pastPageRef.current.total !== null ||
+      pastPageRef.current.loading
+    ) {
+      return Promise.resolve();
+    }
+    return fetchReplicaPage({
+      identity: identityRef.current,
+      generation: generationRef.current,
+      scope: PAST_REPLICA_SCOPE,
+    });
+  }, [fetchReplicaPage, serviceHash]);
+
+  const loadMoreCurrent = useCallback(() => {
+    const cursor = currentPageRef.current.nextCursor;
+    if (
+      !cursor ||
+      currentPageRef.current.loading ||
+      currentPageRef.current.loadingMore
+    ) {
+      return Promise.resolve();
+    }
+    return fetchReplicaPage({
+      identity: identityRef.current,
+      generation: generationRef.current,
+      scope: CURRENT_REPLICA_SCOPE,
+      cursor,
+      append: true,
+    });
+  }, [fetchReplicaPage]);
+
+  const loadMorePast = useCallback(() => {
+    const cursor = pastPageRef.current.nextCursor;
+    if (
+      !cursor ||
+      pastPageRef.current.loading ||
+      pastPageRef.current.loadingMore
+    ) {
+      return Promise.resolve();
+    }
+    return fetchReplicaPage({
+      identity: identityRef.current,
+      generation: generationRef.current,
+      scope: PAST_REPLICA_SCOPE,
+      cursor,
+      append: true,
+    });
+  }, [fetchReplicaPage]);
+
+  const refreshWhenVisible = useCallback(() => {
+    void refreshReplicas();
+  }, [refreshReplicas]);
+  useVisibleRefreshInterval(
+    Boolean(enabled && serviceName && hasMetadata),
+    60 * 1000,
+    refreshWhenVisible
+  );
+
+  return {
+    liveService,
+    liveSummaryLoading,
+    liveSummaryUnavailable,
+    replicaSummary,
+    replicaSummaryLoading,
+    replicaSummaryUnavailable,
+    currentPage,
+    pastPage,
+    legacyService,
+    refreshReplicas,
+    openPastAttempts,
+    loadMoreCurrent,
+    loadMorePast,
+  };
+}
+
 function ServiceDetails() {
   const router = useRouter();
   const { service: serviceName } = router.query;
@@ -659,11 +1286,22 @@ function ServiceDetails() {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const activeServiceNameRef = useRef(serviceName);
   const isMobile = useMobile();
-  const { serviceData, loading, replicasLoading, refreshData } =
-    useServiceDetails({
-      serviceName,
-      loadFull: activeTab === 'overview',
-    });
+  const { serviceData, loading, refreshData } = useServiceDetails({
+    serviceName,
+    // Overview uses the bounded direct replica projections below. The full
+    // controller status path is reserved for capability/topology fallback.
+    loadFull: false,
+  });
+  const replicaData = useServiceReplicaData({
+    serviceName,
+    serviceHash:
+      serviceData?.name === serviceName ? serviceData.serviceHash : null,
+    metadataReady:
+      serviceData?.name === serviceName &&
+      Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
+    enabled: activeTab === 'overview',
+    onServiceHashMismatch: refreshData,
+  });
   const { replicaHistory, historyLoading, loadHistoryHours, refreshHistory } =
     useServiceHistory({
       serviceName,
@@ -693,13 +1331,60 @@ function ServiceDetails() {
   // service's snapshot or a false settled state before the new route owns the
   // page and lands its first matching response.
   const ownsRouteState = activeServiceNameRef.current === serviceName;
-  const currentServiceData =
-    ownsRouteState && serviceData?.name === serviceName ? serviceData : null;
+  const currentServiceData = useMemo(() => {
+    if (!ownsRouteState || serviceData?.name !== serviceName) return null;
+    const anchoredHash = serviceData.serviceHash;
+    const ownsIdentity = (candidate) =>
+      candidate?.name === serviceName &&
+      (!anchoredHash ||
+        !candidate.serviceHash ||
+        candidate.serviceHash === anchoredHash);
+    const persistedSummary = ownsIdentity(replicaData.replicaSummary)
+      ? replicaData.replicaSummary
+      : null;
+    const liveSummary = ownsIdentity(replicaData.liveService)
+      ? replicaData.liveService
+      : null;
+    const legacy = ownsIdentity(replicaData.legacyService)
+      ? replicaData.legacyService
+      : null;
+    const directOnlyFields = persistedSummary
+      ? {
+          currentOrUncertainCount: persistedSummary.currentOrUncertainCount,
+          pastAttemptCount: persistedSummary.pastAttemptCount,
+          replicaSummaryObservedAt: persistedSummary.observedAt,
+        }
+      : {};
+    const enriched = {
+      ...serviceData,
+      ...(persistedSummary || {}),
+      ...(liveSummary || {}),
+      ...directOnlyFields,
+      ...(legacy || {}),
+      replicas: replicaData.currentPage.replicas,
+      enrichmentUnavailable: replicaData.liveSummaryUnavailable,
+      replicaSummaryUnavailable: replicaData.replicaSummaryUnavailable,
+      pricingUnavailable:
+        !legacy &&
+        !replicaData.currentPage.loading &&
+        (replicaData.currentPage.total !== null ||
+          replicaData.currentPage.unavailable),
+      serviceYamlUnavailable: !legacy && Boolean(anchoredHash),
+    };
+    // A live controller summary settles metadata-dependent cells but cannot
+    // erase an independently landed replica summary or page.
+    if (liveSummary || legacy) enriched.metadataOnly = false;
+    return enriched;
+  }, [ownsRouteState, replicaData, serviceData, serviceName]);
   const isRouteLoading = !router.isReady || !ownsRouteState || isInitialLoad;
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
-    await Promise.all([refreshData(), refreshHistory()]);
+    await Promise.all([
+      refreshData(),
+      refreshHistory(),
+      replicaData.refreshReplicas(),
+    ]);
     setIsRefreshing(false);
   };
 
@@ -801,19 +1486,15 @@ function ServiceDetails() {
                   role="alert"
                   className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
                 >
-                  Computed replica, placement, and pricing details could not be
-                  loaded. The persisted service state and independently loaded
-                  history below are still available. Refresh to retry.
+                  Live target, request, or endpoint details could not be loaded.
+                  Persisted replica state and independently loaded history
+                  remain available. Refresh to retry.
                 </div>
               )}
               <ServiceDetailCard
                 serviceData={currentServiceData}
                 requestHistory={replicaHistory}
-                pricingLoading={
-                  replicasLoading &&
-                  (currentServiceData.summaryOnly ||
-                    currentServiceData.metadataOnly)
-                }
+                pricingLoading={replicaData.currentPage.loading}
               />
               <AcceleratorCapacityCard serviceData={currentServiceData} />
               <ServeHistorySection
@@ -824,20 +1505,79 @@ function ServiceDetails() {
               />
               <ReplicaPlacementCard
                 replicas={currentServiceData.replicas}
-                unavailable={currentServiceData.enrichmentUnavailable}
-                loading={
-                  replicasLoading &&
-                  (currentServiceData.summaryOnly ||
-                    currentServiceData.metadataOnly)
-                }
+                unavailable={replicaData.currentPage.unavailable}
+                loading={replicaData.currentPage.loading}
+                currentOnly
+                partial={Boolean(replicaData.currentPage.nextCursor)}
               />
               <ReplicasCard
-                replicas={currentServiceData.replicas}
-                unavailable={currentServiceData.enrichmentUnavailable}
-                loading={
-                  replicasLoading &&
-                  (currentServiceData.summaryOnly ||
-                    currentServiceData.metadataOnly)
+                replicas={
+                  replicaData.legacyService?.replicas ??
+                  currentServiceData.replicas
+                }
+                loading={replicaData.currentPage.loading}
+                unavailable={replicaData.currentPage.unavailable}
+                refreshUnavailable={replicaData.currentPage.refreshUnavailable}
+                currentTotal={
+                  replicaData.legacyService
+                    ? undefined
+                    : replicaData.currentPage.total
+                }
+                currentNextCursor={
+                  replicaData.legacyService
+                    ? undefined
+                    : replicaData.currentPage.nextCursor
+                }
+                currentLoadingMore={
+                  !replicaData.legacyService &&
+                  replicaData.currentPage.loadingMore
+                }
+                onLoadMoreCurrent={
+                  replicaData.legacyService
+                    ? undefined
+                    : replicaData.loadMoreCurrent
+                }
+                pastReplicas={
+                  replicaData.legacyService
+                    ? undefined
+                    : replicaData.pastPage.replicas
+                }
+                pastTotal={
+                  replicaData.legacyService
+                    ? undefined
+                    : (replicaData.pastPage.total ??
+                      replicaData.replicaSummary?.pastAttemptCount ??
+                      (replicaData.liveService
+                        ? getPastAttemptCount(currentServiceData)
+                        : null))
+                }
+                pastLoading={
+                  !replicaData.legacyService && replicaData.pastPage.loading
+                }
+                pastLoadingMore={
+                  !replicaData.legacyService && replicaData.pastPage.loadingMore
+                }
+                pastUnavailable={
+                  !replicaData.legacyService && replicaData.pastPage.unavailable
+                }
+                pastRefreshUnavailable={
+                  !replicaData.legacyService &&
+                  replicaData.pastPage.refreshUnavailable
+                }
+                pastNextCursor={
+                  replicaData.legacyService
+                    ? undefined
+                    : replicaData.pastPage.nextCursor
+                }
+                onOpenPast={
+                  replicaData.legacyService
+                    ? undefined
+                    : replicaData.openPastAttempts
+                }
+                onLoadMorePast={
+                  replicaData.legacyService
+                    ? undefined
+                    : replicaData.loadMorePast
                 }
               />
             </>
@@ -1149,7 +1889,9 @@ export function ServiceDetailCard({
                     ? deferredValue
                     : pricingLoading
                       ? 'Loading replica prices...'
-                      : '-'}
+                      : serviceData.pricingUnavailable
+                        ? 'Unavailable in bounded replica view'
+                        : '-'}
               </div>
               {hourlyCostDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">
@@ -1187,20 +1929,24 @@ export function ServiceDetailCard({
                     ? deferredValue
                     : serviceData.hourlyCostExcludedReplicaCount > 0
                       ? 'Unknown'
-                      : '-'}
+                      : serviceData.pricingUnavailable
+                        ? 'Unavailable in bounded replica view'
+                        : '-'}
               </div>
               <div className="text-xs text-gray-500 mt-1">
                 {metadataDeferred
                   ? metadataUnavailable
                     ? 'Request and pricing data are unavailable. Refresh to retry.'
                     : 'Loading request and pricing data.'
-                  : excludedCostDetails.length > 0
-                    ? serviceData.costPerThousandRequests != null
-                      ? `Known lower bound at the recent request rate · ${excludedCostDetails.join(' · ')}`
-                      : serviceData.pricedReplicaCount > 0
-                        ? `No recent request rate · ${excludedCostDetails.join(' · ')}`
-                        : `No pricing available · ${excludedCostDetails.join(' · ')}`
-                    : 'Current fleet cost at the recent request rate'}
+                  : serviceData.pricingUnavailable
+                    ? 'Pricing is not included in the bounded persisted replica projection.'
+                    : excludedCostDetails.length > 0
+                      ? serviceData.costPerThousandRequests != null
+                        ? `Known lower bound at the recent request rate · ${excludedCostDetails.join(' · ')}`
+                        : serviceData.pricedReplicaCount > 0
+                          ? `No recent request rate · ${excludedCostDetails.join(' · ')}`
+                          : `No pricing available · ${excludedCostDetails.join(' · ')}`
+                      : 'Current fleet cost at the recent request rate'}
               </div>
             </div>
             <div>
@@ -1226,6 +1972,16 @@ export function ServiceDetailCard({
                     : '-'}
               </div>
             </div>
+            {!serviceData.serviceYaml && serviceData.serviceYamlUnavailable && (
+              <div>
+                <div className="text-gray-600 font-medium text-base">
+                  SkyPilot YAML
+                </div>
+                <div className="text-base mt-1 text-gray-500">
+                  Not loaded in the bounded replica view.
+                </div>
+              </div>
+            )}
             {serviceData.serviceYaml && (
               <ServiceYamlSection serviceYaml={serviceData.serviceYaml} />
             )}
@@ -1300,8 +2056,15 @@ export function ReplicaPlacementCard({
   replicas,
   loading,
   unavailable = false,
+  currentOnly = false,
+  partial = false,
 }) {
   const rows = getReplicaPlacementBreakdown(replicas);
+  const placementColumns = currentOnly
+    ? REPLICA_PLACEMENT_COLUMNS.filter(
+        (column) => column.key !== 'historicalFailure'
+      )
+    : REPLICA_PLACEMENT_COLUMNS;
 
   return (
     <div className="mb-6">
@@ -1311,8 +2074,11 @@ export function ReplicaPlacementCard({
             Replica attempts by placement
           </h3>
           <p className="text-sm text-gray-500">
-            Selected or confirmed placement for every tracked attempt. Queued
-            intent and retained failure history are not live-machine counts.
+            {currentOnly
+              ? `Selected or confirmed placement for the ${
+                  partial ? 'loaded page of ' : 'loaded '
+                }current or uncertain replicas. These are loaded-row counts, not fleet totals.`
+              : 'Selected or confirmed placement for every tracked attempt. Queued intent and retained failure history are not live-machine counts.'}
           </p>
         </div>
         {loading && (
@@ -1331,7 +2097,7 @@ export function ReplicaPlacementCard({
                 <TableHead className="whitespace-nowrap">
                   Region / context
                 </TableHead>
-                {REPLICA_PLACEMENT_COLUMNS.map((column) => (
+                {placementColumns.map((column) => (
                   <TableHead
                     key={column.key}
                     className="whitespace-nowrap text-right"
@@ -1343,7 +2109,7 @@ export function ReplicaPlacementCard({
                   Current / uncertain
                 </TableHead>
                 <TableHead className="whitespace-nowrap text-right">
-                  Tracked attempts
+                  {currentOnly ? 'Loaded rows' : 'Tracked attempts'}
                 </TableHead>
               </TableRow>
             </TableHeader>
@@ -1353,7 +2119,7 @@ export function ReplicaPlacementCard({
                   <TableRow key={`${row.cloud}/${row.region}`}>
                     <TableCell className="font-medium">{row.cloud}</TableCell>
                     <TableCell>{row.region}</TableCell>
-                    {REPLICA_PLACEMENT_COLUMNS.map((column) => (
+                    {placementColumns.map((column) => (
                       <TableCell
                         key={column.key}
                         className={
@@ -1376,7 +2142,7 @@ export function ReplicaPlacementCard({
               ) : (
                 <TableRow>
                   <TableCell
-                    colSpan={REPLICA_PLACEMENT_COLUMNS.length + 4}
+                    colSpan={placementColumns.length + 4}
                     className="text-center py-6 text-gray-500"
                   >
                     {loading
@@ -1405,6 +2171,7 @@ const REPLICA_SORT_VALUE = {
   endpoint: (replica) => replica.endpoint,
   timeToReadySeconds: (replica) => replica.timeToReadySeconds,
   launched_at: (replica) => replica.launched_at,
+  createdAt: (replica) => replica.createdAt,
 };
 
 const replicaSortCollator = new Intl.Collator(undefined, {
@@ -1439,7 +2206,25 @@ export function sortReplicas(replicas, sortConfig) {
     .map(({ replica }) => replica);
 }
 
-export function ReplicasCard({ replicas, loading, unavailable = false }) {
+export function ReplicasCard({
+  replicas,
+  loading,
+  unavailable = false,
+  refreshUnavailable = false,
+  currentTotal,
+  currentNextCursor = null,
+  currentLoadingMore = false,
+  onLoadMoreCurrent,
+  pastReplicas,
+  pastTotal,
+  pastLoading = false,
+  pastLoadingMore = false,
+  pastUnavailable = false,
+  pastRefreshUnavailable = false,
+  pastNextCursor = null,
+  onOpenPast,
+  onLoadMorePast,
+}) {
   const [sortConfig, setSortConfig] = useState({
     key: 'id',
     direction: 'ascending',
@@ -1448,26 +2233,27 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
     () => sortReplicas(replicas, sortConfig),
     [replicas, sortConfig]
   );
-  const currentReplicas = useMemo(
-    () =>
-      sortedReplicas.filter(
-        (replica) => !REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
-      ),
-    [sortedReplicas]
-  );
-  const historicalReplicas = useMemo(
-    () =>
-      (Array.isArray(replicas) ? replicas : []).filter((replica) =>
-        REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
-      ),
-    [replicas]
-  );
+  const paginated = pastReplicas !== undefined || currentTotal !== undefined;
+  const currentReplicas = useMemo(() => {
+    if (paginated) return sortedReplicas;
+    return sortedReplicas.filter(
+      (replica) => !REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
+    );
+  }, [paginated, sortedReplicas]);
+  const historicalReplicas = useMemo(() => {
+    if (paginated) return Array.isArray(pastReplicas) ? pastReplicas : [];
+    return (Array.isArray(replicas) ? replicas : []).filter((replica) =>
+      REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
+    );
+  }, [paginated, pastReplicas, replicas]);
   const boundedHistoricalReplicas = useMemo(() => {
-    const mostRecent = [...historicalReplicas]
-      .sort((left, right) => Number(right.id) - Number(left.id))
-      .slice(0, 50);
+    const mostRecent = [...historicalReplicas].sort(
+      (left, right) => Number(right.id) - Number(left.id)
+    );
+    if (!paginated) mostRecent.splice(50);
     return sortReplicas(mostRecent, sortConfig);
-  }, [historicalReplicas, sortConfig]);
+  }, [historicalReplicas, paginated, sortConfig]);
+  const resolvedPastTotal = paginated ? pastTotal : historicalReplicas.length;
 
   const requestSort = (key) => {
     setSortConfig((current) => ({
@@ -1515,6 +2301,7 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
               {sortableHeader('Endpoint', 'endpoint')}
               {sortableHeader('Ready in', 'timeToReadySeconds')}
               {sortableHeader('Launched', 'launched_at')}
+              {sortableHeader('Created', 'createdAt')}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1541,6 +2328,8 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
                           {replica.is_spot ? ' [spot]' : ''}
                         </span>
                       </NonCapitalizedTooltip>
+                    ) : replica.directProjection ? (
+                      <span className="text-gray-400">Not loaded</span>
                     ) : (
                       '-'
                     )}
@@ -1548,11 +2337,17 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
                   <TableCell>
                     {replica.hourlyCost != null
                       ? formatUsd(replica.hourlyCost)
-                      : '-'}
+                      : replica.directProjection
+                        ? 'Not loaded'
+                        : '-'}
                   </TableCell>
                   <TableCell>{replica.region || '-'}</TableCell>
                   <TableCell>
-                    <EndpointCell endpoint={replica.endpoint} />
+                    {replica.directProjection && !replica.endpoint ? (
+                      <span className="text-gray-400">Not loaded</span>
+                    ) : (
+                      <EndpointCell endpoint={replica.endpoint} />
+                    )}
                   </TableCell>
                   <TableCell>
                     {replica.timeToReadySeconds != null ? (
@@ -1574,6 +2369,13 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
                       ? formatFullTimestamp(
                           new Date(replica.launched_at * 1000)
                         )
+                      : replica.directProjection
+                        ? 'Not loaded'
+                        : '-'}
+                  </TableCell>
+                  <TableCell>
+                    {replica.createdAt
+                      ? formatFullTimestamp(new Date(replica.createdAt * 1000))
                       : '-'}
                   </TableCell>
                 </TableRow>
@@ -1581,7 +2383,7 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
             ) : (
               <TableRow>
                 <TableCell
-                  colSpan={9}
+                  colSpan={10}
                   className="text-center py-6 text-gray-500"
                 >
                   {emptyMessage}
@@ -1598,13 +2400,26 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-lg font-semibold">Replicas</h3>
-        {loading && (
-          <span className="text-sm text-gray-500">
-            <CircularProgress size={14} className="mr-2" />
-            Loading replicas…
-          </span>
-        )}
+        <div className="text-sm text-gray-500">
+          {currentTotal != null && (
+            <span className="mr-3">
+              Showing {currentReplicas.length} of {currentTotal} current or
+              uncertain
+            </span>
+          )}
+          {loading && (
+            <span className="text-sm text-gray-500">
+              <CircularProgress size={14} className="mr-2" />
+              Loading replicas…
+            </span>
+          )}
+        </div>
       </div>
+      {refreshUnavailable && currentReplicas.length > 0 && (
+        <p className="mb-2 text-sm text-amber-700">
+          Replica refresh failed. Showing the last available page.
+        </p>
+      )}
       {renderReplicaTable(
         currentReplicas,
         loading
@@ -1613,21 +2428,65 @@ export function ReplicasCard({ replicas, loading, unavailable = false }) {
             ? 'Replica details unavailable. Refresh to retry.'
             : 'No current replicas.'
       )}
-      {historicalReplicas.length > 0 && (
-        <details className="mt-3 rounded-lg border bg-white px-4 py-3">
+      {currentNextCursor && (
+        <button
+          type="button"
+          onClick={onLoadMoreCurrent}
+          disabled={loading || currentLoadingMore}
+          className="mt-2 text-sm font-medium text-sky-blue hover:text-sky-blue-bright disabled:text-gray-400"
+        >
+          {currentLoadingMore ? 'Loading more replicas…' : 'Load more replicas'}
+        </button>
+      )}
+      {(resolvedPastTotal == null ||
+        resolvedPastTotal > 0 ||
+        historicalReplicas.length > 0) && (
+        <details
+          className="mt-3 rounded-lg border bg-white px-4 py-3"
+          onToggle={(event) => {
+            if (event.currentTarget.open) void onOpenPast?.();
+          }}
+        >
           <summary className="cursor-pointer font-medium text-gray-700">
-            Past attempts ({historicalReplicas.length})
+            {`Past attempts (${
+              resolvedPastTotal == null ? 'count loading' : resolvedPastTotal
+            })`}
           </summary>
           <p className="mb-3 mt-2 text-sm text-gray-500">
-            These terminal attempts are retained to explain automatic retries
-            and provisioning history. They do not indicate a current service
-            failure.
+            These replaced attempts are retained as diagnostic history. They do
+            not indicate a current incident while the service is meeting its
+            serving target, and no action is normally required.
           </p>
-          {renderReplicaTable(boundedHistoricalReplicas, 'No past attempts.')}
-          {historicalReplicas.length > boundedHistoricalReplicas.length && (
-            <p className="mt-2 text-sm text-gray-500">
-              Showing the 50 most recent attempts.
+          {pastRefreshUnavailable && historicalReplicas.length > 0 && (
+            <p className="mb-2 text-sm text-amber-700">
+              Past-attempt refresh failed. Showing the last available page.
             </p>
+          )}
+          {renderReplicaTable(
+            boundedHistoricalReplicas,
+            pastLoading
+              ? 'Past attempts are loading.'
+              : pastUnavailable
+                ? 'Past attempts unavailable. Refresh to retry.'
+                : 'No past attempts.'
+          )}
+          {!paginated &&
+            historicalReplicas.length > boundedHistoricalReplicas.length && (
+              <p className="mt-2 text-sm text-gray-500">
+                Showing the 50 most recent attempts.
+              </p>
+            )}
+          {pastNextCursor && (
+            <button
+              type="button"
+              onClick={onLoadMorePast}
+              disabled={pastLoading || pastLoadingMore}
+              className="mt-2 text-sm font-medium text-sky-blue hover:text-sky-blue-bright disabled:text-gray-400"
+            >
+              {pastLoadingMore
+                ? 'Loading more past attempts…'
+                : 'Load more past attempts'}
+            </button>
           )}
         </details>
       )}

@@ -43,6 +43,18 @@ class TestGetViewerAllowlist:
             'method': 'GET'
         } in allowlist
 
+    def test_serve_dashboard_replica_reads_are_on_default_allowlist(self):
+        with mock.patch('sky.skypilot_config.get_nested', return_value={}):
+            allowlist = rbac.get_viewer_allowlist()
+        assert {
+            'path': '/serve/replica-summaries',
+            'method': 'GET'
+        } in allowlist
+        assert {
+            'path': '/serve/:service_name/replicas',
+            'method': 'GET'
+        } in allowlist
+
     def test_launch_is_NOT_on_default_allowlist(self):
         with mock.patch('sky.skypilot_config.get_nested', return_value={}):
             allowlist = rbac.get_viewer_allowlist()
