@@ -2,9 +2,11 @@
 
 Status: bounded M0 and M1b contract accepted after independent adversarial
 review; M1a inert schema and dark M1b typed store implemented and locally
-verified; M2 schema, cluster identity, immutable provider contracts, and typed
-shadow-store foundations implemented and locally verified; runtime shadow
-instrumentation pending
+verified; the frozen M2 Serve032 foundation, cluster identity, immutable
+provider contracts, and typed shadow store are implemented and locally
+verified; additive Serve033 decision coverage plus the candidate-only
+Kubernetes preparation/admission handshake and execution-config boundary are
+specified but not yet implemented; runtime shadow instrumentation pending
 
 Last updated: 2026-07-31
 
@@ -75,7 +77,7 @@ if it requires the deferred platform work to become authoritative, its claimed
 
 The first program does not add:
 
-- another generic request queue, domain worker pool, or action execution lease;
+- another generic request queue, domain scheduler, or action execution lease;
 - a public resource-action CLI, SDK, or YAML contract;
 - new autoscaling, placement, rolling-update, or load-balancer policy;
 - central PostgreSQL role/ownership convergence or new migration/runtime
@@ -301,9 +303,80 @@ garbage collection cannot erase action history or fail on a reverse FK.
 Materialization inserts the attempt first and then the request and existing
 queue row in one transaction. Before a correlated terminal request becomes
 eligible for retention deletion, its terminal state, provider-operation ID,
-mutation boundary, and typed outcome must be snapshotted into the attempt.
+request-lifecycle boundary, retained provider-I/O watermark, and typed outcome
+must be snapshotted into the attempt.
 Request retention skips a correlated terminal request whose attempt is not yet
 `SETTLED`.
+
+The fixed Kubernetes topology has several externally visible effects inside
+one request attempt. Recovery must carry partial UID, handle, and job-submission
+commitments into the next effect; a terminal-only outcome is too late. Additive
+API-request revision 006 has `down_revision='005'` and therefore replaces 005
+as the one API-request lineage head. It adds no queue or table, only this
+bounded snapshot plus the nonterminal provider-I/O watermark to
+`api_resource_action_attempts`:
+
+```text
+  provider_io_boundary       TEXT not null default 'NOT_STARTED'
+                               # NOT_STARTED | INTENT_COMMITTED |
+                               # SUBMITTED_OR_AMBIGUOUS
+  provider_progress          JSONB nullable
+  provider_progress_sha256   TEXT nullable
+  provider_progress_revision BIGINT not null default 0
+```
+
+`mutation_boundary` remains the request-attempt lifecycle field from revision
+005 and may advance to `SETTLED`; `provider_io_boundary` is the monotonic
+pre-settlement watermark and is never overwritten by settlement. Before
+settlement the two fields are equal. Reduction changes only
+`mutation_boundary` to `SETTLED`, leaving `provider_io_boundary` as durable
+proof of whether provider I/O ever became possible. Revision 006 checks the
+closed watermark enum and this equality. Because a revision-005 `SETTLED` row
+has already erased the pre-settlement value, the migration first fails closed
+if any action-attempt row exists; the feature is dark before 006 and any such
+installation requires a separately reviewed evidence backfill rather than an
+invented watermark.
+
+The pair is null exactly when revision is zero; otherwise revision is positive,
+the value is an object whose stored rendering is at most 65,536 bytes, and the
+hash has the normal shape. The Serve handler binds it to the companion's closed
+`ProviderLifecycleProgressV1`, recomputes canonical bytes/hash on every read,
+and permits only its monotonic phase transitions. Claim-fenced progress writes
+lock action -> predecessor attempt when one exists -> current attempt ->
+current request, revalidate the fresh request lease after any wait, and commit
+before the next provider object or Skylet job effect. Attempt rows are locked
+in increasing attempt number, preserving the action -> attempt -> request
+class order. Progress
+survives request terminalization and is included in the reducer's immutable
+attempt snapshot. Ordinary requests and non-provider actions leave it null.
+Revision 006 is required before provider-authoritative dispatch; it is not
+needed to collect M2 legacy shadow evidence. It is PostgreSQL-only, preserves
+ordinary attempts, and refuses schema down once present; application rollback
+keeps the additive head.
+
+Provider progress is attempt-local storage for one action-wide monotonic
+provider cursor. Materializing attempt `n+1` locks the action and settled
+attempt `n` before inserting the new attempt. It rejects an unsettled
+predecessor, a predecessor cursor already at `SUCCEEDED`, or a typed outcome
+that does not authorize retry/observation. If `n` has nonnull progress, the
+typed store validates it, byte-copies its
+`ProviderLifecycleProgressV1.cursor` into `n+1`, sets the explicitly
+attempt-scoped `worker_attestation` member to null, recomputes the canonical
+envelope hash, and starts the new attempt at local progress revision one. It
+does not claim that the predecessor and successor envelope hashes are equal.
+If `n` has null progress,
+`n+1` may also start null only when
+`n.provider_io_boundary='NOT_STARTED'`; under
+the journal-before-I/O invariant that boundary value is itself the durable
+proof that no provider call was entered, while the typed outcome independently
+authorizes retry/observation. A crossed/ambiguous boundary
+with missing or regressed progress is corruption and blocks materialization.
+Within an attempt, progress revisions increase from that seed. Across attempts,
+every provider identity, partial object UID/allocation, resolved target,
+handle, deletion proof, runtime/job commitment, and effect-intent phase must be
+byte-equal to or a legal monotonic successor of the settled prior snapshot.
+The new request handler consumes only its own seeded row; it never starts from
+a caller-supplied or null cursor when prior progress exists.
 
 Attempt `n` uses request ID `str(uuid.uuid5(action_id, f'attempt:{n}'))`.
 `request_input_sha256` is SHA-256 of canonical `ResourceActionRequestInputV1`
@@ -415,28 +488,61 @@ than one class:
 1. current controller leadership/owner fence;
 2. Serve service parent and replica-incarnation rows, in canonical key order;
 3. capacity, placement, handoff, and reservation rows;
-4. shadow parent rows in canonical action-ID order;
-5. shadow child rows in `(action_id, request_sequence)` order;
-6. action row;
-7. attempt row;
-8. API request row;
-9. API request queue row; and
-10. global operational-event sequence row.
+4. worker-cohort registry rows in cohort-ID order;
+5. worker-cohort reference rows in decision-ID order;
+6. shadow coverage rows in canonical decision-ID order;
+7. coverage-only submission rows in `(decision_id, request_sequence)` order;
+8. shadow parent rows in canonical action-ID order;
+9. shadow child rows in `(action_id, request_sequence)` order;
+10. action rows in canonical action-ID order;
+11. attempt rows in `(action_id, attempt)` order;
+12. API request row;
+13. API request queue row; and
+14. global operational-event sequence row.
 
 Transactions may take a suffix or a subset and finish, but may never acquire
-an earlier class afterward. Shadow admission/completion uses classes 1-5;
-authoritative admission may continue from class 5 to class 6. Materialization
-uses 6-9. Existing generic request claim/terminalization uses only 8-10 and
+an earlier class afterward. Shadow admission/completion uses classes 1-9;
+authoritative admission may continue from class 9 to class 10. Materialization
+uses 10-13. Existing generic request claim/terminalization uses only 12-14 and
 never writes an action or attempt. Authoritative down that adopts shadow launch
-evidence locks the parent before admitting/locking its down action.
-Provider-I/O code holds none of these locks.
+evidence locks coverage and parent before admitting/locking its down action.
+Preparation-reference creation and cohort retirement may take only the cohort/
+reference suffix. Shadow or authoritative admission takes owner -> service/
+replica -> capacity -> cohort -> reference -> coverage/parent -> action.
+Retirement takes cohort then references and performs only nonlocking defensive
+reads of later-class state; it never reaches backward to service/capacity rows.
+The existing cross-process resources-file lock, when needed for launch-cap
+admission, is acquired before the short SQL transaction and released before a
+worker is authorized; it is never held during preparation, condition waits, or
+provider I/O. Provider-I/O code holds none of these locks.
+
+All deterministic action IDs and candidate immutable rows are constructed
+before action-row acquisition begins. A transaction touching multiple action
+keys iterates their sorted union. At each key, `SELECT ... FOR UPDATE`,
+insertion, or `ON CONFLICT` exact adoption is the acquisition for that key;
+insertion is never deferred until after a higher key has been locked. Candidate
+bytes derived from an optimistic source read are revalidated after the complete
+sorted acquisition, and mismatch rolls back every write.
 
 ## Journal-before-I/O and typed outcomes
 
-Before the existing high-level launch/down handler can enter provider I/O, it
-must claim-fenced-write `INTENT_COMMITTED` on the correlated attempt and verify
-the immutable provider plan/locator already committed by admission. These
-attempt writes lock action, attempt, and correlated request in that order.
+Before the existing high-level launch/down handler can enter mutating provider
+I/O, it dispatches on the current attempt's persisted progress shape. An exact
+`provider_io_boundary='NOT_STARTED'`, null progress/hash, revision-zero attempt
+uses the fresh-cursor branch—even when it is attempt `n+1` copied from a
+proved pre-I/O predecessor—and claim-fenced-writes `INTENT_COMMITTED` to both
+boundary fields plus the companion profile's first legal nonnull API006 cursor
+in one transaction after any read-only pre-observation. An exact inherited
+retry seed instead has `provider_io_boundary='NOT_STARTED'`, nonnull progress
+at local revision one, a cursor byte-equal to the locked settled predecessor,
+null worker attestation, and null current-attempt provider operation ID; it
+atomically writes `INTENT_COMMITTED` to both boundary fields and binds the
+current worker attestation to that validated cursor. Both branches verify the
+immutable provider plan/locator already committed by admission. An
+authoritative attempt can never have
+`provider_io_boundary != NOT_STARTED` with null provider progress. These
+attempt writes lock action, predecessor attempt when present, current attempt,
+and correlated request in that order.
 After any lock wait they use a fresh database-clock statement and revalidate
 the exact correlation, `RUNNING` state, execution generation, claim token,
 worker, current owner fence, and unexpired lease. They update and commit before
@@ -466,6 +572,7 @@ ServeReplicaActionOutcomeV1 = {
                "observation_required",
   retry_after_seconds: null | NonnegativeInteger,
   observation: null | ProviderLifecycleObservationV1,
+  supersession_quiescence: null | ProviderLaunchSupersessionQuiescenceV1,
   normalized_message: null | Text
 }
 ```
@@ -473,6 +580,11 @@ ServeReplicaActionOutcomeV1 = {
 Provider error strings are diagnostic only. The closed disposition/certainty/
 retry fields authorize state transitions. Secrets, credentials, raw tracebacks,
 and unbounded provider payloads are redacted before persistence.
+`supersession_quiescence` is null except for a launch cancellation being
+handed to a real down action; the companion defines its closed proof, and the
+Serve transaction byte-compares it to the final attempt cursor/request fence.
+When nonnull it requires `disposition='cancelled'`, `certainty='observed'`, and
+no retry class/deadline; it cannot make the old launch successful.
 
 Shadow JSON fields are bound to named closed types, not merely size/hash
 checks. `actual_outcome` and `proposed_outcome` are
@@ -520,24 +632,52 @@ typed code owns the complete nested contract.
 An action-correlated `sky.launch` or `sky.down` request keeps its existing
 `ReplayPolicy.NEVER` behavior. PR #1070 may complete or fence that one request,
 but no terminal request is refreshed as the same action attempt. A lease loss
-after the mutation boundary terminalizes the request as ambiguous. Any retry
+after the provider-I/O watermark crosses `NOT_STARTED` terminalizes the request
+as ambiguous. Any retry
 is action attempt `n+1`, whose handler observes the frozen target before it may
 mutate. The controller-action reservation table remains orthogonal: it keeps
 fencing non-replayable controller-class requests, while these launch/down
 requests use the normal executor class and the action-attempt correlation.
 
-When the correlated request becomes terminal, terminalization snapshots the
-claim-fenced attempt evidence. One reducer transaction then locks the current
-Serve controller leadership row, action, attempt, and matching Serve
-replica/capacity rows in that order. It revalidates request/attempt identity,
-action revision, and the replica's current action link/teardown generation,
-then does exactly one of:
+Generic request terminalization updates only the request, queue, and existing
+operational event; it does not acquire action/attempt/domain locks or snapshot
+action evidence. Request terminal states are immutable. A later reducer
+transaction takes the lock classes above through the attempt row, then reads
+the correlated request without `FOR UPDATE`. Under PostgreSQL `READ COMMITTED`,
+an uncommitted terminal transition is seen as nonterminal and reduction simply
+retries later. Once terminal, the reducer validates the correlation and
+request-input hash, derives the bounded typed outcome, and snapshots terminal
+state/outcome/provider evidence into the attempt while updating the action and
+Serve state atomically. Request GC cannot remove the source row before this
+snapshot because both its candidate query and delete predicate exclude an
+unsettled correlated attempt.
+
+The reducer transaction locks current Serve controller leadership, matching
+service/replica rows, matching capacity/reservation rows, the frozen cohort and
+same-ID reference, action, and attempt in that order. It revalidates action revision and the replica's current action
+link/teardown generation, then does exactly one of:
 
 - commit Serve success projection and action `TERMINAL`;
-- commit a retry result, increment no attempt yet, set action `READY`, and set
-  `next_attempt_at` from PostgreSQL time plus the domain-classified delay;
+- commit a retry result only after validating either (a) a nonnull legal
+  inheritable provider cursor or (b) the exact pre-I/O shape
+  `provider_io_boundary='NOT_STARTED'`, null provider progress/progress hash,
+  progress revision zero, and null provider operation ID. For (a), a
+  `NOT_STARTED` watermark is legal only for the exact inherited pre-I/O seed:
+  local revision one, cursor byte-equal to the locked predecessor, null worker
+  attestation, and null current-attempt provider operation ID. Both shapes
+  require a typed outcome that independently authorizes retry or observation.
+  A crossed provider-I/O watermark with null progress, or any malformed or
+  predecessor-mismatched `NOT_STARTED` seed, is corruption and blocks
+  reduction. For either legal shape, increment no attempt yet, set action
+  `READY`, and set `next_attempt_at` from PostgreSQL time plus the
+  domain-classified delay;
 - commit `BLOCKED` for an identity conflict or quarantine requiring repair; or
 - commit a terminal error/cancellation and the legal Serve failure projection.
+
+A terminal action transition also changes its exact `ACTION_ACTIVE` reference
+to `RELEASED` in that transaction after proving every correlated attempt/request
+settled. `READY` and `BLOCKED` retain the active reference because later retry or
+operator repair can still require the frozen worker cohort.
 
 The reducer borrows the caller's SQLAlchemy `Connection`; it never opens a
 second transaction for Serve state. Same-state replay with the same committed
@@ -582,37 +722,178 @@ Down is admitted only after Serve policy has durably committed the replica's
 teardown generation. Retries target the frozen locator; they do not recompute a
 cluster from display name. A provider delete acknowledgement is not success.
 The action becomes terminal only after the companion profile proves the exact
-resource absent (or proves a different incarnation occupies the name while the
-target UID is absent). Recoverable uncertainty returns to observation-first
-`READY` with a database-clock deadline and retries indefinitely. `BLOCKED` is
-reserved for a conflict/quarantine that requires repair; there is no cleanup
-give-up deadline.
+resource absent by exact NotFound reads for every frozen object name. A
+same-name replacement or different identity is a conflict, never an alternate
+absence proof. Recoverable uncertainty returns to observation-first `READY`
+with a database-clock deadline and retries indefinitely. `BLOCKED` is reserved
+for a conflict/quarantine that requires repair; there is no cleanup give-up
+deadline.
 
-A down action may supersede an unsubmitted launch of the same replica
-incarnation. Once a launch mutation boundary may have been crossed, down first
-observes/reduces that attempt and then targets the resulting exact resource.
-This is Serve-specific precedence through the replica's launch/down action
-links and teardown generation, not a generic dependency graph. A late launch
-reducer cannot project the replica READY after the teardown generation wins.
+A launch whose provider-I/O watermark never crossed `NOT_STARTED` is not
+superseded by a down action.
+After any correlated request is terminal and fenced with no active claim, the
+Serve transaction revalidates either no materialized attempt or an exact
+`provider_io_boundary='NOT_STARTED'` attempt with null API006 progress and
+null provider-operation evidence. An inherited nonnull cursor is therefore
+never a `CANCELLED_NO_EFFECT` proof even when no I/O occurred in its current
+attempt. The transaction terminalizes the launch as
+`CANCELLED_NO_EFFECT`, releases its counted `PROVISIONING` slot and exact
+action-owned capacity/reservation claim and `ACTION_ACTIVE` cohort reference
+once, and removes the action-owned provisional replica row under the owner/
+incarnation fence. It creates no down
+action, down link, cleanup target, or prior-launch basis. Lost-response replay
+adopts that one terminal projection and cannot release capacity twice.
+
+A real down action may supersede a nonterminal launch of the same replica
+incarnation only after its provider-I/O watermark crossed. Request fencing alone is
+not a quiescence proof: the old launch remains observation-only authority until
+every emitted Kubernetes/Skylet effect intent has exact committed effect
+evidence, a companion-defined definitive-no-effect completion proving the
+entered call cannot later take effect, or authoritative proof that the call was
+never entered, and no handler/claim can still emit it. In particular, an
+unresolved `CREATE_INTENT` or `JOB_INTENT` cannot hand off; it remains
+observation-first until exact evidence advances the cursor or the provider
+contract proves the effect cannot still take place. A point-in-time NotFound
+never supplies that proof.
+
+Only after the handler has reconciled every effect entry may its result be
+terminalized and fenced. Request terminalization closes the companion's typed
+supersession-quiescence envelope with its terminal/no-active-claim facts; the
+reducer validates that proof against the exact API006 cursor before copying it
+to the attempt. The Serve transaction sets
+the old launch to `kernel_state='TERMINAL'` with
+`terminal_disposition='SUPERSEDED_TO_DOWN'`, commits the teardown generation
+and real down action link, and freezes either the completed-launch basis or the
+typed partial-launch cleanup basis from the exact API006 cursor and quiescence
+evidence. The down uses
+the normal PR #1070 request/claim path to exact-read all three names, extend
+only unknown UID commitments, UID-precondition-delete matching objects, prove
+all three absent, and remove any byte-equal same-UUID cluster row. There is no
+hidden provider cleanup inside a launch retry and no second scheduler. A
+replan launches only after this real down action succeeds. This is
+Serve-specific precedence through the replica links and teardown generation,
+not a generic dependency graph. A late launch reducer cannot project the
+replica READY after the teardown generation wins.
 
 Reducer guards are action-specific and fail closed. Launch success requires a
-matching authoritative `present` observation and the profile's readiness
-proof. Down success requires a matching authoritative `absent` observation.
+matching authoritative `present` observation and an API006
+`ProviderLifecycleProgressV1.cursor` at `SUCCEEDED` whose exact handle, runtime,
+durably running same-key Skylet job, and endpoint evidence satisfy the
+companion's launch-readiness proof. Down success requires a cursor at
+`SUCCEEDED` reachable only through `TARGET_RESOLVED ->
+(DELETE_INTENT(role) -> DELETE_PARTIAL)* -> ABSENCE_EXACT ->
+HANDLE_REMOVE_INTENT -> HANDLE_REMOVED -> SUCCEEDED`, retaining the exact cleanup target,
+handle-removal proof, and authoritative `absent` observation required by those
+transitions.
 Provider acknowledgement alone terminalizes neither. Cancellation after
 `INTENT_COMMITTED` remains ambiguous until observation makes a terminal
 projection safe.
 
 ## Serve integration
 
-Serve migration 032 is additive. It adds:
+Serve migrations 032 and 033 are additive. The already-frozen revision 032
+adds:
 
 - `services.resource_action_mode` with permanent `legacy` default and
   `resource_action_mode_changed_at` for the promotion window;
 - nullable `replica_incarnation`, `desired_generation`,
   `sky_cluster_record_uuid`, current launch/down action IDs, and current
-  launch/down shadow-sample IDs on replicas;
-  and
-- bounded logical-sample and per-legacy-request-attempt shadow tables.
+  launch/down represented-sample IDs on replicas; and
+- bounded logical-sample and represented per-legacy-request-attempt shadow
+  tables.
+
+Revision 033 has `down_revision='032'`. It adds the two nullable replica
+coverage-link columns on both supported Serve dialects. On PostgreSQL only, it
+creates the worker-cohort registry/reference, decision-coverage, and coverage-
+only submission tables, their checks and indexes, explicitly adds
+`shadow_samples.would_be_action_id -> shadow_coverage.decision_id ON DELETE
+RESTRICT`, adds nullable pair-checked `legacy_effect_trace`/hash columns to the
+represented-attempt table, and updates the replica checks and partial unique
+indexes. It does
+not depend on `metadata.create_all(checkfirst=True)` to alter an existing
+table. Because no runtime shadow writer has ever been activated on revision
+032, the 033 transaction first asserts that both existing shadow tables are
+empty. A nonempty installation fails closed for a separately reviewed
+backfill; migration never synthesizes coverage for prior samples. Revision 032
+is not rewritten and neither revision supports schema down.
+
+The two nonexecuting cohort-retention tables are:
+
+```text
+serve_resource_action_worker_cohorts
+  cohort_id                 TEXT primary key
+  deployment_uid            TEXT not null unique
+  cohort_identity           JSONB not null
+  cohort_identity_sha256    TEXT not null
+  registration_attestations JSONB not null
+  registration_attestations_sha256 TEXT not null
+  lifecycle_state           TEXT not null
+                              # REGISTERING | ACCEPTING | DRAINING |
+                              # REMOVAL_AUTHORIZED | RETIRED
+  revision                  BIGINT not null
+  created_at                TIMESTAMPTZ not null
+  state_changed_at          TIMESTAMPTZ not null
+  retired_at                TIMESTAMPTZ nullable
+
+serve_resource_action_worker_cohort_refs
+  decision_id               UUID primary key
+  cohort_id                 TEXT not null references
+                              serve_resource_action_worker_cohorts(cohort_id)
+                              on delete restrict
+  service_hash              TEXT not null
+  replica_incarnation       UUID not null
+  desired_generation        BIGINT not null
+  action_type               TEXT not null
+  controller_owner_fence    TEXT not null
+  lifecycle_epoch           BIGINT not null
+  reference_state           TEXT not null
+                              # PREPARING | SHADOW_ACTIVE |
+                              # ACTION_ACTIVE | RELEASED
+  revision                  BIGINT not null
+  created_at                TIMESTAMPTZ not null
+  bound_at                  TIMESTAMPTZ nullable
+  released_at               TIMESTAMPTZ nullable
+```
+
+`cohort_identity` is the complete bounded
+`ProviderAuthorityWorkerCohortV1`; typed insert/adopt/read recomputes its
+canonical hash. Each ID permanently names one Deployment UID and identity and
+is never reused. `registration_attestations` is the companion's bounded
+`ProviderAuthorityWorkerRegistrationSetV1`; typed writes recompute its hash and
+permit only distinct, current Pod registrations for the immutable cohort.
+Insertion creates `REGISTERING`, never `ACCEPTING`. `REGISTERING -> ACCEPTING`
+requires exactly two matching ready-worker attestations and the exact
+Deployment's current observed generation with desired/ready/available replicas
+all two. Normal retirement is `ACCEPTING -> DRAINING -> REMOVAL_AUTHORIZED ->
+RETIRED`. A never-accepted failed cohort may take `REGISTERING ->
+REMOVAL_AUTHORIZED`; rollback takes `DRAINING -> ACCEPTING` only in the same
+transaction that replaces the registration set with two current matching
+attestations while the exact Deployment and ServiceAccount still exist. New
+references require the locked cohort to be `ACCEPTING`; existing references
+remain executable while it is `DRAINING`.
+Reference transitions are `PREPARING -> SHADOW_ACTIVE |
+ACTION_ACTIVE | RELEASED`, then either active state to `RELEASED`; no reverse
+transition exists. Rows authorize no execution, claim, retry, or due work. No
+timeout alone releases a reference, and cohort tombstones remain permanently.
+Row-local checks enforce canonical UUID/generation/hash/state/timestamp shapes;
+typed code enforces the complete transition graph. A partial index on
+`(cohort_id, decision_id)` for `reference_state != 'RELEASED'` drives retirement,
+and registry state has its own operational index. `REMOVAL_AUTHORIZED` requires
+zero active references plus a defensive scan finding no nonterminal action,
+private shadow request, or shadow evidence carrying that cohort without a
+matching active reference. `RETIRED` additionally requires exact Deployment
+and ServiceAccount NotFound after authorized removal. That check is performed
+by the still-running API-role retirement verifier, not by the removed cohort.
+The current chart retains tombstone-scoped GET permission for the two exact
+names through this check and prunes it only after the `RETIRED` commit.
+
+The preparation reference snapshots the exact controller owner fence and
+lifecycle epoch used by its one-use authorization. Releasing `PREPARING`
+requires either the same live cell to close its nonce or an owner-fenced
+recovery transaction to prove the stored fence/epoch stale (advancing the epoch
+when needed), plus absence of coverage, action, and private request state. Thus
+an old cell cannot receive valid authorization after its retention fence is
+released.
 
 The existing-row additions are exactly:
 
@@ -627,6 +908,8 @@ replicas
   sky_cluster_record_uuid           UUID nullable
   launch_action_id                  UUID nullable
   down_action_id                    UUID nullable
+  launch_shadow_coverage_id         UUID nullable
+  down_shadow_coverage_id           UUID nullable
   launch_shadow_sample_id           UUID nullable
   down_shadow_sample_id             UUID nullable
 ```
@@ -639,9 +922,9 @@ inventory, and milestone gates; table defaults or a bare SQL update do not
 activate behavior.
 
 The common services/replicas metadata remains usable by local SQLite Serve
-databases, whose rows stay `legacy`: revision 032 adds the inert existing-table
-columns on both supported Serve dialects so current metadata remains queryable,
-but creates neither shadow table on SQLite. The shadow tables and every
+databases, whose rows stay `legacy`: revisions 032 and 033 add only their inert
+existing-table columns on both supported Serve dialects so current metadata
+remains queryable, but create no shadow table on SQLite. The shadow tables and every
 action-aware helper are PostgreSQL-only and fail closed on another dialect. A
 separate SQLAlchemy metadata owns those tables so revision 001/current-Base
 bootstrap cannot accidentally create them in a fresh SQLite database. Existing
@@ -651,20 +934,128 @@ the three identity fields together, with generation one. Row-local checks
 require the identity triple to be all null or all nonnull, a positive
 generation, and an identity for every nonnull action or shadow link. For each
 action kind, the authoritative and shadow link cannot both be nonnull. Partial
-unique indexes prevent one action ID, shadow ID, replica incarnation, or
-cluster-record UUID from being attached to multiple live rows. There is no
+unique indexes prevent one action ID, coverage ID, sample ID, replica
+incarnation, or cluster-record UUID from being attached to multiple live rows.
+A shadow sample link requires the matching coverage link, while a durable
+`NOT_REPRESENTABLE` decision has only the coverage link. There is no
 Serve-to-API foreign key because supported deployments may keep the two state
 stores separate; consolidated PostgreSQL on one physical connection is checked
 at runtime before authority.
 
 The new identity, generation, provider-target, and action/shadow-link columns
 are action-owned. Existing generic replica upserts currently replace every
-non-primary-key column from `EXCLUDED`; Serve032 changes all ordinary, batch,
+non-primary-key column from `EXCLUDED`; Serve032 and Serve033 change all ordinary, batch,
 paid-capacity, and reserved-fill conflict updates to exclude the action-owned
 set. Legacy inserts may still create null action fields, but routine status
 persistence can never erase or replace an existing identity/link. Only typed,
 owner-fenced transition/admission methods may initialize an identity, advance
 a generation, or change its current link.
+
+The coverage table is one immutable row for every capacity-approved launch or
+durably admitted teardown decision made while a service is in `shadow`,
+including a decision that cannot produce a provider invocation. Its
+`decision_id` is exactly the `action_id` UUIDv5 derived from the
+provider-independent `ResourceActionIdentityV1` above, not a second identity.
+The manager mints the replica incarnation/generation in the in-memory decision
+draft before preparation; admission persists or discards that draft atomically.
+
+The exact coverage shape is:
+
+```text
+serve_resource_action_shadow_coverage
+  decision_id               UUID primary key
+  service_name              TEXT not null
+  service_hash              TEXT not null
+  service_incarnation       UUID not null
+  replica_id                BIGINT not null
+  replica_incarnation       UUID not null
+  desired_generation        BIGINT not null
+  action_type               TEXT not null
+  normalizer_contract_version SMALLINT not null  # 1
+  normalization_outcome     TEXT not null  # REPRESENTABLE | NOT_REPRESENTABLE
+  not_representable_reason  TEXT nullable
+  worker_cohort_ref_id      UUID nullable references
+                              serve_resource_action_worker_cohort_refs(decision_id)
+                              on delete restrict
+  admitted_at               TIMESTAMPTZ not null
+
+  unique (service_hash, service_incarnation, replica_id,
+          replica_incarnation, desired_generation, action_type)
+```
+
+`REPRESENTABLE` requires a null reason; `NOT_REPRESENTABLE` requires one closed
+reason from the companion provider contract. The row stores no raw request,
+YAML, configuration, hash of secret-bearing input, or free-form detail. Typed
+insert, read, and replay recompute
+`decision_id = UUIDv5(ResourceActionIdentityV1)` and require the same identity,
+contract version, outcome, and reason; they never change a reason or convert an
+unsupported row into a represented row in place. A changed decision advances
+generation. PostgreSQL CHECKs enforce only row-local bounds and enums,
+canonical `service_hash = service_incarnation::text`, positive generation, and
+the outcome/reason pairing; PostgreSQL does not recompute UUIDv5. Indexes cover
+the service promotion window, every `NOT_REPRESENTABLE` row, and unlinked
+retention. Typed-boundary tests supply a wrong UUID for otherwise valid fields
+and require rejection.
+
+A coverage row routed through `serve_shadow_candidate_launch` or
+`serve_shadow_candidate_down` requires `worker_cohort_ref_id=decision_id` and a
+locked `SHADOW_ACTIVE` reference. Typed request binding requires its decision
+ID, cohort ID, Deployment UID, complete resolved-cohort identity, and internal
+request payload to agree. A represented parent carries that same resolved
+cohort inside its immutable spec. An authoritative action instead requires the
+same-ID reference in `ACTION_ACTIVE`; changing the frozen cohort changes the
+immutable provider plan and therefore requires a new desired generation and
+decision ID.
+
+A representable decision's shadow parent has that same `decision_id` as
+`would_be_action_id` and references coverage with `ON DELETE RESTRICT`; coverage
+is inserted first. Its replica coverage and sample links therefore contain the
+same UUID. A not-representable decision has only the coverage link and no fake
+parent. Coverage is immutable after insert.
+
+A not-representable decision uses a provider-neutral submission ledger rather
+than a fake provider parent:
+
+```text
+serve_resource_action_shadow_coverage_attempts
+  decision_id               UUID not null references
+                              serve_resource_action_shadow_coverage(decision_id)
+                              on delete cascade
+  request_sequence          INTEGER not null
+  logical_attempt           INTEGER not null
+  request_role              TEXT not null  # PRIMARY_LAUNCH | PRIMARY_DOWN |
+                                             LAUNCH_CLEANUP_DOWN
+  phase                     TEXT not null  # PRE_SUBMIT | REQUEST_BOUND |
+                                             COMPLETE | ABANDONED_PRE_SUBMIT |
+                                             REQUEST_ASSOCIATION_UNKNOWN
+  legacy_request_id         TEXT nullable
+  terminal_request_status   TEXT nullable  # SUCCEEDED | FAILED | CANCELLED
+  retry_disposition         TEXT nullable  # RETRY_SAME_DECISION | TERMINAL |
+                                             REPLAN_NEW_GENERATION | BLOCK
+  admitted_at               TIMESTAMPTZ not null
+  request_bound_at          TIMESTAMPTZ nullable
+  completed_at              TIMESTAMPTZ nullable
+  updated_at                TIMESTAMPTZ not null
+
+  primary key (decision_id, request_sequence)
+  unique (legacy_request_id) where legacy_request_id is not null
+```
+
+This ledger stores no invocation, provider plan/outcome, raw error, config,
+request bytes, or secret-bearing hash. Its phase checks mirror the represented
+attempt table. `PRE_SUBMIT` has no ID/completion; `REQUEST_BOUND` has a real
+ID/bind time and no completion; `COMPLETE` has ID/bind/completion and closed
+terminal/retry fields; `ABANDONED_PRE_SUBMIT` has the proved-no-call shape; and
+`REQUEST_ASSOCIATION_UNKNOWN` has no ID and is permanently
+promotion-blocking. Counters are positive, and each table has its own partial
+unique request-ID index. Typed binding first locks the applicable
+already-created `PRE_SUBMIT` evidence row, then locks the exact API request
+row. While holding that request row as the cross-table serialization key, it
+performs nonlocking reads of both attempt tables, validates that no other row
+owns the ID, and writes the applicable row. Every binder follows this protocol,
+so a waiter observes the winner after acquiring the request lock without
+taking an earlier-class row lock. A partial stale index covers `PRE_SUBMIT` and
+`REQUEST_BOUND`.
 
 The logical table is one row per would-be action, keyed by its deterministic
 `would_be_action_id`. It stores the complete canonical action identity,
@@ -682,7 +1073,8 @@ The exact parent shape is:
 
 ```text
 serve_resource_action_shadow_samples
-  would_be_action_id        UUID primary key
+  would_be_action_id        UUID primary key references
+                              serve_resource_action_shadow_coverage(decision_id)
   service_name              TEXT not null
   service_hash              TEXT not null
   service_incarnation       UUID not null
@@ -734,11 +1126,12 @@ pre/post observations, provider correlation evidence, phase, and timestamps.
 Its phases are `PRE_SUBMIT`, `REQUEST_BOUND`, `COMPLETE`,
 `ABANDONED_PRE_SUBMIT`, and `REQUEST_ASSOCIATION_UNKNOWN`. A partial unique
 index prevents a real request ID from belonging to two attempts. A foreign key
-with `ON DELETE CASCADE` points to the logical sample because both shadow tables
-share one retention boundary; typed retention first proves that the parent is
-unreferenced and outside every protected window. Neither table references a
-service, replica, API request, or real action, so the evidence survives deletion
-and request garbage collection.
+with `ON DELETE CASCADE` points to the logical sample because the sample and
+attempts share one retention boundary; the sample's restrictive coverage
+foreign key is removed only by typed retention after all live replica links and
+protected windows are gone. None of the four evidence tables references a service,
+replica, API request, or real action, so the evidence survives row deletion and
+request garbage collection.
 
 The exact child shape is:
 
@@ -764,6 +1157,8 @@ serve_resource_action_shadow_attempts
   pre_observation_sha256    TEXT nullable
   post_observation          JSONB nullable
   post_observation_sha256   TEXT nullable
+  legacy_effect_trace       JSONB nullable
+  legacy_effect_trace_sha256 TEXT nullable
   divergence_class          TEXT nullable
   admitted_at               TIMESTAMPTZ not null
   request_bound_at          TIMESTAMPTZ nullable
@@ -774,14 +1169,20 @@ serve_resource_action_shadow_attempts
   unique (legacy_request_id) where legacy_request_id is not null
 ```
 
-Both counters are positive. Every JSON/hash pair is pair-null and canonically
-bounded. `REQUEST_BOUND` requires API-request execution, a real ID and bind
+Both counters are positive. Every JSON/hash pair, including the companion's
+closed `LegacyProviderEffectTraceV1`, is pair-null and canonically bounded.
+`REQUEST_BOUND` requires API-request execution, a real ID and bind
 timestamp, and no completion timestamp. `COMPLETE` requires a completion
 timestamp and, for API-request execution, a real ID/bind timestamp.
 `ABANDONED_PRE_SUBMIT` requires no request ID, operation ID, actual outcome, or
 post-observation. `REQUEST_ASSOCIATION_UNKNOWN` requires API-request execution,
 a null request ID, and a completion timestamp. `legacy_direct_down` may finish
-without an ID but is always divergent/promotion-blocking. Contiguous sequence
+without an ID but is always divergent/promotion-blocking. For a represented
+Kubernetes candidate, typed completion requires a nonnull
+`LegacyProviderEffectTraceV1`; `MATCH` additionally requires the exact effect
+sequence/body/job equality from the companion contract. SQL enforces only the
+pair-null shape because profile-specific trace validation belongs to typed
+code. Contiguous sequence
 allocation, write-once request/provider IDs, exact replay, and parent
 finalization only after all children are terminal are enforced by typed
 transaction methods rather than triggers.
@@ -804,20 +1205,107 @@ nonmatching, or unsupported row, and a completed-retention index on
 `(completed_at, would_be_action_id)`. The child has a partial stale-work index
 on `(phase, admitted_at, would_be_action_id, request_sequence)` for
 `PRE_SUBMIT` and `REQUEST_BOUND`, in addition to the partial unique request-ID
-index. `divergence_class`, when nonnull, is one of the parent divergence enums
-other than `PENDING`, `MATCH`, `ABANDONED`, and `AMBIGUOUS`.
+index. Coverage has a promotion index on
+`(service_name, service_hash, admitted_at, decision_id)` and a partial blocker
+index for `normalization_outcome='NOT_REPRESENTABLE'`.
+`divergence_class`, when nonnull, is one of the parent divergence enums other
+than `PENDING`, `MATCH`, `ABANDONED`, and `AMBIGUOUS`.
 
 Admission uses one physical PostgreSQL connection. In authoritative mode the
-transaction that changes replica/capacity intent also inserts/adopts the action
-and links its ID. If either write fails, neither commits.
+transaction that changes replica/capacity intent also locks the complete
+resolved cohort and same-ID preparation reference, changes `PREPARING ->
+ACTION_ACTIVE`, inserts/adopts the action, and links its ID. If any write fails,
+none commits.
 
-In shadow mode the legacy thread remains the sole mutation owner. Before every
-eligible legacy launch/down enqueue, the same transaction that persists the
-replica/capacity intent inserts or exactly adopts the logical `PENDING` sample.
-Ordinary, paid-capacity, and reserved-fill admission borrow that transaction;
-denial commits neither intent nor sample. Teardown admission advances the
-generation and inserts the down sample in the transaction that durably commits
-the teardown intent.
+In shadow mode the legacy thread remains the sole mutation owner. Every
+capacity-approved launch and every durably admitted teardown first writes its
+coverage row in the same transaction as replica/capacity intent. A represented
+decision also inserts or exactly adopts the logical `PENDING` sample and links
+both IDs; a not-representable decision links only coverage and stays on the
+legacy path. Ordinary, paid-capacity, and reserved-fill admission borrow that
+transaction; denial commits no replica intent, coverage, parent, or link.
+Teardown admission advances the generation and records coverage, plus a parent
+when represented, in the transaction that durably commits teardown intent.
+
+Resource-action launch and down preparation use an explicit one-shot handshake;
+creating a preparation worker is not provider enqueue. For launch, the manager first chooses a
+provisional placement and preallocates the replica-incarnation and
+cluster-record UUIDs in memory. It selects the rendered active manifest, then
+in a suffix-only transaction locks the matching complete, attested `ACCEPTING`
+cohort row and inserts or exactly adopts the decision's `PREPARING` reference.
+Only then may a bounded preparation worker, separate from the provider-submit
+semaphore, call private preflight, resolve the retained source, and produce
+either a canonical `PreparedProviderLaunchV1` capsule or the companion's closed
+not-representable result. It has no SDK mutation callable and cannot enter
+`_launch_thread_pool`. Failure to acquire the reference closes the mutation
+gate. No PostgreSQL row lock is held during preflight, policy/config projection,
+Kubernetes reads, file work, or a preparation-queue wait.
+
+Down uses the same retention fence before its private preflight. From an
+optimistic retained-launch/replica snapshot, the manager constructs the down
+identity, frozen target, and prior-basis candidate, selects the rendered active
+manifest, and inserts/exactly adopts its `PREPARING` reference under the locked
+`ACCEPTING` cohort. Down admission later locks service -> replica -> applicable
+capacity/reservation -> cohort -> reference -> coverage/optional parent ->
+action, revalidates every optimistic
+source byte under the canonical action-row order, and atomically changes the
+reference to `SHADOW_ACTIVE` or `ACTION_ACTIVE`. It creates no launch slot or
+capacity reservation. Failure or denial releases only with the same proved
+pre-call/owner fence as launch.
+
+The manager then runs one short transaction whose locking order is service ->
+replica -> capacity -> cohort -> reference -> coverage -> optional parent.
+After those locks it changes `PREPARING -> SHADOW_ACTIVE`, writes coverage with
+the reference FK, then the same-ID parent when representable, and links. It revalidates
+service ownership and lifecycle epoch, the provisional placement, and any
+paid/reserved capacity fence. An approved launch also persists
+`sky_launch_status=RUNNING` and the derived indexed
+`replicas.status='PROVISIONING'` in that same commit. That is the exact state
+counted by `in_flight_launch_count()`, so the provider slot is durably occupied
+before either the cross-process resources-file lock or SQL locks are released.
+The manager increments its same-tick local in-flight delta only after this
+commit. For action-aware entries, launch-cap evaluation under the cross-process
+resources-file lock reads the indexed PostgreSQL `PROVISIONING` rows. The same-
+tick local delta is keyed by decision ID and contains only committed IDs absent
+from the manager snapshot being counted; snapshot adoption removes them exactly
+once, and counts deduplicate by decision ID. Process-local state is never the
+cross-process capacity authority. On denial it tells the worker to discard the
+preparation and closes its context; the same transaction changes the
+`PREPARING` reference to `RELEASED`, and writes no replica, slot, coverage,
+parent, or link.
+
+After commit or exact lost-commit readback, the manager sends a one-use
+authorization containing the service hash, lifecycle epoch, decision ID, a
+process-local unguessable preparation nonce, and, when represented, the exact
+stored spec and invocation hashes. Only after receiving that authorization may
+the worker enter the existing provider-submit pool. A commit-before-signal
+crash intentionally leaves a counted `PROVISIONING` slot. Owner-fenced recovery
+either re-prepares and adopts it, or commits proved pre-call abandonment/failure
+together with capacity release and slot removal. No elapsed-time-only cleanup
+may clear the slot. Thus a preparation task may exist before durable admission,
+but no legacy mutation is runnable or queued before coverage, replica intent,
+and the counted slot commit.
+
+For a represented decision, durable authority is the full stored canonical
+`ServeReplicaActionSpecV1`: its `ProviderLifecyclePlanV1` and
+`ProviderLifecycleInvocationV1`, including retained-source,
+execution-config/scope, template/inventory references, and their hashes.
+`request_payload_sha256` remains exactly the invocation hash. A
+`PreparedLaunchRequest`, generic HTTP/request-body bytes, credentials, and
+transport ephemera are neither persisted nor hashed and are not durable
+authority. The live worker projects its process-local request back to the
+stored invocation immediately before `PRE_SUBMIT`. Cross-process recovery
+rebuilds only from the retained source and must reproduce the complete stored
+spec/invocation byte-for-byte. A mismatch abandons or blocks that generation;
+it never submits altered input under the old identity.
+
+For a not-representable decision, reason equality is only coverage evidence and
+grants no cross-process replay authority. The prepared legacy request may be
+used only by the same live preparation cell named by the unguessable nonce. If
+that cell dies before a coverage-attempt `PRE_SUBMIT` exists, owner-fenced
+recovery records proved pre-call abandonment, releases the old counted slot,
+advances generation, and prepares anew. If a `PRE_SUBMIT` exists, the
+submission is ambiguous and the no-blind-replay rules below apply.
 
 Paid-capacity and reserved-fill admission preserve the global lock order rather
 than appending shadow writes to their current capacity-first transactions. The
@@ -825,23 +1313,64 @@ combined PostgreSQL helper locks the service, then locks an existing identified
 replica or inserts a provisional fully identified replica row, and only then
 takes capacity/reservation locks. On denial it removes only the provisional row
 before committing any existing waiter/capacity bookkeeping; it creates no
-shadow parent or link. On approval it finishes the replica/capacity mutation,
-inserts or exactly adopts the parent, and writes the replica link before one
-commit. Recovery never turns an older name-only replica into that provisional
-form.
+coverage, parent, or link. On approval it finishes the replica/capacity
+mutation, writes the counted `PROVISIONING` state, inserts or exactly adopts
+coverage and, when represented, the parent, and writes the replica links before
+one commit. A paid/reserved claim or grant and its launch slot are therefore
+atomic. Recovery never turns an older
+name-only replica into that provisional form. A capacity change during
+preparation simply denies the provisional decision; no network preparation
+result reserves capacity.
 
-Immediately before each `sdk.launch()` or `sdk.down()` call, including an
-in-process legacy retry and its cleanup down, the worker commits the next
-`PRE_SUBMIT` child. After the SDK returns a request ID it binds that real ID in
-a short write-once
-transaction, then streams the request and records the normalized result and
-retry decision. A superseded decision may become
+Handshake recovery is closed. Worker or manager loss before approval leaves no
+replica/action/coverage/slot row, but may leave a nonauthorizing `PREPARING`
+cohort reference. Owner-fenced recovery releases it only after proving the
+preparation cell cannot receive authorization and no coverage, private request,
+or action was admitted. An uncertain proof leaks the reference and safely
+retains the cohort. A denied or superseded candidate closes its preparation
+context and sends no mutation. Loss after approval but before a
+represented `PRE_SUBMIT` child leaves a `PENDING` parent and a counted slot;
+recovery may reprepare and adopt it only when the complete durable
+spec/invocation matches. A proved mismatch before SDK entry marks that parent
+`ABANDONED_PRE_SUBMIT`, keeps its coverage as a promotion blocker, releases the
+slot/capacity under the owner fence, and replans under a new desired generation.
+A coverage-only decision is never replayed from reason equality. Once either
+kind of `PRE_SUBMIT` is committed, cancellation or worker loss is handled as
+ambiguous and never authorizes an unobserved blind replay.
+
+Immediately before each represented `sdk.launch()` or `sdk.down()` call,
+including an in-process legacy retry and its cleanup down, the worker
+locks service -> replica -> cohort -> reference -> coverage -> parent -> child,
+requires the exact `SHADOW_ACTIVE` reference, revalidates the one-use
+authorization, and commits the next `PRE_SUBMIT` child.
+Immediately before every coverage-only unsupported SDK call, it instead locks
+service -> replica -> cohort -> reference -> coverage -> coverage-attempt,
+requires the exact `SHADOW_ACTIVE` reference, revalidates the same
+owner/epoch/link/cancellation fences, allocates the contiguous ledger row, and
+commits `PRE_SUBMIT`. Only then may either kind enter SDK request creation.
+After the SDK returns a request ID, the worker locks its applicable
+`PRE_SUBMIT` evidence row first and the exact API request row second. Under the
+request-row serialization lock it reads both binding tables without acquiring
+another evidence-row lock, verifies that no other row already binds the ID,
+and records the ID in the applicable row in a short write-once transaction. It
+then streams the request and completes that row; represented rows additionally
+store normalized result/parity evidence. A superseded decision may become
 `ABANDONED_PRE_SUBMIT` only when code proves the SDK/direct mutation function
 was never entered. A crash or exception after entering request creation but
 before binding its ID becomes `REQUEST_ASSOCIATION_UNKNOWN`, never inferred as
 not submitted. A parent left without a completed child is likewise a coverage
 failure; recovery adopts its identity and next sequence but never invents a
-request ID or silently manufactures a parity result.
+request ID or silently manufactures a parity result. A process crash that
+leaves a coverage-only `PRE_SUBMIT` is conservatively
+`REQUEST_ASSOCIATION_UNKNOWN`; reason equality never proves that no call was
+made.
+
+`SHADOW_ACTIVE` changes to `RELEASED` only after every private request and every
+represented or coverage-only evidence row is terminal. `ACTION_ACTIVE` changes
+to `RELEASED` only after the action is terminal and every correlated attempt/
+request is settled. `REQUEST_ASSOCIATION_UNKNOWN`, ambiguous preparation, an
+unsettled request, malformed state, or an unreadable store retains the reference
+indefinitely.
 
 Child preparation is serialized under the parent lock. It refuses to append
 while any earlier child is nonterminal and never advances past
@@ -858,6 +1387,16 @@ successfully with exact absence/safe-relaunch proof. A cleanup decision of
 `retry_same_plan` authorizes only another cleanup; `block`, `observe`, and
 `replan_new_generation` authorize no later primary under this parent.
 
+Coverage-only preparation follows the same role/retry graph under the coverage
+lock. Recovery distinguishes only durable evidence: no ledger row proves the
+SDK gate was not crossed; `REQUEST_BOUND` adopts and streams that exact request;
+`COMPLETE` permits a later call only when its committed retry disposition says
+`RETRY_SAME_DECISION`; and `PRE_SUBMIT`,
+`REQUEST_ASSOCIATION_UNKNOWN`, or `ABANDONED_PRE_SUBMIT` authorizes no later
+call. Cancellation takes service -> replica -> coverage -> coverage-attempt
+locks and obeys the same boundary. The ledger is a one-use submission fence,
+not an alternate provider action, queue, or retry scheduler.
+
 The actual terminal legacy state change and logical sample completion share
 one Serve transaction, including paid-capacity outcome/release and replica
 removal. Each legacy retry has a distinct child but all attempts for an
@@ -873,22 +1412,33 @@ action request, suppresses a legacy call, invents a request ID, or calls the
 provider twice. The evaluator compares the proposed action path with the one
 actual legacy path and stores only bounded divergence categories.
 
-Shadow is complete for a service, not statistically sampled: promotion blocks
-if any eligible decision in the candidate window lacks a parent, any expected
-attempt lacks a child or real request association, any row is pending,
-abandoned, ambiguous, direct-down, unsupported, or divergent, or either action
-kind lacks the configured minimum. Retention does not delete candidate-window
-rows before promotion. The transition to `shadow` and its database timestamp
-are written under the service/owner lock; the promotion transaction uses that
-timestamp for the minimum 24-hour window and rechecks all blockers under the
-same lock.
+Shadow is complete for a service, not statistically sampled. All four launch
+owners and all in-scope teardown owners route through the common admission
+primitive, enforced by a checked-in call-site guard. Promotion scans coverage
+with `admitted_at >=` the locked mode-change timestamp, and separately queries
+candidate-window parents without coverage. It blocks if an identified
+launch/down link lacks or mismatches coverage, any outcome is
+`NOT_REPRESENTABLE`, a `REPRESENTABLE` row lacks exactly one same-ID parent (or
+vice versa), any expected attempt lacks a child or real request association,
+any row is pending, abandoned, ambiguous, direct-down, unsupported, or
+divergent, or either action kind lacks the configured minimum. Only
+representable clean `MATCH` graphs count toward those minima. Reason counters
+and logs are diagnostic only and never satisfy coverage. Every coverage-only
+attempt graph is nevertheless validated and reported; a malformed,
+nonterminal, or unknown ledger row is an additional blocker. Retention does not
+delete candidate-window coverage, coverage-attempts, parents, or children before promotion. The
+transition to `shadow` and its database timestamp are written under the
+service/owner lock; the promotion transaction locks service, live replicas,
+cleanup intents, coverage by decision ID, coverage-attempts, parents, then
+children before rechecking the minimum 24-hour window and all blockers.
 
-The parent admission helper first locks and revalidates the service name,
+The compound admission helper first locks and revalidates the service name,
 incarnation hash, controller owner, nonnull lifecycle epoch, and `shadow` mode;
-then it admits/links the parent in the caller's replica-intent transaction.
-`created_at` is a fresh PostgreSQL `clock_timestamp()` read after that lock,
-never the transaction-start timestamp. Promotion takes the same service lock
-before scanning the window, so an admission that waited behind promotion must
+then it admits/links coverage and the optional parent in the caller's
+replica-intent transaction. Coverage `admitted_at` and parent `created_at` use
+one fresh PostgreSQL `clock_timestamp()` read after that lock, never the
+transaction-start timestamp. Promotion takes the same service lock before
+scanning the window, so an admission that waited behind promotion must
 revalidate the mode and cannot appear after the scan with a pre-window
 timestamp.
 
@@ -902,18 +1452,37 @@ that admission; it does not permanently cancel the still-current controller.
 The controller bootstrap or recovery-script epoch must never be cached as the
 expected epoch for later replica actions.
 
-`launch_shadow_sample_id` and `down_shadow_sample_id` are incarnation-scoped,
-not both constrained to the row's current generation. The launch link retains
-the most recent launch parent and therefore may name generation N after
-teardown advances the row to N+1; the down link, when present, must match the
-current teardown generation. Generation advance never clears launch evidence.
-Retention cannot delete a referenced parent or any of its children while the
-replica row or a durable cleanup intent exists. If a replica launched in shadow
+The launch/down coverage links and their optional sample links are
+incarnation-scoped, not all constrained to the row's current generation. The
+launch links retain the most recent launch decision and therefore may name
+generation N after teardown advances the row to N+1; the down links, when
+present, must match the current teardown generation. Generation advance never
+clears launch evidence. Retention cannot delete referenced coverage, a parent,
+or any child while the replica row or a durable cleanup intent exists.
+`NOT_REPRESENTABLE` coverage cannot age out while the service remains in its
+shadow window. Candidate discovery is nonlocking. For each candidate, typed GC
+first locks the exact extant service-incarnation/owner row, then every possible
+replica link and cleanup intent in canonical order, then the cohort/reference,
+then coverage,
+coverage-attempts, the optional parent, and represented children. It re-reads
+the mode/window, links, cleanup intents, and terminal shapes; skips active,
+referenced, or nonterminal evidence; changes the exact reference to `RELEASED`;
+and deletes represented children then parent, or coverage-attempts, and finally
+coverage in one transaction. It never
+locks coverage and then reaches backward to a replica. If the exact service row
+is absent or the name now has another incarnation, M2 GC defers indefinitely;
+reclaiming deleted-service evidence requires a separately designed durable
+incarnation tombstone. Service/replica deletion never cascades evidence. If a
+replica launched in shadow
 later enters authoritative down, down admission loads the matching completed
 launch child, revalidates its canonical observation and
-`ResolvedProviderTargetV1`, and copies that target into the immutable down plan.
-Missing, incomplete, unsupported, or mismatched launch evidence keeps that
-replica on shadow/legacy teardown; it never falls back to a name-only
+`ResolvedProviderTargetV1`, exact-reads the same-UUID global-user-state cluster
+row and its full provider handle, and copies both typed preimages and hashes
+into the immutable down plan's `PriorLaunchBasisV1`. The admission transaction
+then owns that frozen handle; action-aware cluster-row removal is legal only
+through the down attempt's expected-UUID, post-absence seam. Missing,
+hash-only, incomplete, unsupported, or mismatched launch/handle evidence keeps
+that replica on shadow/legacy teardown; it never falls back to a name-only
 authoritative down.
 
 All three in-scope teardown owners—`ReplicaManager._terminate_replica`,
@@ -936,11 +1505,17 @@ legacy -> shadow -> authoritative
 Promotion requires:
 
 - all old controller-capable processes drained;
-- every remaining controller/API/executor running the approved image digest,
-  at API005, Serve032, and global-user-state 028, and exposing the registered
-  action handler through the existing handler inventory;
+- every remaining controller/API running the approved active digest and every
+  versioned authority-worker cohort referenced by a preparation, nonterminal
+  private shadow request/evidence row, or nonterminal action running its own
+  approved immutable digest, all at API006, Serve033, and
+  global-user-state 028; each dedicated attested cohort includes the private
+  handlers only for actions frozen to that cohort, while every ordinary
+  executor excludes them;
 - exact provider-profile eligibility for every live candidate;
-- no unresolved shadow divergence or unsampled mutation;
+- complete decision coverage from the locked window start, zero
+  `NOT_REPRESENTABLE` coverage rows, and no unresolved shadow divergence or
+  unsampled mutation;
 - at least 24 hours and a configured minimum sample count of clean live shadow
   operation, including launch and down; and
 - successful crash injection at every boundary below.
@@ -948,11 +1523,16 @@ Promotion requires:
 `ActivationGateEvidenceV1` is a closed internal value bound to the exact
 service name, service-incarnation hash, lifecycle epoch, and (for authority)
 the database timestamp that opened the current shadow window. It carries the
-three independent schema heads (`API005`, `Serve032`, and global-user-state
-`028`), approved image and named inventory fingerprints, and a database-clock
-`verified_at`. The transition rejects evidence for another fence/window,
+three independent schema heads, approved image and named inventory
+fingerprints, and a database-clock `verified_at`. `legacy -> shadow` requires
+`API005`, `Serve033`, and global-user-state `028`; `shadow -> authoritative`
+requires `API006`, `Serve033`, and global-user-state `028`. The transition
+rejects evidence for another fence/window,
 evidence from the database future, or evidence older than five minutes. A
-`legacy -> shadow` transition requires a null candidate-window binding; a
+`legacy -> shadow` transition requires a null candidate-window binding and no
+live replica lacking the canonical incarnation/generation/cluster UUID triple
+(the first canary is activated while scaled to zero); it never mints identity
+onto a name-only provider resource. A
 `shadow -> authoritative` transition requires exact timestamp equality with
 the locked service row. The 24-hour candidate duration is a hard minimum, not
 a caller-reducible test parameter.
@@ -1023,8 +1603,14 @@ M1b verification evidence on 2026-08-01:
 
 ### M2: Serve shadow journal
 
-- Add Serve032 mode/replica-identity/link plus logical-sample/per-attempt
-  schema. Refuse schema down while retaining the additive state.
+- Keep frozen Serve032 mode/replica-identity/sample-link, logical-sample, and
+  represented-attempt schema unchanged. Add Serve033 coverage links,
+  decision-coverage, and coverage-only attempt schema; assert the dark 032
+  tables are empty before adding the explicit parent FK. Refuse schema down
+  while retaining the additive state.
+- Verify fresh 031 -> 032 -> 033 and already-at-032 -> 033 PostgreSQL upgrades,
+  ordinary-row preservation, fail-closed nonempty-shadow detection, explicit
+  FK/catalog convergence, and SQLite columns-only behavior.
 - Add global-user-state revision 028 with a nullable, partial-unique
   `clusters.cluster_record_uuid`; leave historical rows null, omit it from
   ordinary cluster updates, and reserve initialization/adoption for the
@@ -1037,24 +1623,44 @@ M1b verification evidence on 2026-08-01:
   already-live name-only rows ineligible.
 - Refactor launch/down decision construction into pure descriptor/classifier
   functions used by both legacy execution and shadow evaluation.
-- Persist a child before every legacy SDK call, bind its nullable real request
-  association immediately after SDK admission, and complete the child and
-  parent transactionally with the legacy Serve projection. Route direct
+- Split launch/down preparation from mutation permission with the bounded
+  prepare/admit/authorize handshake. Add the nonexecuting Serve033 cohort
+  registry/reference fence, create `PREPARING` before private preflight, and
+  atomically bind it with coverage/action admission. Persist coverage for every
+  approved decision, including a closed not-representable result, before the
+  sole legacy mutation can enter its submit pool.
+- Persist either a represented child or coverage-only submission row before
+  every legacy SDK call, bind its nullable real request association immediately
+  after SDK admission, and complete it transactionally with the legacy Serve
+  projection. Route direct
   teardown through `sdk.down()` before collecting the promotion window.
+- Capture represented Kubernetes and Skylet effects at their actual serialized
+  transport boundaries. Route only the narrow candidate through the common
+  pure renderer, prebooted runtime, and action-keyed Skylet seam while legacy
+  SafeThread/request ownership remains unchanged. Its real request uses a
+  private server-owned handler that only the dedicated capability-filtered
+  authority-worker cohort may claim; every extra or mismatched call is
+  divergent.
 - Preserve legacy autoscaling and provider mutation authority.
 
 M2 foundation verification evidence on 2026-08-01:
 
-- Serve032 installs the inert mode, replica-identity/link, logical-sample, and
-  per-attempt schema while preserving portable inert columns for supported
-  local controller databases;
+- Serve032 currently installs the frozen inert mode,
+  replica-identity/sample-link, logical-sample, and represented-attempt schema
+  while preserving portable inert columns for supported local controller
+  databases. Serve033 decision coverage, coverage-only attempts, actual-effect
+  trace columns, explicit parent FK, and coverage-link columns remain an M2
+  implementation gate before deployment;
 - global-user-state revision 028 installs a nullable portable cluster-record
   UUID and partial unique index, leaves historical rows null, and provides the
   PostgreSQL-only exact insert/adopt/reject primitive without changing ordinary
   cluster updates;
-- closed, bounded provider locator, invocation, observation, outcome, shadow
-  projection, and retry contracts have canonical byte/hash fixtures and
-  action-specific success proof; and
+- the initial closed, bounded provider locator, invocation, observation,
+  outcome, shadow projection, and retry contracts have canonical byte/hash
+  fixtures and action-specific success proof; the companion's stricter frozen
+  Kubernetes scope, execution-config boundary, and preparation handshake are
+  the next contract slice;
+  and
 - the PostgreSQL typed shadow store passes its full 21-test suite, including
   exact parent/child replay, retry-chain closure, activation-window fencing,
   action-specific projection proof, retention protection, and lock races. Its
@@ -1066,7 +1672,14 @@ eligible for authority yet.
 
 ### M3: dark dispatcher and recovery
 
+- Add API-request revision 006's bounded provider-progress snapshot and
+  claim-fenced monotonic write/read methods; keep ordinary attempts null.
 - Run due discovery/materialization against synthetic/canary actions only.
+- Register the private action handler only in the dedicated
+  capability-filtered normal-executor cohort, with `retryable=false` and no
+  precondition; ordinary normal executors exclude it. Normalize retry/pause
+  exceptions inside the handler so the generic executor cannot requeue the
+  same request attempt.
 - Exercise request correlation, controller eviction, lost admission response,
   retry deadlines, and reducer idempotency.
 - Run provider readback on shadow samples without submitting a second mutation.
@@ -1101,60 +1714,188 @@ lease, or alternate lock order. Otherwise keep the kernel Serve-scoped.
 
 The isolated test target is Kubernetes context `boltz-test`, namespace/release
 `skypilot-ha/skypilot-ha`, with PostgreSQL and two API/controller replicas.
-Production is not a fault-injection target.
+Authority-worker Deployments, ServiceAccounts, selector Service, Secrets,
+manifest projections, and their NetworkPolicy stay in that release namespace;
+only provider workload objects use the separate `skypilot-actions-canary`
+namespace. Production is not a fault-injection target.
 
 Deployment order is:
 
 1. build and push an immutable image digest;
-2. `helm upgrade --reuse-values` with the blocking additive migration hook;
+2. deploy only the API role with `helm upgrade --reuse-values`, explicitly
+   keeping the dark authority-worker role disabled when no cohort exists (or
+   pinning every already-deployed cohort to its immutable digest), pinning the
+   controller role to its prior immutable digest, and letting the API's blocking
+   additive migration hook reach the required heads;
 3. verify all independent milestone-specific heads: M1a is API005 with
-   unchanged Serve031/global-user-state 027; M2 and later require API005,
-   Serve032, and global-user-state 028, with no cross-lineage Alembic
-   dependency;
-4. deploy shadow-capable processes and prove image/head/handler inventory;
-5. collect parity and crash evidence; and
-6. promote only an explicitly selected canary service.
+   unchanged Serve031/global-user-state 027; M2 shadow requires API005,
+   Serve033, and global-user-state 028; M3 provider dispatch and M4 authority
+   require API006, Serve033, and global-user-state 028, with no cross-lineage
+   Alembic dependency;
+4. deploy a new immutable versioned authority-worker cohort at the new digest
+   while retaining/pinning every cohort with a `PREPARING`, `SHADOW_ACTIVE`, or
+   `ACTION_ACTIVE` reference and pinning API/controller roles, then prove its
+   exact static manifest, live identity, capability, and handler inventory
+   before selecting it for new admissions;
+5. deploy controller roles at the new digest while pinning API and
+   authority-worker roles, then prove the complete image/head/handler
+   inventory;
+6. collect parity and crash evidence; and
+7. promote only an explicitly selected canary service.
+
+The first ready worker self-attests the projected static manifest and live
+Deployment/ServiceAccount UIDs and inserts `REGISTERING`; two distinct ready
+Pods must exactly adopt that identity and append current registration evidence
+before the typed gate changes it to `ACCEPTING` and permits active selection.
+Retirement first commits
+`DRAINING`, so no new preparation reference can bind while existing work
+remains claimable. After active references release, one transaction locks the
+cohort/references, performs fail-closed nonlocking scans of every authoritative
+action/attempt/request and private shadow request/evidence carrier, and commits
+`REMOVAL_AUTHORIZED`. Unknown or unreadable state counts as a reference. The
+current chart may remove the exact Deployment/ServiceAccount only afterward,
+while retaining their names in the current chart's tombstone-scoped GET grant.
+The surviving API-role verifier—not the removed worker—proves exact NotFound
+and commits `RETIRED`; a later chart upgrade then prunes that grant. Thus an active-cohort switch between preflight
+and admission and a retirement attempt between reference discovery and
+admission are fenced by the same cohort/reference rows.
 
 The first additive migration deployment omits `--atomic` unless the selected
 automatic rollback image is proven ahead-of-head compatible. Native Helm
 rollback is image rollback only; it does not run schema down. A failed
-milestone is repaired by deploying a compatible digest against the retained
-additive schema. Database principal topology and credentials are unchanged by
-this program.
+milestone is repaired with another current-chart `helm upgrade --reuse-values`
+that pins every role explicitly and deploys the prior compatible immutable
+digest against the retained additive schema; `helm rollback` is not used.
+Database principal topology and credentials are unchanged by this program.
 
 ## Fault-injection and verification
 
 Mandatory crash/race points include:
 
-1. before action admission;
-2. after replica/action commit but before the controller receives the ID;
-3. during two-dispatcher due discovery;
-4. after request/queue commit but before materialization acknowledgement;
-5. after request claim but before provider mutation boundary;
-6. after provider bytes may have been accepted but before operation ID/result;
-7. after provider result but before request terminalization;
-8. after request terminalization but before Serve reduction;
-9. after retry reduction but before the controller observes `next_attempt_at`;
-10. during controller/API/executor eviction and controller-leadership change;
+1. before and after preparation publishes its typed result;
+2. while two managers race for the last slot across ordinary/ordinary,
+   ordinary/paid-capacity, and ordinary/reserved-fill admission; while a release
+   races new admission; and while owner handoff races recovery release;
+3. after counted-slot/coverage/optional-parent commit but before the worker receives
+   approval;
+4. after approval but before either kind of `PRE_SUBMIT` row;
+5. during two-dispatcher due discovery;
+6. after request/queue commit but before materialization acknowledgement;
+7. after request claim but before the atomic two-boundary/first-cursor or
+   two-boundary/inherited-attestation commit, and immediately after either
+   combined commit;
+8. before and after every later monotonic provider-progress checkpoint, including
+   each of the three object effects and the idempotent job submission;
+9. before and after the Skylet job/outbox fsync commit, after that commit before
+   wakeup, before and after `START_INTENT`, after launcher spawn before its
+   durable run-token transaction, before/after `START_COMMITTED`, during failed
+   or successful `exec`, before/after the pinned entrypoint's durable `RUNNING`
+   handshake, and during watcher or Skylet/container restart;
+10. after provider result but before request terminalization;
+11. after request terminalization but before Serve reduction;
+12. after retry reduction but before the controller observes `next_attempt_at`;
+13. while materializing attempt `n+1`, after materialization but before its
+    boundary/attestation binding, while carrying a partial cursor, and while
+    re-attesting a replacement authority worker;
+14. while superseding a partial launch, committing its real down action, and
+    exact-reading/deleting each cleanup object and cluster row;
+15. during controller/API/executor eviction and controller-leadership change;
     and
-11. during compatible image rollback/re-upgrade with nonterminal actions.
+16. during compatible image rollback/re-upgrade with nonterminal actions; and
+17. while active cohort selection changes between preflight/admission and while
+    retirement's zero-reference discovery races admission/private request
+    binding.
 
 Tests must prove:
 
+- fresh empty API005 -> API006 migration, both boundary-field constraints, and
+  fail-closed rejection of any pre-006 action-attempt row whose provider-I/O
+  watermark cannot be reconstructed;
 - deterministic action/request identity and byte-mismatch rejection;
+- with cap `C`, `N > C` simultaneously prepared successful decisions commit at
+  most the available number of new `PROVISIONING` rows; each winner atomically
+  has one identified replica, counted slot, applicable capacity claim, coverage,
+  optional parent, links, and bound cohort reference, while each loser has none
+  of those and may retain only a released preparation reference;
+- paid/reserved denial preserves existing waiter/grant bookkeeping without a
+  replica intent or coverage row; a commit-before-signal crash remains counted
+  across controller death and is adopted or released only with pre-call proof;
+  two recovery owners cannot double-release; release racing admission never
+  exceeds the cap; restart/local-snapshot lag neither undercounts nor double-
+  counts a decision ID;
+- capacity race fixtures exercise both lock-acquisition directions and fail on
+  deadlock, an external resources-file lock acquired after SQL locks, or any
+  condition/preflight/provider wait while either lock is held;
+- authoritative `INTENT_COMMITTED` in both boundary fields and the first legal
+  API006 cursor are one atomic write, so no crash can leave a crossed provider-
+  I/O watermark with null progress;
+- monotonic provider-progress replay, stale-write rejection, and partial UID/
+  job commitment survival across request-worker eviction;
+- attempt `n+1` byte-copies the settled predecessor cursor, clears only its
+  attempt-scoped worker attestation, recomputes the envelope hash, starts local
+  revision one, and cannot materialize from missing/regressed crossed-boundary
+  progress;
+- an exact pre-I/O retry from `NOT_STARTED` with null progress, progress
+  revision zero, and null provider operation ID reduces to `READY` and
+  materializes attempt `n+1` with the same null/zero shape, whose handler takes
+  the fresh-cursor atomic initialization branch before provider I/O;
+- a crash after materializing an inherited revision-one cursor but before
+  boundary/attestation binding remains a legal pre-I/O retry shape, reduces to
+  `READY`, and can seed the next attempt; an arbitrary, attested, regressed, or
+  predecessor-mismatched `NOT_STARTED`/nonnull cursor rejects, and such a
+  cursor can never prove `CANCELLED_NO_EFFECT`;
+- the Skylet durable outbox returns only after the job/outbox fsync commit and
+  every enumerated crash/restart state preserves one submission key, one job
+  row/job ID, and monotonically increasing run epochs without starting job
+  bytes before the run-token transaction; `START_COMMITTED` never satisfies
+  `JOB_RUNNING` or launch success;
 - exactly one queue delivery and one request claim lease per attempt;
 - no action lease/heartbeat table or domain due scanner;
 - database-clock retry continuity across restart;
 - stale owner/request/reducer writes reject;
 - observed launch adoption and ambiguous launch blocking;
+- a never-started launch becomes `CANCELLED_NO_EFFECT`, creates no down action,
+  removes the provisional row/count exactly once, and cannot double-release on
+  lost-response replay;
+- a superseded effectful launch is fenced and terminalized as
+  `SUPERSEDED_TO_DOWN`, hands its exact partial cursor to one normally queued
+  down action, and cannot run hidden cleanup or another launch request;
+- partial-launch cleanup exact-reads all three frozen roles, rejects every
+  same-name replacement, uses UID-preconditioned deletes, proves three exact
+  NotFound results, and removes or adopts only the exact cluster row before
+  terminal success;
+- a create that becomes visible after an initial NotFound prevents handoff
+  until the old launch commits its exact effect evidence; down cannot admit or
+  terminalize from the earlier absence sample;
+- after earlier committed effects, a later CoreV1 422, rolled-back cluster-row
+  insert, or pre-commit Skylet conflict permits handoff only with its exact
+  typed definitive-no-effect proof; timeout, reset, 5xx, lost acknowledgement,
+  expired lease, and post-call NotFound do not; source/down insertion races use
+  both possible UUID sort orders;
+- launch at `ENDPOINT_RESOLVED` and down at `ABSENCE_EXACT` or
+  `HANDLE_REMOVED` fail success reduction; only the final claim-fenced
+  `SUCCEEDED` cursor can project terminal success;
 - down terminalization only from exact absence evidence;
-- shadow creates one logical row with replica/capacity intent and one child
-  before every real legacy SDK attempt, performs exactly that one legacy
-  mutation, binds only its real request ID, and records the actual result;
+- shadow creates one coverage row with replica/capacity intent for every
+  approved decision; a representable row creates the same-ID parent and one
+  child before every real legacy SDK attempt, while a not-representable row
+  creates no fake parent but does create one coverage-attempt fence before each
+  real SDK attempt; neither path blindly repeats an ambiguous mutation;
 - stale parent, pre-call, call/ID-bind, and completion gaps become explicit
   promotion blockers rather than synthetic results or request IDs;
-- promotion refuses mixed binaries, a missing handler/head, incomplete shadow
-  coverage, a pending row, or any unresolved divergence; and
+- preparation creates a nonauthorizing `PREPARING` cohort reference before
+  preflight; admission atomically binds it to `SHADOW_ACTIVE` or
+  `ACTION_ACTIVE`; active-cohort switch, stale preparation owner, and the zero-
+  reference/admission race cannot strand work; a nonterminal private shadow
+  request pins its cohort; missing/unreadable/malformed reference state blocks
+  retirement; the registry starts `REGISTERING` and requires two distinct
+  matching ready Pods before `ACCEPTING`; down takes the same preflight fence;
+  `DRAINING -> ACCEPTING` rollback atomically recollects both attestations; and
+  removal occurs only after `REMOVAL_AUTHORIZED`, with the surviving API
+  verifier retaining exact tombstone GETs until NotFound commits `RETIRED`;
+- promotion refuses mixed binaries, a missing handler/head, a missing or
+  not-representable coverage row, an orphan coverage/parent, a pending row, or
+  any unresolved divergence; and
 - eligible authority no longer reaches the removed thread/map/clock paths.
 
 Required local test layers are PostgreSQL migration/constraint tests, generic
@@ -1173,7 +1914,7 @@ The restructuring earns its cost only if all of these hold:
   and absence cases with zero unresolved divergence for the soak window;
 - the authoritative Serve path deletes the named in-memory ownership state,
   rather than layering the journal beside it indefinitely;
-- no second queue, action lease, or domain worker is introduced; and
+- no second queue, action lease, or domain-specific scheduler is introduced;
 - M1-M4 remains independent of the deferred principal/downgrade/uninstall
   program.
 
@@ -1199,12 +1940,26 @@ write typed outcomes.
 
 ## Open gates
 
-- Serve032 migration, typed shadow store, pure descriptor/classifier, and
-  legacy launch/down instrumentation verification.
+- Serve033 migration, cohort registry/reference fence, coverage/attempt typed
+  store, pure descriptor/classifier, and legacy launch/down instrumentation
+  verification.
+- API006 monotonic provider-progress snapshot and the private-handler
+  capability filter for the existing request executor, including cross-attempt
+  cursor carry, per-attempt worker re-attestation, and partial-launch cleanup.
+- Rendered and live verification of the dedicated versioned authority-worker
+  Helm cohort, exact RBAC/admission/NetworkPolicy, purpose token/TLS preflight,
+  static-manifest/live-UID qualification, complete-spec submit/observe, worker
+  registration/two-Pod attestation, staged API -> worker -> controller rollout,
+  namespace-local worker Service/RBAC/projections, surviving-API tombstone
+  verification, fail-closed retirement over preparation/action/private-shadow
+  references, and current-chart rollback with nonterminal work pinned to its
+  cohort.
 - A checked-in inventory of the initial `pod_cluster_v1` eligible cohort after
   preallocated cluster UUID propagation, Kubernetes replica-incarnation
-  labeling, exact readback, and the redacted invocation builder pass contract
-  tests. Until then the profile is shadow-only and promotion-blocking.
+  labeling, normalized admitted-object/partial-UID readback, prebooted
+  Ray/Skylet and action-keyed job recovery, exact handle/endpoint, dual-LB
+  reachability, and the redacted invocation builder pass contract tests. Until
+  then the profile is shadow-only and promotion-blocking.
 - Test-cluster SSO and immutable registry-push access for `boltz-test`.
 - Measured shadow sample minimums and the first canary service selection.
 - A separate decision on whether central principal convergence is worth its
@@ -1216,8 +1971,10 @@ write typed outcomes.
   heads remain through application rollback.
 - No new schema owner/migrator/runtime role topology or superuser bootstrap is
   introduced.
-- No maintenance-reader fleet, downgrade fence, rollout-pin authority, or
-  external owner-mutation journal is part of resource actions.
+- No maintenance-reader fleet, downgrade fence, general rollout-pin authority,
+  or external owner-mutation journal is part of resource actions. The two
+  Serve033 worker-cohort tables are profile-local, nonexecuting retention
+  fences for immutable authority-worker cohorts.
 - Event-v2 and broad operational-history redesign are deferred.
 - The generic kernel has two tables in v1; multi-effect/child-action tables are
   deferred until a real second use case requires them.
