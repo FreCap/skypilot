@@ -1,11 +1,14 @@
 """Rest APIs for SkyServe."""
 
 import asyncio
+import enum
 
 import fastapi
 
 from sky import sky_logging
+from sky.serve import serve_history
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.serve.server import core
 from sky.server import common as server_common
 from sky.server import stream_utils
@@ -21,6 +24,13 @@ from sky.utils import yaml_utils
 
 logger = sky_logging.init_logger(__name__)
 router = fastapi.APIRouter()
+
+
+class StatusHistorySection(str, enum.Enum):
+    REQUESTS = 'requests'
+    REPLICAS = 'replicas'
+    PREDICTION = 'prediction'
+    AUTOSCALER = 'autoscaler'
 
 
 def _require_admin(request: fastapi.Request) -> None:
@@ -124,6 +134,48 @@ def version_history(request: fastapi.Request, service_name: str) -> dict:
     """Return immutable version history to an administrator."""
     _require_admin(request)
     return _service_version_history(service_name)
+
+
+@router.get('/{service_name}/history')
+async def status_history(
+    service_name: str,
+    expected_service_hash: str = fastapi.Query(min_length=1),
+    hours: int = fastapi.Query(default=1,
+                               ge=1,
+                               le=serve_history.RETENTION_HOURS),
+    section: list[StatusHistorySection] = fastapi.Query(
+        default=list(StatusHistorySection)),
+) -> dict:
+    """Read selected persisted history without contacting the controller."""
+    requested_sections = {item.value for item in section}
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        return serve_history.unavailable_status_history('non_consolidated',
+                                                        requested_sections)
+    service = await asyncio.to_thread(serve_state.get_service_status_snapshot,
+                                      service_name)
+    if service is None or service.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    if service.get('hash') != expected_service_hash:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    history = await asyncio.to_thread(
+        serve_history.get_status_history,
+        service_name,
+        hours=hours,
+        expected_service_hash=expected_service_hash,
+        sections=requested_sections,
+    )
+    reason = history.get('reason')
+    if reason == 'service_not_found':
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    if reason == 'service_hash_mismatch':
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    return history
 
 
 @router.post('/{service_name}/versions/elect')

@@ -12,6 +12,7 @@ jest.mock('@/data/connectors/client', () => ({
 import { apiClient } from '@/data/connectors/client';
 import {
   electServiceVersion,
+  getServiceHistory,
   getServicePlacement,
   getServiceVersions,
   getServices,
@@ -79,6 +80,7 @@ function mockResultResponse(returnValue) {
 function rawServiceRecord(overrides = {}) {
   return {
     name: 'boltz-l4-fleet',
+    hash: 'service-hash-a',
     status: 'READY',
     uptime: 1751600000,
     endpoint: 'http://10.0.0.1:30001',
@@ -144,6 +146,7 @@ describe('getServices', () => {
     const service = services[0];
     expect(service).toMatchObject({
       name: 'boltz-l4-fleet',
+      serviceHash: 'service-hash-a',
       status: 'READY',
       uptime: 1751600000,
       endpoint: 'http://10.0.0.1:30001',
@@ -646,6 +649,112 @@ describe('getServices', () => {
     const result = await getServices();
 
     expect(result).toEqual({ services: [], controllerStopped: true });
+  });
+});
+
+describe('getServiceHistory', () => {
+  it('requests one bounded range and normalizes the direct response', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '66' },
+      json: async () => ({
+        available: true,
+        service_hash: 'hash/a',
+        bucket_seconds: 60,
+        retention_hours: 72,
+        window_start: 0,
+        window_end: 3600,
+        samples: [],
+        request_samples: [],
+        prediction_time_samples: [],
+        autoscaler_samples: [],
+      }),
+    });
+
+    const history = await getServiceHistory({
+      serviceName: 'boltz/l4',
+      serviceHash: 'hash/a',
+      hours: 1,
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/serve/boltz%2Fl4/history?hours=1&expected_service_hash=hash%2Fa&section=requests&section=replicas&section=prediction&section=autoscaler'
+    );
+    expect(history).toMatchObject({
+      available: true,
+      serviceHash: 'hash/a',
+      legacyFallback: false,
+    });
+  });
+
+  it('uses legacy fallback only when a 404 comes from an older server', async () => {
+    apiClient.get.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      headers: { get: () => '65' },
+    });
+    await expect(
+      getServiceHistory({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        hours: 1,
+      })
+    ).resolves.toMatchObject({
+      available: false,
+      reason: 'unsupported',
+      legacyFallback: true,
+    });
+
+    apiClient.get.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      headers: { get: () => '66' },
+    });
+    await expect(
+      getServiceHistory({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        hours: 1,
+      })
+    ).resolves.toMatchObject({
+      available: false,
+      reason: 'not_found',
+      legacyFallback: false,
+    });
+  });
+
+  it('surfaces a service-incarnation conflict distinctly', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: false,
+      status: 409,
+      headers: { get: () => '66' },
+    });
+
+    await expect(
+      getServiceHistory({
+        serviceName: 'svc',
+        serviceHash: 'old-hash',
+        hours: 12,
+      })
+    ).rejects.toMatchObject({ code: 'SERVICE_HASH_MISMATCH' });
+  });
+
+  it('rejects a malformed successful response', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '66' },
+      json: async () => null,
+    });
+
+    await expect(
+      getServiceHistory({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        hours: 1,
+      })
+    ).rejects.toThrow('Service history response was malformed');
   });
 });
 
