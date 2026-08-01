@@ -8,8 +8,10 @@ candidate-only normalization boundary and atomic durable coverage handshake are
 in progress; the closed Kubernetes transport/scope leaf is implemented and
 independently verified; topology/image/config-policy/principal/authorization
 foundation leaves are implemented and locally verified; full execution-config
-composition, prerequisite/resource/renderer/object-plan leaves, runtime
-provider propagation, observation, and shadow instrumentation remain pending
+composition remains pending; bounded resource values and prerequisite,
+object-plan, and renderer leaves are implemented and independently verified;
+runtime provider propagation, observation, and shadow instrumentation remain
+pending
 
 Last updated: 2026-08-01
 
@@ -1135,6 +1137,15 @@ ProviderDownProgressV1 = one of:
    handle_removal: ProviderClusterRecordRemovalEvidenceV1}
 ```
 
+`ProviderKubernetesHandleV1.cluster_name_on_cloud` is byte-equal to the
+enclosing requested target's nonnull
+`kubernetes.provider_cluster_name`; handle construction and refresh do not
+derive it from ambient user state. Its `provider_config.pod_ip` is canonical,
+zone-free IPv4 or IPv6 text under the same checked-in
+`str(ipaddress.ip_address(value)) == value` rule used by server allocations.
+Arbitrary text, alternate IP spelling, and a zone identifier are not
+representable.
+
 Unknown keys are forbidden in every variant. Launch alternates
 `CREATE_INTENT(role) -> OBJECTS_PARTIAL` in canonical create order, then follows
 `OBJECTS_EXACT -> HANDLE_INTENT -> HANDLE_COMMITTED -> RUNTIME_READY ->
@@ -1704,9 +1715,20 @@ LegacyProviderEffectTraceV1 = {
 For a create, `serialized_object` is byte-equal to the applicable frozen
 `ProviderKubernetesObjectPlanV1.request_body`. For a delete,
 `serialized_delete_options` contains exactly the committed UID precondition
-and no unlisted option. Each CoreV1 path is the exact scope/kind/name path
-derived from the frozen plan; create and delete query objects are empty. Create
-and delete sequences equal the role map's respective sequence. For Skylet, the body is
+and no unlisted option. For a `LAUNCH_CLEANUP_DOWN` child, that UID is
+byte-equal to the current logical attempt's write-once same-role UID
+commitment. That commitment is established only by the same parent's
+primary-launch create/adoption evidence or by the earliest request-sequenced
+cleanup pre-observation containing an exact-present object entry whose `role`
+equals the delete role, and it is carried unchanged across later cleanup
+retries. Every later exact-present same-role observation must agree. A delete
+does not clear the commitment; a different create/adoption/replacement, a
+missing commitment, or a mismatch makes the trace incomplete or divergent and
+promotion-blocking. The parent launch capsule freezes names/specs but cannot
+invent a runtime-assigned UID, and there is no name-only delete fallback. Each
+CoreV1 path is the exact scope/kind/name path derived from the frozen plan;
+create and delete query objects are empty. Create and delete sequences equal
+the role map's respective sequence. For Skylet, the body is
 exactly the closed `ProviderSkyletSubmitRequestV1`; arbitrary job JSON is not
 representable. A secret-bearing, unbounded, or cross-kind body makes the
 candidate not representable and persists no body/hash. For an eligible launch,
@@ -3164,10 +3186,11 @@ deliberately has no `PriorLaunchBasisV1` and no current down execution config:
 it observes the
 existing legacy cleanup between launch retries and grants no replay or provider
 authority. It cannot appear in `ServeReplicaActionSpecV1`, a primary child,
-coverage admission, or either authoritative handler. Expected object/trace
-parity comes only from the parent launch capsule; any extra ambient cleanup
-behavior is divergent and promotion-blocking. Typed reads reconstruct the
-exact applicable union member; arbitrary mappings are not accepted. Golden
+coverage admission, or either authoritative handler. Static role, path, name,
+and request-body parity comes only from the parent launch capsule; runtime UID
+parity is proven by the causally scoped evidence rule above. Any extra ambient
+cleanup behavior is divergent and promotion-blocking. Typed reads reconstruct
+the exact applicable union member; arbitrary mappings are not accepted. Golden
 canonical-byte/hash fixtures plus unknown-key, float, identity-mismatch, and
 mutated-plan/invocation rejection tests freeze this wrapper contract.
 
@@ -3180,7 +3203,17 @@ before its invocation: primary roles accept only the wrapper's byte-equal
 derivation under a launch parent. Cleanup retries reuse those same bytes;
 logical-attempt and request sequence remain in the attempt envelope. Its
 outcome is classified as a down effect, so success requires authoritative
-absence against the frozen target. Recovery preserves legacy request
+absence against the frozen target. Outcome/request validation receives and
+binds `(request_role, parent_spec, invocation)`, parsing the cleanup role and
+parent before selecting this special union member. Cleanup observation comes
+from the shadow pre/post observer; the child never passes through
+`ProviderLifecycleFacet.submit()` or `ProviderLifecycleFacet.observe()`, and
+its special invocation hash is never required to equal the generic API-request
+body hash. Immediately before SDK entry, the worker projects the actual cleanup
+call arguments into the exact `legacy_down_request` shape and requires byte
+equality to the special invocation's `legacy_down_request` member. The bound
+request ID is the real ID returned by that call; generic transport-body hash
+equality is neither required nor authority. Recovery preserves legacy request
 association and retry fencing and never upgrades this evidence fingerprint to
 an independently admitted down action.
 
@@ -3767,6 +3800,17 @@ absence result through a public API.
   down-only execution authority, the closed effect-body trace, qualified
   manifest/config/CRI runtime identity, and the Skylet fsynced outbox/run-token/
   post-exec-handshake recovery state machine.
+- Before `PartialLaunchCleanupBasisV1` admission or any deployable
+  `PriorLaunchBasisV1` parser is implemented, freeze literal tables keyed by
+  every `ProviderLaunchProgressV1` phase for the exact ordered effect prefix,
+  each entry's sequence/kind/role/intent phase, allowed resolution, and
+  committed-evidence hash preimage. Also freeze every definitive-no-effect
+  variant's exact cross-field/nullability rules, including the required
+  post-observation state for CoreV1 422, cluster-row fields for each
+  rolled-back/conflict-no-write disposition, and Skylet job state/revision for
+  every rejection kind. Until then, completed-launch leaf types may be
+  implemented, but no `PriorLaunchBasisV1` parser or admission path may be
+  exposed unless it accepts and fully validates both documented variants.
 - Rendered and live verification of the dedicated authority-worker Helm
   versioned-cohort contract, `REGISTERING`/two-ready-Pod activation,
   release-namespace worker/Service/RBAC/projections, separate canary workload

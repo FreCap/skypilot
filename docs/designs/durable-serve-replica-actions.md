@@ -591,7 +591,11 @@ Shadow JSON fields are bound to named closed types, not merely size/hash
 checks. `actual_outcome` and `proposed_outcome` are
 `ServeReplicaActionOutcomeV1`; `pre_observation` and `post_observation` are
 `ProviderLifecycleObservationV1`; and `invocation` is the companion design's
-`ProviderLifecycleInvocationV1`. Parent projections use:
+`ServeShadowAttemptInvocationV1`. Outcome validation receives the bound
+`(request_role, parent_spec, invocation)` tuple. The cleanup-only union member
+uses down absence semantics against the frozen parent target, while its
+observations come from the shadow pre/post observer rather than
+`ProviderLifecycleFacet.observe()`. Parent projections use:
 
 ```text
 ServeShadowProjectionV1 = {
