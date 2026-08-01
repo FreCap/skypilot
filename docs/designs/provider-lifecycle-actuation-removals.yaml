@@ -128,6 +128,91 @@ coverage_gaps:
   closure_gate: On revision 002 implementation, transcribe exact capability symbols and SQL objects, link
     every SQL contraction to PLA-M3-095, and permit final removal only after all process roles and lifecycle
     domains advertise action-only capability for a full compatibility release
+- id: PLA-GAP-004
+  milestone: M4
+  responsibility: Complete freshness and side-effect classification for every concrete deploy-variable
+    producer before the shared post-bulk callback can be removed
+  candidate_locators:
+  - kind: python_symbol
+    path: sky/clouds/aws.py
+    symbol: AWS.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/azure.py
+    symbol: Azure.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/cudo.py
+    symbol: Cudo.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/do.py
+    symbol: DO.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/fluidstack.py
+    symbol: Fluidstack.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/gcp.py
+    symbol: GCP.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/hyperbolic.py
+    symbol: Hyperbolic.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/ibm.py
+    symbol: IBM.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/kubernetes.py
+    symbol: Kubernetes.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/lambda_cloud.py
+    symbol: Lambda.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/mithril.py
+    symbol: Mithril.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/nebius.py
+    symbol: Nebius.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/oci.py
+    symbol: OCI.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/paperspace.py
+    symbol: Paperspace.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/primeintellect.py
+    symbol: PrimeIntellect.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/runpod.py
+    symbol: RunPod.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/scp.py
+    symbol: SCP.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/seeweb.py
+    symbol: Seeweb.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/shadeform.py
+    symbol: Shadeform.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/slurm.py
+    symbol: Slurm.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/vast.py
+    symbol: Vast.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/verda.py
+    symbol: Verda.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/vsphere.py
+    symbol: Vsphere.make_deploy_resources_variables
+  - kind: python_symbol
+    path: sky/clouds/yotta.py
+    symbol: Yotta.make_deploy_resources_variables
+  owner: M4 provider descriptor and deploy snapshot migration
+  reason: PLA-M2-009 names one shared callback but does not enumerate the 24 concrete producers whose
+    configuration, credential, catalog, provider-read, side-effect, mutability, plugin, retry, and
+    post-mutation freshness semantics determine whether an attempt-local snapshot is safe
+  closure_gate: Replace this gap with one exact artifact or retained terminal compatibility owner for
+    every candidate producer and every inventoried plugin route; close only after each producer has a
+    freshness class, typed runtime projection, stable-input and intentional-delta conformance, live
+    qualification where provider mutation is affected, and no promoted route can reach a second callback
 artifacts:
 - id: PLA-M1-001
   milestone: M1
@@ -3712,15 +3797,17 @@ artifacts:
       satisfied: false
       evidence: []
     test:
-    - id: per_provider_freshness_characterization
+    - id: every_deploy_variable_producer_and_plugin_route_freshness_classified
       satisfied: false
-      evidence: []
+      evidence:
+      - PLA-GAP-004 enumerates the 24 concrete built-in producers; exact plugin routes remain inventory
+        work before this gate can close.
     telemetry:
-    - id: stable_input_and_intentional_delta_conformance
+    - id: every_promoted_route_stable_input_and_intentional_delta_conformance
       satisfied: false
       evidence: []
     release_window:
-    - id: per_provider_descriptor_promotion
+    - id: every_route_descriptor_promoted_or_retained_by_one_terminal_compatibility_owner
       satisfied: false
       evidence:
       - M4 ProviderDescriptorV1 is not implemented.
