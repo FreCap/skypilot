@@ -129,6 +129,8 @@ def bulk_provision(
     prev_cluster_ever_up: bool,
     log_dir: str,
     ports_to_open_on_launch: list[int] | None = None,
+    *,
+    cluster_incarnation: str | None = None,
 ) -> provision_common.ProvisionRecord:
     """Provisions a cluster and wait until fully provisioned.
 
@@ -151,7 +153,8 @@ def bulk_provision(
         count=num_nodes,
         tags={},
         resume_stopped_nodes=True,
-        ports_to_open_on_launch=ports_to_open_on_launch)
+        ports_to_open_on_launch=ports_to_open_on_launch,
+        cluster_incarnation=cluster_incarnation)
 
     with provision_logging.setup_provision_logging(log_dir):
         try:
@@ -234,6 +237,12 @@ def bulk_provision(
                         'manually terminate the cluster. '
                         f'Details: {formatted_exception}') from e
             raise
+
+
+# The backend uses this import-generation identity to preserve the exact old
+# call shape for rebound functions and replacement modules. A module reload
+# reconstructs the function and this alias together.
+_BUILTIN_BULK_PROVISION = bulk_provision
 
 
 def teardown_cluster(cloud_name: str, cluster_name: resources_utils.ClusterName,

@@ -76,10 +76,18 @@ class ProvisionConfig:
     resume_stopped_nodes: bool
     # Optional ports to open on launch of the cluster.
     ports_to_open_on_launch: list[int] | None
+    # Internal cluster-generation identity. This is deliberately keyword-only
+    # so existing positional construction and required-field subclasses remain
+    # compatible.
+    cluster_incarnation: str | None = dataclasses.field(default=None,
+                                                        kw_only=True,
+                                                        repr=False)
 
     def get_redacted_config(self) -> dict[str, Any]:
         """Get the redacted config."""
         config = dataclasses.asdict(self)
+        # This internal identity is not part of the provision-log contract.
+        config.pop('cluster_incarnation', None)
 
         config_copy = config_utils.Config(config)
 
