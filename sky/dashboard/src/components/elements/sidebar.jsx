@@ -16,7 +16,6 @@ import {
   ExternalLinkIcon,
   GitHubIcon,
   SlackIcon,
-  CommentFeedbackIcon,
   BookDocIcon,
   UsersIcon,
   StarIcon,
@@ -606,69 +605,6 @@ export function TopBar() {
                 {Object.entries(groups).map(([groupName, links]) =>
                   renderDesktopDropdownMenu(groupName, links)
                 )}
-
-                <CustomTooltip
-                  content="Documentation"
-                  className="text-sm text-muted-foreground"
-                >
-                  <a
-                    href="https://docs.skypilot.co/en/latest/"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center align-middle border-b-2 border-transparent px-1 pt-1 space-x-1 text-gray-600 hover:text-blue-600 transition-colors duration-150 cursor-pointer"
-                    title="Docs"
-                  >
-                    <span className="leading-none">Docs</span>
-                    <ExternalLinkIcon className="w-3.5 h-3.5" />
-                  </a>
-                </CustomTooltip>
-
-                <CustomTooltip
-                  content="GitHub Repository"
-                  className="text-sm text-muted-foreground"
-                >
-                  <a
-                    href="https://github.com/skypilot-org/skypilot"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center align-middle p-2 rounded-full text-gray-600 hover:bg-gray-100 transition-colors duration-150 cursor-pointer"
-                    title="GitHub"
-                  >
-                    <GitHubIcon className="w-5 h-5" />
-                  </a>
-                </CustomTooltip>
-
-                <CustomTooltip
-                  content="Join Slack"
-                  className="text-sm text-muted-foreground"
-                >
-                  <a
-                    href="https://slack.skypilot.co/"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center align-middle p-2 rounded-full text-gray-600 hover:bg-gray-100 transition-colors duration-150 cursor-pointer"
-                    title="Slack"
-                  >
-                    <SlackIcon className="w-5 h-5" />
-                  </a>
-                </CustomTooltip>
-
-                <CustomTooltip
-                  content="Leave Feedback"
-                  className="text-sm text-muted-foreground"
-                >
-                  <a
-                    href="https://github.com/skypilot-org/skypilot/issues/new"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center align-middle p-2 rounded-full text-gray-600 hover:bg-gray-100 transition-colors duration-150 cursor-pointer"
-                    title="Leave Feedback"
-                  >
-                    <CommentFeedbackIcon className="w-5 h-5" />
-                  </a>
-                </CustomTooltip>
-
-                <div className="border-l border-gray-200 h-6"></div>
 
                 {/* Theme Toggle */}
                 <ThemeToggle />

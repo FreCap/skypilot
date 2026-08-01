@@ -61,6 +61,7 @@ overlay_commit="$(git rev-parse HEAD)"
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   overlay_commit="${overlay_commit}-dirty"
 fi
+overlay_commit_timestamp="$(git show -s --format=%cI HEAD)"
 overlay_build="$(git rev-list --count HEAD)"
 
 echo ">> Overlay file set: full fork sky/ tree at HEAD (tests excluded)"
@@ -131,7 +132,9 @@ done
 # The wheel replaces the base package, so stamp the source-tree placeholders
 # before building it. There is no .git directory in the final image from which
 # the runtime fallback could recover this identity.
-OVERLAY_COMMIT="$overlay_commit" OVERLAY_BUILD="$overlay_build" \
+OVERLAY_COMMIT="$overlay_commit" \
+  OVERLAY_COMMIT_TIMESTAMP="$overlay_commit_timestamp" \
+  OVERLAY_BUILD="$overlay_build" \
   OVERLAY_VERSION="$SKYPILOT_VERSION" \
   python3 - "$ctx/sky/__init__.py" <<'PY'
 import os
@@ -143,6 +146,8 @@ path = Path(sys.argv[1])
 content = path.read_text(encoding='utf-8')
 for name, value in (
     ('_SKYPILOT_COMMIT_SHA', os.environ['OVERLAY_COMMIT']),
+    ('_SKYPILOT_COMMIT_TIMESTAMP',
+     os.environ['OVERLAY_COMMIT_TIMESTAMP']),
     ('_SKYPILOT_COMMIT_COUNT', os.environ['OVERLAY_BUILD']),
 ):
     content, replacements = re.subn(
@@ -163,7 +168,7 @@ if replacements != 1:
     raise RuntimeError(f'could not stamp __version__ in {path}')
 path.write_text(content, encoding='utf-8')
 PY
-echo ">> Stamped overlay identity: version ${SKYPILOT_VERSION}, commit ${overlay_commit}, build ${overlay_build}"
+echo ">> Stamped overlay identity: version ${SKYPILOT_VERSION}, commit ${overlay_commit}, checked in ${overlay_commit_timestamp}, build ${overlay_build}"
 
 # Ship ONLY the static export (out/) — never node_modules/.next; the server
 # serves sky/dashboard/out directly (sky/server/constants.py: DASHBOARD_DIR),
@@ -186,6 +191,7 @@ docker build --platform "$PLATFORM" \
 echo ">> Verifying canonical version + identity + modules + dashboard"
 docker run --rm --platform "$PLATFORM" \
   -e "EXPECTED_SKYPILOT_COMMIT=${overlay_commit}" \
+  -e "EXPECTED_SKYPILOT_COMMIT_TIMESTAMP=${overlay_commit_timestamp}" \
   -e "EXPECTED_SKYPILOT_BUILD=${overlay_build}" \
   "$TAG" python -c "
 import importlib.metadata, inspect, os
@@ -195,6 +201,7 @@ from sky.utils import controller_utils
 import sky.server.config
 from sky.server import constants as server_constants
 assert sky.__commit__ == os.environ['EXPECTED_SKYPILOT_COMMIT']
+assert sky.__commit_timestamp__ == os.environ['EXPECTED_SKYPILOT_COMMIT_TIMESTAMP']
 assert sky.__build__ == os.environ['EXPECTED_SKYPILOT_BUILD']
 assert hasattr(controller_utils, 'in_flight_launch_count')
 assert 'in_flight' in inspect.signature(controller_utils.can_provision).parameters

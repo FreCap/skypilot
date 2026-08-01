@@ -102,6 +102,12 @@ P = ParamSpec('P')
 
 logger = sky_logging.init_logger(__name__)
 
+# Portable deployment provenance for the code instance serving this process.
+# Capturing this at module initialization avoids adding Helm/Kubernetes calls
+# to the health endpoint and works for local, VM, container, and K8s servers.
+_SERVER_STARTED_AT = datetime.datetime.now(
+    datetime.timezone.utc).isoformat(timespec='seconds')
+
 # TODO(zhwu): Streaming requests, such log tailing after sky launch or sky logs,
 # need to be detached from the main requests queue. Otherwise, the streaming
 # response will block other requests from being processed.
@@ -2028,8 +2034,9 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         responses.APIHealthResponse: The health response.
     """
     user = request.state.auth_user
+    is_anonymous = getattr(request.state, 'anonymous_user', False)
     server_status = common.ApiServerStatus.HEALTHY
-    if getattr(request.state, 'anonymous_user', False):
+    if is_anonymous:
         # API server authentication is enabled, but the request is not
         # authenticated. We still have to serve the request because the
         # /api/health endpoint has two different usage:
@@ -2067,6 +2074,11 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
     # Get latest version from cache (returns None for dev versions
     # or if not available)
     latest_version = version_check.get_latest_version_for_current()
+    release_metadata: dict[str, str] = {}
+    if not is_anonymous:
+        if sky.__commit_timestamp__ is not None:
+            release_metadata['commit_timestamp'] = sky.__commit_timestamp__
+        release_metadata['deployment_timestamp'] = _SERVER_STARTED_AT
 
     return responses.APIHealthResponse(
         status=server_status,
@@ -2094,6 +2106,7 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         # Whether external proxy auth is enabled (from server.yaml config)
         external_proxy_auth_enabled=server_config.load_external_proxy_config().
         enabled,
+        **release_metadata,
         # Latest version info (if available and newer than current)
         latest_version=latest_version,
         # Whether telemetry/usage collection is enabled
