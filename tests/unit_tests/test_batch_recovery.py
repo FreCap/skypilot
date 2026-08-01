@@ -457,6 +457,10 @@ def test_schema_023_adds_batch_coordinator_ownership_tokens(tmp_path):
         'coordinator_token', 'worker_cluster', 'worker_job_name',
         'launch_request_id', 'worker_job_id'
     } <= worker_columns
+    assert inspector.get_pk_constraint(
+        'batch_worker')['constrained_columns'] == [
+            'job_id', 'coordinator_token', 'worker_cluster'
+        ]
 
 
 def test_schema_024_indexes_shared_api_tokens(tmp_path, monkeypatch):
@@ -2222,8 +2226,7 @@ async def test_superseded_cleanup_fans_out_active_workers(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_superseded_cleanup_reuses_one_queue_snapshot_per_cluster(
-        monkeypatch):
+async def test_superseded_cleanup_queries_each_owned_cluster_once(monkeypatch):
     batch_coordinator = _make_coordinator()
     records = [{
         'coordinator_token': batch_coordinator._worker_token,
@@ -2233,28 +2236,39 @@ async def test_superseded_cleanup_reuses_one_queue_snapshot_per_cluster(
         'launch_request_id': None,
     }, {
         'coordinator_token': batch_coordinator._worker_token,
-        'worker_cluster': 'worker-a',
+        'worker_cluster': 'worker-b',
         'worker_job_name': 'batch-worker-1-owner-b',
         'worker_job_id': None,
         'launch_request_id': None,
+    }, {
+        'coordinator_token': 'replacement-owner',
+        'worker_cluster': 'worker-a',
+        'worker_job_name': 'batch-worker-1-replacement-owner',
+        'worker_job_id': None,
+        'launch_request_id': None,
     }]
-    queued_jobs = [
-        types.SimpleNamespace(job_id=17, job_name='batch-worker-1-owner-a'),
-        types.SimpleNamespace(job_id=18, job_name='batch-worker-1-owner-b'),
-    ]
-    queue = mock.Mock(side_effect=['queue-1', 'queue-2'])
+    queued_jobs = {
+        'queue-worker-a': [
+            types.SimpleNamespace(job_id=17, job_name='batch-worker-1-owner-a')
+        ],
+        'queue-worker-b': [
+            types.SimpleNamespace(job_id=18, job_name='batch-worker-1-owner-b')
+        ],
+    }
+    queue = mock.Mock(
+        side_effect=lambda cluster_name, **_: f'queue-{cluster_name}')
     persist_job_id = mock.Mock(return_value=True)
     remove_record = mock.Mock(return_value=True)
 
     def _get(request_id):
-        if request_id in ('queue-1', 'queue-2'):
-            return queued_jobs
+        if request_id in queued_jobs:
+            return queued_jobs[request_id]
         if request_id in ('cancel-17', 'cancel-18'):
             return None
         raise AssertionError(f'unexpected sdk.get request {request_id!r}')
 
     def _cancel(cluster_name, job_ids):
-        assert cluster_name == 'worker-a'
+        assert cluster_name in ('worker-a', 'worker-b')
         assert len(job_ids) == 1
         return f'cancel-{job_ids[0]}'
 
@@ -2273,19 +2287,23 @@ async def test_superseded_cleanup_reuses_one_queue_snapshot_per_cluster(
 
     await batch_coordinator.handle_superseded(timeout=1)
 
-    assert queue.call_count == 1
+    assert queue.call_args_list == [
+        mock.call('worker-a', skip_finished=True),
+        mock.call('worker-b', skip_finished=True),
+    ]
     assert get.call_args_list == [
-        mock.call('queue-1'),
+        mock.call('queue-worker-a'),
         mock.call('cancel-17'),
+        mock.call('queue-worker-b'),
         mock.call('cancel-18'),
     ]
     assert cancel.call_args_list == [
         mock.call('worker-a', job_ids=[17]),
-        mock.call('worker-a', job_ids=[18]),
+        mock.call('worker-b', job_ids=[18]),
     ]
     persist_job_id.assert_has_calls([
         mock.call(1, batch_coordinator._worker_token, 'worker-a', 17),
-        mock.call(1, batch_coordinator._worker_token, 'worker-a', 18),
+        mock.call(1, batch_coordinator._worker_token, 'worker-b', 18),
     ])
     remove_record.assert_has_calls([
         mock.call(1,
@@ -2294,7 +2312,7 @@ async def test_superseded_cleanup_reuses_one_queue_snapshot_per_cluster(
                   worker_job_id=17),
         mock.call(1,
                   batch_coordinator._worker_token,
-                  'worker-a',
+                  'worker-b',
                   worker_job_id=18),
     ])
 
@@ -2393,19 +2411,12 @@ async def test_superseded_cleanup_refuses_ambiguous_queue_ids(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_superseded_cleanup_does_not_retry_failed_cluster_queue(
-        monkeypatch):
+async def test_superseded_cleanup_contains_failed_cluster_queue(monkeypatch):
     batch_coordinator = _make_coordinator()
     records = [{
         'coordinator_token': batch_coordinator._worker_token,
         'worker_cluster': 'worker-a',
         'worker_job_name': 'batch-worker-1-owner-a',
-        'worker_job_id': None,
-        'launch_request_id': None,
-    }, {
-        'coordinator_token': batch_coordinator._worker_token,
-        'worker_cluster': 'worker-a',
-        'worker_job_name': 'batch-worker-1-owner-b',
         'worker_job_id': None,
         'launch_request_id': None,
     }]

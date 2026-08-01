@@ -14,13 +14,12 @@ workers could remain live until a later recovery pass discovered their durable
 records. Cleanup latency also grew as the sum of independent SDK latencies.
 
 After active cleanup, the same method resolves durable worker records that may
-not yet contain an exact job ID. Those records can share a worker cluster. A
-fresh queue request per record repeats identical remote work and can consume the
-remaining deadline without improving correctness. The resolver must therefore
-reuse one queue attempt per cluster without grouping multiple external calls
-inside one timed worker thread. Otherwise a timed-out resolver can continue
-into later queue, persistence, or cancellation actions after
-`handle_superseded()` returns.
+not yet contain an exact job ID. Each coordinator owns at most one durable
+record per worker cluster: the table primary key is `(job_id,
+coordinator_token, worker_cluster)`, and superseded cleanup selects only its own
+coordinator token. Each external call must remain a separate timed segment.
+Otherwise a timed-out resolver can continue into later queue, persistence, or
+cancellation actions after `handle_superseded()` returns.
 
 ## Behavior contract
 
@@ -39,9 +38,10 @@ into later queue, persistence, or cancellation actions after
   pipeline finishes within the deadline. If any active pipeline times out,
   cleanup returns and leaves durable state for the replacement recovery path.
 - Durable recovery performs at most one queue request and one queue-result read
-  per worker cluster in one cleanup pass. Successful snapshots are reused for
-  exact-name matching. A failed attempt is not retried for a sibling record in
-  the same pass; durable state remains available to a later recovery owner.
+  for each unresolved record. Because one coordinator token owns at most one
+  record per worker cluster, this is also at most one queue attempt per owned
+  cluster. Failed attempts leave durable state available to a later recovery
+  owner.
 - Launch-request recovery, queue request, queue result, exact-ID persistence,
   cancellation request, cancellation completion, and record removal remain
   separate deadline-guarded segments. A timed-out segment may finish in its
@@ -65,18 +65,18 @@ pipelines settle, return immediately if any timed out; otherwise continue into
 the existing durable-record recovery and final active-worker drain.
 
 For durable recovery, retain the asynchronous sequence of individually guarded
-external calls. Reuse `_matching_worker_job_ids()` for the pure exact-name
-decision, and keep a local cluster-to-optional-snapshot map. A `None` entry
-records an attempted cluster whose request or result failed. This removes
-duplicate matching logic while ensuring that neither a successful snapshot nor
-a failed queue attempt starts another queue request for the same cluster during
-the pass.
+external calls and reuse `_matching_worker_job_ids()` for the pure exact-name
+decision. Do not add a pass-local queue snapshot map: after filtering by the
+current coordinator token, the durable primary key makes a second record for
+the same cluster unrepresentable. The synchronous replacement-owner cleanup
+path is different because it intentionally walks several stale coordinator
+tokens; its cross-token queue memo remains valid.
 
 This does not add retries, polls, database reads, provider calls, or durable
 state. Successful active cleanup keeps the same per-worker call count.
 Coordination adds one coroutine/task per active worker and keeps O(worker count)
-memory. Durable recovery changes queue work from O(unresolved records) to
-O(distinct worker clusters), with O(distinct worker clusters) transient memory.
+memory. Superseded durable recovery remains O(owned worker clusters) in queue
+calls and uses O(1) additional collection memory.
 
 ## Alternatives considered
 
@@ -101,10 +101,10 @@ launch recovery, queue request/result, and persistence internally. Timing out
 the outer thread cannot stop it from starting later external actions after the
 global deadline, so it is not a valid reuse boundary.
 
-Caching only successful queue snapshots preserves same-pass retries after
-ordinary failures, but can issue one failed remote request per unresolved
-record. One attempted-cluster set bounds failure-path work while leaving the
-durable records intact for a later recovery owner.
+Caching queue snapshots by cluster was rejected after post-merge audit. The
+only test demonstrating reuse supplied two records with the same job, token,
+and cluster, which the durable primary key rejects. Keeping the memo would add
+state and failure semantics without changing a representable production path.
 
 ## Changed-path-to-test matrix
 
@@ -114,10 +114,11 @@ durable records intact for a later recovery owner.
 | Per-worker shutdown-before-cancel ordering and exact job-ID targeting | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | Shutdown failure containment and sibling liveness | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | One global deadline, no post-timeout calls after active-worker or durable launch-recovery timeouts, and cancellation shielding | `tests/unit_tests/test_batch_recovery.py` | same focused command |
-| Durable exact-ID recovery reuses one successful queue snapshot per cluster, persists each exact ID, and cancels/removes only that ID | `tests/unit_tests/test_batch_recovery.py` | same focused command |
-| A failed queue attempt is contained and not repeated for another durable record on the same cluster | `tests/unit_tests/test_batch_recovery.py` | same focused command |
+| Durable exact-ID recovery processes one representable record per owned cluster, persists each exact ID, and cancels/removes only that ID | `tests/unit_tests/test_batch_recovery.py` | same focused command |
+| The durable schema rejects duplicate `(job_id, coordinator_token, worker_cluster)` identities | `tests/unit_tests/test_batch_recovery.py` | same focused command |
+| A failed queue attempt is contained without persistence, cancellation, or removal | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | Ambiguous queue matches remain uncancelled and durable for later recovery | `tests/unit_tests/test_batch_recovery.py` | same focused command |
-| Call-count and latency performance: unchanged calls per successful active worker, sibling starts before blocked worker release, and durable queue calls are bounded by distinct clusters | `tests/unit_tests/test_batch_recovery.py` | same focused command |
+| Call-count and latency performance: unchanged calls per successful active worker, sibling starts before blocked worker release, and one durable queue call per representable owned cluster | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | Adjacent Batch takeover, lease, retry, cleanup, and durable-state behavior | `tests/unit_tests/test_batch_recovery.py` | `python -m pytest -q -o addopts='' tests/unit_tests/test_batch_recovery.py` |
 | Adjacent managed-jobs integration surface | `tests/test_jobs_and_serve.py`, `tests/test_jobs_state_async_vs_sync.py` | `python -m pytest -q -o addopts='' tests/test_jobs_and_serve.py tests/test_jobs_state_async_vs_sync.py` |
 | Python formatting, typing, lint, async lifecycle, and import contracts | production and test paths | `bash format.sh --files sky/batch/coordinator.py tests/unit_tests/test_batch_recovery.py`; repository static-analysis commands; `git diff --check` |
@@ -141,15 +142,16 @@ across seven runs. This is deterministic evidence that the change reduces
 independent cleanup latency from additive to concurrent without adding
 external work.
 
-For durable recovery, the exact-base regression uses two unresolved records on
-one cluster. The base makes two queue requests; the changed implementation must
-make one queue request, persist both exact IDs, and preserve the exact
-cancellation/removal sequence. A failure-boundary test uses two same-cluster
-records and requires one failed queue request with no persistence,
-cancellation, or removal. A deadline regression blocks launch-request recovery,
-waits for `handle_superseded()` to return, then releases the blocking call and
-proves that no queue, persistence, cancellation, or removal action starts
-afterward.
+For durable recovery, a post-merge audit compared 100 valid same-token records
+on distinct clusters against 100 same-token records forced onto one cluster.
+The exact parent and merge both made 100 queue requests for valid state. The
+merge made one request only for the invalid state, which SQLite rejects with a
+primary-key violation. The test matrix therefore covers the real uniqueness
+constraint and valid multi-cluster call counts instead of claiming an
+unreachable asymptotic improvement. A deadline regression blocks
+launch-request recovery, waits for `handle_superseded()` to return, then
+releases the blocking call and proves that no queue, persistence, cancellation,
+or removal action starts afterward.
 
 ## Rollout and rollback
 
@@ -170,6 +172,6 @@ matrix.
    before the delayed call returns.
 5. Confirm the old controller exits the cleanup path within the configured
    global deadline and the replacement coordinator owns subsequent recovery.
-6. With two unresolved durable records on one worker cluster, confirm the old
-   controller issues one queue request, persists both exact IDs, and cancels
-   only those IDs.
+6. With unresolved durable records on two worker clusters, confirm the old
+   controller issues one queue request per cluster, persists each exact ID, and
+   cancels only those IDs.
