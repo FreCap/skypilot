@@ -3051,7 +3051,7 @@ def _update_cluster_status(
                             raise e
                     # We retry for kubernetes because coreweave can have a
                     # transient network issue.
-                    time.sleep(1)
+                    context_utils.sleep_with_cancellation(1)
                     continue
                 if ready_head + ready_workers == total_nodes:
                     return True
@@ -3068,7 +3068,7 @@ def _update_cluster_status(
                 #   (not preempted), but
                 # - The ray cluster is somehow degraded so not all instances are
                 #   showing up
-                time.sleep(1)
+                context_utils.sleep_with_cancellation(1)
 
             ray_status_details = (
                 f'{ready_head + ready_workers}/{total_nodes} ready')
@@ -3215,7 +3215,7 @@ def _update_cluster_status(
             # and haven't appeared yet in the cloud API/console. Wait for a bit
             # and check again. This is a best-effort leak prevention check.
             # See https://github.com/skypilot-org/skypilot/issues/4431.
-            time.sleep(_LAUNCH_DOUBLE_CHECK_DELAY)
+            context_utils.sleep_with_cancellation(_LAUNCH_DOUBLE_CHECK_DELAY)
             node_statuses = _query_cluster_status_via_cloud_api(
                 handle, retry_if_missing=False, get_ray_config=_get_ray_config)
             # Note: even if all the node_statuses are UP now, we will still
