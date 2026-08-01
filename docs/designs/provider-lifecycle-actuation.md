@@ -6794,8 +6794,8 @@ node observation with deterministic identity and effect/incarnation fencing.
 
 #### M4 DigitalOcean incarnation locator foundation
 
-Status: proposed implementation boundary, pending exact-design adversarial
-review. This slice is pinned to SkyPilot
+Status: accepted implementation boundary after exact-design adversarial and
+simplicity review. This slice is pinned to SkyPilot
 `22d64ffe7a344db282904dfe7061847c89e79b8e` and dstack
 `c9ebdaad6bbaa3105061d79f6ab52af9d609e99d`.
 
@@ -8548,3 +8548,29 @@ The reshaped contract has SHA-256
 `16a26ee885670f3e279f51a82461a90fb9e654741a275c88d886b1906980f98f`.
 It requires a fresh exact-contract adversarial and simplicity review before
 implementation.
+
+### Review 32
+
+Verdict: `PURSUE` for the M4 DigitalOcean incarnation locator foundation at
+commit `45af22dd26cfc1ee10c5581c688ae71940b8c9c2`, with exact reviewed
+subsection SHA-256
+`2cd8ff1b1edd9f38634ed6da719c2e1b881411b5b180be6068f2b3f68c9d87ad`.
+Independent simplicity review returned `PASS`.
+
+Re-review of the Review 31 correction found that a new admission exception
+could bypass cleanup inside `bulk_provision()` yet still reach the backend's
+outer broad cleanup handler. Adding a privileged exception through both
+layers was rejected. The accepted contract instead makes marker preparation
+total for in-contract inputs: exact strings receive the fixed V1 digest,
+marked requests replace every occupant of the newly reserved namespace, and
+missing or non-exact-string values preserve exact legacy tag behavior. The
+helper is consumed only by `create_instance()`, so discovery, resume, rename,
+and zero-create paths do no marker work. No new exception class or cleanup
+bypass exists.
+
+The exact adversarial re-review returned `PURSUE` with no concrete blocker.
+This verdict authorizes only propagation of the existing cluster generation
+and creation-time DigitalOcean droplet and volume stamping. It grants no
+system-authorship proof from a tag, provider-effect fence, query-inventory
+authority, cleanup isolation, shared-reconciler mutation, retry, or
+`ProvisionRecord` change.
