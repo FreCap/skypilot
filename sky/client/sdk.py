@@ -11,6 +11,7 @@ Usage example:
 
 """
 from collections.abc import Iterator
+import dataclasses
 import datetime
 import json
 import logging
@@ -845,7 +846,7 @@ def launch(
             request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
             request_options=request_options,
             at_client_side=True) as dag:
-        return _launch(
+        prepared_request = prepare_launch_request(
             dag,
             cluster_name,
             request_options,
@@ -866,9 +867,67 @@ def launch(
             _extra_launch_context,
             _include_credentials,
         )
+        return submit_prepared_launch_request(prepared_request)
 
 
-def _launch(
+@dataclasses.dataclass(frozen=True)
+class PreparedLaunchRequest:
+    """Internal, replay-stable snapshot of one launch request payload.
+
+    The immutable canonical bytes are the sole authority.  ``body`` returns a
+    fresh ``LaunchBody`` for typed inspection, so mutating that view or the
+    source task cannot alter a later inspection or submission.
+    """
+
+    submitted_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.submitted_bytes, bytes):
+            raise TypeError('Launch request canonical payload must be bytes.')
+        try:
+            submitted_json = self.submitted_bytes.decode('utf-8')
+            submitted_payload = json.loads(submitted_json)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                'Launch request payload must be valid UTF-8 JSON.') from exc
+        if not isinstance(submitted_payload, dict):
+            raise ValueError('Launch request payload must be a JSON object.')
+        canonical_bytes = _canonical_launch_json_bytes(submitted_payload)
+        if canonical_bytes != self.submitted_bytes:
+            raise ValueError('Launch request payload is not canonical JSON.')
+        try:
+            body = payloads.LaunchBody.model_validate_json(self.submitted_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                'Launch request payload is not a LaunchBody.') from exc
+        if _canonical_launch_body_bytes(body) != self.submitted_bytes:
+            raise ValueError('Launch request payload does not exactly match '
+                             'its LaunchBody representation.')
+
+    @property
+    def body(self) -> payloads.LaunchBody:
+        """Returns a fresh typed view of the committed request bytes."""
+        return payloads.LaunchBody.model_validate_json(self.submitted_bytes)
+
+    @property
+    def submitted_json(self) -> str:
+        """Returns the canonical UTF-8 JSON text committed for submission."""
+        return self.submitted_bytes.decode('utf-8')
+
+
+def _canonical_launch_json_bytes(value: Any) -> bytes:
+    return json.dumps(value,
+                      sort_keys=True,
+                      separators=(',', ':'),
+                      ensure_ascii=False,
+                      allow_nan=False).encode('utf-8')
+
+
+def _canonical_launch_body_bytes(body: payloads.LaunchBody) -> bytes:
+    return _canonical_launch_json_bytes(json.loads(body.model_dump_json()))
+
+
+def prepare_launch_request(
     dag: 'sky.Dag',
     cluster_name: str,
     request_options: admin_policy.RequestOptions,
@@ -890,9 +949,8 @@ def _launch(
     _file_mounts_blob_id: str | None = None,
     _extra_launch_context: dict[str, Any] | None = None,
     _include_credentials: bool = False,
-) -> server_common.RequestId[tuple[int | None,
-                                   Optional['backends.ResourceHandle']]]:
-    """Auxiliary function for launch(), refer to launch() for details."""
+) -> PreparedLaunchRequest:
+    """Runs launch preparation and freezes the exact HTTP JSON payload."""
 
     validate(dag, admin_policy_request_options=request_options)
     # The flags have been applied to the task YAML and the backward
@@ -998,8 +1056,26 @@ def _launch(
         extra_launch_context=_extra_launch_context or {},
         include_credentials=include_credentials,
     )
+
+    # Keep the submitted representation detached from both the source Dag and
+    # mutable nested values accepted by LaunchBody.  Sorting keys and removing
+    # insignificant whitespace gives callers stable bytes to journal/hash,
+    # while decoding those bytes below preserves the existing ``json=`` HTTP
+    # request behavior.
+    submitted_bytes = _canonical_launch_body_bytes(body)
+    return PreparedLaunchRequest(submitted_bytes=submitted_bytes)
+
+
+def submit_prepared_launch_request(
+    prepared_request: PreparedLaunchRequest,
+) -> server_common.RequestId[tuple[int | None,
+                                   Optional['backends.ResourceHandle']]]:
+    """Submits exactly one HTTP request from a prepared launch snapshot."""
     response = server_common.make_authenticated_request(
-        'POST', '/launch', json=json.loads(body.model_dump_json()), timeout=5)
+        'POST',
+        '/launch',
+        json=json.loads(prepared_request.submitted_bytes),
+        timeout=5)
     return server_common.get_request_id(response)
 
 
