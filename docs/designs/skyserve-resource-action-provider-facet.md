@@ -20,9 +20,12 @@ the enclosing 12-record inventory validator, named capsule composition, and
 request-body renderer/normalizer artifacts are design-frozen and code-pending;
 foundational runtime/job/endpoint leaves now include the closed Skylet job-spec,
 submit-request, retained-evidence, and policy-boundary-proof leaves and are
-independently verified, while contextual action-bound submit comparison,
-execution-config composition, and live preflight remain pending; runtime
-provider propagation, observation, and shadow instrumentation remain pending
+independently verified; the policy-free request-identity, scheduling, storage,
+metadata, security, object-mutation-effect, and exact launch/down mutation
+contract leaves are implemented and independently verified, while contextual
+action-bound submit comparison, enclosing inventory/capsule and execution-config
+composition, and live preflight remain pending; runtime provider propagation,
+observation, and shadow instrumentation remain pending
 
 Last updated: 2026-08-01
 
@@ -4316,6 +4319,20 @@ pass together. Independent adversarial review accepted these context-free
 leaves. This evidence does not claim execution-capsule composition, contextual
 policy or retained-request comparison, renderer/normalizer artifacts, provider
 I/O, or authority.
+
+Further P1 leaf verification evidence on 2026-08-01: the policy-free request
+identity, scheduling, storage, metadata, security, object-mutation-effect, and
+exact launch/down mutation contracts pass fixed canonical byte-size/hash,
+round-trip, closed-shape, semantic-order, exact-list-cardinality, scalar and
+whole-object-bound, direct/wire container, and every-literal mutation tests.
+Hostile-input probes also require bounded rejection before recursive
+serialization or child parsing and reject cycles, 1,100-level nesting, falsey
+collection subclasses, equality/length-spoofing scalars, and typed-child
+subclasses with hidden wire fields. The focused suite and the adjacent 11-file
+provider DTO suite pass together; independent adversarial review accepted the
+leaves. This evidence does not claim prepared-request identity provenance, the
+enclosing 12-role prerequisite inventory, capsule/config composition, policy
+subject projection, provider effect emission, I/O, or authority.
 
 First-deployment cutover evidence on 2026-08-01: read-only `boltz-test`
 inspection found API schema 004, Serve 031, global-user-state 027, and no API or

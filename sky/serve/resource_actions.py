@@ -7110,6 +7110,603 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderKubernetesRequestIdentityV1(_CanonicalContract):
+    """Bounded nonsecret request-user identity retained by a capsule."""
+
+    cleaned_user: str
+    original_user: str
+    frozen_user_hash: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'cleaned_user', 'original_user', 'frozen_user_hash'})
+
+    def __post_init__(self) -> None:
+        for field in ('cleaned_user', 'original_user', 'frozen_user_hash'):
+            value = getattr(self, field)
+            if type(value) is not str:
+                raise TypeError(f'request_identity.{field} must be text.')
+            object.__setattr__(self, field,
+                               _text(value, name=f'request_identity.{field}'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesRequestIdentityV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes request identity',
+                                     keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesSchedulingContractV1(_CanonicalContract):
+    """Policy-free scheduling inputs for the direct-Pod capsule."""
+
+    node_count: int
+    use_spot: bool
+    accelerator: None
+    node_selector: tuple[Any, ...]
+    allowed_nodes: tuple[Any, ...]
+    avoid_accelerator_label_keys: tuple[str, ...]
+    runtime_class_name: None
+    priority_class_name: None
+    queue: None
+    kueue: bool
+    dws: bool
+    autoscaler: None
+    detected_network_type: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'node_count', 'use_spot', 'accelerator', 'node_selector',
+        'allowed_nodes', 'avoid_accelerator_label_keys', 'runtime_class_name',
+        'priority_class_name', 'queue', 'kueue', 'dws', 'autoscaler',
+        'detected_network_type'
+    })
+    _NULL_FIELDS: ClassVar[tuple[str,
+                                 ...]] = ('accelerator', 'runtime_class_name',
+                                          'priority_class_name', 'queue',
+                                          'autoscaler')
+    _EMPTY_FIELDS: ClassVar[tuple[str,
+                                  ...]] = ('node_selector', 'allowed_nodes')
+    _FALSE_FIELDS: ClassVar[tuple[str, ...]] = ('use_spot', 'kueue', 'dws')
+
+    def __post_init__(self) -> None:
+        if type(self.node_count) is not int:
+            raise TypeError('scheduling node_count must be an integer.')
+        _positive_integer(self.node_count, name='scheduling.node_count')
+        if self.node_count != 1:
+            raise ValueError('scheduling node_count must be 1.')
+        for field in self._FALSE_FIELDS:
+            value = getattr(self, field)
+            _boolean(value, name=f'scheduling.{field}')
+            if value:
+                raise ValueError(f'scheduling {field} must be false.')
+        for field in self._NULL_FIELDS:
+            if getattr(self, field) is not None:
+                raise ValueError(f'scheduling {field} must be null.')
+        for field in self._EMPTY_FIELDS:
+            value = getattr(self, field)
+            if type(value) is not tuple:
+                raise TypeError(f'scheduling {field} must be a tuple.')
+            if len(value) != 0:
+                raise ValueError(f'scheduling {field} must be empty.')
+        label_keys = self.avoid_accelerator_label_keys
+        if type(label_keys) is not tuple:
+            raise TypeError('scheduling avoid_accelerator_label_keys must be '
+                            'a tuple.')
+        if any(type(label_key) is not str for label_key in label_keys):
+            raise TypeError('scheduling avoid_accelerator_label_keys must '
+                            'contain text.')
+        object.__setattr__(
+            self, 'avoid_accelerator_label_keys',
+            _sorted_text_tuple(label_keys,
+                               name='scheduling avoid_accelerator_label_keys',
+                               maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        if (type(self.detected_network_type) is not str or
+                self.detected_network_type != 'default'):
+            raise ValueError('scheduling detected_network_type must be '
+                             'default.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesSchedulingContractV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes scheduling contract',
+                                     keys=cls._KEYS)
+        normalized = dict(raw)
+        for field in cls._EMPTY_FIELDS:
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'scheduling {field} must be a list.')
+            if len(items) != 0:
+                raise ValueError(f'scheduling {field} must be empty.')
+            normalized[field] = tuple(items)
+        label_keys = raw['avoid_accelerator_label_keys']
+        if type(label_keys) is not list:
+            raise TypeError('scheduling avoid_accelerator_label_keys must be '
+                            'a list.')
+        if len(label_keys) > _MAX_LIST_ITEMS:
+            raise ValueError('scheduling avoid_accelerator_label_keys must '
+                             'contain at most 256 items.')
+        normalized['avoid_accelerator_label_keys'] = tuple(label_keys)
+        return cls(**normalized)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'node_count': 1,
+            'use_spot': False,
+            'accelerator': None,
+            'node_selector': [],
+            'allowed_nodes': [],
+            'avoid_accelerator_label_keys': list(
+                self.avoid_accelerator_label_keys),
+            'runtime_class_name': None,
+            'priority_class_name': None,
+            'queue': None,
+            'kueue': False,
+            'dws': False,
+            'autoscaler': None,
+            'detected_network_type': 'default',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesStorageContractV1(_CanonicalContract):
+    """Closed absence of storage and mount inputs for the first capsule."""
+
+    persistent_volumes: tuple[Any, ...]
+    object_stores: tuple[Any, ...]
+    file_mounts: tuple[Any, ...]
+    workdir: None
+    fuse: bool
+    docker_cache: bool
+    auto_mounts: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'persistent_volumes', 'object_stores', 'file_mounts', 'workdir', 'fuse',
+        'docker_cache', 'auto_mounts'
+    })
+    _EMPTY_FIELDS: ClassVar[tuple[str, ...]] = ('persistent_volumes',
+                                                'object_stores', 'file_mounts')
+    _FALSE_FIELDS: ClassVar[tuple[str, ...]] = ('fuse', 'docker_cache',
+                                                'auto_mounts')
+
+    def __post_init__(self) -> None:
+        for field in self._EMPTY_FIELDS:
+            value = getattr(self, field)
+            if type(value) is not tuple:
+                raise TypeError(f'storage {field} must be a tuple.')
+            if len(value) != 0:
+                raise ValueError(f'storage {field} must be empty.')
+        if self.workdir is not None:
+            raise ValueError('storage workdir must be null.')
+        for field in self._FALSE_FIELDS:
+            value = getattr(self, field)
+            _boolean(value, name=f'storage.{field}')
+            if value:
+                raise ValueError(f'storage {field} must be false.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesStorageContractV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes storage contract',
+                                     keys=cls._KEYS)
+        normalized = dict(raw)
+        for field in cls._EMPTY_FIELDS:
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'storage {field} must be a list.')
+            if len(items) != 0:
+                raise ValueError(f'storage {field} must be empty.')
+            normalized[field] = tuple(items)
+        return cls(**normalized)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'persistent_volumes': [],
+            'object_stores': [],
+            'file_mounts': [],
+            'workdir': None,
+            'fuse': False,
+            'docker_cache': False,
+            'auto_mounts': False,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesMetadataContractV1(_CanonicalContract):
+    """Closed absence of caller-selected Kubernetes metadata."""
+
+    global_labels: tuple[Any, ...]
+    custom_pod_config: None
+    custom_metadata: tuple[Any, ...]
+    reserved_labels_injected_last: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'global_labels', 'custom_pod_config', 'custom_metadata',
+        'reserved_labels_injected_last'
+    })
+    _EMPTY_FIELDS: ClassVar[tuple[str,
+                                  ...]] = ('global_labels', 'custom_metadata')
+
+    def __post_init__(self) -> None:
+        for field in self._EMPTY_FIELDS:
+            value = getattr(self, field)
+            if type(value) is not tuple:
+                raise TypeError(f'metadata {field} must be a tuple.')
+            if len(value) != 0:
+                raise ValueError(f'metadata {field} must be empty.')
+        if self.custom_pod_config is not None:
+            raise ValueError('metadata custom_pod_config must be null.')
+        _boolean(self.reserved_labels_injected_last,
+                 name='metadata.reserved_labels_injected_last')
+        if not self.reserved_labels_injected_last:
+            raise ValueError('metadata reserved_labels_injected_last must be '
+                             'true.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesMetadataContractV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes metadata contract',
+                                     keys=cls._KEYS)
+        normalized = dict(raw)
+        for field in cls._EMPTY_FIELDS:
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'metadata {field} must be a list.')
+            if len(items) != 0:
+                raise ValueError(f'metadata {field} must be empty.')
+            normalized[field] = tuple(items)
+        return cls(**normalized)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'global_labels': [],
+            'custom_pod_config': None,
+            'custom_metadata': [],
+            'reserved_labels_injected_last': True,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesSecurityContractV1(_CanonicalContract):
+    """Closed absence of security bootstrap and retained secret material."""
+
+    tls_material: None
+    managed_secrets: tuple[Any, ...]
+    task_secrets: tuple[Any, ...]
+    service_account_bootstrap: bool
+    rbac_bootstrap: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'tls_material', 'managed_secrets', 'task_secrets',
+        'service_account_bootstrap', 'rbac_bootstrap'
+    })
+    _EMPTY_FIELDS: ClassVar[tuple[str,
+                                  ...]] = ('managed_secrets', 'task_secrets')
+    _FALSE_FIELDS: ClassVar[tuple[str, ...]] = ('service_account_bootstrap',
+                                                'rbac_bootstrap')
+
+    def __post_init__(self) -> None:
+        if self.tls_material is not None:
+            raise ValueError('security tls_material must be null.')
+        for field in self._EMPTY_FIELDS:
+            value = getattr(self, field)
+            if type(value) is not tuple:
+                raise TypeError(f'security {field} must be a tuple.')
+            if len(value) != 0:
+                raise ValueError(f'security {field} must be empty.')
+        for field in self._FALSE_FIELDS:
+            value = getattr(self, field)
+            _boolean(value, name=f'security.{field}')
+            if value:
+                raise ValueError(f'security {field} must be false.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesSecurityContractV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes security contract',
+                                     keys=cls._KEYS)
+        normalized = dict(raw)
+        for field in cls._EMPTY_FIELDS:
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'security {field} must be a list.')
+            if len(items) != 0:
+                raise ValueError(f'security {field} must be empty.')
+            normalized[field] = tuple(items)
+        return cls(**normalized)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'tls_material': None,
+            'managed_secrets': [],
+            'task_secrets': [],
+            'service_account_bootstrap': False,
+            'rbac_bootstrap': False,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesObjectMutationEffectV1(_CanonicalContract):
+    """One context-free object-mutation scalar union."""
+
+    sequence: int
+    role: ProviderObjectRoleV1
+    kind: ProviderPodTopologyMutableObjectKindV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'sequence', 'role', 'kind'})
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int:
+            raise TypeError('mutation_effect.sequence must be an integer.')
+        sequence = _nonnegative_integer(self.sequence,
+                                        name='mutation_effect.sequence',
+                                        maximum=2)
+        if (not isinstance(self.role, ProviderObjectRoleV1) and
+                type(self.role) is not str):
+            raise TypeError('mutation_effect.role must be text.')
+        role = _enum_value(ProviderObjectRoleV1,
+                           self.role,
+                           name='mutation_effect.role')
+        if (not isinstance(self.kind, ProviderPodTopologyMutableObjectKindV1)
+                and type(self.kind) is not str):
+            raise TypeError('mutation_effect.kind must be text.')
+        kind = _enum_value(ProviderPodTopologyMutableObjectKindV1,
+                           self.kind,
+                           name='mutation_effect.kind')
+        object.__setattr__(self, 'sequence', sequence)
+        object.__setattr__(self, 'role', role)
+        object.__setattr__(self, 'kind', kind)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesObjectMutationEffectV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes object mutation effect',
+                                     keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'sequence': self.sequence,
+            'role': self.role.value,
+            'kind': self.kind.value,
+        }
+
+
+def _validate_provider_kubernetes_mutation_effects_v1(
+        value: Any, *, name: str, order_field: str
+) -> tuple[ProviderKubernetesObjectMutationEffectV1, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f'{name} must be a tuple.')
+    if len(value) != 3:
+        raise ValueError(f'{name} must contain exactly three effects.')
+    if any(
+            type(effect) is not ProviderKubernetesObjectMutationEffectV1
+            for effect in value):
+        raise ValueError(f'{name} must contain typed mutation effects.')
+    ordered_role_map = sorted(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1,
+                              key=lambda entry: getattr(entry, order_field))
+    expected = tuple((getattr(entry, order_field), entry.role, entry.kind)
+                     for entry in ordered_role_map)
+    actual = tuple(
+        (effect.sequence, effect.role, effect.kind) for effect in value)
+    if actual != expected:
+        raise ValueError(f'{name} does not match the exact protocol order.')
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesLaunchMutationContractV1(_CanonicalContract):
+    """Exact bounded launch effect graph for the direct-Pod capsule."""
+
+    role_map_contract: str
+    create_effects: tuple[ProviderKubernetesObjectMutationEffectV1, ...]
+    delete_effects: tuple[ProviderKubernetesObjectMutationEffectV1, ...]
+    job_effect: str
+    allowed_patches: tuple[Any, ...]
+    allowed_updates: tuple[Any, ...]
+    allowed_collection_deletes: tuple[Any, ...]
+    delete_requires_identity_labels_and_uid_precondition: bool
+    create_409: str
+    create_422: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'role_map_contract', 'create_effects', 'delete_effects', 'job_effect',
+        'allowed_patches', 'allowed_updates', 'allowed_collection_deletes',
+        'delete_requires_identity_labels_and_uid_precondition', 'create_409',
+        'create_422'
+    })
+    _EMPTY_FIELDS: ClassVar[tuple[str,
+                                  ...]] = ('allowed_patches', 'allowed_updates',
+                                           'allowed_collection_deletes')
+
+    def __post_init__(self) -> None:
+        if (type(self.role_map_contract) is not str or
+                self.role_map_contract != 'ProviderKubernetesObjectRoleMapV1'):
+            raise ValueError('launch mutation role_map_contract is '
+                             'unsupported.')
+        object.__setattr__(
+            self, 'create_effects',
+            _validate_provider_kubernetes_mutation_effects_v1(
+                self.create_effects,
+                name='launch mutation create_effects',
+                order_field='create_sequence'))
+        object.__setattr__(
+            self, 'delete_effects',
+            _validate_provider_kubernetes_mutation_effects_v1(
+                self.delete_effects,
+                name='launch mutation delete_effects',
+                order_field='delete_sequence'))
+        if (type(self.job_effect) is not str or
+                self.job_effect != 'one_action_keyed_skylet_submit'):
+            raise ValueError('launch mutation job_effect is unsupported.')
+        for field in self._EMPTY_FIELDS:
+            value = getattr(self, field)
+            if type(value) is not tuple:
+                raise TypeError(f'launch mutation {field} must be a tuple.')
+            if len(value) != 0:
+                raise ValueError(f'launch mutation {field} must be empty.')
+        _boolean(self.delete_requires_identity_labels_and_uid_precondition,
+                 name=('launch mutation '
+                       'delete_requires_identity_labels_and_uid_precondition'))
+        if not self.delete_requires_identity_labels_and_uid_precondition:
+            raise ValueError('launch mutation deletes must require identity '
+                             'labels and a UID precondition.')
+        if (type(self.create_409) is not str or
+                self.create_409 != 'exact_admitted_readback_or_conflict'):
+            raise ValueError('launch mutation create_409 is unsupported.')
+        if (type(self.create_422) is not str or
+                self.create_422 != 'terminal_no_rewrite'):
+            raise ValueError('launch mutation create_422 is unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesLaunchMutationContractV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes launch mutation contract',
+                                     keys=cls._KEYS)
+        normalized = dict(raw)
+        for field in ('create_effects', 'delete_effects'):
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'launch mutation {field} must be a list.')
+            if len(items) != 3:
+                raise ValueError(f'launch mutation {field} must contain '
+                                 'exactly three effects.')
+            normalized[field] = tuple(
+                ProviderKubernetesObjectMutationEffectV1.from_value(item)
+                for item in items)
+        for field in cls._EMPTY_FIELDS:
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'launch mutation {field} must be a list.')
+            if len(items) != 0:
+                raise ValueError(f'launch mutation {field} must be empty.')
+            normalized[field] = tuple(items)
+        return cls(**normalized)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'role_map_contract': 'ProviderKubernetesObjectRoleMapV1',
+            'create_effects': [
+                effect.canonical_value() for effect in self.create_effects
+            ],
+            'delete_effects': [
+                effect.canonical_value() for effect in self.delete_effects
+            ],
+            'job_effect': 'one_action_keyed_skylet_submit',
+            'allowed_patches': [],
+            'allowed_updates': [],
+            'allowed_collection_deletes': [],
+            'delete_requires_identity_labels_and_uid_precondition': True,
+            'create_409': 'exact_admitted_readback_or_conflict',
+            'create_422': 'terminal_no_rewrite',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesDownMutationContractV1(_CanonicalContract):
+    """Exact bounded down effect graph for the direct-Pod capsule."""
+
+    role_map_contract: str
+    delete_effects: tuple[ProviderKubernetesObjectMutationEffectV1, ...]
+    delete_requires_identity_labels_and_uid_precondition: bool
+    cluster_record_removal: str
+    allowed_creates: tuple[Any, ...]
+    allowed_patches: tuple[Any, ...]
+    allowed_updates: tuple[Any, ...]
+    allowed_collection_deletes: tuple[Any, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'role_map_contract', 'delete_effects',
+        'delete_requires_identity_labels_and_uid_precondition',
+        'cluster_record_removal', 'allowed_creates', 'allowed_patches',
+        'allowed_updates', 'allowed_collection_deletes'
+    })
+    _EMPTY_FIELDS: ClassVar[tuple[str,
+                                  ...]] = ('allowed_creates', 'allowed_patches',
+                                           'allowed_updates',
+                                           'allowed_collection_deletes')
+
+    def __post_init__(self) -> None:
+        if (type(self.role_map_contract) is not str or
+                self.role_map_contract != 'ProviderKubernetesObjectRoleMapV1'):
+            raise ValueError('down mutation role_map_contract is unsupported.')
+        object.__setattr__(
+            self, 'delete_effects',
+            _validate_provider_kubernetes_mutation_effects_v1(
+                self.delete_effects,
+                name='down mutation delete_effects',
+                order_field='delete_sequence'))
+        _boolean(self.delete_requires_identity_labels_and_uid_precondition,
+                 name=('down mutation '
+                       'delete_requires_identity_labels_and_uid_precondition'))
+        if not self.delete_requires_identity_labels_and_uid_precondition:
+            raise ValueError('down mutation deletes must require identity '
+                             'labels and a UID precondition.')
+        if (type(self.cluster_record_removal) is not str or
+                self.cluster_record_removal
+                != 'same_uuid_exact_handle_after_absence_v1'):
+            raise ValueError('down mutation cluster_record_removal is '
+                             'unsupported.')
+        for field in self._EMPTY_FIELDS:
+            value = getattr(self, field)
+            if type(value) is not tuple:
+                raise TypeError(f'down mutation {field} must be a tuple.')
+            if len(value) != 0:
+                raise ValueError(f'down mutation {field} must be empty.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesDownMutationContractV1':
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes down mutation contract',
+                                     keys=cls._KEYS)
+        delete_effects = raw['delete_effects']
+        if type(delete_effects) is not list:
+            raise TypeError('down mutation delete_effects must be a list.')
+        if len(delete_effects) != 3:
+            raise ValueError('down mutation delete_effects must contain '
+                             'exactly three effects.')
+        normalized = dict(raw)
+        normalized['delete_effects'] = tuple(
+            ProviderKubernetesObjectMutationEffectV1.from_value(item)
+            for item in delete_effects)
+        for field in cls._EMPTY_FIELDS:
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'down mutation {field} must be a list.')
+            if len(items) != 0:
+                raise ValueError(f'down mutation {field} must be empty.')
+            normalized[field] = tuple(items)
+        return cls(**normalized)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'role_map_contract': 'ProviderKubernetesObjectRoleMapV1',
+            'delete_effects': [
+                effect.canonical_value() for effect in self.delete_effects
+            ],
+            'delete_requires_identity_labels_and_uid_precondition': True,
+            'cluster_record_removal': 'same_uuid_exact_handle_after_absence_v1',
+            'allowed_creates': [],
+            'allowed_patches': [],
+            'allowed_updates': [],
+            'allowed_collection_deletes': [],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderLaunchInvocationV1(_CanonicalContract):
     """Redacted provider-effective launch invocation."""
 
