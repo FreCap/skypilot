@@ -5886,6 +5886,37 @@ class TestUpdateVersion(unittest.TestCase):
                              [0.5, 0.5, 0.5])
             self.assertEqual(mock_get.call_count, 2)
 
+    def test_version_fallback_does_not_authorize_rolling_drain(self):
+        autoscaler = autoscalers.ConcurrencyAutoscaler('svc',
+                                                       _spec(knob=10.0,
+                                                             max_replicas=200),
+                                                       version=2)
+        replicas = [
+            _replica(replica_id, version=1) for replica_id in range(1, 101)
+        ]
+        replicas.append(_replica(101, card='A100', version=2))
+        for info in replicas:
+            card = 'A100' if info.version == 2 else 'L4'
+            autoscaler._gpu_shape_cache[info.replica_id] = (card, 1)
+        _report(autoscaler,
+                in_flight={info.replica_id: 0 for info in replicas},
+                queue_depth=60)
+
+        with mock.patch.object(autoscalers.serve_state,
+                               'get_spec',
+                               side_effect=[
+                                   RuntimeError('state store unavailable'),
+                                   _spec(knob=0.1)
+                               ]) as mock_get:
+            first = _decisions(autoscaler, replicas, (1, 2))
+            self.assertEqual(_scale_downs(first), [])
+            self.assertEqual(len(_scale_ups(first)), 5)
+            mock_get.assert_called_once_with('svc', 1)
+
+            second = _decisions(autoscaler, replicas, (1, 2))
+            self.assertEqual(_scale_downs(second), [])
+            self.assertEqual(mock_get.call_count, 2)
+
 
 class TestDynamicStates(unittest.TestCase):
     """The in-process autoscaler swap must carry the demand report."""

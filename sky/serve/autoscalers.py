@@ -3558,6 +3558,12 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 ready_old.append((capacity, info))
             else:
                 nonready_old.append((capacity, info))
+        unavailable_versions = self._qps_dict_unavailable_versions_for_tick
+        if unavailable_versions:
+            logger.info(
+                'Instance-aware rolling drain waiting for historical '
+                'capacity for versions: %s.', sorted(unavailable_versions))
+            return []
         # Largest capacity first: fewest old replicas kept, fastest
         # rollout. Replica id tie-break keeps the selection stable
         # across ticks.
@@ -3605,14 +3611,20 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 'Expected dict for instance-aware logic'
             return self.target_qps_per_replica
         qps_dict = None
+        load_failed = False
         try:
             spec = serve_state.get_spec(self._service_name, version)
             if spec is not None:
                 qps_dict = spec.target_qps_per_replica
         except Exception as e:  # pylint: disable=broad-except
+            load_failed = True
             logger.warning('Failed to load spec for version '
                            f'{version}: {common_utils.format_exception(e)}')
         if not isinstance(qps_dict, dict):
+            if not load_failed:
+                logger.warning(
+                    'No usable target QPS spec for historical version %s; '
+                    'using the latest-version fallback.', version)
             if unavailable_versions is not None:
                 unavailable_versions.add(version)
             assert isinstance(self.target_qps_per_replica, dict), \
@@ -3663,10 +3675,16 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             return resolved
 
         # Fallback to minimum QPS
-        logger.warning(f'No matching QPS found for GPU shape: '
-                       f'{gpu_type}:{gpu_count}. '
-                       f'Available types: {list(target_qps_dict.keys())}. '
-                       f'Using minimum QPS as fallback.')
+        unavailable_versions = self._qps_dict_unavailable_versions_for_tick
+        using_historical_fallback = (version is not None and
+                                     version != self.latest_version and
+                                     unavailable_versions is not None and
+                                     version in unavailable_versions)
+        if not using_historical_fallback:
+            logger.warning(f'No matching QPS found for GPU shape: '
+                           f'{gpu_type}:{gpu_count}. '
+                           f'Available types: {list(target_qps_dict.keys())}. '
+                           f'Using minimum QPS as fallback.')
         return min(target_qps_dict.values())
 
     def _cost_rebalance_replica_capacity(
@@ -6594,6 +6612,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 ready_old.append((capacity, info))
             else:
                 nonready_old.append((capacity, info))
+        unavailable_versions = self._knob_unavailable_versions_for_tick
+        if unavailable_versions:
+            logger.info(
+                'Concurrency rolling drain waiting for historical capacity '
+                'for versions: %s.', sorted(unavailable_versions))
+            return []
         # Keep-preference order: busy replicas first (retiring them kills
         # jobs; keeping them retains capacity that is provably serving),
         # then largest capacity (fewest old replicas kept, fastest

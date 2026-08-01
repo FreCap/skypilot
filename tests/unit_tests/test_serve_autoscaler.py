@@ -1200,6 +1200,47 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
                              [0.1, 0.1, 0.1])
             self.assertEqual(mock_get.call_count, 2)
 
+    def test_version_fallback_does_not_authorize_rolling_drain(self):
+        # Controller restart mid-update: only the latest spec is cached.
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=2)
+        replicas = [self._replica(i, 'L4', version=1) for i in range(1, 101)]
+        replicas.append(self._replica(101, 'A100', version=2))
+        autoscaler.request_timestamps = [0.0
+                                        ] * (60 * autoscaler.qps_window_size)
+        for info in replicas:
+            gpu_type = 'A100' if info.version == 2 else 'L4'
+            autoscaler._gpu_shape_cache[info.replica_id] = (gpu_type, 1)
+            autoscaler._replica_cost_cache[info.replica_id] = 0.5
+        recovered_spec = self._spec({'L4': 0.1})
+
+        with mock.patch.object(
+                autoscalers.serve_state,
+                'get_spec',
+                side_effect=[RuntimeError('state store unavailable'),
+                             recovered_spec]) as mock_get, \
+             mock.patch.object(autoscalers.logger,
+                               'warning') as mock_warning:
+            first = autoscaler.generate_scaling_decisions(replicas, [1, 2])
+            self.assertEqual([
+                decision for decision in first if decision.operator ==
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+            ], [])
+            self.assertEqual(
+                len([
+                    decision for decision in first if decision.operator ==
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP
+                ]), 5)
+            mock_get.assert_called_once_with('svc', 1)
+            self.assertEqual(mock_warning.call_count, 1)
+
+            second = autoscaler.generate_scaling_decisions(replicas, [1, 2])
+            self.assertEqual([
+                decision for decision in second if decision.operator ==
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+            ], [])
+            self.assertEqual(mock_get.call_count, 2)
+
     def test_version_fallback_tick_cleanup_after_decision_failure(self):
         autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
             'svc', self._spec({'A100': 10.0}), version=3)
