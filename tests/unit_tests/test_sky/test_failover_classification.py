@@ -1,8 +1,11 @@
 """Tests for AWS capacity classification and cache scoping."""
 # pylint: disable=protected-access
+import importlib
 import inspect
 import os
+import pathlib
 import pickle
+import types
 import unittest.mock as mock
 
 import botocore.exceptions
@@ -1184,6 +1187,174 @@ def test_new_provisioner_post_bulk_callback_is_authoritative(
     assert result['resources_vars'] == post_bulk_variables
     assert result['provision_record'] is provision_record
     bulk_provision.assert_called_once()
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_builtin_bulk_receives_exact_cluster_incarnation(
+        tmp_path, monkeypatch):
+    reloaded = importlib.reload(backend.provisioner)
+    assert reloaded.bulk_provision is reloaded._BUILTIN_BULK_PROVISION
+
+    events = []
+    writer_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'writer-value',
+        'region': 'nyc3',
+    }
+    post_bulk_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'post-bulk-value',
+        'region': 'nyc3',
+    }
+    (retrying_provisioner, to_provision, provision_record, _, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [writer_variables, post_bulk_variables],
+     )
+    cluster_incarnation = ''.join(['exact', '-cluster', '-incarnation'])
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: cluster_incarnation)
+
+    def get_cluster_yaml_str(path):
+        if path is None:
+            return None
+        yaml_path = pathlib.Path(path)
+        debug_path = pathlib.Path(f'{path}.debug')
+        if yaml_path.exists():
+            return yaml_path.read_text(encoding='utf-8')
+        if debug_path.exists():
+            return debug_path.read_text(encoding='utf-8')
+        return None
+
+    monkeypatch.setattr(backend.global_user_state, 'get_cluster_yaml_str',
+                        get_cluster_yaml_str)
+    captured_configs = []
+
+    def fake_bulk_provision(cloud, region, cluster_name, bootstrap_config):
+        del cloud, region, cluster_name
+        events.append('bulk_provision')
+        captured_configs.append(bootstrap_config)
+        return provision_record
+
+    monkeypatch.setattr(backend.provisioner, '_bulk_provision',
+                        fake_bulk_provision)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        backend.provisioner._BUILTIN_BULK_PROVISION)
+
+    result = _call_retry_zones(retrying_provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+        'bulk_provision',
+        'deploy_vars:post_bulk',
+    ]
+    assert len(captured_configs) == 1
+    assert captured_configs[0].cluster_incarnation is cluster_incarnation
+    assert result['cluster_hash'] is cluster_incarnation
+    assert cluster_incarnation not in get_cluster_yaml_str(result['ray'])
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_old_signature_bulk_replacement_keeps_old_call_shape(
+        tmp_path, monkeypatch):
+    events = []
+    (retrying_provisioner, to_provision, provision_record, _, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'writer-value',
+                 'region': 'nyc3',
+             },
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'post-bulk-value',
+                 'region': 'nyc3',
+             },
+         ],
+     )
+    calls = []
+
+    def old_bulk_provision(cloud,
+                           region,
+                           zones,
+                           cluster_name,
+                           num_nodes,
+                           cluster_yaml,
+                           prev_cluster_ever_up,
+                           log_dir,
+                           ports_to_open_on_launch=None):
+        calls.append(
+            (cloud, region, zones, cluster_name, num_nodes, cluster_yaml,
+             prev_cluster_ever_up, log_dir, ports_to_open_on_launch))
+        events.append('bulk_provision')
+        return provision_record
+
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        old_bulk_provision)
+
+    result = _call_retry_zones(retrying_provisioner, to_provision)
+
+    assert result['provision_record'] is provision_record
+    assert len(calls) == 1
+    assert 'cluster_incarnation' not in inspect.signature(
+        old_bulk_provision).parameters
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_replacement_module_keeps_old_call_shape(
+        tmp_path, monkeypatch):
+    events = []
+    (retrying_provisioner, to_provision, provision_record, _, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'writer-value',
+                 'region': 'nyc3',
+             },
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'post-bulk-value',
+                 'region': 'nyc3',
+             },
+         ],
+     )
+    calls = []
+
+    def old_bulk_provision(cloud,
+                           region,
+                           zones,
+                           cluster_name,
+                           num_nodes,
+                           cluster_yaml,
+                           prev_cluster_ever_up,
+                           log_dir,
+                           ports_to_open_on_launch=None):
+        calls.append(
+            (cloud, region, zones, cluster_name, num_nodes, cluster_yaml,
+             prev_cluster_ever_up, log_dir, ports_to_open_on_launch))
+        events.append('bulk_provision')
+        return provision_record
+
+    replacement_module = types.SimpleNamespace(
+        bulk_provision=old_bulk_provision)
+    monkeypatch.setattr(backend, 'provisioner', replacement_module)
+
+    result = _call_retry_zones(retrying_provisioner, to_provision)
+
+    assert result['provision_record'] is provision_record
+    assert len(calls) == 1
     cleanup.assert_not_called()
 
 

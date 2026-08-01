@@ -1310,17 +1310,26 @@ class RetryingVmProvisioner:
                                     f'{region.name}{colorama.Style.RESET_ALL}'
                                     f'{zone_str}.'))
                         assert handle.cluster_yaml is not None
-                        provision_record = provisioner.bulk_provision(
-                            to_provision.cloud,
-                            region,
-                            zones,
+                        bulk_provision_fn = provisioner.bulk_provision
+                        builtin_bulk_provision_fn = getattr(
+                            provisioner, '_BUILTIN_BULK_PROVISION', None)
+                        bulk_provision_kwargs: dict[str, Any] = {
+                            'num_nodes': num_nodes,
+                            'cluster_yaml': handle.cluster_yaml,
+                            'prev_cluster_ever_up': prev_cluster_ever_up,
+                            'log_dir': self.log_dir,
+                            'ports_to_open_on_launch': ports_to_open_on_launch,
+                        }
+                        if (builtin_bulk_provision_fn is not None and
+                                bulk_provision_fn is builtin_bulk_provision_fn):
+                            assert self._active_cluster_hash is not None
+                            bulk_provision_kwargs['cluster_incarnation'] = (
+                                self._active_cluster_hash)
+                        provision_record = bulk_provision_fn(
+                            to_provision.cloud, region, zones,
                             resources_utils.ClusterName(
                                 cluster_name, handle.cluster_name_on_cloud),
-                            num_nodes=num_nodes,
-                            cluster_yaml=handle.cluster_yaml,
-                            prev_cluster_ever_up=prev_cluster_ever_up,
-                            log_dir=self.log_dir,
-                            ports_to_open_on_launch=ports_to_open_on_launch)
+                            **bulk_provision_kwargs)
                         # NOTE: We will handle the logic of '_ensure_cluster_ray_started'
                         # in 'provision_utils.post_provision_runtime_setup()' in the
                         # caller.
