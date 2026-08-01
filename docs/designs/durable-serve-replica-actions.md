@@ -5,7 +5,8 @@ review; M1a inert schema and dark M1b typed store implemented and locally
 verified; the frozen M2 Serve032 foundation, cluster identity, immutable
 provider contracts, typed shadow store, additive Serve033 coverage schema and
 promotion audit, and generic API006 progress substrate are implemented and
-locally verified; the immutable effect-origin, closed handler-return,
+locally verified, while the newly frozen Serve033 preparation-capability
+commitment/endpoint validation delta is code-pending; the immutable effect-origin, closed handler-return,
 pre-I/O representability, and reducer-owned quiescence contract is frozen in
 design while its Serve validator/reducer, dedicated return codec, and shadow-
 outcome parser alignment remain pending; the candidate-only Kubernetes
@@ -1356,8 +1357,9 @@ adds:
 
 Revision 033 has `down_revision='032'`. It adds the two nullable replica
 coverage-link columns on both supported Serve dialects. On PostgreSQL only, it
-creates the worker-cohort registry/reference, decision-coverage, and coverage-
-only submission tables, their checks and indexes, explicitly adds
+creates the worker-cohort registry/reference (including the nonnull preparation-
+capability SHA-256 commitment), decision-coverage, and coverage-only submission
+tables, their checks and indexes, explicitly adds
 `shadow_samples.would_be_action_id -> shadow_coverage.decision_id ON DELETE
 RESTRICT`, adds nullable pair-checked `legacy_effect_trace`/hash columns to the
 represented-attempt table, and updates the replica checks and partial unique
@@ -1398,6 +1400,7 @@ serve_resource_action_worker_cohort_refs
   action_type               TEXT not null
   controller_owner_fence    TEXT not null
   lifecycle_epoch           BIGINT not null
+  preparation_capability_sha256 TEXT not null
   reference_state           TEXT not null
                               # PREPARING | SHADOW_ACTIVE |
                               # ACTION_ACTIVE | RELEASED
@@ -1431,7 +1434,8 @@ Reference transitions are `PREPARING -> SHADOW_ACTIVE |
 ACTION_ACTIVE | RELEASED`, then either active state to `RELEASED`; no reverse
 transition exists. Rows authorize no execution, claim, retry, or due work. No
 timeout alone releases a reference, and cohort tombstones remain permanently.
-Row-local checks enforce canonical UUID/generation/hash/state/timestamp shapes;
+Row-local checks enforce canonical UUID/generation/hash/state/timestamp shapes,
+including a lowercase SHA-256 preparation-capability commitment;
 typed code enforces the complete transition graph. A partial index on
 `(cohort_id, decision_id)` for `reference_state != 'RELEASED'` drives retirement,
 and registry state has its own operational index. `REMOVAL_AUTHORIZED` requires
@@ -1443,13 +1447,26 @@ by the still-running API-role retirement verifier, not by the removed cohort.
 The current chart retains tombstone-scoped GET permission for the two exact
 names through this check and prunes it only after the `RETIRED` commit.
 
-The preparation reference snapshots the exact controller owner fence and
-lifecycle epoch used by its one-use authorization. Releasing `PREPARING`
+The preparation reference snapshots the exact controller owner fence,
+lifecycle epoch, and SHA-256 commitment of a fresh 32-byte random preparation
+capability. The raw 64-lowercase-hex capability exists only in the same live
+preparation cell, is compared in constant time, and is never stored, logged, or
+placed in an action/source/proof. It authorizes only read-only launch-identity
+canonicalization while this exact reference remains `PREPARING`; every other
+endpoint and state rejects it. Releasing `PREPARING`
 requires either the same live cell to close its nonce or an owner-fenced
 recovery transaction to prove the stored fence/epoch stale (advancing the epoch
 when needed), plus absence of coverage, action, and private request state. Thus
 an old cell cannot receive valid authorization after its retention fence is
 released.
+
+The retained proof commits the historical `PREPARING` revision-one snapshot
+and capability hash. The represented-admission transaction validates that
+snapshot against the locked row and atomically stores the proof while changing
+the row to `SHADOW_ACTIVE` or `ACTION_ACTIVE`. Later recovery requires the
+same-ID row's immutable fields/hash and exact kind-matched legal successor
+revision/state; it does not incorrectly require the current row to remain
+`PREPARING` and never needs the raw capability.
 
 The existing-row additions are exactly:
 
@@ -1608,10 +1625,18 @@ unique request-ID index. Typed binding first locks the applicable
 already-created `PRE_SUBMIT` evidence row, then locks the exact API request
 row. While holding that request row as the cross-table serialization key, it
 performs nonlocking reads of both attempt tables, validates that no other row
-owns the ID, and writes the applicable row. Every binder follows this protocol,
-so a waiter observes the winner after acquiring the request lock without
-taking an earlier-class row lock. A partial stale index covers `PRE_SUBMIT` and
-`REQUEST_BOUND`.
+owns the ID, and writes the applicable row. For a represented launch it also
+closed-decodes the persisted `LaunchBody` and compares its effective user
+name/hash with the immutable source proof in the same transaction: equality
+writes `REQUEST_BOUND` with no identity divergence; mismatch writes
+`REQUEST_BOUND` plus write-once `IDENTITY_MISMATCH`. Later completion must
+preserve a nonnull binding-time divergence byte-for-byte. Every binder follows
+this protocol. Once the correct-kind unowned request is found,
+missing/malformed identity takes the mismatch branch and cannot roll binding
+back after SDK admission; a missing row, wrong kind/correlation, or ID owned by
+another child remains an association conflict. Thus a waiter observes the
+winner after acquiring the request lock without taking an earlier-class row
+lock. A partial stale index covers `PRE_SUBMIT` and `REQUEST_BOUND`.
 
 The logical table is one row per would-be action, keyed by its deterministic
 `would_be_action_id`. It stores the complete canonical action identity,
@@ -1730,6 +1755,10 @@ closed `LegacyProviderEffectTraceV1`, is pair-null and canonically bounded.
 `REQUEST_BOUND` requires API-request execution, a real ID and bind
 timestamp, and no completion timestamp. `COMPLETE` requires a completion
 timestamp and, for API-request execution, a real ID/bind timestamp.
+For a represented launch, null `divergence_class` at `REQUEST_BOUND` attests
+that the locked request's effective identity equals the retained canonicalizer
+proof; `IDENTITY_MISMATCH` attests the opposite and is write-once through
+completion. No other divergence may be assigned at request binding.
 `ABANDONED_PRE_SUBMIT` requires no request ID, operation ID, actual outcome, or
 post-observation. `REQUEST_ASSOCIATION_UNKNOWN` requires API-request execution,
 a null request ID, and a completion timestamp. `legacy_direct_down` may finish
@@ -1786,11 +1815,17 @@ when represented, in the transaction that durably commits teardown intent.
 Resource-action launch and down preparation use an explicit one-shot handshake;
 creating a preparation worker is not provider enqueue. For launch, the manager first chooses a
 provisional placement and preallocates the replica-incarnation and
-cluster-record UUIDs in memory. It selects the rendered active manifest, then
+cluster-record UUIDs in memory, derives the decision ID, and generates one
+fresh 32-byte preparation capability. It selects the rendered active manifest, then
 in a suffix-only transaction locks the matching complete, attested `ACCEPTING`
-cohort row and inserts or exactly adopts the decision's `PREPARING` reference.
-Only then may a bounded preparation worker, separate from the provider-submit
-semaphore, call private preflight, resolve the retained source, and produce
+cohort row and inserts or exactly adopts the decision's `PREPARING` reference
+with the capability hash. Exact adoption requires the same hash and all other
+reference bytes; a process-loss recovery creates a new generation/reference,
+not a replacement capability under the old row. Only then may the same bounded
+preparation worker, separate from the provider-submit semaphore, first call the
+private API launch-identity canonicalizer with the raw capability, construct
+the retained source/name basis from its proof, then call authority preflight
+and produce
 either a canonical `PreparedProviderLaunchV1` capsule or the companion's closed
 not-representable result. It has no SDK mutation callable and cannot enter
 `_launch_thread_pool`. Failure to acquire the reference closes the mutation
@@ -1814,7 +1849,10 @@ replica -> capacity -> cohort -> reference -> coverage -> optional parent.
 After those locks it changes `PREPARING -> SHADOW_ACTIVE`, writes coverage with
 the reference FK, then the same-ID parent when representable, and links. It revalidates
 service ownership and lifecycle epoch, the provisional placement, and any
-paid/reserved capacity fence. An approved launch also persists
+paid/reserved capacity fence. For a represented launch it additionally requires
+the source proof's complete reference context and capability hash to be byte-
+equal to the locked reference; the raw capability is neither required nor
+persisted at admission. An approved launch also persists
 `sky_launch_status=RUNNING` and the derived indexed
 `replicas.status='PROVISIONING'` in that same commit. That is the exact state
 counted by `in_flight_launch_count()`, so the provider slot is durably occupied
@@ -1854,6 +1892,34 @@ stored invocation immediately before `PRE_SUBMIT`. Cross-process recovery
 rebuilds only from the retained source and must reproduce the complete stored
 spec/invocation byte-for-byte. A mismatch abandons or blocks that generation;
 it never submits altered input under the old identity.
+
+Launch's provider-affecting user identity is established before represented
+admission by the companion design's private no-enqueue API canonicalizer. It
+accepts only the prepared identity slice plus complete logical resource
+identity and shares the exact effective-identity resolver used by
+`prepare_request_async()`: authenticated requests use `auth_user.name/id`, and
+the legacy no-auth case uses the submitted pair. Its closed proof and effective
+pair are retained in `ProviderLaunchSourceV1`; the pure projector builds the
+launch name basis/capsule from that pair, so recovery can reproduce the full
+spec without a current auth lookup. A missing or mismatched proof is
+`unfrozen_identity` and cannot enter represented admission or `ACTION_ACTIVE`.
+
+When shadow later submits the original prepared request to legacy `/launch`,
+binding the real request ID locks the already-created child and exact API
+request row, decodes the effective persisted `LaunchBody`, and atomically
+compares its `SKYPILOT_USER`/`SKYPILOT_USER_ID` values with the retained proof.
+Equality writes ordinary `REQUEST_BOUND`; drift writes `REQUEST_BOUND` plus
+write-once `IDENTITY_MISMATCH`, which completion can never clear or replace.
+The mismatch is promotion-blocking but never mutates the already-committed
+`REPRESENTABLE` coverage row or stops/replaces the legacy owner. Authoritative
+private action handlers carry no legacy `LaunchBody` and read no current
+request identity as provider input.
+
+Down execution capsules contain no standalone current/down-request identity or
+identity projector. Their locator and cleanup target may retain immutable
+launch-derived name hashes, labels, and Pod annotation bytes required to
+identify the old objects. Changing the current actor cannot change those exact
+cleanup bytes or behavior.
 
 For a not-representable decision, reason equality is only coverage evidence and
 grants no cross-process replay authority. The prepared legacy request may be
@@ -2227,7 +2293,9 @@ M1b verification evidence on 2026-08-01:
   functions used by both legacy execution and shadow evaluation.
 - Split launch/down preparation from mutation permission with the bounded
   prepare/admit/authorize handshake. Add the nonexecuting Serve033 cohort
-  registry/reference fence, create `PREPARING` before private preflight, and
+  registry/reference fence with a committed per-reference preparation-
+  capability hash, create `PREPARING` before identity canonicalization/private
+  preflight, and
   atomically bind it with coverage/action admission. Persist coverage for every
   approved decision, including a closed not-representable result, before the
   sole legacy mutation can enter its submit pool.
@@ -2249,11 +2317,13 @@ M2 foundation verification evidence on 2026-08-01:
 
 - Serve032 installs the frozen inert mode, replica-identity/sample-link,
   logical-sample, and represented-attempt schema while preserving portable
-  inert columns for supported local controller databases. Serve033 now adds
-  PostgreSQL-only cohort/reference retention, decision coverage,
+  inert columns for supported local controller databases. The implemented
+  Serve033 foundation adds PostgreSQL-only cohort/reference retention, decision coverage,
   coverage-only attempts, actual-effect trace columns, the explicit parent FK,
   and replica coverage links; fresh and 032-upgrade catalog/constraint tests,
   fail-closed nonempty-032 refusal, and downgrade refusal pass locally;
+  the preparation-capability commitment newly frozen above must be added to
+  that still-dark revision and those fixtures before runtime activation;
 - global-user-state revision 028 installs a nullable portable cluster-record
   UUID and partial unique index, leaves historical rows null, and provides the
   PostgreSQL-only exact insert/adopt/reject primitive without changing ordinary
@@ -2390,7 +2460,9 @@ Database principal topology and credentials are unchanged by this program.
 
 Mandatory crash/race points include:
 
-1. before and after preparation publishes its typed result;
+1. before and after preparation capability generation, `PREPARING` reference
+   commit, identity-canonicalization request/response, and typed-result
+   publication;
 2. while two managers race for the last slot across ordinary/ordinary,
    ordinary/paid-capacity, and ordinary/reserved-fill admission; while a release
    races new admission; and while owner handoff races recovery release;
@@ -2429,7 +2501,17 @@ Tests must prove:
 - fresh empty API005 -> API006 migration, both boundary-field constraints, and
   fail-closed rejection of any pre-006 action-attempt row whose provider-I/O
   watermark cannot be reconstructed;
-- deterministic action/request identity and byte-mismatch rejection;
+- deterministic action/request identity and byte-mismatch rejection; the
+  no-enqueue identity endpoint and `/launch` use the same extracted resolver,
+  authenticated and no-auth inputs produce exact golden proofs without an API
+  request/queue/action write, raw-body size/content/closed-key parsing and exact
+  status mapping reject, the raw preparation capability never persists and its
+  constant-time hash check rejects another/missing/released reference, complete
+  proof context/resource/prepared-pair drift rejects before represented
+  admission, recovery reproduces the invocation from the retained effective
+  pair and context with no current-auth lookup, and request binding atomically
+  preserves either equality or write-once `IDENTITY_MISMATCH` through terminal
+  completion;
 - with cap `C`, `N > C` simultaneously prepared successful decisions commit at
   most the available number of new `PROVISIONING` rows; each winner atomically
   has one identified replica, counted slot, applicable capacity claim, coverage,

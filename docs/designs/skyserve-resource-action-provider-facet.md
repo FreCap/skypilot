@@ -24,7 +24,8 @@ submit-request, retained-evidence, and policy-boundary-proof leaves and are
 independently verified; the policy-free request-identity, scheduling, storage,
 metadata, security, object-mutation-effect, and exact launch/down mutation
 contract leaves are implemented and independently verified, while contextual
-action-bound submit comparison, enclosing capsule and execution-config
+action-bound submit comparison, launch-only server-effective identity
+canonicalization/projector and down-current-identity absence, enclosing capsule and execution-config
 composition, and live preflight remain pending; runtime provider propagation,
 observation, and shadow instrumentation remain pending
 
@@ -783,7 +784,7 @@ ProviderSkyletJobContractV1 = {
 ProviderSkyletJobSpecV1 = {
   version: 1,
   schema_id: "skypilot.serve.prebooted-canary-job.v1",
-  source: ProviderLaunchSourceV1,
+  source: ProviderLaunchContentSourceV1,
   command_profile: "image_serve_canary_entrypoint_v1",
   entrypoint_artifact_role: "serve_canary_entrypoint",
   replica_id: DecimalIntegerText,
@@ -1210,8 +1211,15 @@ GET above.
 
 For the direct-Pod topology, `sky_cluster_name` is the SkyPilot display name
 and `ProviderWorkloadNameBasisV1.frozen_user_hash` is the bounded nonsecret
-value already frozen in `PreparedLaunchRequest.body.user_hash`; the raw request
-environment map is never persisted. A new pure
+server-effective value frozen by the launch identity canonicalization proof
+below; the raw request environment map is never persisted in the action. The
+controller first freezes `PreparedLaunchRequest`, then sends only its exact
+`SKYPILOT_USER`/`SKYPILOT_USER_ID` slice and the already-known resource identity
+to the private no-enqueue canonicalizer. The normalizer requires a byte-equal
+proof response before constructing the name basis or identity leaf. A missing,
+empty, non-ASCII, or over-bound effective username or a missing/invalid
+effective user hash is `unfrozen_identity`. Neither path invokes an empty-
+argument username helper or an ambient fallback. A new pure
 `make_cluster_name_on_cloud_for_user(..., user_hash=...)` owns the historical
 normalization/truncation algorithm. The existing ambient helper becomes a
 compatibility wrapper that supplies `get_user_hash()`. The pure result must
@@ -1219,6 +1227,41 @@ equal `provider_cluster_name`; `workload_name` must equal
 `provider_cluster_name + "-head"`. Invalid or overlong user hashes are not
 representable. Execution recomputes these names from the basis and never reads
 a later ambient user identity.
+
+The provider-final identity slice is established before represented admission
+by a private API-side no-enqueue canonicalizer. Authentication middleware has
+already produced `auth_user`; the canonicalizer and `prepare_request_async()`
+must call one extracted resolver with identical semantics: a nonnull
+`auth_user` replaces both submitted values with its exact ID/name, while the
+legacy no-auth case uses the submitted pair. The canonicalizer creates no API
+request row, queue entry, action, coverage row, or provider effect and returns
+only the closed bounded proof below. It is authorized only for the fenced Serve
+controller preparation path. The proof is bound to the complete logical
+resource identity, so it cannot be reused for another replica incarnation or
+generation. A malformed, mismatched, missing, or unavailable proof is
+`unfrozen_identity` and cannot enter `ACTION_ACTIVE` or represented shadow
+admission.
+
+In shadow, the controller later submits the object-identical pre-auth
+`PreparedLaunchRequest` to legacy `/launch`. When the real request ID is bound,
+the typed binder locks the already-created child and that exact API request row,
+decodes its effective persisted `LaunchBody`, and in the same transaction
+compares `SKYPILOT_USER`/`SKYPILOT_USER_ID` with the proof's effective pair.
+Equality writes `REQUEST_BOUND` with no identity divergence. Mismatch writes
+`REQUEST_BOUND` plus write-once `IDENTITY_MISMATCH`; completion may preserve but
+never clear or replace that divergence, and the parent finalizes as promotion-
+blocking. It does not rewrite the immutable `REPRESENTABLE` coverage row or
+stop the already-authoritative legacy owner. The authoritative private
+resource-action request does not carry a legacy `LaunchBody`; its handler
+reprojects identity solely from the immutable action spec and never reads its
+current request environment or authenticated actor as provider input.
+
+Once a correct-kind, unowned real request row is found, missing, malformed, or
+invalid identity fields are the mismatch branch and the ID is still atomically
+bound; validation failure cannot roll the child back to an ambiguous
+`PRE_SUBMIT` after SDK admission. A missing row, wrong request kind/action
+correlation, or request ID already owned elsewhere remains a request-
+association conflict and never fabricates equality or an alternate ID.
 
 The first topology contains exactly the SSH Service named
 `workload_name + "-ssh"`, the Service named `workload_name`, and that head Pod,
@@ -2522,7 +2565,7 @@ ServeLegacyLaunchCleanupDownInvocationV1 = {
     cluster_name: ParentSpec.invocation.requested_target.sky_cluster_name,
     expected_cluster_record_uuid:
         ParentSpec.invocation.requested_target.sky_cluster_record_uuid,
-    workspace: ParentSpec.invocation.require_launch().source.workspace,
+    workspace: ParentSpec.invocation.require_launch().source.content.workspace,
     purge: false,
     graceful: false,
     graceful_timeout: null
@@ -2533,13 +2576,67 @@ ServeShadowAttemptInvocationV1 =
   ProviderLifecycleInvocationV1 |
   ServeLegacyLaunchCleanupDownInvocationV1
 
-ProviderLaunchSourceV1 = {
+ProviderLaunchIdentityCanonicalizationInputV1 = {
+  version: 1,
+  contract: "api_server_effective_launch_identity_v1",
+  service_name: Text,
+  resource_identity: ProviderLifecyclePlanV1.resource_identity,
+  prepared_original_user: Text,
+  prepared_user_hash: Text
+}
+
+ProviderLaunchIdentityCanonicalizationContextV1 = {
+  version: 1,
+  decision_id: UUID,
+  cohort_id: Text,
+  action_type: "launch",
+  controller_owner_fence: Text,
+  lifecycle_epoch: PositiveInteger,
+  preparation_reference_revision: 1,
+  reference_state: "PREPARING",
+  preparation_capability_sha256: Sha256,
+  input: ProviderLaunchIdentityCanonicalizationInputV1,
+  input_sha256: Sha256
+}
+
+ProviderLaunchIdentityCanonicalizationRequestV1 = {
+  version: 1,
+  context: ProviderLaunchIdentityCanonicalizationContextV1,
+  context_sha256: Sha256,
+  preparation_capability: 64LowerHex
+}
+
+ProviderLaunchIdentityCanonicalizationProofV1 = {
+  version: 1,
+  boundary: "api_server_post_auth_no_enqueue",
+  context: ProviderLaunchIdentityCanonicalizationContextV1,
+  context_sha256: Sha256,
+  effective_original_user: Text,
+  effective_user_hash: Text
+}
+
+ProviderLaunchIdentityCanonicalizationResponseV1 = {
+  version: 1,
+  decision_id: UUID,
+  context_sha256: Sha256,
+  proof: ProviderLaunchIdentityCanonicalizationProofV1,
+  proof_sha256: Sha256
+}
+
+ProviderLaunchContentSourceV1 = {
   store: "serve_version_specs",
   service_name: Text,
   service_incarnation: UUID,
   service_version: PositiveInteger,
   yaml_content_sha256: Sha256,
   workspace: Text
+}
+
+ProviderLaunchSourceV1 = {
+  content: ProviderLaunchContentSourceV1,
+  identity_canonicalization:
+      ProviderLaunchIdentityCanonicalizationProofV1,
+  identity_canonicalization_sha256: Sha256
 }
 
 ProviderLaunchInvocationV1 = {
@@ -2573,6 +2670,77 @@ ProviderDownInvocationV1 = {
   graceful: false,
   graceful_timeout: null
 }
+
+The exact endpoint is `POST /internal/resource-actions/v1/launch-identity/canonicalize`
+on the normal API origin, after its ordinary authentication middleware and
+outside the request executor. The manager generates 32 random bytes from the
+OS CSPRNG for each new reference, transports them as exactly 64 lowercase hex
+characters, stores only SHA-256 of the decoded 32 bytes in the `PREPARING`
+reference, and gives the raw value only to that live preparation cell. The
+request context repeats the stored commitment and every nonsecret reference/
+owner field. The proof retains that complete context and its hash, never the
+raw capability. Response validation requires byte-equal decision/context/hash
+echoes before the proof can enter `ProviderLaunchSourceV1`; recovery recomputes
+the retained context/proof hashes and validates all immutable reference fields
+and the capability hash against the still-retained same-ID reference, but never
+needs the raw capability. The proof's `PREPARING`/revision-one values are the
+historical canonicalization boundary. Admission stores the proof while
+atomically advancing that row to `SHADOW_ACTIVE` or `ACTION_ACTIVE`; recovery
+therefore requires the exact kind-matched legal successor revision/state and
+bind timestamp, not a current row still equal to `PREPARING`.
+
+The endpoint reads the raw body with a hard 65,536-byte pre-parse limit,
+requires `Content-Type: application/json` and no `Content-Encoding`, decodes
+canonical UTF-8 JSON, and calls the closed
+`ProviderLaunchIdentityCanonicalizationRequestV1.from_value` parser directly.
+The FastAPI signature accepts only `Request`; it has no auto-decoded body model.
+The controller sends the typed request's exact `canonical_bytes` as raw content
+through `make_authenticated_request`, not its `json=` convenience argument. It
+must not use `BasePayload` or any `extra='ignore'` model; every extra key,
+subclass-spoofed in-process value, noncanonical byte sequence, or mismatched
+hash rejects before lookup. It accepts no `LaunchBody`, task YAML, generic
+environment map, credential, or provider configuration. In one read-only
+database session the direct handler recomputes the input/context hashes and
+deterministic decision ID, exact-compares the raw capability hash in constant
+time with the context and stored row, and read-validates the exact
+`PREPARING` revision-one cohort reference, service incarnation, controller-
+owner fence, lifecycle epoch, and replica/generation identity. It then applies
+the same extracted effective-identity resolver used by
+`prepare_request_async()`, validates the bounded result, and returns the closed
+response. The later admission transaction locks and revalidates every
+optimistic ownership/reference/context field; this endpoint grants no mutation
+authority.
+
+The direct endpoint itself inserts or mutates no API request, queue, action,
+coverage, reference, service, replica, or provider row. Ordinary authentication
+middleware may independently update its existing token-last-used or proxy-user
+bookkeeping before the route. Exact statuses are: `400` for malformed,
+noncanonical, self-hash-invalid, or deterministically inconsistent bytes;
+`401` for ordinary authentication failure; `403` for a capability mismatch;
+`409` for an unknown/non-`PREPARING` reference or stale/
+unequal owner/cohort/epoch/resource context, `413` for an oversized body, `415`
+for content-type/encoding failure, and `503` for transient database
+unavailability. Only a connection reset, timeout, or `503` permits one retry
+after 100 ms with identical bytes; every other non-`200`, malformed response,
+or unequal decision/context/input/proof/hash is terminal
+`unfrozen_identity`. Redirects are disabled.
+
+For an authenticated request the effective pair is exactly
+`(auth_user.name, auth_user.id)`; with no authenticated user it is exactly the
+submitted prepared pair, matching legacy `/launch`. The proof context and
+output are immutable members of `ProviderLaunchSourceV1`; their hashes are
+recomputed on every parse, and the context input `service_name` equals
+`source.content.service_name` and the locked service. Cross-process recovery
+resolves only the referenced exact YAML and uses the retained effective pair to
+reconstruct the full invocation. It never re-runs
+authentication, consults a current actor, infers a hash from
+`version_specs.created_by`, or treats `services.hash` as a user hash.
+Within a live shadow preparation, canonicalization and the later `/launch`
+submission use the same `server_common.make_authenticated_request` credential/
+endpoint resolution; no alternate HTTP client or identity header is allowed.
+Credential or proxy-auth change between the two calls is detected only by the
+locked persisted-request comparison and becomes `IDENTITY_MISMATCH`, never a
+silent change to the admitted action.
 
 DecimalPortText = canonical ASCII decimal text matching
   `[1-9][0-9]{0,4}` whose integer value is at most 65535. Leading zeroes,
@@ -2972,7 +3140,7 @@ ProviderKubernetesRendererV1 = {
   binding_schema: ProviderRepoArtifactRefV1,
   config_access_inventory: ProviderRepoArtifactRefV1,
   admitted_object_normalization: ProviderRepoArtifactRefV1,
-  source: ProviderLaunchSourceV1
+  source: ProviderLaunchContentSourceV1
 }
 
 ProviderKubernetesProvisionRuntimeMetadataV1 = {
@@ -2989,7 +3157,7 @@ ProviderKubernetesProvisionRuntimeMetadataV1 = {
 ProviderKubernetesJobSubmissionV1 = {
   protocol: "skylet_idempotent_submit_v1",
   submission_key_source: "launch_action_id",
-  run_source: ProviderLaunchSourceV1,
+  run_source: ProviderLaunchContentSourceV1,
   contract: ProviderSkyletJobContractV1,
   durability: ProviderSkyletDurabilityContractV1,
   job_spec_profile: "ProviderSkyletJobSpecV1"
@@ -3137,6 +3305,13 @@ ProviderKubernetesRequestIdentityV1 = {
   frozen_user_hash: Text
 }
 
+clean_username_for_explicit_user_v1(original_user: Text) -> Text
+
+project_provider_kubernetes_request_identity_v1(
+  original_user: Text,
+  name_basis: ProviderWorkloadNameBasisV1
+) -> ProviderKubernetesRequestIdentityV1
+
 ProviderKubernetesSchedulingContractV1 = {
   node_count: 1,
   use_spot: false,
@@ -3275,7 +3450,6 @@ ProviderKubernetesDownExecutionCapsuleV1 = {
   scope: ProviderKubernetesScopeV1,
   principals: ProviderKubernetesPrincipalsV1,
   prerequisites: ProviderKubernetesPrerequisiteInventoryV1,
-  request_identity: ProviderKubernetesRequestIdentityV1,
   cleanup_target: ProviderKubernetesCleanupTargetV1,
   cleanup_target_sha256: Sha256,
   mutation_contract: ProviderKubernetesDownMutationContractV1
@@ -3314,6 +3488,33 @@ ProviderLifecycleExecutionCapsuleV1 =
 ProviderLifecyclePolicyBoundaryProofV1 =
   ProviderPolicyBoundaryProofV1
 ```
+
+The identity leaf remains context-free; only the pure projector grants these
+relations. `original_user` must be exact nonempty ASCII text within the generic
+text bound. The cleaner applies the historical algorithm in this literal order:
+ASCII `A-Z` become `a-z`; bytes outside `[a-z0-9-_]` are removed; the maximal
+leading run matching `[0-9-]+` is removed; exactly one final `-`, if present, is
+removed; and the result is truncated to 63 ASCII bytes. An empty result or a
+result that is not a canonical Kubernetes label value is not representable.
+The projector accepts no `cleaned_user` or independent hash argument. It sets
+`cleaned_user` only from that cleaner, copies `original_user` byte-for-byte, and
+copies `frozen_user_hash` only from `name_basis.frozen_user_hash`. It performs no
+environment, user-database, request-context, filesystem, network, clock, or
+randomness read. The existing ambient `get_cleaned_username()` path remains
+legacy-only and must delegate to the same explicit-input cleaner after choosing
+its compatibility fallback.
+
+The launch execution capsule carries the projector result. A down capsule has
+no standalone `request_identity` field and invokes no identity projector: exact
+cleanup uses the prior requested target, frozen cleanup object identity,
+current Kubernetes principals/prerequisites, and current worker cohort, and
+performs no rendering or name derivation from a current user. Its locator and
+cleanup target necessarily retain immutable launch-derived name-basis hash,
+labels, and Pod annotation bytes so they can identify and precondition the
+exact old objects; those are prior-launch deletion evidence, not down-request
+identity. A current down request's authenticated identity remains process-local
+scheduling and audit context and is not provider-affecting input. The down
+parser rejects a standalone `request_identity` key even when null.
 
 The controller-owner leaf accepts either closed kind because it is shared. The
 enclosing worker-identity validator requires
@@ -3384,11 +3585,13 @@ ServiceAccount -> exact live ServiceAccount UID. A structurally valid caller,
 ServiceAccount, or Deployment leaf does not prove this relation outside the
 endpoint/enclosing-capsule validator.
 
-The down capsule deliberately contains no endpoint contract, prerequisite
-projection, caller, or caller-workload evidence. Its closed parser rejects any
-such key. Down retains the complete 12-role prerequisite inventory for current
-scope/principal/admission identity, but it neither projects the five endpoint
-roles into a second field nor reads an LB Deployment.
+The down capsule deliberately contains no current/down-request identity DTO,
+endpoint contract, prerequisite projection, caller, or caller-workload
+evidence. Its closed parser rejects any such key. Down retains the complete
+12-role prerequisite inventory and prior-launch locator/cleanup evidence for
+current scope/principal/admission and exact deletion, but it neither projects
+the five endpoint roles into a second field, reads an LB Deployment, nor reads
+or derives a current request user/hash for provider cleanup.
 
 The remaining cross-field bindings are exhaustive. The authority/release
 record's name equals the executor-cohort, caller-ServiceAccount, and live
@@ -3396,6 +3599,36 @@ authority-worker Namespace. Both LB Namespace role records are its required
 aliases. For launch, both endpoint callers' `namespace`/`namespace_uid` equal
 that record's name/UID; this prerequisite UID is the sole typed caller-Namespace
 UID source in v1. Down has no endpoint-caller copy to bind.
+For launch, `requested_target.sky_cluster_name`,
+`requested_target.kubernetes.name_basis.display_name`, and the frozen
+`PreparedLaunchRequest.body.cluster_name` are byte-equal. The capsule
+`request_identity.frozen_user_hash`, name basis `frozen_user_hash`, and identity
+proof `effective_user_hash` are byte-equal. The proof's
+`effective_original_user` is byte-equal to `request_identity.original_user`,
+and the complete request identity is byte-equal to the pure projector result.
+The proof context input resource identity is byte-equal to the enclosing plan/invocation
+resource identity; its service name equals the content source and locked
+service, and `source.content.service_incarnation` equals that resource
+identity's service incarnation. The context `decision_id`, `cohort_id`,
+controller-owner fence, lifecycle epoch, reference revision, and capability
+hash are byte-equal to the deterministic launch ID and exact retained
+preparation reference; `action_type="launch"`,
+`reference_state="PREPARING"`, and `preparation_reference_revision=1` at the
+canonicalization boundary. Its prepared pair is byte-equal to the exact two
+values in the process-local frozen body. For a legacy-shadow submission only,
+request association additionally requires the proof's effective pair to be
+byte-equal to the effective post-auth persisted body's `SKYPILOT_USER` and
+`SKYPILOT_USER_ID`. All three object request bodies have
+`metadata.labels["skypilot-user"]` byte-equal to
+`request_identity.cleaned_user`; the head Pod alone has
+`metadata.annotations["skypilot-user"]` byte-equal to
+`request_identity.original_user`. A missing, extra-role, unequal, or
+post-proof rewritten identity field in the frozen candidate is not
+representable. Post-canonicalization auth drift on the already-submitted
+legacy-shadow request is instead write-once `IDENTITY_MISMATCH` divergence.
+Down has no standalone request-identity field, projector invocation, or
+current-user read; it does retain the prior frozen object metadata and name
+basis that exact deletion must match.
 The target record equals `scope.namespace`/`target_namespace_uid`, config and
 resource namespaces, every object-plan namespace, workload-ServiceAccount and
 rules-review Namespace, and the NetworkPolicy Namespace. The kube-system record
@@ -3769,6 +4002,7 @@ ProviderLaunchPreflightSeedV1 = {
   topology: ProviderPodTopologyV1,
   replica_id: NonnegativeInteger,
   retry_until_up: Boolean,
+  request_identity: ProviderKubernetesRequestIdentityV1,
   config_projection: ProviderKubernetesConfigProjectionV1
 }
 
@@ -3858,15 +4092,23 @@ The two boundary proofs have one closed construction sequence:
 
 1. After the controller's final policy/managed-secret boundary, it freezes the
    complete kind-specific seed. Launch includes the full requested target and
-   `retry_until_up`; down includes the full prior-launch basis and cleanup target
-   beside their recomputed hashes. Every seed field is byte-equal to the outer
+   `retry_until_up` plus the pure projected request identity; down includes the
+   full prior-launch basis and cleanup target beside their recomputed hashes,
+   but no current/down-request identity DTO. Prior launch-derived target and
+   deletion bytes remain. Every seed field is byte-equal to the outer
    plan/invocation projector input.
 2. The authority preflight validates that seed, constructs the kind-matched
    capsule, runs the same pure subject projector, and returns only an
    `executor_policy_proof` whose boundary is exactly `api_executor_pre_io` and
    whose hashes bind that capsule projection and projected subject. A controller
    proof in this response, or an executor field with the controller boundary,
-   is invalid.
+   is invalid. For launch it also validates the retained identity proof and
+   recomputes request identity solely from
+   `seed.source.identity_canonicalization.effective_original_user` and
+   `seed.requested_target.kubernetes.name_basis`; the proof's effective hash
+   must equal the name basis hash, and the full result must be byte-equal to the
+   seed and capsule copies before rendering. Down has no projector invocation
+   or standalone identity copy.
 3. In the same bounded preparation cell, the controller recomputes the capsule
    and subject hashes, reruns the projector against its retained seed, and
    constructs the only `serve_controller_prepare` proof from its byte-equal
@@ -3878,7 +4120,12 @@ The two boundary proofs have one closed construction sequence:
    from the immutable spec and one live client, recomputes an
    `api_executor_pre_io` proof, and requires it to be byte-equal to the stored
    preflight proof. Drift blocks before I/O. The controller proof is hash-
-   revalidated but never regenerated by the handler.
+   revalidated but never regenerated by the handler. A launch handler also
+   validates the immutable source proof, then reprojects the immutable
+   capsule's identity from the proof's effective original user and the
+   immutable name basis and rejects drift before committing an effect intent;
+   it does not inspect handler request identity. A down handler has no current-
+   identity projection, comparison, or user lookup.
 
 The launch/down seed parsers recompute every content hash, including full prior
 basis and cleanup target, before any projector runs. This sequence is the sole
@@ -4065,6 +4312,43 @@ ProviderDownNormalizationResultV1 =
   }
 ```
 
+Launch normalization uses one immutable `PreparedLaunchRequest`, one exact
+server-effective identity proof for that resource identity, and no ambient
+identity source. It requires exact nonempty built-in strings at
+`body.env_vars[SKYPILOT_USER]` and `body.user_hash`, requires them to equal the
+proof context input, and requires the proof/context/reference/resource-identity
+bindings above. It
+constructs `ProviderWorkloadNameBasisV1` from `body.cluster_name` and the
+proof's `effective_user_hash`, then constructs
+`ProviderKubernetesRequestIdentityV1` only through the pure projector from the
+proof's `effective_original_user` and that name basis. The name-basis,
+requested-target, rendered metadata, source-proof, and capsule equalities all
+run before a represented candidate is returned. The complete environment map
+remains process-local and is never copied into the invocation. Before
+`ACTION_ACTIVE` admission, the live worker reprojects the same prepared pair
+plus proof back to the admitted invocation. Recovery instead resolves the
+retained source, uses its immutable effective pair, and must reproduce the
+complete stored spec/invocation byte-for-byte without an authenticated-user
+lookup.
+
+For a legacy-shadow submission, the API-request binder locks and decodes the
+persisted effective `LaunchBody` and exact-compares its two identity values with
+the retained proof in the same request-binding transaction. A mismatch writes
+`IDENTITY_MISMATCH` once, leaves the immutable represented coverage row
+unchanged, and grants no provider authority; terminal completion cannot clear
+or replace it.
+
+Down normalization never looks up `SKYPILOT_USER`, `SKYPILOT_USER_ID`, or an
+ambient/current user and never constructs a standalone request identity.
+`PreparedDownRequest` may retain authenticated actor data for the existing
+request scheduler/audit path, but it is not copied as provider input. The down
+invocation, seed, capsule, policy subject, and cleanup cursor may transitively
+retain the prior launch's frozen name-basis hash, object labels, and Pod
+annotation as exact target/deletion evidence; those bytes are immutable and do
+not change when the down actor changes. Tests replace the current actor between
+launch and down and require identical down canonical bytes and cleanup
+behavior.
+
 Each not-representable result has no free-form detail and is not an action
 specification. The normalizer uses bounded accessors and returns the first
 failure in the enum order shown above; tests cover inputs with multiple
@@ -4207,18 +4491,29 @@ headroom), and still enforce the absolute 65,536-byte parser bound. Failure is
 `NOT_REPRESENTABLE`; no truncation, compression, omitted preimage, or external
 hash-only lookup is allowed.
 
-The `source` tuple is a content-addressed reference to an immutable retained
-`version_specs` row; the builder verifies the row's exact UTF-8 YAML bytes
-against `yaml_content_sha256` before use. The first eligible cohort requires
+The `source` object contains a `content` reference to an immutable retained
+`version_specs` row plus the closed server-effective identity proof;
+the builder verifies the row's exact UTF-8 YAML bytes against
+`yaml_content_sha256` and every proof hash/binding before use. The first
+eligible cohort requires
 `file_mounts_blob_id=null`, `tls_material_ref=null`, no task
 secrets/storage/local mounts, and byte-equal pre/post-policy projections as
 defined above. The v1 run source is the reviewed nonsecret canary content
 addressed by that row; arbitrary user commands remain not representable until a
 separate secret-safe job-input commitment exists. Any other resource field, nondefault launch flag, policy
 mutation, secret/material source, or compound topology normalizes to not
-representable. This intentionally narrow gate lets the source reference plus
-the closed transformations reconstruct the same prepared request without
-copying YAML, commands, environment values, or secret bytes into action JSON.
+representable. This intentionally narrow gate lets the source reference, the
+bounded nonsecret prepared/effective identity pairs, and the closed
+transformations reconstruct the same provider-effective prepared projection
+without copying YAML, commands, an arbitrary environment map, or secret bytes
+into action JSON.
+
+Only `ProviderLaunchContentSourceV1` enters renderer, runtime/job-submission,
+and Skylet wire contracts. The identity proof is action/recovery authority and
+never appears in a Kubernetes object body, Skylet submit request, workload
+environment, or legacy-effect comparison. The launch policy subject and
+preflight seed retain the complete `ProviderLaunchSourceV1` so those boundaries
+still bind both content and identity provenance.
 
 The builder includes the action/target identity, normalized topology and
 resource selection, workspace/config identities, and content identities for
@@ -4233,8 +4528,15 @@ the real invocation; a parallel observer-only serialization is not authority.
 Launch `SafeThread` becomes a bounded two-phase prepare/wait/submit worker with
 state `NEW -> PREPARING -> PREPARED -> APPROVED | APPROVED_LEGACY |
 DENIED/CANCELLED -> PRE_SUBMIT -> SDK_ENTERED -> DONE`. Preparation applies the
-allowed transforms once, proves both policy/secret modes, obtains the read-only
-scope/config inputs, and privately retains the immutable request. It publishes
+allowed transforms once, proves both policy/secret modes, and privately retains
+the immutable request. The exact launch order is: freeze that request and mint
+resource/decision identity; create the `PREPARING` reference with a fresh
+capability hash; make identity canonicalization the first post-reference
+network call using the raw capability; validate and freeze the complete source
+proof/name basis/request identity; then perform authority preflight and obtain
+the read-only scope/config inputs. No launch source, requested target, rendered
+object, preflight seed, or represented result may be constructed before the
+identity proof. The worker publishes
 only the redacted typed result and then waits on a one-shot
 condition. It has no path to `sdk.launch()` before approval. Preparation and
 the wait hold no SQL transaction, database row lock, resources-file lock, or
@@ -4256,8 +4558,9 @@ Construction/start of a PREPARING worker is
 not mutation enqueue; release of this gate is the enforceable provider
 boundary.
 
-The live worker uses the same in-memory request object until SDK request
-admission, but object identity is not a distributed authority. Across HTTP the
+The live worker uses the same in-memory request object and retained identity
+proof until SDK request admission, but object identity is not a distributed
+authority. Across HTTP the
 durable contract is the full stored `ServeReplicaActionSpecV1`, including the
 frozen execution config, scope, invocation, and retrievable references. Generic
 request/HTTP bytes and credentials are not persisted or hashed. After process
@@ -4288,7 +4591,8 @@ mutation is permitted afterward.
   do not serialize raw generic request bodies.
 - Add the explicit frozen Kubernetes transport/scope, execution config,
   principal/prerequisite evidence, exact resource translation, dual-boundary
-  policy trace, pure naming helper, exact three-object renderer/admission
+  policy trace, shared API effective-identity resolver and private no-enqueue
+  canonicalization proof, pure naming helper, exact three-object renderer/admission
   normalizer, prebooted runtime/job/endpoint contract, and checked-in access/
   call inventory. Restrict v1 normalization to the location-pinned canary
   candidate above.
@@ -4517,7 +4821,18 @@ Contract tests must cover:
   the committed handle;
 - the same `PreparedLaunchRequest` object through one live admission epoch, and
   full stored spec/invocation equality rather than generic request-byte or
-  object-identity authority after recovery;
+  object-identity authority after recovery; missing/empty/non-ASCII original
+  user, independently mutated prepared/effective/cleaned/original/hash values,
+  proof context/input/resource/capability-hash drift, wrong raw capability,
+  capability reuse after `PREPARING`, every extra raw key, wrong content type/
+  encoding, each body-size edge and exact HTTP status, no-enqueue resolver drift
+  from `prepare_request_async()`, name-basis drift, authenticated
+  canonicalization/persisted-request drift, rendered user-label/Pod-annotation
+  drift, and any ambient helper access reject; request binding atomically preserves either
+  equality or write-once `IDENTITY_MISMATCH`, while changing the current actor
+  before down leaves the prior-launch-derived down bytes unchanged and a
+  standalone down `request_identity` key rejects; inserting any identity proof
+  field into the content source, Kubernetes bodies, or Skylet request rejects;
 - the legacy launch-cleanup child is the exact parent-derived special wire
   member, is accepted only for `LAUNCH_CLEANUP_DOWN`, and is rejected as an
   action spec, primary child, coverage input, or authoritative-handler input;
