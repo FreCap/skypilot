@@ -14,10 +14,12 @@ from collections.abc import Mapping
 import dataclasses
 import datetime
 import enum
+import ipaddress
 import json
 import re
 import types
 from typing import Any, ClassVar, TypeVar
+import unicodedata
 import uuid
 
 from sky.container_images import models as container_image_models
@@ -41,6 +43,10 @@ _UTC_TIMESTAMP_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:'
                                r'[0-9]{2}\.[0-9]{6}Z$')
 _DECIMAL_INTEGER_RE = re.compile(r'^(0|[1-9][0-9]*)$')
 _DECIMAL_PORT_RE = re.compile(r'^[1-9][0-9]{0,4}$')
+_CANONICAL_POSITIVE_DECIMAL_RE = re.compile(
+    r'^(?:[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]{0,2}[1-9])$')
+_MAX_CANONICAL_JSON_CONTAINER_DEPTH = 16
+_MAX_CANONICAL_JSON_AGGREGATE_MEMBERS = 4_096
 WORKER_REGISTRATION_MAX_AGE = datetime.timedelta(minutes=5)
 
 PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1 = (
@@ -361,19 +367,32 @@ def canonical_sha256(value: Any) -> str:
     return kernel_actions.canonical_sha256(value)
 
 
-def _closed_object(value: Any, *, name: str,
-                   keys: frozenset[str]) -> JsonObject:
+def _closed_object_shallow(value: Any, *, name: str,
+                           keys: frozenset[str]) -> Mapping[str, Any]:
+    """Validate only the outer shape of one closed object.
+
+    Callers with bounded canonical-JSON leaves use this before the generic
+    recursive serializer so adversarial cycles and depth overflow reach the
+    iterative leaf validator first.
+    """
+
     if not isinstance(value, Mapping):
         raise TypeError(f'{name} must be an object.')
     if any(not isinstance(key, str) for key in value):
         raise TypeError(f'{name} keys must be text.')
     if set(value) != keys:
         raise ValueError(f'{name} has unknown or missing fields.')
-    encoded = canonical_json_bytes(value)
+    return value
+
+
+def _closed_object(value: Any, *, name: str,
+                   keys: frozenset[str]) -> JsonObject:
+    shallow = _closed_object_shallow(value, name=name, keys=keys)
+    encoded = canonical_json_bytes(shallow)
     if len(encoded) > _MAX_OBJECT_BYTES:
         raise ValueError(f'{name} exceeds {_MAX_OBJECT_BYTES} bytes.')
     normalized = json.loads(encoded.decode('utf-8'))
-    if value != normalized:
+    if shallow != normalized:
         raise ValueError(f'{name} is not canonical.')
     return normalized
 
@@ -430,6 +449,22 @@ def _decimal_port_text(value: Any, *, name: str) -> str:
     return port
 
 
+def _canonical_positive_decimal_text(value: Any, *, name: str) -> str:
+    """Validate one exact positive decimal in the provider numeric domain."""
+
+    decimal_text = _text(value, name=name)
+    if _CANONICAL_POSITIVE_DECIMAL_RE.fullmatch(decimal_text) is None:
+        raise ValueError(f'{name} must be canonical positive decimal text.')
+    integer_part, separator, _ = decimal_text.partition('.')
+    maximum_text = str(_MAX_POSTGRES_BIGINT)
+    if (len(integer_part) > len(maximum_text) or
+        (len(integer_part) == len(maximum_text) and integer_part > maximum_text)
+            or (integer_part == maximum_text and separator)):
+        raise ValueError(f'{name} must be no greater than '
+                         f'{_MAX_POSTGRES_BIGINT}.')
+    return decimal_text
+
+
 def _sha256(value: Any, *, name: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f'{name} must be lowercase SHA-256 hex.')
@@ -470,6 +505,33 @@ def _dns_label(value: Any, *, name: str) -> str:
     normalized = _text(value, name=name, maximum_bytes=_MAX_TEXT_BYTES)
     if _DNS_LABEL_RE.fullmatch(normalized) is None:
         raise ValueError(f'{name} must be a DNS label.')
+    return normalized
+
+
+def _dns_subdomain(value: Any, *, name: str) -> str:
+    """Validate one canonical Kubernetes DNS-subdomain value."""
+
+    normalized = _text(value, name=name, maximum_bytes=_MAX_SHORT_TEXT_BYTES)
+    segments = normalized.split('.')
+    if (not normalized.isascii() or any(
+            _DNS_LABEL_RE.fullmatch(segment) is None for segment in segments)):
+        raise ValueError(f'{name} must be a canonical Kubernetes DNS '
+                         'subdomain.')
+    return normalized
+
+
+def _canonical_ip_text(value: Any, *, name: str) -> str:
+    """Validate zone-free canonical IPv4 or IPv6 text."""
+
+    normalized = _text(value, name=name, maximum_bytes=_MAX_SHORT_TEXT_BYTES)
+    if not normalized.isascii() or '%' in normalized:
+        raise ValueError(f'{name} must be canonical zone-free IP text.')
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError as e:
+        raise ValueError(f'{name} must be IPv4 or IPv6 text.') from e
+    if str(address) != normalized:
+        raise ValueError(f'{name} must use canonical IP spelling.')
     return normalized
 
 
@@ -554,6 +616,147 @@ class _CanonicalContract:
     @property
     def sha256(self) -> str:
         return canonical_sha256(self.canonical_value())
+
+
+def _canonical_json_text(value: str, *, name: str) -> None:
+    """Validate one string or object key in the bounded canonical domain."""
+
+    try:
+        size = len(value.encode('utf-8'))
+    except UnicodeEncodeError as e:
+        raise ValueError(f'{name} must be valid UTF-8 text.') from e
+    if size == 0 or size > _MAX_TEXT_BYTES:
+        raise ValueError(f'{name} must be 1..{_MAX_TEXT_BYTES} UTF-8 bytes.')
+    if unicodedata.normalize('NFC', value) != value:
+        raise ValueError(f'{name} must be NFC-normalized.')
+
+
+def _bounded_canonical_json_bytes(value: Any,
+                                  *,
+                                  name: str,
+                                  require_object: bool = False) -> bytes:
+    """Iteratively validate and encode one bounded canonical JSON value."""
+
+    if require_object and not isinstance(value, Mapping):
+        raise TypeError(f'{name} must have a JSON object root.')
+
+    # Each item is (entering, value, parent container depth).  Active container
+    # IDs are removed by exit markers, which rejects cycles while permitting a
+    # non-cyclic value to be referenced from more than one sibling position.
+    stack: list[tuple[bool, Any, int]] = [(True, value, 0)]
+    active_container_ids: set[int] = set()
+    aggregate_members = 0
+    while stack:
+        entering, item, parent_depth = stack.pop()
+        if not entering:
+            active_container_ids.remove(id(item))
+            continue
+        if item is None or isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            if item < -_MAX_POSTGRES_BIGINT - 1 or item > _MAX_POSTGRES_BIGINT:
+                raise ValueError(f'{name} integers must fit signed 64-bit.')
+            continue
+        if isinstance(item, float):
+            raise TypeError(f'{name} forbids floating-point values.')
+        if isinstance(item, str):
+            _canonical_json_text(item, name=f'{name} string')
+            continue
+        if isinstance(item, tuple):
+            raise TypeError(f'{name} JSON arrays must be lists, not tuples.')
+
+        children: list[Any]
+        if isinstance(item, list):
+            children = list(item)
+        elif isinstance(item, Mapping):
+            entries = list(item.items())
+            normalized_keys: set[str] = set()
+            children = []
+            for key, child in entries:
+                if not isinstance(key, str):
+                    raise TypeError(f'{name} object keys must be text.')
+                normalized_key = unicodedata.normalize('NFC', key)
+                if normalized_key in normalized_keys:
+                    raise ValueError(f'{name} has duplicate-after-NFC keys.')
+                normalized_keys.add(normalized_key)
+                _canonical_json_text(key, name=f'{name} object key')
+                children.append(child)
+        else:
+            raise TypeError(f'{name} contains a value outside the JSON domain.')
+
+        container_depth = parent_depth + 1
+        if container_depth > _MAX_CANONICAL_JSON_CONTAINER_DEPTH:
+            raise ValueError(f'{name} container depth exceeds '
+                             f'{_MAX_CANONICAL_JSON_CONTAINER_DEPTH}.')
+        if len(children) > _MAX_LIST_ITEMS:
+            raise ValueError(f'{name} containers may contain at most '
+                             f'{_MAX_LIST_ITEMS} members.')
+        aggregate_members += len(children)
+        if aggregate_members > _MAX_CANONICAL_JSON_AGGREGATE_MEMBERS:
+            raise ValueError(f'{name} aggregate container members exceed '
+                             f'{_MAX_CANONICAL_JSON_AGGREGATE_MEMBERS}.')
+        container_id = id(item)
+        if container_id in active_container_ids:
+            raise ValueError(f'{name} contains a reference cycle.')
+        active_container_ids.add(container_id)
+        stack.append((False, item, parent_depth))
+        stack.extend(
+            (True, child, container_depth) for child in reversed(children))
+
+    encoded = canonical_json_bytes(value)
+    if len(encoded) > _MAX_OBJECT_BYTES:
+        raise ValueError(f'{name} exceeds {_MAX_OBJECT_BYTES} bytes.')
+    return encoded
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class CanonicalJsonValue:
+    """Immutable bytes for one value in the bounded canonical JSON domain."""
+
+    _canonical_bytes: bytes = dataclasses.field(repr=False)
+
+    def __init__(self, value: Any) -> None:
+        object.__setattr__(
+            self, '_canonical_bytes',
+            _bounded_canonical_json_bytes(value, name='canonical JSON value'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'CanonicalJsonValue':
+        return cls(value)
+
+    def canonical_value(self) -> Any:
+        """Return a detached JSON value that cannot mutate the stored bytes."""
+
+        return json.loads(self._canonical_bytes.decode('utf-8'))
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return self._canonical_bytes
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.canonical_value())
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class CanonicalJsonObject(CanonicalJsonValue):
+    """Immutable bounded canonical JSON value with an object root."""
+
+    def __init__(self, value: Any) -> None:
+        if not isinstance(value, Mapping):
+            raise TypeError('canonical JSON object must have a JSON object '
+                            'root.')
+        super().__init__(value)
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'CanonicalJsonObject':
+        return cls(value)
+
+    def canonical_value(self) -> JsonObject:
+        value = super().canonical_value()
+        if not isinstance(value, dict):
+            raise ValueError('canonical JSON object lost its object root.')
+        return value
 
 
 def _canonical_der_base64(value: Any, *, name: str) -> str:
@@ -2678,6 +2881,88 @@ class ProviderPodTopologyV1(_CanonicalContract):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderKubernetesServerAllocationV1(_CanonicalContract):
+    """One independently validated Kubernetes server allocation value."""
+
+    json_pointer: str
+    allocator: str
+    value: CanonicalJsonValue
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'json_pointer', 'allocator', 'value'})
+    _SERVICE_POINTERS: ClassVar[frozenset[str]] = frozenset({
+        '/spec/clusterIP', '/spec/clusterIPs', '/spec/ipFamilies',
+        '/spec/ipFamilyPolicy'
+    })
+    _NODE_NAME_POINTER: ClassVar[str] = '/spec/nodeName'
+
+    def __post_init__(self) -> None:
+        pointer = _text(self.json_pointer,
+                        name='server_allocation.json_pointer')
+        allocator = _text(self.allocator, name='server_allocation.allocator')
+        if not isinstance(self.value, CanonicalJsonValue):
+            raise TypeError('server allocation value has an invalid type.')
+        raw_value = self.value.canonical_value()
+        if pointer in self._SERVICE_POINTERS:
+            if allocator != 'api_server':
+                raise ValueError('Service allocations require the api_server '
+                                 'allocator.')
+            self._validate_service_value(pointer, raw_value)
+        elif pointer == self._NODE_NAME_POINTER:
+            if allocator != 'scheduler':
+                raise ValueError('Pod nodeName allocation requires the '
+                                 'scheduler allocator.')
+            _dns_subdomain(raw_value, name='server_allocation.value.nodeName')
+        else:
+            raise ValueError('server allocation JSON pointer is unsupported.')
+        object.__setattr__(self, 'json_pointer', pointer)
+        object.__setattr__(self, 'allocator', allocator)
+        _ = self.canonical_bytes
+
+    @staticmethod
+    def _validate_service_value(pointer: str, value: Any) -> None:
+        if pointer == '/spec/clusterIP':
+            if value != 'None':
+                _canonical_ip_text(value,
+                                   name='server_allocation.value.clusterIP')
+            return
+        if pointer == '/spec/clusterIPs':
+            if not isinstance(value, list) or len(value) != 1:
+                raise ValueError('clusterIPs allocation must be a one-element '
+                                 'JSON array.')
+            if value[0] != 'None':
+                _canonical_ip_text(value[0],
+                                   name='server_allocation.value.clusterIPs')
+            return
+        if pointer == '/spec/ipFamilies':
+            if (not isinstance(value, list) or len(value) != 1 or
+                    value[0] not in ('IPv4', 'IPv6')):
+                raise ValueError('ipFamilies allocation must contain exactly '
+                                 'IPv4 or IPv6.')
+            return
+        if value != 'SingleStack':
+            raise ValueError('ipFamilyPolicy allocation must be SingleStack.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesServerAllocationV1':
+        shallow = _closed_object_shallow(value,
+                                         name='server allocation',
+                                         keys=cls._KEYS)
+        allocation_value = CanonicalJsonValue.from_value(shallow['value'])
+        raw = _closed_object(shallow, name='server allocation', keys=cls._KEYS)
+        return cls(json_pointer=raw['json_pointer'],
+                   allocator=raw['allocator'],
+                   value=allocation_value)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'json_pointer': self.json_pointer,
+            'allocator': self.allocator,
+            'value': self.value.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderPodImageV1(_CanonicalContract):
     """Fixed explicit digest-qualified workload image contract."""
 
@@ -2717,6 +3002,142 @@ class ProviderPodImageV1(_CanonicalContract):
             'qualification': self.qualification.canonical_value(),
             'auth_strategy': 'anonymous',
             'implementation_contract': 'kubernetes_serve_prebooted_runtime_v1',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesResourceContractV1(_CanonicalContract):
+    """Exact Kubernetes Pod resource translation for the first provider."""
+
+    source_cpus: str
+    source_memory_gb: str
+    pod_cpu_request: str
+    pod_cpu_limit: str
+    pod_memory_request: str
+    pod_memory_limit: str
+    translation_contract: str
+    set_pod_resource_limits: bool
+    resource_limit_multiplier: int
+    live_allocatable_clamp: bool
+    accelerator: None
+    ephemeral_storage: None
+    image: ProviderPodImageV1
+    image_pull_policy: str
+    application_port: str
+    resources_ports: tuple[str, ...]
+    port_mode: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'source_cpus', 'source_memory_gb', 'pod_cpu_request', 'pod_cpu_limit',
+        'pod_memory_request', 'pod_memory_limit', 'translation_contract',
+        'set_pod_resource_limits', 'resource_limit_multiplier',
+        'live_allocatable_clamp', 'accelerator', 'ephemeral_storage', 'image',
+        'image_pull_policy', 'application_port', 'resources_ports', 'port_mode'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'source_cpus',
+            _canonical_positive_decimal_text(self.source_cpus,
+                                             name='resources.source_cpus'))
+        object.__setattr__(
+            self, 'source_memory_gb',
+            _canonical_positive_decimal_text(self.source_memory_gb,
+                                             name='resources.source_memory_gb'))
+        for field in ('pod_cpu_request', 'pod_cpu_limit', 'pod_memory_request',
+                      'pod_memory_limit'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field), name=f'resources.{field}'))
+        if (self.pod_cpu_request != self.source_cpus or
+                self.pod_cpu_limit != self.source_cpus):
+            raise ValueError(
+                'Pod CPU request and limit must equal source_cpus.')
+        expected_memory = f'{self.source_memory_gb}G'
+        if (self.pod_memory_request != expected_memory or
+                self.pod_memory_limit != expected_memory):
+            raise ValueError('Pod memory request and limit must equal '
+                             'source_memory_gb with a G suffix.')
+        if self.translation_contract != 'sky_to_k8s_exact_resources_v1':
+            raise ValueError('resource translation contract is unsupported.')
+        if not _boolean(self.set_pod_resource_limits,
+                        name='resources.set_pod_resource_limits'):
+            raise ValueError('set_pod_resource_limits must be true.')
+        if (not isinstance(self.resource_limit_multiplier, int) or
+                isinstance(self.resource_limit_multiplier, bool) or
+                self.resource_limit_multiplier != 1):
+            raise ValueError('resource_limit_multiplier must be integer 1.')
+        if _boolean(self.live_allocatable_clamp,
+                    name='resources.live_allocatable_clamp'):
+            raise ValueError('live_allocatable_clamp must be false.')
+        if self.accelerator is not None or self.ephemeral_storage is not None:
+            raise ValueError('accelerator and ephemeral_storage must be null.')
+        if not isinstance(self.image, ProviderPodImageV1):
+            raise TypeError('resource image has an invalid type.')
+        if self.image_pull_policy != 'Always':
+            raise ValueError('resource image_pull_policy must be Always.')
+        object.__setattr__(
+            self, 'application_port',
+            _decimal_port_text(self.application_port,
+                               name='resources.application_port'))
+        if not isinstance(self.resources_ports, tuple):
+            raise TypeError('resource resources_ports must be a tuple.')
+        ports = tuple(
+            _decimal_port_text(port, name='resources.resources_ports')
+            for port in self.resources_ports)
+        if ports != (self.application_port,):
+            raise ValueError('resource resources_ports must contain exactly '
+                             'the application port.')
+        object.__setattr__(self, 'resources_ports', ports)
+        if self.port_mode != 'podip':
+            raise ValueError('resource port_mode must be podip.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesResourceContractV1':
+        raw = _closed_object(value,
+                             name='Kubernetes resource contract',
+                             keys=cls._KEYS)
+        resources_ports = raw['resources_ports']
+        if not isinstance(resources_ports, list):
+            raise TypeError('resource resources_ports must be a list.')
+        return cls(source_cpus=raw['source_cpus'],
+                   source_memory_gb=raw['source_memory_gb'],
+                   pod_cpu_request=raw['pod_cpu_request'],
+                   pod_cpu_limit=raw['pod_cpu_limit'],
+                   pod_memory_request=raw['pod_memory_request'],
+                   pod_memory_limit=raw['pod_memory_limit'],
+                   translation_contract=raw['translation_contract'],
+                   set_pod_resource_limits=raw['set_pod_resource_limits'],
+                   resource_limit_multiplier=raw['resource_limit_multiplier'],
+                   live_allocatable_clamp=raw['live_allocatable_clamp'],
+                   accelerator=raw['accelerator'],
+                   ephemeral_storage=raw['ephemeral_storage'],
+                   image=ProviderPodImageV1.from_value(raw['image']),
+                   image_pull_policy=raw['image_pull_policy'],
+                   application_port=raw['application_port'],
+                   resources_ports=tuple(resources_ports),
+                   port_mode=raw['port_mode'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'source_cpus': self.source_cpus,
+            'source_memory_gb': self.source_memory_gb,
+            'pod_cpu_request': self.pod_cpu_request,
+            'pod_cpu_limit': self.pod_cpu_limit,
+            'pod_memory_request': self.pod_memory_request,
+            'pod_memory_limit': self.pod_memory_limit,
+            'translation_contract': 'sky_to_k8s_exact_resources_v1',
+            'set_pod_resource_limits': True,
+            'resource_limit_multiplier': 1,
+            'live_allocatable_clamp': False,
+            'accelerator': None,
+            'ephemeral_storage': None,
+            'image': self.image.canonical_value(),
+            'image_pull_policy': 'Always',
+            'application_port': self.application_port,
+            'resources_ports': list(self.resources_ports),
+            'port_mode': 'podip',
         }
 
 
