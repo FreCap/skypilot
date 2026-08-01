@@ -6864,45 +6864,50 @@ together, and the next invocation observes that new import generation.
 DigitalOcean reserves the tag key
 `skypilot-cluster-incarnation`. When the optional value is absent,
 `utils.create_instance()` preserves the exact current tag ordering and request
-shape. When it is present, the raw value must have exact type `str`; every such
-string, including empty, non-ASCII, surrogate-containing, and arbitrarily long
-legacy values, has one total deterministic encoding. The encoded value is
-exactly `v1-` followed by lowercase hexadecimal SHA-256 of the byte domain
-separator `skypilot-do-cluster-incarnation-v1\0` followed by the raw value
-encoded with UTF-8 `surrogatepass`. No Unicode normalization, truncation, raw
-identity substring, clock, salt, random value, or provider lookup participates.
-The resulting full tag uses only ASCII letters, digits, colon, and dash and has
-a fixed length below DigitalOcean's 255-character limit. The provider
-documents that grammar at
+shape. Exact type `str` opts into the system marker. `None` and every value
+whose exact type is not `str` preserve the byte-for-byte legacy unmarked tag
+request; this compatibility downgrade grants no attribution or future
+actuation authority. Every exact string, including empty, non-ASCII,
+surrogate-containing, and arbitrarily long legacy values, has one total
+deterministic encoding. The encoded value is exactly `v1-` followed by
+lowercase hexadecimal SHA-256 of the byte domain separator
+`skypilot-do-cluster-incarnation-v1\0` followed by the raw value encoded with
+UTF-8 `surrogatepass`. No Unicode normalization, truncation, raw identity
+substring, clock, salt, random value, or provider lookup participates. The
+resulting full tag uses only ASCII letters, digits, colon, and dash and has a
+fixed length below DigitalOcean's 255-character limit. The provider documents
+that grammar at
 <https://docs.digitalocean.com/reference/api/reference/tags/>.
 
 User-supplied tags retain their current sorting and legacy override behavior
-for `Name`, `ray-cluster-name`, and `skypilot-cluster-name`. A marked request
-rejects any encoded user tag that case-insensitively occupies the reserved
-`skypilot-cluster-incarnation:` namespace. This includes an exact key and a
-key already containing a suffix after the reserved key. The validated marker
-is appended as the only new final tag. The same immutable-by-convention tag
-list is supplied to both the droplet request and its paired volume request.
-The input `config.tags` mapping is not mutated. DigitalOcean bootstrap
-continues to return the exact `ProvisionConfig` object, so the field survives
-without another copy owner.
+for `Name`, `ray-cluster-name`, and `skypilot-cluster-name`. Legacy mode also
+preserves every marker-like user tag exactly. In marked mode, the helper first
+formats the existing tags in their current deterministic order, then removes
+every formatted tag whose case-folded value occupies the reserved
+`skypilot-cluster-incarnation:` namespace. This includes the exact key and a
+key that already contains a suffix after the reserved key. It preserves the
+relative order and exact value of every remaining tag, then appends exactly one
+authoritative marker as the final tag. This is managed-namespace overwrite,
+not validation or rejection. The same immutable-by-convention tag list is
+supplied to both the droplet request and its paired volume request. The input
+`config.tags` mapping is not mutated. DigitalOcean bootstrap continues to
+return the exact `ProvisionConfig` object, so the field survives without
+another copy owner.
 
-One pure DigitalOcean helper owns raw-type validation, total encoding, and
-reserved-namespace collision detection. `run_instances()` calls it before its
-first discovery, resume, rename, or create operation. `create_instance()`
-calls the same helper defensively for direct callers, before SSH-key lookup or
-any droplet, volume, or attachment request. The generic pre-run ephemeral
-volume path has no DigitalOcean mutation: it can create only a Kubernetes PVC
-and skips or rejects every other volume type before provider submission.
+One pure DigitalOcean helper owns the existing tag projection, exact-string V1
+encoding, and marked-mode reserved-namespace replacement. `create_instance()`
+calls it exactly once before SSH-key lookup or any droplet, volume, or
+attachment request. For all in-contract values the helper is total and adds no
+new exception class, retry, cleanup bypass, or provider call. Existing
+exceptions from copying, sorting, or string-formatting malformed legacy tags
+retain their current type and ordinary cleanup behavior. `run_instances()`
+does not duplicate marker preparation before discovery, resume, or rename
+because preparation cannot reject a request and this slice stamps only newly
+created resources.
 
-The helper raises `InvalidProvisionConfigError`, a `ValueError` subtype in
-`sky.provision.common`. `bulk_provision()` re-raises that exact admission error
-before its broad failure-cleanup branch. An invalid type or reserved collision
-therefore cannot call stop, terminate, ephemeral-volume deletion, or other
-destructive failover cleanup. This bypass is limited to the closed admission
-exception and does not change cleanup for an error after provider mutation.
-
-The marker is durable attribution evidence, not an external-effect fence.
+The marker is durable generation-correlation evidence emitted by an exact
+built-in marked create, not standalone proof of system authorship, ownership,
+or an external-effect fence. Legacy mode can preserve a marker-like user tag.
 `cluster_hash` is stable across multiple creates, retries, resume, and scale
 within one cluster generation, so it is not a unique create-attempt identity.
 The current DigitalOcean create remains three unjournaled effects: droplet,
@@ -6953,17 +6958,19 @@ The focused compatibility suite must prove:
 5. encoding is byte-repeatable and domain-separated for ASCII, empty,
    non-ASCII, lone-surrogate, very long, 255-character, and 256-character raw
    hashes, always producing the closed fixed-length tag grammar;
-6. invalid raw type and every case-insensitive reserved-namespace collision
-   fail before discovery, SSH-key, droplet, volume, attachment, resume, rename,
-   stop, terminate, or cleanup calls;
-7. input tags remain unchanged and existing user-tag order remains
-   deterministic;
+6. `None` and every non-exact-string value preserve the exact legacy tag
+   request, including marker-like user tags, without adding a marker;
+7. marked requests filter exact-key, suffixed-key, and mixed-case occupants of
+   the reserved namespace, preserve all remaining relative order and values,
+   append exactly one marker last, and leave the input tags unchanged;
 8. a legacy unmarked create followed by a marked same-name create, and two
    distinct same-name generations, produce the expected mixed attribution
    without asserting cleanup isolation, current ownership, or mutation
-   eligibility; and
+   eligibility;
 9. the merged DigitalOcean query-projector, provider-facet, and stale database
-   generation-fence characterization suites remain unchanged and green.
+   generation-fence characterization suites remain unchanged and green; and
+10. no new exception class or cleanup bypass exists, while existing ordinary
+    provisioning-failure cleanup characterization remains unchanged and green.
 
 This runtime change requires an exact-image test-cluster deployment. The
 rollout proves migration completion, import safety, API-server, controller,
