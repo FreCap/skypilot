@@ -135,6 +135,14 @@ def _build_sky_wheel() -> pathlib.Path:
         init_file_content = re.sub(
             r'_SKYPILOT_COMMIT_SHA = [\'"](.*?)[\'"]',
             f'_SKYPILOT_COMMIT_SHA = \'{sky.__commit__}\'', init_file_content)
+        # Always replace the timestamp placeholder. An empty stamp is an
+        # explicit absence marker that prevents an installed wheel from
+        # deriving provenance from an unrelated ambient Git checkout.
+        commit_timestamp = sky.__commit_timestamp__ or ''
+        init_file_content = re.sub(
+            r'_SKYPILOT_COMMIT_TIMESTAMP = [\'"](.*?)[\'"]',
+            f'_SKYPILOT_COMMIT_TIMESTAMP = \'{commit_timestamp}\'',
+            init_file_content)
         if sky.__build__ is not None:
             # setup.py runs outside the source checkout, so it cannot discover
             # the commit count itself. Stamp the running build just like the
