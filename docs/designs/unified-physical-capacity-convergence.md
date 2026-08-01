@@ -2,9 +2,10 @@
 
 Status: C1 foundation implemented, verified, and retained; C2.1 and C2.2 are
 historical-complete; C2.3 was cancelled without activation and C2.4 will not
-run; the C2-only evidence scanner is explicitly retired for removal, no payoff
-gate was satisfied, and every materialized or authoritative capacity product
-remains unauthorized
+run; the C2-only evidence scanner is retired and its exact cleanup is locally
+implemented and verified, with merge and deployment pending; no payoff gate
+was satisfied, and every materialized or authoritative capacity product remains
+unauthorized
 
 Last updated: 2026-08-01
 
@@ -1477,6 +1478,40 @@ replaced by a synthetic selector or internal log inference. Mapping version 1
 will not be activated, and none of the four follow-on products acquired
 implementation authority.
 
+### C2 cleanup implementation verification
+
+The cleanup implementation is based on `improvements` commit `24d2eb250` and
+the independently approved retirement-design commit `fa0e3681d`. It deletes
+all seven C2-only production modules and all five C2-only test modules in the
+ledger. The six shared implementation files are byte-for-byte equal to their
+pre-C2 blobs from the first parent of merge `73d80feb9`; no later commit had
+changed those paths. A repository search finds no remaining code, test, or
+chart reference to the deleted modules, projector/repository hooks,
+source/pilot constants, C2 canonical domains/enums, or isolated evidence-pool
+helpers.
+
+The revision-`001` migration, all five SQLAlchemy tables, state access,
+migration initialization hook, Alembic section, migration constants, C1
+mode/allowlist configuration, and retained C1 tests remain present. No schema
+revision, row deletion, or data rewrite is included.
+
+Local verification completed:
+
+- compile/import checks loaded the retained capacity package and controller
+  runtime and found exactly five capacity tables;
+- 94 retained capacity model/state, controller-runtime, and migration tests
+  passed;
+- 14 PostgreSQL schema tests were collected and skipped because no local test
+  PostgreSQL DSN was configured;
+- the container migration test could not start because this host has no Docker
+  socket, so that exact test remains a CI gate; and
+- YAPF, isort, mypy over 807 source files, pylint at 10.00/10, and dashboard
+  lint/Prettier completed successfully. The formatting wrapper returned its
+  expected nonzero status only because the cleanup changes were not yet staged.
+
+This is implementation evidence only. It does not claim that the cleanup image
+has been merged or deployed; the retirement rollout checks above remain open.
+
 Before retirement, automated tests covered:
 
 - strict top-level selector grammar, UTF-8/count/partition/pilot-end bounds,
@@ -1545,9 +1580,9 @@ Cancelled C2.3 manual activation plan (not executed):
   existed. Its canary and restart/handoff test will not run.
 - C2.4 not run: no measurement manifest or 30-day comparison window was
   frozen, and no gate decision can claim production evidence.
-- C2 cleanup authorized: remove the exact ledger in this design, retain C1,
-  deploy disabled with no schema/data deletion, and record exact verification
-  evidence here after rollout.
+- C2 cleanup implemented locally: the exact ledger is removed and retained C1
+  tests pass. Merge and the disabled staged rollout remain pending; deployment
+  must add no schema/data deletion and must record exact live evidence here.
 
 The activated-pilot 14-day decision and 45-day removal clocks never started.
 The explicit no-go decision authorizes earlier cleanup without fabricating an

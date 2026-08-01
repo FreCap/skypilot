@@ -1,8 +1,7 @@
 """Bounded generic canonical JSON for the revision-001 capacity schema.
 
-Only the generic envelope and limits are defined here.  C2 adds two closed
-domains for its bounded, read-only evidence scan; payload shapes remain in
-``contracts`` rather than weakening the generic encoder.
+Only the generic envelope and limits are defined here.  Production projection
+payload schemas and source mappings are deliberately deferred to C2 review.
 """
 
 import enum
@@ -25,8 +24,6 @@ _SCHEMA_VERSION = 1
 
 
 class CanonicalDomain(str, enum.Enum):
-    """Closed identity and digest domains accepted by schema version 1."""
-
     PLACEMENT_CONTRACT = 'placement_contract'
     TOPOLOGY = 'topology'
     PHYSICAL_SPEC = 'physical_spec'
@@ -35,8 +32,6 @@ class CanonicalDomain(str, enum.Enum):
     SOURCE_FINGERPRINT = 'source_fingerprint'
     SOURCE_PARTITION = 'source_partition'
     PROJECTION_CURSOR = 'projection_cursor'
-    SCOPE_ENTRY = 'scope_entry'
-    EVIDENCE_RECORD = 'evidence_record'
 
 
 def validate_bounded_string(value: object,
