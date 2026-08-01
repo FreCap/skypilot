@@ -1276,8 +1276,14 @@ def test_stale_cleanup_reuses_one_queue_snapshot_per_cluster(
     assert state.get_batch_worker_records(3) == []
 
 
+@pytest.mark.parametrize(
+    ('invalid_snapshot', 'error_type', 'error_match'),
+    [(None, TypeError, 'Queue snapshot for worker-a returned None'),
+     ([object()], AttributeError, "object.*has no attribute 'job_name'")])
 def test_stale_cleanup_retries_invalid_queue_snapshot(batch_state_db,
-                                                      monkeypatch):
+                                                      monkeypatch,
+                                                      invalid_snapshot,
+                                                      error_type, error_match):
     del batch_state_db
     _create_batch_job(4, 'owner-a')
     assert state.register_batch_worker_launch(4, 'owner-a', 'worker-a',
@@ -1293,8 +1299,8 @@ def test_stale_cleanup_retries_invalid_queue_snapshot(batch_state_db,
     queue = mock.Mock(
         side_effect=['queue-strict', 'queue-owner-a', 'queue-owner-b'])
     get = mock.Mock(side_effect=[
-        None,
-        None,
+        invalid_snapshot,
+        invalid_snapshot,
         [types.SimpleNamespace(job_id=18, job_name='batch-worker-4-owner-b')],
         None,
     ])
@@ -1303,8 +1309,7 @@ def test_stale_cleanup_retries_invalid_queue_snapshot(batch_state_db,
     monkeypatch.setattr(coordinator.sdk, 'get', get)
     monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
 
-    with pytest.raises(TypeError,
-                       match='Queue snapshot for worker-a returned None'):
+    with pytest.raises(error_type, match=error_match):
         batch_coordinator._cleanup_stale_worker_services(strict=True)
     batch_coordinator._cleanup_stale_worker_services()
 
