@@ -184,6 +184,10 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       const inFlight = refreshInFlightRef.current;
       const hasVisibleCurrentServiceData =
         visibleServiceDataRef.current?.name === serviceName;
+      const hasVisibleCurrentFullServiceData =
+        hasVisibleCurrentServiceData &&
+        visibleServiceDataRef.current?.summaryOnly !== true &&
+        Array.isArray(visibleServiceDataRef.current?.replicas);
       if (
         source === 'initial' &&
         !loadFullRequest &&
@@ -209,6 +213,17 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
           inFlight.source === 'manual');
       if (shouldReuseInFlight) {
         return inFlight.promise;
+      }
+      if (
+        source === 'initial' &&
+        loadFullRequest &&
+        !loadSummary &&
+        hasVisibleCurrentFullServiceData
+      ) {
+        setLoading(false);
+        setReplicasLoading(false);
+        setHistoryLoading(false);
+        return Promise.resolve();
       }
       if (invalidate) {
         if (loadSummary) {
