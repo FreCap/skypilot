@@ -1,16 +1,14 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: M1, M2 S1, and M2 S2a.1 merged; S1 exact-head CI, revision 34
-deployment, canary, cleanup, and monitor qualified; S2a.1 exact-head CI and
-merge qualified; responsibility-deduplication review accepted for planning;
-the first M2 S2 prototype was rejected because it duplicated placement policy,
-and the bounded S2a.2 production-owner contract passed exact design review;
-the live physical-capacity branch is reconciled; and the separately deployable
-S2a.2 deterministic-gzip prerequisite passed exact-head CI, merge, staged
-revision 45 deployment, and bounded monitoring. The source-composer staging
-slice is implemented and locally qualified; its exact-head CI, merge, and
-deployment gates remain open. M3 and M4 implementation require dedicated
-exact-design adversarial reviews.
+Status: M1, M2 S1, M2 S2a.1, and the S2a.2 source composer are merged and
+deployment-qualified. The separately deployable S2a.2 deterministic-gzip
+prerequisite passed exact-head CI, merge, staged revision 45 deployment, and
+bounded monitoring; the source composer passed exact-head CI, merge, staged
+revisions 46 through 48, and bounded monitoring. The pre-M3 volume projection
+contract passed exact-design adversarial review and its implementation is under
+local qualification. Its exact-head CI, merge, deployment, and live-volume
+evidence gates remain open. The M3 action runtime and M4 implementation still
+require dedicated exact-design adversarial reviews.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -4001,11 +3999,17 @@ ordinary shadow failure.
 Deferred capture is explicitly bounded. One sweep may retain at most 128
 complete snapshots, 4,096 total current-plus-observed usage references, and
 256 KiB of UTF-8 usage-identity bytes. Admission checks all three remaining
-budgets before converting any usage list to a tuple. A snapshot is retained in
-full or classified `NOT_SAMPLED_BUDGET`; it is never truncated. Budget
-accounting itself is exception-contained after the authoritative work for that
-volume. These constants are characterization limits, not volume product
-limits, and they do not reject or alter a legacy write or config refresh.
+budgets before converting any usage list to a tuple. Capture admits only exact
+built-in `list` containers and exact built-in `str` identities. Other runtime
+types are classified `NOT_SAMPLED_BUDGET` without invoking their overridable
+length, iteration, encoding, equality, or hashing behavior. Each admitted list
+is traversed once into a temporary list while enforcing the remaining reference
+and UTF-8 byte budgets; the immutable snapshot is then built only from those
+bounded copies. A snapshot is retained in full or classified
+`NOT_SAMPLED_BUDGET`; it is never truncated. Budget accounting itself is
+exception-contained after the authoritative work for that volume. These
+constants are characterization limits, not volume product limits, and they do
+not reject or alter a legacy write or config refresh.
 
 The caller emits no success metric, database row, per-volume warning, or
 per-match log. If the complete sweep contains any mismatch, projector error,
@@ -4563,6 +4567,9 @@ M3-S0 precedes the action runtime and has its own focused contract tests:
   UTF-8 identity-byte budgets and prove snapshots are never truncated,
   candidate calls stay capped, `NOT_SAMPLED_BUDGET` is counted, and every
   authoritative write and config refresh still runs;
+- lying and stateful list and string subclasses cannot bypass accounting or
+  cause a second input traversal, and exact built-in lists are copied once
+  through a reference-capped traversal before tuple conversion;
 - one bounded anomaly summary covers many volumes, samples at most three
   names through fixed-size accumulation, and contains no raw error, provider
   payload, exception message, projection payload, or full usage collection;
@@ -5241,3 +5248,28 @@ statistics store. Original lists continue directly to the legacy writer, and
 the pure diagnostic projection can never supply writer arguments. A generic
 comparison helper remains prohibited until a second production domain proves
 the same contract.
+
+### Review 17
+
+Verdict: `PURSUE` for the corrected M3-S0 implementation contract at exact
+heading-through-before-Cleanup SHA-256
+`e98439a57dd81c7956b6f0eb1aaeb8affe2a8753c546c3bec3915e55308847d8`.
+
+Two independent implementation reviews initially returned `DO NOT MERGE`
+because the first capture implementation accounted overridable list and string
+operations, then traversed each input again during tuple conversion. A lying or
+stateful subtype could therefore retain more than 4,096 references or 256 KiB
+while debiting a smaller value.
+
+The corrected contract and implementation reject non-exact list and string
+inputs without invoking subtype behavior, traverse each admitted exact list
+once into reference-capped built-in copies, account UTF-8 bytes from the exact
+identities retained in those copies, and construct snapshots only from the
+bounded copies. Both original reproductions now fail closed with no budget
+debit. Both reviewers returned `LGTM`, and the exact-design adversarial
+re-review independently verified the section digest and returned `PURSUE`.
+
+Local qualification currently includes 45 pure-projection and facade tests,
+the existing 55 volume-core tests, clean mypy across 817 source files, and a
+10.00/10 pylint result. Exact-head CI, merge, immutable-image deployment, and
+live-volume evidence remain open gates.
