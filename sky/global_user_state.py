@@ -29,6 +29,7 @@ from sky import global_user_state_cloud_checks
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
 from sky import global_user_state_service_account_tokens
+from sky import global_user_state_system_config
 from sky import models
 from sky import sky_logging
 from sky import skypilot_config
@@ -3651,13 +3652,8 @@ def get_all_service_account_tokens() -> list[dict[str, Any]]:
 @metrics_lib.time_me
 def get_system_config(config_key: str) -> str | None:
     """Get a system configuration value by key."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(system_config_table).filter_by(
-            config_key=config_key).first()
-    if row is None:
-        return None
-    return row.config_value
+    return global_user_state_system_config.get_system_config(
+        _db_manager.get_engine(), config_key)
 
 
 @metrics_lib.time_me
@@ -3669,59 +3665,18 @@ def get_or_set_system_config(config_key: str, default_value: str) -> str:
     defaults, but every caller returns the single value that won the unique-key
     insert.
     """
-    engine = _db_manager.get_engine()
-    current_time = int(time.time())
-    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-        insert_func = sqlite.insert
-    elif engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-        insert_func = postgresql.insert
-    else:
-        raise ValueError('Unsupported database dialect')
-
-    insert_stmnt = insert_func(system_config_table).values(
-        config_key=config_key,
-        config_value=default_value,
-        created_at=current_time,
-        updated_at=current_time).on_conflict_do_nothing(
-            index_elements=[system_config_table.c.config_key])
-    with orm.Session(engine) as session:
-        session.execute(insert_stmnt)
-        value = session.execute(
-            sqlalchemy.select(system_config_table.c.config_value).where(
-                system_config_table.c.config_key == config_key)).scalar_one()
-        session.commit()
-    return str(value)
+    return global_user_state_system_config.get_or_set_system_config(
+        _db_manager.get_engine(), config_key, default_value, int(time.time()),
+        sqlite, postgresql)
 
 
 @metrics_lib.time_me
 def set_system_config(config_key: str, config_value: str) -> None:
     """Set a system configuration value."""
-    engine = _db_manager.get_engine()
-    current_time = int(time.time())
-
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
-        insert_stmnt = insert_func(system_config_table).values(
-            config_key=config_key,
-            config_value=config_value,
-            created_at=current_time,
-            updated_at=current_time)
-
-        upsert_stmnt = insert_stmnt.on_conflict_do_update(
-            index_elements=[system_config_table.c.config_key],
-            set_={
-                system_config_table.c.config_value: config_value,
-                system_config_table.c.updated_at: current_time,
-            })
-        session.execute(upsert_stmnt)
-        session.commit()
+    global_user_state_system_config.set_system_config(_db_manager.get_engine(),
+                                                      config_key, config_value,
+                                                      int(time.time()), sqlite,
+                                                      postgresql)
 
 
 @metrics_lib.time_me
