@@ -5,6 +5,7 @@ providers supported by SkyPilot need to follow.
 """
 import dataclasses
 import dis
+import enum
 import functools
 import inspect
 import types
@@ -135,11 +136,25 @@ def _make_builtin_bundle(
     canonical_name: str,
     module: Any,
 ) -> provider_facets.ProvisionerBundleV1:
+    diagnostic = None
+    try:
+        candidate = inspect.getattr_static(module,
+                                           '_QUERY_INSTANCES_DIAGNOSTIC_V1',
+                                           None)
+        if (type(candidate) is provider_facets.BuiltinQueryInstancesDiagnosticV1
+                and not provider_facets.
+                builtin_query_instances_diagnostic_v1_validation_errors(
+                    candidate)):
+            diagnostic = candidate
+    except Exception:  # pylint: disable=broad-exception-caught
+        # An optional diagnostic must not break authoritative provisioning.
+        diagnostic = None
     return provider_facets.ProvisionerBundleV1(
         canonical_name=canonical_name,
         instance_lifecycle=provider_facets.LegacyInstanceLifecycleAdapter(
             module),
         legacy_module=module,
+        builtin_query_instances_diagnostic=diagnostic,
     )
 
 
@@ -253,6 +268,46 @@ def _get_builtin_provisioner_bundle(
     return _make_builtin_bundle(canonical_name, module_getter())
 
 
+@enum.unique
+class _ProvisionerOperationOwnerV1(enum.Enum):
+    """Source that owns one resolved provider operation."""
+
+    STRICT = 'strict'
+    LEGACY = 'legacy'
+    BUILTIN = 'builtin'
+
+
+@dataclasses.dataclass(frozen=True)
+class _ResolvedProvisionerOperation:
+    """One selected operation and its optional diagnostic entry point."""
+
+    owner: _ProvisionerOperationOwnerV1
+    authoritative_implementation: Any
+    diagnostic_implementation: Any | None = None
+
+    @property
+    def implementation(self) -> Any:
+        if self.diagnostic_implementation is not None:
+            return self.diagnostic_implementation
+        return self.authoritative_implementation
+
+
+_BUILTIN_LIFECYCLE_DISCARD_RETURN_METHODS: typing.Final[frozenset[str]] = (
+    frozenset(('stop_instances', 'terminate_instances', 'wait_instances')))
+
+
+def _pin_builtin_lifecycle_implementation(method_name: str,
+                                          implementation: Any) -> Any:
+    """Pin one raw built-in method while preserving adapter return semantics."""
+    if method_name not in _BUILTIN_LIFECYCLE_DISCARD_RETURN_METHODS:
+        return implementation
+
+    def _discard_return(*args: Any, **kwargs: Any) -> None:
+        implementation(*args, **kwargs)
+
+    return _discard_return
+
+
 @dataclasses.dataclass(frozen=True)
 class _ProvisionerResolution:
     """One provider lookup shared by lifecycle and template dispatch."""
@@ -279,29 +334,37 @@ class _ProvisionerResolution:
             return self.builtin_bundle.template_override
         return None
 
-    def implementation(self, method_name: str) -> Any | None:
+    def resolve_operation(
+            self, method_name: str) -> _ResolvedProvisionerOperation | None:
         if (self.strict_bundle is not None and
                 method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS):
-            return getattr(self.strict_bundle.instance_lifecycle, method_name)
+            return _ResolvedProvisionerOperation(
+                owner=_ProvisionerOperationOwnerV1.STRICT,
+                authoritative_implementation=getattr(
+                    self.strict_bundle.instance_lifecycle, method_name),
+            )
 
         legacy_module = (self.legacy_registration.module
                          if self.legacy_registration is not None else None)
         if legacy_module is not None:
             implementation = getattr(legacy_module, method_name, None)
             if implementation is not None:
-                return implementation
+                return _ResolvedProvisionerOperation(
+                    owner=_ProvisionerOperationOwnerV1.LEGACY,
+                    authoritative_implementation=implementation,
+                )
 
-        builtin_module = None
-        if self.builtin_bundle is not None:
-            if method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS:
-                raw_builtin_module = self.builtin_bundle.legacy_module
-                if (raw_builtin_module is not None and getattr(
-                        raw_builtin_module, method_name, None) is not None):
-                    builtin_module = self.builtin_bundle.instance_lifecycle
-            else:
-                builtin_module = self.builtin_bundle.legacy_module
+        if self.builtin_bundle is None:
+            return None
+        raw_builtin_module = self.builtin_bundle.legacy_module
+        if raw_builtin_module is None:
+            return None
+        raw_builtin_implementation = getattr(raw_builtin_module, method_name,
+                                             None)
+        if raw_builtin_implementation is None:
+            return None
 
-        if (legacy_module is not None and builtin_module is not None and
+        if (legacy_module is not None and
                 method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS):
             plugin_owns_part_of_facet = any(
                 callable(getattr(legacy_module, name, None))
@@ -316,9 +379,26 @@ class _ProvisionerResolution:
                     'ProvisionerBundleV1 to remove fallback.',
                     self.canonical_name)
 
-        if builtin_module is not None:
-            return getattr(builtin_module, method_name, None)
-        return None
+        authoritative_implementation = raw_builtin_implementation
+        if method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS:
+            authoritative_implementation = (
+                _pin_builtin_lifecycle_implementation(
+                    method_name, raw_builtin_implementation))
+
+        diagnostic_implementation = None
+        diagnostic = self.builtin_bundle.builtin_query_instances_diagnostic
+        if (method_name == 'query_instances' and
+                self.legacy_registration is None and type(diagnostic)
+                is provider_facets.BuiltinQueryInstancesDiagnosticV1 and
+                diagnostic.authoritative_implementation
+                is raw_builtin_implementation):
+            diagnostic_implementation = diagnostic.diagnostic_implementation
+
+        return _ResolvedProvisionerOperation(
+            owner=_ProvisionerOperationOwnerV1.BUILTIN,
+            authoritative_implementation=authoritative_implementation,
+            diagnostic_implementation=diagnostic_implementation,
+        )
 
 
 def _resolve_provisioner(provider_name: str) -> _ProvisionerResolution:
@@ -370,6 +450,9 @@ def get_registered_provisioner(cloud_name: str) -> Provisioner | None:
 def register_provisioner_bundle(
         bundle: provider_facets.ProvisionerBundleV1) -> None:
     """Register one complete, strictly owned V1 lifecycle facet."""
+    if bundle.builtin_query_instances_diagnostic is not None:
+        raise ValueError('Strict ProvisionerBundleV1 registration cannot '
+                         'declare a built-in query diagnostic.')
     validation_errors = (
         provider_facets.instance_lifecycle_v1_validation_errors(
             bundle.instance_lifecycle))
@@ -388,7 +471,9 @@ def register_provisioner_bundle(
     if (existing_bundle is not None and
             existing_bundle.instance_lifecycle is bundle.instance_lifecycle and
             existing_bundle.template_override is bundle.template_override and
-            existing_bundle.legacy_module is bundle.legacy_module):
+            existing_bundle.legacy_module is bundle.legacy_module and
+            existing_bundle.builtin_query_instances_diagnostic
+            is bundle.builtin_query_instances_diagnostic):
         logger.debug('ProvisionerBundleV1 for %r is already registered.',
                      canonical_name)
         return
@@ -434,10 +519,10 @@ def _route_to_cloud_impl(func):
         resolution = _resolve_provisioner(provider_name)
         assert resolution.exists, (
             f'Unknown provider: {resolution.canonical_name}')
-        impl = resolution.implementation(func.__name__)
+        operation = resolution.resolve_operation(func.__name__)
 
-        if impl is not None:
-            return impl(*args, **kwargs)
+        if operation is not None:
+            return operation.implementation(*args, **kwargs)
 
         # Neither side implements it — fall back to the decorator's default
         # body (typically ``raise NotImplementedError``).

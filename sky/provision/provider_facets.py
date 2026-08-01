@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import types
 import typing
 from typing import Any
 
@@ -21,6 +22,23 @@ INSTANCE_LIFECYCLE_V1_METHODS: typing.Final[tuple[str, ...]] = (
     'wait_instances',
     'get_cluster_info',
 )
+
+
+@typing.runtime_checkable
+class QueryInstancesFnV1(typing.Protocol):
+    """Exact callable contract for one synchronous instance query."""
+
+    # pylint: disable=unnecessary-ellipsis
+
+    def __call__(
+        self,
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ) -> dict[str, tuple[status_lib.ClusterStatus | None, str | None]]:
+        ...
 
 
 @typing.runtime_checkable
@@ -139,6 +157,14 @@ class LegacyInstanceLifecycleAdapter:
 
 
 @dataclasses.dataclass(frozen=True)
+class BuiltinQueryInstancesDiagnosticV1:
+    """One in-tree query entry point with its authoritative identity."""
+
+    authoritative_implementation: QueryInstancesFnV1
+    diagnostic_implementation: QueryInstancesFnV1
+
+
+@dataclasses.dataclass(frozen=True)
 class ProvisionerBundleV1:
     """One immutable owner for the V1 instance lifecycle facet."""
 
@@ -146,6 +172,66 @@ class ProvisionerBundleV1:
     instance_lifecycle: InstanceLifecycleV1
     template_override: TemplateOverrideFn | None = None
     legacy_module: Any | None = None
+    builtin_query_instances_diagnostic: (BuiltinQueryInstancesDiagnosticV1 |
+                                         None) = None
+
+
+def _callable_v1_validation_error(
+    implementation: Any,
+    protocol_implementation: Any,
+    actual_signature: inspect.Signature | None = None,
+) -> str | None:
+    """Return one callable-shape error, or None when it is compatible."""
+    if not callable(implementation):
+        return 'missing or not callable'
+    if (inspect.iscoroutinefunction(implementation) or
+            inspect.isasyncgenfunction(implementation)):
+        return 'must be synchronous'
+    expected_parameters = tuple(
+        inspect.signature(protocol_implementation).parameters.values())[
+            1:]  # Drop protocol ``self``.
+    if actual_signature is None:
+        try:
+            actual_signature = inspect.signature(implementation)
+        except (TypeError, ValueError) as exception:
+            return f'signature unavailable: {exception}'
+    actual_parameters = tuple(actual_signature.parameters.values())
+    if (len(actual_parameters) == len(expected_parameters) and all(
+            actual.name == expected.name and actual.kind is expected.kind and
+        (actual.default is expected.default or (type(actual.default) is type(
+            expected.default) and actual.default == expected.default))
+            for actual, expected in zip(actual_parameters, expected_parameters))
+       ):
+        return None
+    expected_signature = inspect.Signature(expected_parameters)
+    actual_signature = inspect.Signature(actual_parameters)
+    return f'expected {expected_signature}, got {actual_signature}'
+
+
+def _exact_builtin_query_function_validation_error(
+        implementation: Any) -> str | None:
+    """Reject every built-in diagnostic shape except a bare Python function."""
+    if type(implementation) is not types.FunctionType:
+        return 'must be an exact Python function'
+    missing = object()
+    if inspect.getattr_static(implementation, '__wrapped__',
+                              missing) is not missing:
+        return 'must be undecorated'
+    return None
+
+
+def _code_derived_function_signature(
+        implementation: types.FunctionType) -> inspect.Signature:
+    """Return a signature without consulting writable inspection metadata."""
+    clean_function = types.FunctionType(
+        implementation.__code__,
+        implementation.__globals__,
+        implementation.__name__,
+        implementation.__defaults__,
+        implementation.__closure__,
+    )
+    clean_function.__kwdefaults__ = implementation.__kwdefaults__
+    return inspect.signature(clean_function, follow_wrapped=False)
 
 
 def instance_lifecycle_v1_validation_errors(lifecycle: Any) -> tuple[str, ...]:
@@ -153,35 +239,45 @@ def instance_lifecycle_v1_validation_errors(lifecycle: Any) -> tuple[str, ...]:
     errors = []
     for method_name in INSTANCE_LIFECYCLE_V1_METHODS:
         implementation = getattr(lifecycle, method_name, None)
-        if not callable(implementation):
-            errors.append(f'{method_name}: missing or not callable')
-            continue
-        if inspect.iscoroutinefunction(implementation):
-            errors.append(f'{method_name}: must be synchronous')
-            continue
-        expected_parameters = tuple(
-            inspect.signature(
-                getattr(InstanceLifecycleV1,
-                        method_name)).parameters.values())[1:]  # Drop ``self``.
-        actual_parameters = tuple(
-            inspect.signature(implementation).parameters.values())
-        expected_shape = tuple(
-            (parameter.name, parameter.kind, parameter.default)
-            for parameter in expected_parameters)
-        actual_shape = tuple((parameter.name, parameter.kind, parameter.default)
-                             for parameter in actual_parameters)
-        if actual_shape != expected_shape:
-            expected_signature = inspect.Signature(expected_parameters)
-            actual_signature = inspect.Signature(actual_parameters)
-            errors.append(f'{method_name}: expected {expected_signature}, '
-                          f'got {actual_signature}')
+        error = _callable_v1_validation_error(
+            implementation, getattr(InstanceLifecycleV1, method_name))
+        if error is not None:
+            errors.append(f'{method_name}: {error}')
+    return tuple(errors)
+
+
+def builtin_query_instances_diagnostic_v1_validation_errors(
+    diagnostic: BuiltinQueryInstancesDiagnosticV1,) -> tuple[str, ...]:
+    """Return callable-shape errors for a built-in query diagnostic."""
+    errors = []
+    for field_name in ('authoritative_implementation',
+                       'diagnostic_implementation'):
+        implementation = getattr(diagnostic, field_name)
+        error = _exact_builtin_query_function_validation_error(implementation)
+        if error is None:
+            try:
+                actual_signature = _code_derived_function_signature(
+                    implementation)
+            except (TypeError, ValueError) as exception:
+                error = f'signature unavailable: {exception}'
+            else:
+                error = _callable_v1_validation_error(
+                    implementation,
+                    QueryInstancesFnV1.__call__,
+                    actual_signature=actual_signature,
+                )
+        if error is not None:
+            errors.append(f'{field_name}: {error}')
     return tuple(errors)
 
 
 __all__ = [
+    'BuiltinQueryInstancesDiagnosticV1',
     'INSTANCE_LIFECYCLE_V1_METHODS',
     'InstanceLifecycleV1',
     'LegacyInstanceLifecycleAdapter',
     'ProvisionerBundleV1',
+    'QueryInstancesFnV1',
+    'builtin_query_instances_diagnostic_v1_validation_errors',
     'instance_lifecycle_v1_validation_errors',
 ]
