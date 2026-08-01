@@ -478,6 +478,51 @@ def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
     refresh.assert_called_once_with([42])
 
 
+def test_cancel_refreshed_pending_job_reuses_atomic_finalizer(tmp_path):
+    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                         'default')
+    pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
+                                         'default')
+    with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
+         mock.patch('sky.jobs.state.get_job_cancellation_states',
+                    side_effect=[{42: running}, {42: pending}]) as snapshots, \
+         mock.patch('sky.jobs.state.set_pending_cancelled',
+                    return_value=True) as set_cancelled, \
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh, \
+         mock.patch('sky.jobs.utils.filelock.FileLock',
+                    side_effect=AssertionError(
+                        'refreshed pending cancel must not write a signal')):
+        result = utils.cancel_jobs_by_id(job_ids=[42],
+                                         current_workspace='default')
+
+    assert result == 'Job with ID 42 is scheduled to be cancelled.'
+    assert snapshots.call_count == 2
+    assert set_cancelled.call_args_list == [mock.call(42)]
+    refresh.assert_called_once_with([42])
+    assert not (tmp_path / '42').exists()
+
+
+def test_cancel_refreshed_pending_job_still_signals_after_claim_race(tmp_path):
+    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                         'default')
+    pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
+                                         'default')
+    with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
+         mock.patch('sky.jobs.state.get_job_cancellation_states',
+                    side_effect=[{42: running}, {42: pending}]) as snapshots, \
+         mock.patch('sky.jobs.state.set_pending_cancelled',
+                    return_value=False) as set_cancelled, \
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh:
+        result = utils.cancel_jobs_by_id(job_ids=[42],
+                                         current_workspace='default')
+
+    assert result == 'Job with ID 42 is scheduled to be cancelled.'
+    assert snapshots.call_count == 2
+    assert set_cancelled.call_args_list == [mock.call(42)]
+    refresh.assert_called_once_with([42])
+    assert (tmp_path / '42').exists()
+
+
 def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
     job_ids = list(range(1, 21))
     running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,

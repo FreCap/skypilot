@@ -1135,6 +1135,14 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
         if snapshot.workspace != current_workspace:
             wrong_workspace_job_ids.append(job_id)
             continue
+        if snapshot.status == managed_job_state.ManagedJobStatus.PENDING:
+            # A refresh can move a stale live snapshot back into the
+            # pre-launch backlog. Reuse the same atomic finalizer here before
+            # falling back to controller-signal delivery.
+            cancelled = managed_job_state.set_pending_cancelled(job_id)
+            if cancelled:
+                cancelled_job_ids.append(job_id)
+                continue
 
         try:
             signal_file = pathlib.Path(
