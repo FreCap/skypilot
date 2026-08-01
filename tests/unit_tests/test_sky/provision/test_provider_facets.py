@@ -1,10 +1,17 @@
 """Characterization tests for typed provisioner facets."""
 
+# This suite intentionally characterizes private resolution contracts.
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import inspect
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -108,6 +115,35 @@ class _RecordingInstanceLifecycle:
                             provider_config)
 
 
+def _make_query_implementation(
+    result: object,
+    calls: list[tuple[Any, ...]],
+):
+
+    def query_instances(
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ) -> object:
+        calls.append((cluster_name, cluster_name_on_cloud, provider_config,
+                      non_terminated_only, retry_if_missing))
+        return result
+
+    return query_instances
+
+
+def _make_valid_query_diagnostic(
+    authoritative_implementation: Any,
+    diagnostic_implementation: Any,
+) -> provider_facets.BuiltinQueryInstancesDiagnosticV1:
+    return provider_facets.BuiltinQueryInstancesDiagnosticV1(
+        authoritative_implementation=authoritative_implementation,
+        diagnostic_implementation=diagnostic_implementation,
+    )
+
+
 @pytest.mark.parametrize(('provider_name', 'module_name'),
                          _BUILTIN_PROVISIONERS)
 def test_builtin_provisioner_has_complete_instance_lifecycle(
@@ -121,6 +157,7 @@ def test_builtin_provisioner_has_complete_instance_lifecycle(
                       provider_facets.LegacyInstanceLifecycleAdapter)
     assert bundle.instance_lifecycle.module is module
     assert bundle.legacy_module is module
+    assert bundle.builtin_query_instances_diagnostic is None
     assert isinstance(bundle.instance_lifecycle,
                       provider_facets.InstanceLifecycleV1)
     for method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS:
@@ -178,6 +215,85 @@ def test_provisioner_bundle_is_immutable():
         bundle.canonical_name = 'changed'  # type: ignore[misc]
 
 
+def test_resolved_operation_owner_enum_is_exact():
+    assert tuple(
+        member.name for member in provision._ProvisionerOperationOwnerV1) == (
+            'STRICT',
+            'LEGACY',
+            'BUILTIN',
+        )
+
+
+def test_direct_all_source_resolution_preserves_precedence_owner_and_identity():
+    strict_query = mock.Mock(name='strict-query')
+    legacy_query = mock.Mock(name='legacy-query')
+    builtin_query = mock.Mock(name='builtin-query')
+    strict_bundle = provider_facets.ProvisionerBundleV1(
+        canonical_name='all-source-test',
+        instance_lifecycle=SimpleNamespace(query_instances=strict_query),
+    )
+    legacy_registration = provision.Provisioner(module=SimpleNamespace(
+        query_instances=legacy_query))
+    builtin_module = SimpleNamespace(query_instances=builtin_query)
+    builtin_bundle = provider_facets.ProvisionerBundleV1(
+        canonical_name='all-source-test',
+        instance_lifecycle=provider_facets.LegacyInstanceLifecycleAdapter(
+            builtin_module),
+        legacy_module=builtin_module,
+    )
+    all_sources = provision._ProvisionerResolution(
+        canonical_name='all-source-test',
+        strict_bundle=strict_bundle,
+        legacy_registration=legacy_registration,
+        builtin_bundle=builtin_bundle,
+    )
+
+    strict_operation = all_sources.resolve_operation('query_instances')
+    legacy_operation = dataclasses.replace(
+        all_sources, strict_bundle=None).resolve_operation('query_instances')
+    builtin_operation = dataclasses.replace(
+        all_sources,
+        strict_bundle=None,
+        legacy_registration=None,
+    ).resolve_operation('query_instances')
+
+    assert strict_operation is not None
+    assert strict_operation.owner is provision._ProvisionerOperationOwnerV1.STRICT
+    assert strict_operation.authoritative_implementation is strict_query
+    assert strict_operation.diagnostic_implementation is None
+    assert strict_operation.implementation is strict_query
+    assert legacy_operation is not None
+    assert legacy_operation.owner is provision._ProvisionerOperationOwnerV1.LEGACY
+    assert legacy_operation.authoritative_implementation is legacy_query
+    assert legacy_operation.diagnostic_implementation is None
+    assert legacy_operation.implementation is legacy_query
+    assert builtin_operation is not None
+    assert builtin_operation.owner is provision._ProvisionerOperationOwnerV1.BUILTIN
+    assert builtin_operation.authoritative_implementation is builtin_query
+    assert builtin_operation.diagnostic_implementation is None
+    assert builtin_operation.implementation is builtin_query
+
+
+def test_old_bundle_construction_defaults_private_diagnostic_to_none():
+    lifecycle = _RecordingInstanceLifecycle(object())
+    template_override = mock.Mock()
+    legacy_module = SimpleNamespace()
+
+    positional = provider_facets.ProvisionerBundleV1('positional-bundle-test',
+                                                     lifecycle,
+                                                     template_override,
+                                                     legacy_module)
+    keyword = provider_facets.ProvisionerBundleV1(
+        canonical_name='keyword-bundle-test',
+        instance_lifecycle=lifecycle,
+        template_override=template_override,
+        legacy_module=legacy_module,
+    )
+
+    assert positional.builtin_query_instances_diagnostic is None
+    assert keyword.builtin_query_instances_diagnostic is None
+
+
 def test_strict_registration_rejects_incomplete_instance_lifecycle():
     incomplete_lifecycle = SimpleNamespace(query_instances=mock.Mock())
     bundle = provider_facets.ProvisionerBundleV1(
@@ -187,6 +303,36 @@ def test_strict_registration_rejects_incomplete_instance_lifecycle():
 
     with pytest.raises(ValueError, match='InstanceLifecycleV1'):
         provision.register_provisioner_bundle(bundle)
+
+
+def test_strict_diagnostic_registration_rejects_before_validation_or_mutation():
+    existing_strict = provider_facets.ProvisionerBundleV1(
+        canonical_name='protected-test',
+        instance_lifecycle=_RecordingInstanceLifecycle('strict'),
+    )
+    existing_legacy = provision.Provisioner(module=SimpleNamespace())
+    strict_registrations = provision._registered_provisioner_bundles
+    legacy_registrations = provision._registered_provisioners
+    strict_registrations['protected-test'] = existing_strict
+    legacy_registrations['protected-test'] = existing_legacy
+    authoritative = _make_query_implementation(object(), [])
+    diagnostic = _make_query_implementation(object(), [])
+    invalid_bundle = provider_facets.ProvisionerBundleV1(
+        canonical_name='protected-test',
+        instance_lifecycle=SimpleNamespace(),
+        builtin_query_instances_diagnostic=_make_valid_query_diagnostic(
+            authoritative, diagnostic),
+    )
+
+    with pytest.raises(ValueError, match='diagnostic'):
+        provision.register_provisioner_bundle(invalid_bundle)
+
+    assert provision._registered_provisioner_bundles is strict_registrations
+    assert tuple(strict_registrations) == ('protected-test',)
+    assert strict_registrations['protected-test'] is existing_strict
+    assert provision._registered_provisioners is legacy_registrations
+    assert tuple(legacy_registrations) == ('protected-test',)
+    assert legacy_registrations['protected-test'] is existing_legacy
 
 
 def test_strict_registration_rejects_incompatible_signatures():
@@ -354,6 +500,103 @@ def test_builtin_module_replacement_remains_a_facade_seam(monkeypatch):
     query_instances.assert_called_once_with('display', 'cloud')
 
 
+def test_resolved_operation_is_pinned_and_next_facade_call_observes_patch(
+        monkeypatch):
+    first_result = object()
+    next_result = object()
+    first_query = mock.Mock(return_value=first_result)
+    next_query = mock.Mock(return_value=next_result)
+    monkeypatch.setattr(provision.aws, 'query_instances', first_query)
+
+    operation = provision._resolve_provisioner('aws').resolve_operation(
+        'query_instances')
+    assert operation is not None
+    assert operation.owner is provision._ProvisionerOperationOwnerV1.BUILTIN
+    assert operation.authoritative_implementation is first_query
+
+    monkeypatch.setattr(provision.aws, 'query_instances', next_query)
+
+    assert operation.implementation('first-display',
+                                    'first-cloud') is first_result
+    assert provision.query_instances('aws', 'next-display',
+                                     'next-cloud') is next_result
+    first_query.assert_called_once_with('first-display', 'first-cloud')
+    next_query.assert_called_once_with('next-display', 'next-cloud')
+
+
+def test_builtin_descriptor_is_read_once_and_first_callable_is_invoked(
+        monkeypatch):
+    first_result = object()
+    first_query = mock.Mock(return_value=first_result)
+    second_query = mock.Mock(return_value=object())
+
+    class _RotatingQueryDescriptor:
+        """Return a different query callable for each descriptor read."""
+
+        def __init__(self) -> None:
+            self.lookups = 0
+
+        def __get__(self, instance: Any, owner: type[Any]) -> Any:
+            del instance, owner
+            self.lookups += 1
+            if self.lookups == 1:
+                return first_query
+            return second_query
+
+    descriptor = _RotatingQueryDescriptor()
+
+    class _RotatingModule:
+        pass
+
+    setattr(_RotatingModule, 'query_instances', descriptor)
+    monkeypatch.setattr(provision, 'aws', _RotatingModule())
+
+    assert provision.query_instances('aws', 'display', 'cloud') is first_result
+    assert descriptor.lookups == 1
+    first_query.assert_called_once_with('display', 'cloud')
+    second_query.assert_not_called()
+
+
+def test_diagnostic_admission_reuses_the_single_raw_descriptor_read(
+        monkeypatch):
+    authoritative_calls: list[tuple[Any, ...]] = []
+    diagnostic_result = object()
+    diagnostic_calls: list[tuple[Any, ...]] = []
+    first_query = _make_query_implementation(object(), authoritative_calls)
+    second_query = mock.Mock(return_value=object())
+    diagnostic = _make_query_implementation(diagnostic_result, diagnostic_calls)
+
+    class _RotatingQueryDescriptor:
+        """Return a different query callable for each descriptor read."""
+
+        def __init__(self) -> None:
+            self.lookups = 0
+
+        def __get__(self, instance: Any, owner: type[Any]) -> Any:
+            del instance, owner
+            self.lookups += 1
+            if self.lookups == 1:
+                return first_query
+            return second_query
+
+    descriptor = _RotatingQueryDescriptor()
+
+    class _DiagnosticModule:
+        pass
+
+    setattr(_DiagnosticModule, 'query_instances', descriptor)
+    setattr(_DiagnosticModule, '_QUERY_INSTANCES_DIAGNOSTIC_V1',
+            _make_valid_query_diagnostic(first_query, diagnostic))
+    monkeypatch.setattr(provision, 'aws', _DiagnosticModule())
+
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is diagnostic_result
+    assert descriptor.lookups == 1
+    assert not authoritative_calls
+    second_query.assert_not_called()
+    assert diagnostic_calls == [('display', 'cloud', None, True, False)]
+
+
 @pytest.mark.parametrize(
     'replacement',
     (
@@ -364,8 +607,820 @@ def test_builtin_module_replacement_remains_a_facade_seam(monkeypatch):
 def test_builtin_missing_method_uses_facade_default(monkeypatch, replacement):
     monkeypatch.setattr(provision, 'aws', replacement)
 
+    resolution = provision._resolve_provisioner('aws')
+    assert resolution.resolve_operation('query_instances') is None
+
     with pytest.raises(NotImplementedError):
         provision.query_instances('aws', 'display', 'cloud')
+
+
+def test_exact_valid_builtin_diagnostic_is_selected_exactly_once(monkeypatch):
+    authoritative_result = object()
+    diagnostic_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    diagnostic_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    diagnostic = _make_query_implementation(diagnostic_result, diagnostic_calls)
+    module = SimpleNamespace(
+        query_instances=authoritative,
+        _QUERY_INSTANCES_DIAGNOSTIC_V1=_make_valid_query_diagnostic(
+            authoritative, diagnostic),
+    )
+    monkeypatch.setattr(provision, 'aws', module)
+
+    operation = provision._resolve_provisioner('aws').resolve_operation(
+        'query_instances')
+
+    assert operation is not None
+    assert operation.owner is provision._ProvisionerOperationOwnerV1.BUILTIN
+    assert operation.authoritative_implementation is authoritative
+    assert operation.diagnostic_implementation is diagnostic
+    assert operation.implementation is diagnostic
+    provider_config = {'region': 'test-region'}
+    assert provision.query_instances(
+        'aws',
+        'display-name',
+        'cloud-name',
+        provider_config,
+        False,
+        True,
+    ) is diagnostic_result
+    assert diagnostic_calls == [
+        ('display-name', 'cloud-name', provider_config, False, True),
+    ]
+    assert not authoritative_calls
+
+
+def test_diagnostic_exception_propagates_without_authoritative_retry(
+        monkeypatch):
+    authoritative_calls: list[tuple[Any, ...]] = []
+    diagnostic_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(object(), authoritative_calls)
+    error = RuntimeError('diagnostic failure')
+
+    def diagnostic(
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ) -> object:
+        diagnostic_calls.append(
+            (cluster_name, cluster_name_on_cloud, provider_config,
+             non_terminated_only, retry_if_missing))
+        raise error
+
+    monkeypatch.setattr(
+        provision, 'aws',
+        SimpleNamespace(
+            query_instances=authoritative,
+            _QUERY_INSTANCES_DIAGNOSTIC_V1=_make_valid_query_diagnostic(
+                authoritative, diagnostic),
+        ))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        provision.query_instances('aws', 'display', 'cloud')
+
+    assert exc_info.value is error
+    assert diagnostic_calls == [('display', 'cloud', None, True, False)]
+    assert not authoritative_calls
+
+
+def test_replacing_raw_authoritative_query_invalidates_stale_diagnostic(
+        monkeypatch):
+    stale_calls: list[tuple[Any, ...]] = []
+    replacement_calls: list[tuple[Any, ...]] = []
+    diagnostic_calls: list[tuple[Any, ...]] = []
+    stale_authoritative = _make_query_implementation(object(), stale_calls)
+    replacement_result = object()
+    replacement = _make_query_implementation(replacement_result,
+                                             replacement_calls)
+    diagnostic = _make_query_implementation(object(), diagnostic_calls)
+    module = SimpleNamespace(
+        query_instances=replacement,
+        _QUERY_INSTANCES_DIAGNOSTIC_V1=_make_valid_query_diagnostic(
+            stale_authoritative, diagnostic),
+    )
+    monkeypatch.setattr(provision, 'aws', module)
+
+    operation = provision._resolve_provisioner('aws').resolve_operation(
+        'query_instances')
+
+    assert operation is not None
+    assert operation.authoritative_implementation is replacement
+    assert operation.diagnostic_implementation is None
+    assert operation.implementation is replacement
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is replacement_result
+    assert replacement_calls == [('display', 'cloud', None, True, False)]
+    assert not stale_calls
+    assert not diagnostic_calls
+
+
+@pytest.mark.parametrize('legacy_owns_query', (False, True))
+def test_any_legacy_registration_suppresses_builtin_diagnostic(
+        monkeypatch, legacy_owns_query: bool):
+    authoritative_result = object()
+    diagnostic_result = object()
+    plugin_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    diagnostic_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    diagnostic = _make_query_implementation(diagnostic_result, diagnostic_calls)
+    monkeypatch.setattr(
+        provision, 'aws',
+        SimpleNamespace(
+            query_instances=authoritative,
+            _QUERY_INSTANCES_DIAGNOSTIC_V1=_make_valid_query_diagnostic(
+                authoritative, diagnostic),
+        ))
+    plugin_query = mock.Mock(return_value=plugin_result)
+    if legacy_owns_query:
+        legacy_module = SimpleNamespace(query_instances=plugin_query)
+    else:
+        legacy_module = SimpleNamespace(stop_instances=mock.Mock())
+    provision.register_provisioner('aws', legacy_module)
+
+    operation = provision._resolve_provisioner('aws').resolve_operation(
+        'query_instances')
+
+    assert operation is not None
+    assert operation.diagnostic_implementation is None
+    if legacy_owns_query:
+        assert operation.owner is provision._ProvisionerOperationOwnerV1.LEGACY
+        assert operation.authoritative_implementation is plugin_query
+        assert provision.query_instances('aws', 'display',
+                                         'cloud') is plugin_result
+        plugin_query.assert_called_once_with('display', 'cloud')
+        assert not authoritative_calls
+    else:
+        assert operation.owner is provision._ProvisionerOperationOwnerV1.BUILTIN
+        assert operation.authoritative_implementation is authoritative
+        assert provision.query_instances('aws', 'display',
+                                         'cloud') is authoritative_result
+        assert authoritative_calls == [('display', 'cloud', None, True, False)]
+        plugin_query.assert_not_called()
+    assert not diagnostic_calls
+
+
+def test_query_diagnostic_never_attaches_to_stop_and_void_result_is_preserved(
+        monkeypatch):
+    query_calls: list[tuple[Any, ...]] = []
+    diagnostic_calls: list[tuple[Any, ...]] = []
+    query = _make_query_implementation(object(), query_calls)
+    diagnostic = _make_query_implementation(object(), diagnostic_calls)
+    stop_sentinel = object()
+    stop = mock.Mock(return_value=stop_sentinel)
+    monkeypatch.setattr(
+        provision, 'aws',
+        SimpleNamespace(
+            query_instances=query,
+            stop_instances=stop,
+            _QUERY_INSTANCES_DIAGNOSTIC_V1=_make_valid_query_diagnostic(
+                query, diagnostic),
+        ))
+
+    operation = provision._resolve_provisioner('aws').resolve_operation(
+        'stop_instances')
+
+    assert operation is not None
+    assert operation.owner is provision._ProvisionerOperationOwnerV1.BUILTIN
+    assert operation.diagnostic_implementation is None
+    assert operation.implementation is operation.authoritative_implementation
+    assert operation.authoritative_implementation is not stop
+    assert provision.stop_instances('aws', 'cloud-name', {'region': 'test'},
+                                    True) is None
+    stop.assert_called_once_with('cloud-name', {'region': 'test'}, True)
+    assert not query_calls
+    assert not diagnostic_calls
+
+
+@pytest.mark.parametrize(
+    'invalid_kind',
+    (
+        'missing',
+        'subclass',
+        'descriptor',
+        'noncallable-authoritative',
+        'noncallable-diagnostic',
+        'coroutine',
+        'async-callable',
+        'variadic',
+        'wrong-default',
+        'false-as-zero',
+        'true-as-one',
+        'none-equal',
+        'wrong-parameter',
+        'uninspectable',
+    ),
+)
+def test_invalid_builtin_diagnostic_is_absent_and_authoritative_query_runs(
+        monkeypatch, invalid_kind: str):
+    authoritative_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    diagnostic_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    valid_diagnostic = _make_query_implementation(object(), diagnostic_calls)
+    metadata: Any | None = None
+    descriptor = None
+
+    if invalid_kind == 'subclass':
+
+        class _DiagnosticSubclass(
+                provider_facets.BuiltinQueryInstancesDiagnosticV1):
+            pass
+
+        metadata = _DiagnosticSubclass(authoritative, valid_diagnostic)
+    elif invalid_kind == 'descriptor':
+        valid_metadata = _make_valid_query_diagnostic(authoritative,
+                                                      valid_diagnostic)
+
+        class _DiagnosticDescriptor:
+
+            def __init__(self) -> None:
+                self.lookups = 0
+
+            def __get__(self, instance: Any, owner: type[Any]) -> Any:
+                del instance, owner
+                self.lookups += 1
+                return valid_metadata
+
+        descriptor = _DiagnosticDescriptor()
+    elif invalid_kind == 'noncallable-authoritative':
+        metadata = _make_valid_query_diagnostic(object(), valid_diagnostic)
+    elif invalid_kind == 'noncallable-diagnostic':
+        metadata = _make_valid_query_diagnostic(authoritative, object())
+    elif invalid_kind == 'coroutine':
+
+        async def invalid_diagnostic(
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                invalid_diagnostic)
+    elif invalid_kind == 'async-callable':
+
+        class _AsyncCallableDiagnostic:
+            """Callable object that violates the synchronous query contract."""
+
+            async def __call__(
+                self,
+                cluster_name: str,
+                cluster_name_on_cloud: str,
+                provider_config: dict[str, Any] | None = None,
+                non_terminated_only: bool = True,
+                retry_if_missing: bool = False,
+            ) -> object:
+                del (cluster_name, cluster_name_on_cloud, provider_config,
+                     non_terminated_only, retry_if_missing)
+                return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                _AsyncCallableDiagnostic())
+    elif invalid_kind == 'variadic':
+
+        def invalid_diagnostic(*args: Any, **kwargs: Any) -> object:
+            del args, kwargs
+            return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                invalid_diagnostic)
+    elif invalid_kind == 'wrong-default':
+
+        def invalid_diagnostic(
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = True,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                invalid_diagnostic)
+    elif invalid_kind == 'false-as-zero':
+
+        def invalid_diagnostic(
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = 0,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                invalid_diagnostic)
+    elif invalid_kind == 'true-as-one':
+
+        def invalid_diagnostic(
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = 1,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                invalid_diagnostic)
+    elif invalid_kind == 'none-equal':
+
+        class _NoneEqualDefault:
+            """Wrong-type default that compares equal to None."""
+
+            def __eq__(self, other: object) -> bool:
+                return other is None
+
+        none_equal_default = _NoneEqualDefault()
+
+        def invalid_diagnostic(
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = none_equal_default,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                invalid_diagnostic)
+    elif invalid_kind == 'wrong-parameter':
+
+        def invalid_diagnostic(
+            display_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (display_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                invalid_diagnostic)
+    elif invalid_kind == 'uninspectable':
+
+        class _UninspectableDiagnostic:
+            """Callable whose runtime signature cannot be inspected."""
+
+            @property
+            def __signature__(self) -> inspect.Signature:
+                raise ValueError('signature unavailable')
+
+            def __call__(
+                self,
+                cluster_name: str,
+                cluster_name_on_cloud: str,
+                provider_config: dict[str, Any] | None = None,
+                non_terminated_only: bool = True,
+                retry_if_missing: bool = False,
+            ) -> object:
+                del (cluster_name, cluster_name_on_cloud, provider_config,
+                     non_terminated_only, retry_if_missing)
+                return object()
+
+        metadata = _make_valid_query_diagnostic(authoritative,
+                                                _UninspectableDiagnostic())
+    else:
+        assert invalid_kind == 'missing'
+
+    if descriptor is not None:
+
+        class _DescriptorModule:
+            pass
+
+        setattr(_DescriptorModule, '_QUERY_INSTANCES_DIAGNOSTIC_V1', descriptor)
+        module = _DescriptorModule()
+        module.query_instances = authoritative
+    else:
+        module = SimpleNamespace(query_instances=authoritative)
+        if metadata is not None:
+            module._QUERY_INSTANCES_DIAGNOSTIC_V1 = metadata
+    monkeypatch.setattr(provision, 'aws', module)
+
+    bundle = provision._get_builtin_provisioner_bundle('aws')
+    assert bundle is not None
+    assert bundle.builtin_query_instances_diagnostic is None
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is authoritative_result
+    assert authoritative_calls == [('display', 'cloud', None, True, False)]
+    assert not diagnostic_calls
+    if descriptor is not None:
+        assert descriptor.lookups == 0
+
+
+@pytest.mark.parametrize(
+    'field_name', ('authoritative_implementation', 'diagnostic_implementation'))
+@pytest.mark.parametrize(
+    'callable_shape',
+    ('bound-method', 'callable-class', 'callable-instance', 'partial',
+     'cache-wrapper', 'decorated-function', 'custom-call-descriptor',
+     'singledispatchmethod-descriptor'))
+def test_every_diagnostic_field_rejects_non_function_shapes(
+        monkeypatch, field_name: str, callable_shape: str):
+    authoritative_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    valid_diagnostic = _make_query_implementation(object(), [])
+
+    class _BoundOwner:
+        """Own a signature-compatible bound method."""
+
+        def implementation(
+            self,
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+    class _CallableClass:
+        """Expose a signature-compatible callable class."""
+
+        def __new__(
+            cls,
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cls, cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+    class _CallableInstance:
+        """Expose a signature-compatible callable instance."""
+
+        def __call__(
+            self,
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+    class _CallDescriptor:
+        """Resolve an instance call to a query function."""
+
+        def __get__(self, instance: Any, owner: type[Any]) -> Any:
+            del instance, owner
+            return valid_diagnostic
+
+    class _DescriptorCallable:
+        """Expose query calling through a custom descriptor."""
+        __call__ = _CallDescriptor()
+        __signature__ = inspect.signature(valid_diagnostic)
+
+    class _DispatchCallable:
+        """Expose query calling through singledispatchmethod."""
+
+        @functools.singledispatchmethod
+        @staticmethod
+        def __call__(
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+    @functools.wraps(valid_diagnostic)
+    def decorated_function(*args: Any, **kwargs: Any) -> object:
+        return valid_diagnostic(*args, **kwargs)
+
+    invalid_implementations = {
+        'bound-method': _BoundOwner().implementation,
+        'callable-class': _CallableClass,
+        'callable-instance': _CallableInstance(),
+        'partial': functools.partial(valid_diagnostic),
+        'cache-wrapper': functools.lru_cache()(valid_diagnostic),
+        'decorated-function': decorated_function,
+        'custom-call-descriptor': _DescriptorCallable(),
+        'singledispatchmethod-descriptor': _DispatchCallable(),
+    }
+    implementations = {
+        'authoritative_implementation': authoritative,
+        'diagnostic_implementation': valid_diagnostic,
+    }
+    implementations[field_name] = invalid_implementations[callable_shape]
+    metadata = provider_facets.BuiltinQueryInstancesDiagnosticV1(
+        **implementations)
+    monkeypatch.setattr(
+        provision, 'aws',
+        SimpleNamespace(
+            query_instances=authoritative,
+            _QUERY_INSTANCES_DIAGNOSTIC_V1=metadata,
+        ))
+
+    bundle = provision._get_builtin_provisioner_bundle('aws')
+    assert bundle is not None
+    assert bundle.builtin_query_instances_diagnostic is None
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is authoritative_result
+    assert authoritative_calls == [('display', 'cloud', None, True, False)]
+
+
+@pytest.mark.parametrize(
+    'field_name', ('authoritative_implementation', 'diagnostic_implementation'))
+@pytest.mark.parametrize('override_kind',
+                         ('signature', 'text-signature', 'partialmethod'))
+def test_code_derived_validation_ignores_signature_overrides(
+        monkeypatch, field_name: str, override_kind: str):
+    authoritative_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    valid_diagnostic = _make_query_implementation(object(), [])
+
+    def wrong_implementation(only_argument: str) -> object:
+        del only_argument
+        return object()
+
+    if override_kind == 'signature':
+        wrong_implementation.__signature__ = inspect.signature(  # type: ignore[attr-defined]
+            valid_diagnostic)
+    elif override_kind == 'text-signature':
+        wrong_implementation.__text_signature__ = (  # type: ignore[attr-defined]
+            '(cluster_name, cluster_name_on_cloud, provider_config=None, '
+            'non_terminated_only=True, retry_if_missing=False)')
+    else:
+        assert override_kind == 'partialmethod'
+        wrong_implementation._partialmethod = functools.partialmethod(  # type: ignore[attr-defined]
+            valid_diagnostic)
+    assert tuple(inspect.signature(wrong_implementation).parameters) == (
+        'cluster_name',
+        'cluster_name_on_cloud',
+        'provider_config',
+        'non_terminated_only',
+        'retry_if_missing',
+    )
+
+    implementations = {
+        'authoritative_implementation': authoritative,
+        'diagnostic_implementation': valid_diagnostic,
+    }
+    implementations[field_name] = wrong_implementation
+    metadata = provider_facets.BuiltinQueryInstancesDiagnosticV1(
+        **implementations)
+    monkeypatch.setattr(
+        provision, 'aws',
+        SimpleNamespace(
+            query_instances=authoritative,
+            _QUERY_INSTANCES_DIAGNOSTIC_V1=metadata,
+        ))
+
+    bundle = provision._get_builtin_provisioner_bundle('aws')
+    assert bundle is not None
+    assert bundle.builtin_query_instances_diagnostic is None
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is authoritative_result
+    assert authoritative_calls == [('display', 'cloud', None, True, False)]
+
+
+@pytest.mark.parametrize(
+    'field_name', ('authoritative_implementation', 'diagnostic_implementation'))
+@pytest.mark.parametrize(
+    'async_shape', ('coroutine-function', 'callable-object', 'async-generator',
+                    'classmethod-callable', 'staticmethod-callable',
+                    'partial-callable', 'lru-cache-wrapper', 'nested-wraps'))
+def test_every_diagnostic_field_rejects_asynchronous_callables(
+        monkeypatch, field_name: str, async_shape: str):
+    authoritative_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    valid_diagnostic = _make_query_implementation(object(), [])
+
+    async def coroutine_function(
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ) -> object:
+        del (cluster_name, cluster_name_on_cloud, provider_config,
+             non_terminated_only, retry_if_missing)
+        return object()
+
+    async def async_generator(
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ):
+        del (cluster_name, cluster_name_on_cloud, provider_config,
+             non_terminated_only, retry_if_missing)
+        yield object()
+
+    class _AsyncCallable:
+        """Callable object that violates the synchronous query contract."""
+
+        async def __call__(
+            self,
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+    class _AsyncClassMethodCallable:
+        """Callable object whose classmethod descriptor is asynchronous."""
+
+        @classmethod
+        async def __call__(
+            cls,
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cls, cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+    class _AsyncStaticMethodCallable:
+        """Callable object whose staticmethod descriptor is asynchronous."""
+
+        @staticmethod
+        async def __call__(
+            cluster_name: str,
+            cluster_name_on_cloud: str,
+            provider_config: dict[str, Any] | None = None,
+            non_terminated_only: bool = True,
+            retry_if_missing: bool = False,
+        ) -> object:
+            del (cluster_name, cluster_name_on_cloud, provider_config,
+                 non_terminated_only, retry_if_missing)
+            return object()
+
+    def synchronous_base(
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ) -> object:
+        del (cluster_name, cluster_name_on_cloud, provider_config,
+             non_terminated_only, retry_if_missing)
+        return object()
+
+    @functools.wraps(synchronous_base)
+    async def asynchronous_middle(
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ) -> object:
+        del (cluster_name, cluster_name_on_cloud, provider_config,
+             non_terminated_only, retry_if_missing)
+        return object()
+
+    @functools.wraps(asynchronous_middle)
+    def synchronous_outer(
+        cluster_name: str,
+        cluster_name_on_cloud: str,
+        provider_config: dict[str, Any] | None = None,
+        non_terminated_only: bool = True,
+        retry_if_missing: bool = False,
+    ) -> object:
+        return asynchronous_middle(cluster_name, cluster_name_on_cloud,
+                                   provider_config, non_terminated_only,
+                                   retry_if_missing)
+
+    invalid_implementation: Any
+    if async_shape == 'coroutine-function':
+        invalid_implementation = coroutine_function
+    elif async_shape == 'callable-object':
+        invalid_implementation = _AsyncCallable()
+    elif async_shape == 'async-generator':
+        invalid_implementation = async_generator
+    elif async_shape == 'classmethod-callable':
+        invalid_implementation = _AsyncClassMethodCallable()
+    elif async_shape == 'staticmethod-callable':
+        invalid_implementation = _AsyncStaticMethodCallable()
+    elif async_shape == 'partial-callable':
+        invalid_implementation = functools.partial(_AsyncCallable())
+    elif async_shape == 'lru-cache-wrapper':
+        invalid_implementation = functools.lru_cache()(coroutine_function)
+    else:
+        assert async_shape == 'nested-wraps'
+        invalid_implementation = synchronous_outer
+
+    implementations = {
+        'authoritative_implementation': authoritative,
+        'diagnostic_implementation': valid_diagnostic,
+    }
+    implementations[field_name] = invalid_implementation
+    metadata = provider_facets.BuiltinQueryInstancesDiagnosticV1(
+        **implementations)
+    monkeypatch.setattr(
+        provision, 'aws',
+        SimpleNamespace(
+            query_instances=authoritative,
+            _QUERY_INSTANCES_DIAGNOSTIC_V1=metadata,
+        ))
+
+    bundle = provision._get_builtin_provisioner_bundle('aws')
+    assert bundle is not None
+    assert bundle.builtin_query_instances_diagnostic is None
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is authoritative_result
+    assert authoritative_calls == [('display', 'cloud', None, True, False)]
+
+
+@pytest.mark.parametrize(
+    'field_name', ('authoritative_implementation', 'diagnostic_implementation'))
+def test_every_diagnostic_field_rejects_a_cyclic_wrapped_callable(
+        monkeypatch, field_name: str):
+    authoritative_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    valid_diagnostic = _make_query_implementation(object(), [])
+    cyclic = _make_query_implementation(object(), [])
+    cyclic.__wrapped__ = cyclic  # type: ignore[attr-defined]
+    implementations = {
+        'authoritative_implementation': authoritative,
+        'diagnostic_implementation': valid_diagnostic,
+    }
+    implementations[field_name] = cyclic
+    metadata = provider_facets.BuiltinQueryInstancesDiagnosticV1(
+        **implementations)
+    monkeypatch.setattr(
+        provision, 'aws',
+        SimpleNamespace(
+            query_instances=authoritative,
+            _QUERY_INSTANCES_DIAGNOSTIC_V1=metadata,
+        ))
+
+    bundle = provision._get_builtin_provisioner_bundle('aws')
+    assert bundle is not None
+    assert bundle.builtin_query_instances_diagnostic is None
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is authoritative_result
+    assert authoritative_calls == [('display', 'cloud', None, True, False)]
+
+
+def test_static_diagnostic_discovery_failure_is_non_authoritative(monkeypatch):
+    authoritative_result = object()
+    authoritative_calls: list[tuple[Any, ...]] = []
+    authoritative = _make_query_implementation(authoritative_result,
+                                               authoritative_calls)
+    monkeypatch.setattr(provision, 'aws',
+                        SimpleNamespace(query_instances=authoritative))
+    original_getattr_static = inspect.getattr_static
+
+    def fail_diagnostic_lookup(target: Any, attribute: str, *args: Any) -> Any:
+        if attribute == '_QUERY_INSTANCES_DIAGNOSTIC_V1':
+            raise RuntimeError('static discovery failed')
+        return original_getattr_static(target, attribute, *args)
+
+    monkeypatch.setattr(provision.inspect, 'getattr_static',
+                        fail_diagnostic_lookup)
+
+    assert provision.query_instances('aws', 'display',
+                                     'cloud') is authoritative_result
+    assert authoritative_calls == [('display', 'cloud', None, True, False)]
 
 
 def test_legacy_partial_plugin_still_falls_back_to_builtin(monkeypatch):
@@ -407,7 +1462,13 @@ def test_mixed_legacy_facet_diagnostic_is_emitted_once(monkeypatch):
     provision.get_cluster_info('aws', 'region', 'cloud')
     provision.get_cluster_info('aws', 'region', 'cloud')
 
+    operation = provision._resolve_provisioner('aws').resolve_operation(
+        'get_cluster_info')
+
     warning.assert_called_once()
+    assert operation is not None
+    assert operation.owner is provision._ProvisionerOperationOwnerV1.BUILTIN
+    assert operation.authoritative_implementation is builtin_cluster_info
 
 
 def test_strict_facet_never_falls_back_inside_declared_group(monkeypatch):
@@ -466,6 +1527,24 @@ def test_lambda_aliases_resolve_the_same_builtin_bundle():
     assert canonical.canonical_name == 'lambda'
     assert historical_alias.canonical_name == 'lambda'
     assert canonical.legacy_module is historical_alias.legacy_module
+
+
+def test_subprocess_can_import_and_reload_provision_module():
+    repository_root = Path(__file__).resolve().parents[4]
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            ('import importlib; import sky.provision as provision; '
+             'assert importlib.reload(provision) is provision'),
+        ],
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_public_facade_signature_and_metadata_are_preserved():
