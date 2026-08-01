@@ -12,11 +12,14 @@ candidate-only normalization boundary and atomic durable coverage handshake are
 in progress; the closed Kubernetes transport/scope leaf is implemented and
 independently verified; topology/image/config-policy/principal/authorization
 foundation leaves are implemented and locally verified; full execution-config
-composition remains pending; bounded resource values and prerequisite,
-object-plan, and renderer leaves are implemented and independently verified;
-runtime/job/endpoint leaves are implemented and independently verified;
-runtime provider propagation, observation, and shadow instrumentation remain
-pending
+composition remains pending; bounded resource values and the generic
+prerequisite/object-plan/renderer foundations are implemented and independently
+verified, while the exact role-scoped prerequisite inventory, named capsule
+composition, and request-body renderer/normalizer artifacts are design-frozen
+and code-pending; foundational runtime/job/endpoint leaves are implemented and
+independently verified, while action-bound submit comparison and exact endpoint
+projection remain code-pending; runtime provider propagation, observation, and
+shadow instrumentation remain pending
 
 Last updated: 2026-08-01
 
@@ -452,9 +455,12 @@ The action-internal effect table is a literal v1 protocol constant:
 | 4 | `skylet_job_submit` | null | `JOB_INTENT` | complete `submit_request` |
 
 The CoreV1 request-body and semantic hashes are checked against the full
-applicable `ProviderKubernetesObjectPlanV1` preimages in the immutable spec;
-the Skylet hash is checked against the full reconstructed
-`ProviderSkyletSubmitRequestV1`. Hash or authority metadata without those full
+applicable `ProviderKubernetesObjectPlanV1` preimages in the immutable spec.
+For Skylet, the one pure session-owned submit comparator specified below
+reconstructs the complete `ProviderSkyletSubmitRequestV1` from the enclosing
+launch action ID, invocation, and execution capsule and computes its canonical
+bytes and SHA-256. Every sequence-4 intent, commit, or no-effect proof must equal
+that one reconstruction and hash. Hash or authority metadata without those full
 preimages is insufficient. The cluster-row record retains its full intended
 handle as well as its hash.
 
@@ -623,23 +629,31 @@ the source launch, but partial-down admission still requires a fresh cleanup
 read yielding either the exact own-UUID handle or exact NotFound; the conflicting
 row itself cannot become the cleanup target.
 
-The Skylet rejection proof requires the exact current `JOB_INTENT`, submit
-request hash and launch-action submission key, plus the runtime evidence's
-exact state-store UUID. The job read and the `pending_start_outbox=false` and
-`active_run_token=false` facts come from one SQLite transaction, or from two
-reads pinned to the same unchanged record revision. For `schema_rejected`,
-`post_job.read_disposition="not_found"`; its durable state, job ID, run epoch,
-and record revision are null, while both job hashes equal the attempted
-request. For `same_key_different_spec`, the disposition is `conflict`, durable
-state is exactly `SUCCEEDED`, `FAILED`, or `BLOCKED`, job ID, run epoch, and
-record revision are nonnull, and at least one retained job hash differs from
-the attempted request. A runnable state, `uncertain` read, null required
-revision, changing revision, pending outbox, or active run token blocks
-handoff. Conversely, `C4` requires a `present` job with matching hashes and
-nonnull durable state, job ID, run epoch, and revision. Later job evidence may
-only follow the documented monotonic state/revision/run-epoch transitions with
-stable submission key, hashes, job ID, and state-store UUID; `job_at_commit`
-itself remains immutable.
+The Skylet rejection proof requires the exact current `JOB_INTENT`. The pure
+session-owned submit comparator must reproduce that cursor's complete request,
+launch-action submission key, capsule job-contract hash, job-spec bytes/hash,
+and `submit_request_sha256`; the proof hash and every expected-value copy in
+`post_job` equal that result. The proof also carries the runtime evidence's
+exact state-store UUID. The job read, retained-request reconstruction, and the
+`pending_start_outbox=false` and `active_run_token=false` facts come from one
+SQLite transaction, or from two reads pinned to the same unchanged record
+revision. For `schema_rejected`,
+`post_job.read_disposition="not_found"`; `retained_submit_request`, durable
+state, job ID, run epoch, and record revision are null, while both top-level job
+hashes equal the comparator's attempted request. For
+`same_key_different_spec`, the disposition is `conflict`, the reconstructed
+`retained_submit_request` is nonnull and canonical-byte-unequal to the expected
+request, durable state is exactly `SUCCEEDED`, `FAILED`, or `BLOCKED`, and job
+ID, run epoch, and record revision are nonnull. No retained-hash difference is
+required: equal hashes with unequal full bytes remain conflict. A runnable
+state, `uncertain` read, null required revision, changing revision, pending
+outbox, or active run token blocks handoff. Conversely, `C4` requires a
+`present` job whose nonnull reconstructed retained request is byte-equal to the
+same comparator result and whose durable state, job ID, run epoch, and revision
+are nonnull. Later job evidence may only follow the documented monotonic
+state/revision/run-epoch transitions with stable expected key/hashes, byte-equal
+retained request, job ID, and state-store UUID; `job_at_commit` itself remains
+immutable.
 
 `ProviderLaunchSupersessionQuiescenceV1` is constructed by the Serve reducer,
 never accepted from a caller. It names the exact action, attempt, request,
@@ -762,7 +776,7 @@ ProviderSkyletJobContractV1 = {
 ProviderSkyletJobSpecV1 = {
   version: 1,
   schema_id: "skypilot.serve.prebooted-canary-job.v1",
-  source: ProviderLaunchInvocationV1.source,
+  source: ProviderLaunchSourceV1,
   command_profile: "image_serve_canary_entrypoint_v1",
   entrypoint_artifact_role: "serve_canary_entrypoint",
   replica_id: DecimalIntegerText,
@@ -904,13 +918,41 @@ ProviderKubernetesServerAllocationV1 = {
 }
 ```
 
+The job-spec leaf requires its two decimal replica-ID copies to be byte-equal
+and recomputes its complete canonical bytes. The submit-request leaf owns only
+closed shape, the fixed protocol, scalar UUID/SHA validation, typed job-spec
+parsing, and
+`job_spec_sha256 == canonical_sha256(job_spec.canonical_value())`.
+`submission_key` and `job_contract_sha256` are deliberately context-free
+scalars at that leaf; it cannot know the enclosing action ID or the capsule's
+complete job contract. It also does not accept or compute a hash of itself.
+
+`KubernetesResourceActionSession.validate_skylet_submit_binding_v1()` is the
+single pure contextual comparator. It performs no Kubernetes, Skylet, database,
+or filesystem I/O. Given the complete immutable launch spec, it reconstructs
+the job spec through the fixed profile from the byte-equal invocation/capsule
+source and the one replica environment value; requires the candidate job spec
+to be byte-equal; requires `submission_key` to equal the enclosing launch action
+ID; and requires `job_contract_sha256` to equal the canonical SHA-256 of the
+complete capsule `post_provision.job_submission.contract`. It then returns the
+canonical complete submit-request bytes and SHA-256. The execution session,
+typed API006 cursor validator, committed-effect validator, and no-effect-proof
+validator all call this exact comparator rather than reimplementing a subset.
+For Skylet readback, the same comparator reconstructs a retained submit request
+from the transactional `SkyletJobRecordV1` key, contract hash, complete job
+spec, and spec hash. It compares canonical request bytes, not a claimed equality
+boolean or hash equality; a bounded byte-different retained spec remains a
+conflict even if adversarial hash scalars collide.
+
 `ProviderKubernetesObjectRoleMapV1` is a literal protocol constant, not
 configuration. Topology objects, execution-config object plans, partial/full
 targets, and observation objects all serialize in plan-sequence order from
-that table. Launch mutation effects use create sequence followed by the Skylet
-submit at effect sequence three; down effects use delete sequence. A role,
-kind, name, or sequence mismatch is invalid even when every object is otherwise
-canonical.
+that table. The legacy provider-wire trace uses create sequences 0-2 followed
+by Skylet submit at wire sequence 3. The authoritative action-internal journal
+instead inserts cluster-record commit at sequence 3 and numbers Skylet submit
+as sequence 4, exactly as its separate table specifies. Down effects use delete
+sequence. A role, kind, name, or sequence mismatch is invalid even when every
+object is otherwise canonical.
 
 The only v1 server allocations, in exact pointer order within each role, are:
 
@@ -964,11 +1006,12 @@ committed, or changed.
 
 `request_body` is the exact nonsecret CoreV1 body sent by the session and is
 bounded together with the complete action spec to 65,536 canonical UTF-8
-bytes. The candidate rejects any env value other than its fixed nonsecret
-replica ID, any Secret/config-map reference, projected token, credential,
-private key, raw user YAML, or unbounded field. Both body and requested semantic
-preimages are embedded next to their hashes; the implementation does not rely
-on a hash-only private interpretation.
+bytes. The fixed renderer may contain only its reviewed nonsecret runtime env
+entries plus one caller-derived replica-ID entry; arbitrary task/caller env is
+not accepted. Any Secret/config-map reference, projected token, credential,
+private key, raw user YAML, or unbounded field rejects. Both body and requested
+semantic preimages are embedded next to their hashes; the implementation does
+not rely on a hash-only private interpretation.
 
 An object-plan leaf independently enforces sequence/role/kind against
 `ProviderKubernetesObjectRoleMapV1`, `api_version="v1"`, Kubernetes DNS-label
@@ -993,10 +1036,33 @@ in role order, names equal to its workload-name basis/topology, every role's
 complete body label map equal to that topology entry, and every plan's
 `normalization_profile` byte-equal to
 `renderer.admitted_object_normalization`. The Pod body omits `spec.nodeName`;
-the two Service body shapes and headless request are checked by the pinned
-renderer/normalizer contract.
+the exact body contract is:
 
-`kubernetes_admitted_object_v1` is implemented by the checked-in, pinned
+| Role | Exact request-body bindings |
+|---|---|
+| `head_pod` | `/spec/nodeName` key absent; `/spec/containers` has exactly one entry and `/spec/containers/0/name="ray-node"`; its `image` equals the digest-qualified workload image and `imagePullPolicy="Always"`; its resource requests/limits contain exactly the frozen CPU and memory translations with no accelerator or ephemeral-storage entry; `/spec/serviceAccountName` equals the frozen workload ServiceAccount and `/spec/automountServiceAccountToken=false` |
+| `head_ssh_service` | `/spec/ports` is exactly the singleton `[{"protocol":"TCP","port":22,"targetPort":22}]`; requested `/spec/clusterIP` is absent so the API server allocates it |
+| `head_service` | `/spec/clusterIP="None"`; `/spec/ports` key is absent, not null or an empty list |
+
+The `ray-node` env list is inspected by name, never by a numeric index. It has
+exactly one `SKYPILOT_SERVE_REPLICA_ID` entry whose scalar `value` is the
+canonical `DecimalIntegerText` from the launch invocation and job spec;
+`valueFrom` is absent. Missing, duplicate, wrong-value, or `valueFrom` forms
+reject. Other entries are only the byte-exact fixed nonsecret renderer-owned
+runtime env preimage.
+
+The management-port position is intentionally fixed:
+`/spec/containers/0/ports/4/containerPort` is JSON integer `46590`. The
+application-port integer appears in no Pod `containerPort`, including that
+entry, and in neither Service. The normalizer explicitly rejects an application
+port equal to 22, 46590, or any member of the complete fixed renderer-owned
+container-port set. The SSH Service has no application or management port, and
+the head Service has no port list at all. In `podip` mode `open_ports()` and
+`cleanup_ports()` take
+their literal no-op branches and emit no Service, Ingress, LoadBalancer, patch,
+or other provider mutation.
+
+`kubernetes_admitted_object_v1` must be implemented by the checked-in, pinned
 `normalization_profile`. It removes only `status`, the enumerated server-owned
 metadata fields (`uid`, `resourceVersion`, `generation`, creation/deletion
 timestamps, and `managedFields`), and scheduler-assigned Pod `/spec/nodeName`.
@@ -1016,6 +1082,15 @@ label, annotation, owner reference, finalizer, or any unreviewed path/value is a
 conflict. Both a 201 response readback and a 409 readback must normalize to the
 stored requested semantic bytes, with only those typed allocations separated.
 Raw request/readback JSON equality is never used.
+
+This paragraph is normative, not evidence that those artifacts currently
+exist. The present branch has only structural artifact-reference and object-
+metadata leaves; it has no checked-in candidate renderer, binding schema, or
+admitted-object normalizer that executes this body contract. Until all three
+resolve by exact repository path/size/hash and realistic plus maximal goldens
+pass, launch normalization returns `unrepresented_execution_config`, remains
+shadow-only, and sends no action-owned provider bytes. The generic Jinja/config
+path is not a substitute and is ineligible for authority.
 
 For the initial authoritative `pod_cluster_v1` cohort, `cloud` is
 `kubernetes`, the `kubernetes` block is nonnull, and `workload_kind` is exactly
@@ -1071,11 +1146,15 @@ the full tuple is intentionally the same logical target for v1.
 Preparation may use one isolated nonmutating `KubernetesApiClientTarget` and
 then close it. Each execution or observation attempt opens exactly one fresh
 target, derives and compares its full scope under the request execution fence,
-and keeps that target alive for SelfSubjectReview/AccessReview, namespace and
-service-account reads, exact object reads, creates, and deletes in that attempt.
-It re-reads both namespaces and both service accounts with that same client
-after the final provider call before accepting evidence, then closes the
-target. Scope evidence always uses `ProviderKubernetesScopeReadV1`: a failed
+and keeps that target alive for SelfSubjectReview/AccessReview, all exact
+prerequisite reads, exact object reads, creates, and deletes in that attempt. It
+revalidates all 12 semantic prerequisite roles with that same client after the
+final provider call before accepting evidence. Launch additionally revalidates
+both exact LB Deployment projections; down has no endpoint projection and makes
+no LB Deployment read. Both may coalesce only the required release/LB Namespace
+alias read while reproducing all three role records, then close the target. Scope
+evidence always uses
+`ProviderKubernetesScopeReadV1`: a failed
 before/after read is encoded with a null scope and closed disposition, never a
 fabricated complete object. The action-aware path passes its raw `ApiClient`
 explicitly through the provisioner seam; it may not call cached
@@ -1101,9 +1180,14 @@ KubernetesResourceActionSession
 Every wrapper receives the object-identical raw `target.api_client`; contract
 tests reject a second or cached client. CoreV1 permits exact Namespace,
 ServiceAccount, Pod, and Service GET, namespaced Pod/Service create, and
-UID-preconditioned Pod/Service delete. AppsV1 permits exact current ReplicaSet
-and frozen Deployment GET only. NetworkingV1 permits exact named NetworkPolicy
-GET. AdmissionregistrationV1 permits exact named policy and binding GET.
+UID-preconditioned Pod/Service delete. AppsV1 permits the exact current
+authority-worker ReplicaSet/frozen Deployment GETs and the two exact frozen
+load-balancer Deployment GETs only. NetworkingV1 permits exact named
+NetworkPolicy GET. AdmissionregistrationV1 permits exact named policy and
+binding GET.
+The kind-matched session call inventory permits the two load-balancer Deployment
+GETs only for launch. A down session has no locator or method path for either GET;
+an attempted down call is rejected before invoking the shared raw client.
 Version permits only `GET /version`; AuthenticationV1 only creates
 SelfSubjectReview; AuthorizationV1 only creates one namespaced
 SelfSubjectRulesReview and the fixed SelfSubjectAccessReview matrix. The request handler
@@ -1343,6 +1427,7 @@ ProviderSkyletJobEvidenceV1 = {
   submission_key: UUID,  # enclosing launch action ID
   job_contract_sha256: Sha256,
   job_spec_sha256: Sha256,
+  retained_submit_request: null | ProviderSkyletSubmitRequestV1,
   state_store_uuid: UUID,
   read_disposition: "present" | "not_found" | "conflict" | "uncertain",
   durable_state: null | "COMMITTED_PENDING_START" | "START_INTENT" |
@@ -1486,6 +1571,24 @@ zone-free IPv4 or IPv6 text under the same checked-in
 Arbitrary text, alternate IP spelling, and a zone identifier are not
 representable.
 
+In `ProviderSkyletJobEvidenceV1`, the top-level submission key and two job
+hashes are always the immutable expected-query basis supplied by the session
+comparator. `retained_submit_request` is nonnull exactly for `present` and
+`conflict`, is reconstructed from one typed Skylet record, and has the same
+submission key. It is canonical-byte-equal to the expected request only for
+`present` and canonical-byte-unequal only for `conflict`; the contextual session
+comparator owns that comparison. For both `present` and `conflict`, durable
+state, job ID, run epoch, and record revision are nonnull values read from that
+same record. For `not_found` and `uncertain`, the retained request and every
+response-derived durable state, job ID, run epoch, and record revision are null.
+The state-store UUID and observed timestamp remain nonnull in every disposition
+because they describe the exact queried store/read. A leaf validates this
+disposition/nullability matrix and the retained request's internal hashes but
+cannot grant present/conflict authority without the expected full request and
+enclosing action. A no-effect proof separately narrows a conflicting record to
+the terminal durable states displayed in its matrix; the generic evidence leaf
+does not silently apply that proof-only restriction.
+
 Unknown keys are forbidden in every variant. Launch normally alternates
 `CREATE_INTENT(role) -> OBJECTS_PARTIAL` in canonical create order. The head-Pod
 edge may instead be `CREATE_INTENT(head_pod) -> OBJECTS_EXACT` when its first
@@ -1497,8 +1600,10 @@ JOB_INTENT -> JOB_COMMITTED -> JOB_RUNNING -> ENDPOINT_RESOLVED -> SUCCEEDED`.
 one to three committed slots; three is permitted while scheduler `nodeName` is
 still absent. `OBJECTS_EXACT` requires three UIDs, all required server
 allocations, and authoritative exact semantic readback. `HANDLE_INTENT` freezes
-the complete intended handle before cluster-row I/O. `JOB_COMMITTED` requires a
-present, fsync-committed same-key/byte-equal job and nonnull job ID;
+the complete intended handle before cluster-row I/O. `JOB_COMMITTED` requires
+the session-owned submit comparator to validate the reconstructed request and a
+present, fsync-committed job whose key, contract hash, and spec hash equal that
+result, with a nonnull job ID;
 `JOB_RUNNING` additionally requires its exact durable state to be `RUNNING`.
 Launch `SUCCEEDED` retains every proof and an authoritative `present`
 observation.
@@ -1524,12 +1629,13 @@ immutable allocation quartet. The Pod record may initially omit only the
 scheduler-owned `/spec/nodeName`; later progress may append exactly that
 allocation to the same-UID current object without changing `C2`; when the first
 readback already contains it, `object_at_commit` includes it and the cursor
-takes the direct `OBJECTS_EXACT` edge. `C3` retains
-the byte-equal complete intended handle and its hash, and its disposition is
-the exact insert/adopt transaction result. `C4.job_at_commit` is the exact
-fsync-committed same-key, same-spec job read described above. None of these
-records is reconstructed later from a resource name, authority identity, or
-digest alone.
+takes the direct `OBJECTS_EXACT` edge. `C3` retains the byte-equal complete
+intended handle and its hash, and its disposition is the exact insert/adopt
+transaction result. For `C4`, the session-owned comparator reconstructs the
+full submit request from the immutable spec; `submit_request_sha256` equals its
+result, and `job_at_commit` is the exact fsync-committed job read whose key and
+hashes equal that reconstruction. None of these records is reconstructed later
+from a resource name, authority identity, or digest alone.
 
 The evidence disposition is also provenance, not an advisory diagnostic.
 CoreV1 `created`, cluster-row `inserted`, and Skylet `submitted` require the
@@ -1546,11 +1652,17 @@ receives the exact immutable action ID, kind, plan, spec hash, and (for down)
 prior-launch basis. It requires `cursor.action_kind` to equal the action kind;
 every requested-target, cleanup-target, prior-basis, resource, cluster-record,
 service/replica-incarnation, and nested object hash/identity to equal the
-applicable frozen preimage; and every launch submission key to equal the launch
-action ID. All repeated resolved targets, handles, runtime records, and endpoint
-or observation targets are mutually byte-equal. Repeated job submission key,
-hashes, job ID, and state-store UUID are byte-equal; only the closed monotonic
-job state/revision/run-epoch transitions may differ from `job_at_commit`. For
+applicable frozen preimage. For every `JOB_INTENT` and every later job-bearing
+cursor/effect/proof, it calls
+`KubernetesResourceActionSession.validate_skylet_submit_binding_v1()` against
+that same immutable spec and rejects any unequal request, action key, contract
+hash, spec, spec hash, or submit-request hash. All repeated resolved targets,
+handles, runtime records, and endpoint or observation targets are mutually
+byte-equal. Repeated job evidence key, hashes, job ID, and state-store UUID are
+byte-equal; every `present` retained submit request is byte-equal to
+`job_at_commit`, while a typed conflict retains its byte-unequal full request.
+Only the closed monotonic job state/revision/run-epoch transitions may differ
+from `job_at_commit`. For
 down, `delete_target.observation`, each later `absence_observation`, and the final
 handle-removal proof describe that same three-role target without a present/
 absent contradiction. A structurally valid cursor for another action, plan, or
@@ -1940,8 +2052,10 @@ For a fresh authoritative launch attempt:
 5. verify the digest-pinned prebooted container's exact artifact measurements,
    startup probe, Ray/Skylet health, and state-store UUID, then commit
    `RUNTIME_READY`;
-6. construct the closed `ProviderSkyletSubmitRequestV1`, commit `JOB_INTENT`,
-   and send the one keyed Skylet RPC;
+6. use `KubernetesResourceActionSession.validate_skylet_submit_binding_v1()` to
+   reconstruct the closed `ProviderSkyletSubmitRequestV1` and its canonical
+   hash from the immutable spec, commit that byte-equal request at `JOB_INTENT`,
+   and send those exact bytes in the one keyed Skylet RPC;
 7. exact-read the fsync-committed same-key job/outbox row and commit
    `JOB_COMMITTED`, then wait for exact `RUNNING` evidence and commit
    `JOB_RUNNING`;
@@ -1983,12 +2097,20 @@ request lease expired.
 
 The job submission has the same lost-ack property. Skylet's internal
 `skylet_idempotent_submit_v1` API accepts the closed submit request, returns the
-existing job ID for the same key and byte-equal contract/spec, rejects any
-difference, and supports readback by key. Hash equality alone is insufficient.
+existing job ID only when the contract-hash scalar is equal and the reconstructed
+complete submit request is byte-equal, rejects any difference, and supports
+readback by key. The complete job-contract preimage remains in the execution
+capsule; the submit protocol deliberately carries only its hash. Therefore the
+session comparator proves that preimage, reconstructs the full request, and
+compares its canonical bytes; hash equality alone is insufficient.
 `JOB_INTENT` commits before the RPC. After a timeout or worker death, recovery
-queries by key before any send; same-spec presence adopts, absence permits the
-same keyed send, and conflict blocks. The public/generic `backend.execute()`
-path has no authority fallback.
+queries by key before any send. In one SQLite read transaction Skylet returns
+the complete stored key, contract hash, job spec, and spec hash needed to
+reconstruct `retained_submit_request`; the session comparator exact-compares it
+to the immutable expected request. Byte-equal presence adopts, exact absence
+permits the same keyed send, and any byte difference blocks—even if every hash
+scalar is equal. The public/generic `backend.execute()` path has no authority
+fallback.
 
 The exact local durable records are:
 
@@ -2019,6 +2141,12 @@ SkyletStartOutboxV1 = {
   state: "PENDING" | "DELIVERED"
 }
 ```
+
+Those four stored request fields are the complete bounded preimage of
+`ProviderSkyletSubmitRequestV1`; readback reconstructs that typed request
+rather than returning only hashes. The record does not need a second opaque
+request blob, and a caller cannot replace the reconstructed preimage with a
+boolean equality assertion.
 
 The exact `skylet-state` `emptyDir` uses SQLite WAL with synchronous FULL. The
 first submit transaction allocates one job ID and fsync-commits the byte-equal
@@ -2398,15 +2526,17 @@ ServeShadowAttemptInvocationV1 =
   ProviderLifecycleInvocationV1 |
   ServeLegacyLaunchCleanupDownInvocationV1
 
+ProviderLaunchSourceV1 = {
+  store: "serve_version_specs",
+  service_name: Text,
+  service_incarnation: UUID,
+  service_version: PositiveInteger,
+  yaml_content_sha256: Sha256,
+  workspace: Text
+}
+
 ProviderLaunchInvocationV1 = {
-  source: {
-    store: "serve_version_specs",
-    service_name: Text,
-    service_incarnation: UUID,
-    service_version: PositiveInteger,
-    yaml_content_sha256: Sha256,
-    workspace: Text
-  },
+  source: ProviderLaunchSourceV1,
   resources: ProviderPodResourceSnapshotV1,
   topology: ProviderPodTopologyV1,
   execution_config: ProviderKubernetesExecutionConfigV1,
@@ -2443,6 +2573,14 @@ DecimalPortText = canonical ASCII decimal text matching
   This type applies to workload application and Skylet management ports; the
   integer port inside `ProviderKubernetesServerOriginV1` is a separate
   transport-decomposition field and is not silently coerced through this type.
+
+DecimalIntegerText = canonical ASCII decimal text matching
+  `(?:0|[1-9][0-9]{0,18})` whose integer value is at most
+  9223372036854775807. Leading zeroes, signs, whitespace, decimal points,
+  exponents, unit suffixes, more than 19 digits, and larger 19-digit values are
+  invalid. This type is used for the retained replica-ID environment value and
+  legacy decimal job-ID text; callers do not silently coerce an integer into
+  it.
 
 CanonicalPositiveDecimalText = canonical ASCII text matching
   `(?:[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]{0,2}[1-9])`, whose exact decimal
@@ -2707,6 +2845,12 @@ booleans cannot both be true, an allowed result requires `observed_denied=false`
 and a not-allowed result permits either value of `observed_denied`. Exact check
 count, attributes, expectation, and order are supplied by and byte-compared to
 the content-addressed access-matrix artifact, not invented by the leaf parser.
+The enclosing action kind binds this reference to one unique approved inventory
+role: `launch_access_matrix` includes both exact LB Deployment GET decisions,
+while `down_access_matrix` omits those two decisions. Both include the exact
+12-role prerequisite, worker-chain, version, self-review, and action-applicable
+CoreV1 decisions. Crossed, missing, duplicate, or extra action-kind decisions
+reject; a down matrix cannot silently inherit the launch-only GETs.
 
 Live ServiceAccount normalization rejects a null/omitted
 `automountServiceAccountToken`; the first cohort requires an explicit `true`
@@ -2724,7 +2868,17 @@ the final group. The scope's existing rule that caller/workload
 `(namespace,name)` pairs are equal if and only if their UIDs are equal remains
 in force.
 
+ProviderKubernetesPrerequisiteRoleV1 =
+  "authority_release_namespace" | "target_namespace" |
+  "kube_system_namespace" | "serve_lb_slot_0_namespace" |
+  "serve_lb_slot_1_namespace" | "caller_service_account" |
+  "workload_service_account" | "serve_lb_slot_0_service_account" |
+  "serve_lb_slot_1_service_account" | "endpoint_network_policy" |
+  "validating_admission_policy" |
+  "validating_admission_policy_binding"
+
 ProviderKubernetesPrerequisiteV1 = {
+  role: ProviderKubernetesPrerequisiteRoleV1,
   api_version: Text,
   kind: "Namespace" | "ServiceAccount" | "NetworkPolicy" |
         "ValidatingAdmissionPolicy" | "ValidatingAdmissionPolicyBinding",
@@ -2762,6 +2916,28 @@ ProviderKubernetesPrerequisiteKindMapV1 = {
       {api_version: "admissionregistration.k8s.io/v1", scope: "cluster"}
 }
 
+ProviderKubernetesPrerequisiteRoleMapV1 = [
+  {sequence: 0, role: "authority_release_namespace", kind: "Namespace"},
+  {sequence: 1, role: "target_namespace", kind: "Namespace"},
+  {sequence: 2, role: "kube_system_namespace", kind: "Namespace"},
+  {sequence: 3, role: "serve_lb_slot_0_namespace", kind: "Namespace"},
+  {sequence: 4, role: "serve_lb_slot_1_namespace", kind: "Namespace"},
+  {sequence: 5, role: "caller_service_account", kind: "ServiceAccount"},
+  {sequence: 6, role: "workload_service_account", kind: "ServiceAccount"},
+  {sequence: 7, role: "serve_lb_slot_0_service_account",
+   kind: "ServiceAccount"},
+  {sequence: 8, role: "serve_lb_slot_1_service_account",
+   kind: "ServiceAccount"},
+  {sequence: 9, role: "endpoint_network_policy", kind: "NetworkPolicy"},
+  {sequence: 10, role: "validating_admission_policy",
+   kind: "ValidatingAdmissionPolicy"},
+  {sequence: 11, role: "validating_admission_policy_binding",
+   kind: "ValidatingAdmissionPolicyBinding"}
+]
+
+ProviderKubernetesPrerequisiteInventoryV1 =
+  [ProviderKubernetesPrerequisiteV1]  # exact 12 role-map entries/order
+
 ProviderKubernetesResourceContractV1 = {
   source_cpus: CanonicalPositiveDecimalText,
   source_memory_gb: CanonicalPositiveDecimalText,
@@ -2789,22 +2965,33 @@ ProviderKubernetesRendererV1 = {
   binding_schema: ProviderRepoArtifactRefV1,
   config_access_inventory: ProviderRepoArtifactRefV1,
   admitted_object_normalization: ProviderRepoArtifactRefV1,
-  source: ProviderLaunchInvocationV1.source
+  source: ProviderLaunchSourceV1
+}
+
+ProviderKubernetesProvisionRuntimeMetadataV1 = {
+  runtime_setup_done: true,
+  has_ray: true,
+  has_skylet: true,
+  has_job_queue: true,
+  workdir_synced: false,
+  file_mounts_synced: false,
+  setup_done: true,
+  run_started: false
+}
+
+ProviderKubernetesJobSubmissionV1 = {
+  protocol: "skylet_idempotent_submit_v1",
+  submission_key_source: "launch_action_id",
+  run_source: ProviderLaunchSourceV1,
+  contract: ProviderSkyletJobContractV1,
+  durability: ProviderSkyletDurabilityContractV1,
+  job_spec_profile: "ProviderSkyletJobSpecV1"
 }
 
 ProviderKubernetesPostProvisionV1 = {
   runtime_mode: "prebooted_ray_skylet_v1",
   runtime_artifacts: [ProviderWorkloadArtifactBindingV1],  # exact role order
-  provision_runtime_metadata: {
-    runtime_setup_done: true,
-    has_ray: true,
-    has_skylet: true,
-    has_job_queue: true,
-    workdir_synced: false,
-    file_mounts_synced: false,
-    setup_done: true,
-    run_started: false
-  },
+  provision_runtime_metadata: ProviderKubernetesProvisionRuntimeMetadataV1,
   sync_workdir: "assert_absent_skip",
   sync_file_mounts: "assert_absent_skip",
   user_setup: "assert_null_skip",
@@ -2812,29 +2999,41 @@ ProviderKubernetesPostProvisionV1 = {
   management_transport: "skylet_grpc_only",
   management_port: "46590",  # DecimalPortText
   ssh_fallback: false,
-  job_submission: {
-    protocol: "skylet_idempotent_submit_v1",
-    submission_key_source: "launch_action_id",
-    run_source: ProviderLaunchInvocationV1.source,
-    contract: ProviderSkyletJobContractV1,
-    durability: ProviderSkyletDurabilityContractV1,
-    job_spec_profile: "ProviderSkyletJobSpecV1"
-  }
+  job_submission: ProviderKubernetesJobSubmissionV1
+}
+
+ProviderKubernetesEndpointCallerWorkloadV1 = {
+  api_version: "apps/v1",
+  kind: "Deployment",
+  namespace: Text,
+  name: Text,
+  uid: Text,
+  resource_version: Text,
+  generation: PositiveInteger,
+  observed_generation: PositiveInteger,
+  deletion_timestamp: null,
+  selector: [{key: Text, value: Text}],
+  pod_template_labels: [{key: Text, value: Text}],
+  service_account_name: Text,
+  automount_service_account_token: false
+}
+
+ProviderKubernetesEndpointCallerV1 = {
+  role: "serve_lb_slot_0" | "serve_lb_slot_1",
+  namespace: Text,
+  namespace_uid: Text,
+  pod_selector: [{key: Text, value: Text}],
+  service_account_name: Text,
+  service_account_uid: Text,
+  workload: ProviderKubernetesEndpointCallerWorkloadV1
 }
 
 ProviderKubernetesEndpointContractV1 = {
   mode: "podip",
   application_port: DecimalPortText,
   ambient_fallback: false,
-  network_prerequisites: [ProviderKubernetesPrerequisiteV1],
-  required_callers: [
-    {role: "serve_lb_slot_0", namespace: Text, namespace_uid: Text,
-     pod_selector: [{key: Text, value: Text}], service_account_name: Text,
-     service_account_uid: Text},
-    {role: "serve_lb_slot_1", namespace: Text, namespace_uid: Text,
-     pod_selector: [{key: Text, value: Text}], service_account_name: Text,
-     service_account_uid: Text}
-  ]
+  prerequisite_projection: [ProviderKubernetesPrerequisiteV1],
+  required_callers: [ProviderKubernetesEndpointCallerV1]
 }
 
 ProviderAuthorityWorkerImageV1 = {
@@ -2868,19 +3067,24 @@ ProviderAuthorityWorkerCohortV1 = {
   service_account_uid: Text
 }
 
+ProviderKubernetesControllerOwnerV1 = {
+  api_version: "apps/v1",
+  kind: "ReplicaSet" | "Deployment",
+  name: Text,
+  uid: Text
+}
+
 ProviderAuthorityWorkerIdentityV1 = {
   namespace: Text,
   pod_name: Text,
   pod_uid: Text,
   pod_resource_version: Text,
   pod_service_account_name: Text,
-  pod_controller_owner: {api_version: "apps/v1", kind: "ReplicaSet",
-                         name: Text, uid: Text},
+  pod_controller_owner: ProviderKubernetesControllerOwnerV1,
   replica_set_name: Text,
   replica_set_uid: Text,
   replica_set_resource_version: Text,
-  replica_set_controller_owner: {api_version: "apps/v1", kind: "Deployment",
-                                 name: Text, uid: Text},
+  replica_set_controller_owner: ProviderKubernetesControllerOwnerV1,
   deployment_name: Text,
   deployment_uid: Text,
   deployment_resource_version: Text,
@@ -2920,6 +3124,83 @@ ProviderAuthorityWorkerAttemptAttestationV1 = {
   after: null | ProviderAuthorityWorkerIdentityV1
 }
 
+ProviderKubernetesRequestIdentityV1 = {
+  cleaned_user: Text,
+  original_user: Text,
+  frozen_user_hash: Text
+}
+
+ProviderKubernetesSchedulingContractV1 = {
+  node_count: 1,
+  use_spot: false,
+  accelerator: null,
+  node_selector: [],
+  allowed_nodes: [],
+  avoid_accelerator_label_keys: [Text],
+  runtime_class_name: null,
+  priority_class_name: null,
+  queue: null,
+  kueue: false,
+  dws: false,
+  autoscaler: null,
+  detected_network_type: "default"
+}
+
+ProviderKubernetesStorageContractV1 = {
+  persistent_volumes: [],
+  object_stores: [],
+  file_mounts: [],
+  workdir: null,
+  fuse: false,
+  docker_cache: false,
+  auto_mounts: false
+}
+
+ProviderKubernetesMetadataContractV1 = {
+  global_labels: [],
+  custom_pod_config: null,
+  custom_metadata: [],
+  reserved_labels_injected_last: true
+}
+
+ProviderKubernetesSecurityContractV1 = {
+  tls_material: null,
+  managed_secrets: [],
+  task_secrets: [],
+  service_account_bootstrap: false,
+  rbac_bootstrap: false
+}
+
+ProviderKubernetesObjectMutationEffectV1 = {
+  sequence: 0 | 1 | 2,
+  role: "head_ssh_service" | "head_service" | "head_pod",
+  kind: "Service" | "Pod"
+}
+
+ProviderKubernetesLaunchMutationContractV1 = {
+  role_map_contract: "ProviderKubernetesObjectRoleMapV1",
+  create_effects: [ProviderKubernetesObjectMutationEffectV1],
+  delete_effects: [ProviderKubernetesObjectMutationEffectV1],
+  job_effect: "one_action_keyed_skylet_submit",
+  allowed_patches: [],
+  allowed_updates: [],
+  allowed_collection_deletes: [],
+  delete_requires_identity_labels_and_uid_precondition: true,
+  create_409: "exact_admitted_readback_or_conflict",
+  create_422: "terminal_no_rewrite"
+}
+
+ProviderKubernetesDownMutationContractV1 = {
+  role_map_contract: "ProviderKubernetesObjectRoleMapV1",
+  delete_effects: [ProviderKubernetesObjectMutationEffectV1],
+  delete_requires_identity_labels_and_uid_precondition: true,
+  cluster_record_removal: "same_uuid_exact_handle_after_absence_v1",
+  allowed_creates: [],
+  allowed_patches: [],
+  allowed_updates: [],
+  allowed_collection_deletes: []
+}
+
 ProviderKubernetesExecutionCapsuleV1 = {
   version: 1,
   implementation_contract: "kubernetes_serve_prebooted_runtime_v1",
@@ -2928,77 +3209,25 @@ ProviderKubernetesExecutionCapsuleV1 = {
   config_projection_sha256: Sha256,
   scope: ProviderKubernetesScopeV1,
   principals: ProviderKubernetesPrincipalsV1,
-  prerequisites: [ProviderKubernetesPrerequisiteV1],
-  request_identity: {
-    cleaned_user: Text,
-    original_user: Text,
-    frozen_user_hash: Text
-  },
+  prerequisites: ProviderKubernetesPrerequisiteInventoryV1,
+  request_identity: ProviderKubernetesRequestIdentityV1,
   resources: ProviderKubernetesResourceContractV1,
   renderer: ProviderKubernetesRendererV1,
   objects: [ProviderKubernetesObjectPlanV1],
   post_provision: ProviderKubernetesPostProvisionV1,
   endpoint: ProviderKubernetesEndpointContractV1,
-  scheduling: {
-    node_count: 1,
-    use_spot: false,
-    accelerator: null,
-    node_selector: [],
-    allowed_nodes: [],
-    avoid_accelerator_label_keys: [Text],
-    runtime_class_name: null,
-    priority_class_name: null,
-    queue: null,
-    kueue: false,
-    dws: false,
-    autoscaler: null,
-    detected_network_type: "default"
-  },
-  storage: {
-    persistent_volumes: [], object_stores: [], file_mounts: [],
-    workdir: null, fuse: false, docker_cache: false, auto_mounts: false
-  },
-  metadata: {
-    global_labels: [], custom_pod_config: null, custom_metadata: [],
-    reserved_labels_injected_last: true
-  },
-  security: {
-    tls_material: null, managed_secrets: [], task_secrets: [],
-    service_account_bootstrap: false, rbac_bootstrap: false
-  },
+  scheduling: ProviderKubernetesSchedulingContractV1,
+  storage: ProviderKubernetesStorageContractV1,
+  metadata: ProviderKubernetesMetadataContractV1,
+  security: ProviderKubernetesSecurityContractV1,
   topology: ProviderPodTopologyV1,
-  mutation_contract: {
-    role_map_contract: "ProviderKubernetesObjectRoleMapV1",
-    create_effects: [{sequence: 0, role: "head_ssh_service", kind: "Service"},
-                     {sequence: 1, role: "head_service", kind: "Service"},
-                     {sequence: 2, role: "head_pod", kind: "Pod"}],
-    delete_effects: [{sequence: 0, role: "head_service", kind: "Service"},
-                     {sequence: 1, role: "head_ssh_service", kind: "Service"},
-                     {sequence: 2, role: "head_pod", kind: "Pod"}],
-    job_effect: "one_action_keyed_skylet_submit",
-    allowed_patches: [], allowed_updates: [], allowed_collection_deletes: [],
-    delete_requires_identity_labels_and_uid_precondition: true,
-    create_409: "exact_admitted_readback_or_conflict",
-    create_422: "terminal_no_rewrite"
-  }
-}
-
-ProviderKubernetesExecutionConfigV1 = {
-  version: 1,
-  capsule: ProviderKubernetesExecutionCapsuleV1,
-  execution_capsule_sha256: Sha256,
-  policy_subject: ProviderLaunchPolicySubjectV1,
-  policy_subject_sha256: Sha256,
-  policy: {
-    controller: ProviderPolicyBoundaryProofV1,
-    executor: ProviderPolicyBoundaryProofV1
-  }
+  mutation_contract: ProviderKubernetesLaunchMutationContractV1
 }
 
 ProviderLaunchPolicySubjectV1 = {
   version: 1,
-  source: ProviderLaunchInvocationV1.source,
-  requested_target: ProviderLifecycleInvocationV1.requested_target,
+  source: ProviderLaunchSourceV1,
+  requested_target: ProviderLocatorV1,
   resources: ProviderPodResourceSnapshotV1,
   topology: ProviderPodTopologyV1,
   execution_capsule_sha256: Sha256,
@@ -3018,6 +3247,18 @@ ProviderLaunchPolicySubjectV1 = {
   tls_material_ref: null
 }
 
+ProviderKubernetesExecutionConfigV1 = {
+  version: 1,
+  capsule: ProviderKubernetesExecutionCapsuleV1,
+  execution_capsule_sha256: Sha256,
+  policy_subject: ProviderLaunchPolicySubjectV1,
+  policy_subject_sha256: Sha256,
+  policy: {
+    controller: ProviderPolicyBoundaryProofV1,
+    executor: ProviderPolicyBoundaryProofV1
+  }
+}
+
 ProviderKubernetesDownExecutionCapsuleV1 = {
   version: 1,
   implementation_contract: "kubernetes_serve_exact_cleanup_v1",
@@ -3026,29 +3267,16 @@ ProviderKubernetesDownExecutionCapsuleV1 = {
   config_projection_sha256: Sha256,
   scope: ProviderKubernetesScopeV1,
   principals: ProviderKubernetesPrincipalsV1,
-  prerequisites: [ProviderKubernetesPrerequisiteV1],
-  request_identity: {
-    cleaned_user: Text,
-    original_user: Text,
-    frozen_user_hash: Text
-  },
+  prerequisites: ProviderKubernetesPrerequisiteInventoryV1,
+  request_identity: ProviderKubernetesRequestIdentityV1,
   cleanup_target: ProviderKubernetesCleanupTargetV1,
   cleanup_target_sha256: Sha256,
-  mutation_contract: {
-    role_map_contract: "ProviderKubernetesObjectRoleMapV1",
-    delete_effects: [{sequence: 0, role: "head_service", kind: "Service"},
-                     {sequence: 1, role: "head_ssh_service", kind: "Service"},
-                     {sequence: 2, role: "head_pod", kind: "Pod"}],
-    delete_requires_identity_labels_and_uid_precondition: true,
-    cluster_record_removal: "same_uuid_exact_handle_after_absence_v1",
-    allowed_creates: [], allowed_patches: [], allowed_updates: [],
-    allowed_collection_deletes: []
-  }
+  mutation_contract: ProviderKubernetesDownMutationContractV1
 }
 
 ProviderDownPolicySubjectV1 = {
   version: 1,
-  requested_target: ProviderLifecycleInvocationV1.requested_target,
+  requested_target: ProviderLocatorV1,
   workspace: Text,
   prior_launch_basis_sha256: Sha256,
   cleanup_target_sha256: Sha256,
@@ -3060,17 +3288,6 @@ ProviderDownPolicySubjectV1 = {
   graceful_timeout: null
 }
 
-ProviderDownPolicyBoundaryProofV1 = {
-  version: 1,
-  boundary: "serve_controller_prepare" | "api_executor_pre_io",
-  config_projection_sha256: Sha256,
-  modes: ProviderPolicyModeEvidenceV1,
-  policy_subject_sha256: Sha256,
-  projection_before_sha256: Sha256,
-  projection_after_sha256: Sha256,
-  projections_equal: true
-}
-
 ProviderKubernetesDownExecutionConfigV1 = {
   version: 1,
   capsule: ProviderKubernetesDownExecutionCapsuleV1,
@@ -3078,8 +3295,8 @@ ProviderKubernetesDownExecutionConfigV1 = {
   policy_subject: ProviderDownPolicySubjectV1,
   policy_subject_sha256: Sha256,
   policy: {
-    controller: ProviderDownPolicyBoundaryProofV1,
-    executor: ProviderDownPolicyBoundaryProofV1
+    controller: ProviderPolicyBoundaryProofV1,
+    executor: ProviderPolicyBoundaryProofV1
   }
 }
 
@@ -3088,8 +3305,27 @@ ProviderLifecycleExecutionCapsuleV1 =
   ProviderKubernetesDownExecutionCapsuleV1
 
 ProviderLifecyclePolicyBoundaryProofV1 =
-  ProviderPolicyBoundaryProofV1 | ProviderDownPolicyBoundaryProofV1
+  ProviderPolicyBoundaryProofV1
 ```
+
+The controller-owner leaf accepts either closed kind because it is shared. The
+enclosing worker-identity validator requires
+`pod_controller_owner.kind="ReplicaSet"` and byte-equal name/UID to the
+embedded ReplicaSet fields, and requires
+`replica_set_controller_owner.kind="Deployment"` and byte-equal name/UID to
+the embedded Deployment fields. Swapped kinds, a direct Pod-to-Deployment
+owner, multiple controller owners, or any crossed name/UID is invalid.
+
+The object-mutation-effect leaf validates only its closed scalar union. The
+enclosing launch mutation contract requires `create_effects` to be exactly
+`[(0, head_ssh_service, Service), (1, head_service, Service),
+(2, head_pod, Pod)]` and `delete_effects` to be exactly
+`[(0, head_service, Service), (1, head_ssh_service, Service),
+(2, head_pod, Pod)]`. The down mutation contract requires that same exact
+delete list. No list may be empty, reordered, duplicated, extended, or contain a
+role/kind mismatch. The launch/down mutation-contract validators are the sole
+owners of these exact list comparisons; a capsule only requires the correctly
+typed, already-validated kind-matched mutation contract.
 
 Every prerequisite leaf dispatches through
 `ProviderKubernetesPrerequisiteKindMapV1`: its outer and spec `kind` are equal,
@@ -3099,10 +3335,106 @@ its API version is the displayed literal, cluster-scoped kinds require
 All prerequisite kinds carry top-level `deletion_timestamp=null`; a deleting
 live object is not representable before or after effects.
 
+The leaf also dispatches through
+`ProviderKubernetesPrerequisiteRoleMapV1` and requires its role/kind pair to be
+one literal map entry. The enclosing inventory validator, which can see the
+container, owns list position: a launch or down capsule contains exactly all 12
+records in map order; no key sort, missing/extra/duplicate/swapped role, or
+wrong-kind substitution is accepted. V1 always serializes every semantic role,
+even when two roles name the same live object.
+
+The Boltz-v1 alias outcome is exact. The three Namespace roles
+`authority_release_namespace`, `serve_lb_slot_0_namespace`, and
+`serve_lb_slot_1_namespace` are required aliases for the one Helm release
+Namespace. Their canonical projections after omitting only the serialized
+`role` field are byte-equal, while each retains its exact distinct role and
+list position. No other
+roles may alias: the target and `kube-system` Namespace records have distinct
+keys/UIDs, and all four ServiceAccount roles have distinct keys/UIDs. A required
+alias with unequal API version, key, UID, resourceVersion, deletion state, spec,
+or spec hash rejects; the same UID under two nonaliased keys also rejects. This
+alias contract is a protocol constant, not inferred from coincident names.
+
+The launch-only endpoint `prerequisite_projection` is exactly five records in this order:
+`endpoint_network_policy`, `serve_lb_slot_0_namespace`,
+`serve_lb_slot_0_service_account`, `serve_lb_slot_1_namespace`, and
+`serve_lb_slot_1_service_account`. Each is byte-equal, including `role`, to its
+record in the enclosing 12-role inventory. The two `required_callers` remain in
+slot-0/slot-1 order. Each caller's namespace/name/UID fields equal its Namespace
+and ServiceAccount projection records, and its nonempty selector is the one
+parsed by the NetworkPolicy contract; aliasing the two Namespace roles never
+removes a projection position.
+
+Each caller also embeds one exact live Deployment projection. Its namespace is
+the caller Namespace; its name/UID is distinct from the other slot; its
+`observed_generation` equals `generation`; its exact selector is byte-equal to
+`caller.pod_selector`; and its complete sorted Pod-template labels contain
+every selector pair. The Deployment template's
+`service_account_name` equals the caller and that slot's prerequisite
+ServiceAccount name, and its explicit token automount is false. Thus the
+relation is closed as selector -> frozen LB Deployment -> Pod-template
+ServiceAccount -> exact live ServiceAccount UID. A structurally valid caller,
+ServiceAccount, or Deployment leaf does not prove this relation outside the
+endpoint/enclosing-capsule validator.
+
+The down capsule deliberately contains no endpoint contract, prerequisite
+projection, caller, or caller-workload evidence. Its closed parser rejects any
+such key. Down retains the complete 12-role prerequisite inventory for current
+scope/principal/admission identity, but it neither projects the five endpoint
+roles into a second field nor reads an LB Deployment.
+
+The remaining cross-field bindings are exhaustive. The authority/release
+record's name equals the executor-cohort, caller-ServiceAccount, and live
+authority-worker Namespace. Both LB Namespace role records are its required
+aliases. For launch, both endpoint callers' `namespace`/`namespace_uid` equal
+that record's name/UID; this prerequisite UID is the sole typed caller-Namespace
+UID source in v1. Down has no endpoint-caller copy to bind.
+The target record equals `scope.namespace`/`target_namespace_uid`, config and
+resource namespaces, every object-plan namespace, workload-ServiceAccount and
+rules-review Namespace, and the NetworkPolicy Namespace. The kube-system record
+has name exactly `kube-system` and the scope's kube-system UID. Caller and
+workload ServiceAccount records are byte-equal to `principals.caller` and
+`principals.workload`, match their scope fields, and respectively match the
+cohort ServiceAccount and Pod `/spec/serviceAccountName`; caller automount is
+true and workload automount is false. Both LB ServiceAccounts have explicit
+automount false and empty image-pull/legacy-secret references.
+
+For launch, the NetworkPolicy manifest selects the exact target Pod identity,
+allows only the two LB role namespace/Pod selectors to the application port and
+the authority-worker namespace/selector to management port 46590, and contains
+no extra ingress path. NetworkPolicy does not select by ServiceAccount; each
+launch caller's exact live Deployment projection supplies the selector-to-
+ServiceAccount binding, and the Namespace/ServiceAccount records supply its live
+UID attestation. Down still exact-compares the content-addressed prerequisite to
+the same live NetworkPolicy but does not derive a caller projection from it. The
+ValidatingAdmissionPolicy binds the exact authenticated caller and frozen
+workload/object contract. Its binding names that exact policy and target
+Namespace. The access-matrix artifact contains the literal GET decisions for
+all 12 semantic prerequisite roles; only the launch artifact additionally
+contains the two exact LB Deployment GETs. Preflight and each execution session
+use the same live client to exact-read, normalize, and revalidate all 12 records
+before and after effects. Launch also reads both Deployment projections in that
+window; down performs zero LB Deployment GETs. An implementation may coalesce
+the one required Namespace alias GET but must reproduce three records equal after
+omitting only their distinct exact `role` fields.
+
 For a ServiceAccount, outer namespace/name/UID/resourceVersion are byte-equal
 to its embedded projection. For Namespace, its live metadata name/UID/
 resourceVersion populate the outer record and its sorted labels/annotations
 populate the spec.
+
+`ProviderKubernetesEndpointCallerWorkloadV1` is produced only from one exact
+AppsV1 Deployment GET. Its leaf validates the displayed literals, nonempty
+bounded names/UID/resourceVersion, positive generations, null deletion
+timestamp, sorted duplicate-free nonempty selector, sorted duplicate-free
+complete Pod-template labels, nonempty ServiceAccount name, and explicit false
+token automount. A usable projection additionally requires
+`observed_generation == generation`; raw Deployment JSON, containers, status
+conditions, and unrelated metadata are not persisted. Preflight and execution
+reconstruct this same projection from the live Deployment and apply the
+endpoint cross-field bindings above.
+This leaf and live projection path are launch-only; down cannot carry a
+structurally valid workload leaf as unused evidence.
 
 The manifest-backed contract-to-normalizer map is literal:
 `serve_action_network_policy_v1` uses
@@ -3153,10 +3485,63 @@ The launch capsule owns only comparisons available inside it:
 `renderer.source == post_provision.job_submission.run_source`, complete
 byte-equality of renderer/config-projection `config_access_inventory`, and
 complete byte-equality of every object-plan `normalization_profile` with
-`renderer.admitted_object_normalization`. Enclosing execution-config/spec
-admission requires both capsule source copies to equal `policy_subject.source`
-and the launch invocation `source`. Preflight and the execution session own the
-inventory binding and artifact execution checks above.
+`renderer.admitted_object_normalization`. Preflight and the execution session
+own the inventory binding and artifact execution checks above.
+
+A down capsule deliberately has no renderer. Its preflight and execution session
+resolve `capsule.config_projection.config_access_inventory` directly against the
+unique `config_access_inventory` role in the content-addressed approved artifact
+inventory named by `capsule.executor_cohort.manifest.artifact_inventory` and
+require the complete `ProviderRepoArtifactRefV1` values to be byte-equal. A
+missing, duplicate, crossed-role, or unequal approved entry is not representable.
+This is the sole down config-access-inventory binding; no absent renderer field
+is inferred or reconstructed.
+
+Policy subjects are never accepted as self-consistent caller-selected
+preimages. Two pure nonrecursive projectors are the only constructors:
+
+- `project_provider_launch_policy_subject_v1(resource_identity, source,
+  requested_target, resources, topology, replica_id, retry_until_up, capsule)`
+  takes exactly those variable fields, converts the replica ID to its canonical
+  one-entry environment, sets `security_group_scope`, both policy/secret modes,
+  `exact_resources_override`, backend, optimize target, every fixed launch
+  flag, mount-blob field, and TLS-material field to the displayed protocol
+  literals, and computes `execution_capsule_sha256` from the full capsule. The
+  replica value also equals `resource_identity.replica_id`, and both capsule
+  source copies equal `source`. A resource-identity replica ID that cannot be
+  represented by `DecimalIntegerText` rejects rather than truncating or changing
+  spelling. Neither the controller nor worker call includes or dereferences
+  `launch.execution_config`.
+- `project_provider_down_policy_subject_v1(requested_target, workspace,
+  prior_launch_basis, prior_cleanup_target, capsule)` takes exactly those
+  variable fields; sets the policy/secret modes and purge/graceful fields only
+  to the displayed literals; computes `prior_launch_basis_sha256` from the
+  complete typed basis; computes the input cleanup-target hash from the complete
+  `prior_cleanup_target`; and computes `execution_capsule_sha256` from the full
+  capsule. The outer nonnull `prior_cleanup_target`, the basis's complete
+  `launch_cleanup_target`, the preflight cleanup target, and the capsule cleanup
+  target are byte-equal. The basis's `launch_cleanup_target_sha256`, preflight
+  `cleanup_target_sha256`, capsule `cleanup_target_sha256`, and projected-subject
+  `cleanup_target_sha256` all equal that recomputed input hash. No input includes
+  or dereferences `down.execution_config`.
+
+Execution-config/spec admission calls the kind-matched projector and requires
+its complete canonical result to be byte-equal to the embedded policy subject.
+It also requires every projector input to equal the corresponding plan,
+invocation, retained basis, and preflight field. For launch, it additionally
+compares the outer invocation field-for-field with the projected subject:
+source, requested target, resources, topology, replica environment,
+security-group scope, policy and managed-secret modes, retry flag, exact-resource
+override, backend/optimizer, every boolean launch option, clone-disk value,
+mount-blob value, and TLS-material value must equal the projector input or its
+displayed fixed result. The invocation's execution-config field is compared to
+the complete enclosing config but is not a projector input. For down, requested
+target, workspace, cluster name, expected cluster-record UUID, complete prior
+basis, purge/graceful flags, and timeout are bound to the plan, cleanup target,
+projected subject, and enclosing config; both basis and cleanup hashes are
+recomputed from their complete typed preimages. A self-consistent subject/hash
+graph with one changed target, retry flag, replica value, option, cleanup target,
+cluster identity, or prior-basis hash is therefore invalid.
 
 Every null, empty collection, and literal in
 `ProviderKubernetesExecutionConfigV1` is semantic; execution may not replace it
@@ -3172,28 +3557,34 @@ If the current template cannot be reconstructed under those constraints, the
 decision is not representable and remains shadow-only.
 
 The split is intentionally nonrecursive and content-addressed within one closed
-envelope. Each execution config embeds its capsule and policy subject exactly
-once and stores both recomputed hashes. The capsule likewise stores its
-config-projection hash. The subject contains `execution_capsule_sha256`, never
-the capsule or full execution config. Each boundary proof stores only the
-recomputed config-projection hash, the same policy-subject hash, and the
-before/after hashes. Admission requires both proof
-config-projection hashes to equal `capsule.config_projection.sha256`; the
-capsule's stored projection hash to equal that same value; the config's stored
-capsule hash and subject capsule hash to equal `capsule.sha256`; both proof
-subject hashes to equal `policy_subject.sha256`; and every before/after hash to
-equal that same subject hash when `projections_equal=true`. Thus every
-nonsecret preimage is co-located exactly once rather than repeating the capsule
-and object bodies four times. A bare hash outside this typed enclosing config
-remains non-authoritative. Raw effective config, raw tasks, admin-policy output, and
-managed-secret responses are forbidden. The checked-in config-access inventory
-is the finite list of reads; an unlisted read or a value outside the closed
-projection makes the candidate not representable.
-`capsule.config_projection.config_access_inventory` and
-`capsule.renderer.config_access_inventory` are two bindings to that one
-artifact and must be byte-equal as complete `ProviderRepoArtifactRefV1`
-objects. Each leaf validates only its closed artifact reference; the enclosing
-launch/down capsule owns this cross-field equality.
+envelope. The `ProviderPolicyBoundaryProofV1` leaf validates only its closed
+shape, fixed boundary/mode literals, scalar hashes,
+`projection_before_sha256 == projection_after_sha256`, and
+`projections_equal=true`. It deliberately cannot compare its hash scalars to a
+capsule, config projection, or policy-subject preimage.
+
+The enclosing launch/down execution-config validator owns the complete graph.
+It recomputes `capsule.config_projection_sha256` from the co-located config
+projection; recomputes `execution_capsule_sha256` from the capsule and requires
+the policy subject's capsule hash to equal it; recomputes
+`policy_subject_sha256` from the one co-located subject; and requires every
+proof config-projection hash, subject hash, and before/after hash to equal those
+respective results. The controller proof occupies only the
+`serve_controller_prepare` slot and the executor proof only the
+`api_executor_pre_io` slot; crossed or duplicate boundary literals reject.
+Thus every nonsecret preimage is co-located exactly once rather than repeating
+the capsule and object bodies four times. A bare hash or valid proof leaf
+outside this typed enclosing config remains non-authoritative. Raw effective
+config, raw tasks, admin-policy output, and managed-secret responses are
+forbidden. The checked-in config-access inventory is the finite list of reads;
+an unlisted read or a value outside the closed projection makes the candidate
+not representable.
+For launch only, `capsule.config_projection.config_access_inventory` and
+`capsule.renderer.config_access_inventory` are two bindings to that one artifact
+and must be byte-equal as complete `ProviderRepoArtifactRefV1` objects. Each leaf
+validates only its closed artifact reference; the enclosing launch capsule owns
+this co-located cross-field equality. Down uses the direct approved-inventory
+binding above instead.
 
 Down never inherits execution authority from the prior launch. At down
 admission, the same private preflight selects the then-active versioned worker
@@ -3206,37 +3597,46 @@ supplies target evidence only; it cannot supply an obsolete worker identity,
 ambient config, or security authority.
 The down capsule's scope/namespace, cleanup target/hash, three object plans,
 cluster UUID, workspace/config projection, principals, prerequisites, cohort,
-and both policy subjects are exhaustively byte-equal to the down invocation,
-plan, preflight result, and retained target fields; any contradiction is not
-representable.
+policy subject, and two boundary proofs are exhaustively byte-equal to the down
+invocation, plan, preflight result, and retained target fields; any
+contradiction is not representable.
 
 SelfSubjectReview, RulesReview, and AccessReview responses are immediately
-normalized into the named nonsecret types above. The access-matrix artifact
-contains the exact ordered required and forbidden checks; check sequences must
-match it. Wildcard groups/resources/verbs, unknown nonresource URLs, extra
+normalized into the named nonsecret types above. The action-kind-selected
+access-matrix artifact contains the exact ordered required and forbidden checks;
+check sequences must match it. Wildcard groups/resources/verbs, unknown
+nonresource URLs, extra
 identity groups/keys, incomplete rules, evaluation errors, and any result that
 differs from `expected_allowed` are rejected. Kubernetes reason/error strings
 and raw review bodies are never persisted. Prerequisite manifests are loaded
 from their content-addressed artifacts and byte-compared to the typed live
 projection; arbitrary Kubernetes response JSON is not stored.
 
-Cross-field validation is exhaustive. Both resource/image copies and the Pod
-container image are byte-equal. `source_cpus` and `source_memory_gb` are
+Launch cross-field validation is exhaustive. Both resource/image copies and the
+Pod container image are byte-equal. `source_cpus` and `source_memory_gb` are
 nonnull canonical positive decimals with at most three fractional digits and
 no `+`, relative `x`, exponent, or unit suffix. The candidate requires
 `instance_type == source_cpus + "CPU--" + source_memory_gb + "GB"`,
 `pod_cpu_request == pod_cpu_limit == source_cpus`, and
 `pod_memory_request == pod_memory_limit == source_memory_gb + "G"`; those four
 strings are byte-equal to the normalized Pod spec. The live allocatable clamp
-is disabled and cannot rewrite them. Scope/namespace/fingerprint, both
-service-account identities, name basis and all object names, each role's final
+is disabled and cannot rewrite them. Scope/namespace/fingerprint, every
+prerequisite Namespace and ServiceAccount role, name basis and all object names,
+each role's final
 labels against that role's topology and request body,
 topology order, source/workspace, image/digest/pull policy, and the one port in
-resources/topology/Services/endpoint must also be byte-equal. Every duplicated
-cluster UUID, replica incarnation, and down basis is equal to the enclosing
-identity. The separate fixed Skylet management port must equal the prebooted
-runtime, Pod, and NetworkPolicy projections and is never exposed as a user
-resource port. A contradictory but individually canonical object is rejected.
+the invocation/resource snapshot, capsule resource contract, topology,
+endpoint contract, and parsed workload NetworkPolicy must also be byte-equal.
+Those are the only execution-capsule application-port copies: the value is
+absent from the Pod container-port set and both Service port lists. Every
+duplicated cluster UUID and replica incarnation is equal to the enclosing
+identity. The separate fixed Skylet management port must equal
+`post_provision.management_port="46590"`, Pod
+`/spec/containers/0/ports/4/containerPort=46590`, and the parsed workload
+NetworkPolicy rule; it is never exposed as a user resource port. Preflight and
+the execution session must resolve and parse the NetworkPolicy artifact because
+a structurally valid artifact reference cannot prove either port. A
+contradictory but individually canonical object is rejected.
 
 The workload-image digest is allowlisted only after a checked-in build proves
 that its entrypoint contains the exact SkyPilot runtime bundle, Ray, Skylet,
@@ -3285,8 +3685,9 @@ immediately before mutation both recalculate the inventory/template/callable
 fingerprints and require the approved cohort deployment UID,
 service-account UID, and image digest. Each execution additionally records its
 typed `ProviderAuthorityWorkerAttemptAttestationV1`. Using downward-API
-name/namespace/UID, it exact-reads its Pod, follows the sole controller owner to
-an exact ReplicaSet, then follows that owner to the frozen Deployment. Pod,
+name/namespace/UID, it exact-reads its Pod, requires its sole controller owner
+to be the byte-equal typed ReplicaSet, then requires that ReplicaSet's sole
+controller owner to be the byte-equal frozen Deployment. Pod,
 ReplicaSet template, and Deployment template must agree on the service account,
 digest image, handler allowlist, and pod-template contract. The named container
 status must expose the qualified runtime image ID, and checked-in image
@@ -3352,13 +3753,15 @@ ProviderLaunchPreflightSeedV1 = {
   version: 1,
   resource_identity: ProviderLifecyclePlanV1.resource_identity,
   workspace: Text,
-  source: ProviderLaunchInvocationV1.source,
+  source: ProviderLaunchSourceV1,
+  requested_target: ProviderLocatorV1,
   requested_cloud: "kubernetes",
   context_mode: "in_cluster",
   target_namespace: Text,
   resources: ProviderPodResourceSnapshotV1,
   topology: ProviderPodTopologyV1,
   replica_id: NonnegativeInteger,
+  retry_until_up: Boolean,
   config_projection: ProviderKubernetesConfigProjectionV1
 }
 
@@ -3367,6 +3770,7 @@ ProviderDownPreflightSeedV1 = {
   resource_identity: ProviderLifecyclePlanV1.resource_identity,
   workspace: Text,
   requested_target: ProviderLocatorV1,
+  prior_launch_basis: PriorLaunchBasisV1,
   prior_launch_basis_sha256: Sha256,
   cleanup_target: ProviderKubernetesCleanupTargetV1,
   cleanup_target_sha256: Sha256,
@@ -3397,7 +3801,7 @@ ProviderLaunchAuthorityPreflightResponseV1 = {
   reason: null | ProviderLaunchNotRepresentableReasonV1,
   resolved_cohort: null | ProviderAuthorityWorkerCohortV1,
   execution_capsule: null | ProviderKubernetesExecutionCapsuleV1,
-  policy_proof: null | ProviderPolicyBoundaryProofV1,
+  executor_policy_proof: null | ProviderPolicyBoundaryProofV1,
   worker_identity: null | ProviderAuthorityWorkerIdentityV1
 }
 
@@ -3411,7 +3815,7 @@ ProviderDownAuthorityPreflightResponseV1 = {
   reason: null | ProviderDownNotRepresentableReasonV1,
   resolved_cohort: null | ProviderAuthorityWorkerCohortV1,
   execution_capsule: null | ProviderKubernetesDownExecutionCapsuleV1,
-  policy_proof: null | ProviderDownPolicyBoundaryProofV1,
+  executor_policy_proof: null | ProviderPolicyBoundaryProofV1,
   worker_identity: null | ProviderAuthorityWorkerIdentityV1
 }
 
@@ -3433,14 +3837,46 @@ evidence cannot activate the cohort.
 
 Only `complete` has all four evidence fields; only `not_representable` has a
 reason and all four evidence fields null. The `action_kind` discriminator
-selects the kind-specific reason constructor as well as the seed, capsule, and
-policy-proof variants; a spelling shared by both reason enums is still decoded
-through that selected constructor. Launch produces the launch execution config;
-down produces the current down execution config and never copies the launch
-capsule. Any wrong-kind reason, seed, capsule, or proof is invalid rather than
-coerced into the other variant. The hash covers the request without its hash
-field. Nonce and transport envelope are process-local and absent from the
-action spec.
+selects the kind-specific reason constructor, seed, capsule, subject projector,
+and enclosing proof bindings; a spelling shared by both reason enums is still
+decoded through that selected constructor. The proof leaf type itself is common
+to launch and down. Launch produces the launch execution config; down produces
+the current down execution config and never copies the launch capsule. Any
+wrong-kind reason, seed, or capsule, or any common proof whose hashes do not bind
+the selected capsule/subject, is invalid rather than coerced into the other
+variant. The hash covers the request without its hash field. Nonce and transport
+envelope are process-local and absent from the action spec.
+
+The two boundary proofs have one closed construction sequence:
+
+1. After the controller's final policy/managed-secret boundary, it freezes the
+   complete kind-specific seed. Launch includes the full requested target and
+   `retry_until_up`; down includes the full prior-launch basis and cleanup target
+   beside their recomputed hashes. Every seed field is byte-equal to the outer
+   plan/invocation projector input.
+2. The authority preflight validates that seed, constructs the kind-matched
+   capsule, runs the same pure subject projector, and returns only an
+   `executor_policy_proof` whose boundary is exactly `api_executor_pre_io` and
+   whose hashes bind that capsule projection and projected subject. A controller
+   proof in this response, or an executor field with the controller boundary,
+   is invalid.
+3. In the same bounded preparation cell, the controller recomputes the capsule
+   and subject hashes, reruns the projector against its retained seed, and
+   constructs the only `serve_controller_prepare` proof from its byte-equal
+   before/after subject projection and absent modes. It then assembles the
+   execution config with that local controller proof and the response's exact
+   executor proof; neither side supplies the other's slot.
+4. Immediately before the first provider-I/O intent, the frozen-cohort handler
+   reconstructs the current capsule/config projection and kind-matched subject
+   from the immutable spec and one live client, recomputes an
+   `api_executor_pre_io` proof, and requires it to be byte-equal to the stored
+   preflight proof. Drift blocks before I/O. The controller proof is hash-
+   revalidated but never regenerated by the handler.
+
+The launch/down seed parsers recompute every content hash, including full prior
+basis and cleanup target, before any projector runs. This sequence is the sole
+path to the dual-proof config; ambient reconstruction or an undifferentiated
+proof is not allowed.
 
 The expected cohort manifest contains only values knowable from the rendered
 release: names, qualified image identity, inventories, template contract,
@@ -3490,17 +3926,19 @@ without replacing its other egress.
 
 The preflight endpoint itself creates no API request, queue row, lease, or
 durable state; the caller's already-committed `PREPARING` retention reference is
-outside that endpoint and carries no execution authority. The endpoint
-returns only the action-kind-matched capsule, policy proof, and current worker identity,
-never credentials or a live client. The later request handler independently
-reconstructs and byte-compares the result with its one mutation client
+outside that endpoint and carries no execution authority. The endpoint returns
+only the action-kind-matched capsule, executor policy proof, and current worker
+identity, never credentials or a live client. The later request handler
+independently reconstructs and byte-compares the result with its one mutation client
 immediately before I/O. Preflight is admission evidence, not mutation authority
 or a TOCTOU substitute.
 
-The same live execution client re-reads both Namespaces, caller/workload/LB
-ServiceAccounts, NetworkPolicy, admission policy/binding, `/version`, and the
-worker Pod/ReplicaSet/Deployment chain immediately before the first effect and
-after the last. It requires exact UID, resourceVersion, typed spec/artifact
+The same live execution client revalidates the exact 12-role prerequisite
+inventory, `/version`, and the worker Pod/ReplicaSet/Deployment chain immediately
+before the first effect and after the last. Launch additionally revalidates both
+frozen LB Deployment projections; down makes no such GET and rejects endpoint
+evidence in its spec. The applicable reads require exact UID, resourceVersion,
+typed spec/artifact
 preimage, image qualification, and canonical hash. SelfSubjectReview must
 produce the closed frozen identity; SelfSubjectRulesReview must be complete and
 byte-equal to its typed preimage; and every required/forbidden access decision
@@ -3511,9 +3949,11 @@ other field.
 
 For the first cohort, both the controller/client and executor/server admin
 policy are proven absent, not merely projection-preserving. Managed-secret
-resolution is also proven absent. Each boundary embeds its bounded nonsecret
-before/after projection preimages beside their hashes; typed validation
-recomputes both and requires byte equality.
+resolution is also proven absent. The one bounded nonsecret policy-subject
+preimage is co-located in the execution config; each boundary records only its
+hashes and absence modes. The boundary leaf proves local before/after hash
+equality, while the enclosing execution-config validator recomputes the subject
+and projection hashes and binds both boundary slots to those preimages.
 The preparation trace proves the DAG is byte-exactly reconstructible from the
 retained source after only the frozen exact-resource and replica-environment
 transforms; setup, additional environment, hook, secret, mount, storage,
@@ -3558,10 +3998,11 @@ local mounts/workdirs, a nonnull mount blob, credentials, and every nondefault
 or unrepresented launch/resource field are not representable. Setup, hooks,
 autostop, a run source outside the approved nonsecret content-addressed canary
 contract, SSH/private-key dependency, and workload service-account token
-automount are also rejected. Namespace, both service accounts, admission and
-network policies, dual load-balancer caller identities, and executor cohort
-must already exist with frozen UIDs/specs, and the caller must satisfy the
-complete authorization matrix. An unpinned request is
+automount are also rejected. All 12 semantic prerequisite roles, including the
+required release/LB Namespace aliases, four distinct ServiceAccounts, admission
+objects, NetworkPolicy, dual load-balancer caller identities, and executor
+cohort must already exist with frozen UIDs/specs, and the caller must satisfy
+the complete authorization matrix. An unpinned request is
 not provider-final because the server optimizer may still choose a different
 resource; it cannot produce a v1 invocation.
 
@@ -3737,16 +4178,23 @@ silently reorder a noncanonical input:
   resource names, verbs, rule objects, nonresource-rule objects, and
   avoid-accelerator label keys are sorted duplicate-free sets; compound rules
   sort by canonical bytes after their inner sets are canonicalized.
-- prerequisites and endpoint network prerequisites are sorted by
-  `(api_version, kind, namespace-or-empty, name)` and reject duplicate logical
-  keys, including two UIDs for one key. All fields displayed as `[]` in a v1
-  config are empty-only, not unordered extension points.
+- prerequisites use the exact 12-entry
+  `ProviderKubernetesPrerequisiteRoleMapV1` order and the launch-only endpoint
+  projection uses its exact five-role order. They are never key-sorted. Only the three
+  release/LB Namespace roles may share one logical key/UID, as the required
+  alias group; every other duplicate logical key, duplicate nonaliased UID, or
+  alias mismatch rejects. All fields displayed as `[]` in a v1 config are
+  empty-only, not unordered extension points.
 
 Before linked represented admission is enabled, checked-in realistic launch and
-down golden fixtures must include the observed 1,036-byte `boltz-test` CA
-scalar, three complete requested/semantic object bodies, the full principal/
-authorization/prerequisite inventory, six runtime artifacts, and both endpoint
-callers. Tests record each full `ServeReplicaActionSpecV1` byte length, require
+down golden fixtures must include the observed 1,036-byte `boltz-test` CA scalar,
+three complete requested/semantic object bodies, the full kind-specific
+principal/authorization inventory, and all 12 prerequisite role records. The
+launch golden additionally includes the exact five-role endpoint projection,
+six runtime artifacts, and both endpoint callers with their complete live
+Deployment projections. The down golden contains none of those launch-only
+endpoint/runtime/job fields, and insertion of any one rejects. Tests
+record each full `ServeReplicaActionSpecV1` byte length, require
 it to be at most 60,000 bytes (preserving at least 5,536 bytes of rollout
 headroom), and still enforce the absolute 65,536-byte parser bound. Failure is
 `NOT_REPRESENTABLE`; no truncation, compression, omitted preimage, or external
@@ -3931,9 +4379,49 @@ Contract tests must cover:
 - all exhaustive cross-field equalities, nonnull CPU/memory and literal
   request/limit translations, `imagePullPolicy: Always`, and byte equality to
   the normalized Pod/Service specs;
+- the exact 12-role prerequisite inventory and role/kind/order map, the one
+  required release/LB Namespace alias group, rejection of every other key/UID
+  alias, launch-only exact five-role endpoint projection and two-caller order, all
+  role-to-scope/principal/policy bindings, alias equality after omitting only
+  the exact role field, and same-client pre/post drift for each individual role;
+- both launch endpoint callers bind their NetworkPolicy selector through an exact live
+  LB Deployment projection to its distinct Pod-template ServiceAccount and
+  prerequisite UID; missing/default/shared/wrong ServiceAccounts, selector or
+  template-label drift, stale observed generation, deletion, cross-slot
+  Deployment identity, and pre/post replacement all reject; a down capsule
+  rejects every endpoint/caller/workload key and emits zero LB Deployment GETs;
+- the exact three request bodies: absent Pod `spec.nodeName`, one `ray-node`
+  container, digest image, exact CPU/memory-only requests/limits, workload
+  ServiceAccount and false token automount, replica environment lookup by name
+  with scalar value and absent `valueFrom`, management port as JSON integer
+  `46590` at `/spec/containers/0/ports/4/containerPort`, singleton SSH-Service
+  port 22 with absent `clusterIP`, and headless Service `clusterIP="None"`
+  with an absent—not null or empty—`ports` key;
+- application-port rejection against every fixed runtime/management/SSH port,
+  absence from all Pod/Service port lists, and literal `podip`
+  `open_ports()`/`cleanup_ports()` no-op assertions with zero Service,
+  Ingress, LoadBalancer, patch, or other provider calls;
+- missing, unreadable, hash-drifted, or behavior-drifted candidate renderer,
+  binding-schema, or admitted-object-normalizer artifacts return exactly
+  `unrepresented_execution_config`, preserve shadow-only routing, and emit no
+  action-owned provider bytes; realistic and candidate-maximal artifact goldens
+  are required before that gate can open;
 - exact retained-source verification, both policy boundaries absent,
   byte-equal pre/post projections, and deterministic precedence for every
   closed not-representable reason;
+- launch requires byte-equal renderer/config-projection config-access references;
+  down has no renderer and instead binds its config-projection reference directly
+  to the cohort's unique approved `config_access_inventory` role; missing,
+  duplicate, crossed-role, or unequal entries reject;
+- the two pure nonrecursive policy-subject projectors copy every displayed
+  launch/down field from outer plan/invocation/basis/capsule preimages; mutation
+  of each target, retry, replica, option, basis, cleanup target, or recomputed
+  hash rejects even when the submitted subject graph is internally consistent;
+- launch preflight seeds include full requested target and retry value; down
+  seeds include the full prior basis and cleanup target beside their hashes;
+  responses accept only an `api_executor_pre_io` proof, controllers construct only
+  `serve_controller_prepare`, and the handler's immediate pre-I/O executor
+  recomputation must be byte-equal to the stored proof;
 - down preflight freezes a current down-only execution capsule/cohort/security
   proof, rejects an obsolete launch authority or ambient reconstruction, and
   revalidates the exact same-client evidence on every retry;
@@ -3953,11 +4441,13 @@ Contract tests must cover:
 - literal execution-config/template/inventory fixtures and an AST guard for
   every config/environment/file/global-state/discovery/mutation access;
 - exact caller/workload ServiceAccount UID/resourceVersion/spec, authenticated
-  SelfSubjectReview, complete rules preimage, required/forbidden access-review
-  matrix, and drift before/after effects;
+  SelfSubjectReview, complete rules preimage, kind-specific required/forbidden
+  access-review matrix, crossed launch/down matrix rejection, and drift
+  before/after effects;
 - one live isolated Kubernetes client for typed scope-before/after, exact
   prerequisite and CoreV1 reads/creates/deletes, with failed scope reads
-  encoded, exact worker Pod/ReplicaSet/Deployment GETs, and zero second-client,
+  encoded, exact worker Pod/ReplicaSet/Deployment, launch's two exact LB
+  Deployment GETs, down's zero LB Deployment GETs, and zero second-client,
   patch/update/collection-delete/Secret/RBAC mutation/PVC/Deployment mutation/
   Ingress/exec/cp calls;
 - every facade wraps the object-identical raw `ApiClient`, and the exact
@@ -3967,7 +4457,9 @@ Contract tests must cover:
 - every requested/admitted object semantic preimage/hash, allowed literal
   default/server allocation, 201/409 exact adoption, injected field rejection,
   and partial UID commitment supplied to each later effect;
-- the literal three-role plan/create/delete order, requested Pod omission of
+- the literal three-role plan order and exact launch/down mutation-contract
+  create/delete sequence-role-kind tuples, including rejection of an individually
+  valid mutation-effect leaf in a wrong list position; requested Pod omission of
   `spec.nodeName`, scheduler-only append of that allocation, incomplete
   pre-scheduling readback, immutable allocation replay, and exact node name in
   the committed handle;
@@ -3980,11 +4472,16 @@ Contract tests must cover:
 - every content-addressed policy edge recomputes to its one co-located capsule,
   config projection, and policy-subject preimage; crossed controller/executor,
   before/after, capsule, or subject hashes are rejected;
+- a standalone policy-proof leaf accepts only its local closed shape, absence
+  modes, and equal before/after hashes but grants no authority; only the
+  enclosing launch/down config binds its controller/executor slot and all
+  projection/capsule/subject hashes to co-located preimages;
 - registration sets require ascending unique worker Pod UIDs and reject both a
   permuted list and duplicate UID;
-- realistic launch/down golden specs exercise the full inventories and observed
-  CA size, record their canonical byte counts, retain 5,536 bytes of headroom,
-  and reject a one-byte-over-budget variant without dropping a preimage;
+- realistic launch/down golden specs exercise their complete kind-specific
+  inventories and observed CA size, record their canonical byte counts, retain
+  5,536 bytes of headroom, and reject a one-byte-over-budget variant without
+  dropping a preimage;
 - secret sentinels, raw YAML, arbitrary environment, kubeconfig/config, and
   launch-fence values never appearing in canonical invocation bytes;
 - the first launch/down progress cursor and `INTENT_COMMITTED` commit atomically
@@ -4004,9 +4501,11 @@ Contract tests must cover:
   predecessor-equal, null-attestation seed; it is not corruption and never
   proves `CANCELLED_NO_EFFECT`;
 - every external effect exact-revalidates the worker Pod -> ReplicaSet ->
-  Deployment chain, the first effect fills one write-once post-attestation,
-  later effects match it, and a replacement execution generation binds a new
-  attestation to the carried cursor without replaying a committed effect;
+  Deployment chain, with exact owner kinds and byte-equal embedded name/UID
+  fields plus rejection of swapped/direct/crossed owners; the first effect fills
+  one write-once post-attestation, later effects match it, and a replacement
+  execution generation binds a new attestation to the carried cursor without
+  replaying a committed effect;
 - crash before intent and before/after every object, progress, handle, runtime,
   job-intent/job-ID, endpoint, operation-ID, and response boundary;
 - lost launch acknowledgement followed by exact adoption;
@@ -4034,6 +4533,13 @@ Contract tests must cover:
 - prebooted runtime imageID/startup/Ray/Skylet evidence, asserted no-op generic
   stages, action-keyed same-spec job adoption, different-spec conflict, and no
   SSH/private-key fallback;
+- the one pure session-owned Skylet comparator reconstructs a byte-exact job
+  spec/request, binds action ID and capsule job-contract preimage, and supplies
+  every intent/commit/rejection hash; leaf-valid but crossed action keys,
+  contract hashes, specs, request hashes, or duplicated partial validators
+  reject; lost-ack readback reconstructs the full retained request from one
+  SQLite revision, equal bytes adopt, unequal bytes conflict even under equal
+  adversarial hash scalars, and not-found/uncertain evidence retains no request;
 - six ordered workload artifact bindings with retrievable manifest/build
   preimages, qualified OCI manifest/config/runtime-image identity for both
   workload and authority containers, explicit CRI-scheme/config mapping instead
@@ -4067,8 +4573,10 @@ Contract tests must cover:
   two-replica authority cohorts, active-cohort preflight selection, frozen-
   cohort claim joins, `REGISTERING` plus two distinct ready adopters before
   `ACCEPTING`, digest pins, namespace-local Secrets/static-manifest mounts,
-  release-namespace worker/Service selectors, separate canary workload
-  namespace, ClusterIP Service, NetworkPolicy, exact namespaced/cluster RBAC
+  release-namespace worker/Service selectors, two frozen LB Deployment
+  selectors with distinct explicit ServiceAccounts and exact GET-only evidence,
+  separate canary workload namespace, ClusterIP Service, NetworkPolicy, exact
+  namespaced/cluster RBAC
   grants and forbidden verbs, plus API -> new worker cohort -> controller
   rollout and current-chart rollback while both cohorts remain claimable;
 - atomic `PREPARING -> SHADOW_ACTIVE|ACTION_ACTIVE` binding with admission;
@@ -4215,6 +4723,12 @@ Deployment precreates and freezes the namespace, a no-permission workload
 ServiceAccount with token automount disabled and no image pull secrets, the
 authorization bindings, a validating admission policy/binding, and the
 NetworkPolicy for the two load-balancer slots and Skylet management path. The
+two warm-standby LB Deployments use distinct named ServiceAccounts with explicit
+false token automount; their immutable selectors, complete Pod-template labels,
+Deployment names/UIDs/generations, and ServiceAccount names are the endpoint
+caller workload projections. A rollout that reuses the default ServiceAccount,
+shares one ServiceAccount across slots, or leaves either Deployment projection
+unavailable cannot enter shadow or authority. The
 RBAC grants are exact and split by scope:
 
 - a ClusterRole/Binding permits GET of only the named release, canary,
@@ -4236,8 +4750,10 @@ RBAC grants are exact and split by scope:
   and GET of the exact workload ServiceAccount and NetworkPolicy. Dynamic
   create names cannot be RBAC-restricted; the typed session and admission
   policy are the name/shape fences; and
-- each LB namespace has a Role/Binding granting only GET of its named LB
-  ServiceAccount.
+- each LB role Namespace has a Role/Binding, bound only to authority-worker
+  ServiceAccounts, granting GET by `resourceNames` of its one named LB
+  ServiceAccount and one named LB Deployment. Required Namespace aliases may
+  co-locate these rules in the release Namespace but do not broaden either name.
 
 No rule grants list/watch/patch/update/deletecollection, Secret/ConfigMap read,
 RBAC/admission mutation, PVC, Ingress, or Deployment/ReplicaSet mutation. The
@@ -4247,11 +4763,16 @@ workload ServiceAccount, digest image, no secret/token references, and closed
 Pod/Service shapes; on DELETE it requires the old object's identity labels.
 UID delete preconditions remain an independent application/session fence.
 
-Shadow activation remains blocked until an in-cluster preflight on the deployed
-cohort proves both service-account and namespace UIDs/specs, complete
-SelfSubjectRulesReview, every required/forbidden access review, admission and
-network policy fingerprints, policy/managed-secret absence, and the renderer/
-runtime inventory. Historical or out-of-cluster evidence is insufficient.
+Shadow activation remains blocked until a launch-capability in-cluster preflight
+on the deployed cohort proves all 12 semantic prerequisite roles and their exact
+alias/projection contract, both LB selector-to-Deployment-to-ServiceAccount
+projections, complete SelfSubjectRulesReview, every required/forbidden launch
+access review, admission and network policy fingerprints, policy/managed-secret
+absence, and the renderer/runtime inventory. This is a cohort rollout gate, not
+an instruction to copy endpoint evidence into a down action. A down action runs
+its smaller kind-specific preflight and access matrix with the same 12-role
+inventory and zero LB Deployment GETs. Historical or out-of-cluster evidence is
+insufficient for either.
 Authority additionally requires the complete zero-divergence effect window,
 201/409/defaulting/admission fixtures, every phase-cursor crash test, action-keyed
 job recovery, and live application-port reachability from both load-balancer
@@ -4266,12 +4787,20 @@ absence result through a public API.
 - Exact inventory of existing providers that can propagate a stable
   cluster-record UUID/incarnation before launch; multi-node/compound launch is
   ineligible until all effects have one exact observable target contract.
-- Checked-in `pod_cluster_v1` renderer/admission-normalization, prebooted runtime,
-  action-keyed Skylet, mutation-trace, handle/endpoint, and observation fixtures
-  against real Kubernetes plus the in-cluster namespace/principal/
-  authorization/admission/network preflight on the selected Boltz canary path.
+- The current branch has no checked-in candidate `pod_cluster_v1` renderer,
+  binding schema, or `kubernetes_admitted_object_v1` normalizer, so
+  `unrepresented_execution_config` and shadow-only routing remain mandatory.
+  Add those three pinned artifacts plus realistic/candidate-maximal body
+  goldens, prebooted runtime, action-keyed Skylet, mutation-trace,
+  handle/endpoint, and observation fixtures against real Kubernetes, then
+  exercise the exact 12-role in-cluster principal/authorization/admission/
+  network preflight plus both launch LB Deployment-to-ServiceAccount projections
+  on the selected Boltz canary path, and verify the down preflight performs zero
+  LB Deployment GETs.
 - Implementation and contract verification of execution config and access
-  inventory, dual policy-absence proof, preparation/counted-slot gate,
+  inventory, the two nonrecursive policy-subject projectors, complete preflight
+  seeds and controller/executor dual policy-absence proof sequence,
+  preparation/counted-slot gate,
   normalized spec/partial UID-qualified adoption/deletion, redacted invocation
   builder, private handler claim filter, and request-handler pre-I/O/
   operation-ID callbacks without duplicating provider policy. The exact
@@ -4285,7 +4814,8 @@ absence result through a public API.
   worker attestation, quiesced superseded partial-launch cleanup, current
   down-only execution authority, the closed effect-body trace, qualified
   manifest/config/CRI runtime identity, and the Skylet fsynced outbox/run-token/
-  post-exec-handshake recovery state machine.
+  post-exec-handshake recovery state machine, including full retained-request
+  reconstruction and equal-hash/unequal-byte conflict handling.
 - Design-complete/code-pending: this canonical file now freezes the literal
   five-effect and every-phase prefix tables, immutable full effect claims,
   committed-effect hash preimages and created/adopted dispositions, CoreV1 422
@@ -4303,8 +4833,9 @@ absence result through a public API.
   no second queue or database migration for this provider-specific validator.
 - Rendered and live verification of the dedicated authority-worker Helm
   versioned-cohort contract, `REGISTERING`/two-ready-Pod activation,
-  release-namespace worker/Service/RBAC/projections, separate canary workload
-  namespace, purpose-specific TLS/token transport, exact same-client facade and
+  release-namespace worker/Service/RBAC/projections, two distinct frozen LB
+  Deployments and explicit ServiceAccounts, separate canary workload namespace,
+  purpose-specific TLS/token transport, exact same-client facade and
   RBAC/access-review matrices, controller-only preflight network path,
   frozen-cohort claim routing/retention, surviving-API tombstone verification,
   and the pinned API -> new worker cohort -> controller rollout/current-chart
