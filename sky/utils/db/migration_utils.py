@@ -71,6 +71,11 @@ API_REQUESTS_DB_NAME = 'api_requests_db'
 API_REQUESTS_VERSION = '004'
 API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
 
+LIFECYCLE_ACTIONS_DB_NAME = 'lifecycle_actions_db'
+LIFECYCLE_ACTIONS_VERSION = '001'  # inert lifecycle store identity and scope
+LIFECYCLE_ACTIONS_LOCK_PATH = (
+    f'~/.sky/locks/.{LIFECYCLE_ACTIONS_DB_NAME}.lock')
+
 CAPACITY_STATE_DB_NAME = 'capacity_state_db'
 CAPACITY_STATE_VERSION = '001'  # read-only physical-capacity projection core
 CAPACITY_STATE_LOCK_PATH = f'~/.sky/locks/.{CAPACITY_STATE_DB_NAME}.lock'

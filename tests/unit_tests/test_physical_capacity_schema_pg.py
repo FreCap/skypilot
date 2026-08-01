@@ -285,9 +285,27 @@ def test_fresh_process_bootstraps_all_lineages_with_capacity(
                     'alembic_version_serve_state_db',
                     'alembic_version_spot_jobs_db',
                     'alembic_version_api_requests_db',
+                    'alembic_version_lifecycle_actions_db',
                     'alembic_version_capacity_state_db',
                 )
             }
+            store_row = connection.execute(
+                sqlalchemy.text("""
+                    SELECT store_key, store_uuid, schema_version,
+                           writer_authority_digest, created_at,
+                           isfinite(created_at) AS created_at_is_finite
+                    FROM lifecycle_store_identity
+                """)).one()
+            scope_row = connection.execute(
+                sqlalchemy.text("""
+                    SELECT domain, operation_subset, store_mode, routing_mode,
+                           minimum_lifecycle_version, ownership_epoch,
+                           authority_generation,
+                           writer_implementation_digest,
+                           reconciler_implementation_digest, updated_at,
+                           isfinite(updated_at) AS updated_at_is_finite
+                    FROM lifecycle_ownership_scopes
+                """)).one()
         assert revisions == {
             'alembic_version_state_db':
                 migration_utils.GLOBAL_USER_STATE_VERSION,
@@ -297,9 +315,34 @@ def test_fresh_process_bootstraps_all_lineages_with_capacity(
             'alembic_version_spot_jobs_db': migration_utils.SPOT_JOBS_VERSION,
             'alembic_version_api_requests_db':
                 migration_utils.API_REQUESTS_VERSION,
+            'alembic_version_lifecycle_actions_db':
+                migration_utils.LIFECYCLE_ACTIONS_VERSION,
             'alembic_version_capacity_state_db':
                 migration_utils.CAPACITY_STATE_VERSION,
         }
+        store_uuid = uuid.UUID(str(store_row.store_uuid))
+        assert store_row.store_key == 'global'
+        assert store_uuid.version == 4
+        assert store_uuid.variant == uuid.RFC_4122
+        assert store_row.schema_version == 1
+        assert store_row.writer_authority_digest is None
+        assert store_row.created_at.tzinfo is not None
+        assert store_row.created_at.utcoffset() is not None
+        assert store_row.created_at_is_finite is True
+        assert tuple(scope_row[:9]) == (
+            'VOLUME',
+            'KUBERNETES_PVC_OWNED_LIFECYCLE_V1',
+            'CENTRAL_POSTGRESQL',
+            'DARK',
+            0,
+            1,
+            0,
+            None,
+            None,
+        )
+        assert scope_row.updated_at.tzinfo is not None
+        assert scope_row.updated_at.utcoffset() is not None
+        assert scope_row.updated_at_is_finite is True
     finally:
         with postgres_engine.begin() as connection:
             connection.exec_driver_sql(
