@@ -1,16 +1,14 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: M1, M2 S1, and M2 S2a.1 merged; S1 exact-head CI, revision 34
-deployment, canary, cleanup, and monitor qualified; S2a.1 exact-head CI and
-merge qualified; responsibility-deduplication review accepted for planning;
-the first M2 S2 prototype was rejected because it duplicated placement policy,
-and the bounded S2a.2 production-owner contract passed exact design review;
-the live physical-capacity branch is reconciled; and the separately deployable
-S2a.2 deterministic-gzip prerequisite passed exact-head CI, merge, staged
-revision 45 deployment, and bounded monitoring. The source-composer staging
-slice is implemented and locally qualified; its exact-head CI, merge, and
-deployment gates remain open. M3 and M4 implementation require dedicated
-exact-design adversarial reviews.
+Status: M1, M2 S1, M2 S2a.1, and the S2a.2 source composer are merged and
+deployment-qualified. The separately deployable S2a.2 deterministic-gzip
+prerequisite passed exact-head CI, merge, staged revision 45 deployment, and
+bounded monitoring; the source composer passed exact-head CI, merge, staged
+revisions 46 through 48, and bounded monitoring. The pre-M3 volume projection
+contract passed exact-design adversarial review and its implementation is under
+local qualification. Its exact-head CI, merge, deployment, and live-volume
+evidence gates remain open. The M3 action runtime and M4 implementation still
+require dedicated exact-design adversarial reviews.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -3944,6 +3942,104 @@ Pure seams run in shadow mode before taking ownership. Shadow output is keyed
 by resource incarnation and desired generation so same-name recreation cannot
 compare unrelated resources.
 
+### Pre-M3 volume projection characterization slice
+
+Before M3 adds any schema, claim owner, worker, or mutation path, one additive
+slice establishes a pure characterization seam for the current volume refresh
+reducer. This slice is named M3-S0. It is not approval for the M3 action store
+or volume writer and it cannot be used as evidence that mutation ownership
+moved.
+
+One consumer does not yet earn a generic reconciliation package. M3-S0 adds
+only `sky/volumes/refresh_projection.py`. A shared comparison helper may be
+extracted later only when a second production domain needs the identical,
+characterized exception-containment and comparison contract. Until then the
+volume module owns its pure projector, tagged snapshots, tagged projections,
+and shadow comparison outcome.
+
+There are two frozen snapshot variants. `UsedByFetchFailed` represents the
+existing early exit and requires no fabricated current row. `ObservedRefresh`
+contains the current status, current error, current ordered usage tuples,
+observed error, and observed ordered usage tuples captured while the existing
+volume lock is held. There are three tagged projection variants: `SKIP`,
+`NO_WRITE`, and `WRITE(payload)`. Only the diagnostic `WRITE` payload uses
+tuples. It never supplies arguments to the authoritative writer, which keeps
+receiving the original mapped lists from `volume_refresh()`.
+
+The projector preserves the current contract exactly:
+
+- a failed used-by observation produces `SKIP`;
+- a truthy provider error has precedence and produces `NOT_READY`;
+- otherwise nonempty pod use produces `IN_USE`;
+- no pod use produces `READY`, including cluster-only use;
+- current and observed usage are compared as sets, so ordering alone produces
+  `NO_WRITE`;
+- a diagnostic `WRITE` retains observed order, while the legacy writer
+  independently receives the original mapped lists.
+
+`sky/volumes/server/core.py::volume_refresh()` remains the sole orchestration
+owner. It performs the existing batched error and used-by reads exactly once,
+retains the current file lock and latest-row read, computes the current inline
+legacy decision, and leaves `global_user_state.update_volume_status()` as the
+only status writer. The failed-used-by branch captures its tagged snapshot and
+`SKIP` decision without adding a lock, latest-row read, mapping call, or config
+refresh. The ordinary branch captures its immutable snapshot and legacy
+decision under the current lock but still passes the original lists directly
+to the writer.
+
+All candidate projection, equality comparison, and diagnostic reporting run
+only after the complete authoritative loop has finished every status write and
+config refresh and released every volume lock. A candidate cannot therefore
+delay, skip, reorder, or alter authoritative work for the current or a later
+volume. Candidate exceptions and comparison exceptions are distinct closed
+outcomes, neither retains an exception object or message, and neither aborts
+comparison of later snapshots. `BaseException` is never contained as an
+ordinary shadow failure.
+
+Deferred capture is explicitly bounded. One sweep may retain at most 128
+complete snapshots, 4,096 total current-plus-observed usage references, and
+256 KiB of UTF-8 usage-identity bytes. Admission checks all three remaining
+budgets before converting any usage list to a tuple. Capture admits only exact
+built-in `list` containers and exact built-in `str` identities. Other runtime
+types are classified `NOT_SAMPLED_BUDGET` without invoking their overridable
+length, iteration, encoding, equality, or hashing behavior. Each admitted list
+is traversed once into a temporary list while enforcing the remaining reference
+and UTF-8 byte budgets; the immutable snapshot is then built only from those
+bounded copies. A snapshot is retained in full or classified
+`NOT_SAMPLED_BUDGET`; it is never truncated. Budget accounting itself is
+exception-contained after the authoritative work for that volume. These
+constants are characterization limits, not volume product limits, and they do
+not reject or alter a legacy write or config refresh.
+
+The caller emits no success metric, database row, per-volume warning, or
+per-match log. If the complete sweep contains any mismatch, projector error,
+comparison error, or `NOT_SAMPLED_BUDGET`, it attempts one bounded warning
+suitable for the existing Datadog log pipeline. The warning contains total
+compared and closed-outcome counts plus at most three volume names. Those names
+are admitted directly into a fixed-size three-element sample; the caller never
+collects every anomaly name and slices later. The warning must not contain
+provider payloads, exception messages, volume error text, credentials,
+projection payloads, or full usage collections. Logging failure is contained
+after all authoritative work. A warning-free deployment proves only absence of
+reported anomalies; it does not prove a positive match denominator or live
+parity.
+
+Config refresh, daemon cadence, public volume commands, apply, delete, and
+purge are unchanged.
+
+Volumes do not have the M3 incarnation and desired-generation fields yet.
+Therefore M3-S0 parity is diagnostic only and is not same-name-recreation,
+ownership-cutover, or authoritative-promotion evidence. M3 still has to add
+those fences and pass its complete schema, transaction, compatibility,
+activation, and rollback review before any action or writer implementation.
+
+M3-S0 explicitly adds no PostgreSQL or SQLite schema, request-queue reuse,
+claim, lease, heartbeat, retry timing, provider mutation, second observation,
+shared resource-status enum, generic lifecycle state machine, generic shadow
+package, Datadog metric, dashboard, or statistics store. No cluster, Serve,
+jobs, pool, image, or API request production path adopts the volume seam in
+this slice.
+
 ## Cleanup Contract
 
 - Intent and cleanup obligation are durable before provider mutation.
@@ -4187,6 +4283,12 @@ rollback, and cleanup on the exact image digest.
 
 ### M3: Durable action runtime and volume pilot
 
+- land M3-S0 first: the domain-local pure volume refresh projection and
+  shadow-only wiring, with the current reducer and writer still authoritative;
+- deploy M3-S0 without a schema migration, prove mismatch, projector,
+  comparison, and diagnostic-reporting errors are contained, and keep the
+  shadow result diagnostic-only until volume incarnation and
+  desired-generation fencing exists;
 - update this file with the complete M3 transaction, schema, activation, and
   rollback contract and pass a second adversarial review before implementation;
 - add the PostgreSQL action store and worker;
@@ -4436,6 +4538,53 @@ owned by the named test rather than left implicit:
 15. `test_cloud_offer_source_default_is_none_and_side_effect_free`.
 
 ### Action runtime
+
+M3-S0 precedes the action runtime and has its own focused contract tests:
+
+- tagged failed-fetch and observed snapshots require no fake fields or added
+  I/O, and tagged `SKIP`, `NO_WRITE`, and `WRITE` projections admit no invalid
+  payload combination;
+- the volume projector table covers failed observation, truthy and falsy
+  errors, error precedence, pod use, no use, cluster-only use, missing current
+  status, identical state, order-only changes, duplicate-only usage changes,
+  and each independently changed field;
+- projection never mutates snapshot tuples and diagnostic `WRITE` preserves
+  observed order while change detection retains legacy set equality;
+- candidate and equality errors are separately classified without retaining
+  an exception or message, later projections still run, and cancellation or
+  another `BaseException` is not contained as an ordinary shadow failure;
+- import and source inspection prove the volume projection leaf has no
+  database, provider, clock, sleep, lock, logging, or mutation dependency;
+- volume-refresh facade tests prove exactly one batched provider read per
+  cloud, exact original list arguments reach the legacy writer, unchanged
+  missing-handle and missing-row skips, and unchanged config refresh;
+- the failed-used-by branch still performs no lock, latest-row read, mapping,
+  status write, or config refresh;
+- all candidate work begins only after every authoritative write, config
+  refresh, and lock release, and candidate or diagnostic-logging failure cannot
+  affect current or later legacy work;
+- tests independently exceed the snapshot-count, total-usage-reference, and
+  UTF-8 identity-byte budgets and prove snapshots are never truncated,
+  candidate calls stay capped, `NOT_SAMPLED_BUDGET` is counted, and every
+  authoritative write and config refresh still runs;
+- lying and stateful list and string subclasses cannot bypass accounting or
+  cause a second input traversal, and exact built-in lists are copied once
+  through a reference-capped traversal before tuple conversion;
+- one bounded anomaly summary covers many volumes, samples at most three
+  names through fixed-size accumulation, and contains no raw error, provider
+  payload, exception message, projection payload, or full usage collection;
+- the PR diff proves M3-S0 adds no schema, worker, claim, lease, heartbeat,
+  retry, provider mutation, statistics store, generic shadow package, or second
+  production consumer.
+
+The M3-S0 deployment uses the normal exact-SHA gate but has no migration or
+ownership activation. It verifies all API roles on one immutable digest,
+exercises at least one volume refresh cycle when a safe test volume is
+available, and confirms the current writer and public volume behavior remain
+authoritative. Absence of a safe live volume is recorded as missing live parity
+evidence and never converted into promotion evidence.
+
+### Action runtime after M3-S0
 
 - admission atomically writes the existing domain reservation, exact fence
   identities, and generic action without acquiring capacity twice;
@@ -5036,3 +5185,91 @@ generic and Kubernetes config reads remain dynamically resolved. Authoritative
 placement and provider-wide deploy-variable freshness remain disabled until M4
 supplies immutable descriptor-owned actuation. Implementation may begin only
 after the live physical-capacity branch is reconciled with the deployment base.
+
+### Review 15
+
+Verdict: `MERGE` and staged deployment completed for the S2a.2 built-in
+Kubernetes template source composer.
+
+PR #1103 passed all 29 visible checks on unchanged head
+`389c8e861e7695b482fba94505e1765427776b9d`. It merged normally at
+`24d2eb250274b9ed3052a5891cddc3edbf322eae`; the first parent is
+`c96bd97d4c6a0b3573b00ac25a3a3a7f90cb91ed` and the second parent is the exact
+tested head. The remote feature branch was deleted only after merge and parent
+verification.
+
+The clean-clone merge image resolved to immutable ECR digest
+`sha256:d3beddddc62a75662fe1c3ff8e36f9d3e1d8477631e9bdae95103750ef6f2c9d`.
+The pulled image reported commit `24d2eb250274b9ed3052a5891cddc3edbf322eae`,
+build 8067, and exact monolith, outer, and fragment SHA-256 values
+`988b6d5e2afd7e96b3a6d7e0091c661a3d05d5a61d23fd7efa138ab75d55a6f8`,
+`3f9343f8ff289711d931af2915391338ac628d30d96fb10e66b4808578eadcd1`, and
+`09ea5d743a09286649c56f26c5b737764b81730b90fefae2bd561e0707a72e04`.
+Runtime composition reproduced the monolith byte for byte.
+
+Helm revisions 46, 47, and 48 rolled API, executor, and controller separately
+with `--reuse-values`. Final revision 48 is deployed with all three roles on
+the immutable digest. Migration Job 48 used that digest, completed with one
+success and zero failures, and the external-service-account RBAC values and
+bindings remained intact.
+
+Six post-deploy samples ran at `00:27:22Z`, `00:28:06Z`, `00:28:50Z`,
+`00:29:31Z`, `00:30:10Z`, and `00:31:02Z` on 2026-08-01. The first observed a
+PDB-safe Karpenter executor replacement at one of two Ready replicas. Samples
+two through six were stable at two Ready, updated, and available replicas for
+every role, all on the exact digest with zero restarts. API, executor, and
+controller health endpoints returned HTTP 200 in every sample. No Warning
+event occurred after the second sample, and current pod logs contained no
+source-composer or attributable error. Capacity mode remained disabled,
+capacity schema version remained 001, and all five capacity tables remained
+empty.
+
+### Review 16
+
+Verdict: `PURSUE` for the pre-M3 volume projection characterization contract
+at SHA-256
+`8cde65a846b790e9d1d306fd1651e273e279c8cda2b10a8067e3f30cfb4e2c52`.
+
+The first adversarial pass returned `RESHAPE` because one consumer did not earn
+a generic reconciliation package, failed observation could not honestly fill
+one ordinary snapshot, candidate work could precede later authoritative
+writes, per-volume warnings could flood the existing Datadog pipeline, and the
+initial deferred snapshot collection was unbounded. The reviewed contract now
+keeps the seam volume-local; uses tagged failed-fetch and observed snapshots;
+uses tagged `SKIP`, `NO_WRITE`, and diagnostic `WRITE` projections; runs all
+candidate work after the authoritative sweep; distinguishes projection and
+comparison failures; caps complete snapshots, usage references, and UTF-8
+identity bytes; and accumulates at most three anomaly names without collecting
+an unbounded list.
+
+The accepted slice adds no generic worker, action store, schema, lease, retry
+owner, provider mutation, second observation, status enum, Datadog metric, or
+statistics store. Original lists continue directly to the legacy writer, and
+the pure diagnostic projection can never supply writer arguments. A generic
+comparison helper remains prohibited until a second production domain proves
+the same contract.
+
+### Review 17
+
+Verdict: `PURSUE` for the corrected M3-S0 implementation contract at exact
+heading-through-before-Cleanup SHA-256
+`e98439a57dd81c7956b6f0eb1aaeb8affe2a8753c546c3bec3915e55308847d8`.
+
+Two independent implementation reviews initially returned `DO NOT MERGE`
+because the first capture implementation accounted overridable list and string
+operations, then traversed each input again during tuple conversion. A lying or
+stateful subtype could therefore retain more than 4,096 references or 256 KiB
+while debiting a smaller value.
+
+The corrected contract and implementation reject non-exact list and string
+inputs without invoking subtype behavior, traverse each admitted exact list
+once into reference-capped built-in copies, account UTF-8 bytes from the exact
+identities retained in those copies, and construct snapshots only from the
+bounded copies. Both original reproductions now fail closed with no budget
+debit. Both reviewers returned `LGTM`, and the exact-design adversarial
+re-review independently verified the section digest and returned `PURSUE`.
+
+Local qualification currently includes 45 pure-projection and facade tests,
+the existing 55 volume-core tests, clean mypy across 817 source files, and a
+10.00/10 pylint result. Exact-head CI, merge, immutable-image deployment, and
+live-volume evidence remain open gates.
