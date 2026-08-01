@@ -320,6 +320,115 @@ def test_api005_upgrade_preserves_ordinary_api004_rows(postgres_engine):
     assert queue_count == 1
 
 
+def test_api006_upgrade_requires_empty_action_attempts(postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '005',
+                                         mode='upgrade')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '006',
+                                         mode='upgrade')
+    inspector = sqlalchemy.inspect(postgres_engine)
+    attempt_columns = {
+        column['name']
+        for column in inspector.get_columns('api_resource_action_attempts')
+    }
+    assert {
+        'provider_io_boundary', 'provider_progress', 'provider_progress_sha256',
+        'provider_progress_revision'
+    }.issubset(attempt_columns)
+
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '005',
+                                         mode='upgrade')
+    action_id = uuid.uuid4()
+    request_id = str(uuid.uuid4())
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values(
+                **_action_values(action_id)))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+                **_attempt_values(action_id, 1, request_id)))
+    with pytest.raises(RuntimeError, match='cannot reconstruct'):
+        migration_utils.safe_alembic_upgrade(
+            postgres_engine,
+            migration_utils.API_REQUESTS_DB_NAME,
+            '006',
+            mode='upgrade')
+    assert migration_utils.get_current_alembic_revision(
+        postgres_engine, migration_utils.API_REQUESTS_DB_NAME) == '005'
+
+
+def test_api006_upgrade_serializes_with_uncommitted_api005_insert(
+        postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '005',
+                                         mode='upgrade')
+    action_id = uuid.uuid4()
+    request_id = str(uuid.uuid4())
+    writer = postgres_engine.connect()
+    writer_transaction = writer.begin()
+    writer.execute(
+        sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values(
+            **_action_values(action_id)))
+    writer.execute(
+        sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+            **_attempt_values(action_id, 1, request_id)))
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(migration_utils.safe_alembic_upgrade,
+                             postgres_engine,
+                             migration_utils.API_REQUESTS_DB_NAME,
+                             '006',
+                             mode='upgrade')
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            with postgres_engine.connect() as observer:
+                lock_waiting = observer.execute(
+                    sqlalchemy.text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE datname = current_database() "
+                        "AND state = 'active' "
+                        "AND wait_event_type = 'Lock' "
+                        "AND query LIKE "
+                        "'LOCK TABLE api_resource_action_attempts%')")
+                ).scalar_one()
+            if lock_waiting:
+                break
+            if future.done():
+                future.result()
+                pytest.fail('API006 migration did not wait for the API005 '
+                            'attempt insert.')
+            if time.monotonic() >= deadline:
+                pytest.fail('API006 migration did not reach its table lock.')
+            time.sleep(0.01)
+        assert not future.done()
+        writer_transaction.commit()
+        with pytest.raises(RuntimeError, match='cannot reconstruct'):
+            future.result(timeout=10)
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+    assert migration_utils.get_current_alembic_revision(
+        postgres_engine, migration_utils.API_REQUESTS_DB_NAME) == '005'
+
+
 def test_ordinary_request_lifecycle_does_not_create_actions(request_database):
     engine, backend = request_database
     request_id = str(uuid.uuid4())
@@ -374,7 +483,7 @@ def test_ordinary_request_lifecycle_does_not_create_actions(request_database):
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '005'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '006'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
@@ -389,6 +498,14 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     assert 'event_context' in request_columns
     assert {'resource_action_id',
             'resource_action_attempt'}.issubset(request_columns)
+    attempt_columns = {
+        column['name']
+        for column in inspector.get_columns('api_resource_action_attempts')
+    }
+    assert {
+        'provider_io_boundary', 'provider_progress', 'provider_progress_sha256',
+        'provider_progress_revision'
+    }.issubset(attempt_columns)
     assert {
         'ix_resource_events_workspace_sequence',
         'ix_resource_events_workspace_actor_sequence',
@@ -445,9 +562,10 @@ def test_resource_action_schema_is_bounded_and_request_points_to_attempt(
     }
     assert attempt_columns == {
         'action_id', 'attempt', 'request_id', 'request_input_sha256',
-        'provider_operation_id', 'mutation_boundary', 'typed_outcome',
-        'typed_outcome_sha256', 'request_terminal_state', 'admitted_at',
-        'updated_at', 'settled_at'
+        'provider_operation_id', 'mutation_boundary', 'provider_io_boundary',
+        'provider_progress', 'provider_progress_sha256',
+        'provider_progress_revision', 'typed_outcome', 'typed_outcome_sha256',
+        'request_terminal_state', 'admitted_at', 'updated_at', 'settled_at'
     }
     assert 'TEXT' in str(
         next(column['type']
@@ -713,15 +831,15 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api005_downgrade_retains_additive_schema(request_database):
+def test_api006_downgrade_retains_additive_schema(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
     with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
-        alembic_command.downgrade(config, '004')
+        alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '005'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '006'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()

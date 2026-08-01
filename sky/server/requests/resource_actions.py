@@ -14,7 +14,7 @@ import datetime
 import enum
 import hashlib
 import json
-from typing import Any, TYPE_CHECKING
+from typing import Any, Protocol, TYPE_CHECKING
 import unicodedata
 import uuid
 
@@ -61,12 +61,20 @@ class KernelState(enum.Enum):
 
 
 class MutationBoundary(enum.Enum):
-    """Durable provider-mutation evidence for one request attempt."""
+    """Request-attempt lifecycle, including terminal evidence settlement."""
 
     NOT_STARTED = 'NOT_STARTED'
     INTENT_COMMITTED = 'INTENT_COMMITTED'
     SUBMITTED_OR_AMBIGUOUS = 'SUBMITTED_OR_AMBIGUOUS'
     SETTLED = 'SETTLED'
+
+
+class ProviderIOBoundary(enum.Enum):
+    """Last provider-I/O watermark retained after attempt settlement."""
+
+    NOT_STARTED = 'NOT_STARTED'
+    INTENT_COMMITTED = 'INTENT_COMMITTED'
+    SUBMITTED_OR_AMBIGUOUS = 'SUBMITTED_OR_AMBIGUOUS'
 
 
 class ActionKind(enum.Enum):
@@ -290,12 +298,27 @@ class AttemptRecord:
     request_input_sha256: str
     provider_operation_id: str | None
     mutation_boundary: MutationBoundary
+    provider_io_boundary: ProviderIOBoundary
+    provider_progress: JsonObject | None
+    provider_progress_sha256: str | None
+    provider_progress_revision: int
     typed_outcome: JsonObject | None
     typed_outcome_sha256: str | None
     request_terminal_state: str | None
     admitted_at: datetime.datetime
     updated_at: datetime.datetime
     settled_at: datetime.datetime | None
+
+
+@dataclasses.dataclass(frozen=True)
+class AttemptExecutionFence:
+    """Fresh request-claim identity supplied to typed progress validation."""
+
+    request_id: str
+    execution_generation: int
+    claim_token: uuid.UUID
+    worker_instance_id: uuid.UUID
+    controller_generation: int | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -556,6 +579,47 @@ class ActionReduction:
             raise ValueError('Only TERMINAL reduction accepts a disposition.')
         return ActionReduction(self.kernel_state, outcome, result, retry_after,
                                disposition)
+
+
+class ProviderProgressContract(Protocol):
+    """Domain-owned closed validation behind the generic API006 journal.
+
+    Implementations are pure: they may parse and compare the immutable action,
+    predecessor, attempt, execution fence, and proposed value, but must not do
+    I/O or mutate durable state.
+    """
+
+    def retry_seed(self, action: ActionRecord,
+                   predecessor: AttemptRecord) -> Mapping[str, Any] | None:
+        """Derive the only legal attempt-local seed from a predecessor."""
+
+    def validate_attempt_snapshot(
+        self,
+        action: ActionRecord,
+        predecessor: AttemptRecord | None,
+        attempt: AttemptRecord,
+        execution_fence: AttemptExecutionFence | None,
+    ) -> None:
+        """Validate one persisted attempt and its predecessor lineage."""
+
+    def validate_progress_transition(
+        self,
+        action: ActionRecord,
+        predecessor: AttemptRecord | None,
+        attempt: AttemptRecord,
+        execution_fence: AttemptExecutionFence,
+        proposed_progress: JsonObject,
+    ) -> None:
+        """Validate a claim-fenced progress transition or exact replay."""
+
+    def validate_reduction(
+        self,
+        action: ActionRecord,
+        predecessor: AttemptRecord | None,
+        attempt: AttemptRecord,
+        reduction: ActionReduction,
+    ) -> None:
+        """Validate a first terminal reduction, including retry authority."""
 
 
 @dataclasses.dataclass(frozen=True)

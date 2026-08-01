@@ -2,6 +2,7 @@
 # pylint: disable=protected-access,redefined-outer-name
 
 import concurrent.futures
+import copy
 import os
 import shutil
 import threading
@@ -28,6 +29,189 @@ pytest.importorskip('psycopg2')
 pytestmark = pytest.mark.skipif(
     _POSTGRES_URL is None and shutil.which('docker') is None,
     reason='docker unavailable; skipping resource-action PostgreSQL tests')
+
+
+class _TestProviderProgressContract:
+    """Closed miniature provider contract used to exercise API006 fencing."""
+
+    _PHASES = ('CREATE_INTENT', 'OBJECT_CREATED', 'SUCCEEDED')
+
+    def __init__(self) -> None:
+        self.transitions = []
+        self.snapshot_validations = 0
+        self.reject_next_snapshot = False
+
+    @staticmethod
+    def _attestation(fence: actions.AttemptExecutionFence) -> dict:
+        return {
+            'request_id': fence.request_id,
+            'execution_generation': fence.execution_generation,
+            'claim_token': str(fence.claim_token),
+            'worker_instance_id': str(fence.worker_instance_id),
+            'controller_generation': fence.controller_generation,
+        }
+
+    def _parse_progress(self, value):
+        if not isinstance(value, dict) or set(value) != {
+                'version', 'cursor', 'worker_attestation'
+        }:
+            raise ValueError('progress envelope is not closed')
+        if value['version'] != 1 or isinstance(value['version'], bool):
+            raise ValueError('progress version is not 1')
+        cursor = value['cursor']
+        if not isinstance(cursor, dict) or set(cursor) != {'phase'}:
+            raise ValueError('progress cursor is not closed')
+        if cursor['phase'] not in self._PHASES:
+            raise ValueError('progress phase is unsupported')
+        attestation = value['worker_attestation']
+        if attestation is not None and (
+                not isinstance(attestation, dict) or set(attestation) != {
+                    'request_id', 'execution_generation', 'claim_token',
+                    'worker_instance_id', 'controller_generation'
+                }):
+            raise ValueError('worker attestation is not closed')
+        if attestation is not None:
+            if (not isinstance(attestation['request_id'], str) or
+                    not isinstance(attestation['execution_generation'], int) or
+                    isinstance(attestation['execution_generation'], bool) or
+                    not isinstance(attestation['claim_token'], str) or
+                    not isinstance(attestation['worker_instance_id'], str) or
+                (attestation['controller_generation'] is not None and
+                 (not isinstance(attestation['controller_generation'], int) or
+                  isinstance(attestation['controller_generation'], bool)))):
+                raise ValueError('worker attestation field types are invalid')
+            uuid.UUID(attestation['claim_token'])
+            uuid.UUID(attestation['worker_instance_id'])
+        return cursor['phase'], attestation
+
+    @staticmethod
+    def _parse_outcome(value):
+        if not isinstance(value, dict) or set(value) != {
+                'version', 'disposition', 'provider_operation_id'
+        }:
+            raise ValueError('typed outcome is not closed')
+        if value['version'] != 1 or isinstance(value['version'], bool):
+            raise ValueError('typed outcome version is not 1')
+        if value['disposition'] not in {
+                'retryable', 'uncertain', 'succeeded', 'terminal_error',
+                'cancelled'
+        }:
+            raise ValueError('typed outcome disposition is unsupported')
+        if (value['provider_operation_id'] is not None and
+                not isinstance(value['provider_operation_id'], str)):
+            raise ValueError('typed outcome operation ID is invalid')
+
+    def retry_seed(self, action, predecessor):
+        del action
+        assert predecessor.typed_outcome is not None
+        self._parse_outcome(predecessor.typed_outcome)
+        if predecessor.typed_outcome['disposition'] not in {
+                'retryable', 'uncertain'
+        }:
+            raise actions.ActionConflict(
+                'typed outcome does not authorize retry')
+        if predecessor.provider_progress is None:
+            return None
+        phase, _ = self._parse_progress(predecessor.provider_progress)
+        if phase == 'SUCCEEDED':
+            raise actions.ActionConflict('SUCCEEDED progress cannot be retried')
+        seed = copy.deepcopy(predecessor.provider_progress)
+        seed['worker_attestation'] = None
+        return seed
+
+    def validate_attempt_snapshot(self, action, predecessor, attempt,
+                                  execution_fence):
+        self.snapshot_validations += 1
+        if self.reject_next_snapshot:
+            self.reject_next_snapshot = False
+            raise ValueError('synthetic snapshot rejection')
+        progress = attempt.provider_progress
+        if progress is None:
+            if (attempt.provider_io_boundary
+                    is not actions.ProviderIOBoundary.NOT_STARTED or
+                    attempt.provider_progress_revision != 0 or
+                    attempt.provider_progress_sha256 is not None):
+                raise ValueError('null progress crossed provider I/O')
+        else:
+            _, attestation = self._parse_progress(progress)
+            if attempt.provider_progress_revision <= 0:
+                raise ValueError('nonnull progress has no revision')
+            if attempt.provider_io_boundary is (
+                    actions.ProviderIOBoundary.NOT_STARTED):
+                if (predecessor is None or
+                        attempt.provider_progress_revision != 1 or
+                        attestation is not None):
+                    raise ValueError('invalid inherited retry seed')
+                expected = self.retry_seed(action, predecessor)
+                if actions.canonical_json_bytes(progress) != (
+                        actions.canonical_json_bytes(expected)):
+                    raise ValueError('inherited retry seed differs')
+            elif attestation is None:
+                raise ValueError('crossed progress has no worker attestation')
+            if (execution_fence is not None and attempt.provider_io_boundary
+                    is not actions.ProviderIOBoundary.NOT_STARTED and
+                    actions.canonical_json_bytes(attestation)
+                    != actions.canonical_json_bytes(
+                        self._attestation(execution_fence))):
+                raise ValueError('worker attestation differs from claim fence')
+        if attempt.mutation_boundary is actions.MutationBoundary.SETTLED:
+            self._parse_outcome(attempt.typed_outcome)
+
+    def validate_progress_transition(self, action, predecessor, attempt,
+                                     execution_fence, proposed_progress):
+        del action, predecessor
+        new_phase, new_attestation = self._parse_progress(proposed_progress)
+        if (actions.canonical_json_bytes(new_attestation)
+                != actions.canonical_json_bytes(
+                    self._attestation(execution_fence))):
+            raise ValueError('proposed attestation differs from claim fence')
+        if attempt.provider_progress is None:
+            if new_phase != 'CREATE_INTENT':
+                raise ValueError('fresh progress must start at CREATE_INTENT')
+            old_phase = None
+        else:
+            old_phase, old_attestation = self._parse_progress(
+                attempt.provider_progress)
+            if (attempt.provider_io_boundary
+                    is actions.ProviderIOBoundary.NOT_STARTED):
+                if (new_phase != old_phase or old_attestation is not None):
+                    raise ValueError('inherited seed may only bind attestation')
+            elif (self._PHASES.index(new_phase) -
+                  self._PHASES.index(old_phase)) not in (0, 1):
+                raise ValueError('progress phase is not monotonic')
+            elif (actions.canonical_json_bytes(old_attestation)
+                  != actions.canonical_json_bytes(new_attestation)):
+                raise ValueError('worker attestation changed')
+        self.transitions.append((old_phase, new_phase))
+
+    def validate_reduction(self, action, predecessor, attempt, reduction):
+        self.validate_attempt_snapshot(action, predecessor, attempt, None)
+        outcome = dict(reduction.typed_outcome)
+        self._parse_outcome(outcome)
+        if reduction.kernel_state is actions.KernelState.READY:
+            if outcome['disposition'] not in {'retryable', 'uncertain'}:
+                raise ValueError('typed outcome does not authorize retry')
+            if attempt.provider_progress is not None:
+                phase, _ = self._parse_progress(attempt.provider_progress)
+                if phase == 'SUCCEEDED':
+                    raise ValueError('SUCCEEDED progress cannot reduce READY')
+
+
+def _typed_progress(item, store, phase='CREATE_INTENT'):
+    contract = store._provider_progress_contract
+    fence = actions.AttemptExecutionFence(
+        request_id=item.request_id,
+        execution_generation=item.execution_generation,
+        claim_token=uuid.UUID(item.claim_token),
+        worker_instance_id=uuid.UUID(store._instance_id),
+        controller_generation=None)
+    return {
+        'version': 1,
+        'cursor': {
+            'phase': phase
+        },
+        'worker_attestation': contract._attestation(fence),
+    }
 
 
 @pytest.fixture(scope='module')
@@ -93,7 +277,8 @@ def action_database(postgres_engine, monkeypatch):
                        str(uuid.uuid4()))
     backend = request_postgres.PostgresRequestBackend()
     store = resource_actions_postgres.PostgresResourceActionStore(
-        postgres_engine)
+        postgres_engine,
+        provider_progress_contract=_TestProviderProgressContract())
     return postgres_engine, backend, store
 
 
@@ -167,9 +352,56 @@ def _commit_intent_with_claim(store, item):
                                                    item.execution_generation,
                                                    item.claim_token)
     try:
-        return store.commit_intent(item.request_id)
+        return store.commit_intent_with_progress(item.request_id,
+                                                 _typed_progress(item, store),
+                                                 0)
     finally:
         storage.deactivate_execution_claim(claim_token)
+
+
+def _reduce_retry(engine, store, action, request):
+    request_input = actions.ActionRequestInput.from_request(
+        action.action_id, 1, request)
+
+    def reducer(connection, action_record, attempt_record, terminal_request):
+        del connection, action_record, attempt_record, terminal_request
+        return actions.ActionReduction(
+            kernel_state=actions.KernelState.READY,
+            typed_outcome={
+                'version': 1,
+                'disposition': 'retryable',
+                'provider_operation_id': None,
+            },
+            result={
+                'version': 1,
+                'classification': 'transient',
+            },
+            retry_after_seconds=0,
+        )
+
+    with engine.begin() as connection:
+        return store.reduce_in_transaction(connection, action.action_id, 1, 2,
+                                           request_input, reducer)
+
+
+def _settle_first_attempt_for_retry(engine, backend, store):
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    materialized = store.materialize(action.action_id, 1, 1, request)
+    assert materialized is not None and materialized.created
+    item = _claim(backend, request.request_id)
+    progress = _typed_progress(item, store)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        store.commit_intent_with_progress(request.request_id, progress, 0)
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    reduced = _reduce_retry(engine, store, action, request)
+    return action, request, progress, reduced
 
 
 def test_admission_due_discovery_and_immutable_conflict(action_database):
@@ -229,6 +461,62 @@ def test_materialization_lost_ack_adopts_without_second_delivery(
             ).select_from(
                 request_postgres.RESOURCE_ACTION_ATTEMPTS)).scalar_one()
     assert (request_count, queue_count, attempt_count) == (1, 1, 1)
+
+
+def test_materialization_snapshot_rejection_creates_no_delivery(
+        action_database):
+    engine, _, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    contract = store._provider_progress_contract
+    contract.reject_next_snapshot = True
+
+    blocked = store.materialize(action.action_id, action.revision, 1, request)
+
+    assert blocked is not None and blocked.blocked
+    assert blocked.action.kernel_state is actions.KernelState.BLOCKED
+    assert blocked.action.last_result is not None
+    assert (blocked.action.last_result['code'] ==
+            'inserted_attempt_progress_contract')
+    with engine.connect() as connection:
+        counts = tuple(
+            connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                                 ).select_from(table)).scalar_one()
+            for table in (request_postgres.RESOURCE_ACTION_ATTEMPTS,
+                          request_postgres.REQUESTS, request_postgres.QUEUE))
+    assert counts == (1, 0, 0)
+
+
+def test_lost_ack_adopts_after_worker_advances_typed_progress(action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    created = store.materialize(action.action_id, action.revision, 1, request)
+    assert created is not None and created.created
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        first = _typed_progress(item, store, 'CREATE_INTENT')
+        second = _typed_progress(item, store, 'OBJECT_CREATED')
+        store.commit_intent_with_progress(request.request_id, first, 0)
+        store.write_provider_progress(request.request_id, second, 1)
+        adopted = store.materialize(action.action_id, action.revision, 1,
+                                    request)
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    assert adopted is not None and adopted.adopted
+    assert not adopted.blocked
+    assert adopted.attempt is not None
+    assert adopted.attempt.provider_progress == second
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS)).scalar_one() == 1
 
 
 def test_two_dispatchers_create_one_delivery_and_adopt_same_tuple(
@@ -340,6 +628,49 @@ def test_attempt_decoder_revalidates_deterministic_preimage(action_database):
         with pytest.raises(actions.InvariantViolation):
             resource_actions_postgres._attempt_record(corrupted)
 
+    corrupted = dict(persisted)
+    decomposed = {'label': 'e\u0301'}
+    corrupted['provider_progress'] = decomposed
+    corrupted['provider_progress_sha256'] = actions.canonical_sha256(decomposed)
+    corrupted['provider_progress_revision'] = 1
+    with pytest.raises(actions.InvariantViolation, match='already canonical'):
+        resource_actions_postgres._attempt_record(corrupted)
+
+
+@pytest.mark.parametrize('values', [
+    {
+        'provider_io_boundary': 'BROKEN'
+    },
+    {
+        'mutation_boundary': 'INTENT_COMMITTED'
+    },
+    {
+        'provider_operation_id': 'operation-before-submission'
+    },
+    {
+        'provider_progress': {
+            'version': 1
+        },
+        'provider_progress_sha256': None,
+        'provider_progress_revision': 0,
+    },
+])
+def test_api006_attempt_constraints_reject_invalid_boundary_and_progress_shape(
+        action_database, values):
+    engine, _, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    store.materialize(action.action_id, 1, 1, request)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                        action.action_id,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                        1).values(**values))
+
 
 def test_claim_journal_and_retry_reduction_replay_keep_deadline(
         action_database):
@@ -348,20 +679,45 @@ def test_claim_journal_and_retry_reduction_replay_keep_deadline(
     request = _request(action.action_id)
     materialized = store.materialize(action.action_id, 1, 1, request)
     assert materialized is not None and materialized.created
+    assert materialized.attempt is not None
+    assert materialized.attempt.provider_io_boundary is (
+        actions.ProviderIOBoundary.NOT_STARTED)
+    assert materialized.attempt.provider_progress is None
+    assert materialized.attempt.provider_progress_revision == 0
+    assert not hasattr(store, 'commit_intent')
     with pytest.raises(actions.ClaimLost, match='no active'):
-        store.commit_intent(request.request_id)
+        store.commit_intent_with_progress(
+            request.request_id, {
+                'version': 1,
+                'cursor': {
+                    'phase': 'CREATE_INTENT'
+                },
+                'worker_attestation': {
+                    'request_id': request.request_id,
+                    'execution_generation': 1,
+                    'claim_token': str(uuid.uuid4()),
+                    'worker_instance_id': str(uuid.uuid4()),
+                    'controller_generation': None,
+                },
+            }, 0)
 
     item = _claim(backend, request.request_id)
     claim_token = storage.activate_execution_claim(item.request_id,
                                                    item.execution_generation,
                                                    item.claim_token)
     try:
-        intent = store.commit_intent(request.request_id)
+        intent = store.commit_intent_with_progress(request.request_id,
+                                                   _typed_progress(item, store),
+                                                   0)
         assert intent.mutation_boundary is (
             actions.MutationBoundary.INTENT_COMMITTED)
+        assert intent.provider_io_boundary is (
+            actions.ProviderIOBoundary.INTENT_COMMITTED)
         ambiguous = store.record_submission(request.request_id, None)
         assert ambiguous.mutation_boundary is (
             actions.MutationBoundary.SUBMITTED_OR_AMBIGUOUS)
+        assert ambiguous.provider_io_boundary is (
+            actions.ProviderIOBoundary.SUBMITTED_OR_AMBIGUOUS)
         assert ambiguous.provider_operation_id is None
         submitted = store.record_submission(request.request_id, 'operation-1')
         assert submitted.mutation_boundary is (
@@ -412,6 +768,8 @@ def test_claim_journal_and_retry_reduction_replay_keep_deadline(
     assert reduced.action.kernel_state is actions.KernelState.READY
     assert reduced.action.revision == 3
     assert reduced.attempt.mutation_boundary is actions.MutationBoundary.SETTLED
+    assert reduced.attempt.provider_io_boundary is (
+        actions.ProviderIOBoundary.SUBMITTED_OR_AMBIGUOUS)
     assert reduced.attempt.request_terminal_state == 'SUCCEEDED'
     assert reduced.attempt.provider_operation_id == 'operation-1'
     assert reduced.attempt.typed_outcome is not None
@@ -438,6 +796,486 @@ def test_claim_journal_and_retry_reduction_replay_keep_deadline(
     assert len(callbacks) == 1
 
 
+def test_typed_progress_is_claim_fenced_and_retains_io_boundary(
+        action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    materialized = store.materialize(action.action_id, 1, 1, request)
+    assert materialized is not None and materialized.created
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    contract = store._provider_progress_contract
+    contract.transitions.clear()
+    starting_snapshot_validations = contract.snapshot_validations
+    first = _typed_progress(item, store, 'CREATE_INTENT')
+    second = _typed_progress(item, store, 'OBJECT_CREATED')
+    try:
+        intent = store.commit_intent_with_progress(request.request_id, first, 0)
+        assert intent.provider_progress == first
+        assert intent.provider_progress_revision == 1
+        assert intent.mutation_boundary is (
+            actions.MutationBoundary.INTENT_COMMITTED)
+        assert intent.provider_io_boundary is (
+            actions.ProviderIOBoundary.INTENT_COMMITTED)
+        replayed = store.commit_intent_with_progress(request.request_id, first,
+                                                     0)
+        assert replayed.provider_progress_revision == 1
+
+        checkpoint = store.write_provider_progress(request.request_id, second,
+                                                   1)
+        assert checkpoint.provider_progress == second
+        assert checkpoint.provider_progress_revision == 2
+        checkpoint_replay = store.write_provider_progress(
+            request.request_id, second, 1)
+        assert checkpoint_replay.provider_progress_revision == 2
+        with pytest.raises(actions.StaleRevision, match='revision changed'):
+            store.write_provider_progress(
+                request.request_id, _typed_progress(item, store, 'SUCCEEDED'),
+                1)
+        submitted = store.record_submission(request.request_id, None)
+        assert submitted.provider_io_boundary is (
+            actions.ProviderIOBoundary.SUBMITTED_OR_AMBIGUOUS)
+        assert submitted.provider_progress == second
+        assert submitted.provider_progress_revision == 2
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    assert contract.transitions == [(None, 'CREATE_INTENT'),
+                                    ('CREATE_INTENT', 'CREATE_INTENT'),
+                                    ('CREATE_INTENT', 'OBJECT_CREATED'),
+                                    ('OBJECT_CREATED', 'OBJECT_CREATED'),
+                                    ('OBJECT_CREATED', 'SUCCEEDED')]
+    assert contract.snapshot_validations >= starting_snapshot_validations + 6
+
+
+def test_bool_int_alias_cannot_replay_typed_progress(action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    store.materialize(action.action_id, 1, 1, request)
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        progress = _typed_progress(item, store)
+        store.commit_intent_with_progress(request.request_id, progress, 0)
+        aliased = copy.deepcopy(progress)
+        aliased['worker_attestation']['execution_generation'] = True
+        with pytest.raises(actions.ActionConflict,
+                           match='transition is invalid'):
+            store.commit_intent_with_progress(request.request_id, aliased, 0)
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+
+
+def test_retry_materialization_requires_typed_inherited_seed(action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    materialized = store.materialize(action.action_id, 1, 1, request)
+    assert materialized is not None and materialized.created
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    predecessor_progress = _typed_progress(item, store)
+    try:
+        store.commit_intent_with_progress(request.request_id,
+                                          predecessor_progress, 0)
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    reduced = _reduce_retry(engine, store, action, request)
+    assert reduced.attempt.provider_io_boundary is (
+        actions.ProviderIOBoundary.INTENT_COMMITTED)
+
+    request_two = _request(action.action_id, 2)
+    seed = {
+        'version': 1,
+        'cursor': {
+            'phase': 'CREATE_INTENT'
+        },
+        'worker_attestation': None,
+    }
+    with pytest.raises(TypeError, match='unexpected keyword'):
+        store.materialize(action.action_id,
+                          reduced.action.revision,
+                          2,
+                          request_two,
+                          provider_progress_seed=seed)
+
+    second = store.materialize(action.action_id, reduced.action.revision, 2,
+                               request_two)
+    assert second is not None and second.created
+    assert second.attempt is not None
+    assert second.attempt.provider_io_boundary is (
+        actions.ProviderIOBoundary.NOT_STARTED)
+    assert second.attempt.provider_progress == seed
+    assert second.attempt.provider_progress_revision == 1
+
+    item_two = _claim(backend, request_two.request_id)
+    claim_token = storage.activate_execution_claim(
+        item_two.request_id, item_two.execution_generation,
+        item_two.claim_token)
+    try:
+        assert not hasattr(store, 'commit_intent')
+        with pytest.raises(actions.InvariantViolation,
+                           match='crossed active intent'):
+            store.write_provider_progress(request_two.request_id, seed, 1)
+        bound = dict(seed)
+        bound['worker_attestation'] = _typed_progress(
+            item_two, store)['worker_attestation']
+        intent = store.commit_intent_with_progress(request_two.request_id,
+                                                   bound, 1)
+        assert intent.provider_progress_revision == 2
+        assert intent.provider_progress == bound
+        assert intent.provider_io_boundary is (
+            actions.ProviderIOBoundary.INTENT_COMMITTED)
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+
+
+@pytest.mark.parametrize('corruption,match', [
+    ('succeeded_cursor', 'SUCCEEDED progress cannot be retried'),
+    ('unauthorized_outcome', 'does not authorize retry'),
+])
+def test_retry_materialization_rejects_invalid_settled_predecessor(
+        action_database, corruption, match):
+    engine, backend, store = action_database
+    action, _, _, reduced = _settle_first_attempt_for_retry(
+        engine, backend, store)
+    with engine.begin() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                1).with_for_update()).mappings().one()
+        if corruption == 'succeeded_cursor':
+            progress = copy.deepcopy(row['provider_progress'])
+            progress['cursor']['phase'] = 'SUCCEEDED'
+            values = {
+                'provider_progress': progress,
+                'provider_progress_sha256': actions.canonical_sha256(progress),
+            }
+        else:
+            outcome = copy.deepcopy(row['typed_outcome'])
+            outcome['disposition'] = 'succeeded'
+            values = {
+                'typed_outcome': outcome,
+                'typed_outcome_sha256': actions.canonical_sha256(outcome),
+            }
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                1).values(**values))
+    with pytest.raises(actions.ActionConflict, match=match):
+        store.materialize(action.action_id, reduced.action.revision, 2,
+                          _request(action.action_id, 2))
+
+
+@pytest.mark.parametrize(
+    'corruption',
+    ['attested_seed', 'mismatched_cursor', 'wrong_local_revision'])
+def test_lost_ack_rejects_corrupt_inherited_retry_seed(action_database,
+                                                       corruption):
+    engine, backend, store = action_database
+    action, _, predecessor_progress, reduced = (_settle_first_attempt_for_retry(
+        engine, backend, store))
+    request_two = _request(action.action_id, 2)
+    created = store.materialize(action.action_id, reduced.action.revision, 2,
+                                request_two)
+    assert created is not None and created.created
+    with engine.begin() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                2).with_for_update()).mappings().one()
+        progress = copy.deepcopy(row['provider_progress'])
+        values = {}
+        if corruption == 'attested_seed':
+            progress['worker_attestation'] = predecessor_progress[
+                'worker_attestation']
+        elif corruption == 'mismatched_cursor':
+            progress['cursor']['phase'] = 'OBJECT_CREATED'
+        else:
+            values['provider_progress_revision'] = 2
+        if corruption != 'wrong_local_revision':
+            values.update({
+                'provider_progress': progress,
+                'provider_progress_sha256': actions.canonical_sha256(progress),
+            })
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                2).values(**values))
+    adopted = store.materialize(action.action_id, reduced.action.revision, 2,
+                                request_two)
+    assert adopted is not None and adopted.blocked
+    assert adopted.action.kernel_state is actions.KernelState.BLOCKED
+
+
+def test_null_progress_retry_takes_fresh_cursor_branch(action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    materialized = store.materialize(action.action_id, 1, 1, request)
+    assert materialized is not None and materialized.created
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    reduced = _reduce_retry(engine, store, action, request)
+    assert reduced.attempt.provider_io_boundary is (
+        actions.ProviderIOBoundary.NOT_STARTED)
+    assert reduced.attempt.provider_progress is None
+
+    request_two = _request(action.action_id, 2)
+    second = store.materialize(action.action_id, reduced.action.revision, 2,
+                               request_two)
+    assert second is not None and second.created
+    assert second.attempt is not None
+    assert second.attempt.provider_progress is None
+    assert second.attempt.provider_progress_revision == 0
+    item_two = _claim(backend, request_two.request_id)
+    claim_token = storage.activate_execution_claim(
+        item_two.request_id, item_two.execution_generation,
+        item_two.claim_token)
+    try:
+        first = _typed_progress(item_two, store)
+        intent = store.commit_intent_with_progress(request_two.request_id,
+                                                   first, 0)
+        assert intent.provider_progress == first
+        assert intent.provider_progress_revision == 1
+        assert intent.provider_io_boundary is (
+            actions.ProviderIOBoundary.INTENT_COMMITTED)
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+
+
+def test_ready_reduction_rejects_crossed_provider_io_with_null_progress(
+        action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    materialized = store.materialize(action.action_id, 1, 1, request)
+    assert materialized is not None and materialized.created
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        # Simulate a self-consistent SQL-level corruption that API006's removed
+        # null-intent API can no longer create.
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                        action.action_id,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt == 1
+                    ).values(
+                        mutation_boundary=(
+                            actions.MutationBoundary.INTENT_COMMITTED.value),
+                        provider_io_boundary=(
+                            actions.ProviderIOBoundary.INTENT_COMMITTED.value)))
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    with pytest.raises(actions.ActionConflict,
+                       match='exact pre-I/O null cursor'):
+        _reduce_retry(engine, store, action, request)
+
+
+def test_reducer_locks_predecessor_before_current_attempt(
+        action_database, monkeypatch):
+    engine, backend, store = action_database
+    action, _, _, reduced = _settle_first_attempt_for_retry(
+        engine, backend, store)
+    request_two = _request(action.action_id, 2)
+    created = store.materialize(action.action_id, reduced.action.revision, 2,
+                                request_two)
+    assert created is not None and created.created
+    item = _claim(backend, request_two.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        assert backend.transition_request_terminal(
+            request_two.request_id, requests.RequestStatus.FAILED,
+            'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+
+    lock_order = []
+    original_action = store._locked_action
+    original_attempt = store._locked_attempt
+
+    def _record_action(*args, **kwargs):
+        lock_order.append(('action', str(args[1])))
+        return original_action(*args, **kwargs)
+
+    def _record_attempt(*args, **kwargs):
+        lock_order.append(('attempt', args[2]))
+        return original_attempt(*args, **kwargs)
+
+    monkeypatch.setattr(store, '_locked_action', _record_action)
+    monkeypatch.setattr(store, '_locked_attempt', _record_attempt)
+    request_input = actions.ActionRequestInput.from_request(
+        action.action_id, 2, request_two)
+
+    def reducer(*unused_args):
+        del unused_args
+        return actions.ActionReduction(kernel_state=actions.KernelState.READY,
+                                       typed_outcome={
+                                           'version': 1,
+                                           'disposition': 'retryable',
+                                           'provider_operation_id': None,
+                                       },
+                                       result={
+                                           'version': 1,
+                                           'classification': 'transient',
+                                       },
+                                       retry_after_seconds=0)
+
+    with engine.begin() as connection:
+        store.reduce_in_transaction(connection, action.action_id, 2,
+                                    created.action.revision, request_input,
+                                    reducer)
+    assert lock_order[:3] == [('action', str(action.action_id)), ('attempt', 1),
+                              ('attempt', 2)]
+
+
+@pytest.mark.parametrize('journal_id,typed_id,expected_id,error_match', [
+    (None, None, None, None),
+    ('operation-1', None, 'operation-1', None),
+    ('operation-1', 'operation-1', 'operation-1', None),
+    ('operation-1', 'operation-2', None, 'conflicts with journaled'),
+    (None, 'operation-1', None, 'cannot create provider operation'),
+])
+def test_settlement_provider_operation_id_matrix(action_database, journal_id,
+                                                 typed_id, expected_id,
+                                                 error_match):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    materialized = store.materialize(action.action_id, 1, 1, request)
+    assert materialized is not None and materialized.created
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        store.commit_intent_with_progress(request.request_id,
+                                          _typed_progress(item, store), 0)
+        store.record_submission(request.request_id, journal_id)
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    request_input = actions.ActionRequestInput.from_request(
+        action.action_id, 1, request)
+
+    def reducer(*unused_args):
+        del unused_args
+        return actions.ActionReduction(
+            kernel_state=actions.KernelState.TERMINAL,
+            typed_outcome={
+                'version': 1,
+                'disposition': 'terminal_error',
+                'provider_operation_id': typed_id,
+            },
+            result={
+                'version': 1,
+                'classification': 'terminal',
+            },
+            terminal_disposition='terminal_error')
+
+    if error_match is not None:
+        with engine.begin() as connection:
+            with pytest.raises(actions.ActionConflict, match=error_match):
+                store.reduce_in_transaction(connection, action.action_id, 1, 2,
+                                            request_input, reducer)
+        return
+    with engine.begin() as connection:
+        settled = store.reduce_in_transaction(connection, action.action_id, 1,
+                                              2, request_input, reducer)
+    assert settled.attempt.provider_operation_id == expected_id
+    assert settled.attempt.typed_outcome is not None
+    assert settled.attempt.typed_outcome['provider_operation_id'] == expected_id
+
+
+def test_settled_replay_revalidates_closed_typed_outcome(action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    store.materialize(action.action_id, 1, 1, request)
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        store.commit_intent_with_progress(request.request_id,
+                                          _typed_progress(item, store), 0)
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    request_input = actions.ActionRequestInput.from_request(
+        action.action_id, 1, request)
+
+    def reducer(*unused_args):
+        del unused_args
+        return actions.ActionReduction(
+            kernel_state=actions.KernelState.TERMINAL,
+            typed_outcome={
+                'version': 1,
+                'disposition': 'terminal_error',
+                'provider_operation_id': None,
+            },
+            result={
+                'version': 1,
+                'classification': 'terminal',
+            },
+            terminal_disposition='terminal_error')
+
+    with engine.begin() as connection:
+        store.reduce_in_transaction(connection, action.action_id, 1, 2,
+                                    request_input, reducer)
+    malformed = {'version': 1, 'provider_operation_id': None}
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                1).values(
+                    typed_outcome=malformed,
+                    typed_outcome_sha256=actions.canonical_sha256(malformed)))
+    with engine.begin() as connection:
+        with pytest.raises(actions.InvariantViolation,
+                           match='snapshot is invalid'):
+            store.reduce_in_transaction(
+                connection, action.action_id, 1, 2, request_input,
+                lambda *args: pytest.fail(f'reducer replayed: {args!r}'))
+
+
 def test_expired_claim_cannot_commit_intent(action_database):
     engine, backend, store = action_database
     action = _admit(engine, store, _new_action())
@@ -455,7 +1293,8 @@ def test_expired_claim_cannot_commit_intent(action_database):
                                                    item.claim_token)
     try:
         with pytest.raises(actions.ClaimLost, match='live claim'):
-            store.commit_intent(request.request_id)
+            store.commit_intent_with_progress(request.request_id,
+                                              _typed_progress(item, store), 0)
     finally:
         storage.deactivate_execution_claim(claim_token)
 

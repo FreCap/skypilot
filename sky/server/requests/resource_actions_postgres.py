@@ -36,10 +36,20 @@ def _mapping_value(mapping: Mapping[str, Any], key: str) -> Any:
 def _json_object(value: Any, *, name: str) -> actions.JsonObject:
     if not isinstance(value, Mapping):
         raise actions.InvariantViolation(f'{name} is not a JSON object.')
-    normalized = actions._normalize_json(value)  # pylint: disable=protected-access
-    if not isinstance(normalized, dict):
-        raise actions.InvariantViolation(f'{name} is not a JSON object.')
-    return normalized
+    try:
+        normalized = actions._canonical_object(  # pylint: disable=protected-access
+            value, name=name)
+        raw_bytes = json.dumps(value,
+                               sort_keys=True,
+                               separators=(',', ':'),
+                               ensure_ascii=False,
+                               allow_nan=False).encode('utf-8')
+        if raw_bytes != actions.canonical_json_bytes(normalized):
+            raise ValueError('stored value is not already canonical')
+        return normalized
+    except (TypeError, ValueError) as e:
+        raise actions.InvariantViolation(
+            f'{name} violates canonical object bounds: {e}') from e
 
 
 def _sha256_text(value: Any, *, name: str) -> str:
@@ -174,10 +184,33 @@ def _attempt_record(row: Mapping[str, Any]) -> actions.AttemptRecord:
             raise ValueError('typed outcome/hash shape mismatch')
         boundary = actions.MutationBoundary(
             str(_mapping_value(row, 'mutation_boundary')))
-        if (boundary not in (actions.MutationBoundary.SUBMITTED_OR_AMBIGUOUS,
-                             actions.MutationBoundary.SETTLED) and
+        provider_io_boundary = actions.ProviderIOBoundary(
+            str(_mapping_value(row, 'provider_io_boundary')))
+        if (boundary is not actions.MutationBoundary.SETTLED and
+                boundary.value != provider_io_boundary.value):
+            raise ValueError('unsettled request/provider boundaries differ')
+        if (provider_io_boundary
+                is not actions.ProviderIOBoundary.SUBMITTED_OR_AMBIGUOUS and
                 provider_operation_id is not None):
             raise ValueError('provider operation ID precedes submission')
+        provider_progress_raw = row.get('provider_progress')
+        provider_progress = (_json_object(provider_progress_raw,
+                                          name='provider_progress')
+                             if provider_progress_raw is not None else None)
+        provider_progress_sha256 = row.get('provider_progress_sha256')
+        if provider_progress_sha256 is not None:
+            provider_progress_sha256 = _sha256_text(
+                provider_progress_sha256, name='provider_progress_sha256')
+        progress_revision = _mapping_value(row, 'provider_progress_revision')
+        if (not isinstance(progress_revision, int) or
+                isinstance(progress_revision, bool) or progress_revision < 0):
+            raise ValueError('provider progress revision is negative')
+        if ((provider_progress is None) != (provider_progress_sha256 is None) or
+            (provider_progress is None) != (progress_revision == 0) or
+            (provider_progress is not None and
+             actions.canonical_sha256(provider_progress)
+             != provider_progress_sha256)):
+            raise ValueError('provider progress/hash/revision shape mismatch')
         terminal_state = row.get('request_terminal_state')
         admitted_at = _timestamp(_mapping_value(row, 'admitted_at'),
                                  name='admitted_at')
@@ -208,6 +241,12 @@ def _attempt_record(row: Mapping[str, Any]) -> actions.AttemptRecord:
             request_input_sha256=request_input_sha256,
             provider_operation_id=provider_operation_id,
             mutation_boundary=boundary,
+            provider_io_boundary=provider_io_boundary,
+            provider_progress=provider_progress,
+            provider_progress_sha256=(str(provider_progress_sha256)
+                                      if provider_progress_sha256 is not None
+                                      else None),
+            provider_progress_revision=progress_revision,
             typed_outcome=typed_outcome,
             typed_outcome_sha256=(str(typed_outcome_sha256) if
                                   typed_outcome_sha256 is not None else None),
@@ -315,9 +354,22 @@ def _bounded_conflict_result(code: str, request_id: str) -> actions.JsonObject:
 class PostgresResourceActionStore:
     """Typed PostgreSQL store reusing the existing request queue and lease."""
 
-    def __init__(self, engine: sqlalchemy.engine.Engine | None = None) -> None:
+    def __init__(
+        self,
+        engine: sqlalchemy.engine.Engine | None = None,
+        *,
+        provider_progress_contract: actions.ProviderProgressContract,
+    ) -> None:
         self._engine = engine
         self._instance_id = request_postgres.ensure_server_instance_id()
+        self._provider_progress_contract = provider_progress_contract
+        for method_name in ('retry_seed', 'validate_attempt_snapshot',
+                            'validate_progress_transition',
+                            'validate_reduction'):
+            if not callable(
+                    getattr(provider_progress_contract, method_name, None)):
+                raise TypeError('provider_progress_contract is missing '
+                                f'{method_name}().')
 
     def _database(self) -> sqlalchemy.engine.Engine:
         return self._engine or request_postgres.initialize_and_get_db()
@@ -527,6 +579,106 @@ class PostgresResourceActionStore:
                     )
         return rows
 
+    def _derive_retry_seed(
+        self,
+        action: actions.ActionRecord,
+        predecessor: actions.AttemptRecord,
+    ) -> actions.JsonObject | None:
+        """Validate a settled predecessor and derive its sole retry seed."""
+        if predecessor.mutation_boundary is not actions.MutationBoundary.SETTLED:
+            raise actions.ActionConflict('Retry predecessor is not settled.')
+        if predecessor.typed_outcome is None:
+            raise actions.InvariantViolation(
+                'Settled retry predecessor has no typed outcome.')
+        if predecessor.provider_progress is None:
+            if (predecessor.provider_io_boundary
+                    is not actions.ProviderIOBoundary.NOT_STARTED or
+                    predecessor.provider_progress_sha256 is not None or
+                    predecessor.provider_progress_revision != 0 or
+                    predecessor.provider_operation_id is not None):
+                raise actions.ActionConflict(
+                    'A fresh retry cursor requires the exact predecessor '
+                    'pre-I/O shape.')
+        try:
+            seed_value = self._provider_progress_contract.retry_seed(
+                action, predecessor)
+            seed = (
+                None if seed_value is None else actions._canonical_object(  # pylint: disable=protected-access
+                    seed_value,
+                    name='derived_provider_progress_seed'))
+        except (TypeError, ValueError) as e:
+            raise actions.ActionConflict(
+                f'Typed retry seed derivation rejected the predecessor: {e}'
+            ) from e
+        if ((predecessor.provider_progress is None) != (seed is None)):
+            raise actions.ActionConflict(
+                'Typed retry seed presence differs from predecessor progress.')
+        return seed
+
+    def _validate_progress_snapshot(
+        self,
+        action: actions.ActionRecord,
+        predecessor: actions.AttemptRecord | None,
+        attempt: actions.AttemptRecord,
+        execution_fence: actions.AttemptExecutionFence | None,
+    ) -> None:
+        try:
+            self._provider_progress_contract.validate_attempt_snapshot(
+                action, predecessor, attempt, execution_fence)
+        except (TypeError, ValueError) as e:
+            raise actions.InvariantViolation(
+                f'Typed provider progress snapshot is invalid: {e}') from e
+
+    def _validate_progress_transition(
+        self,
+        action: actions.ActionRecord,
+        predecessor: actions.AttemptRecord | None,
+        attempt: actions.AttemptRecord,
+        execution_fence: actions.AttemptExecutionFence,
+        proposed_progress: actions.JsonObject,
+    ) -> None:
+        self._validate_progress_snapshot(action, predecessor, attempt,
+                                         execution_fence)
+        try:
+            self._provider_progress_contract.validate_progress_transition(
+                action, predecessor, attempt, execution_fence,
+                proposed_progress)
+        except (TypeError, ValueError) as e:
+            raise actions.ActionConflict(
+                f'Typed provider progress transition is invalid: {e}') from e
+
+    def _validate_reduction_contract(
+        self,
+        action: actions.ActionRecord,
+        predecessor: actions.AttemptRecord | None,
+        attempt: actions.AttemptRecord,
+        reduction: actions.ActionReduction,
+    ) -> None:
+        if reduction.kernel_state is actions.KernelState.READY:
+            if attempt.provider_progress is None:
+                if (attempt.provider_io_boundary
+                        is not actions.ProviderIOBoundary.NOT_STARTED or
+                        attempt.provider_progress_sha256 is not None or
+                        attempt.provider_progress_revision != 0 or
+                        attempt.provider_operation_id is not None):
+                    raise actions.ActionConflict(
+                        'Retry reduction requires an exact pre-I/O null cursor '
+                        'or a retained typed cursor.')
+            elif attempt.provider_io_boundary is (
+                    actions.ProviderIOBoundary.NOT_STARTED):
+                if (attempt.attempt <= 1 or predecessor is None or
+                        attempt.provider_progress_revision != 1 or
+                        attempt.provider_operation_id is not None):
+                    raise actions.ActionConflict(
+                        'A NOT_STARTED retry cursor must be the exact inherited '
+                        'revision-one seed.')
+        try:
+            self._provider_progress_contract.validate_reduction(
+                action, predecessor, attempt, reduction)
+        except (TypeError, ValueError) as e:
+            raise actions.ActionConflict(
+                f'Typed action reduction is invalid: {e}') from e
+
     def materialize(
         self,
         action_id: uuid.UUID,
@@ -571,6 +723,16 @@ class PostgresResourceActionStore:
                         action.next_attempt_at > database_now):
                     raise actions.StaleRevision(
                         f'Action {action.action_id} is not due.')
+                predecessor: actions.AttemptRecord | None = None
+                progress_seed: actions.JsonObject | None = None
+                if expected_attempt > 1:
+                    predecessor_row = self._locked_attempt(
+                        connection, action.action_id, expected_attempt - 1)
+                    if predecessor_row is None:
+                        raise actions.InvariantViolation(
+                            'Retry materialization is missing its predecessor.')
+                    predecessor = _attempt_record(predecessor_row)
+                    progress_seed = self._derive_retry_seed(action, predecessor)
                 inserted_attempt = connection.execute(
                     postgresql.insert(
                         request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
@@ -581,6 +743,14 @@ class PostgresResourceActionStore:
                             provider_operation_id=None,
                             mutation_boundary=(
                                 actions.MutationBoundary.NOT_STARTED.value),
+                            provider_io_boundary=(
+                                actions.ProviderIOBoundary.NOT_STARTED.value),
+                            provider_progress=progress_seed,
+                            provider_progress_sha256=(
+                                actions.canonical_sha256(progress_seed)
+                                if progress_seed is not None else None),
+                            provider_progress_revision=(1 if progress_seed
+                                                        is not None else 0),
                             typed_outcome=None,
                             typed_outcome_sha256=None,
                             request_terminal_state=None,
@@ -613,6 +783,25 @@ class PostgresResourceActionStore:
                     return actions.MaterializationResult(blocked,
                                                          None,
                                                          blocked=True)
+                inserted_attempt_row = self._locked_attempt(
+                    connection, action.action_id, expected_attempt)
+                if inserted_attempt_row is None:
+                    raise actions.InvariantViolation(
+                        'Attempt insert succeeded without a durable row.')
+                inserted_attempt_record = _attempt_record(inserted_attempt_row)
+                try:
+                    self._validate_progress_snapshot(action, predecessor,
+                                                     inserted_attempt_record,
+                                                     None)
+                except actions.ResourceActionError:
+                    blocked = self._block_locked_action(
+                        connection,
+                        action,
+                        attempt=expected_attempt,
+                        request_id=request_input.request_id,
+                        code='inserted_attempt_progress_contract')
+                    return actions.MaterializationResult(
+                        blocked, inserted_attempt_record, blocked=True)
                 inserted_request = request_postgres._insert_request_and_queue(  # pylint: disable=protected-access
                     connection,
                     request,
@@ -647,6 +836,16 @@ class PostgresResourceActionStore:
                 if (attempt.request_id != request_input.request_id or
                         attempt.request_input_sha256 != request_input.sha256):
                     mismatches.append('attempt_commitment')
+                if (not _same_canonical_value(attempt.provider_progress,
+                                              progress_seed) or
+                        attempt.provider_progress_revision
+                        != (1 if progress_seed is not None else 0)):
+                    mismatches.append('attempt_progress_seed')
+                try:
+                    self._validate_progress_snapshot(action, predecessor,
+                                                     attempt, None)
+                except actions.ResourceActionError:
+                    mismatches.append('attempt_progress_contract')
                 if mismatches:
                     blocked = self._block_locked_action(
                         connection,
@@ -686,6 +885,18 @@ class PostgresResourceActionStore:
                     raise actions.StaleRevision(
                         f'Action {action.action_id} is not the expected '
                         'lost-ack materialization.')
+                predecessor = None
+                if expected_attempt > 1:
+                    predecessor_row = self._locked_attempt(
+                        connection, action.action_id, expected_attempt - 1)
+                    if predecessor_row is None:
+                        raise actions.InvariantViolation(
+                            'Lost-ACK retry adoption is missing its predecessor.'
+                        )
+                    predecessor = _attempt_record(predecessor_row)
+                    # Re-derivation validates the settled predecessor's typed
+                    # outcome/cursor without accepting any caller cursor.
+                    self._derive_retry_seed(action, predecessor)
                 attempt, request_row, queue_row = self._locked_binding(
                     connection, request_input)
                 if attempt is None or request_row is None:
@@ -707,6 +918,11 @@ class PostgresResourceActionStore:
                 if (attempt.request_id != request_input.request_id or
                         attempt.request_input_sha256 != request_input.sha256):
                     mismatches.append('attempt_commitment')
+                try:
+                    self._validate_progress_snapshot(action, predecessor,
+                                                     attempt, None)
+                except actions.ResourceActionError:
+                    mismatches.append('attempt_progress_contract')
                 if terminal and queue_row is not None:
                     mismatches.append('terminal_queue_present')
                 if mismatches:
@@ -731,7 +947,8 @@ class PostgresResourceActionStore:
         self,
         connection: sqlalchemy.engine.Connection,
         request_id: str,
-    ) -> tuple[actions.ActionRecord, actions.AttemptRecord]:
+    ) -> tuple[actions.ActionRecord, actions.AttemptRecord | None,
+               actions.AttemptRecord, actions.AttemptExecutionFence]:
         claim = request_storage.current_execution_claim(request_id)
         if claim is None:
             raise actions.ClaimLost(
@@ -753,6 +970,20 @@ class PostgresResourceActionStore:
             raise actions.InvariantViolation(
                 f'Correlated action {action_id} is missing.')
         action = _action_record(action_row)
+        predecessor: actions.AttemptRecord | None = None
+        if attempt_number > 1:
+            predecessor_row = self._locked_attempt(connection, action_id,
+                                                   attempt_number - 1)
+            if predecessor_row is None:
+                raise actions.InvariantViolation(
+                    f'Correlated attempt {action_id}/{attempt_number} has no '
+                    'predecessor.')
+            predecessor = _attempt_record(predecessor_row)
+            if predecessor.mutation_boundary is not (
+                    actions.MutationBoundary.SETTLED):
+                raise actions.InvariantViolation(
+                    f'Correlated attempt {action_id}/{attempt_number} has an '
+                    'unsettled predecessor.')
         attempt_row = self._locked_attempt(connection, action_id,
                                            attempt_number)
         if attempt_row is None:
@@ -799,32 +1030,142 @@ class PostgresResourceActionStore:
                 attempt.mutation_boundary is actions.MutationBoundary.SETTLED):
             raise actions.ClaimLost(
                 f'Request {request_id} is no longer the active action attempt.')
-        return action, attempt
+        fence_identity = actions.AttemptExecutionFence(
+            request_id=request_id,
+            execution_generation=claim.execution_generation,
+            claim_token=expected_token,
+            worker_instance_id=expected_worker,
+            controller_generation=request_row['controller_generation'])
+        return action, predecessor, attempt, fence_identity
 
-    def commit_intent(self, request_id: str) -> actions.AttemptRecord:
-        """Claim-fenced journal write that must commit before provider I/O."""
+    def commit_intent_with_progress(
+        self,
+        request_id: str,
+        provider_progress: Mapping[str, Any],
+        expected_progress_revision: int,
+    ) -> actions.AttemptRecord:
+        """Atomically cross intent and commit the first typed cursor.
+
+        The configured domain contract owns the closed cursor transition. This
+        store owns canonical bytes, revision monotonicity, claim fencing, and
+        the two boundary fields.
+        """
+        if (not isinstance(expected_progress_revision, int) or
+                isinstance(expected_progress_revision, bool) or
+                expected_progress_revision < 0):
+            raise ValueError('expected_progress_revision must be nonnegative.')
+        normalized = actions._canonical_object(  # pylint: disable=protected-access
+            provider_progress,
+            name='provider_progress')
+        progress_sha256 = actions.canonical_sha256(normalized)
         with self._database().begin() as connection:
-            _, attempt = self._lock_claimed_attempt(connection, request_id)
-            if attempt.mutation_boundary is actions.MutationBoundary.NOT_STARTED:
-                updated = connection.execute(
-                    sqlalchemy.update(
-                        request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
-                            request_postgres.RESOURCE_ACTION_ATTEMPTS.c.
-                            action_id == attempt.action_id,
-                            request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt
-                            == attempt.attempt).values(
-                                mutation_boundary=(actions.MutationBoundary.
-                                                   INTENT_COMMITTED.value),
-                                updated_at=sqlalchemy.func.clock_timestamp()))
-                if updated.rowcount != 1:
-                    raise actions.ClaimLost(
-                        f'Request {request_id} lost its intent journal fence.')
-            elif attempt.mutation_boundary not in (
+            action, predecessor, attempt, fence = self._lock_claimed_attempt(
+                connection, request_id)
+            self._validate_progress_transition(action, predecessor, attempt,
+                                               fence, normalized)
+            if (attempt.mutation_boundary
+                    is actions.MutationBoundary.INTENT_COMMITTED):
+                if (_same_canonical_value(attempt.provider_progress,
+                                          normalized) and
+                        attempt.provider_progress_sha256 == progress_sha256 and
+                        attempt.provider_progress_revision
+                        == expected_progress_revision + 1):
+                    return attempt
+                raise actions.InvariantViolation(
+                    'Typed intent replay differs from the committed cursor.')
+            if attempt.mutation_boundary is not (
+                    actions.MutationBoundary.NOT_STARTED):
+                raise actions.InvariantViolation(
+                    'Typed intent can only start from NOT_STARTED.')
+            if (attempt.provider_progress_revision
+                    != expected_progress_revision):
+                raise actions.StaleRevision(
+                    'Provider progress changed before intent commit.')
+            updated = connection.execute(
+                sqlalchemy.update(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                        attempt.action_id,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                        attempt.attempt, request_postgres.
+                        RESOURCE_ACTION_ATTEMPTS.c.mutation_boundary ==
+                        actions.MutationBoundary.NOT_STARTED.value,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.
+                        provider_progress_revision == expected_progress_revision
+                    ).values(
+                        mutation_boundary=(actions.MutationBoundary.
+                                           INTENT_COMMITTED.value),
+                        provider_io_boundary=(
+                            actions.ProviderIOBoundary.INTENT_COMMITTED.value),
+                        provider_progress=normalized,
+                        provider_progress_sha256=progress_sha256,
+                        provider_progress_revision=(expected_progress_revision +
+                                                    1),
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            if updated.rowcount != 1:
+                raise actions.ClaimLost(
+                    f'Request {request_id} lost its typed intent fence.')
+            row = self._locked_attempt(connection, attempt.action_id,
+                                       attempt.attempt)
+            assert row is not None
+            return _attempt_record(row)
+
+    def write_provider_progress(
+        self,
+        request_id: str,
+        provider_progress: Mapping[str, Any],
+        expected_progress_revision: int,
+    ) -> actions.AttemptRecord:
+        """Claim-fenced monotonic typed provider-progress checkpoint."""
+        if (not isinstance(expected_progress_revision, int) or
+                isinstance(expected_progress_revision, bool) or
+                expected_progress_revision <= 0):
+            raise ValueError('expected_progress_revision must be positive.')
+        normalized = actions._canonical_object(  # pylint: disable=protected-access
+            provider_progress,
+            name='provider_progress')
+        progress_sha256 = actions.canonical_sha256(normalized)
+        with self._database().begin() as connection:
+            action, predecessor, attempt, fence = self._lock_claimed_attempt(
+                connection, request_id)
+            if attempt.mutation_boundary not in (
                     actions.MutationBoundary.INTENT_COMMITTED,
                     actions.MutationBoundary.SUBMITTED_OR_AMBIGUOUS):
                 raise actions.InvariantViolation(
-                    f'Cannot commit intent from '
-                    f'{attempt.mutation_boundary.value}.')
+                    'Provider progress requires a crossed active intent.')
+            if attempt.provider_progress is None:
+                raise actions.InvariantViolation(
+                    'Later provider progress is missing its first cursor.')
+            self._validate_progress_transition(action, predecessor, attempt,
+                                               fence, normalized)
+            if (_same_canonical_value(attempt.provider_progress, normalized) and
+                    attempt.provider_progress_sha256 == progress_sha256 and
+                    attempt.provider_progress_revision
+                    in (expected_progress_revision,
+                        expected_progress_revision + 1)):
+                return attempt
+            if (attempt.provider_progress_revision
+                    != expected_progress_revision):
+                raise actions.StaleRevision(
+                    'Provider progress revision changed before checkpoint.')
+            updated = connection.execute(
+                sqlalchemy.update(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                        attempt.action_id,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                        attempt.attempt,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.
+                        provider_progress_revision == expected_progress_revision
+                    ).values(
+                        provider_progress=normalized,
+                        provider_progress_sha256=progress_sha256,
+                        provider_progress_revision=(expected_progress_revision +
+                                                    1),
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            if updated.rowcount != 1:
+                raise actions.ClaimLost(
+                    f'Request {request_id} lost its progress fence.')
             row = self._locked_attempt(connection, attempt.action_id,
                                        attempt.attempt)
             assert row is not None
@@ -843,7 +1184,10 @@ class PostgresResourceActionStore:
                 name='provider_operation_id',
                 maximum_bytes=1024)
         with self._database().begin() as connection:
-            _, attempt = self._lock_claimed_attempt(connection, request_id)
+            action, predecessor, attempt, fence = self._lock_claimed_attempt(
+                connection, request_id)
+            self._validate_progress_snapshot(action, predecessor, attempt,
+                                             fence)
             if attempt.mutation_boundary is actions.MutationBoundary.NOT_STARTED:
                 raise actions.InvariantViolation(
                     'Provider submission cannot precede INTENT_COMMITTED.')
@@ -868,6 +1212,8 @@ class PostgresResourceActionStore:
                         attempt.attempt).values(
                             mutation_boundary=(actions.MutationBoundary.
                                                SUBMITTED_OR_AMBIGUOUS.value),
+                            provider_io_boundary=(actions.ProviderIOBoundary.
+                                                  SUBMITTED_OR_AMBIGUOUS.value),
                             provider_operation_id=(
                                 normalized_operation_id
                                 if normalized_operation_id is not None else
@@ -962,6 +1308,20 @@ class PostgresResourceActionStore:
             raise actions.InvariantViolation(
                 f'Unknown resource action {parsed_action_id}.')
         action = _action_record(action_row)
+        predecessor: actions.AttemptRecord | None = None
+        if attempt > 1:
+            predecessor_row = self._locked_attempt(connection, parsed_action_id,
+                                                   attempt - 1)
+            if predecessor_row is None:
+                raise actions.InvariantViolation(
+                    f'Action attempt {parsed_action_id}/{attempt} has no '
+                    'predecessor.')
+            predecessor = _attempt_record(predecessor_row)
+            if predecessor.mutation_boundary is not (
+                    actions.MutationBoundary.SETTLED):
+                raise actions.InvariantViolation(
+                    f'Action attempt {parsed_action_id}/{attempt} has an '
+                    'unsettled predecessor.')
         attempt_row = self._locked_attempt(connection, parsed_action_id,
                                            attempt)
         if attempt_row is None:
@@ -982,6 +1342,8 @@ class PostgresResourceActionStore:
                 raise actions.StaleRevision(
                     f'Settled action {action.action_id} has advanced beyond '
                     'this reduction replay.')
+            self._validate_progress_snapshot(action, predecessor,
+                                             attempt_record, None)
             return actions.ReductionResult(action,
                                            attempt_record,
                                            replayed=True)
@@ -1011,6 +1373,9 @@ class PostgresResourceActionStore:
                             terminal_request).normalized()
         typed_outcome = dict(reduction.typed_outcome)
         result_value = dict(reduction.result)
+        if 'provider_operation_id' not in typed_outcome:
+            raise actions.ActionConflict(
+                'Typed outcome is missing provider_operation_id.')
         typed_provider_operation_id = typed_outcome.get('provider_operation_id')
         if typed_provider_operation_id is not None:
             if not isinstance(typed_provider_operation_id, str):
@@ -1020,16 +1385,28 @@ class PostgresResourceActionStore:
                 typed_provider_operation_id,
                 name='provider_operation_id',
                 maximum_bytes=1024)
-            if (attempt_record.provider_operation_id is not None and
-                    attempt_record.provider_operation_id
+            if attempt_record.provider_operation_id is None:
+                raise actions.ActionConflict(
+                    'Typed outcome cannot create provider operation evidence '
+                    'that is absent from the claim-fenced journal.')
+            if (attempt_record.provider_operation_id
                     != typed_provider_operation_id):
                 raise actions.ActionConflict(
                     'Typed outcome conflicts with journaled provider '
                     'operation ID.')
-        provider_operation_id = (typed_provider_operation_id
-                                 if typed_provider_operation_id is not None else
-                                 attempt_record.provider_operation_id)
+        provider_operation_id = attempt_record.provider_operation_id
         typed_outcome['provider_operation_id'] = provider_operation_id
+        typed_outcome = actions._canonical_object(  # pylint: disable=protected-access
+            typed_outcome,
+            name='settled_typed_outcome')
+        reduction = actions.ActionReduction(
+            kernel_state=reduction.kernel_state,
+            typed_outcome=typed_outcome,
+            result=result_value,
+            retry_after_seconds=reduction.retry_after_seconds,
+            terminal_disposition=reduction.terminal_disposition).normalized()
+        self._validate_reduction_contract(action, predecessor, attempt_record,
+                                          reduction)
 
         settled = connection.execute(
             sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
@@ -1085,6 +1462,10 @@ class PostgresResourceActionStore:
                                                      parsed_action_id, attempt)
         assert committed_action_row is not None
         assert committed_attempt_row is not None
-        return actions.ReductionResult(_action_record(committed_action_row),
-                                       _attempt_record(committed_attempt_row),
+        committed_action = _action_record(committed_action_row)
+        committed_attempt = _attempt_record(committed_attempt_row)
+        self._validate_progress_snapshot(committed_action, predecessor,
+                                         committed_attempt, None)
+        return actions.ReductionResult(committed_action,
+                                       committed_attempt,
                                        replayed=False)

@@ -66,6 +66,8 @@ def role_is_draining() -> bool:
 
 _METADATA = postgres_schema.metadata
 REQUESTS = postgres_schema.REQUESTS
+RESOURCE_ACTIONS = postgres_schema.RESOURCE_ACTIONS
+RESOURCE_ACTION_ATTEMPTS = postgres_schema.RESOURCE_ACTION_ATTEMPTS
 QUEUE = postgres_schema.QUEUE
 STORE_METADATA = postgres_schema.STORE_METADATA
 SERVER_INSTANCES = postgres_schema.SERVER_INSTANCES
