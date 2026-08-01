@@ -15,6 +15,9 @@ mock_provider "aws" {
       arn      = "arn:aws:eks:us-east-2:210987654321:cluster/gpu-pool"
       endpoint = "https://example.eks.amazonaws.com"
       id       = "gpu-pool"
+      vpc_config = [{
+        cluster_security_group_id = "sg-0fedcba9876543210"
+      }]
     }
   }
 }
@@ -27,6 +30,10 @@ variables {
   aws_region          = "us-east-2"
   eks_cluster_name    = "gpu-pool"
   controller_role_arn = "arn:aws:iam::123456789012:role/skypilot-api"
+  cluster_api_ingress_cidrs = [
+    "10.20.0.0/16",
+    "10.30.0.0/16",
+  ]
   partitions = [
     {
       namespace                    = "training"
@@ -110,6 +117,14 @@ run "commercial_pool_preserves_partition_identity_shapes" {
   assert {
     condition     = aws_security_group_rule.serve_probe_from_control_plane[0].description == "SkyServe probe traffic from the control plane"
     error_message = "The probe rule must use the reusable default description."
+  }
+
+  assert {
+    condition = (
+      aws_security_group_rule.cluster_api_from_control_plane[0].security_group_id == "sg-0fedcba9876543210" &&
+      aws_security_group_rule.cluster_api_from_control_plane[0].cidr_blocks == tolist(["10.20.0.0/16", "10.30.0.0/16"])
+    )
+    error_message = "Private API ingress must target the EKS-managed cluster security group and preserve the reviewed CIDRs."
   }
 
   assert {

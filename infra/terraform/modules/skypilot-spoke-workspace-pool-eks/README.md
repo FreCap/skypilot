@@ -3,11 +3,11 @@
 Connect workspace workloads to an existing spoke Amazon EKS cluster. The module
 maps one SkyPilot control-plane IAM role to namespaced Kubernetes RBAC and can
 optionally create Pod Identity associations, exact-priority admission policies,
-static FSx volumes, and a one-port SkyServe probe ingress rule. It does not
-provision the cluster. A pool may serve multiple workspaces, and a workspace may
-target more than one pool. “Spoke” is logical and does not require a separate
-cluster. This infrastructure package is unrelated to a managed Job Pool operated
-through `sky jobs pool`.
+static FSx volumes, private EKS API ingress, and a one-port SkyServe probe
+ingress rule. It does not provision the cluster. A pool may serve multiple
+workspaces, and a workspace may target more than one pool. “Spoke” is logical
+and does not require a separate cluster. This infrastructure package is
+unrelated to a managed Job Pool operated through `sky jobs pool`.
 
 This is a provider-neutral child module. It declares provider requirements but
 does not configure credentials or cluster authentication.
@@ -29,6 +29,8 @@ does not configure credentials or cluster authentication.
   `priority_class` is enabled.
 - Network routing from the control plane to workload pod IPs before enabling
   `serve_probe_ingress`.
+- Private network routing from each source CIDR to the EKS endpoint before
+  setting `cluster_api_ingress_cidrs`.
 
 Service availability can differ across AWS commercial, GovCloud, and China
 partitions. Partition-correct ARN and DNS construction does not imply that EKS,
@@ -50,6 +52,8 @@ module "spoke_workspace_pool" {
   aws_region          = "us-east-2"
   eks_cluster_name    = "gpu-pool"
   controller_role_arn = "arn:aws:iam::123456789012:role/skypilot-api"
+
+  cluster_api_ingress_cidrs = ["10.20.0.0/16"]
 
   partitions = [
     {
@@ -130,6 +134,11 @@ Each FSx entry creates a static `Retain` PV and a namespaced PVC. Lustre uses
 `fsx.openzfs.csi.aws.com` and rejects `mountname`. The endpoint is derived as
 `<filesystem-id>.fsx.<region>.<AWS partition DNS suffix>`.
 
+`cluster_api_ingress_cidrs` adds TCP/443 ingress to the EKS-managed cluster
+security group used by private endpoint interfaces. It rejects public `/0`
+sources. Configure routing and private DNS separately; this rule alone does not
+make a private endpoint reachable.
+
 `serve_probe_ingress` mutates a caller-owned security group. It grants one TCP
 port from one IPv4 CIDR and rejects `0.0.0.0/0` unless
 `allow_public_cidr = true` is explicitly set. Review that ownership edge before
@@ -179,6 +188,7 @@ replacement, deletion, namespace recreation, or PV recreation.
 |------|------|
 | [aws_eks_access_entry.pool](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_access_entry) | resource |
 | [aws_eks_pod_identity_association.pool_sa](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_pod_identity_association) | resource |
+| [aws_security_group_rule.cluster_api_from_control_plane](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group_rule) | resource |
 | [aws_security_group_rule.serve_probe_from_control_plane](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group_rule) | resource |
 | [kubernetes_manifest.partition_priority_binding](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest) | resource |
 | [kubernetes_manifest.partition_priority_policy](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest) | resource |
@@ -194,6 +204,7 @@ replacement, deletion, namespace recreation, or PV recreation.
 |------|-------------|------|---------|:--------:|
 | <a name="input_aws_profile"></a> [aws\_profile](#input\_aws\_profile) | Optional AWS CLI profile exposed through local.exec\_env for Terragrunt<br/>callers that generate an aws eks get-token Kubernetes provider in the<br/>downloaded module directory. Ordinary Terraform callers may leave this<br/>null and pass their own configured providers. | `string` | `null` | no |
 | <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | Region of the existing EKS cluster. | `string` | n/a | yes |
+| <a name="input_cluster_api_ingress_cidrs"></a> [cluster\_api\_ingress\_cidrs](#input\_cluster\_api\_ingress\_cidrs) | IPv4 CIDRs from which the SkyPilot control plane may reach the existing<br/>EKS cluster's private API endpoint. The module adds one TCP/443 rule to the<br/>EKS-managed cluster security group. The default creates no rule, and public<br/>/0 sources are rejected. | `list(string)` | `[]` | no |
 | <a name="input_controller_role_arn"></a> [controller\_role\_arn](#input\_controller\_role\_arn) | IAM role ARN used by the SkyPilot control plane. The module maps this<br/>principal to every partition's RBAC group through one EKS access entry.<br/>Cross-account roles are supported within the active AWS partition. | `string` | n/a | yes |
 | <a name="input_eks_cluster_name"></a> [eks\_cluster\_name](#input\_eks\_cluster\_name) | Name of the existing EKS cluster to register as a SkyPilot pool. | `string` | n/a | yes |
 | <a name="input_partitions"></a> [partitions](#input\_partitions) | Workload partitions to register. Each item creates namespaced RBAC and can<br/>optionally create a Pod Identity association, an exact-priority admission<br/>policy, and static FSx PV/PVC pairs.<br/><br/>A partition is a workload credential and storage partition, not an<br/>independent tenant boundary. The same controller principal receives every<br/>configured group. Pin each SkyPilot workspace to its intended namespace and<br/>audit pre-existing service-account associations and namespaced resources.<br/><br/>Durable identity keys are namespace, group, priority-class name, FSx claim<br/>name, and the derived RBAC resource names. Change them only with a reviewed<br/>Terraform state and workload migration. | <pre>list(object({<br/>    namespace                    = string<br/>    group                        = optional(string)<br/>    manage_namespace             = optional(bool, true)<br/>    pod_identity_role_arn        = optional(string, "")<br/>    pod_identity_service_account = optional(string, "skypilot-pool-sa")<br/><br/>    priority_class = optional(object({<br/>      value = number<br/>      name  = optional(string)<br/>    }))<br/><br/>    fsx_volumes = optional(list(object({<br/>      claim_name    = string<br/>      volume_handle = string<br/>      storage_class = string<br/>      capacity      = string<br/>      driver        = optional(string, "fsx.csi.aws.com")<br/>      mountname     = optional(string)<br/>    })), [])<br/>  }))</pre> | n/a | yes |

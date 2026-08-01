@@ -201,6 +201,30 @@ variable "tags" {
   default     = {}
 }
 
+variable "cluster_api_ingress_cidrs" {
+  description = <<-EOT
+    IPv4 CIDRs from which the SkyPilot control plane may reach the existing
+    EKS cluster's private API endpoint. The module adds one TCP/443 rule to the
+    EKS-managed cluster security group. The default creates no rule, and public
+    /0 sources are rejected.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = (
+      length(var.cluster_api_ingress_cidrs) ==
+      length(distinct(var.cluster_api_ingress_cidrs)) &&
+      alltrue([
+        for cidr in var.cluster_api_ingress_cidrs :
+        can(cidrnetmask(cidr)) &&
+        try(tonumber(split("/", cidr)[1]) > 0, false)
+      ])
+    )
+    error_message = "cluster_api_ingress_cidrs must contain unique, valid IPv4 CIDRs and must not contain a /0 source."
+  }
+}
+
 variable "serve_probe_ingress" {
   description = <<-EOT
     Optional one-port ingress rule on a caller-owned node security group for a
