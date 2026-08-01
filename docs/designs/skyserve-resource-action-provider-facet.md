@@ -514,13 +514,20 @@ ProviderWorkloadNameBasisV1 = {
   cluster_name_hash_length: 8
 }
 
+ProviderPodTopologyMutableObjectV1 = {
+  kind: "Service" | "Pod",
+  role: "head_ssh_service" | "head_service" | "head_pod",
+  name: Text,
+  labels: [{key: Text, value: Text}]
+}
+
 ProviderPodTopologyV1 = {
   version: 1,
   kind: "single_direct_pod_two_services",
   node_count: 1,
   application_port: DecimalPortText,
   resources_ports: [DecimalPortText],
-  mutable_objects: [
+  mutable_objects: [  # each entry is ProviderPodTopologyMutableObjectV1
     {kind: "Service", role: "head_ssh_service", name: Text,
      labels: [{key: Text, value: Text}]},
     {kind: "Service", role: "head_service", name: Text,
@@ -748,12 +755,21 @@ during the action. Worker Pods, workload Deployments, persistent claims,
 generic bootstrap mutation, and every extra Kubernetes object are not
 representable. The one workload Pod uses the digest-pinned prebooted
 Ray/Skylet runtime and accepts exactly one idempotent job RPC after startup.
-Each of the three mutable objects carries
-the exact final label map, including display-cluster name,
+Each of the three mutable objects carries its role-specific exact final label
+map, including the display-cluster label `skypilot-cluster-name`,
 `skypilot.co/cluster-record-uuid`, and
 `skypilot.co/serve-replica-incarnation`. Source, policy, resource, and
 `custom_metadata` inputs that contain either reserved identity label are
 rejected before the system labels are injected after all allowed merges.
+The three complete maps are not byte-equal: the Pod has its fixed head and
+component labels while the two Services have their fixed Service labels. Each
+map is independently sorted by unique key. The display-label value is the
+provider cluster name (the workload name without its terminal `-head`); it and
+the values of the two reserved identity labels are byte-equal across all three
+maps, and the two reserved values are canonical UUID text. For each role, the topology label
+bytes equal that role's request-body `metadata.labels`; every
+`required_identity_labels` map is the exact shared three-label subset, not a
+replacement for the role-specific final map.
 Create, adopt, observe, and delete validate every recorded object, label, and
 normalized semantic spec; the Pod remains the primary resolved target.
 
@@ -1851,6 +1867,25 @@ ProviderDownInvocationV1 = {
   graceful_timeout: null
 }
 
+DecimalPortText = canonical ASCII decimal text matching
+  `[1-9][0-9]{0,4}` whose integer value is at most 65535. Leading zeroes,
+  signs, whitespace, ranges, and alternate numeric spellings are invalid.
+  This type applies to workload application and Skylet management ports; the
+  integer port inside `ProviderKubernetesServerOriginV1` is a separate
+  transport-decomposition field and is not silently coerced through this type.
+
+DigestPinnedOCIReference = canonical secret-free OCI reference accepted
+  byte-for-byte by `sky.container_images.models.validate_oci_reference`, with
+  one terminal `@sha256:` plus 64 lowercase hexadecimal characters. Its parsed
+  digest must equal the enclosing `oci_manifest_digest`. The reusable leaf may
+  retain a validator-accepted tag before that digest; the first
+  `pod_cluster_v1` workload normalizer independently rejects every tag,
+  including tag-plus-digest. A scheme, whitespace, userinfo, query, fragment,
+  percent encoding, backslash, absent digest, uppercase/noncanonical spelling,
+  or normalized output unequal to the input is invalid. The approved cohort
+  inventory pins the validator implementation; changing these v1 semantics
+  requires a new profile/version.
+
 ProviderPodResourceSnapshotV1 = {
   version: 1,
   cloud: "kubernetes",
@@ -1891,6 +1926,14 @@ ProviderPodImageV1 = {
   auth_strategy: "anonymous",
   implementation_contract: "kubernetes_serve_prebooted_runtime_v1"
 }
+
+`ProviderPodImageV1` is a fixed shape: `source`, `auth_strategy`, and
+`implementation_contract` accept only the displayed literals. Its
+qualification applies the complete `DigestPinnedOCIReference` contract above,
+including parsed requested-reference digest equality with
+`oci_manifest_digest`; merely passing the generic OCI parser is insufficient.
+Every resource-contract, object-body, runtime, and artifact-binding copy of the
+workload image must agree under the enclosing capsule checks.
 
 ProviderKubernetesConfigProjectionV1 = {
   version: 1,
@@ -1981,11 +2024,23 @@ ProviderKubernetesVerbV1 =
   "get" | "create" | "delete" | "list" | "watch" | "patch" |
   "update" | "deletecollection"
 
+ProviderKubernetesApiGroupResourceMapV1 = {
+  "": ["namespaces", "pods", "serviceaccounts", "services"],
+  "admissionregistration.k8s.io":
+      ["validatingadmissionpolicies",
+       "validatingadmissionpolicybindings"],
+  "apps": ["deployments", "replicasets"],
+  "authentication.k8s.io": ["selfsubjectreviews"],
+  "authorization.k8s.io":
+      ["selfsubjectaccessreviews", "selfsubjectrulesreviews"],
+  "networking.k8s.io": ["networkpolicies"]
+}
+
 ProviderKubernetesResourceRuleV1 = {
-  api_groups: [ProviderKubernetesApiGroupV1],
-  resources: [ProviderKubernetesResourceV1],
-  resource_names: [Text],
-  verbs: [ProviderKubernetesVerbV1]
+  api_groups: [ProviderKubernetesApiGroupV1],  # exactly one
+  resources: [ProviderKubernetesResourceV1],  # 1..256
+  resource_names: [Text],                     # 0..256
+  verbs: [ProviderKubernetesVerbV1]           # 1..256
 }
 
 ProviderKubernetesNonResourceRuleV1 = {
@@ -1997,8 +2052,8 @@ ProviderKubernetesRulesReviewV1 = {
   namespace: Text,
   incomplete: false,
   evaluation_error: false,
-  resource_rules: [ProviderKubernetesResourceRuleV1],
-  non_resource_rules: [ProviderKubernetesNonResourceRuleV1]
+  resource_rules: [ProviderKubernetesResourceRuleV1],       # 1..256
+  non_resource_rules: [ProviderKubernetesNonResourceRuleV1] # exact singleton
 }
 
 ProviderKubernetesResourceAccessV1 = {
@@ -2027,7 +2082,7 @@ ProviderKubernetesAuthorizationEvidenceV1 = {
   rules: ProviderKubernetesRulesReviewV1,
   rules_sha256: Sha256,
   access_matrix_contract: ProviderRepoArtifactRefV1,
-  access_decisions: [ProviderKubernetesAccessDecisionV1],
+  access_decisions: [ProviderKubernetesAccessDecisionV1],  # 1..256
   access_decisions_sha256: Sha256
 }
 
@@ -2036,6 +2091,41 @@ ProviderKubernetesPrincipalsV1 = {
   workload: ProviderKubernetesServiceAccountProjectionV1,
   caller_authorization: ProviderKubernetesAuthorizationEvidenceV1
 }
+
+Each resource rule has exactly one API group; every resource in that rule, and
+every resource access decision, must belong to that group under
+`ProviderKubernetesApiGroupResourceMapV1`. The required rule arrays are
+nonempty as annotated, while `resource_names` may be empty because create
+permissions and rollout-generated Pod/ReplicaSet names cannot use a fixed
+`resourceNames` fence. All inner sets and compound-rule collections retain the
+canonical sorting rules below. The nonresource-rule collection is exactly one
+rule with `urls=["/version"]` and `verbs=["get"]`.
+
+An access decision has exactly one nonnull member of `resource` and
+`non_resource`. Decisions are a nonempty contiguous zero-based sequence and
+`observed_allowed == expected_allowed`; `evaluation_error` is exactly false.
+`observed_denied` preserves the Kubernetes authorization response rather than
+being synthesized as the complement of `observed_allowed`: the two observed
+booleans cannot both be true, an allowed result requires `observed_denied=false`,
+and a not-allowed result permits either value of `observed_denied`. Exact check
+count, attributes, expectation, and order are supplied by and byte-compared to
+the content-addressed access-matrix artifact, not invented by the leaf parser.
+
+Live ServiceAccount normalization rejects a null/omitted
+`automountServiceAccountToken`; the first cohort requires an explicit `true`
+on the caller authority-worker ServiceAccount and an explicit `false` on the
+no-permission workload ServiceAccount. Absent labels, annotations,
+`imagePullSecrets`, or legacy `secrets` normalize to their typed empty
+collections. The workload image-pull-secret and legacy-secret collections are
+exactly empty. The principals envelope requires caller and workload
+namespace/name/UID to equal the corresponding scope fields, workload namespace
+to equal the target namespace, and rules-review namespace to equal that same
+target namespace. Its self identity is exactly
+`system:serviceaccount:<caller.namespace>:<caller.name>`, has UID byte-equal to
+`caller.uid`, and has the displayed three groups with the caller namespace in
+the final group. The scope's existing rule that caller/workload
+`(namespace,name)` pairs are equal if and only if their UIDs are equal remains
+in force.
 
 ProviderKubernetesPrerequisiteV1 = {
   api_version: Text,
@@ -2111,7 +2201,7 @@ ProviderKubernetesPostProvisionV1 = {
   user_setup: "assert_null_skip",
   pre_exec_hooks_autostop: "assert_absent_skip",
   management_transport: "skylet_grpc_only",
-  management_port: DecimalPortText,
+  management_port: "46590",  # DecimalPortText
   ssh_fallback: false,
   job_submission: {
     protocol: "skylet_idempotent_submit_v1",
@@ -2423,6 +2513,11 @@ remains non-authoritative. Raw effective config, raw tasks, admin-policy output,
 managed-secret responses are forbidden. The checked-in config-access inventory
 is the finite list of reads; an unlisted read or a value outside the closed
 projection makes the candidate not representable.
+`capsule.config_projection.config_access_inventory` and
+`capsule.renderer.config_access_inventory` are two bindings to that one
+artifact and must be byte-equal as complete `ProviderRepoArtifactRefV1`
+objects. Each leaf validates only its closed artifact reference; the enclosing
+launch/down capsule owns this cross-field equality.
 
 Down never inherits execution authority from the prior launch. At down
 admission, the same private preflight selects the then-active versioned worker
@@ -2458,7 +2553,8 @@ no `+`, relative `x`, exponent, or unit suffix. The candidate requires
 `pod_memory_request == pod_memory_limit == source_memory_gb + "G"`; those four
 strings are byte-equal to the normalized Pod spec. The live allocatable clamp
 is disabled and cannot rewrite them. Scope/namespace/fingerprint, both
-service-account identities, name basis and all object names, final labels,
+service-account identities, name basis and all object names, each role's final
+labels against that role's topology and request body,
 topology order, source/workspace, image/digest/pull policy, and the one port in
 resources/topology/Services/endpoint must also be byte-equal. Every duplicated
 cluster UUID, replica incarnation, and down basis is equal to the enclosing
