@@ -310,9 +310,7 @@ class BatchCoordinator:
             return
 
         async def _resolve_durable_worker_job_id(
-            record: dict[str, Any],
-            queue_jobs_by_cluster: dict[str, list[Any] | None],
-        ) -> tuple[bool, int | None]:
+                record: dict[str, Any]) -> tuple[bool, int | None]:
             """Resolve one durable worker record under the shared deadline."""
             worker_job_id = record.get('worker_job_id')
             if worker_job_id is None and record.get('launch_request_id'):
@@ -329,31 +327,25 @@ class BatchCoordinator:
 
             if worker_job_id is None:
                 cluster_name = record['worker_cluster']
-                queued_jobs = queue_jobs_by_cluster.get(cluster_name)
-                if cluster_name not in queue_jobs_by_cluster:
-                    queue_jobs_by_cluster[cluster_name] = None
-                    within_deadline, succeeded, queue_request_id = (
-                        await _run_call('worker queue request',
-                                        sdk.queue,
-                                        cluster_name,
-                                        skip_finished=True))
-                    if not within_deadline:
-                        return False, None
-                    if not succeeded:
-                        return True, None
-                    within_deadline, succeeded, queued_jobs = await _run_call(
-                        'worker queue result', sdk.get, queue_request_id)
-                    if not within_deadline:
-                        return False, None
-                    if not succeeded:
-                        return True, None
-                    if queued_jobs is None:
-                        logger.warning(
-                            'Superseded Batch queue snapshot for %s returned '
-                            'None', cluster_name)
-                        return True, None
-                    queue_jobs_by_cluster[cluster_name] = queued_jobs
+                within_deadline, succeeded, queue_request_id = await _run_call(
+                    'worker queue request',
+                    sdk.queue,
+                    cluster_name,
+                    skip_finished=True)
+                if not within_deadline:
+                    return False, None
+                if not succeeded:
+                    return True, None
+                within_deadline, succeeded, queued_jobs = await _run_call(
+                    'worker queue result', sdk.get, queue_request_id)
+                if not within_deadline:
+                    return False, None
+                if not succeeded:
+                    return True, None
                 if queued_jobs is None:
+                    logger.warning(
+                        'Superseded Batch queue snapshot for %s returned None',
+                        cluster_name)
                     return True, None
                 try:
                     matching_ids = self._matching_worker_job_ids(
@@ -389,14 +381,11 @@ class BatchCoordinator:
         if not within_deadline:
             return
         if succeeded:
-            queue_jobs_by_cluster: dict[str, list[Any] | None] = {}
             for record in records:
                 if record['coordinator_token'] != self._worker_token:
                     continue
                 within_deadline, worker_job_id = (
-                    await
-                    _resolve_durable_worker_job_id(record,
-                                                   queue_jobs_by_cluster))
+                    await _resolve_durable_worker_job_id(record))
                 if not within_deadline:
                     return
                 if worker_job_id is None:
