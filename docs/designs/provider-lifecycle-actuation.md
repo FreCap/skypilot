@@ -6728,8 +6728,10 @@ point so later observation work has one explicit, independently testable
 translation owner.
 
 `sky.provision.do.query_projection` adds one internal
-`project_query_instances(instances)` function. It receives the exact object
-returned by `utils.filter_instances()` and returns the existing ordered
+`project_query_instances(instances, cluster_status)` function. It receives the
+exact object returned by `utils.filter_instances()` and the exact current
+`status_lib.ClusterStatus` binding read by `do.instance` for that call, then
+returns the existing ordered
 `dict[str, tuple[ClusterStatus | None, str | None]]`. The function owns the
 current native-state map:
 
@@ -6750,20 +6752,22 @@ For each value from `instances.values()`, evaluation order remains:
 3. read `instance_meta['name']`; and
 4. assign `(mapped_status, None)` to that name in the result.
 
-The map remains function-local and is built from the current `status_lib`
-members on every invocation, preserving the existing late-bound module seam
-without adding mutable module state. Duplicate projected names retain Python
-dictionary first-insertion position and last-value-wins value semantics.
+The map remains function-local and is built from the explicitly passed status
+binding on every invocation, preserving replacement of the existing
+`do.instance.status_lib` binding without adding mutable module state. Duplicate
+projected names retain Python dictionary first-insertion position and
+last-value-wins value semantics.
 
 `sky.provision.do.instance.query_instances()` retains all argument deletion,
 provider-config assertion, and the single exact `utils.filter_instances()`
 call with positional `cluster_name_on_cloud` and keyword
 `status_filters=None`. It then calls `project_query_instances()` exactly once
-and directly returns that dictionary. Direct provider calls, facade calls,
-helper replacements, exported aliases, strict and legacy plugin precedence,
-and every non-DigitalOcean route keep their existing resolver path. No V2
-diagnostic metadata, context state, hook, shadow event, database state, feature
-flag, or removal-manifest row is added.
+with the helper result and the current `status_lib.ClusterStatus` object, and
+directly returns that dictionary. Direct provider calls, facade calls, helper
+and status-module replacements, exported aliases, strict and legacy plugin
+precedence, and every non-DigitalOcean route keep their existing resolver path.
+No V2 diagnostic metadata, context state, hook, shadow event, database state,
+feature flag, or removal-manifest row is added.
 
 Characterization tests prove the empty result, every mapped native state,
 ordered values, duplicate projected names, and exact returned value shape.
@@ -6772,9 +6776,10 @@ prove an unknown state raises before reading the name, missing keys and
 unhashable names retain their ordinary exception type and message, and neither
 the projector nor query retries. Query integration tests prove one helper
 lookup and call with the exact arguments, one projector invocation with the
-helper's exact return object, and direct return of the projector's exact result
-object. Existing provider-facet, full provision, backend-status, import,
-formatting, type, and lint gates also run.
+helper's exact return object and current status binding, replacement of the
+existing `do.instance.status_lib` binding, and direct return of the projector's
+exact result object. Existing provider-facet, full provision, backend-status,
+import, formatting, type, and lint gates also run.
 
 This extraction is authoritative immediately because its finite mapping and
 ordering semantics are fully characterized without a second live execution
@@ -8282,7 +8287,7 @@ built-in facet seam for exact-image control-plane regression rollout.
 
 Verdict: `PURSUE` for the M4 DigitalOcean authoritative query projection
 extraction at contract SHA-256
-`25c07b38e40cb1c5f762d500e898b7e8f6a9b17863476bff4c28de143ff0331c`.
+`2aecc86b674b232ddf80cd508753f8ca7819b8cbd652dbf4ecae774a91d00e47`.
 The unchanged locator-only removal manifest remains at SHA-256
 `712420900df178e7f166b21a43d23304e016a4e80a8453a04c480ae2ac1a6ce5`.
 
@@ -8304,3 +8309,10 @@ prove that `values()` is evaluated once and the input mapping remains
 unmodified. This verdict authorizes only the DigitalOcean query projection
 extraction and its characterization tests. It grants no provider inventory,
 node actuation, retry, cleanup, planning, or reconciliation authority.
+
+The first implementation review then reproduced one compatibility regression:
+rebinding the existing `sky.provision.do.instance.status_lib` module binding no
+longer affected the extracted translation. The corrected contract passes the
+entry point's exact current `status_lib.ClusterStatus` object into the pure
+projector on every call and requires a replacement regression test. This
+correction requires final implementation re-review before the pull request.
