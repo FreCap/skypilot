@@ -160,3 +160,27 @@ or copy. Python imports one small local module while loading `autoscalers`; a
 balanced import benchmark must show no material regression. Direct calls use
 the same function objects and bytecode after relocation. Rollback is a single
 structural revert because no data or API migration occurs.
+
+## Validation Evidence
+
+- Exact base: `af20f62b379323df37ebf81ef3f5c3c54aa9a420`.
+- Pre-move characterization: 11 tests passed before any production behavior
+  moved.
+- Post-move regression matrix: 768 tests passed serially with an isolated
+  `SKY_RUNTIME_DIR` across compatibility, QPS, concurrency, reserved-capacity,
+  cost-rebalance, controller, decision-contract, and spec coverage.
+- Serve integration: all 17 cases in `tests/test_jobs_and_serve.py` passed
+  serially with the same isolated-runtime contract.
+- Structural parity: normalized ASTs for all four moved functions are exactly
+  identical to the base; both import orders, direct object aliases, signatures,
+  module and qualified names, pickle round trips, and compile checks pass.
+- Static gates: YAPF, isort, mypy over 823 source files, Pylint 10.00,
+  dashboard lint and formatting, and `git diff --check` pass.
+- Performance: ten balanced import samples changed from a 0.553246625-second
+  base median to 0.552696708 seconds, a favorable 0.10 percent delta. Eight
+  balanced samples of 20,000 representative allocations changed from
+  0.300240312 seconds to 0.301304312 seconds, a noise-level 0.35 percent delta.
+- CI mapping: pull-request workflows have no relevant path filters. Python
+  Tests - Unit Tests collects all of `tests/unit_tests`; mypy, Pylint, format,
+  static analysis, and limited-dependency Serve imports likewise run for every
+  pull request targeting `improvements`.
