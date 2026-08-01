@@ -5,7 +5,11 @@ review; M1a inert schema and dark M1b typed store implemented and locally
 verified; the frozen M2 Serve032 foundation, cluster identity, immutable
 provider contracts, typed shadow store, additive Serve033 coverage schema and
 promotion audit, and generic API006 progress substrate are implemented and
-locally verified; the candidate-only Kubernetes preparation/admission
+locally verified; the immutable effect-origin, closed handler-return,
+pre-I/O representability, and reducer-owned quiescence contract is frozen in
+design while its Serve validator/reducer, dedicated return codec, and shadow-
+outcome parser alignment remain pending; the candidate-only Kubernetes
+preparation/admission
 handshake and execution-config boundary are in progress; runtime shadow
 instrumentation pending
 
@@ -291,6 +295,11 @@ api_resource_action_attempts
   unique (action_id, attempt, request_id)
 ```
 
+V1 fixes `RESOURCE_ACTION_MAX_ATTEMPT_V1 = 2147483647`, the PostgreSQL
+`INTEGER` maximum used by both `current_attempt` and `attempt`. No action may
+materialize, derive a request ID for, or reference attempt max plus one. The
+closed exhaustion reduction below handles the boundary before any increment.
+
 `api_requests.resource_action_id` and
 `api_requests.resource_action_attempt` are both null for ordinary requests. A
 pair-null check plus a normal composite foreign key from
@@ -355,6 +364,37 @@ needed to collect M2 legacy shadow evidence. It is PostgreSQL-only, preserves
 ordinary attempts, and refuses schema down once present; application rollback
 keeps the additive head.
 
+The 65,536-byte column check is not a late runtime escape hatch. Before
+authoritative admission creates or binds an action request, a pure companion-
+owned representability enumerator renders the exact frozen spec/cohort and each
+byte-exact live registered worker identity and claim/attempt-attestation preimage
+through every launch phase, terminal handler-return/no-effect-resolution
+variant, and reducer-built quiescence variant. The exact case set includes
+handler-domain `S` and every legal phase/category `R`/`U`/`B` row with maximal
+bounded error code, message, and retry delay; supersession `Q` with every E-only
+prefix and every legal `E* + N<i>` prefix; all three direct no-effect bases with
+empty, one-link, and maximum-integer-count no-I/O prefixes; request-terminal
+fallback `P0`, `O`, `S`, and `X` for each compatible
+`SUCCEEDED`/`FAILED`/`CANCELLED` reason; and the shadow basis. It maximizes only
+response leaves still unknown at admission and the
+reachable five-effect origin schedule. Every
+API006 progress envelope, exact
+`ServeReplicaActionRequestReturnV1`, and final
+`ServeReplicaActionOutcomeV1` must independently fit within 65,536 canonical
+UTF-8 bytes. Missing finite leaf bounds or any oversize case rejects authority
+before the provider-I/O watermark/intent; no truncation, dropped provenance, or
+hash-only replacement is legal. The checked-in fixture manifest and case list
+are canonicalized in the provider companion and contain realistic and
+`candidate_maximal` goldens with exact byte counts and SHA-256 values. Admission
+and the immediate pre-I/O validator run the same versioned enumerator; drift
+blocks rather than
+discovering an oversized cursor after an effect. The candidate-maximal fixture
+does not synthetically maximize arbitrary `Text` inside already-frozen
+attestations. If either realistic or candidate-maximal evidence exceeds the
+limit, authority stays disabled until the canonical design deduplicates
+provenance or tightens an explicit bound; the gate does not assume a passing
+measurement.
+
 Provider progress is attempt-local storage for one action-wide monotonic
 provider cursor. Materializing attempt `n+1` locks the action and settled
 attempt `n` before inserting the new attempt. It rejects an unsettled
@@ -376,6 +416,10 @@ Within an attempt, progress revisions increase from that seed. Across attempts,
 every provider identity, partial object UID/allocation, resolved target,
 handle, deletion proof, runtime/job commitment, and effect-intent phase must be
 byte-equal to or a legal monotonic successor of the settled prior snapshot.
+Every inherited launch intent retains its byte-equal original effect claim;
+every committed record retains both origin claims and disposition. Origin
+ordering is lexicographic by `(attempt, execution_generation)`, because
+generation restarts for each deterministic attempt request.
 The new request handler consumes only its own seeded row; it never starts from
 a caller-supplied or null cursor when prior progress exists.
 
@@ -408,8 +452,9 @@ checked independently of the caller-supplied hash, so a self-consistent hash
 over a malformed or extended object is not accepted. The generic executor
 currently requeues `ExecutionRetryableError` and
 `ExecutionPausedError` independently of the `retryable` field, so the action
-handler/facet must catch both families and return a closed typed
-retry/uncertain outcome before either can escape. One request attempt therefore
+handler/facet must catch both families and return the closed
+`ServeReplicaActionRequestReturnV1` carrying a retry/uncertain provider result
+before either can escape. One request attempt therefore
 terminalizes once; only the action reducer can schedule attempt `n+1`.
 `created_at`, database timestamps, queue sequence, delivery/claim state,
 request result/error/status after creation, and execution generation after
@@ -447,8 +492,9 @@ The durable action states are:
 - `READY`: due now or later according to `next_attempt_at`;
 - `QUEUED`: the current attempt/request binding exists, including a terminal
   request awaiting reduction;
-- `BLOCKED`: an identity conflict or quarantine requires operator-visible
-  repair and no mutation request is runnable; or
+- `BLOCKED`: an identity conflict, quarantine, or finite attempt-domain
+  exhaustion requires operator-visible repair and no mutation request is
+  runnable; or
 - `TERMINAL`: result, disposition, and `terminal_at` are complete and
   immutable.
 
@@ -471,11 +517,30 @@ crypto functions, recursive JSON walkers, or validation triggers.
 Candidate discovery is a nonlocking indexed query over
 `kernel_state='READY' AND next_attempt_at <= clock_timestamp()`. Only
 authoritative admission creates action rows; shadow rows are stored in the
-Serve shadow table and therefore cannot appear in this query. For each
-candidate, a short transaction locks the action with `FOR UPDATE SKIP LOCKED`,
-revalidates its revision/state/due time, inserts or adopts the deterministic
-attempt, creates or adopts the byte-equal API request, inserts its existing
-queue delivery, and sets `QUEUED`.
+Serve shadow table and therefore cannot appear in this query.
+
+The dispatcher calls one retryable operation with
+`(action_id, expected_revision, expected_attempt, canonical_request_input)` and
+reuses that exact tuple after an unknown commit outcome. A short transaction
+locks the action with `FOR UPDATE SKIP LOCKED` and has exactly two successful
+branches:
+
+- `READY`: require the exact expected revision and due time, require
+  `current_attempt < RESOURCE_ACTION_MAX_ATTEMPT_V1`, and only then require
+  `expected_attempt == current_attempt + 1`; insert the attempt, request, and
+  existing queue delivery, then set `QUEUED`, advance `current_attempt`, and
+  increment revision once.
+- `QUEUED` lost-ack adoption: require
+  `revision == expected_revision + 1` and
+  `current_attempt == expected_attempt`; validate the current attempt/request
+  binding and full input commitment as above, return it, and neither increment
+  nor enqueue.
+
+`BLOCKED`, `TERMINAL`, a changed attempt/revision, or any binding/input
+mismatch rejects. `READY` plus a pre-existing attempt/request is corruption,
+because their creation is one transaction. General queued recovery reads the
+committed binding directly; only retry of this exact materialization tuple uses
+the lost-ack adoption branch.
 
 The transaction then ends. The action has no claim token, heartbeat, or lease.
 Only the existing API request worker claims execution. If two dispatchers race,
@@ -533,7 +598,8 @@ I/O, it dispatches on the current attempt's persisted progress shape. An exact
 uses the fresh-cursor branch—even when it is attempt `n+1` copied from a
 proved pre-I/O predecessor—and claim-fenced-writes `INTENT_COMMITTED` to both
 boundary fields plus the companion profile's first legal nonnull API006 cursor
-in one transaction after any read-only pre-observation. An exact inherited
+and its immutable `ProviderLaunchEffectClaimV1` intent origin in one
+transaction after any read-only pre-observation. An exact inherited
 retry seed instead has `provider_io_boundary='NOT_STARTED'`, nonnull progress
 at local revision one, a cursor byte-equal to the locked settled predecessor,
 null worker attestation, and null current-attempt provider operation ID; it
@@ -555,15 +621,18 @@ it under the same fence as soon as it is known. The ID is optional because some
 providers do not expose one; the immutable requested locator and readback
 contract are mandatory for authoritative eligibility. Submission evidence is
 write-once: null means that this call learned no new ID and preserves an
-existing ID; two different non-null IDs conflict. At settlement, the journaled
-ID is injected into a missing/null typed-outcome field before canonical hashing,
-while a different non-null typed ID conflicts. The attempt column and persisted
+existing ID; two different non-null IDs conflict. At reduction, the journaled
+ID is injected only into a null
+`provider_result.provider_operation_id` while constructing the final action
+outcome, before that final outcome is canonically hashed; a different nonnull
+typed ID conflicts. The immutable handler-return hash continues to name the
+bytes actually stored on the request. The attempt column and persisted final
 typed outcome therefore cannot disagree.
 
-The v1 typed outcome is:
+The v1 handler return and reducer-owned outcome are distinct closed types:
 
 ```text
-ServeReplicaActionOutcomeV1 = {
+ServeReplicaActionProviderResultV1 = {
   disposition: "succeeded" | "retryable" | "uncertain" |
                "terminal_error" | "cancelled",
   certainty: "observed" | "provider_acknowledged" | "unknown",
@@ -573,19 +642,416 @@ ServeReplicaActionOutcomeV1 = {
                "observation_required",
   retry_after_seconds: null | NonnegativeInteger,
   observation: null | ProviderLifecycleObservationV1,
-  supersession_quiescence: null | ProviderLaunchSupersessionQuiescenceV1,
   normalized_message: null | Text
 }
+
+ServeReplicaActionHandlerTerminalResultV1 = {
+  version: 1,
+  result_kind: "serve_resource_action_handler_terminal_v1",
+  action_id: UUID,
+  action_kind: "launch" | "down",
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_execution_generation: PositiveInteger,
+  handler_name: "serve_resource_action_launch" |
+                "serve_resource_action_down",
+  reduction_kind: "domain" | "supersede_to_down",
+  request_input_sha256: Sha256,
+  final_provider_progress_sha256: null | Sha256,
+  worker_attestation: ProviderAuthorityWorkerAttemptAttestationV1,
+  worker_attestation_sha256: Sha256,
+  provider_result: ServeReplicaActionProviderResultV1,
+  normalized_provider_error: null | ProviderErrorV1,
+  launch_no_effect_resolution: null | ProviderLaunchNoEffectResolutionV1
+}
+
+ServeReplicaActionRequestReturnV1 = {
+  version: 1,
+  return_type: "serve_replica_action_handler_terminal_result_v1",
+  terminal_result: ServeReplicaActionHandlerTerminalResultV1,
+  terminal_result_sha256: Sha256
+}
+
+ServeLaunchNoIoAttemptProjectionV1 = {
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_input_sha256: Sha256,
+  mutation_boundary: "SETTLED",
+  provider_io_boundary: "NOT_STARTED",
+  provider_progress_revision: 0,
+  provider_progress_sha256: null,
+  provider_operation_id: null,
+  request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  settled_at: UtcTimestamp
+}
+
+ServeLaunchNoIoPrefixV1 = {
+  version: 1,
+  count: NonnegativeInteger,  # at most PostgreSQL INTEGER max 2147483647
+  previous_prefix_sha256: null | Sha256,
+  current_attempt: null | ServeLaunchNoIoAttemptProjectionV1,
+  prefix_sha256: Sha256
+}
+
+ServeReplicaActionDirectNoEffectCancellationV1 = one of:
+  {version: 1,
+   proof_kind: "unmaterialized",
+   action_id: UUID,
+   resource_identity: ResourceActionIdentityV1,
+   source_action_revision: NonnegativeInteger,
+   current_attempt: 0,
+   no_io_prefix: ServeLaunchNoIoPrefixV1,
+   request_id: null,
+   request_terminal_state: null,
+   request_row_disposition: "not_applicable",
+   request_finished_at: null,
+   active_claim: false,
+   provider_io_boundary: null,
+   provider_progress_revision: null,
+   provider_progress_sha256: null,
+   provider_operation_id: null,
+   current_typed_outcome_sha256: null,
+   attempt_settled_at: null,
+   cancelled_at: UtcTimestamp}
+  {version: 1,
+   proof_kind: "terminal_request_unsettled",
+   action_id: UUID,
+   resource_identity: ResourceActionIdentityV1,
+   source_action_revision: NonnegativeInteger,
+   current_attempt: PositiveInteger,
+   no_io_prefix: ServeLaunchNoIoPrefixV1,
+   request_id: UUID,
+   request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+   request_row_disposition: "retained_terminal",
+   request_finished_at: UtcTimestamp,
+   active_claim: false,
+   provider_io_boundary: "NOT_STARTED",
+   provider_progress_revision: 0,
+   provider_progress_sha256: null,
+   provider_operation_id: null,
+   current_typed_outcome_sha256: null,
+   attempt_settled_at: UtcTimestamp,
+   cancelled_at: UtcTimestamp}
+  {version: 1,
+   proof_kind: "retained_settled_attempt",
+   action_id: UUID,
+   resource_identity: ResourceActionIdentityV1,
+   source_action_revision: NonnegativeInteger,
+   current_attempt: PositiveInteger,
+   no_io_prefix: ServeLaunchNoIoPrefixV1,
+   request_id: UUID,
+   request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+   request_row_disposition: "retained_terminal" | "garbage_collected",
+   request_finished_at: null | UtcTimestamp,
+   active_claim: false,
+   provider_io_boundary: "NOT_STARTED",
+   provider_progress_revision: 0,
+   provider_progress_sha256: null,
+   provider_operation_id: null,
+   current_typed_outcome_sha256: Sha256,
+   attempt_settled_at: UtcTimestamp,
+   cancelled_at: UtcTimestamp}
+
+ServeReplicaActionRequestFallbackEvidenceV1 = {
+  version: 1,
+  request_id: UUID,
+  attempt: PositiveInteger,
+  fallback_reason: "missing_handler_return" | "invalid_handler_return" |
+                   "request_failed" | "request_cancelled",
+  request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  request_finished_at: UtcTimestamp,
+  active_claim: false,
+  journal_class: "not_started_empty" | "valid_nonterminal" |
+                 "valid_succeeded" | "invalid",
+  provider_io_boundary: "NOT_STARTED" | "INTENT_COMMITTED" |
+                        "SUBMITTED_OR_AMBIGUOUS",
+  provider_progress_revision: NonnegativeInteger,
+  provider_progress_sha256: null | Sha256,
+  provider_operation_id: null | Text
+}
+
+ServeReplicaActionOutcomeBasisV1 = one of:
+  {version: 1,
+   basis_kind: "handler_terminal_result",
+   request_terminal_state: "SUCCEEDED",
+   handler_terminal_result_sha256: Sha256,
+   direct_no_effect_cancellation: null,
+   request_fallback_evidence: null}
+  {version: 1,
+   basis_kind: "direct_no_effect_cancellation",
+   request_terminal_state: null | "SUCCEEDED" | "FAILED" | "CANCELLED",
+   handler_terminal_result_sha256: null,
+   direct_no_effect_cancellation:
+       ServeReplicaActionDirectNoEffectCancellationV1,
+   request_fallback_evidence: null}
+  {version: 1,
+   basis_kind: "request_terminal_fallback",
+   request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+   handler_terminal_result_sha256: null,
+   direct_no_effect_cancellation: null,
+   request_fallback_evidence: ServeReplicaActionRequestFallbackEvidenceV1}
+  {version: 1,
+   basis_kind: "shadow",
+   request_terminal_state: null,
+   handler_terminal_result_sha256: null,
+   direct_no_effect_cancellation: null,
+   request_fallback_evidence: null}
+
+ServeReplicaActionOutcomeV1 = {
+  version: 1,
+  basis: ServeReplicaActionOutcomeBasisV1,
+  provider_result: ServeReplicaActionProviderResultV1,
+  supersession_quiescence: null | ProviderLaunchSupersessionQuiescenceV1,
+  launch_no_io_prefix: null | ServeLaunchNoIoPrefixV1
+}
 ```
+
+All unions are closed and discriminated before nested parsing. In a direct
+basis, the basis terminal state equals the nested proof state; it is null
+exactly for `proof_kind="unmaterialized"`. In a fallback basis, the basis and
+nested terminal states are byte-equal. A handler basis names the exact nested
+terminal-result hash stored in the correlated request. Shadow basis is legal
+only in shadow columns. Unknown keys, a mismatched discriminator/null shape, or
+a duplicated terminal state/hash that differs from its source rejects.
+`terminal_request_unsettled` requires `request_row_disposition="retained_terminal"`,
+nonnull request finish and attempt-settlement times, null current-outcome hash,
+and equal settlement/cancellation times. `retained_settled_attempt` requires a
+nonnull current-outcome hash and attempt-settlement time; request finish is
+nonnull exactly for `retained_terminal` and null exactly for
+`garbage_collected`, and `cancelled_at >= attempt_settled_at`.
+
+`ServeLaunchNoIoPrefixV1` is a reducer-owned monotonic accumulator, not a
+caller assertion. Count zero has null previous/current members and
+`prefix_sha256=canonical_sha256([])` and is legal only in an unmaterialized
+direct-cancellation proof/outcome. For positive count, `current_attempt` is
+nonnull with `current_attempt.attempt=count`; `previous_prefix_sha256` is null
+exactly at count one, and `prefix_sha256` is the canonical SHA-256 of
+`{"previous_prefix_sha256": previous_prefix_sha256,
+"current_attempt": current_attempt.canonical_value}`. A launch attempt gets a
+nonnull `launch_no_io_prefix` exactly when its post-settlement journal is
+revision-zero `NOT_STARTED` with null progress/hash and operation ID and either
+it is attempt one or the locked predecessor has a valid prefix of count
+`attempt-1`. The reducer embeds the complete current projection and the prior
+immutable hash while holding action, predecessor, current attempt, and request
+locks. Down, shadow, any nonnull/inherited cursor, and every crossed/invalid
+journal have a null prefix. A direct-cancellation basis embeds a byte-equal
+prefix; count equals the locked action's `current_attempt`.
+The attempt projection deliberately excludes `typed_outcome` and its hash so
+the outcome that contains this prefix is not recursively self-hashed; the
+settlement validator independently checks the complete immutable outcome/hash.
+
+All attempt rows remain retained with the action. At direct cancellation the
+transaction locks the predecessor when count is greater than one and then the
+current attempt in increasing attempt order, revalidates the current full
+projection and immediate hash link, and relies on the same invariant already
+checked when each immutable prior link was committed. Thus proof construction/
+replay is O(1), while an offline audit can traverse every retained preimage. No
+unbounded list is serialized or locked and no provider/caller-supplied hash
+substitutes for evidence.
 
 Provider error strings are diagnostic only. The closed disposition/certainty/
 retry fields authorize state transitions. Secrets, credentials, raw tracebacks,
 and unbounded provider payloads are redacted before persistence.
-`supersession_quiescence` is null except for a launch cancellation being
-handed to a real down action; the companion defines its closed proof, and the
-Serve transaction byte-compares it to the final attempt cursor/request fence.
-When nonnull it requires `disposition='cancelled'`, `certainty='observed'`, and
-no retry class/deadline; it cannot make the old launch successful.
+The handler can return only `ServeReplicaActionRequestReturnV1`; it cannot
+return `ServeReplicaActionOutcomeV1`, an outcome basis, or
+`ProviderLaunchSupersessionQuiescenceV1`. A nonnull
+`supersession_quiescence` is legal only with
+`basis_kind="handler_terminal_result"` and is equivalent to the reducer handing
+that launch cancellation to a real down action. The companion defines its
+closed proof, and the Serve transaction constructs it only after byte-comparing
+the final cursor, immutable effect origins, exact terminal return, and request
+fence. When nonnull, `provider_result.disposition='cancelled'`,
+`provider_result.certainty='observed'`, and the provider code, retry
+class/deadline, observation, and normalized message are null; it cannot
+make the old launch successful. The only other exact
+cancelled/observed/null-retry result is the reducer-owned direct no-effect form:
+it has null operation ID, provider code, observation, and message, a direct-
+cancellation basis, and null quiescence.
+No shadow or request-fallback outcome may use either cancellation shape.
+
+The private launch/down handler returns one ordinary Python mapping with the
+exact `ServeReplicaActionRequestReturnV1` keys. Dedicated return-value encoders
+are registered for only `serve_resource_action_launch` and
+`serve_resource_action_down`; they closed-validate and return that JSON object
+without default encoding, pickle, compatibility filtering, or omitted nulls.
+`terminal_result_sha256` is the canonical SHA-256 of the complete nested
+terminal result. The stored PostgreSQL `requests.return_value` must be that
+nonnull object, canonicalize to at most 65,536 UTF-8 bytes, and round-trip
+byte-equivalently through the closed decoder. Unknown/missing keys, floats,
+encoder fallback/drop-to-null, or any other return type are invalid.
+
+The terminal result's action, kind, attempt, deterministic request ID, request-
+input hash, private handler name, and execution generation equal the locked
+attempt/request row. Its complete worker attestation and hash equal the claim
+that returns it. `reduction_kind="supersede_to_down"` is launch-only;
+`reduction_kind="domain"` covers down and every launch result that is not the
+typed partial-handoff handshake. `final_provider_progress_sha256` is null
+exactly for the legal revision-zero pre-I/O shape; otherwise it equals the
+current API006 envelope hash.
+
+The handler/result/reducer cross-field table is exact. The tuple symbols below
+name the reducer-owned final outcome after operation-ID injection; they do not
+rename the immutable handler-return bytes. `OP` is the attempt's journaled
+nullable provider-operation ID. The handler's `provider_result` has every
+displayed field byte-equal except that its operation-ID field may be null when
+`OP` is nonnull; the reducer then injects exactly `OP`. A nonnull handler field
+must already equal `OP`, and any different nonnull value rejects. No other
+field is injected or rewritten. `SUCCESS_OBSERVATION` is byte-equal to the
+launch success observation or down absence observation in the exact terminal
+cursor. For a
+nonnull `normalized_provider_error`, `C` and `M` are its exact bounded nullable
+provider-code and normalized-message leaves. `RC` is exactly `transient`,
+`capacity`, `quota`, or `rate_limited` for the same named error category. `D`
+is `min(normalized_provider_error.retry_after_seconds if nonnull else 60,
+3600)`. These names denote complete provider-result tuples in field order
+`(disposition, certainty, provider_operation_id, provider_code, retry_class,
+retry_after_seconds, observation, normalized_message)`:
+
+```text
+Q = ("cancelled", "observed", OP, null, null, null, null, null)
+S = ("succeeded", "observed", OP, null, null, null,
+     SUCCESS_OBSERVATION, null)
+R = ("retryable", "unknown", OP, C, RC, D, null, M)
+U = ("uncertain", "unknown", OP, C, "observation_required", 60,
+     null, M)
+B = ("terminal_error", "unknown", OP, C, null, null, null, M)
+```
+
+| Handler reduction kind and exact final journal | Provider error / no-effect DTO | Legal final outcome provider result | Reducer result |
+|---|---|---|---|
+| `domain`, launch or down `SUCCEEDED` | error null; no-effect null | `S` | terminal `succeeded`, null quiescence, commit the Serve success projection |
+| `supersede_to_down`, launch current-intent phase | error null; exact original-claim `N<i>` | `Q` | terminal `SUPERSEDED_TO_DOWN`, reducer builds the exact `E* + N<i>` quiescence and links one real down |
+| `supersede_to_down`, launch nonintent, non-`SUCCEEDED` phase | error null; no-effect null | `Q` | terminal `SUPERSEDED_TO_DOWN`, reducer builds the exact E-only quiescence and links one real down |
+| `domain`, revision-zero pre-I/O or a legal nonintent, non-`SUCCEEDED` cursor | nonnull error; no-effect null | exact row from the error-category table below | below max, `R` moves `READY` and `U` moves observation-first `READY`; at max, both take the exhaustion block; `B` moves `BLOCKED`; quiescence null |
+| `domain`, launch or down current-intent phase | nonnull error; no-effect null | exact current-intent row from the error-category table below | below max, `U` remains observation-first; at max it takes the exhaustion block; `B` blocks; quiescence null |
+
+| Exact `ProviderErrorV1.category` | Revision-zero or nonintent result | Current-intent result |
+|---|---|---|
+| `transient` | `R` with `RC="transient"` | `U` |
+| `capacity` | `R` with `RC="capacity"` | `U` |
+| `quota` | `R` with `RC="quota"` | `U` |
+| `rate_limited` | `R` with `RC="rate_limited"` | `U` |
+| `unknown` | `U` | `U` |
+| `invalid_request` | `B` | `B` |
+| `permission` | `B` | `B` |
+| `conflict` | `B` | `B` |
+
+When `n < RESOURCE_ACTION_MAX_ATTEMPT_V1`, `R` sets `next_attempt_at` from the
+transaction's database time plus `D`; `U` uses exactly 60 seconds. Both retain
+the existing replica status, capacity/reservation ownership, and
+`ACTION_ACTIVE` cohort reference while scheduling only action attempt `n+1`.
+`B` sets action `BLOCKED` with no deadline and also retains those exact Serve
+rows/references; it emits the bounded operator event but does not fabricate a
+Serve failure/success projection. No v1 handler-domain non-success row directly
+terminates an action or replans a generation. The provider code and message are
+diagnostic and cannot alter these transitions.
+`provider_acknowledged`, a nonnull observation on `R`/`U`/`B`, a retry field on
+`B`, a category/result mismatch, or a missing/extra normalized error rejects.
+
+Provider success is legal if and only if the exact final cursor is
+`SUCCEEDED`; an earlier cursor never infers success, and a `SUCCEEDED` cursor
+accepts no non-success result. The supersession rows accept no successful
+cursor. `reduction_kind="supersede_to_down"` additionally requires a nonnull
+launch cursor and action-wide provider-I/O-started evidence under the
+companion's current-attempt predicate. A revision-zero/null-cursor result can
+never use `Q`; owner-fenced teardown uses the direct no-effect route after its
+request fence, while an ordinary domain failure uses its exact `R`/`U`/`B`
+row. E-only phases reject a no-effect DTO. A current-intent phase requires
+exactly one DTO whose effect/role/cursor hash and immutable intent/resolution
+origins satisfy the companion; a null, wrong-claim, or extra DTO is corruption.
+That DTO's `resolution_origin` has this terminal result's attempt, request ID,
+execution generation, and worker. Its `intent_origin` and
+`resolution_origin` equal the final intent cursor's immutable original claim,
+and its `intent_cursor_sha256` equals the canonical hash of that exact final
+cursor. For `call_not_entered`, the terminal worker attestation/hash are also
+byte-equal to that claim. For a definitive proof they may differ only by the
+same execution's one legal `after` completion. A down result always has null
+resolution and cannot use `reduction_kind="supersede_to_down"` or `Q`.
+
+Because domain failures are values in `provider_result`, a valid handler return
+terminalizes the generic request as `SUCCEEDED`. A generic/external
+`FAILED`/`CANCELLED` terminalization, escaped exception, killed handler, or a
+terminal `SUCCEEDED` row with null/invalid/mismatched return value instead uses
+`basis_kind="request_terminal_fallback"`. Its `fallback_reason` is
+`request_failed` exactly for `FAILED`, `request_cancelled` exactly for
+`CANCELLED`, and `missing_handler_return` or `invalid_handler_return` exactly
+for terminal `SUCCEEDED`. It can never establish `N<i>`, supersession
+quiescence, or partial-down admission.
+
+The fallback mapping is deterministic. V1 fixes
+`REQUEST_TERMINAL_FALLBACK_DELAY_SECONDS_V1 = 60`; below the attempt maximum,
+the retry result and `next_attempt_at` use that same integer and the
+transaction's one PostgreSQL clock read. At the maximum, the result remains
+byte-equal but the exhaustion rule sets no deadline. Define the complete
+tuples:
+
+```text
+P0 = ("retryable", "observed", null, null, "transient", 60, null,
+      null)
+O  = ("uncertain", "unknown", OP, null, "observation_required", 60,
+      null, null)
+X  = ("terminal_error", "unknown", OP, null, null, null, null, null)
+```
+
+| Exact retained journal class | Provider result | Action/Serve reduction |
+|---|---|---|
+| `not_started_empty`: `NOT_STARTED`, null progress/hash, revision zero, null operation ID | `P0` | when below the attempt maximum, settle and move `READY` for attempt `n+1` at database time plus 60 seconds; a launch with an owner-fenced teardown request instead takes the direct no-effect row below |
+| `valid_nonterminal`: any valid non-`SUCCEEDED` cursor, including an inherited cursor with the current attempt still `NOT_STARTED` | `O` | when below the attempt maximum, settle and move observation-first `READY` at database time plus 60 seconds; retain all capacity/cohort references and admit no down even when teardown is pending |
+| `valid_succeeded`: exact fully validated `SUCCEEDED` cursor | `S` | settle and commit terminal `succeeded`; a pending teardown subsequently uses the normal completed-launch basis, never partial handoff |
+| `invalid`: malformed/cross-bound cursor, hash/revision mismatch, or impossible watermark/progress combination | `X` | settle to operator-visible `BLOCKED`; retain evidence/references and admit no retry, release, or down |
+
+The `invalid` classifier operates on the locked, outer-schema-bounded raw
+attempt row before the domain cursor parser. It copies no malformed progress
+object into the fallback outcome; it records only the bounded watermark,
+declared hash/revision, operation ID, and literal invalid classification, while
+the original row remains retained for repair. A row that violates PostgreSQL
+outer CHECKs or whose identity/request binding cannot be decoded is database
+corruption outside this typed fallback and remains unreduced under operator
+quarantine.
+
+External request failure therefore does not override a claim-fenced durable
+success checkpoint: it is success exactly in the `valid_succeeded` row. It also
+never makes an earlier cursor successful. The fallback evidence stores the
+exact terminal state, finish time, journal classification, watermark,
+revision/hash, and operation ID used by this table; the outcome validator
+recomputes the classification from the locked attempt rather than trusting the
+serialized enum.
+
+After selecting and operation-ID-normalizing the final provider tuple, the
+reducer assigns `launch_no_io_prefix` by this exhaustive rule. A launch
+settlement with the exact revision-zero `NOT_STARTED`/null-progress/null-
+operation journal appends the current projection to the predecessor prefix;
+this includes handler-domain pre-I/O `R`/`U`/`B`, fallback `P0`, and the newly
+settled direct-cancellation variant. An unmaterialized direct cancellation uses
+the count-zero prefix, and a retained-settled direct cancellation copies the
+current attempt's already committed nonnull prefix byte-for-byte. Down, shadow,
+handler `S`/`Q`, fallback `O`/`S`/`X`, every nonnull or inherited cursor, and
+every crossed or invalid journal use null. No other combination is legal.
+
+The attempt-domain exhaustion override is also exact. If a settlement would
+otherwise produce handler `R`/`U` or fallback `P0`/`O` while
+`n=RESOURCE_ACTION_MAX_ATTEMPT_V1`, the reducer persists that same typed outcome
+and any prefix dictated above to the current attempt and action, retains every
+Serve/capacity/cohort reference, sets the action to nonterminal `BLOCKED`, sets
+`next_attempt_at=null`, and emits the bounded operator event code
+`attempt_domain_exhausted`. It does not construct attempt `n+1`, change the
+provider tuple to `B`/`X`, terminalize or replan the action, or advance the
+desired generation. The owner-fenced direct cancellation route still takes
+precedence for an eligible no-I/O launch with teardown requested. Settled replay
+re-adopts the same blocked projection without another event. This rule is the
+only v1 case where an `R`/`U`/`P0`/`O` provider tuple maps to `BLOCKED`.
+
+For the Serve domain, the transaction that first settles current attempt `n`
+writes byte-equal `ServeReplicaActionOutcomeV1` bytes/hashes to that attempt's
+`typed_outcome` and the action's `last_result` after the one legal operation-ID
+injection. Attempt outcomes are immutable history. A later attempt settlement
+or retained-attempt direct cancellation may replace only the action's mutable
+latest `last_result`; it never rewrites an earlier settled attempt. While `n`
+remains the latest settled attempt and the action has not taken a later direct
+transition, the two values are equal. After `current_attempt`/revision advances,
+replay of `n` is stale and validates its own retained outcome rather than the
+new action result. A direct cancellation before any attempt has no attempt
+outcome and stores its closed outcome only in `last_result`.
 
 Shadow JSON fields are bound to named closed types, not merely size/hash
 checks. `actual_outcome` and `proposed_outcome` are
@@ -595,7 +1061,17 @@ checks. `actual_outcome` and `proposed_outcome` are
 `(request_role, parent_spec, invocation)` tuple. The cleanup-only union member
 uses down absence semantics against the frozen parent target, while its
 observations come from the shadow pre/post observer rather than
-`ProviderLifecycleFacet.observe()`. Parent projections use:
+`ProviderLifecycleFacet.observe()`.
+
+Shadow actual/proposed outcomes always have
+`basis_kind="shadow"`, `supersession_quiescence=null`,
+`launch_no_io_prefix=null`, and place their closed provider fields under
+`provider_result`; shadow completion never fabricates a handler terminal-return
+envelope, request-fallback evidence, direct-cancellation proof, accumulator, or
+reducer quiescence. Authoritative outcome validation rejects a shadow basis,
+and shadow validation rejects every authoritative basis.
+
+Parent projections use:
 
 ```text
 ServeShadowProjectionV1 = {
@@ -651,11 +1127,18 @@ transaction takes the lock classes above through the attempt row, then reads
 the correlated request without `FOR UPDATE`. Under PostgreSQL `READ COMMITTED`,
 an uncommitted terminal transition is seen as nonterminal and reduction simply
 retries later. Once terminal, the reducer validates the correlation and
-request-input hash, derives the bounded typed outcome, and snapshots terminal
-state/outcome/provider evidence into the attempt while updating the action and
-Serve state atomically. Request GC cannot remove the source row before this
-snapshot because both its candidate query and delete predicate exclude an
-unsettled correlated attempt.
+request-input hash. For terminal `SUCCEEDED` with an exact valid return it
+closed-decodes and hashes `ServeReplicaActionRequestReturnV1`, copies the
+provider result, and constructs a handler-basis outcome. Every other terminal
+shape constructs the exact request-fallback basis and applies the literal
+journal-class table above. Neither route trusts request status as provider
+success or failure: only an exact `SUCCEEDED` cursor yields `S`. The direct
+owner-fenced no-I/O cancellation below is a third reducer-owned route and takes
+precedence only when teardown is requested and its action-wide proof passes.
+The reducer snapshots terminal state/final outcome/provider evidence into the
+attempt while updating the action and Serve state atomically. Request GC cannot
+remove the source row before this snapshot because both its candidate query and
+delete predicate exclude an unsettled correlated attempt.
 
 The reducer transaction locks current Serve controller leadership, matching
 service/replica rows, matching capacity/reservation rows, the frozen cohort and
@@ -663,7 +1146,7 @@ same-ID reference, action, and attempt in that order. It revalidates action revi
 link/teardown generation, then does exactly one of:
 
 - commit Serve success projection and action `TERMINAL`;
-- commit a retry result only after validating either (a) a nonnull legal
+- commit `R`/`U` retry only after validating either (a) a nonnull legal
   inheritable provider cursor or (b) the exact pre-I/O shape
   `provider_io_boundary='NOT_STARTED'`, null provider progress/progress hash,
   progress revision zero, and null provider operation ID. For (a), a
@@ -673,11 +1156,16 @@ link/teardown generation, then does exactly one of:
   require a typed outcome that independently authorizes retry or observation.
   A crossed provider-I/O watermark with null progress, or any malformed or
   predecessor-mismatched `NOT_STARTED` seed, is corruption and blocks
-  reduction. For either legal shape, increment no attempt yet, set action
-  `READY`, and set `next_attempt_at` from PostgreSQL time plus the
-  domain-classified delay;
-- commit `BLOCKED` for an identity conflict or quarantine requiring repair; or
-- commit a terminal error/cancellation and the legal Serve failure projection.
+  reduction. For either legal shape below the attempt maximum, increment no
+  attempt yet, set action `READY`, and set `next_attempt_at` from PostgreSQL
+  time plus the exact `R`/`U` delay. At the maximum, take the exact exhaustion
+  override above instead;
+- commit `B`/`X` as `BLOCKED` for an identity conflict, invalid contract, or
+  quarantine requiring repair, retaining the current Serve projection and
+  references; or
+- commit only the exact `Q` supersession or direct no-effect cancellation
+  terminal transitions defined above/below. V1 has no other handler-domain
+  non-success terminal transition.
 
 A terminal action transition also changes its exact `ACTION_ACTIVE` reference
 to `RELEASED` in that transaction after proving every correlated attempt/request
@@ -697,10 +1185,20 @@ hash, but this v1 replay API intentionally exposes only adoption of the stored
 projection. It does not commit a `REDUCING` state: a crash rolls the transaction
 back to `QUEUED`, where another reducer can retry.
 
-Backoff is database-clock based. Jitter, when used, is deterministic from
-`(action_id,attempt)` so a process restart cannot move the deadline. Serve—not
-the generic kernel—selects retry class, maximum delay, and whether observation
-is required.
+The first retry reduction reads one fresh PostgreSQL clock value after locking,
+computes and stores exactly one `next_attempt_at`, snapshots the attempt, and
+increments the action revision. A byte-equal replay of that settled attempt
+with the action still at the resulting revision/current attempt returns the
+stored projection and deadline without invoking the callback or reading a new
+clock. Replay after `current_attempt` or revision advances rejects as stale.
+Thus a response loss cannot move a retry deadline.
+
+Backoff is database-clock based. V1 handler-domain `R` uses its exact capped
+`D`; handler/fallback `U`/`O` and fallback `P0` use the fixed delays above and
+add no jitter. A later version that adds jitter must derive it deterministically
+from `(action_id, attempt)` so restart cannot move a committed deadline.
+Serve—not the generic kernel—selects retry class, maximum delay, and whether
+observation is required.
 
 ## Launch semantics
 
@@ -730,24 +1228,62 @@ The action becomes terminal only after the companion profile proves the exact
 resource absent by exact NotFound reads for every frozen object name. A
 same-name replacement or different identity is a conflict, never an alternate
 absence proof. Recoverable uncertainty returns to observation-first `READY`
-with a database-clock deadline and retries indefinitely. `BLOCKED` is reserved
-for a conflict/quarantine that requires repair; there is no cleanup give-up
-deadline.
+with a database-clock deadline while the finite attempt domain remains.
+`BLOCKED` is reserved for a conflict/quarantine or the exact attempt-domain
+exhaustion that requires repair; there is no time- or failure-count-based
+cleanup give-up deadline.
 
-A launch whose provider-I/O watermark never crossed `NOT_STARTED` is not
-superseded by a down action.
-After any correlated request is terminal and fenced with no active claim, the
-Serve transaction revalidates either no materialized attempt or an exact
-`provider_io_boundary='NOT_STARTED'` attempt with null API006 progress and
-null provider-operation evidence. An inherited nonnull cursor is therefore
-never a `CANCELLED_NO_EFFECT` proof even when no I/O occurred in its current
-attempt. The transaction terminalizes the launch as
-`CANCELLED_NO_EFFECT`, releases its counted `PROVISIONING` slot and exact
-action-owned capacity/reservation claim and `ACTION_ACTIVE` cohort reference
-once, and removes the action-owned provisional replica row under the owner/
-incarnation fence. It creates no down
-action, down link, cleanup target, or prior-launch basis. Lost-response replay
-adopts that one terminal projection and cannot release capacity twice.
+A launch with a complete nonnull no-I/O prefix is not superseded by a down
+action. The owner-fenced teardown transaction accepts exactly three direct
+proof variants:
+
+- `unmaterialized` requires `current_attempt=0`, no attempt/request row, the
+  count-zero prefix, and the exact locked launch identity/action revision;
+- `terminal_request_unsettled` requires the current attempt not yet settled,
+  an exact terminal correlated request with no active claim, and the exact
+  revision-zero `NOT_STARTED`/null-progress/null-operation journal. The
+  transaction uses its one database timestamp to settle that attempt, builds
+  its `ServeLaunchNoIoAttemptProjectionV1` and next prefix under the predecessor
+  locks, and sets proof `attempt_settled_at=cancelled_at`;
+- `retained_settled_attempt` requires the current retained attempt already
+  `SETTLED`, its immutable typed outcome/hash to parse and contain the exact
+  nonnull no-I/O prefix of count `current_attempt`, and the action still to be
+  nonterminal at that same current attempt. Its prior action `last_result` must
+  equal that current attempt outcome unless an explicitly typed same-attempt
+  operator transition is later added; v1 has none. The correlated request may
+  be `garbage_collected`. If retained, it must be terminal, unclaimed, and
+  byte-equal to the attempt's request ID/state; `request_finished_at` is its
+  timestamp. If absent, `request_row_disposition="garbage_collected"` and
+  `request_finished_at=null`; the settled attempt's immutable request snapshot
+  and `attempt_settled_at` are authority.
+
+For both materialized variants, request ID/state, journal fields, prefix, and
+current attempt equal the locked attempt. The retained-settled proof additionally
+embeds its existing `typed_outcome_sha256` and existing `settled_at`; its fresh
+`cancelled_at` is the new action terminal time and may be later. An inherited
+nonnull cursor, a nonzero progress revision, null/invalid prefix, or any crossed
+predecessor therefore categorically rejects `CANCELLED_NO_EFFECT`. All variants
+bind the exact launch identity and derived action ID;
+`source_action_revision` is the locked pre-transition revision, and the
+committed terminal action revision is exactly one greater.
+
+On any exact proof the reducer constructs the direct-cancellation-basis
+`ServeReplicaActionOutcomeV1` with provider tuple
+`("cancelled", "observed", null, null, null, null, null, null)`, null
+quiescence, and `launch_no_io_prefix` byte-equal to the proof. Conversely
+`terminal_disposition='CANCELLED_NO_EFFECT'` requires that exact outcome and
+proof. `unmaterialized` writes only action `last_result`.
+`terminal_request_unsettled` writes byte-equal outcome bytes to the newly
+settled current attempt and action. `retained_settled_attempt` never overwrites
+the historical attempt outcome; it writes the later cancellation only to action
+`last_result`. The same transaction releases the counted `PROVISIONING` slot
+and exact action-owned capacity/reservation claim and `ACTION_ACTIVE` cohort
+reference once, and removes the action-owned provisional replica row under the
+owner/incarnation fence. It creates no down action, down link, cleanup target,
+prior-launch basis, provider intent origin, or
+`ProviderLaunchNoEffectResolutionV1`; no provider intent existed. Lost-response
+replay adopts that one terminal action projection and cannot release capacity
+or rewrite attempt history twice.
 
 A real down action may supersede a nonterminal launch of the same replica
 incarnation only after its provider-I/O watermark crossed. Request fencing alone is
@@ -761,11 +1297,22 @@ observation-first until exact evidence advances the cursor or the provider
 contract proves the effect cannot still take place. A point-in-time NotFound
 never supplies that proof.
 
-Only after the handler has reconciled every effect entry may its result be
-terminalized and fenced. Request terminalization closes the companion's typed
-supersession-quiescence envelope with its terminal/no-active-claim facts; the
-reducer validates that proof against the exact API006 cursor before copying it
-to the attempt. The Serve transaction sets
+Only the original effect claim may return the companion's closed
+`ProviderLaunchNoEffectResolutionV1`; a later attempt or execution generation
+can exact-adopt committed evidence but cannot assert `call_not_entered` or a
+call-specific definitive-no-effect proof for the inherited entrant. The
+handler returns the exact `ServeReplicaActionRequestReturnV1`, and generic
+request terminalization records only that return plus its own terminal/no-
+active-claim facts. It never constructs quiescence.
+
+The Serve reducer requires terminal `SUCCEEDED`, the exact hash-valid handler
+DTO, and the final API006 cursor. It embeds/hashes every complete committed-
+effect record from that cursor, validates any one current no-effect resolution
+against the cursor's immutable intent origin, copies the request envelope's
+exact `terminal_result_sha256`, and constructs
+`ProviderLaunchSupersessionQuiescenceV1` inside the owner-fenced attempt-
+outcome transaction. External terminalization or a missing/invalid DTO is
+ineligible. Only then does the Serve transaction set
 the old launch to `kernel_state='TERMINAL'` with
 `terminal_disposition='SUPERSEDED_TO_DOWN'`, commits the teardown generation
 and real down action link, and freezes either the completed-launch basis or the
@@ -1902,6 +2449,18 @@ Tests must prove:
   I/O watermark with null progress;
 - monotonic provider-progress replay, stale-write rejection, and partial UID/
   job commitment survival across request-worker eviction;
+- every checked-in realistic and candidate-maximal companion fixture for all
+  launch phases, both head-Pod edges, terminal no-effect resolutions, request-
+  return envelopes, E-only/E+N reducer quiescence, handler-domain `S` and every
+  legal phase/category `R`/`U`/`B` tuple, all three direct no-effect bases and
+  empty/one/max-count prefix shapes, and request-fallback `P0`/`O`/`S`/`X`
+  outcomes remains at most 65,536 canonical UTF-8 bytes with its golden hash; an
+  oversized/unbounded candidate is rejected by admission and the immediate
+  pre-I/O recheck before any intent/watermark;
+- effect provenance survives generation reset across attempts: intent origins
+  and prior evidence remain byte-equal, evidence-commit origins and
+  created/adopted dispositions are exact, later claims may adopt but cannot
+  produce a no-effect resolution for an inherited ambiguous intent;
 - attempt `n+1` byte-copies the settled predecessor cursor, clears only its
   attempt-scoped worker attestation, recomputes the envelope hash, starts local
   revision one, and cannot materialize from missing/regressed crossed-boundary
@@ -1915,6 +2474,20 @@ Tests must prove:
   `READY`, and can seed the next attempt; an arbitrary, attested, regressed, or
   predecessor-mismatched `NOT_STARTED`/nonnull cursor rejects, and such a
   cursor can never prove `CANCELLED_NO_EFFECT`;
+- the private handler's dedicated encoder stores exactly one hash-valid
+  `ServeReplicaActionRequestReturnV1`; null/drop/default-encoded/mismatched
+  returns and external `FAILED`/`CANCELLED` terminalization cannot produce
+  partial-launch quiescence, while the reducer—not the handler—constructs and
+  persists the final quiescence from the valid DTO and API006 cursor;
+- every request-fallback terminal state and return-failure reason takes the
+  literal journal-class row: empty pre-I/O retries at 60 seconds, a valid
+  nonterminal cursor remains observation-first, exact `SUCCEEDED` progress
+  commits success, and invalid progress blocks; none can synthesize N or
+  partial handoff;
+- at attempt `RESOURCE_ACTION_MAX_ATTEMPT_V1`, each otherwise-retrying handler
+  `R`/`U` and fallback `P0`/`O` outcome settles byte-exactly but blocks with the
+  one exhaustion event and no deadline/request/attempt max-plus-one; replay is
+  idempotent, while eligible no-I/O teardown still takes the direct route;
 - the Skylet durable outbox returns only after the job/outbox fsync commit and
   every enumerated crash/restart state preserves one submission key, one job
   row/job ID, and monotonically increasing run epochs without starting job
@@ -1925,9 +2498,13 @@ Tests must prove:
 - database-clock retry continuity across restart;
 - stale owner/request/reducer writes reject;
 - observed launch adoption and ambiguous launch blocking;
-- a never-started launch becomes `CANCELLED_NO_EFFECT`, creates no down action,
-  removes the provisional row/count exactly once, and cannot double-release on
-  lost-response replay;
+- a never-started launch cancels through each of `unmaterialized`, terminal-
+  request-unsettled, retained-settled/request-present, and retained-settled/
+  request-GC paths using the exact monotonic no-I/O prefix; the unsettled path
+  writes attempt plus action, retained paths preserve the old attempt outcome
+  byte-for-byte while replacing only action `last_result`, and all paths remove
+  the provisional row/count exactly once without a down; prefix-link tampering,
+  inherited cursors, and crossed predecessors reject;
 - a superseded effectful launch is fenced and terminalized as
   `SUPERSEDED_TO_DOWN`, hands its exact partial cursor to one normally queued
   down action, and cannot run hidden cleanup or another launch request;
@@ -2016,8 +2593,11 @@ write typed outcomes.
   coverage/attempt store, promotion audit, and retention protocol.
 - The Serve-owned cursor validator/reducer and private-handler capability filter
   on top of the implemented generic API006 progress journal, including
-  cross-attempt cursor carry, per-attempt worker re-attestation, and
-  partial-launch cleanup.
+  immutable cross-attempt effect origins, per-attempt worker re-attestation,
+  the dedicated closed return encoder/decoder, candidate-maximal 65,536-byte
+  representability fixtures/preflight, reducer-owned quiescence, and
+  partial-launch cleanup. Authority remains disabled until realistic and
+  candidate-maximal fixture measurements both pass.
 - Rendered and live verification of the dedicated versioned authority-worker
   Helm cohort, exact RBAC/admission/NetworkPolicy, purpose token/TLS preflight,
   static-manifest/live-UID qualification, complete-spec submit/observe, worker

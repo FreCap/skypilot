@@ -4,6 +4,10 @@ Status: bounded M0 accepted after independent adversarial review; parent M1
 kernel complete; M2 cluster identity, initial immutable provider contracts, and
 typed shadow-store and Serve033 coverage/promotion foundations plus the generic
 API006 progress substrate are implemented and locally verified; the
+committed-effect/origin, closed handler-return, API006 representability, and
+partial-launch quiescence literal contract is frozen in this design while its
+Serve-owned cursor validator/reducer and both
+prior-launch-basis parser/admission paths remain pending; the
 candidate-only normalization boundary and atomic durable coverage handshake are
 in progress; the closed Kubernetes transport/scope leaf is implemented and
 independently verified; topology/image/config-policy/principal/authorization
@@ -127,7 +131,8 @@ The action request uses the normal executor with `retryable=false` and no queue
 precondition. Because the current generic executor otherwise requeues
 `ExecutionRetryableError` and `ExecutionPausedError` regardless of that flag,
 the action handler/facet catches both families and normalizes them into a closed
-typed retry/uncertain outcome before they escape. The same request ID never
+typed retry/uncertain provider result inside the parent design's
+`ServeReplicaActionRequestReturnV1` before they escape. The same request ID never
 gets executor-driven retry/requeue. A later claim generation for that request
 may recover the handler, but it observes and consumes API006 progress and never
 repeats a committed effect; only the Serve reducer may admit attempt `n+1`.
@@ -208,6 +213,63 @@ CompletedLaunchBasisV1 = {
   exact_resources_override: true
 }
 
+ProviderLaunchEffectClaimV1 = {
+  version: 1,
+  launch_attempt: PositiveInteger,
+  request_id: UUID,
+  request_execution_generation: PositiveInteger,
+  worker_attestation: ProviderAuthorityWorkerAttemptAttestationV1,
+  worker_attestation_sha256: Sha256
+}
+
+ProviderLaunchCommittedEffectEvidenceV1 =
+    ProviderCoreV1CreateCommitEvidenceV1 |
+    ProviderClusterRecordCommitEvidenceV1 |
+    ProviderSkyletJobCommitEvidenceV1
+
+ProviderCoreV1CreateCommitEvidenceV1 = {
+  version: 1,
+  evidence_kind: "core_v1_create_committed",
+  effect_sequence: 0 | 1 | 2,
+  effect_kind: "core_v1_create",
+  role: ProviderObjectRoleV1,
+  intent_phase: "CREATE_INTENT",
+  intent_origin: ProviderLaunchEffectClaimV1,
+  evidence_commit_origin: ProviderLaunchEffectClaimV1,
+  commit_disposition: "created" | "adopted_exact",
+  request_body_sha256: Sha256,
+  requested_semantic_sha256: Sha256,
+  object_at_commit: ProviderKubernetesResolvedObjectV1
+}
+
+ProviderClusterRecordCommitEvidenceV1 = {
+  version: 1,
+  evidence_kind: "cluster_record_insert_committed",
+  effect_sequence: 3,
+  effect_kind: "cluster_record_insert",
+  role: null,
+  intent_phase: "HANDLE_INTENT",
+  intent_origin: ProviderLaunchEffectClaimV1,
+  evidence_commit_origin: ProviderLaunchEffectClaimV1,
+  write_disposition: "inserted" | "adopted_exact",
+  intended_handle: ProviderKubernetesHandleV1,
+  intended_handle_sha256: Sha256
+}
+
+ProviderSkyletJobCommitEvidenceV1 = {
+  version: 1,
+  evidence_kind: "skylet_job_submit_committed",
+  effect_sequence: 4,
+  effect_kind: "skylet_job_submit",
+  role: null,
+  intent_phase: "JOB_INTENT",
+  intent_origin: ProviderLaunchEffectClaimV1,
+  evidence_commit_origin: ProviderLaunchEffectClaimV1,
+  commit_disposition: "submitted" | "adopted_exact",
+  submit_request_sha256: Sha256,
+  job_at_commit: ProviderSkyletJobEvidenceV1
+}
+
 ProviderLaunchEffectDefinitiveNoEffectV1 = one of:
   {version: 1,
    proof_kind: "core_v1_422_no_create",
@@ -217,12 +279,22 @@ ProviderLaunchEffectDefinitiveNoEffectV1 = one of:
   {version: 1,
    proof_kind: "cluster_record_no_commit",
    intended_handle_sha256: Sha256,
-   transaction_result: "rolled_back" | "conflict_no_write",
+   transaction_result: "rolled_back",
    cluster_name: Text,
    expected_cluster_record_uuid: UUID,
-   post_read_disposition: "not_found" | "different_identity_conflict",
-   observed_cluster_record_uuid: null | UUID,
-   observed_handle: null | ProviderKubernetesHandleV1,
+   post_read_disposition: "not_found",
+   observed_cluster_record_uuid: null,
+   observed_handle: null,
+   observed_at: UtcTimestamp}
+  {version: 1,
+   proof_kind: "cluster_record_no_commit",
+   intended_handle_sha256: Sha256,
+   transaction_result: "conflict_no_write",
+   cluster_name: Text,
+   expected_cluster_record_uuid: UUID,
+   post_read_disposition: "different_identity_conflict",
+   observed_cluster_record_uuid: UUID,
+   observed_handle: ProviderKubernetesHandleV1,
    observed_at: UtcTimestamp}
   {version: 1,
    proof_kind: "skylet_rejected_before_job_commit",
@@ -232,26 +304,76 @@ ProviderLaunchEffectDefinitiveNoEffectV1 = one of:
    pending_start_outbox: false,
    active_run_token: false}
 
-ProviderLaunchEffectQuiescenceV1 = {
-  effect_sequence: 0 | 1 | 2 | 3 | 4,
-  effect_kind: "core_v1_create" | "cluster_record_insert" |
-               "skylet_job_submit",
-  role: null | ProviderObjectRoleV1,
-  intent_phase: "CREATE_INTENT" | "HANDLE_INTENT" | "JOB_INTENT",
-  resolution: "evidence_committed" | "definitive_no_effect" |
-              "call_not_entered",
-  evidence_sha256: null | Sha256,
-  definitive_no_effect: null | ProviderLaunchEffectDefinitiveNoEffectV1,
-  request_execution_generation: PositiveInteger
-}
+ProviderLaunchNoEffectResolutionV1 = one of:
+  {version: 1,
+   effect_sequence: 0 | 1 | 2 | 3 | 4,
+   effect_kind: "core_v1_create" | "cluster_record_insert" |
+                "skylet_job_submit",
+   role: null | ProviderObjectRoleV1,
+   intent_phase: "CREATE_INTENT" | "HANDLE_INTENT" | "JOB_INTENT",
+   intent_cursor_sha256: Sha256,
+   intent_origin: ProviderLaunchEffectClaimV1,
+   resolution_origin: ProviderLaunchEffectClaimV1,
+   resolution: "definitive_no_effect",
+   evidence_sha256: Sha256,
+   definitive_no_effect: ProviderLaunchEffectDefinitiveNoEffectV1}
+  {version: 1,
+   effect_sequence: 0 | 1 | 2 | 3 | 4,
+   effect_kind: "core_v1_create" | "cluster_record_insert" |
+                "skylet_job_submit",
+   role: null | ProviderObjectRoleV1,
+   intent_phase: "CREATE_INTENT" | "HANDLE_INTENT" | "JOB_INTENT",
+   intent_cursor_sha256: Sha256,
+   intent_origin: ProviderLaunchEffectClaimV1,
+   resolution_origin: ProviderLaunchEffectClaimV1,
+   resolution: "call_not_entered",
+   evidence_sha256: null,
+   definitive_no_effect: null}
+
+ProviderLaunchEffectQuiescenceV1 = one of:
+  {version: 1,
+   effect_sequence: 0 | 1 | 2 | 3 | 4,
+   effect_kind: "core_v1_create" | "cluster_record_insert" |
+                "skylet_job_submit",
+   role: null | ProviderObjectRoleV1,
+   intent_phase: "CREATE_INTENT" | "HANDLE_INTENT" | "JOB_INTENT",
+   resolution: "evidence_committed",
+   evidence_sha256: Sha256,
+   committed_evidence: ProviderLaunchCommittedEffectEvidenceV1,
+   definitive_no_effect: null}
+  {version: 1,
+   effect_sequence: 0 | 1 | 2 | 3 | 4,
+   effect_kind: "core_v1_create" | "cluster_record_insert" |
+                "skylet_job_submit",
+   role: null | ProviderObjectRoleV1,
+   intent_phase: "CREATE_INTENT" | "HANDLE_INTENT" | "JOB_INTENT",
+   resolution: "definitive_no_effect",
+   evidence_sha256: Sha256,
+   committed_evidence: null,
+   intent_origin: ProviderLaunchEffectClaimV1,
+   resolution_origin: ProviderLaunchEffectClaimV1,
+   definitive_no_effect: ProviderLaunchEffectDefinitiveNoEffectV1}
+  {version: 1,
+   effect_sequence: 0 | 1 | 2 | 3 | 4,
+   effect_kind: "core_v1_create" | "cluster_record_insert" |
+                "skylet_job_submit",
+   role: null | ProviderObjectRoleV1,
+   intent_phase: "CREATE_INTENT" | "HANDLE_INTENT" | "JOB_INTENT",
+   resolution: "call_not_entered",
+   evidence_sha256: null,
+   committed_evidence: null,
+   intent_origin: ProviderLaunchEffectClaimV1,
+   resolution_origin: ProviderLaunchEffectClaimV1,
+   definitive_no_effect: null}
 
 ProviderLaunchSupersessionQuiescenceV1 = {
   version: 1,
   launch_action_id: UUID,
   launch_attempt: PositiveInteger,
   request_id: UUID,
-  request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  request_terminal_state: "SUCCEEDED",
   active_claim: false,
+  handler_terminal_result_sha256: Sha256,
   launch_provider_cursor_sha256: Sha256,
   effects: [ProviderLaunchEffectQuiescenceV1],
   settled_at: UtcTimestamp
@@ -279,31 +401,86 @@ PartialLaunchCleanupBasisV1 = {
 }
 ```
 
-`PriorLaunchBasisV1` intentionally has no `NOT_STARTED` variant. After fencing
-and terminalizing any materialized request, a launch whose current attempt
-still has `provider_io_boundary='NOT_STARTED'` and null API006 progress is
-cancelled as a proved no-effect launch. A retry attempt with an inherited
-nonnull cursor is not eligible for this cancellation even if its own provider-
-I/O watermark remains `NOT_STARTED`. The Serve transaction creates no down
-action, down link, cleanup target, or prior-launch basis; it terminalizes the
-launch with `terminal_disposition='CANCELLED_NO_EFFECT'`, releases its counted
-slot/capacity exactly once, and applies the owner-fenced replica/generation
-cancellation projection. A real down action is required only after the launch
-has action-wide provider-I/O-started evidence or a completed launch exists.
-`launch_io_started` is a typed predicate over the locked retained attempt
-chain: at least one attempt has
-`provider_io_boundary != 'NOT_STARTED'`. The request-lifecycle
-`mutation_boundary='SETTLED'` never satisfies it by itself. An exact inherited
-nonnull cursor keeps the predicate true even when the current retry's own
-watermark remains `NOT_STARTED`, because admission revalidates its byte-equal
-predecessor chain back to the attempt that crossed the watermark. Such a retry
-must be reconciled and quiesced; it cannot fall back to direct no-effect
-cancellation.
+`PriorLaunchBasisV1` intentionally has no `NOT_STARTED` variant. The parent's
+reducer maintains a closed monotonic `ServeLaunchNoIoPrefixV1` in each settled
+revision-zero no-I/O launch outcome. Each link embeds the complete current
+attempt projection and the predecessor's reducer-owned prefix hash; the
+preimages remain in immutable retained attempt rows, while direct proof/replay
+locks only predecessor then current attempt and is O(1). The direct path accepts
+exactly an unmaterialized empty prefix, a terminal-request-unsettled attempt it
+settles atomically, or an already-settled current attempt whose request may
+have been garbage-collected. The retained-settled path preserves that attempt's
+historical outcome and writes only the later action result. A retry attempt with
+an inherited nonnull cursor has null prefix and is not eligible even if its own
+provider-I/O watermark remains `NOT_STARTED`.
+
+The path persists the closed
+`ServeReplicaActionDirectNoEffectCancellationV1` proof and exact reducer-owned
+cancellation outcome. The Serve transaction creates no down action, down link,
+cleanup target, prior-launch basis, or provider no-effect resolution; it
+terminalizes the launch with `terminal_disposition='CANCELLED_NO_EFFECT'`,
+releases its counted slot/capacity exactly once, and applies the owner-fenced
+replica/generation cancellation projection. A real down action is required only
+after the launch has action-wide provider-I/O-started evidence or a completed
+launch exists. `launch_io_started` is an O(1) typed predicate over the locked
+current attempt, not a scan or serialized list of historical attempts. It is
+true exactly when that attempt has either (a) a valid non-`NOT_STARTED`
+provider-I/O boundary and its required nonnull cursor, or (b) a valid inherited
+nonnull cursor even though the new retry's own boundary remains `NOT_STARTED`.
+Case (b) is sufficient because attempt materialization already byte-validated
+the cursor against the immutable predecessor outcome before committing it. The
+request-lifecycle `mutation_boundary='SETTLED'` never satisfies the predicate
+by itself. An exact revision-zero current attempt can establish no-I/O only
+through the parent's rolling prefix; a missing/invalid prefix or cursor/
+boundary mismatch is corruption, not either proof. Thus an inherited retry
+must be reconciled and quiesced, while direct proof construction locks at most
+predecessor and current attempt.
 
 Supersession quiescence uses action-internal mutation order: create roles 0-2,
 cluster-record insert 3, and Skylet submit 4. This is deliberately distinct
 from the legacy wire-effect trace, which excludes the local cluster-row
 transaction and therefore numbers Skylet submit as 3.
+
+The action-internal effect table is a literal v1 protocol constant:
+
+| Sequence | Effect kind | Role | Intent phase | Frozen full preimage |
+|---:|---|---|---|---|
+| 0 | `core_v1_create` | `head_ssh_service` | `CREATE_INTENT` | object-plan 0 `request_body` |
+| 1 | `core_v1_create` | `head_service` | `CREATE_INTENT` | object-plan 1 `request_body` |
+| 2 | `core_v1_create` | `head_pod` | `CREATE_INTENT` | object-plan 2 `request_body` |
+| 3 | `cluster_record_insert` | null | `HANDLE_INTENT` | complete `intended_handle` |
+| 4 | `skylet_job_submit` | null | `JOB_INTENT` | complete `submit_request` |
+
+The CoreV1 request-body and semantic hashes are checked against the full
+applicable `ProviderKubernetesObjectPlanV1` preimages in the immutable spec;
+the Skylet hash is checked against the full reconstructed
+`ProviderSkyletSubmitRequestV1`. Hash or authority metadata without those full
+preimages is insufficient. The cluster-row record retains its full intended
+handle as well as its hash.
+
+`ProviderLaunchEffectClaimV1` is the immutable origin of an intent or evidence
+commit. Its request ID is exactly
+`uuid5(enclosing_launch_action_id, f"attempt:{launch_attempt}")`; its embedded
+attestation has the same request ID and execution generation, and
+`worker_attestation_sha256` is the canonical hash of that complete embedded
+attestation, including its worker and authority-worker identity preimages. The
+claim stores the attestation snapshot that existed at the origin commit; a
+later legal `after: null -> exact identity` completion in the attempt envelope
+does not rewrite that snapshot or its hash.
+
+Each intent cursor retains an `intent_origin` written in the same API006
+transaction as the intent. Each `C<i>` copies that origin byte-for-byte and
+adds the immutable claim-origin snapshot used by the evidence checkpoint as
+`evidence_commit_origin`. Both are validated against their own attempt's
+deterministic request and live execution fence; a live attestation may be the
+same snapshot or its one legal same-execution `after` completion without
+rewriting the origin. Exact readback under a later claim may create committed
+evidence with a later evidence-commit origin, but it cannot replace the
+original intent origin. Origin order is lexicographic by
+`(launch_attempt, request_execution_generation)`, never by bare generation:
+the evidence-commit origin cannot precede its intent origin, and origins for a
+later effect cannot precede the preceding committed effect's evidence origin.
+Execution generation may restart at one for a new attempt.
 
 A launch has `prior_launch_basis=null` and `prior_cleanup_target=null`. Its
 resource hash is the canonical
@@ -344,38 +521,186 @@ source cursor, quiescence, cleanup-target, and immutable-spec byte used to
 construct the candidate. Any mismatch rolls back the entire transaction,
 including a newly inserted down row. It derives the three-slot cleanup target
 from the retained launch object plans, every committed UID/allocation, and an
-exact same-UUID cluster-row read. The quiescence list is the exact canonical
-prefix of mutation intents present in the cursor. Each entry has exactly one
-resolution. `evidence_committed` has a nonnull `evidence_sha256` naming
-immutable effect evidence retained by the cursor and has
-`definitive_no_effect=null`. `definitive_no_effect` embeds the complete closed
-proof above, sets `evidence_sha256` to its canonical hash, and must match the
-entry's sequence, kind, role, intent phase, request generation, frozen request
-bytes, and current cursor. `call_not_entered` has both evidence fields null and
-is written by the same-generation handler before entering that effect call.
+exact same-UUID cluster-row read.
 
-A definitive-no-effect proof is valid only for a synchronous Kubernetes 422
-that cannot persist the object, a cluster-record transaction proved not to
-have committed, or a Skylet protocol rejection proved to occur before job-row
-commit. A same-key/different-spec Skylet conflict additionally requires a
-terminal-or-`BLOCKED` conflicting job with no pending start outbox or active run
-token; a runnable conflicting job blocks handoff. Timeout, reset, 5xx, lost
-acknowledgement, expired lease, or a point-in-time NotFound never qualifies.
-The handler claim-fenced-commits the
-proof in the typed terminal result; request terminalization atomically closes
-the envelope with its own terminal state and `active_claim=false` without
-reading or locking the attempt;
-the reducer later byte-compares the supplied cursor/effect commitments to
-API006 before copying the final `ProviderLaunchSupersessionQuiescenceV1` into
-the attempt outcome. Callers cannot supply it.
-An ambiguous or in-flight `CREATE_INTENT`/`JOB_INTENT`, a lost acknowledgement
-with no exact evidence, or a merely expired lease is not eligible: the old
-launch remains observation-first and the down action is not admitted. The
-request must be terminal with no active claim before admission, so no old
-handler can emit another effect. Unknown UID slots are allowed only for roles
-whose create intent never existed, has `call_not_entered`, or has a matching
-`core_v1_422_no_create` definitive-no-effect proof; they are never guessed from
-NotFound.
+The progress and quiescence prefixes are also literal protocol constants. In
+the following table, `C<i>` is the complete immutable committed-effect record
+for sequence `i`; `E<i>` is an `evidence_committed` quiescence entry that embeds
+and hashes that exact record; and `N<i>` is exactly one `call_not_entered` or the
+effect-specific `definitive_no_effect` entry allowed below. Brackets denote the
+complete list, not a subset or a pattern:
+
+| Exact `ProviderLaunchProgressV1` phase | Exact `committed_effects` | Exact quiescence `effects` |
+|---|---|---|
+| `CREATE_INTENT(head_ssh_service)` | `[]` | `[N0]` |
+| `OBJECTS_PARTIAL` with 1 committed slot | `[C0]` | `[E0]` |
+| `CREATE_INTENT(head_service)` | `[C0]` | `[E0, N1]` |
+| `OBJECTS_PARTIAL` with 2 committed slots | `[C0, C1]` | `[E0, E1]` |
+| `CREATE_INTENT(head_pod)` | `[C0, C1]` | `[E0, E1, N2]` |
+| `OBJECTS_PARTIAL` with 3 committed slots and no Pod `nodeName` | `[C0, C1, C2]` | `[E0, E1, E2]` |
+| `OBJECTS_EXACT` | `[C0, C1, C2]` | `[E0, E1, E2]` |
+| `HANDLE_INTENT` | `[C0, C1, C2]` | `[E0, E1, E2, N3]` |
+| `HANDLE_COMMITTED` | `[C0, C1, C2, C3]` | `[E0, E1, E2, E3]` |
+| `RUNTIME_READY` | `[C0, C1, C2, C3]` | `[E0, E1, E2, E3]` |
+| `JOB_INTENT` | `[C0, C1, C2, C3]` | `[E0, E1, E2, E3, N4]` |
+| `JOB_COMMITTED` | `[C0, C1, C2, C3, C4]` | `[E0, E1, E2, E3, E4]` |
+| `JOB_RUNNING` | `[C0, C1, C2, C3, C4]` | `[E0, E1, E2, E3, E4]` |
+| `ENDPOINT_RESOLVED` | `[C0, C1, C2, C3, C4]` | `[E0, E1, E2, E3, E4]` |
+| `SUCCEEDED` | `[C0, C1, C2, C3, C4]` | `[E0, E1, E2, E3, E4]`; partial basis forbidden |
+
+`OBJECTS_PARTIAL` with three slots is valid only while the head Pod's sole
+scheduler allocation is absent; once `nodeName` is known, the cursor is
+`OBJECTS_EXACT`. Runtime checks and endpoint resolution add no mutation effect.
+A current intent cannot resolve as `evidence_committed` while retaining its
+intent phase: the same claim-fenced API006 commit first appends `C<i>` and
+advances to the corresponding post-effect phase. An inherited current intent
+with neither exact committed readback nor an origin-bound `N<i>` result from
+the original execution claim cannot be handed off.
+
+The allowed `N<i>` resolution is exact by sequence. `N0` through `N2` are
+either `call_not_entered` or `core_v1_422_no_create`; `N3` is either
+`call_not_entered` or `cluster_record_no_commit`; and `N4` is either
+`call_not_entered` or `skylet_rejected_before_job_commit`. A timeout, reset,
+5xx response, lost acknowledgement, expired claim, or point-in-time NotFound
+is no resolution at any sequence. Each `evidence_committed` entry has
+`definitive_no_effect=null`, embeds the canonical complete `C<i>` record, and
+hashes that record including both origins and its disposition.
+Each `definitive_no_effect` entry embeds the complete proof and hashes that
+canonical proof. Both no-effect resolutions retain the cursor's byte-equal
+`intent_origin` and the handler result's `resolution_origin`. Their origin
+claims, including the complete attestation preimage and hash, must be
+byte-equal, so a reclaimed or later-attempt handler cannot resolve an earlier
+entrant. `call_not_entered` has null evidence/proof fields and is claim-fenced-
+written before that original claim enters the call. For a definitive proof,
+the terminal result's live worker attestation may be the origin snapshot's one
+documented same-execution `after` completion, but `resolution_origin` remains
+the original immutable claim. A different request ID, attempt, execution
+generation, worker, or authority identity is never a no-effect resolver;
+cross-claim recovery must exact-adopt committed evidence or remain observation-
+first.
+
+The CoreV1 422 proof is valid only for the exact current create intent, exact
+request-body hash and original intent-origin execution claim, and the
+synchronous 422 response to that claim's create. Its post-observation uses the
+same live client and has
+complete, byte-equal frozen-scope reads before and after all three exact-name
+GETs. Its object list and overall state are fixed by this table:
+
+| Failing sequence | Exact object dispositions in role order | Overall state and certainty |
+|---:|---|---|
+| 0 | `not_found, not_found, not_found` | `absent, authoritative` |
+| 1 | `present, not_found, not_found` | `uncertain, authoritative` |
+| 2 | `present, present, not_found` | `uncertain, authoritative` |
+
+Every earlier `present` entry is byte-equal in identity, UID, admitted
+semantic hash, and allocations to its `C<i>` record. The failing and every
+later role are exact `not_found`; their response-derived UID, identity-label,
+normalized-observed-semantic, observed-semantic-hash, spec-match, allocation,
+deletion, phase, and readiness fields are respectively null or empty. Their
+role/kind/name/scope and requested-semantic hash still equal the frozen plan.
+At the observation top level, provider operation ID, provider resource ID,
+workload UID, resolved target, and readiness are null. The authoritative mixed
+state for sequences 1 and 2 is deliberately `uncertain`; no additional partial
+state exists. If exact readback instead finds the failing object, the handler
+must adopt it and append the commit evidence before quiescence. A conflict or
+uncertain read blocks; it cannot be rewritten as 422 no-effect.
+
+The cluster-row no-commit proof has this exhaustive field matrix:
+
+| `transaction_result` | `post_read_disposition` | `observed_cluster_record_uuid` | `observed_handle` |
+|---|---|---|---|
+| `rolled_back` | `not_found` | null | null |
+| `conflict_no_write` | `different_identity_conflict` | nonnull and different from expected | exact typed handle for that UUID and the same cluster name |
+
+Every row also requires the exact sequence-3 intended-handle hash, cluster
+name, expected cluster-record UUID, and transaction/lock result. `rolled_back`
+means an observed transaction rollback; a later NotFound alone cannot prove
+it. A legacy same-name row with a null UUID, any null or unparseable provider
+block, a same expected UUID with a different handle, the expected UUID under
+another name, or an out-of-contract conflict race blocks. A structurally valid
+different-UUID conflict can settle
+the source launch, but partial-down admission still requires a fresh cleanup
+read yielding either the exact own-UUID handle or exact NotFound; the conflicting
+row itself cannot become the cleanup target.
+
+The Skylet rejection proof requires the exact current `JOB_INTENT`, submit
+request hash and launch-action submission key, plus the runtime evidence's
+exact state-store UUID. The job read and the `pending_start_outbox=false` and
+`active_run_token=false` facts come from one SQLite transaction, or from two
+reads pinned to the same unchanged record revision. For `schema_rejected`,
+`post_job.read_disposition="not_found"`; its durable state, job ID, run epoch,
+and record revision are null, while both job hashes equal the attempted
+request. For `same_key_different_spec`, the disposition is `conflict`, durable
+state is exactly `SUCCEEDED`, `FAILED`, or `BLOCKED`, job ID, run epoch, and
+record revision are nonnull, and at least one retained job hash differs from
+the attempted request. A runnable state, `uncertain` read, null required
+revision, changing revision, pending outbox, or active run token blocks
+handoff. Conversely, `C4` requires a `present` job with matching hashes and
+nonnull durable state, job ID, run epoch, and revision. Later job evidence may
+only follow the documented monotonic state/revision/run-epoch transitions with
+stable submission key, hashes, job ID, and state-store UUID; `job_at_commit`
+itself remains immutable.
+
+`ProviderLaunchSupersessionQuiescenceV1` is constructed by the Serve reducer,
+never accepted from a caller. It names the exact action, attempt, request,
+terminal request state, final cursor hash, and retained request settlement row:
+`request_terminal_state` and `settled_at` equal that row's terminal state and
+terminal-transition timestamp. `active_claim=false` is proved by the terminal
+request fence, not trusted from the serialized boolean. Its effect list is
+exactly the applicable phase table row, with no omitted, duplicated, reordered,
+or caller-added entry. Each `E<i>` embeds and hashes the byte-equal `C<i>`;
+each `N<i>` copies the intent and resolution origins from the validated handler
+terminal result. Origin tuples obey the lexicographic attempt/generation order
+above; no standalone generation monotonicity exists. Request terminalization
+atomically closes the
+request envelope without locking the action attempt. The handler may
+claim-fenced-persist only the current `N<i>` resolution input in its typed
+terminal result. That input is exactly one
+`ProviderLaunchNoEffectResolutionV1` nested in the companion's closed
+`ServeReplicaActionHandlerTerminalResultV1`; neither it nor request
+terminalization constructs the final quiescence object. The later
+owner-fenced attempt-outcome transaction byte-compares API006 and the terminal
+request row, requires the exact handler-terminal-result hash named here,
+constructs this object, and persists it before admitting any partial basis.
+The request row must be terminal `SUCCEEDED`, retain the companion's exact
+nonnull return envelope and hash-valid terminal DTO with
+`reduction_kind="supersede_to_down"`, and have no active claim. For a current-
+intent phase the DTO contains exactly the matching original-claim `N<i>` and
+the reducer constructs `E* + N<i>`. For every nonintent, non-`SUCCEEDED` phase
+the DTO has null resolution and the reducer constructs the exact E-only row.
+Every legal row in that phase table has a nonnull cursor and satisfies the
+current-attempt `launch_io_started` predicate. Revision-zero/null-cursor input
+is never an E-only row and must use the parent's direct no-effect route after
+the request fence. An E-only phase with a resolution, an intent phase without
+its exact resolution, any supersession result at `SUCCEEDED`, or a
+noncancelled provider tuple is corruption and admits no down.
+
+External `FAILED`/`CANCELLED` terminalization, a null/dropped return, or an
+invalid/mismatched terminal-`SUCCEEDED` DTO is categorically ineligible for
+quiescence and partial cleanup. It uses the parent's closed request-fallback
+table: an exact non-`SUCCEEDED` cursor remains observation-first, an exact
+`SUCCEEDED` cursor commits normal provider success, a revision-zero empty
+journal retries when the action remains desired, and malformed progress
+blocks. External terminalization never supplies `N<i>` or partial handoff. The
+only exception is not a provider quiescence path: when owner-fenced teardown is
+requested and the parent's exact no-I/O prefix proves the empty, newly settled,
+or retained-settled shape, the reducer constructs
+`ServeReplicaActionDirectNoEffectCancellationV1` and
+`CANCELLED_NO_EFFECT`; the retained request may already be garbage-collected.
+That proof is not
+`ProviderLaunchNoEffectResolutionV1`; no provider intent exists, so inventing
+an intent origin, resolution origin, or `call_not_entered` entry is invalid.
+For partial cleanup, the request must be terminal with no active claim before
+admission, so no old handler can emit another effect. A `SUCCEEDED` cursor or
+successful launch action rejects `partial_launch_cleanup` regardless of request
+terminal state.
+
+An ambiguous or in-flight intent, a lost acknowledgement without exact
+evidence, or a merely expired claim keeps the old launch observation-first and
+prevents down admission. Unknown UID slots are allowed only for create roles
+whose effect is outside the cursor prefix or whose current intent has
+`call_not_entered` or a matching `core_v1_422_no_create` proof. They are never
+guessed from NotFound.
 
 Both variants share service, service incarnation, replica ID, replica
 incarnation, target, resources, and workspace with the down; the down
@@ -1040,46 +1365,60 @@ ProviderLifecycleCursorV1 = ProviderLaunchProgressV1 | ProviderDownProgressV1
 ProviderLaunchProgressV1 = one of:
   {version: 1, action_kind: "launch", phase: "CREATE_INTENT",
    role: ProviderObjectRoleV1,
+   intent_origin: ProviderLaunchEffectClaimV1,
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    known_objects: PartialResolvedProviderTargetV1,
    pre_observation: ProviderLifecycleObservationV1}
   {version: 1, action_kind: "launch", phase: "OBJECTS_PARTIAL",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    known_objects: PartialResolvedProviderTargetV1,
    post_observation: ProviderLifecycleObservationV1}
   {version: 1, action_kind: "launch", phase: "OBJECTS_EXACT",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    post_observation: ProviderLifecycleObservationV1}
   {version: 1, action_kind: "launch", phase: "HANDLE_INTENT",
+   intent_origin: ProviderLaunchEffectClaimV1,
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    intended_handle: ProviderKubernetesHandleV1}
   {version: 1, action_kind: "launch", phase: "HANDLE_COMMITTED",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    handle: ProviderKubernetesHandleV1}
   {version: 1, action_kind: "launch", phase: "RUNTIME_READY",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    handle: ProviderKubernetesHandleV1,
    runtime_evidence: ProviderKubernetesRuntimeEvidenceV1}
   {version: 1, action_kind: "launch", phase: "JOB_INTENT",
+   intent_origin: ProviderLaunchEffectClaimV1,
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    handle: ProviderKubernetesHandleV1,
    runtime_evidence: ProviderKubernetesRuntimeEvidenceV1,
    submit_request: ProviderSkyletSubmitRequestV1}
   {version: 1, action_kind: "launch", phase: "JOB_COMMITTED",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    handle: ProviderKubernetesHandleV1,
    runtime_evidence: ProviderKubernetesRuntimeEvidenceV1,
    job: ProviderSkyletJobEvidenceV1}
   {version: 1, action_kind: "launch", phase: "JOB_RUNNING",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    handle: ProviderKubernetesHandleV1,
    runtime_evidence: ProviderKubernetesRuntimeEvidenceV1,
    job: ProviderSkyletJobEvidenceV1}
   {version: 1, action_kind: "launch", phase: "ENDPOINT_RESOLVED",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    handle: ProviderKubernetesHandleV1,
    runtime_evidence: ProviderKubernetesRuntimeEvidenceV1,
    job: ProviderSkyletJobEvidenceV1,
    endpoint: ProviderKubernetesEndpointEvidenceV1}
   {version: 1, action_kind: "launch", phase: "SUCCEEDED",
+   committed_effects: [ProviderLaunchCommittedEffectEvidenceV1],
    resolved_target: ResolvedProviderTargetV1,
    handle: ProviderKubernetesHandleV1,
    runtime_evidence: ProviderKubernetesRuntimeEvidenceV1,
@@ -1147,9 +1486,12 @@ zone-free IPv4 or IPv6 text under the same checked-in
 Arbitrary text, alternate IP spelling, and a zone identifier are not
 representable.
 
-Unknown keys are forbidden in every variant. Launch alternates
-`CREATE_INTENT(role) -> OBJECTS_PARTIAL` in canonical create order, then follows
-`OBJECTS_EXACT -> HANDLE_INTENT -> HANDLE_COMMITTED -> RUNTIME_READY ->
+Unknown keys are forbidden in every variant. Launch normally alternates
+`CREATE_INTENT(role) -> OBJECTS_PARTIAL` in canonical create order. The head-Pod
+edge may instead be `CREATE_INTENT(head_pod) -> OBJECTS_EXACT` when its first
+exact readback already contains the write-once scheduler `nodeName`; otherwise
+it reaches `OBJECTS_PARTIAL` with three slots and later `OBJECTS_EXACT`. Launch
+then follows `OBJECTS_EXACT -> HANDLE_INTENT -> HANDLE_COMMITTED -> RUNTIME_READY ->
 JOB_INTENT -> JOB_COMMITTED -> JOB_RUNNING -> ENDPOINT_RESOLVED -> SUCCEEDED`.
 `CREATE_INTENT.role` is exactly the first unknown role. `OBJECTS_PARTIAL` has
 one to three committed slots; three is permitted while scheduler `nodeName` is
@@ -1161,15 +1503,55 @@ present, fsync-committed same-key/byte-equal job and nonnull job ID;
 Launch `SUCCEEDED` retains every proof and an authoritative `present`
 observation.
 
+Every launch variant carries the exact `committed_effects` list selected by the
+literal phase table above. Records are ordered by strictly contiguous ascending
+`effect_sequence`; no sparse, duplicate, out-of-order, or extra record is
+valid. A record is appended only by the same claim-fenced API006 transaction
+that advances the current intent to its post-effect phase. Every prior record
+is byte-equal forever. The record's `intent_origin` equals the current intent
+cursor's immutable origin, and its `evidence_commit_origin` equals the live
+claim's immutable origin snapshot and complete content-addressed attestation
+provenance. Their lexicographic
+attempt/generation ordering follows the rule above. A newer attempt or request
+generation can exact-adopt and append later evidence but cannot relabel an
+earlier intent or committed record.
+
+For `C0` through `C2`, sequence, role, request-body hash, and requested-semantic
+hash equal the corresponding full immutable object plan, and
+`object_at_commit` equals that role's committed slot in UID, admitted semantic
+hash, and then-known allocations. Both Service records have their complete
+immutable allocation quartet. The Pod record may initially omit only the
+scheduler-owned `/spec/nodeName`; later progress may append exactly that
+allocation to the same-UID current object without changing `C2`; when the first
+readback already contains it, `object_at_commit` includes it and the cursor
+takes the direct `OBJECTS_EXACT` edge. `C3` retains
+the byte-equal complete intended handle and its hash, and its disposition is
+the exact insert/adopt transaction result. `C4.job_at_commit` is the exact
+fsync-committed same-key, same-spec job read described above. None of these
+records is reconstructed later from a resource name, authority identity, or
+digest alone.
+
+The evidence disposition is also provenance, not an advisory diagnostic.
+CoreV1 `created`, cluster-row `inserted`, and Skylet `submitted` require the
+evidence-commit origin to be byte-equal to the intent origin and require that
+same claim's corresponding synchronous success result. `adopted_exact` means the
+evidence checkpoint came from qualified exact readback of already-committed
+state, including 409/lost-ack recovery; it is mandatory whenever the evidence-
+commit origin is a later attempt or generation and is also legal after 409 or
+readback in the same byte-equal claim. A disposition/origin/response/readback
+mismatch is invalid.
+
 Progress is never validated as a free-standing union. The typed API006 store
 receives the exact immutable action ID, kind, plan, spec hash, and (for down)
 prior-launch basis. It requires `cursor.action_kind` to equal the action kind;
 every requested-target, cleanup-target, prior-basis, resource, cluster-record,
 service/replica-incarnation, and nested object hash/identity to equal the
 applicable frozen preimage; and every launch submission key to equal the launch
-action ID. All repeated resolved targets, handles, runtime/job records, and
-endpoint or observation targets are mutually byte-equal. For down,
-`delete_target.observation`, each later `absence_observation`, and the final
+action ID. All repeated resolved targets, handles, runtime records, and endpoint
+or observation targets are mutually byte-equal. Repeated job submission key,
+hashes, job ID, and state-store UUID are byte-equal; only the closed monotonic
+job state/revision/run-epoch transitions may differ from `job_at_commit`. For
+down, `delete_target.observation`, each later `absence_observation`, and the final
 handle-removal proof describe that same three-role target without a present/
 absent contradiction. A structurally valid cursor for another action, plan, or
 incarnation is corruption and cannot be inherited, reduced, or used for I/O.
@@ -1213,7 +1595,85 @@ Attempt materialization byte-copies a settled predecessor's nonnull cursor,
 sets `worker_attestation=null`, recomputes the envelope hash, and starts local
 progress revision one; its typed validator separately proves the copied cursor
 preserves every immutable predecessor commitment before any new attestation or
-effect.
+effect. In particular, it copies `committed_effects` exactly; retry
+materialization cannot truncate, normalize, regenerate, or rehash that list,
+and an inherited intent retains its byte-equal `intent_origin`. It clears only
+the envelope's attempt-scoped worker attestation. A successor claim may
+exact-adopt evidence under its own evidence-commit origin, but cannot replace
+the inherited intent origin or produce `call_not_entered`/definitive-no-effect
+under its newer claim.
+
+Materialization also requires the predecessor attempt to be strictly below the
+parent's `RESOURCE_ACTION_MAX_ATTEMPT_V1`. At the maximum, the parent's exact
+attempt-domain exhaustion reduction persists the otherwise-retrying `R`/`U`/
+`P0`/`O` outcome, blocks without a deadline, and creates no request or attempt
+max-plus-one. Provider code never widens, wraps, or resets that counter.
+
+### API006 representability gate
+
+Provider-authoritative admission runs a pure size enumerator before creating a
+request or permitting provider I/O. The immediate pre-I/O check reruns that
+same versioned enumerator before the first intent/watermark commit. It uses the
+exact frozen launch/cohort preimages plus every exact live registered worker
+identity and claim/attempt-attestation preimage eligible at that check; only
+still-unknown response-derived leaves and the reachable five-effect origin
+schedule are maximized. It then canonical-renders every v1 launch progress
+shape, every handler no-effect
+resolution/return shape, and every reducer-built quiescence shape. Every
+rendered object, not merely its PostgreSQL JSONB stored rendering, must be at
+most 65,536 canonical UTF-8 bytes. Any leaf still lacking a finite protocol
+bound makes the candidate unrepresentable. Oversize or unbounded candidates
+remain legacy/shadow (or block an already materialized dark action) before any
+provider-I/O watermark or intent is committed; runtime truncation, origin
+elision, hash-only substitution, and late terminal-result dropping are
+forbidden.
+
+The checked-in golden fixture manifest has both `realistic` and
+`candidate_maximal` members for each of these exact cases:
+
+- all phase-table rows: three `CREATE_INTENT` roles, one/two/three-slot
+  `OBJECTS_PARTIAL`, `OBJECTS_EXACT` through both Pod edges, `HANDLE_INTENT`,
+  `HANDLE_COMMITTED`, `RUNTIME_READY`, `JOB_INTENT`, `JOB_COMMITTED`,
+  `JOB_RUNNING`, `ENDPOINT_RESOLVED`, and `SUCCEEDED`;
+- `call_not_entered` for sequences 0-4; CoreV1 422 for failing sequences 0-2;
+  cluster-row `rolled_back/not_found` and the one typed different-UUID conflict;
+  Skylet `schema_rejected` plus same-key conflict in each allowed terminal job
+  state;
+- reducer quiescence for every nonsuccessful phase-table row, including every
+  E-only post-effect/read-only row and every legal `E* + N<i>` intent row, plus
+  explicit rejection of `SUCCEEDED`, E-only-with-N, intent-without-N, and
+  wrong-claim N; same-claim created/submitted/inserted commits, same-claim
+  adoption, later-generation adoption, generation reset across attempts, and
+  rejection of a retry-local no-effect resolution for an inherited intent;
+- the parent's complete handler/outcome cross-field cases: domain success `S`;
+  every revision-zero, nonintent, and current-intent error-category mapping to
+  `R`/`U`/`B`, including maximal bounded code/message/retry leaves and every
+  invalid cross-combination; supersession `Q` for E-only and E+N; all three
+  unmaterialized, terminal-request-unsettled, and retained-settled direct
+  `CANCELLED_NO_EFFECT` bases, including retained request present/GC; request-
+  terminal fallback `P0`, `O`, external-cursor `S`, and corruption `X`, for
+  each compatible terminal request state and missing/invalid-return reason.
+  Direct fixtures cover empty, one-link, and maximum-integer-count rolling no-
+  I/O prefixes, immutable historical attempt outcomes, immediate-link tamper,
+  inherited cursor, and crossed-predecessor rejection. Maximum-attempt fixtures
+  also cover the parent's exact exhaustion reduction for handler `R`/`U` and
+  fallback `P0`/`O`, including no max-plus-one request and direct-teardown
+  precedence.
+
+Each fixture records case ID, payload kind, canonical byte count, and SHA-256;
+the `candidate_maximal` member is not a synthetic protocol-wide fill of every
+`Text` leaf. It keeps the selected frozen spec/cohort and complete live
+registered worker/attempt-attestation preimages byte-exact, substitutes declared
+maxima only for runtime response values not known at admission, and uses the
+maximum number of distinct full intent/evidence claims reachable in five
+effects. CI requires both members
+to remain at or below 65,536 bytes and checks the committed golden hashes. A
+failing realistic or candidate-maximal fixture keeps provider authority
+disabled and requires this design to deduplicate provenance or tighten an
+explicit leaf bound before implementation; passing is not assumed. The
+companion's request-return envelope and final action outcome are
+included in the terminal/quiescence measurements, so fitting the cursor alone
+does not pass this gate.
 
 ## Submission journal
 
@@ -1239,7 +1699,8 @@ plan hash, and attempt identity. An exact `NOT_STARTED`/null/revision-zero
 attempt, whether initial or a pre-I/O retry successor, commits
 `INTENT_COMMITTED` to both boundary fields and the first legal nonnull progress
 cursor in that same transaction: launch uses
-`CREATE_INTENT(first_missing_role)` and down uses `TARGET_RESOLVED`. An exact
+`CREATE_INTENT(first_missing_role)` with the current immutable
+`ProviderLaunchEffectClaimV1` origin, and down uses `TARGET_RESOLVED`. An exact
 `NOT_STARTED` inherited revision-one seed instead atomically commits
 `INTENT_COMMITTED` to both fields and binds its current worker attestation to
 the already-carried, predecessor-validated cursor. An authoritative attempt
@@ -1249,8 +1710,10 @@ never locked before its action. The handler then performs one bounded
 fixed-topology session mutation group. The first effect uses the combined
 boundary/intent write above; before each later CoreV1 or Skylet effect it
 commits the corresponding monotonic
-`ProviderLifecycleProgressV1` intent; after an exact readback it commits the
-resulting UID/spec/allocation/handle/job evidence before the next effect. A
+`ProviderLifecycleProgressV1` intent and its current claim origin; after an
+exact readback it commits the resulting UID/spec/allocation/handle/job record,
+its exact disposition, and the current evidence-commit origin before the next
+effect. A
 worker replacement consumes that snapshot rather than reconstructing partial
 commitments from names or process memory.
 
@@ -1306,7 +1769,23 @@ ProviderErrorV1 = {
 
 Raw exceptions and provider payloads are not state-machine inputs. The facet
 maps only reviewed codes/statuses into the closed category; unknown values stay
-`unknown`. The Serve reducer decides retry, block, or terminal failure.
+`unknown`. The complete normalized error is retained in the parent handler DTO
+and byte-binds its provider tuple. For revision-zero or nonintent journals,
+`transient`, `capacity`, `quota`, and `rate_limited` map to parent tuple `R`
+with the same retry class and
+`D=min(retry_after_seconds if nonnull else 60, 3600)`; `unknown` maps to `U`;
+and `invalid_request`, `permission`, and `conflict` map to `B`. At a current
+launch or down intent, the four retry categories and `unknown` map
+conservatively to `U`, because an exception cannot resolve the entrant, while
+the three invalid/permission/conflict categories map to `B`. Code/message
+leaves are copied exactly after bounded redaction. Below the parent's attempt
+maximum, `R` retries at `D`, `U` observes at 60 seconds, and `B` blocks while
+retaining the Serve projection; none is a handler-domain terminal action. At
+the maximum, the parent preserves `R`/`U` but applies its one typed exhaustion
+override instead of constructing an unrepresentable next attempt. Success `S`
+and supersession `Q` have null normalized error. Any other disposition/
+certainty/retry/observation/error combination is invalid. The provider facet
+does not choose a different retry, block, terminal, or replan policy.
 
 ## Observation contract
 
@@ -1449,9 +1928,12 @@ For a fresh authoritative launch attempt:
 2. exact-observe the first missing role, then atomically commit
    `INTENT_COMMITTED` plus `CREATE_INTENT(first_missing_role)`; send only its
    frozen create body, exact-read it, and commit the extended
-   `OBJECTS_PARTIAL` target; repeat the intent/evidence pair for later roles;
-3. wait for the scheduler's write-once Pod `nodeName`, exact-read all three
-   admitted specs/UIDs/allocations, and commit `OBJECTS_EXACT`;
+   `OBJECTS_PARTIAL` target; repeat the intent/evidence pair for later roles.
+   For the head Pod, commit `OBJECTS_EXACT` directly instead when that first
+   exact readback already has `nodeName`;
+3. only when the Pod readback lacked `nodeName`, wait for that write-once
+   scheduler allocation, exact-read all three admitted specs/UIDs/allocations,
+   and advance from three-slot `OBJECTS_PARTIAL` to `OBJECTS_EXACT`;
 4. construct and commit the full intended handle, including that node name and
    same-UID Pod IP, at `HANDLE_INTENT`; exact-insert/adopt the same-UUID cluster
    row and commit `HANDLE_COMMITTED`;
@@ -1631,8 +2113,10 @@ old target as absent, even if a previously recorded UID is no longer visible.
 Serve quarantines the action for operator repair; only three exact NotFound
 reads under the frozen scope can establish authoritative absence in v1.
 
-There is no provider-facet cleanup deadline. Serve may schedule bounded
-database-clock retries indefinitely.
+There is no time- or failure-count-based provider-facet cleanup deadline. Serve
+schedules bounded database-clock retries while the parent's finite attempt
+domain remains; reaching its exact maximum takes the typed exhaustion block and
+never wraps or manufactures a max-plus-one attempt.
 
 ## Shadow protocol
 
@@ -3541,7 +4025,8 @@ Contract tests must cover:
   provisional replica/count once, and is idempotent; effectful supersession
   inserts/adopts source/down action IDs in both possible UUID sort orders;
 - every old launch effect intent has exact cursor evidence, a typed definitive-
-  no-effect proof, or a same-generation `call_not_entered` proof before
+  no-effect proof bound to its original intent claim, or an origin-byte-equal
+  `call_not_entered` proof before
   supersession; after earlier committed effects, a later CoreV1 422, rolled-back
   cluster-record insert, or pre-commit Skylet conflict hands off only with its
   exact proof, while timeout, reset, 5xx, lost acknowledgement, expired lease,
@@ -3801,17 +4286,21 @@ absence result through a public API.
   down-only execution authority, the closed effect-body trace, qualified
   manifest/config/CRI runtime identity, and the Skylet fsynced outbox/run-token/
   post-exec-handshake recovery state machine.
-- Before `PartialLaunchCleanupBasisV1` admission or any deployable
-  `PriorLaunchBasisV1` parser is implemented, freeze literal tables keyed by
-  every `ProviderLaunchProgressV1` phase for the exact ordered effect prefix,
-  each entry's sequence/kind/role/intent phase, allowed resolution, and
-  committed-evidence hash preimage. Also freeze every definitive-no-effect
-  variant's exact cross-field/nullability rules, including the required
-  post-observation state for CoreV1 422, cluster-row fields for each
-  rolled-back/conflict-no-write disposition, and Skylet job state/revision for
-  every rejection kind. Until then, completed-launch leaf types may be
-  implemented, but no `PriorLaunchBasisV1` parser or admission path may be
-  exposed unless it accepts and fully validates both documented variants.
+- Design-complete/code-pending: this canonical file now freezes the literal
+  five-effect and every-phase prefix tables, immutable full effect claims,
+  committed-effect hash preimages and created/adopted dispositions, CoreV1 422
+  observation matrix, cluster-row disposition matrix, Skylet rejection matrix,
+  lexicographic attempt/generation origin ordering, closed handler terminal
+  result, candidate-maximal size representability fixtures/preflight, and
+  quiescence ownership.
+  Implement and adversarially verify the Serve-owned API006 progress
+  validator/reducer and owner-fenced quiescence builder before partial cleanup
+  admission; provider authority remains disabled until both realistic and
+  candidate-maximal size goldens are measured below the bound. No deployable
+  `PriorLaunchBasisV1` parser or admission path may be
+  exposed until it accepts and fully validates both `completed_launch` and
+  `partial_launch_cleanup`; the generic opaque API006 JSONB substrate requires
+  no second queue or database migration for this provider-specific validator.
 - Rendered and live verification of the dedicated authority-worker Helm
   versioned-cohort contract, `REGISTERING`/two-ready-Pod activation,
   release-namespace worker/Service/RBAC/projections, separate canary workload
