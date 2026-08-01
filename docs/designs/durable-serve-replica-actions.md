@@ -831,6 +831,21 @@ not submitted. A parent left without a completed child is likewise a coverage
 failure; recovery adopts its identity and next sequence but never invents a
 request ID or silently manufactures a parity result.
 
+Child preparation is serialized under the parent lock. It refuses to append
+while any earlier child is nonterminal and never advances past
+`REQUEST_ASSOCIATION_UNKNOWN` or `ABANDONED_PRE_SUBMIT`. A second primary for
+the same frozen plan additionally requires the preceding primary's committed
+retry decision to be `retry_same_plan`; `terminal`, `block`, `observe`, and
+`replan_new_generation` do not authorize another primary mutation under that
+parent. Cleanup-down retries remain request-sequenced children of the current
+logical launch attempt. A first cleanup may follow a completed failed primary;
+another cleanup requires the preceding cleanup to be complete with
+`retry_same_plan` before another call may begin. Once a cleanup exists, the
+next primary additionally requires the latest cleanup to have terminalized
+successfully with exact absence/safe-relaunch proof. A cleanup decision of
+`retry_same_plan` authorizes only another cleanup; `block`, `observe`, and
+`replan_new_generation` authorize no later primary under this parent.
+
 The actual terminal legacy state change and logical sample completion share
 one Serve transaction, including paid-capacity outcome/release and replica
 removal. Each legacy retry has a distinct child but all attempts for an
@@ -855,6 +870,15 @@ rows before promotion. The transition to `shadow` and its database timestamp
 are written under the service/owner lock; the promotion transaction uses that
 timestamp for the minimum 24-hour window and rechecks all blockers under the
 same lock.
+
+The parent admission helper first locks and revalidates the service name,
+incarnation hash, controller owner, nonnull lifecycle epoch, and `shadow` mode;
+then it admits/links the parent in the caller's replica-intent transaction.
+`created_at` is a fresh PostgreSQL `clock_timestamp()` read after that lock,
+never the transaction-start timestamp. Promotion takes the same service lock
+before scanning the window, so an admission that waited behind promotion must
+revalidate the mode and cannot appear after the scan with a pre-window
+timestamp.
 
 `launch_shadow_sample_id` and `down_shadow_sample_id` are incarnation-scoped,
 not both constrained to the row's current generation. The launch link retains
@@ -898,6 +922,18 @@ Promotion requires:
 - at least 24 hours and a configured minimum sample count of clean live shadow
   operation, including launch and down; and
 - successful crash injection at every boundary below.
+
+`ActivationGateEvidenceV1` is a closed internal value bound to the exact
+service name, service-incarnation hash, lifecycle epoch, and (for authority)
+the database timestamp that opened the current shadow window. It carries the
+three independent schema heads (`API005`, `Serve032`, and global-user-state
+`028`), approved image and named inventory fingerprints, and a database-clock
+`verified_at`. The transition rejects evidence for another fence/window,
+evidence from the database future, or evidence older than five minutes. A
+`legacy -> shadow` transition requires a null candidate-window binding; a
+`shadow -> authoritative` transition requires exact timestamp equality with
+the locked service row. The 24-hour candidate duration is a hard minimum, not
+a caller-reducible test parameter.
 
 The promotion transaction rechecks those facts under the service/owner lock.
 After promotion, an image that ignores authoritative action rows is forbidden.
