@@ -6986,6 +6986,78 @@ The tag is not removed during rollback. The slice adds no database schema,
 feature flag, metric, event, persisted report, dual execution path, or
 temporary removal-ledger owner.
 
+#### M4 DigitalOcean dual-family inventory traversal, deferred
+
+Status: design rejected before runtime implementation. The rejected proposal
+was pinned to SkyPilot `612197aa45add7242187bf8338fbfd256255b9d4` and dstack
+`c9ebdaad6bbaa3105061d79f6ab52af9d609e99d`. No dependency, provider-read,
+lifecycle, database, or deployment change is authorized by this subsection.
+
+DigitalOcean documents two disjoint list families. A request filtered by
+`tag_name` returns tagged non-GPU droplets because the default list excludes
+GPU droplets. A request with `type=gpus` returns GPU droplets, but `type` cannot
+be combined with `tag_name`. See the official
+[Droplet API](https://docs.digitalocean.com/products/droplets/reference/api/droplets/)
+and
+[PyDo list reference](https://docs.digitalocean.com/reference/pydo/reference/droplets/list/).
+SkyPilot currently calls only the first family. The resulting GPU discovery
+gap is real, but correcting a read path is not authority-neutral when every
+result is immediately consumed by legacy mutation paths.
+
+The current `filter_instances()` result is a mutable name-keyed dictionary
+used by readiness, status, start, stop, rename, termination, and cleanup. It
+does not preserve canonical identity, credential scope, duplicate rows, or an
+atomic provider snapshot. Feeding account-wide GPU rows into that dictionary
+would therefore expand destructive reach before typed ownership and effect
+fences exist. A cross-family duplicate name could redirect a lifecycle action
+to a different droplet, and rollback could not restore a stopped or deleted
+resource. The proposed `authority=NONE` raw carrier did not constrain the
+legacy dictionary that actually reached those effects.
+
+The rejected design also changed compatibility and availability semantics. It
+read `status` when `status_filters is None`, although the current path reads
+only `name`; retained dead raw-row data; treated changing account-wide
+`meta.total` as a hard cluster failure without obtaining a snapshot; changed
+client-resolution timing; mixed native and translated pagination failures;
+and doubled each polling traversal before token-scoped pacing or single-flight
+coordination existed. Stable totals could still accept duplicate IDs and omit
+another row, so the additional failures did not prove completeness.
+
+The known GPU omission remains explicit until a future promotion satisfies all
+of these prerequisites in one reviewed behavior contract:
+
+1. one immutable observation preserves a validated canonical provider ID,
+   exact cluster tag, incarnation marker classification, native state, region,
+   and a request-scoped credential or account identity;
+2. a read-only consumer receives dual-family rows without changing the legacy
+   dictionary, lifecycle decisions, or provider effects, and fails closed on
+   duplicate IDs, cross-family name collisions, malformed membership, and
+   incomplete traversal;
+3. token-scoped pacing and single-flight ownership bound repeated account-wide
+   scans before any polling loop can use them;
+4. an actuation attempt is durably recorded before a provider effect, and the
+   effect owner revalidates the exact provider ID, credential scope, cluster
+   tag, and incarnation through an exact-ID read immediately before mutation;
+5. absence, partial pagination, scope mismatch, collision, stale incarnation,
+   and lost responses all produce closed non-mutating outcomes; and
+6. a read-only credentialed canary proves both list families and their rate
+   behavior before a separate promotion enables any mutation consumer.
+
+Legacy compatibility must remain exact while these prerequisites are absent.
+In particular, `status_filters=None` must not read `status`, existing
+field-access and exception timing must remain characterized, and no GPU row may
+enter a name-keyed destructive path. The PyDo minimum-version increase belongs
+with the first production consumer of the explicit `type='gpus'` call, not as
+an isolated dependency change.
+
+dstack's useful lesson remains narrower than the rejected implementation: it
+keeps the provider-generated droplet ID from creation and later performs an
+exact-ID read, while its shared server pipeline owns repeated readiness and
+state transitions. SkyPilot should adopt that command/query separation only
+after its observation carries identity and scope and its shared effect owner is
+fenced. Until then, preserving a visible limitation is safer than silently
+widening legacy authority.
+
 ### M5: Serve and pools
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
@@ -8574,3 +8646,32 @@ and creation-time DigitalOcean droplet and volume stamping. It grants no
 system-authorship proof from a tag, provider-effect fence, query-inventory
 authority, cleanup isolation, shared-reconciler mutation, retry, or
 `ProvisionRecord` change.
+
+### Review 33
+
+Verdict: `RESHAPE` for the initial M4 DigitalOcean complete inventory capture
+proposal committed at `846f23dfb902479564cd80781fca46917a766044`, with exact
+reviewed subsection SHA-256
+`b724023e27f037198f2c91ef5d747aa391e944a451dd136dec5657631f9c8f51`.
+Independent simplicity review returned `FAIL`.
+
+The proposal correctly identified DigitalOcean's disjoint non-GPU and GPU
+list families, but it was not authority-neutral. It routed newly discovered
+GPU rows into the same name-keyed dictionary used by stop, termination,
+rename, and cleanup. A duplicate name could redirect an irreversible effect,
+and neither the proposed raw carrier nor its `authority=NONE` label restricted
+that legacy consumer. The design also changed the `status_filters=None`
+short-circuit, retained raw rows without a production consumer, used unstable
+account totals as hard availability gates without obtaining a snapshot, mixed
+pagination exception contracts, and increased account-wide polling before
+token-scoped pacing existed.
+
+No runtime implementation was started. The canonical subsection was replaced
+in place by the explicit deferred boundary at SHA-256
+`0e9c738e6e899d1435e8b10d96906164d263428202c90c834c51b151d87ad692`.
+It keeps the discovery gap visible and requires immutable canonical identity,
+credential scope, collision and completeness closure, paced read-only canary
+evidence, a persisted effect attempt, and exact-ID pre-effect revalidation
+before any dual-family row can reach mutation. This review grants no
+dependency, provider-read, lifecycle, database, deployment, or removal-ledger
+authority.
