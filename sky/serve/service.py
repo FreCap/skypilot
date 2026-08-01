@@ -507,7 +507,8 @@ def _cleanup(service_name: str,
                         f'Replica {info.replica_id} terminated successfully.')
                 else:
                     _set_to_failed_cleanup(info)
-        time.sleep(3)
+        if info2thr:
+            time.sleep(3)
 
     _assert_owner('before scoped storage cleanup')
 
