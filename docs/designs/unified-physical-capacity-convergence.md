@@ -1,13 +1,12 @@
 # Unified Physical-Capacity Evidence Scan
 
-Status: C1 foundation implemented and verified; C2 evidence-scan contract
-accepted; C2.1 implementation and local verification recorded with an exact
-removal ledger; C2.2 exact-merge deployment is complete and verified in
-disabled mode; C2.3 shadow activation is blocked on a real Serve selector and
-independent provider-call audit evidence, and every materialized or
-authoritative capacity phase remains blocked
+Status: C1 foundation implemented, verified, and retained; C2.1 and C2.2 are
+historical-complete; C2.3 was cancelled without activation and C2.4 will not
+run; the C2-only evidence scanner is explicitly retired for removal, no payoff
+gate was satisfied, and every materialized or authoritative capacity product
+remains unauthorized
 
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 Canonical owner: this file. Rejected materialized/active-control drafts remain
 recoverable from branch history and the review record; they are not a second
@@ -46,6 +45,31 @@ Products 1–4 require separate accepted designs after the value gate below.
 The previously proposed admission controls, Helm proxy, quota reservations,
 action tokens, compatibility floor, provider actions, and source-table
 migrations are not authorized.
+
+### 2026-08-01 early-retirement decision
+
+The operator explicitly ended the C2 experiment after its exact merged binary
+had been deployed and verified in disabled mode. C2.3 never started: no real
+selector or independent provider-call baseline was supplied, no C2 environment
+variable or pilot end was set, and no first scan established a durable
+activation anchor. The canary, measurement, decision, expiry, and removal
+clocks therefore never started.
+
+This is an explicit early no-go decision, not a claim that production evidence
+disproved or validated the payoff hypothesis. The 14-day and 45-day deadlines
+below are latest bounds for an activated pilot, not minimum retention periods.
+Because no later accepted product design names or owns a C2 pure symbol, the
+entire exact C2 removal ledger is authorized for immediate removal. The C1
+schema, tables, migration hook, state access, and closed row contracts remain
+unchanged. No shared inventory, observation cache, action journal, occupancy
+ledger, or identity-transport product is authorized by this retirement.
+
+C1 also retains `CapacityMode.SHADOW` and
+`validate_runtime_capability()`. After projector removal that accepted mode is
+intentionally inert rather than fail-closed. Therefore deployment preflight
+must prove mode is absent or exactly `disabled` before any cleanup pod starts;
+a stale `shadow` value is a rollout blocker even though the cleanup binary
+would accept it.
 
 ## Why convergence could pay off
 
@@ -1035,11 +1059,30 @@ after shadow mode has returned a live projector, because that projector must
 be joined before leadership release. A disabled-mode cleanup exception still
 uses the existing `try/finally` release semantics.
 
-Rollback is controller `shadow -> disabled`, unset both C2 variables, and roll
-back the binary. The projector is joined before leadership release. Existing
-scan summaries remain inert and old code ignores the new variables. No source
-row, provider resource, Kubernetes admission object, Helm release history, or
-public contract needs rollback.
+Rollback from an activated pilot would set controller mode `shadow ->
+disabled`, unset the sources and pilot-end variables, and roll back the binary.
+That path was never needed: the experiment remained disabled and produced no
+scan summary. No source row, provider resource, Kubernetes admission object,
+Helm release history, or public contract needs retirement rollback.
+
+### Retirement rollout and rollback
+
+1. Remove exactly the C2 ledger below in one cleanup PR while retaining every
+   listed C1 foundation artifact. Add no schema revision or data deletion.
+2. Build the exact merge and deploy it by immutable digest with existing Helm
+   values reused. Before any cleanup pod starts, require on every role
+   `SKYPILOT_PHYSICAL_CAPACITY_MODE` to be absent or exactly `disabled` and
+   require the allowlist, sources, and pilot-end variables to be absent. Roll
+   API, executor, and controller in bounded stages under the existing PDBs.
+3. Verify role health, zero restarts, the external-ServiceAccount RBAC
+   contract, capacity revision `001`, zero projector connections, and unchanged
+   row counts in all five C1 tables. Verify that the C2 modules, symbols,
+   source/pilot environment constants, metrics, and runtime hooks are absent;
+   the retained C1 mode/allowlist constants are not cleanup targets.
+4. If binary rollback is required, pin the last qualified pre-removal image
+   through the current chart/RBAC contract with all C2 variables absent. The
+   restored C2 code remains disabled; do not use a Helm-history rollback that
+   removes the external-ServiceAccount RBAC fix.
 
 ## Temporary code and removal ledger
 
@@ -1047,13 +1090,16 @@ There is no C2 data migration whose temporary dual-write code must linger.
 The decision record is due no later than 14 calendar days after pilot expiry.
 Missing evidence or a missed decision deadline counts as no gate. All C2-only
 code must be removed from the deployed controller no later than 45 calendar
-days after expiry.
+days after expiry. Because this pilot never activated or acquired an expiry,
+the explicit early no-go decision above authorizes immediate removal rather
+than inventing a clock.
 
 ### Exact C2 removal ledger
 
 Unless a separately accepted product design names and owns an exact pure
 symbol before the 14-day decision deadline, remove the following no later than
-45 calendar days after pilot expiry.
+45 calendar days after pilot expiry. No such product design exists at the
+early-retirement decision, so every item below is in scope for the cleanup PR.
 
 #### Delete these C2-only files in full
 
@@ -1414,21 +1460,24 @@ managed jobs. This later rollout does not replace or blur the exact
 revision-41/42 C2.2 evidence; it proves the currently deployed descendant kept
 that disabled-path and RBAC state intact.
 
-### C2.3 current activation-gate result
+### C2.3 cancellation and early-retirement result
 
-C2.3 was not activated. The exact post-deployment source audit still has no
-real isolated Serve service or replica selector, and no independently owned
-provider-call audit exporter, query, owner, or baseline has been supplied.
-Creating a paid workload solely to manufacture a selector is not authorized.
-No physical-capacity variable or pilot end is configured, so the canary,
-measurement, decision, expiry, and removal clocks have not started.
+C2.3 was not activated. The exact post-deployment source audit had no real
+isolated Serve service or replica selector, and no independently owned
+provider-call audit exporter, query, owner, or baseline was supplied. No
+physical-capacity variable or pilot end was configured, so the canary,
+measurement, decision, expiry, and removal clocks never started. On 2026-08-01
+the operator cancelled C2.3 and C2.4 and directed early retirement of the
+C2-only implementation.
 
-This completes C2.2 only. There is still no claim of provider-call or
-source-write safety under an active scan, digest stability, three completed
-slots, restart/handoff behavior, or measurement-cohort value. C2.3 remains
-blocked only on the real selector and independent audit prerequisites above.
+There is no claim of provider-call or source-write safety under an active
+scan, digest stability, three completed slots, restart/handoff behavior, or
+measurement-cohort value. Missing evidence is recorded as a no-go; it is not
+replaced by a synthetic selector or internal log inference. Mapping version 1
+will not be activated, and none of the four follow-on products acquired
+implementation authority.
 
-Automated tests cover:
+Before retirement, automated tests covered:
 
 - strict top-level selector grammar, UTF-8/count/partition/pilot-end bounds,
   role/backend/co-location gates, and old-binary variable ignorance;
@@ -1460,7 +1509,7 @@ Automated tests cover:
   DML outside `capacity_projection_scans`; and
 - metric/committed-counter parity with no high-cardinality labels.
 
-Remaining C2.3 manual activation test:
+Cancelled C2.3 manual activation plan (not executed):
 
 ```text
 1. Deploy with mode disabled.
@@ -1480,7 +1529,7 @@ Remaining C2.3 manual activation test:
    Expected: workload behavior is unchanged and summaries are inert.
 ```
 
-## Implementation phases and open gates
+## Implementation phases and retirement state
 
 - C2.1 complete: strict configuration, pure adapters, digest/counters, scan
   repository, controller daemon, and unit/PostgreSQL tests.
@@ -1491,22 +1540,19 @@ Remaining C2.3 manual activation test:
   tables, role health, external-ServiceAccount RBAC, and rollback anchors. The
   later revision-45 descendant qualification is recorded separately; the
   earlier pre-curation deployment remains supporting evidence only.
-- C2.3 blocked: supply and freeze one real isolated Serve selector plus an
-  independently owned provider-call audit. Then set all three variables
-  only through `controllerService.extraEnvs`; run one real isolated service
-  selector for three scans spanning a restart and leadership handoff, with
-  independent proof of zero provider calls, zero source writes, and no rows in
-  the four materialized C1 tables. Finish this canary within three days. Do not
-  add pool or managed-task selectors until the audits pass.
-- C2.4 gated: freeze the exact typed Serve/pool/jobs selector and scope-hash
-  manifest, prove the preceding 30-day baseline exists and a complete following
-  30-day window fits before the immutable pilot end, then collect the signed
-  decision record.
+- C2.3 cancelled before activation: no selector, independent provider-call
+  audit, capacity variable, pilot end, durable activation anchor, or scan row
+  existed. Its canary and restart/handoff test will not run.
+- C2.4 not run: no measurement manifest or 30-day comparison window was
+  frozen, and no gate decision can claim production evidence.
+- C2 cleanup authorized: remove the exact ledger in this design, retain C1,
+  deploy disabled with no schema/data deletion, and record exact verification
+  evidence here after rollout.
 
-The decision is due no later than 14 days after expiry. Unowned C2 code is due
-for removal no later than 45 days after expiry. Missing live-selector or
-external provider-call evidence blocks C2.3 rather than being replaced by a
-synthetic selector or internal log inference.
+The activated-pilot 14-day decision and 45-day removal clocks never started.
+The explicit no-go decision authorizes earlier cleanup without fabricating an
+expiry. Missing live-selector and external provider-call evidence remains
+missing evidence, not proof for or against the payoff hypothesis.
 
 No materialized inventory, provider observation cache, identity transport,
 action journal, occupancy ledger, read cutover, or mutation authority is
