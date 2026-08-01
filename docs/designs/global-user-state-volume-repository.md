@@ -52,6 +52,8 @@ pattern because the public import and monkeypatch surface must remain stable.
 - Preserve query cardinality, session and transaction ownership, empty batch
   query elision, duplicate-name deduplication order, unsupported-dialect error,
   and missing-row behavior.
+- Preserve all provider-lifecycle removal obligations and gates by retargeting
+  their structural locators to the repository that now owns the sessions.
 - Do not change the schema, serialized formats, lifecycle policy, provider
   calls, remote commands, or public models.
 
@@ -87,6 +89,7 @@ pattern because the public import and monkeypatch surface must remain stable.
 | `VolumeConfig` payloads | Real add, point read, list, batch read, and configuration-update round trips with exact class identity |
 | Volume lifecycle projection | Status, ephemeral integer/boolean conversion, attachment consumers, error clearing, creation YAML, and exact point/list projection keys |
 | Volume callers | Volume server and provision tests, backend-utils auto-mount tests, task tests, completion/server tests, and smoke-test collection where local execution does not require cloud resources |
+| Provider-lifecycle removal manifest | Current-phase manifest validation with all 15 volume transaction obligations resolving in the extracted repository |
 
 No live-cloud smoke test is required for a pure repository extraction that does
 not change providers, remote commands, schemas, network protocols, or process

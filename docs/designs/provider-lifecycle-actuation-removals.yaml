@@ -5196,11 +5196,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: add_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: add_volume
     call: session.commit
   replacement: Borrowed lifecycle action admission transaction
@@ -5248,11 +5248,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_config
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_config
     call: session.commit
   replacement: Borrowed volume reducer transaction
@@ -5300,11 +5300,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_status
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_status
     call: session.commit
   replacement: Borrowed volume reconciler transaction
@@ -5352,11 +5352,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume
     call: session.commit
   replacement: Borrowed volume attachment-state transaction
@@ -5404,11 +5404,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: delete_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: delete_volume
     call: session.commit
   replacement: Borrowed lifecycle cleanup transaction
@@ -7322,11 +7322,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: add_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: add_volume
     call: session.commit
   replacement: Retire local SQLite add-volume session after product deprecation
@@ -7370,11 +7370,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_config
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_config
     call: session.commit
   replacement: Retire local SQLite update-volume-config session after product deprecation
@@ -7418,11 +7418,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_status
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_status
     call: session.commit
   replacement: Retire local SQLite update-volume-status session after product deprecation
@@ -7466,11 +7466,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume
     call: session.commit
   replacement: Retire local SQLite update-volume session after product deprecation
@@ -7514,11 +7514,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: delete_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: delete_volume
     call: session.commit
   replacement: Retire local SQLite delete-volume session after product deprecation
@@ -7562,11 +7562,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: add_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: add_volume
     call: session.commit
   replacement: Retire controller SQLite add-volume session after product deprecation
@@ -7610,11 +7610,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_config
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_config
     call: session.commit
   replacement: Retire controller SQLite update-volume-config session after product deprecation
@@ -7658,11 +7658,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_status
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume_status
     call: session.commit
   replacement: Retire controller SQLite update-volume-status session after product deprecation
@@ -7706,11 +7706,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: update_volume
     call: session.commit
   replacement: Retire controller SQLite update-volume session after product deprecation
@@ -7754,11 +7754,11 @@ artifacts:
   runtime_affecting: true
   locators:
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: delete_volume
-    call: orm.Session
+    call: session_factory
   - kind: python_call_within
-    path: sky/global_user_state.py
+    path: sky/global_user_state_volumes.py
     symbol: delete_volume
     call: session.commit
   replacement: Retire controller SQLite delete-volume session after product deprecation
