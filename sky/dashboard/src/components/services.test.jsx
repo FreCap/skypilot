@@ -171,6 +171,55 @@ describe('Services fetch wiring', () => {
     expect(screen.getByText('http://10.0.0.1:30001')).toBeInTheDocument();
   });
 
+  it('renders a summary that arrives before metadata without losing enrichment', async () => {
+    const metadata = deferred();
+    dashboardCache.get
+      .mockReturnValueOnce(metadata.promise)
+      .mockResolvedValueOnce({
+        services: [
+          {
+            ...SERVICES_RESPONSE.services[0],
+            status: 'READY',
+            summaryOnly: true,
+            metadataOnly: false,
+            targetReplicas: 1,
+            replicaStatusCounts: { READY: 1 },
+          },
+        ],
+        controllerStopped: false,
+      });
+
+    render(<Services />);
+    await flushFetches();
+
+    expect(screen.getByText('boltz-l4-fleet')).toBeInTheDocument();
+    expect(screen.getByText('Healthy')).toBeInTheDocument();
+    expect(screen.getByText('http://10.0.0.1:30001')).toBeInTheDocument();
+
+    await act(async () => {
+      metadata.resolve({
+        services: [
+          {
+            ...SERVICES_RESPONSE.services[0],
+            status: 'READY',
+            endpoint: null,
+            metadataOnly: true,
+            replicasReady: null,
+            replicasTotal: null,
+            replicasFailed: null,
+            replicaStatusCounts: null,
+          },
+        ],
+        controllerStopped: false,
+      });
+      await metadata.promise;
+    });
+
+    expect(screen.getByText('Healthy')).toBeInTheDocument();
+    expect(screen.getByText('http://10.0.0.1:30001')).toBeInTheDocument();
+    expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
+  });
+
   it('settles metadata placeholders as unavailable when enrichment fails', async () => {
     const consoleError = jest.spyOn(console, 'error').mockImplementation();
     dashboardCache.get
@@ -287,38 +336,43 @@ describe('Services fetch wiring', () => {
       window.document,
       'visibilityState'
     );
-    const oldRequest = deferred();
-    const visibleRequest = deferred();
+    const oldMetadata = deferred();
+    const oldSummary = deferred();
+    const visibleMetadata = deferred();
+    const visibleSummary = deferred();
     dashboardCache.get
-      .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(visibleRequest.promise)
-      .mockResolvedValue(SERVICES_RESPONSE);
+      .mockReturnValueOnce(oldMetadata.promise)
+      .mockReturnValueOnce(oldSummary.promise)
+      .mockReturnValueOnce(visibleMetadata.promise)
+      .mockReturnValueOnce(visibleSummary.promise);
     setDocumentVisibility('hidden');
     const { unmount } = render(<Services />);
 
     try {
-      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
       setDocumentVisibility('visible');
       await act(async () => {
         window.document.dispatchEvent(new Event('visibilitychange'));
         await Promise.resolve();
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
 
       await act(async () => {
-        oldRequest.resolve(responseFor('stale-service'));
-        await oldRequest.promise;
+        oldMetadata.resolve(responseFor('stale-service'));
+        oldSummary.resolve(responseFor('stale-service'));
+        await Promise.all([oldMetadata.promise, oldSummary.promise]);
       });
       expect(screen.queryByText('stale-service')).not.toBeInTheDocument();
 
       await act(async () => {
-        visibleRequest.resolve(responseFor('visible-service'));
-        await visibleRequest.promise;
+        visibleMetadata.resolve(responseFor('visible-service'));
+        visibleSummary.resolve(responseFor('visible-service'));
+        await Promise.all([visibleMetadata.promise, visibleSummary.promise]);
       });
       expect(screen.getByText('visible-service')).toBeInTheDocument();
       await flushFetches();
-      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
     } finally {
       unmount();
       if (visibilityDescriptor) {
@@ -338,13 +392,16 @@ describe('Services fetch wiring', () => {
       window.document,
       'visibilityState'
     );
-    const initialRequest = deferred();
-    const manualRequest = deferred();
+    const initialMetadata = deferred();
+    const initialSummary = deferred();
+    const manualMetadata = deferred();
+    const manualSummary = deferred();
     const refreshDataRef = { current: null };
     dashboardCache.get
-      .mockReturnValueOnce(initialRequest.promise)
-      .mockReturnValueOnce(manualRequest.promise)
-      .mockResolvedValue(SERVICES_RESPONSE);
+      .mockReturnValueOnce(initialMetadata.promise)
+      .mockReturnValueOnce(initialSummary.promise)
+      .mockReturnValueOnce(manualMetadata.promise)
+      .mockReturnValueOnce(manualSummary.promise);
     setDocumentVisibility('hidden');
     const { unmount } = render(
       <StatefulServicesTable refreshDataRef={refreshDataRef} />
@@ -355,7 +412,7 @@ describe('Services fetch wiring', () => {
         refreshDataRef.current();
         await Promise.resolve();
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
       dashboardCache.invalidate.mockClear();
 
       setDocumentVisibility('visible');
@@ -365,17 +422,19 @@ describe('Services fetch wiring', () => {
       });
 
       expect(dashboardCache.invalidate).not.toHaveBeenCalled();
-      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
 
       await act(async () => {
-        manualRequest.resolve(responseFor('manual-service'));
-        await manualRequest.promise;
+        manualMetadata.resolve(responseFor('manual-service'));
+        manualSummary.resolve(responseFor('manual-service'));
+        await Promise.all([manualMetadata.promise, manualSummary.promise]);
       });
       expect(screen.getByText('manual-service')).toBeInTheDocument();
     } finally {
       unmount();
-      initialRequest.resolve(SERVICES_RESPONSE);
-      await initialRequest.promise;
+      initialMetadata.resolve(SERVICES_RESPONSE);
+      initialSummary.resolve(SERVICES_RESPONSE);
+      await Promise.all([initialMetadata.promise, initialSummary.promise]);
       if (visibilityDescriptor) {
         Object.defineProperty(
           window.document,
@@ -393,13 +452,13 @@ describe('Services fetch wiring', () => {
     dashboardCache.get.mockReturnValue(pendingRequest.promise);
 
     render(<Services />);
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       jest.advanceTimersByTime(90000);
     });
 
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       pendingRequest.resolve(SERVICES_RESPONSE);
@@ -410,69 +469,79 @@ describe('Services fetch wiring', () => {
   });
 
   it('lets a manual refresh supersede an older request', async () => {
-    const oldRequest = deferred();
-    const currentRequest = deferred();
+    const oldMetadata = deferred();
+    const oldSummary = deferred();
+    const currentMetadata = deferred();
+    const currentSummary = deferred();
     const refreshDataRef = { current: null };
     dashboardCache.get
-      .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(currentRequest.promise)
-      .mockResolvedValue(SERVICES_RESPONSE);
+      .mockReturnValueOnce(oldMetadata.promise)
+      .mockReturnValueOnce(oldSummary.promise)
+      .mockReturnValueOnce(currentMetadata.promise)
+      .mockReturnValueOnce(currentSummary.promise);
 
     render(<StatefulServicesTable refreshDataRef={refreshDataRef} />);
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       refreshDataRef.current();
     });
     await flushFetches();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
 
     await act(async () => {
-      oldRequest.resolve(responseFor('stale-service'));
-      await oldRequest.promise;
+      oldMetadata.resolve(responseFor('stale-service'));
+      oldSummary.resolve(responseFor('stale-service'));
+      await Promise.all([oldMetadata.promise, oldSummary.promise]);
     });
 
     expect(screen.queryByText('stale-service')).not.toBeInTheDocument();
     expect(screen.getAllByText('Loading...').length).toBeGreaterThan(0);
 
     await act(async () => {
-      currentRequest.resolve(responseFor('current-service'));
-      await currentRequest.promise;
+      currentMetadata.resolve(responseFor('current-service'));
+      currentSummary.resolve(responseFor('current-service'));
+      await Promise.all([currentMetadata.promise, currentSummary.promise]);
     });
 
     expect(screen.getByText('current-service')).toBeInTheDocument();
     expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
     await flushFetches();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
   });
 
   it('does not let an older failure erase a newer manual refresh', async () => {
-    const oldRequest = deferred();
-    const currentRequest = deferred();
+    const oldMetadata = deferred();
+    const oldSummary = deferred();
+    const currentMetadata = deferred();
+    const currentSummary = deferred();
     const refreshDataRef = { current: null };
     const consoleError = jest.spyOn(console, 'error').mockImplementation();
     dashboardCache.get
-      .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(currentRequest.promise)
-      .mockResolvedValue(SERVICES_RESPONSE);
+      .mockReturnValueOnce(oldMetadata.promise)
+      .mockReturnValueOnce(oldSummary.promise)
+      .mockReturnValueOnce(currentMetadata.promise)
+      .mockReturnValueOnce(currentSummary.promise);
 
     render(<StatefulServicesTable refreshDataRef={refreshDataRef} />);
     await act(async () => {
       refreshDataRef.current();
-      currentRequest.resolve(responseFor('current-service'));
-      await currentRequest.promise;
+      currentMetadata.resolve(responseFor('current-service'));
+      currentSummary.resolve(responseFor('current-service'));
+      await Promise.all([currentMetadata.promise, currentSummary.promise]);
     });
     expect(screen.getByText('current-service')).toBeInTheDocument();
 
     await act(async () => {
-      oldRequest.reject(new Error('stale failure'));
-      await oldRequest.promise.catch(() => {});
+      oldMetadata.reject(new Error('stale failure'));
+      oldSummary.reject(new Error('stale failure'));
+      await Promise.allSettled([oldMetadata.promise, oldSummary.promise]);
     });
 
     expect(screen.getByText('current-service')).toBeInTheDocument();
     expect(consoleError).not.toHaveBeenCalled();
     await flushFetches();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
     consoleError.mockRestore();
   });
 
@@ -502,7 +571,7 @@ describe('Services fetch wiring', () => {
 
     expect(onFetched).not.toHaveBeenCalled();
     expect(setLoading).not.toHaveBeenCalled();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -2,12 +2,14 @@
 
 _Created: 2026-08-01_
 
-_Status: Implemented, pending merge and rollout_
+_Status: v0 deployed; v1a implemented pending merge; v1b-v1c accepted_
 _Last updated: 2026-08-01_
 
 ## Problems
 
-The services list blocks its first useful rows on one aggregate status request. In production that request took about 2.9 seconds for six services because it includes replica-status aggregation, including thousands of retained terminal attempts. The service detail route starts its summary/history request and its full replica-inventory request together. For `boltz-l4-fleet`, the full response materializes more than 300 retained replica attempts and the dashboard renders every row, so expensive work can contend with the fast request and then create a large DOM.
+Before v0, the services list blocked its first useful rows on one aggregate status request. The deployed v0 now renders metadata first, but it starts the summary only after metadata settles. Production verification measured 6.36 seconds for the sequential pair and 3.09 seconds when both requests started together.
+
+The service detail still couples unrelated costs in one deferred full-status request: live autoscaler data, 24 hours of history, current replica detail, every retained attempt, endpoint resolution, and service YAML. For `boltz-l4-fleet`, the page transferred about 2.5 MB of 24-hour history even though its initial selection is one hour; the equivalent one-hour history was 113 KB. The direct PostgreSQL history query took 87 ms for one hour and 170 ms for 24 hours, while the scheduled status path retained a roughly 2.8-second controller-transport floor. The full fleet response also serialized hundreds of replica rows although the page displayed at most 50 historical attempts.
 
 The list also renders retained terminal attempts as a red `+N failed` suffix beside the live replica count. That is not the service-health contract. At investigation time `boltz-l4-fleet` was `READY` with 1/1 serving replica and no cleanup failure, while the database retained 321 unsuccessful attempts across old and current versions. SkyServe had already replaced those attempts. The primary UI therefore described normal automatic recovery as a current incident and offered no useful operator action.
 
@@ -19,7 +21,7 @@ Health presentation must distinguish current service impact from retained attemp
 
 ## Background
 
-The existing `/serve/status` contract supports `summary_only`, but even that mode aggregates retained replica rows. The detail hook already issues separate summary and full requests, yet it starts them concurrently and couples 24-hour history plus autoscaler target computation to the first summary. Full status serializes all retained replicas and the replica table renders them all.
+The existing `/serve/status` contract supports `metadata_only` and `summary_only`, but both are scheduled through the Serve controller compatibility transport. This is appropriate for live autoscaler state and backward compatibility, but unnecessary for centralized PostgreSQL history and persisted replica rows. The v0 detail hook intentionally orders metadata before the full request, so its first paint does not compete with heavy enrichment. Production profiling now satisfies the v1 trigger: the deferred payload remains operationally expensive after first paint.
 
 The production observation is decisive for the status semantics:
 
@@ -59,9 +61,39 @@ The dashboard must not infer a stalled autoscaler from a single snapshot. If cap
 
 On the detail page, show current or uncertain replica rows first. Put terminal replica records in a collapsed `Past attempts` section with a count and explanation. Retain the raw `FAILED_*` code in the row or tooltip, but use plain-language reason labels and avoid red emphasis unless the current health decision is actionable. Paginate or bound rendered historical rows so a large fleet does not create hundreds or thousands of DOM rows at once.
 
-### v1: avoid eager historical payloads if profiling still shows material cost
+### v1: independent persisted history, counts, and replica pages
 
-If v0 verification shows that deferred full status remains operationally expensive, add a paginated replica-history endpoint backed by indexed `service_name`, `status`, and `replica_id` reads. The Overview route would fetch current/nonterminal replicas only; terminal history would load on expansion. This is independently shippable and should not be included in v0 unless measurements show that client-side collapsing is insufficient.
+Production profiling shows that v0's deferred full request remains expensive, so v1 replaces it on the Overview route with bounded, independently rendered reads. These routes are dashboard-coupled, read-only APIs served directly by the API server when consolidated Serve makes the central database authoritative. They inherit the existing authentication and authorization middleware and use `asyncio.to_thread` for synchronous PostgreSQL and serialization work; they do not allocate request-executor slots or contact the Serve controller. Non-consolidated services keep replica authority on the remote controller, so every direct route returns `available: false` with reason `non_consolidated` in that topology and the dashboard preserves the v0 controller-backed fallback.
+
+The API contracts are:
+
+- `GET /serve/{service_name}/history?hours=N&section=S&expected_service_hash=H` returns only the requested aggregate history sections, where repeated `section` values select `requests`, `replicas`, `prediction`, or `autoscaler`. `hours` is bounded to the 72-hour retention contract. A hash mismatch returns `409` rather than mixing same-name service incarnations.
+- `GET /serve/replica-summaries?service_name=N` returns one batched persisted projection for the selected or all non-pool services: service hash, replica unit, physical status counts, logical planned-capacity counts, current-or-uncertain count, past-attempt count, and observation time. The query scans normalized compact state once rather than issuing one query per service.
+- `GET /serve/{service_name}/replicas?scope=current_or_uncertain|past_attempts&limit=N&cursor=C&expected_service_hash=H` returns a descending, cursor-paginated lightweight replica projection with `1 <= limit <= 100` and a default of 50. The response includes `total` and `next_cursor`, so disclosure counts and pagination do not depend on loaded rows. Both scopes expose explicit load-more behavior; current or uncertain rows are never silently truncated, while past pages remain inside their disclosure. Rich current-row pricing and endpoint enrichment may arrive separately; past attempts never resolve handles, endpoints, or pricing.
+
+All three routes preserve the read permissions of `POST /serve/status`: authenticated viewers are explicitly allowlisted for the three exact GET patterns, while write operations remain unavailable. They return no credentials, handles, stored YAML, or secrets. SkyServe status is currently a global read rather than workspace-filtered; these routes do not broaden that visibility. If status gains workspace filtering, the dashboard routes must use the same authorization helper rather than maintaining a second policy.
+
+`past_attempts` is server-defined as exactly `FAILED`, `FAILED_INITIAL_DELAY`, `FAILED_PROBING`, or `FAILED_PROVISION`, matching the existing UI contract. `current_or_uncertain` contains every other known or future state, especially `FAILED_CLEANUP`, `UNKNOWN`, `PREEMPTED`, and `SHUTTING_DOWN`, so potentially live or verification-worthy rows remain visible. The summary response reports exact physical row and logical planned-capacity counts as observed in one bounded repeatable-read database snapshot, together with `observed_at`; the UI does not call an older count a live value.
+
+Replica cursors are opaque, versioned keyset cursors over descending `replica_id`. They carry the service hash, scope, first-page maximum replica ID, and last replica ID. Each request supplies the expected service hash, so recreating a same-name service invalidates the cursor with `409`; the first-page maximum keeps later pages stable when newer attempts arrive. Each page filters before decoding legacy JSON/pickle replica state and reads at most `limit + 1` rows. Rows that transition between current and past across refreshes are deduplicated by replica ID, and a manual or visibility refresh replaces the current page and exact totals rather than adding counts from different snapshots.
+
+The dashboard starts the list metadata and summary requests together and renders either phase as it arrives. On a cold consolidated detail route, the cheap existing metadata projection is the required identity anchor because it supplies the current service hash. As soon as that hash lands, the dashboard fans out one hour of direct history, the batched replica summary, and the first current-replica page concurrently while the controller-backed live summary proceeds independently. Direct responses are merged only when they match the anchored visible service incarnation. A refresh may reuse the visible hash to start those reads immediately, but a `409` invalidates that anchor and restarts from metadata. Each section has its own loading and unavailable state, and stale-response fencing checks both the route generation and service hash. Selecting 12 or 24 hours requests only that range; choosing a smaller range reuses already loaded data. A 404 from an older server or `available: false` from a non-consolidated server uses the existing v0 full-status path.
+
+Past attempts are not requested until the disclosure is opened. Further pages load explicitly and retain the existing neutral explanation that replaced attempts are diagnostic history, not a current incident. Current or uncertain rows remain visible outside the disclosure, including cleanup failures and unknown states that may require verification. The direct replica query filters and bounds rows before deserializing replica state or resolving optional current-row cluster records. The existing full-status fallback continues to provide YAML on non-consolidated or older servers; lazy YAML is outside this performance slice.
+
+The controller-backed summary remains the authoritative fresh source for autoscaler target and request-pressure fields. Minute history may render first but must retain its observation time and must not be presented as a fresh target. If one independent enrichment fails, the last good data in other sections remains visible and only that section offers refresh-to-retry guidance.
+
+The API version advances to 66 for the new routes. Existing clients and all existing `/serve/status` behavior remain unchanged. The new dashboard assets are served by the same API-server release that owns the routes; an already-open page spanning a server rollback may show the affected section as unavailable until reload, but must keep the last good snapshot rather than blanking the page.
+
+This v1 does not change the clusters dashboard. Production measured the active cluster list at about 0.58 seconds and workspaces at about 0.27 seconds, so cluster cache seeding and future pagination-plugin preload guards are lower-priority, independently shippable follow-ups.
+
+Deliver v1 as three mergeable milestones to keep review and rollback boundaries narrow:
+
+1. v1a starts list metadata and summary concurrently and makes either arrival order monotonic.
+2. v1b adds capability-gated selected-range direct history while retaining the existing full replica path and fallback.
+3. v1c adds the direct batched replica-summary projection and current/past replica pagination, then removes the eager full replica request from Overview.
+
+Each milestone updates this canonical design in place, runs its focused frontend and backend tests, and passes the complete CI rollup on its exact pushed SHA before merge. Later milestones start from the verified merge of the preceding milestone rather than an unmerged stack.
 
 ## Alternatives considered
 
@@ -71,14 +103,18 @@ Removing failed rows would make the page calmer but erase useful diagnostic evid
 
 Fetching every service in separate requests before rendering would amplify request and controller load. A single metadata projection followed by scoped enrichment provides progressive rendering without an uncontrolled fan-out.
 
+Only starting the existing detail requests concurrently reduced measured wall time, but it delayed metadata by about half a second under contention and retained the multi-megabyte payload. Direct bounded PostgreSQL reads provide the stronger latency and carrying-cost boundary.
+
+Returning every replica and collapsing it client-side preserves the old API shape but keeps database deserialization, pricing, transfer, and memory proportional to retained history. Cursor pagination makes those costs proportional to what the operator opens.
+
 ## Implementation details
 
-Expected implementation areas include `sky/server/requests/payloads.py`, API-version and Serve status runner/RPC projection code, a slim Serve-state metadata query, `sky/dashboard/src/data/connectors/services.jsx`, the services list, the service detail hook, and their focused tests. Preserve request-version fencing, cache-key separation, visibility refresh behavior, and old status defaults. The deferred summary may opt into endpoint hydration, but the metadata projection itself must remain free of Kubernetes or cloud calls.
+The v1 implementation areas include the Serve dashboard REST router, indexed Serve-state page queries, API-version constants, `sky/dashboard/src/data/connectors/services.jsx`, the services list, the service detail hook, history range controls, and focused tests. Preserve request-version and service-hash fencing, cache-key separation, visibility refresh behavior, last-good snapshots, and all existing `/serve/status` defaults. No central database migration is required because the replica table already has `(service_name, status)` and primary-key `(service_name, replica_id)` indexes.
 
-Tests must cover metadata projection cost boundaries, default API compatibility, two-phase list merging, the ordered metadata-then-full detail requests, stale responses, route changes, retained last-good data during refresh, healthy service messaging with historical failures, actionable failure messaging, and bounded/collapsed history rendering. Build the dashboard and perform authenticated live verification on both requested production routes after deployment.
+Tests must cover direct-route bounds and hash mismatches, current versus past classification, cursor stability, handle-free serialization, selected-range history loading, independent failure states, stale responses, route changes, retained last-good data during refresh, concurrent list merging in either arrival order, and paginated past-attempt disclosure. Build the dashboard and manually verify the services list and `boltz-l4-fleet` detail route before merge. Production deployment remains a separate explicitly authorized action.
 
 ## Release and rollback
 
-Land through a PR from a clean worktree based on the current `origin/improvements`. Require the full CI rollup on the exact pushed SHA. Deploy the merged commit through the current private OCI/Helm production path, preserving existing Helm values. Verify the final Helm revision, image and commit, API health, services list, `boltz-l4-fleet` detail page, and data-plane service health separately.
+Land through a PR from a clean worktree based on the current `origin/improvements`. Require the full CI rollup on the exact pushed SHA. If deployment is separately requested, use the current private OCI/Helm production path, preserve existing Helm values, and verify the final Helm revision, image and commit, API health, dashboard routes, and data-plane service health separately.
 
 Rollback is the prior Helm revision. The API additions are optional and backward compatible, so rollback does not require a database migration.
