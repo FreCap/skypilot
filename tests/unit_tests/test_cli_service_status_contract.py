@@ -12,6 +12,7 @@ import pytest
 
 from sky import exceptions
 from sky.client.cli import command
+from sky.client.cli import service_status
 from sky.server import common as server_common
 from sky.utils import status_lib
 
@@ -41,6 +42,7 @@ def _call_handler(*,
 
 def test_historical_function_contract_and_pickle_identity():
     handler = command._handle_services_request
+    assert handler is service_status._handle_services_request
     assert handler.__module__ == 'sky.client.cli.command'
     assert handler.__qualname__ == '_handle_services_request'
     signature = inspect.signature(handler)
