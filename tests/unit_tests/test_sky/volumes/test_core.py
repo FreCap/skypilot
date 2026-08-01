@@ -1,6 +1,9 @@
 """Unit tests for volume core functions."""
 
+import concurrent.futures
+import contextlib
 from datetime import datetime
+import threading
 from unittest import mock
 
 import pytest
@@ -10,6 +13,7 @@ from sky import models
 from sky import provision
 from sky.schemas.api import responses
 from sky.server import plugin_hooks
+from sky.server.requests import storage as request_storage
 from sky.utils import status_lib
 from sky.volumes.server import core
 
@@ -1675,6 +1679,515 @@ def _make_volume_config(**kwargs) -> models.VolumeConfig:
     }
     defaults.update(kwargs)
     return models.VolumeConfig(**defaults)
+
+
+class TestVolumeMutationTranscript:
+    """Characterize the current volume mutation responsibility ordering."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_volume_deleted_hooks(self):
+        # pylint: disable=protected-access
+        hooks = plugin_hooks._VOLUME_DELETED_HOOKS
+        # pylint: enable=protected-access
+        hooks.clear()
+        yield
+        hooks.clear()
+
+    @staticmethod
+    def _volume_config(name: str = 'test-volume') -> models.VolumeConfig:
+        return models.VolumeConfig(
+            name=name,
+            type='k8s-pvc',
+            cloud='kubernetes',
+            region='test-context',
+            zone=None,
+            size='10',
+            config={},
+            name_on_cloud=f'{name}-provider',
+        )
+
+    @staticmethod
+    def _volume_row(name: str = 'test-volume') -> dict:
+        return {
+            'name': name,
+            'status': status_lib.VolumeStatus.READY,
+            'handle': TestVolumeMutationTranscript._volume_config(name),
+        }
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _recording_lock(events: list[str], name: str):
+        events.append(f'lock_enter:{name}')
+        try:
+            yield
+        finally:
+            events.append(f'lock_exit:{name}')
+
+    def _patch_apply_prefix(self, monkeypatch, events: list[str]) -> None:
+        cloud = mock.MagicMock()
+        cloud.__str__.return_value = 'Kubernetes'
+        cloud.max_cluster_name_length.return_value = 63
+
+        def validate_region_zone(region, zone):
+            events.append('validate_region_zone')
+            return region, zone
+
+        cloud.validate_region_zone.side_effect = validate_region_zone
+        cloud_registry = mock.MagicMock()
+
+        def resolve_cloud(cloud_name):
+            assert cloud_name == 'kubernetes'
+            events.append('cloud_lookup')
+            return cloud
+
+        cloud_registry.from_str.side_effect = resolve_cloud
+        monkeypatch.setattr(core.registry, 'CLOUD_REGISTRY', cloud_registry)
+
+        def new_uuid():
+            events.append('uuid')
+            return 'abcdef1234567890'
+
+        monkeypatch.setattr(core.uuid, 'uuid4', new_uuid)
+
+        def make_name(name, *, max_length):
+            assert name == 'test-volume'
+            assert max_length == 63
+            events.append('normalize_name')
+            return name
+
+        monkeypatch.setattr(core.common_utils, 'make_cluster_name_on_cloud',
+                            make_name)
+        monkeypatch.setattr(core, '_volume_lock',
+                            lambda name: self._recording_lock(events, name))
+
+    @pytest.mark.parametrize(
+        ('use_existing', 'expected_name_on_cloud', 'expected_events'), [
+            (False, 'test-volume-abcdef', [
+                'cloud_lookup',
+                'validate_region_zone',
+                'uuid',
+                'normalize_name',
+                'lock_enter:test-volume',
+                'row_read',
+                'provider_apply:test-volume-abcdef',
+                'db_insert:test-volume-abcdef',
+                'lock_exit:test-volume',
+            ]),
+            (True, 'test-volume', [
+                'cloud_lookup',
+                'validate_region_zone',
+                'lock_enter:test-volume',
+                'row_read',
+                'provider_apply:test-volume',
+                'duplicate_check:test-volume',
+                'db_insert:test-volume',
+                'lock_exit:test-volume',
+            ]),
+        ],
+        ids=['create', 'use-existing'])
+    def test_volume_apply_exact_order(self, monkeypatch, use_existing,
+                                      expected_name_on_cloud, expected_events):
+        events: list[str] = []
+        self._patch_apply_prefix(monkeypatch, events)
+
+        def read_volume(name):
+            assert name == 'test-volume'
+            events.append('row_read')
+            return None
+
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            read_volume)
+
+        def apply_volume(cloud, config):
+            assert cloud == 'kubernetes'
+            events.append(f'provider_apply:{config.name_on_cloud}')
+            return config
+
+        monkeypatch.setattr(provision, 'apply_volume', apply_volume)
+
+        def check_duplicate(name, config):
+            assert name == 'test-volume'
+            events.append(f'duplicate_check:{config.name_on_cloud}')
+
+        monkeypatch.setattr(core, '_check_duplicate_backend_resource',
+                            check_duplicate)
+
+        inserted_configs = []
+
+        def add_volume(name, config, status, is_ephemeral, creation_yaml=None):
+            assert name == 'test-volume'
+            assert status is status_lib.VolumeStatus.READY
+            assert not is_ephemeral
+            assert creation_yaml is None
+            events.append(f'db_insert:{config.name_on_cloud}')
+            inserted_configs.append(config)
+
+        monkeypatch.setattr(global_user_state, 'add_volume', add_volume)
+
+        core.volume_apply(name='test-volume',
+                          volume_type='k8s-pvc',
+                          cloud='kubernetes',
+                          region='test-context',
+                          zone=None,
+                          size='10',
+                          config={},
+                          use_existing=use_existing)
+
+        assert events == expected_events
+        assert len(inserted_configs) == 1
+        assert inserted_configs[0].name_on_cloud == expected_name_on_cloud
+
+    def test_volume_apply_provider_success_then_db_failure_is_not_compensated(
+            self, monkeypatch):
+        events: list[str] = []
+        self._patch_apply_prefix(monkeypatch, events)
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            lambda name: events.append('row_read') or None)
+
+        def apply_volume(cloud, config):
+            del cloud
+            events.append(f'provider_apply:{config.name_on_cloud}')
+            return config
+
+        monkeypatch.setattr(provision, 'apply_volume', apply_volume)
+
+        def fail_insert(*args, **kwargs):
+            del args, kwargs
+            events.append('db_insert_error')
+            raise RuntimeError('volume insert failed')
+
+        monkeypatch.setattr(global_user_state, 'add_volume', fail_insert)
+        compensate = mock.MagicMock()
+        monkeypatch.setattr(provision, 'delete_volume', compensate)
+
+        with pytest.raises(RuntimeError, match='volume insert failed'):
+            core.volume_apply(name='test-volume',
+                              volume_type='k8s-pvc',
+                              cloud='kubernetes',
+                              region='test-context',
+                              zone=None,
+                              size='10',
+                              config={})
+
+        assert events == [
+            'cloud_lookup',
+            'validate_region_zone',
+            'uuid',
+            'normalize_name',
+            'lock_enter:test-volume',
+            'row_read',
+            'provider_apply:test-volume-abcdef',
+            'db_insert_error',
+            'lock_exit:test-volume',
+        ]
+        compensate.assert_not_called()
+
+    def test_volume_apply_ignores_active_request_claim_fence(self, monkeypatch):
+        """A request claim does not fence provider I/O or the volume write."""
+        events: list[str] = []
+        self._patch_apply_prefix(monkeypatch, events)
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            lambda name: events.append('row_read') or None)
+        expected_claim = request_storage.ExecutionClaim(
+            request_id='stale-volume-request',
+            execution_generation=7,
+            claim_token='stale-claim-token')
+
+        def apply_volume(cloud, config):
+            del cloud
+            assert request_storage.active_execution_claim() == expected_claim
+            events.append('provider_apply')
+            return config
+
+        def add_volume(*args, **kwargs):
+            del args, kwargs
+            assert request_storage.active_execution_claim() == expected_claim
+            events.append('db_insert')
+
+        monkeypatch.setattr(provision, 'apply_volume', apply_volume)
+        monkeypatch.setattr(global_user_state, 'add_volume', add_volume)
+        claim_context = request_storage.activate_execution_claim(
+            expected_claim.request_id, expected_claim.execution_generation,
+            expected_claim.claim_token)
+        try:
+            core.volume_apply(name='test-volume',
+                              volume_type='k8s-pvc',
+                              cloud='kubernetes',
+                              region='test-context',
+                              zone=None,
+                              size='10',
+                              config={})
+        finally:
+            request_storage.deactivate_execution_claim(claim_context)
+
+        assert events == [
+            'cloud_lookup',
+            'validate_region_zone',
+            'uuid',
+            'normalize_name',
+            'lock_enter:test-volume',
+            'row_read',
+            'provider_apply',
+            'db_insert',
+            'lock_exit:test-volume',
+        ]
+
+    def test_volume_delete_exact_order(self, monkeypatch):
+        events: list[str] = []
+        row = self._volume_row()
+
+        def read_volume(name):
+            assert name == 'test-volume'
+            events.append('row_read')
+            return row
+
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            read_volume)
+
+        def get_usedby(cloud, config):
+            assert cloud == 'kubernetes'
+            assert config is row['handle']
+            events.append('usedby_read')
+            return [], []
+
+        monkeypatch.setattr(provision, 'get_volume_usedby', get_usedby)
+        monkeypatch.setattr(core, '_volume_lock',
+                            lambda name: self._recording_lock(events, name))
+        monkeypatch.setattr(
+            provision, 'delete_volume',
+            lambda cloud, config: events.append('provider_delete'))
+        monkeypatch.setattr(global_user_state, 'delete_volume',
+                            lambda name: events.append('db_delete'))
+        plugin_hooks.register_volume_deleted_hook(
+            'test.transcript.delete',
+            lambda name, config: events.append('hook'))
+
+        core.volume_delete(['test-volume'])
+
+        assert events == [
+            'row_read',
+            'usedby_read',
+            'lock_enter:test-volume',
+            'provider_delete',
+            'db_delete',
+            'hook',
+            'lock_exit:test-volume',
+        ]
+
+    def test_volume_delete_provider_success_then_db_failure_leaves_stale_row(
+            self, monkeypatch):
+        events: list[str] = []
+        row = self._volume_row()
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            lambda name: events.append('row_read') or row)
+        monkeypatch.setattr(
+            provision, 'get_volume_usedby',
+            lambda cloud, config: events.append('usedby_read') or ([], []))
+        monkeypatch.setattr(core, '_volume_lock',
+                            lambda name: self._recording_lock(events, name))
+        monkeypatch.setattr(
+            provision, 'delete_volume',
+            lambda cloud, config: events.append('provider_delete'))
+
+        def fail_delete(name):
+            events.append('db_delete_error')
+            raise RuntimeError(f'failed to delete {name}')
+
+        monkeypatch.setattr(global_user_state, 'delete_volume', fail_delete)
+        plugin_hooks.register_volume_deleted_hook(
+            'test.transcript.db-failure',
+            lambda name, config: events.append('hook'))
+
+        with pytest.raises(RuntimeError, match='failed to delete test-volume'):
+            core.volume_delete(['test-volume'])
+
+        assert events == [
+            'row_read',
+            'usedby_read',
+            'lock_enter:test-volume',
+            'provider_delete',
+            'db_delete_error',
+            'lock_exit:test-volume',
+        ]
+
+    def test_volume_purge_forgets_provider_failure_then_deletes_and_hooks(
+            self, monkeypatch):
+        events: list[str] = []
+        row = self._volume_row()
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            lambda name: events.append('row_read') or row)
+        usedby = mock.MagicMock()
+        monkeypatch.setattr(provision, 'get_volume_usedby', usedby)
+        monkeypatch.setattr(core, '_volume_lock',
+                            lambda name: self._recording_lock(events, name))
+
+        def fail_provider_delete(cloud, config):
+            del cloud, config
+            events.append('provider_delete_error')
+            raise RuntimeError('provider delete failed')
+
+        monkeypatch.setattr(provision, 'delete_volume', fail_provider_delete)
+        monkeypatch.setattr(global_user_state, 'delete_volume',
+                            lambda name: events.append('db_delete'))
+        plugin_hooks.register_volume_deleted_hook(
+            'test.transcript.purge', lambda name, config: events.append('hook'))
+
+        core.volume_delete(['test-volume'], purge=True)
+
+        assert events == [
+            'row_read',
+            'lock_enter:test-volume',
+            'provider_delete_error',
+            'db_delete',
+            'hook',
+            'lock_exit:test-volume',
+        ]
+        usedby.assert_not_called()
+
+    def test_concurrent_volume_deletes_both_use_stale_prelock_row(
+            self, monkeypatch):
+        events: list[str] = []
+        events_lock = threading.Lock()
+        read_barrier = threading.Barrier(2)
+        usedby_barrier = threading.Barrier(2)
+        provider_lock = threading.Lock()
+        state = {'row': self._volume_row(), 'read_count': 0}
+
+        def record(event):
+            with events_lock:
+                events.append(event)
+
+        def read_volume(name):
+            assert name == 'test-volume'
+            record('row_read')
+            with events_lock:
+                state['read_count'] += 1
+                read_count = state['read_count']
+                captured_row = state['row']
+            if read_count <= 2:
+                read_barrier.wait(timeout=5)
+            return captured_row
+
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            read_volume)
+
+        def get_usedby(cloud, config):
+            del cloud, config
+            record('usedby_read')
+            usedby_barrier.wait(timeout=5)
+            return [], []
+
+        monkeypatch.setattr(provision, 'get_volume_usedby', get_usedby)
+
+        @contextlib.contextmanager
+        def serialized_volume_lock(name):
+            assert name == 'test-volume'
+            with provider_lock:
+                record('lock_enter')
+                try:
+                    yield
+                finally:
+                    record('lock_exit')
+
+        monkeypatch.setattr(core, '_volume_lock', serialized_volume_lock)
+        monkeypatch.setattr(provision, 'delete_volume',
+                            lambda cloud, config: record('provider_delete'))
+
+        def delete_row(name):
+            assert name == 'test-volume'
+            record('db_delete')
+            state['row'] = None
+
+        monkeypatch.setattr(global_user_state, 'delete_volume', delete_row)
+        plugin_hooks.register_volume_deleted_hook(
+            'test.transcript.concurrent', lambda name, config: record('hook'))
+        monkeypatch.setattr(core.rich_utils, 'safe_status',
+                            lambda message: contextlib.nullcontext())
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(core.volume_delete, ['test-volume'])
+                for _ in range(2)
+            ]
+            for future in futures:
+                future.result(timeout=10)
+
+        assert events == [
+            'row_read',
+            'row_read',
+            'usedby_read',
+            'usedby_read',
+            'lock_enter',
+            'provider_delete',
+            'db_delete',
+            'hook',
+            'lock_exit',
+            'lock_enter',
+            'provider_delete',
+            'db_delete',
+            'hook',
+            'lock_exit',
+        ]
+        assert state['row'] is None
+
+    def test_multi_name_delete_commits_prefix_then_retry_stops_at_missing_first(
+            self, monkeypatch):
+        events: list[str] = []
+        rows = {
+            name: self._volume_row(name) for name in ('volume-1', 'volume-2')
+        }
+
+        def read_volume(name):
+            events.append(f'row_read:{name}')
+            return rows.get(name)
+
+        monkeypatch.setattr(global_user_state, 'get_volume_by_name',
+                            read_volume)
+        monkeypatch.setattr(
+            provision, 'get_volume_usedby',
+            lambda cloud, config: events.append(f'usedby_read:{config.name}') or
+            ([], []))
+        monkeypatch.setattr(core, '_volume_lock',
+                            lambda name: self._recording_lock(events, name))
+
+        def provider_delete(cloud, config):
+            del cloud
+            events.append(f'provider_delete:{config.name}')
+            if config.name == 'volume-2':
+                raise RuntimeError('second provider delete failed')
+
+        monkeypatch.setattr(provision, 'delete_volume', provider_delete)
+
+        def delete_row(name):
+            events.append(f'db_delete:{name}')
+            del rows[name]
+
+        monkeypatch.setattr(global_user_state, 'delete_volume', delete_row)
+        plugin_hooks.register_volume_deleted_hook(
+            'test.transcript.partial',
+            lambda name, config: events.append(f'hook:{name}'))
+
+        with pytest.raises(RuntimeError, match='second provider delete failed'):
+            core.volume_delete(['volume-1', 'volume-2'])
+        with pytest.raises(ValueError, match='Volume volume-1 not found'):
+            core.volume_delete(['volume-1', 'volume-2'])
+
+        assert events == [
+            'row_read:volume-1',
+            'usedby_read:volume-1',
+            'lock_enter:volume-1',
+            'provider_delete:volume-1',
+            'db_delete:volume-1',
+            'hook:volume-1',
+            'lock_exit:volume-1',
+            'row_read:volume-2',
+            'usedby_read:volume-2',
+            'lock_enter:volume-2',
+            'provider_delete:volume-2',
+            'lock_exit:volume-2',
+            'row_read:volume-1',
+        ]
+        assert set(rows) == {'volume-2'}
 
 
 class TestSameBackendResource:

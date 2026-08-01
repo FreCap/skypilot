@@ -1,14 +1,15 @@
 # Provider and Lifecycle Actuation Architecture
 
-Status: M1, M2 S1, M2 S2a.1, and the S2a.2 source composer are merged and
-deployment-qualified. The separately deployable S2a.2 deterministic-gzip
-prerequisite passed exact-head CI, merge, staged revision 45 deployment, and
-bounded monitoring; the source composer passed exact-head CI, merge, staged
-revisions 46 through 48, and bounded monitoring. The pre-M3 volume projection
-contract passed exact-design adversarial review and its implementation is under
-local qualification. Its exact-head CI, merge, deployment, and live-volume
-evidence gates remain open. The M3 action runtime and M4 implementation still
-require dedicated exact-design adversarial reviews.
+Status: M1, M2 S1, M2 S2a.1, the S2a.2 deterministic-gzip prerequisite and
+source composer, and M3-S0 are merged and deployment-qualified. M3-S0 passed
+exact-head CI, exact-parent merge verification, staged revisions 49 through 51,
+and bounded monitoring. The test deployment had no managed volume, so positive
+live per-volume parity remains explicitly unproven and the shadow remains
+diagnostic-only. M3-S1 is the next design-and-characterization slice. M3-S2 is
+limited to the inert store-identity and scoped-ownership foundation. The full
+M3 action graph, action runtime, authoritative volume writer, and M4
+implementation still require their dedicated exact-design adversarial reviews
+and activation gates.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -4040,6 +4041,554 @@ package, Datadog metric, dashboard, or statistics store. No cluster, Serve,
 jobs, pool, image, or API request production path adopts the volume seam in
 this slice.
 
+### M3-S1 volume mutation transcript and exact durable action envelope
+
+M3-S1 is the next stacked slice after the deployed M3-S0 shadow. It updates
+this canonical design and adds behavior-characterization tests only. It adds no
+action table, domain column, migration, producer, worker, queue, due query,
+claim, lease, heartbeat, retry owner, provider mutation, request endpoint,
+event kind, activation flag, compatibility reconciler, or statistics store.
+The legacy volume request handler, provider calls, status writer, database
+sessions, and public synchronous behavior remain authoritative and unchanged.
+
+The characterization fixes three logical keys separately from their mutable
+record state and chooses the minimum storage ownership needed by the next DDL
+slice:
+
+- An **action** is one stable logical domain transition. Its unique business
+  key is the canonical tuple `(control-plane store identity, workspace,
+  volume resource key, resource incarnation, desired generation, tombstone
+  generation or zero, operation kind)`. Workspace and volume name are
+  nonempty fixed-`NFC_V1` UTF-8 strings of at most 256 bytes. Store identity
+  and incarnation are canonical lowercase UUID strings. Desired and tombstone
+  generations are nonnegative signed 64-bit integers, with zero reserved for
+  no tombstone. Operation kind is a closed ASCII enum. Its `action_id` is
+  UUIDv5 over the exact encoding below. The record also retains the canonical
+  request-payload digest, authenticated
+  admission subject, admission ownership epoch and fence, cleanup requirement,
+  request correlations, and mutable terminal domain result. A retried HTTP
+  request joins the existing action only when its business key, operation,
+  payload digest, and authenticated subject match exactly; otherwise admission
+  returns a conflict. An initiating request ID is correlation, never part of
+  action identity. An action survives worker and process changes and cannot be
+  replaced merely because another attempt is due.
+- An **attempt** is one bounded ownership interval for an action. Its key is
+  `(action_id, monotonically increasing attempt number)`. A unique claim token
+  fences the mutable ownership record but is not attempt identity. The record
+  retains worker identity, database-clock lease and heartbeat times, start and
+  finish times, and the normalized attempt outcome. Attempt identity never
+  doubles as provider-effect identity and lease expiry never proves that an
+  effect did not occur.
+- An **effect** is one deterministic provider-side step within an action. Its
+  unique key is `(action_id, dependency ordinal)`, where ordinal is zero-based
+  and limited to a nonnegative signed 32-bit integer, with a stable UUIDv5
+  `effect_id` derived from the action and ordinal. Immutable fields are the
+  versioned effect kind, canonical effect payload and digest, actuation
+  binding, idempotency key, and initial readback locator. Mutable fields are a
+  returned provider operation identity, exact observed resource UID, cleanup
+  obligation, phase, certainty, and normalized outcome. A retry observes or
+  continues the same effect. It cannot create a fresh effect identity to hide
+  an ambiguous prior submission.
+
+The PostgreSQL expand layout uses a sidecar
+`volume_lifecycle_resources` row keyed by the currently global logical volume
+name. It can exist without a legacy `volumes` row and therefore owns absent-name
+reservations, incarnation, desired and tombstone generations, workspace,
+writer mode, ownership epoch, current binding digest, public visibility, and
+domain state. For an action-owned live or tombstoned provider resource it also
+owns the versioned canonical base locator and digest, exact observed provider
+UID, comparison-rules version, canonical requested projection and digest, and
+ownership-annotation version. Those fields cannot be cleared or replaced by
+effect compaction; they change only through an incarnation-fenced domain
+transition and remain until exact cleanup proof is durable. It is not deleted
+on ordinary volume deletion. The existing `volumes` row remains the old-reader
+public projection and may be absent while the sidecar retains a tombstone. A
+volume row with no sidecar is unambiguously legacy. The dark identity slice
+creates no sidecar table or row; later action admission creates or locks the
+sidecar and writes its action and effects in one transaction. The sidecar has
+no foreign key to `volumes`, because the name reservation and tombstone must
+outlive that row.
+
+A new incarnation is random UUIDv4 persisted before any provider I/O, with
+desired generation 1 and tombstone generation 0. Each admitted desired-state
+change increments desired generation. Delete increments desired generation and
+sets tombstone generation to that same value. Same-name recreation is legal
+only after the prior cleanup gate, allocates a fresh UUIDv4, and restarts its
+per-incarnation desired generation at 1 with tombstone 0. UUID identity, not a
+reused generation number, separates old and new effects.
+
+The control-plane store identity is a UUID in one singleton PostgreSQL row. It
+is created once before any sidecar or action row, is never derived from a pod,
+hostname, context, or image, and is preserved by backup and authoritative
+restore. Database state alone cannot distinguish a source from its clone. The
+same row therefore carries a nullable SHA-256 digest of an external 256-bit
+writer-authority seal. The seal itself is not stored in this database or its
+backup. Seal possession and its database digest are proof material, not
+exclusive authority. A dark store has a null digest and cannot write lifecycle
+work.
+
+Before any scope may leave `DARK`, the deployment must acquire an externally
+enforced, short-lived, renewable single-writer grant by compare-and-set. The
+grant record is keyed only by store UUID and exact scope key. Its value carries
+the authority generation. Acquisition or transfer compares the expected prior
+generation and cannot replace any unexpired grant except a same-holder renewal;
+using generation as part of the record key is prohibited because two
+generations could then remain live. The grant is issued only through
+deployment-specific workload identity and is excluded from the database, Helm
+values, deployment backups, and ordinary secret copying. Its signed or
+attested payload binds the store UUID, scope key, authority generation, target
+ownership epoch, deployment identity, writer and reconciler implementation
+digests, serial, issue time, and expiry. Every later legacy-intent producer,
+action producer, reconciler, worker, and underlying provider attempt must
+freshly validate that live grant plus the seal digest and scoped epoch. Cached
+seal or grant possession is insufficient. Datadog observes expiry or
+split-brain signals but never grants authority.
+
+An authoritative restore or transfer first enters `DRAINING`, fences the
+source workload identity and its provider-call credentials or provider-call
+authority proxy, and revokes the old grant or waits for its expiry. It then
+waits the reviewed maximum check-to-call, provider-call, and hidden-SDK-retry
+ambiguity horizon and reconciles any call that may have escaped to readback or
+quarantine. Only after that proof may it increment the authority generation
+and ownership epoch and issue a target-bound grant. Grant expiry alone is
+insufficient because a paused old holder could have validated immediately
+before expiry and call afterward. A database and secret clone cannot acquire
+the source's unexpired external grant. A fork may receive a new store UUID,
+seal, and authority lineage only after proving that it has no action-owned
+volume and no nonterminal, quarantined, or cleanup-required action; terminal
+evidence keeps its original store UUID. The exact external grant service,
+credential fence, ambiguity horizon, and transfer protocol require the later
+activation review and are not implemented by the inert M3-S2 slice.
+
+Action UUIDv5 namespace is
+`e4abeb94-a9e7-4722-a9e7-2776d6d9e18b`. Effect UUIDv5 namespace is
+`1bdc5439-e342-4933-b48d-18f295d8023d`. For either identity, `LP(x)` is the
+ASCII decimal UTF-8 byte length of `x`, one colon, then the exact UTF-8 bytes of
+`x`. The action UUID name bytes are
+`skypilot-volume-action-v1` followed in order by `LP()` encodings of canonical
+store UUID, workspace, logical volume name, incarnation UUID, desired
+generation decimal, tombstone generation decimal, and operation enum. There
+are no nullable fields or implicit separators. The effect UUID name bytes are
+`skypilot-volume-effect-v1` followed by `LP()` of canonical action UUID and
+zero-based ordinal decimal. These byte strings are valid UTF-8 and are passed
+unchanged as the UUIDv5 name. The generic idempotency key is
+`skypilot-volume-v1:<lowercase effect UUID>`; a facet may use a
+provider-constrained lossless encoding only when its collision proof is part of
+the binding. The Kubernetes pilot persists the effect UUID directly in its
+reserved annotation.
+
+Effect phase is closed to `PRE_INTENT`, `IN_FLIGHT`, `READBACK`, `COMPLETED`,
+or `QUARANTINED`. Effect certainty is independently closed to
+`NOT_SUBMITTED`, `SUBMISSION_UNKNOWN`, `PROVIDER_ACCEPTED`, `EXACT_PRESENT`,
+`EXACT_ABSENT`, `REPLACED`, or `FOREIGN_CONFLICT`. An action terminal result is
+closed to `SUCCEEDED`, `SUCCEEDED_REPLACED`, `CONFLICT`, or `FAILED_SAFE`.
+`QUARANTINED` is a nonterminal action state with no terminal result.
+`REPLACED` means the exact old provider UID is absent while the same name now
+resolves to another UID. It completes cleanup for the old incarnation but
+never authorizes deletion of the replacement.
+`DETACHED_CLEANUP_PENDING` is a nonterminal domain-visibility state, not a
+success result: force purge may hide the volume only after the same admission
+transaction persists the exact cleanup effect and locator. The action remains
+owned until absence is proved or it reaches visible quarantine.
+
+Runnable ownership is not stored on an effect. An action owns lifecycle state
+closed to `WAITING`, `OWNED`, `QUARANTINED`, or `TERMINAL`, its
+database-clock `next_attempt_at`, monotonically increasing `attempt_count`,
+nullable `current_attempt_number`, retry counters, and terminal result. An
+attempt owns its unique claim token, worker identity, database-clock lease and
+heartbeat, start and finish times, and an outcome that is null while live and
+then closed to `SUCCEEDED`, `READBACK_REQUIRED`, `RETRYABLE_NO_EFFECT`,
+`FENCED`, `LEASE_EXPIRED`, `QUARANTINED`, or `FAILED_SAFE`.
+
+Claiming locks one due `WAITING` action, requires no current attempt, increments
+`attempt_count`, inserts exactly that attempt, and changes the action to
+`OWNED` with its current-attempt pointer in the same transaction. A unique
+partial constraint permits only one unfinished attempt per action, and the
+action pointer has a composite foreign key to its attempt. Completion or retry
+locks both records, validates the claim token and fresh database-clock lease,
+finishes the attempt, clears the pointer, and changes the action to `TERMINAL`,
+`QUARANTINED`, or `WAITING` with a newly computed
+`next_attempt_at`. An expired owner is finished as `LEASE_EXPIRED`; any effect
+that reached `IN_FLIGHT` or has `SUBMISSION_UNKNOWN` returns through
+`READBACK`, while exact `PRE_INTENT/NOT_SUBMITTED` work may be retried without
+readback. Backoff and due time live only on the action; attempt rows are
+immutable after finish.
+
+The legal effect pairs are exact. Initial state is
+`PRE_INTENT/NOT_SUBMITTED`. The final pre-call transaction writes
+`IN_FLIGHT/SUBMISSION_UNKNOWN` before releasing its lock for the provider call.
+Acknowledgement writes `READBACK/PROVIDER_ACCEPTED`; timeout, lost response, or
+lease loss writes or retains `READBACK/SUBMISSION_UNKNOWN`. Create completes
+only as `COMPLETED/EXACT_PRESENT`; delete completes only as
+`COMPLETED/EXACT_ABSENT` or `COMPLETED/REPLACED`; an observed foreign object
+completes as `COMPLETED/FOREIGN_CONFLICT`; and a proved no-call failure may
+complete as `COMPLETED/NOT_SUBMITTED` with action result `FAILED_SAFE`.
+`QUARANTINED` preserves the prior certainty and cannot conceal it. No other
+phase and certainty pair is valid. Only nonterminal certainty
+`NOT_SUBMITTED`, `SUBMISSION_UNKNOWN`, or `PROVIDER_ACCEPTED` may enter
+`QUARANTINED`, and the effect records its exact pre-quarantine phase.
+
+Cleanup state is separately closed to `NONE`, `REQUIRED`, or `PROVED`. Delete
+starts `REQUIRED` and becomes `PROVED` only with `EXACT_ABSENT` or `REPLACED`.
+A still-desired create remains `NONE`; superseding an ambiguous or present
+create atomically changes cleanup to `REQUIRED` and admits its exact delete
+effect before the create action can close. Force purge retains `REQUIRED`.
+`TERMINAL` requires every effect completed, no cleanup state `REQUIRED`, and an
+exact result-compatible certainty. `QUARANTINED` and
+`DETACHED_CLEANUP_PENDING` are never selected as terminal success.
+
+Quarantine is reactivated only by an audited reconciliation transaction. It
+requires no live attempt, proves that the original binding is again resolvable
+or that an approved compatibility adapter exists, increments the action
+ownership epoch, appends the operator or deploy-reconciler identity, changes
+each proven `NOT_SUBMITTED` effect back to
+`PRE_INTENT/NOT_SUBMITTED`, changes each `SUBMISSION_UNKNOWN` or
+`PROVIDER_ACCEPTED` effect to `READBACK` with certainty unchanged, and sets the
+action to `WAITING` at database time. The safe branch requires recorded
+pre-quarantine phase `PRE_INTENT` and zero submissions. An unknown effect never
+returns to `PRE_INTENT` or directly to submission. Merely starting a different
+image does not requeue quarantine.
+
+Nonterminal, quarantined, detached-cleanup, and cleanup-required rows have no
+time-based expiry. Full terminal action, effect, attempt, and evidence rows are
+retained for at least 90 days, configurable only upward. Compaction then writes
+an immutable identity tombstone in the same transaction, retaining action ID,
+complete business key and payload digests, authenticated-subject digest,
+terminal result, an ordinal-keyed final-certainty and cleanup-proof entry for
+every effect, original binding digest, and completion time before removing
+bulky attempt or evidence data. A scalar effect summary is not sufficient.
+Compaction cannot remove a locator, UID, requested projection, binding, or
+cleanup fact still needed by a live or tombstoned domain resource; the sidecar
+retains that provider identity independently of effect retention. Identity
+tombstones and `volume_lifecycle_resources` rows persist for the lifetime of
+the control-plane store and continue to reject reuse of an old business key.
+Executable compatibility implementations may be removed only when no
+nonterminal effect references the binding; terminal tombstones retain the
+digest but do not require executable code.
+
+The API request row is not this ledger. Existing volume handlers use the
+ordinary request system and its request-lifetime policy, which can cancel a
+request after lease loss without resolving an ambiguous provider mutation. A
+future action may retain and correlate the initiating request ID, but effect
+recovery, readback, cleanup, and retention remain independently durable. The
+public request handler must not remain a second provider-call owner. Normal
+apply and delete wait for the action terminal result. Force purge instead waits
+only for the atomic visibility transaction, which stores request-facing result
+`DETACHED_CLEANUP_PENDING`, action ID, and exact cleanup locator before hiding
+the legacy volume row; it then completes the current request with the same
+successful detach semantics while cleanup continues durably. Request-facing
+result and action terminal result are separate columns. New clients may expose
+the action correlation after a separately versioned API change; old clients
+retain their current empty successful response.
+
+Admission is one exact transaction boundary. Typed provider preflight reads
+run before the transaction and carry target identity, capture time, and a
+bounded freshness deadline. The admission transaction locks the existing
+`volume_lifecycle_resources` name reservation or conflict-safely inserts and
+locks an exact sidecar when the name is new. It revalidates the authenticated
+subject, expected incarnation, desired and tombstone generations, domain
+fence, payload digest, and preflight freshness, then writes the desired volume
+transition, action, and complete deterministic effect plan through one borrowed
+PostgreSQL connection. A unique
+business-key conflict either joins the exact matching action or fails; it never
+silently discards a different payload. No action is claimable before this
+transaction commits, and no provider I/O or provider polling occurs while a
+database lock is held. Existing `global_user_state` helpers that open and
+commit their own sessions cannot be used by this transaction.
+
+The locked volume reservation or tombstone serializes apply, attachment
+admission, and delete for the exact incarnation. The deterministic provider
+name is derived from that incarnation and stored in the same transaction, not
+randomly generated inside a later handler.
+
+Immediately before a provider call, the action kernel obtains a typed live
+precondition observation without holding a database lock. It then opens a
+short transaction, locks the action and volume rows, validates the claim token,
+database-clock lease, action and domain fences, target binding, observation
+freshness, and effect phase, records the observation, and commits before one
+bounded provider call. Delete `usedby` policy belongs to the volume domain, but
+Kubernetes usage is a typed provider observation and is refreshed at this
+pre-effect fence. A nonempty or incomplete usage observation prevents delete.
+StorageClass existence/default checks and their current 401/403-unverified
+outcome are typed create-preflight observations. They do not become generic
+action-kernel policy.
+
+Responsibility is fixed as follows for DDL design:
+
+- the volume domain admission owner controls incarnation and desired
+  generation construction, tombstones, legal transitions, duplicate-name and
+  `usedby` checks, purge policy, and the user-visible terminal result;
+- the generic action kernel controls already-admitted due selection, claim,
+  fresh-database-clock lease, heartbeat, bounded backoff, effect phase,
+  pre-call live fencing, and connection-borrowing transaction orchestration;
+- a provider volume facet controls bounded raw submission and typed
+  observation or exact-absence evidence, but no request scheduling, domain
+  status transition, blind retry, or database commit;
+- the volume reducer maps typed observation and effect evidence into volume
+  domain state; and
+- Datadog remains the observation plane. M3-S1 adds no statistics database or
+  parallel metrics store.
+
+The candidate provider contract is `VolumeActuationV1`:
+
+```text
+observe_preflight(exact_intent, target) -> PreflightObservation
+prepare(exact_action, preflight, effect_observation?) -> EffectPlan
+submit_effect(exact_effect, idempotency_key) -> EffectEvidence
+observe_effect(readback_locator) -> EffectObservation
+prove_absent(readback_locator) -> AbsenceEvidence
+```
+
+Each method accepts and returns exact versioned value types. Submission is one
+bounded provider SDK attempt and does not poll to readiness; observation is a
+separate operation. `prepare()` is pure and cannot access credentials, the
+database, or the provider. The facet cannot translate a transport timeout into
+no-effect evidence. Observation and absence proof must distinguish the exact
+resource incarnation from a later same-name resource. The current generic
+Kubernetes delete retry helper and RunPod's method-wide HTTP retry layer are
+prohibited inside `submit_effect()` because they can hide several mutations
+behind one live fence.
+
+M3 does not make the full `ProviderDescriptorV1` authoritative. The volume
+pilot instead requires one immutable `VolumeActuationBindingV1` containing the
+canonical provider, facet contract version, dependency-closed operation
+subset, realized provider mode, `central_postgresql` store mode, and stable
+implementation digest. For Kubernetes it also contains a credential-free
+transport identity digest over the effective API-server origin, TLS server
+name, CA identity or explicit insecure mode, plus the target namespace name
+and observed namespace UID. The immutable base readback locator contains that
+target plus PVC name. A first exact observation appends PVC UID as
+claim-fenced, versioned effect evidence; it never mutates the base locator. A
+context name alone is not an identity because kubeconfig can retarget it. Every
+effect retains its original binding, and each migrated volume retains an
+explicit action-writer and current binding marker.
+
+The runtime registry must resolve every nonterminal binding to its exact
+compatible implementation. A deploy preflight rejects removal of a binding
+while a nonterminal effect references it; released images retain the current
+and prior compatible implementations for the reviewed retention window. If a
+binding is nevertheless unavailable, the worker performs no provider call and
+sets the effect phase to `QUARANTINED` and the action state to
+`QUARANTINED`, with a bounded Datadog alert. Recovery requires
+either rollback to an image that resolves the binding or a separately audited
+compatibility-adapter row that retains the original binding, pins the adapter
+implementation digest, and proves the old locator and payload map exactly. The
+effect binding is never rewritten. A plugin or implementation replacement
+never inherits an old effect merely because the provider name is unchanged.
+
+The first future mutation pilot is limited to new SkyPilot-owned Kubernetes PVC
+create with `use_existing` false, and delete only for PVCs created or explicitly
+adopted by that action writer, all on central PostgreSQL. It is not activated by
+M3-S1. Legacy PVC rows have no trustworthy ownership marker or stored UID;
+their delete path remains legacy until a separately reviewed observation and
+backfill proves exact ownership. Mixed-version activation uses the per-volume
+writer marker, so a legacy-created PVC cannot switch delete owners merely
+because the server was upgraded.
+
+That marker is not the mixed-version fence by itself. Ownership lives in
+`lifecycle_ownership_scopes`, keyed by `(domain, dependency-closed operation
+subset, store mode)`. The volume pilot key is exactly
+`(VOLUME, KUBERNETES_PVC_OWNED_LIFECYCLE_V1, CENTRAL_POSTGRESQL)`. Routing mode
+is closed to `DARK`, `LEGACY_OPEN`, `DRAINING`, or `ACTION_OPEN`. `DARK` is an
+inert expanded schema that current legacy handlers do not consult and from
+which no lifecycle producer or worker may claim authority. The scoped row also
+stores `minimum_lifecycle_version`, a monotonically increasing ownership
+epoch, a monotonically increasing authority generation, and nullable selected
+writer and reconciler implementation digests.
+
+Before a later compatibility release changes `DARK` to `LEGACY_OPEN`, every
+API, controller, executor, or worker process eligible to run a volume handler
+must advertise its supported lifecycle version, exact image digest, role, and
+binding and reconciler support through a database-clock heartbeat in a
+separately reviewed process-capability table. `LEGACY_OPEN` requires every
+legacy mutation admission to register an exact legacy intent and validate the
+scope epoch and writer-authority seal. Activation later enters `DRAINING`,
+rejects new apply and delete admission, waits for every earlier volume request
+and known provider call to finish, and terminates every older eligible process.
+Lease-lost or otherwise unresolved legacy requests are imported as explicit
+`legacy_volume_intents` keyed by every affected logical name, request payload
+digest, and request execution identity. Those names reject action admission
+until a separately pinned reconciler proves provider and legacy-row outcome;
+request cancellation alone is not resolution. Activation requires no old
+process heartbeat and every remaining eligible process plus the pinned
+reconciler to advertise `volume_action_v1`. One transaction then increments
+the ownership epoch and sets mixed routing: no-sidecar rows remain legacy,
+while an action-writer sidecar routes exclusively to the action handler. Every
+later admission, attempt claim, pre-call fence, domain write, and cleanup
+validates that epoch.
+
+Once any action-owned sidecar exists, rollback to a pre-action binary is
+prohibited because that binary ignores the sidecar and epoch. Supported
+rollback is only to an image that still contains the mixed router, original
+binding implementation or approved adapter, and pinned action reconciler. The
+deployment preflight refuses an older image while the ownership scope is past
+`DARK` or any action-owned sidecar remains. Returning to a pre-action binary
+requires a separately reviewed reverse migration that first proves no
+action-owned volume, nonterminal effect, quarantine, or cleanup obligation
+remains. A forced old binary outside that gate is explicitly unsupported and
+cannot be treated as a rollback path.
+
+Admission persists a deterministic `name_on_cloud`, exact target binding,
+canonical requested PVC projection, comparison-rules version, and readback
+locator before create. The provider body reserves these annotations:
+`skypilot.co/volume-incarnation`, `skypilot.co/volume-effect-id`, and
+`skypilot.co/requested-spec-sha256`. User metadata under the
+`skypilot.co/` prefix is rejected rather than overwritten. The canonical
+requested projection contains namespace name and UID, PVC name, the exact
+single requested access mode, storage request as canonical bytes, the
+three-way storage-class intent of omitted, empty, or explicit name, and
+volume-mode intent with missing and `Filesystem` defined as equivalent. The
+readback projection ignores server-owned UID, resource version, status, bound
+volume name, finalizers, and other admission fields; it canonicalizes quantity
+values; requires exact ownership annotations, access mode, requested storage,
+and every explicit user-controlled immutable field; and applies only the
+persisted storage-class and volume-mode defaulting equivalences. A preflight
+default-class set or 401/403-unverified result is persisted so a later
+readback uses the same reviewed equivalence rule rather than current mutable
+cluster policy.
+
+Create begins with an exact GET. A 404 permits one create submission. An
+existing nonterminating PVC is adopted only when the reserved ownership
+annotations and normalized projection match exactly; its UID is then persisted
+with a claim-fenced compare-and-set. Any foreign marker or immutable-spec
+mismatch is terminal `CONFLICT`. An exactly matching PVC with a
+`deletionTimestamp` remains in `READBACK`: the worker neither adopts it as
+complete nor submits create until exact absence is observed, after which the
+same effect identity may submit the deterministic create. A lost create
+response or 409 moves to GET readback and never directly replays POST.
+
+The effect retains `submission_count`, database-clock call start and deadline,
+and every readback observation. Before the first submission, an exact GET 404
+permits POST immediately. After an ambiguous submission, GET 404 is evidence
+but not immediate replay permission. The same effect and byte-identical body
+may submit again only after the prior call deadline plus a 30-second ambiguity
+horizon, three complete 404 GETs from fresh calls spanning that horizon with at
+least five seconds between observations, unchanged target and ownership epoch,
+a fresh claim and final fence, and `submission_count < 3`. Any incomplete read,
+matching object, foreign object, or target change resets or terminates that
+decision as specified above. If the third submission remains ambiguous and
+the same absence horizon completes, the effect enters `QUARANTINED` with
+certainty `SUBMISSION_UNKNOWN`; it never creates a fourth POST. Counts and
+horizon evidence survive attempts and process restarts.
+
+Create action completion means an exact, nonterminating, owned PVC object has
+been observed with the persisted comparison projection. It means Kubernetes
+API acceptance and object existence, preserving current synchronous semantics;
+it does not wait for `Bound`. `Pending` is retained as typed observation for
+the existing refresh and Datadog diagnostics and does not make the create call
+block.
+
+Delete carries target transport identity, namespace UID, PVC name, and the
+stored PVC UID. Its one submission uses a Kubernetes UID precondition. A lost
+response enters readback. GET 404 proves `EXACT_ABSENT`; GET of the same UID
+with a deletion timestamp remains in readback; GET of the same UID without a
+deletion timestamp may re-submit the same effect after a fresh claim and usage
+fence; and GET of a different UID proves `REPLACED`, completing the old cleanup
+as `SUCCEEDED_REPLACED` without ever deleting the replacement.
+
+HostPath cleanup, `use_existing`, RunPod network volumes, local SQLite,
+controller SQLite, clusters, Serve, pools, jobs, images, and generic provider
+descriptor dispatch are excluded from the pilot. HostPath deletion is a
+multi-effect cleanup, and RunPod create currently depends on a
+provider-assigned identifier; both need separate effect and readback contracts
+after the one-effect PVC pilot is qualified.
+
+M3-S1 freezes the current legacy transcript with passing tests before any fix
+is implemented:
+
+1. Non-`use_existing` volume apply records random `name_on_cloud` generation
+   before the file lock, then the current-row read, provider create, and
+   database insert order under the lock. `use_existing=true` instead preserves
+   the logical name without UUID or name normalization and runs the
+   post-provider duplicate check; the new-PVC path does not run that check.
+2. Provider create success followed by database insert failure records the
+   current orphan-resource window without deleting or compensating in the
+   test. The global insert's current `ON CONFLICT DO NOTHING` and absent
+   affected-row check are also frozen.
+3. Provider delete success followed by database deletion failure records the
+   current stale-row window without fabricating a failed provider call. Delete
+   reads the row and performs the provider `usedby` observation before taking
+   the file lock, does not re-read under that lock, and fires its best-effort
+   hook only after the independent database delete commits.
+4. Purge records the current behavior that removes the database row after a
+   provider deletion failure. This is characterization, not approval; the
+   future action writer must retain a cleanup obligation instead. Two
+   concurrent same-name deletes may both call the provider and hook, and a
+   multi-name delete can commit a prefix then fail on a later name such that a
+   retry of the original list stops at its now-missing first item; both gaps are
+   frozen.
+5. Global volume create, update, and delete helpers record their current
+   independently opened and committed sessions, proving that future atomic
+   action/domain writes require explicit borrowed-connection variants.
+6. The current request registry records that volume apply and delete are normal
+   workers with `ReplayPolicy.NEVER`. On the PostgreSQL durable request path,
+   lease loss cancels the request as an ambiguous mutating outcome, but request
+   execution generation and claim token do not fence a stale handler's
+   provider call or independent volume database write. The local SQLite path
+   has no durable claim lease and ignores those fence arguments. Neither
+   request row can serve as the action/effect ledger.
+7. Current Kubernetes tests record initial GET 404 then POST; unconditional
+   adoption of any same-name PVC without ownership or spec comparison; POST
+   409 and transport failure propagation with no second GET; and delete by
+   namespace and name through hidden retries, treating 404 as success without
+   UID precondition or absence wait. Existing explicit/default StorageClass
+   reads and their 401/403-tolerated path are retained. These passing tests
+   prove the future readback and UID cases are missing; M3-S1 adds no skips,
+   expected failures, or tests that imply the future behavior already exists.
+8. The exact diff proves M3-S1 changes only this design and the four named test
+   files. Pilot exclusions remain a design gate; runtime assertions arrive
+   with the first disabled selector and binding registry.
+
+The smallest characterization patch is limited to
+`tests/unit_tests/test_sky/volumes/test_core.py`,
+`tests/unit_tests/test_sky/volumes/test_global_user_state_volumes.py`,
+`tests/unit_tests/test_sky/volumes/test_k8s_volume.py`, and
+`tests/unit_tests/test_api_requests_pg.py`. RunPod remains exclusion evidence,
+not a pilot or a new test owner. The future exact-match, terminating-object,
+Pending, UID-delete, lost-response, replacement, and binding-unavailable cases
+remain acceptance requirements for the later implementation; they are not
+executed against unchanged production code in M3-S1.
+
+The M3-S1 exit gate is an adversarial `PURSUE` verdict over the exact section
+digest plus a passing characterization corpus with no production behavior
+change. The review must find the action, attempt, effect, transaction,
+provider-binding, request-correlation, activation, compatibility, and rollback
+boundaries complete enough to design the inert identity foundation without
+guessing. It does not approve the full action graph DDL.
+
+Only the next separately reviewed slice, M3-S2, may add a new PostgreSQL-only
+Alembic lineage sharing the ordinary central engine. That slice is limited to
+exactly two tables: `lifecycle_store_identity` and
+`lifecycle_ownership_scopes`. It seeds exactly one `global` store row with a
+random UUIDv4, schema version 1, null writer-authority digest, and database
+creation time, plus exactly one volume-pilot scope row with the key above,
+`DARK`, minimum version 0, ownership epoch 1, null writer and reconciler
+digests, authority generation 0, and database update time. Startup fails closed
+on a missing, non-singleton, malformed, or schema-version-mismatched store
+identity, and the runtime repository exposes no operation that can replace its
+UUID. Downgrade may remove only those exact inert seed rows after locking both
+tables and proving there are no other rows; otherwise it fails closed. The
+lineage's Alembic version table is migration metadata, not a third lifecycle
+data table.
+
+M3-S2 adds no sidecar, process-capability, binding, legacy-intent, action,
+request-correlation, attempt, effect, evidence, compatibility-adapter,
+identity-anchor, or identity-tombstone table or row. It changes no volume,
+request, provider, routing, reconciliation, or event code and ships no
+producer, queue, fetcher, heartbeater, worker, or deployment seal. Runtime
+roles verify the lineage only; the Helm migration job remains the sole DDL
+owner. Local and controller SQLite never initialize or emulate this lineage.
+
+M3-S3 cannot add the remaining tables until a dedicated exact-DDL review fixes
+their table and column types, closed values and legal row shapes, generic
+versus volume-specific identity model, immutable binding persistence,
+process-capability ownership, request-correlation cardinality, action-level
+versus effect-level evidence ownership, canonical payload byte storage,
+cross-live-and-tombstone business-key exclusion, tombstone-before-compaction
+enforcement, ordinal effect tombstones, retention indexes, and restricted
+borrowed-transaction facade. No raw provider callback may receive a connection
+on which it can commit, close, or begin a nested transaction.
+
 ## Cleanup Contract
 
 - Intent and cleanup obligation are durable before provider mutation.
@@ -4289,12 +4838,25 @@ rollback, and cleanup on the exact image digest.
   comparison, and diagnostic-reporting errors are contained, and keep the
   shadow result diagnostic-only until volume incarnation and
   desired-generation fencing exists;
-- update this file with the complete M3 transaction, schema, activation, and
-  rollback contract and pass a second adversarial review before implementation;
-- add the PostgreSQL action store and worker;
+- land M3-S1 as the exact legacy mutation transcript and four-file
+  characterization corpus, with no production behavior change;
+- in M3-S2, add only the reviewed dark PostgreSQL-only store-identity and
+  scoped-ownership lineage, with its two inert seed rows and no producer,
+  worker, process-capability row, domain table, or routing change;
+- in M3-S3, after its own exact-DDL adversarial review, add the sidecar,
+  process-capability, binding, legacy-intent, action, request-correlation,
+  attempt, effect, evidence, compatibility-adapter, identity-anchor, and
+  identity-tombstone graph with no domain rows and every producer and worker
+  disabled;
+- in separately reviewed later slices, add the disabled action kernel and
+  volume reducer, then the Release N compatibility reader, reconciler, and
+  legacy-intent producer, then shadow admission, then implement and qualify
+  create plus UID-scoped delete, readback, replacement, and cleanup while both
+  remain disabled, then enable that dependency-closed owned-PVC lifecycle as
+  one scope, and only then replace force purge with the durable detach and
+  cleanup acknowledgement;
 - add volume desired generation, incarnation, tombstone, observation, and
-  deletion proof;
-- remove force-purge success on ambiguous provider errors;
+  deletion proof through the sidecar before either mutation is promoted;
 - add the negotiated V2 action-event wire and emit the volume lifecycle
   transition atomically while preserving the request-only V1 endpoint.
 
@@ -4584,6 +5146,16 @@ available, and confirms the current writer and public volume behavior remain
 authoritative. Absence of a safe live volume is recorded as missing live parity
 evidence and never converted into promotion evidence.
 
+M3-S1 adds no production deployment surface. Its characterization gate freezes
+non-`use_existing` naming and apply order, conditional existing-resource
+deduplication, provider-success/database-failure orphaning, delete
+provider-success/database-failure staleness, purge forgetting, concurrent and
+partial multi-name delete behavior, independently committed volume sessions,
+normal-worker `NEVER` replay policy, PostgreSQL lease ambiguity, local SQLite
+no-lease behavior, and current Kubernetes GET, POST, adoption, conflict,
+transport-failure, hidden-delete-retry, 404, and no-UID behavior. The exact diff
+must contain only this design and the four named characterization files.
+
 ### Action runtime after M3-S0
 
 - admission atomically writes the existing domain reservation, exact fence
@@ -4747,15 +5319,23 @@ identity evidence.
 - Mutation ownership switches behind a server-side gate and can return to the
   old writer only before the new writer performs an irreversible action.
 - Ownership epochs are independent rows keyed by domain, dependency-closed
-  operation subset, and store mode. M3 can therefore cut over only central
-  PostgreSQL volume operations without changing cluster, Serve, jobs, image,
-  or SQLite ownership. A later milestone repeats the same protocol for its own
-  scope.
-- Release N expands the schema for the selected scope and ships a compatibility
-  reader and reconciler with that scope's gate disabled. Every API, controller,
-  executor, or worker role capable of executing that scope must run N or later
-  and pass mixed-version qualification before release N+1 may enable its
-  writer.
+  operation subset, and store mode, with routing closed to `DARK`,
+  `LEGACY_OPEN`, `DRAINING`, or `ACTION_OPEN`. M3 can therefore cut over only
+  `(VOLUME, KUBERNETES_PVC_OWNED_LIFECYCLE_V1, CENTRAL_POSTGRESQL)` without
+  changing cluster, Serve, jobs, image, or SQLite ownership. A later milestone
+  repeats the same protocol for its own scope.
+- M3-S2 is an earlier pure dark expansion, not Release N. It leaves the pilot
+  scope at `DARK`, has no process-capability or legacy-intent table, and makes
+  no current handler consult the scope or writer-authority seal.
+- Release N later ships a compatibility reader, reconciler, and legacy-intent
+  producer against the already-expanded M3-S3 schema while the selected scope
+  is still `DARK`. Every API, controller, executor, or worker role capable of
+  executing that scope must run N or later and pass mixed-version
+  qualification. One guarded transition must first acquire the external grant
+  for the next authority generation, then bind the writer-authority seal,
+  increment the authority generation and epoch, and move only that scope to
+  `LEGACY_OPEN`. Release N+1 cannot enable the action writer before that
+  transition and its qualification window complete.
 - Release N also makes every legacy mutation admission in the selected scope
   lock and check that scope's database ownership epoch and persist an active
   legacy intent before external I/O. The intent contains its resource
@@ -5273,3 +5853,110 @@ Local qualification currently includes 45 pure-projection and facade tests,
 the existing 55 volume-core tests, clean mypy across 817 source files, and a
 10.00/10 pylint result. Exact-head CI, merge, immutable-image deployment, and
 live-volume evidence remain open gates.
+
+### Review 18
+
+Verdict: `MERGE` and staged deployment completed for the M3-S0 volume refresh
+shadow projection.
+
+PR #1110 passed all 29 visible checks on exact head
+`2732284e329cd45bac313e5fa301c9bf6d86ac53` with no legacy status context,
+review, or comment left unresolved. It merged normally at
+`6070160a1379dc0e76fc2a614651cb3ae83b391b`; the first parent is
+`8c64e4c50c681db42741142a7c9792d40a14a2be` and the second parent is the exact
+tested head. Changed paths are byte-identical between the tested head and merge
+result. The remote topic branch was deleted only after merge and parent proof.
+
+The merge image tag `pr1110-6070160a13` resolves to immutable digest
+`sha256:a5afbd26e62ebe2f6990b2f311a59caaf3ef2901f2eab5d6dddd46527320f00a`.
+The Linux amd64 image reports exact commit
+`6070160a1379dc0e76fc2a614651cb3ae83b391b`, build 8080, and imports
+`sky.volumes.refresh_projection` from
+`/skypilot/sky/volumes/refresh_projection.py`.
+
+Helm revisions 49, 50, and 51 rolled API, executor, and controller separately
+with `--reuse-values`. Migration Jobs 49 through 51 each completed once with no
+failure, and all used the exact immutable digest. A PDB retained at least one
+ready replica during Karpenter churn. After the last churn reset, six clean
+samples at `02:19:29Z`, `02:20:21Z`, `02:21:10Z`, `02:22:00Z`, `02:22:51Z`,
+and `02:23:46Z` on 2026-08-01 showed two ready, updated, and available replicas
+for every role, all six pods on the exact digest with zero restarts. API health
+and readiness, executor readiness and liveness, and controller readiness and
+liveness passed in every sample. Logs after reset contained no volume-shadow
+anomaly, traceback, exception, fatal, panic, or error match, and no Warning
+event occurred after reset.
+
+Capacity mode remained disabled on every role and pod. Schema revision stayed
+at 001, all five capacity tables stayed empty, and PostgreSQL reported zero
+capacity-projector connections. An authenticated cached `sky volumes ls` from
+an API pod returned no existing volumes. The warning-free rollout is therefore
+negative safety evidence only; it does not prove a positive per-volume parity
+denominator, and the shadow remains diagnostic.
+
+The apparent ECR scan summary change was a pagination artifact. A complete
+paginated comparison found the same 209 suppressed findings on both digests,
+with zero added or removed Critical, High, or Medium findings and identical
+package versions. No vulnerability-based rollback was required.
+
+### Review 19
+
+Verdict: `PURSUE` for the M3-S1 volume mutation transcript and durable action
+envelope at exact heading-through-before-Cleanup SHA-256
+`873e0c45e8b028059a7f1d6dce09c3c6170acb1576341e45cfa86c35475b8aa1`.
+
+The first adversarial pass returned `RESHAPE` because the draft treated mutable
+record state as identity, overstated the new-PVC duplicate check, left action
+deduplication and atomic admission implicit, could strand old bindings, lacked
+exact Kubernetes ownership and defaulting rules, and confused replacement UID
+evidence with foreign deletion authority. The second pass required an exact
+sidecar choice, reproducible UUID encoding, claim and transition ownership,
+quarantine recovery, permanent identity evidence, mixed-version routing,
+lost-create-response replay bounds, and a separate purge detach acknowledgement.
+
+The accepted contract now fixes the sidecar and store identity, action,
+attempt, and effect keys, legal phase and certainty pairs, claim allocation,
+cleanup ownership, compatibility adapters, activation epoch, retention,
+Kubernetes transport and namespace identity, reserved ownership annotations,
+defaulting-aware comparison, terminating and Pending behavior, bounded
+same-effect create resubmission, UID-scoped delete, replacement completion, and
+legacy exclusion. The final correction records pre-quarantine phase so only a
+proved zero-submission effect returns to `PRE_INTENT`; ambiguous work resumes
+through `READBACK`. Independent source review returned `PASS` against exact
+base `3f4f73b3abeb3943abb0af601df05ff570010122`, and an independent adversarial
+review also returned `PURSUE`.
+
+### Review 20
+
+Verdict: `PURSUE` for the corrected M3-S1 contract at exact
+heading-through-before-Cleanup SHA-256
+`60fba2aa5323a7bbd224582991177ebeada66f1e1d6af743ba75f8ee6f1cca99`.
+This verdict supersedes Review 19 for implementation scope while preserving it
+as the history of the earlier review.
+
+A pre-merge M3-S2 DDL audit returned `RESHAPE`. It found that the earlier text
+mixed a pure dark expansion with Release N legacy interception, described
+activation as both global and scope-keyed, allowed compactable effect evidence
+to own the only live PVC UID, did not fence an ordinary database clone with
+authority outside the backup, and attempted to assign the full action graph to
+M3-S2 before its exact relational model was reviewed. A separate milestone
+review also rejected enabling create authority before its dependency-closed
+UID-scoped delete and cleanup path was qualified.
+
+The corrected contract retains live provider identity on the durable sidecar,
+uses an external writer-authority seal, renewable exclusive grant, and a
+scope-keyed ownership epoch and authority generation, plus a source workload,
+provider-call-authority, and ambiguity-horizon transfer fence. It defines
+`DARK`, separates M3-S2 from Release N, and narrows M3-S2 to exactly two
+PostgreSQL-only lifecycle data tables and two inert seed rows. The full graph,
+process capabilities, immutable bindings, payload bytes, correlations,
+evidence cardinality, identity anchors, per-effect tombstones, and restricted
+transaction facade move behind M3-S3's dedicated exact-DDL review. Create and
+UID-scoped delete, readback, replacement, and cleanup must be implemented and
+qualified while disabled, then enabled together as one dependency-closed
+owned-PVC lifecycle scope.
+
+Independent review against base
+`cb51285f90b54314ff76d1fbb59a779bbd059a0e` returned `PASS`. The dstack-boundary
+review and the PostgreSQL schema adversarial review independently returned
+`PURSUE` on the exact corrected digest. The characterization corpus remains
+unchanged and passing.

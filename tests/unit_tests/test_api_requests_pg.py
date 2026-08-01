@@ -40,6 +40,7 @@ from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
+from sky.volumes.server import core as volume_core
 
 testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
 pytest.importorskip('psycopg2')
@@ -1100,6 +1101,9 @@ def test_registry_owns_controller_classes_and_replay_policies():
     jobs_queue = registry.registration_for_handler(managed_jobs_core.queue)
     serve_status = registry.registration_for_handler(serve_core.status)
     normal_read = registry.registration_for_handler(core.enabled_clouds)
+    volume_apply = registry.registration_for_handler(volume_core.volume_apply)
+    volume_delete = registry.registration_for_handler(volume_core.volume_delete)
+    volume_list = registry.registration_for_handler(volume_core.volume_list)
     daemon = registry.registration_for_handler(
         daemons.INTERNAL_REQUEST_DAEMONS[0].run_event)
 
@@ -1111,8 +1115,43 @@ def test_registry_owns_controller_classes_and_replay_policies():
     assert serve_status.replay_policy is registry.ReplayPolicy.READ_ONLY
     assert normal_read.execution_class is registry.ExecutionClass.NORMAL
     assert normal_read.replay_policy is registry.ReplayPolicy.READ_ONLY
+    assert volume_apply.execution_class is registry.ExecutionClass.NORMAL
+    assert volume_apply.replay_policy is registry.ReplayPolicy.NEVER
+    assert volume_delete.execution_class is registry.ExecutionClass.NORMAL
+    assert volume_delete.replay_policy is registry.ReplayPolicy.NEVER
+    assert volume_list.execution_class is registry.ExecutionClass.NORMAL
+    assert volume_list.replay_policy is registry.ReplayPolicy.READ_ONLY
     assert daemon.execution_class is registry.ExecutionClass.CONTROLLER
     assert daemon.replay_policy is registry.ReplayPolicy.RECONCILE
+
+
+def test_local_sqlite_request_claim_arguments_are_ignored(
+        tmp_path, monkeypatch):
+    """The legacy SQLite worker has no durable claim or lease fence."""
+    database_path = tmp_path / 'requests.db'
+    log_path = tmp_path / 'logs'
+    log_path.mkdir()
+    monkeypatch.setattr('sky.server.constants.API_SERVER_REQUEST_DB_PATH',
+                        str(database_path))
+    monkeypatch.setattr('sky.server.constants.REQUEST_LOG_PATH_PREFIX',
+                        str(log_path))
+    requests._DB = None
+    backend = requests.SqliteRequestBackend()
+    request = _request('sqlite-volume-delete')
+    request.name = 'sky.volumes.delete'
+    request.entrypoint = volume_core.volume_delete
+    request.request_body = payloads.VolumeDeleteBody(names=['test-volume'])
+    try:
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+        assert backend.claim_heartbeat_interval_seconds is None
+        assert backend.try_mark_running(  # pylint: disable=too-many-function-args
+            request.request_id, 1234, 2**31, 'not-a-durable-sqlite-claim')
+        stored = backend.get_request(request.request_id)
+        assert stored is not None
+        assert stored.status is requests.RequestStatus.RUNNING
+        assert stored.pid == 1234
+    finally:
+        requests._DB = None
 
 
 def test_sqlite_cutover_is_atomic_verified_and_idempotent(
