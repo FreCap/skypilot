@@ -16,7 +16,12 @@ jest.mock('@/lib/cache', () => ({
 }));
 
 import dashboardCache from '@/lib/cache';
-import { Services, ServicesTable } from '@/components/services';
+import {
+  Services,
+  ServicesTable,
+  getPastAttemptCount,
+  getServiceOperationalState,
+} from '@/components/services';
 import { getServices } from '@/data/connectors/services';
 
 const SERVICES_RESPONSE = {
@@ -96,20 +101,110 @@ describe('Services fetch wiring', () => {
     jest.useRealTimers();
   });
 
-  it('fetches exactly once on mount despite rerenders from fetch-driven state updates', async () => {
+  it('fetches exactly one metadata and one summary phase on mount', async () => {
     render(<Services />);
 
     await flushFetches();
 
     // The fetch updates loading state and the last-fetched timestamp in
     // the parent; those rerenders must NOT retrigger the fetch effect.
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get.mock.calls).toEqual([
+      [getServices, [{ metadataOnly: true }]],
+      [getServices, [{ summaryOnly: true, includeEndpoints: true }]],
+    ]);
+  });
+
+  it('renders metadata immediately and replaces placeholders when the summary lands', async () => {
+    const summary = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          {
+            ...SERVICES_RESPONSE.services[0],
+            uptime: null,
+            endpoint: null,
+            policy: null,
+            requestedResources: null,
+            metadataOnly: true,
+            replicasReady: null,
+            replicasTotal: null,
+            replicasFailed: null,
+            replicaStatusCounts: null,
+          },
+        ],
+        controllerStopped: false,
+      })
+      .mockReturnValueOnce(summary.promise);
+
+    render(<Services />);
+    await flushFetches();
+
+    expect(screen.getByText('boltz-l4-fleet')).toBeInTheDocument();
+    expect(screen.getByText('Serving')).toBeInTheDocument();
+    expect(screen.getAllByText('Loading...')).toHaveLength(6);
+
+    await act(async () => {
+      summary.resolve({
+        services: [
+          {
+            ...SERVICES_RESPONSE.services[0],
+            metadataOnly: false,
+            summaryOnly: true,
+            targetReplicas: 1,
+            replicaStatusCounts: {
+              READY: 1,
+              FAILED_PROVISION: 199,
+              FAILED_INITIAL_DELAY: 64,
+              FAILED_PROBING: 20,
+              FAILED: 38,
+            },
+          },
+        ],
+        controllerStopped: false,
+      });
+      await summary.promise;
+    });
+
+    expect(screen.getByText('Healthy')).toBeInTheDocument();
+    expect(screen.getByText('321 past attempts')).toBeInTheDocument();
+    expect(screen.getByText('http://10.0.0.1:30001')).toBeInTheDocument();
+  });
+
+  it('settles metadata placeholders as unavailable when enrichment fails', async () => {
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          {
+            ...SERVICES_RESPONSE.services[0],
+            uptime: null,
+            endpoint: null,
+            policy: null,
+            requestedResources: null,
+            metadataOnly: true,
+            replicasReady: null,
+            replicasTotal: null,
+          },
+        ],
+        controllerStopped: false,
+      })
+      .mockRejectedValueOnce(new Error('summary unavailable'));
+
+    render(<Services />);
+    await flushFetches();
+
+    expect(screen.getByText('boltz-l4-fleet')).toBeInTheDocument();
+    expect(screen.getByText('Serving')).toBeInTheDocument();
+    expect(screen.getAllByText('Unavailable')).toHaveLength(5);
+    expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
+    consoleError.mockRestore();
   });
 
   it('fetches again only when the refresh interval elapses', async () => {
     render(<Services />);
     await flushFetches();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     // Just under the 30s interval: no new fetch (the 10s ticks of the
     // last-updated timestamp rerender the parent along the way).
@@ -117,14 +212,14 @@ describe('Services fetch wiring', () => {
       jest.advanceTimersByTime(29000);
     });
     await flushFetches();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     // Crossing the interval triggers exactly one more fetch.
     await act(async () => {
       jest.advanceTimersByTime(2000);
     });
     await flushFetches();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
   });
 
   it('refreshes once immediately when the page becomes visible again', async () => {
@@ -152,15 +247,17 @@ describe('Services fetch wiring', () => {
         await Promise.resolve();
       });
 
-      expect(dashboardCache.invalidate).toHaveBeenCalledWith(getServices, [
-        { summaryOnly: true },
+      expect(dashboardCache.invalidate.mock.calls).toEqual([
+        [getServices, [{ summaryOnly: true, includeEndpoints: true }]],
+        [getServices, [{ metadataOnly: true }]],
       ]);
-      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+      await flushFetches();
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
       await act(async () => {
         jest.advanceTimersByTime(1);
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
       unmount();
       mounted = false;
@@ -168,7 +265,7 @@ describe('Services fetch wiring', () => {
       await act(async () => {
         jest.advanceTimersByTime(30000);
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
     } finally {
       if (mounted) {
         unmount();
@@ -194,7 +291,8 @@ describe('Services fetch wiring', () => {
     const visibleRequest = deferred();
     dashboardCache.get
       .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(visibleRequest.promise);
+      .mockReturnValueOnce(visibleRequest.promise)
+      .mockResolvedValue(SERVICES_RESPONSE);
     setDocumentVisibility('hidden');
     const { unmount } = render(<Services />);
 
@@ -219,6 +317,8 @@ describe('Services fetch wiring', () => {
         await visibleRequest.promise;
       });
       expect(screen.getByText('visible-service')).toBeInTheDocument();
+      await flushFetches();
+      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
     } finally {
       unmount();
       if (visibilityDescriptor) {
@@ -243,7 +343,8 @@ describe('Services fetch wiring', () => {
     const refreshDataRef = { current: null };
     dashboardCache.get
       .mockReturnValueOnce(initialRequest.promise)
-      .mockReturnValueOnce(manualRequest.promise);
+      .mockReturnValueOnce(manualRequest.promise)
+      .mockResolvedValue(SERVICES_RESPONSE);
     setDocumentVisibility('hidden');
     const { unmount } = render(
       <StatefulServicesTable refreshDataRef={refreshDataRef} />
@@ -304,6 +405,8 @@ describe('Services fetch wiring', () => {
       pendingRequest.resolve(SERVICES_RESPONSE);
       await pendingRequest.promise;
     });
+    await flushFetches();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
   it('lets a manual refresh supersede an older request', async () => {
@@ -312,7 +415,8 @@ describe('Services fetch wiring', () => {
     const refreshDataRef = { current: null };
     dashboardCache.get
       .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(currentRequest.promise);
+      .mockReturnValueOnce(currentRequest.promise)
+      .mockResolvedValue(SERVICES_RESPONSE);
 
     render(<StatefulServicesTable refreshDataRef={refreshDataRef} />);
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
@@ -320,6 +424,7 @@ describe('Services fetch wiring', () => {
     await act(async () => {
       refreshDataRef.current();
     });
+    await flushFetches();
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
@@ -337,7 +442,8 @@ describe('Services fetch wiring', () => {
 
     expect(screen.getByText('current-service')).toBeInTheDocument();
     expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    await flushFetches();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
   });
 
   it('does not let an older failure erase a newer manual refresh', async () => {
@@ -347,7 +453,8 @@ describe('Services fetch wiring', () => {
     const consoleError = jest.spyOn(console, 'error').mockImplementation();
     dashboardCache.get
       .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(currentRequest.promise);
+      .mockReturnValueOnce(currentRequest.promise)
+      .mockResolvedValue(SERVICES_RESPONSE);
 
     render(<StatefulServicesTable refreshDataRef={refreshDataRef} />);
     await act(async () => {
@@ -364,7 +471,8 @@ describe('Services fetch wiring', () => {
 
     expect(screen.getByText('current-service')).toBeInTheDocument();
     expect(consoleError).not.toHaveBeenCalled();
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    await flushFetches();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
     consoleError.mockRestore();
   });
 
@@ -395,5 +503,80 @@ describe('Services fetch wiring', () => {
     expect(onFetched).not.toHaveBeenCalled();
     expect(setLoading).not.toHaveBeenCalled();
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('service operational semantics', () => {
+  it('treats retained terminal attempts as history, not a live failure', () => {
+    const service = {
+      status: 'READY',
+      replicasReady: 1,
+      targetReplicas: 1,
+      replicaStatusCounts: {
+        READY: 1,
+        FAILED_PROVISION: 199,
+        FAILED_INITIAL_DELAY: 64,
+        FAILED_PROBING: 20,
+        FAILED: 38,
+      },
+      replicas: [],
+    };
+
+    expect(getPastAttemptCount(service)).toBe(321);
+    expect(getServiceOperationalState(service)).toMatchObject({
+      label: 'Healthy',
+      tone: 'success',
+      detail:
+        '1/1 target replicas are ready. 321 past attempts were replaced automatically. No action is required.',
+    });
+  });
+
+  it('reserves needs-attention wording for actionable states', () => {
+    expect(
+      getServiceOperationalState({
+        status: 'FAILED_CLEANUP',
+        replicasReady: null,
+        targetReplicas: null,
+        replicaStatusCounts: null,
+        replicas: [],
+        metadataOnly: true,
+      }).label
+    ).toBe('Cleanup needs verification');
+    expect(
+      getServiceOperationalState({
+        status: 'READY',
+        replicasReady: 1,
+        targetReplicas: 2,
+        replicaStatusCounts: { READY: 1, PROVISIONING: 1 },
+        replicas: [],
+      }).label
+    ).toBe('Scaling automatically');
+    expect(
+      getServiceOperationalState({
+        status: 'CONTROLLER_FAILED',
+        replicasReady: 0,
+        targetReplicas: 1,
+        replicaStatusCounts: {},
+        replicas: [],
+      }).label
+    ).toBe('Needs attention');
+    expect(
+      getServiceOperationalState({
+        status: 'READY',
+        replicasReady: 1,
+        targetReplicas: 1,
+        replicaStatusCounts: { READY: 1, FAILED_CLEANUP: 1 },
+        replicas: [],
+      }).label
+    ).toBe('Cleanup needs verification');
+    expect(
+      getServiceOperationalState({
+        status: 'READY',
+        replicasReady: 1,
+        targetReplicas: 1,
+        replicaStatusCounts: { READY: 1, UNKNOWN: 1 },
+        replicas: [],
+      }).label
+    ).toBe('Replica state needs verification');
   });
 });

@@ -354,6 +354,56 @@ describe('getServices', () => {
     expect(services[0].replicasFailed).toBe(1);
   });
 
+  it('keeps metadata-only replica fields pending instead of inventing zeroes', async () => {
+    const record = rawServiceRecord({
+      metadata_only: true,
+      endpoint: null,
+      replica_info: undefined,
+      replica_status_counts: undefined,
+      target_num_replicas: undefined,
+    });
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse([record]));
+
+    const { services } = await getServices({ metadataOnly: true });
+
+    expect(apiClient.post).toHaveBeenCalledWith('/serve/status', {
+      service_names: null,
+      summary_only: false,
+      metadata_only: true,
+    });
+    expect(services[0]).toMatchObject({
+      name: 'boltz-l4-fleet',
+      status: 'READY',
+      metadataOnly: true,
+      summaryOnly: false,
+      replicasReady: null,
+      replicasTotal: null,
+      replicasFailed: null,
+      replicaStatusCounts: null,
+    });
+  });
+
+  it('opts summary requests into deferred endpoint hydration', async () => {
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(
+      mockResultResponse([
+        rawServiceRecord({
+          replica_info: undefined,
+          replica_status_counts: { READY: 1 },
+        }),
+      ])
+    );
+
+    await getServices({ summaryOnly: true, includeEndpoints: true });
+
+    expect(apiClient.post).toHaveBeenCalledWith('/serve/status', {
+      service_names: null,
+      summary_only: true,
+      include_endpoints: true,
+    });
+  });
+
   it('requests and normalizes aggregate replica history', async () => {
     const record = rawServiceRecord({
       replica_status_history: {

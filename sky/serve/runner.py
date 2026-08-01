@@ -51,6 +51,7 @@ class ServiceStatusRunner(Protocol):
         pool: bool,
         summary_only: bool = False,
         include_target_num_replicas: bool | None = None,
+        metadata_only: bool = False,
     ) -> list[dict[str, Any]]:
         ...
 

@@ -415,6 +415,8 @@ export function normalizeService(record) {
     !replicaInfo.length && record.replica_status_counts
       ? record.replica_status_counts
       : null;
+  const metadataOnly = Boolean(record.metadata_only);
+  const replicaStatusCounts = counts ? { ...counts } : null;
   let physicalReplicasReady;
   let physicalReplicasFailed;
   let physicalReplicasTotalRaw;
@@ -436,6 +438,7 @@ export function normalizeService(record) {
   }
   const physicalReplicasTotal =
     physicalReplicasTotalRaw - physicalReplicasFailed;
+  const replicaCountsPending = metadataOnly && !counts && !replicas.length;
 
   const usesLogicalReplicas = ['logical', 'logical_slot'].includes(
     record.replica_unit
@@ -591,22 +594,33 @@ export function normalizeService(record) {
     // serve_state.set_service_uptime); the UI renders `now - uptime`.
     uptime: record.uptime ?? null,
     endpoint: record.endpoint || null,
-    replicasReady,
-    replicasTotal,
-    replicasFailed,
+    replicasReady: replicaCountsPending ? null : replicasReady,
+    replicasTotal: replicaCountsPending ? null : replicasTotal,
+    replicasFailed: replicaCountsPending ? null : replicasFailed,
     replicaUnit: usesLogicalReplicas ? 'logical' : 'physical',
-    physicalReplicasReady: hasAuthoritativePhysicalCounts
-      ? record.physical_ready_replicas
-      : physicalReplicasReady,
-    physicalReplicasTotal: hasAuthoritativePhysicalCounts
-      ? record.physical_total_replicas
-      : physicalReplicasTotal,
-    physicalReplicasFailed: hasAuthoritativePhysicalCounts
-      ? record.physical_failed_replicas
-      : physicalReplicasFailed,
+    physicalReplicasReady: replicaCountsPending
+      ? null
+      : hasAuthoritativePhysicalCounts
+        ? record.physical_ready_replicas
+        : physicalReplicasReady,
+    physicalReplicasTotal: replicaCountsPending
+      ? null
+      : hasAuthoritativePhysicalCounts
+        ? record.physical_total_replicas
+        : physicalReplicasTotal,
+    physicalReplicasFailed: replicaCountsPending
+      ? null
+      : hasAuthoritativePhysicalCounts
+        ? record.physical_failed_replicas
+        : physicalReplicasFailed,
     // True when this record came from a summary_only response: the
     // per-replica list is intentionally absent, not empty.
     summaryOnly: Boolean(counts),
+    // The metadata projection intentionally omits all replica-derived fields.
+    // Keep that distinct from a real zero-replica summary so the UI can show
+    // placeholders until the aggregate response arrives.
+    metadataOnly,
+    replicaStatusCounts,
     targetReplicas: record.target_num_replicas ?? null,
     acceleratorCapacity,
     fillTarget: record.fill_target ?? null,
@@ -651,19 +665,27 @@ export async function getServices(options = {}) {
   const {
     serviceNames = null,
     summaryOnly = false,
+    metadataOnly = false,
     includeTargetReplicas,
     historyHours,
+    includeEndpoints,
   } = options;
   try {
     const requestBody = {
       service_names: serviceNames,
       summary_only: summaryOnly,
     };
+    if (metadataOnly) {
+      requestBody.metadata_only = true;
+    }
     if (includeTargetReplicas !== undefined) {
       requestBody.include_target_num_replicas = includeTargetReplicas;
     }
     if (historyHours !== undefined) {
       requestBody.history_hours = historyHours;
+    }
+    if (includeEndpoints !== undefined) {
+      requestBody.include_endpoints = includeEndpoints;
     }
     const response = await apiClient.post(`/serve/status`, requestBody);
     if (!response.ok) {

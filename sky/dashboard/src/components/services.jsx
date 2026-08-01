@@ -31,11 +31,217 @@ import {
   LastUpdatedTimestamp,
   formatDuration,
 } from '@/components/utils';
-import { StatusBadge } from '@/components/elements/StatusBadge';
 import dashboardCache from '@/lib/cache';
 
 const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
-const SERVICE_SUMMARY_ARGS = [{ summaryOnly: true }];
+const SERVICE_METADATA_ARGS = [{ metadataOnly: true }];
+const SERVICE_SUMMARY_ARGS = [{ summaryOnly: true, includeEndpoints: true }];
+
+const PAST_ATTEMPT_STATUSES = new Set([
+  'FAILED',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+]);
+
+const ACTIVE_RECOVERY_STATUSES = new Set([
+  'PENDING',
+  'PROVISIONING',
+  'STARTING',
+  'NOT_READY',
+  'PREEMPTED',
+  'SHUTTING_DOWN',
+]);
+
+const CLEANUP_UNCERTAIN_STATUSES = new Set(['FAILED_CLEANUP']);
+const UNKNOWN_REPLICA_STATUSES = new Set(['UNKNOWN']);
+
+function countStatuses(service, statuses) {
+  if (service.replicaStatusCounts) {
+    return Object.entries(service.replicaStatusCounts)
+      .filter(([status]) => statuses.has(status))
+      .reduce((total, [, count]) => total + Number(count || 0), 0);
+  }
+  return (service.replicas || []).filter((replica) =>
+    statuses.has(replica.status)
+  ).length;
+}
+
+export function getPastAttemptCount(service) {
+  return countStatuses(service, PAST_ATTEMPT_STATUSES);
+}
+
+export function getServiceOperationalState(service) {
+  const cleanupCount = countStatuses(service, CLEANUP_UNCERTAIN_STATUSES);
+  const unknownCount = countStatuses(service, UNKNOWN_REPLICA_STATUSES);
+  const rawStatus = service.status || 'UNKNOWN';
+  if (rawStatus === 'FAILED_CLEANUP' || cleanupCount > 0) {
+    const cleanupSubject =
+      cleanupCount > 0
+        ? `${cleanupCount} replica cleanup ${
+            cleanupCount === 1 ? 'record needs' : 'records need'
+          }`
+        : 'Service cleanup needs';
+    return {
+      label: 'Cleanup needs verification',
+      tone: 'warning',
+      detail: `${cleanupSubject} verification. Cloud resources may require manual cleanup.`,
+    };
+  }
+  if (unknownCount > 0) {
+    return {
+      label: 'Replica state needs verification',
+      tone: 'warning',
+      detail: `${unknownCount} replica ${
+        unknownCount === 1 ? 'has' : 'have'
+      } an unknown current state. Inspect replica and provider state.`,
+    };
+  }
+  if (['CONTROLLER_FAILED', 'FAILED'].includes(rawStatus)) {
+    return {
+      label: 'Needs attention',
+      tone: 'danger',
+      detail:
+        'The service controller is in a terminal failure state. Inspect the service logs and placement details.',
+    };
+  }
+  if (service.metadataOnly || service.replicasReady == null) {
+    const enrichmentUnavailable = service.enrichmentUnavailable === true;
+    if (rawStatus === 'READY') {
+      return {
+        label: 'Serving',
+        tone: 'success',
+        detail: enrichmentUnavailable
+          ? 'The service is serving. Replica health is temporarily unavailable. Refresh to retry.'
+          : 'The service is serving. Target and replica health are still loading.',
+      };
+    }
+    return {
+      label: rawStatus === 'CONTROLLER_INIT' ? 'Starting' : rawStatus,
+      tone: 'neutral',
+      detail: enrichmentUnavailable
+        ? 'Replica health is temporarily unavailable. Refresh to retry.'
+        : 'Replica health is still loading.',
+    };
+  }
+  if (
+    service.targetReplicas != null &&
+    service.replicasReady >= service.targetReplicas
+  ) {
+    const pastAttemptCount = getPastAttemptCount(service);
+    return {
+      label: 'Healthy',
+      tone: 'success',
+      detail: `${service.replicasReady}/${service.targetReplicas} target replicas are ready.${
+        pastAttemptCount > 0
+          ? ` ${pastAttemptCount} past ${
+              pastAttemptCount === 1 ? 'attempt was' : 'attempts were'
+            } replaced automatically.`
+          : ''
+      } No action is required.`,
+    };
+  }
+  const activeRecoveryCount = countStatuses(service, ACTIVE_RECOVERY_STATUSES);
+  if (activeRecoveryCount > 0) {
+    return {
+      label: 'Scaling automatically',
+      tone: 'info',
+      detail: `${activeRecoveryCount} replica ${
+        activeRecoveryCount === 1 ? 'is' : 'are'
+      } pending, starting, or being replaced. No action is normally required.`,
+    };
+  }
+  if (rawStatus === 'READY') {
+    return {
+      label:
+        service.targetReplicas == null ? 'Serving' : 'Recovery not yet visible',
+      tone: service.targetReplicas == null ? 'success' : 'warning',
+      detail:
+        service.targetReplicas == null
+          ? 'The service is serving. No autoscaler target was included in this snapshot.'
+          : 'Ready capacity is below target, but this single snapshot does not prove recovery is stalled. Refresh or inspect placement if it persists.',
+    };
+  }
+  return {
+    label: rawStatus,
+    tone: 'neutral',
+    detail: 'The service is operating in this lifecycle state.',
+  };
+}
+
+export function ServiceHealthBadge({ service }) {
+  const health = getServiceOperationalState(service);
+  const toneClasses = {
+    success: 'bg-green-100 text-green-800',
+    info: 'bg-blue-100 text-blue-800',
+    warning: 'bg-amber-100 text-amber-900',
+    danger: 'bg-red-100 text-red-800',
+    neutral: 'bg-gray-100 text-gray-800',
+  };
+  return (
+    <Tooltip content={`${health.detail} SkyServe state: ${service.status}.`}>
+      <span
+        className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${toneClasses[health.tone]}`}
+      >
+        {health.label}
+      </span>
+    </Tooltip>
+  );
+}
+
+ServiceHealthBadge.propTypes = {
+  service: PropTypes.object.isRequired,
+};
+
+function mergeMetadataWithPrevious(metadataRows, previousRows) {
+  const previousByName = new Map(
+    (previousRows || []).map((service) => [service.name, service])
+  );
+  return (metadataRows || []).map((metadata) => {
+    const previous = previousByName.get(metadata.name);
+    if (!previous || previous.metadataOnly) return metadata;
+    return {
+      ...metadata,
+      ...previous,
+      name: metadata.name,
+      status: metadata.status,
+      uptime: metadata.uptime,
+      policy: metadata.policy,
+      loadBalancingPolicy: metadata.loadBalancingPolicy,
+      requestedResources: metadata.requestedResources,
+      activeVersions: metadata.activeVersions,
+      version: metadata.version,
+      electedVersion: metadata.electedVersion,
+      tlsEncrypted: metadata.tlsEncrypted,
+      metadataOnly: false,
+    };
+  });
+}
+
+function mergeServiceRows(baseRows, enrichedRows) {
+  const merged = new Map((baseRows || []).map((row) => [row.name, row]));
+  (enrichedRows || []).forEach((row) => {
+    merged.set(row.name, {
+      ...(merged.get(row.name) || {}),
+      ...row,
+      enrichmentUnavailable: false,
+    });
+  });
+  return Array.from(merged.values());
+}
+
+function LoadingValue({ label, unavailable = false }) {
+  return (
+    <span className="text-gray-400" aria-label={label}>
+      {unavailable ? 'Unavailable' : 'Loading...'}
+    </span>
+  );
+}
+
+LoadingValue.propTypes = {
+  label: PropTypes.string.isRequired,
+  unavailable: PropTypes.bool,
+};
 
 export function formatUptime(uptime) {
   // `uptime` is the epoch timestamp of when the service first became
@@ -182,10 +388,30 @@ export function ServicesTable({
         requestVersionRef.current === requestVersion;
 
       setLoading(true);
+      let metadataLoaded = false;
       try {
-        // The list view only needs per-service aggregates: use the cheap
-        // summary query (the full one serializes every replica and takes
-        // tens of seconds at fleet scale).
+        const metadataResponse = await dashboardCache.get(
+          getServices,
+          SERVICE_METADATA_ARGS
+        );
+        if (!isCurrentRequest()) {
+          return;
+        }
+        metadataLoaded = true;
+        setData((previous) =>
+          mergeMetadataWithPrevious(metadataResponse.services || [], previous)
+        );
+        setControllerStopped(metadataResponse.controllerStopped || false);
+        setIsInitialLoad(false);
+      } catch (error) {
+        if (!isCurrentRequest()) return;
+        console.error('Failed to fetch service metadata:', error);
+      }
+
+      try {
+        // Replica aggregates and provider endpoints are allowed to land after
+        // the persisted service rows. This keeps names and lifecycle state
+        // usable while the more expensive reads are still running.
         const servicesResponse = await dashboardCache.get(
           getServices,
           SERVICE_SUMMARY_ARGS
@@ -193,7 +419,12 @@ export function ServicesTable({
         if (!isCurrentRequest()) {
           return;
         }
-        setData(servicesResponse.services || []);
+        setData((previous) =>
+          mergeServiceRows(
+            metadataLoaded ? previous : [],
+            servicesResponse.services || []
+          )
+        );
         setControllerStopped(servicesResponse.controllerStopped || false);
         if (onFetched) {
           onFetched(new Date());
@@ -202,8 +433,14 @@ export function ServicesTable({
         if (!isCurrentRequest()) {
           return;
         }
-        console.error('Failed to fetch services:', error);
-        setData([]);
+        console.error('Failed to fetch service summaries:', error);
+        setData((previous) =>
+          previous.map((service) =>
+            service.metadataOnly
+              ? { ...service, enrichmentUnavailable: true }
+              : service
+          )
+        );
       } finally {
         if (isCurrentRequest()) {
           setLoading(false);
@@ -267,6 +504,7 @@ export function ServicesTable({
           return;
         }
         dashboardCache.invalidate(getServices, SERVICE_SUMMARY_ARGS);
+        dashboardCache.invalidate(getServices, SERVICE_METADATA_ARGS);
         void fetchData({ kind: 'visibility' });
         return;
       }
@@ -381,23 +619,67 @@ export function ServicesTable({
                       </Link>
                     </TableCell>
                     <TableCell>
-                      <StatusBadge status={service.status} />
+                      <ServiceHealthBadge service={service} />
                     </TableCell>
                     <TableCell>
-                      {service.replicasReady}/{service.replicasTotal}
-                      {service.replicasFailed > 0 && (
-                        <span className="text-red-700">
-                          {' '}
-                          (+{service.replicasFailed} failed)
-                        </span>
+                      {service.replicasReady == null ? (
+                        <LoadingValue
+                          label="Replica summary"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        <>
+                          {service.replicasReady}/{service.replicasTotal}
+                          {getPastAttemptCount(service) > 0 && (
+                            <Tooltip content="Past attempts are retained autoscaling and provisioning history. SkyServe replaced them automatically, so no action is required while the serving target remains met.">
+                              <span className="ml-1 text-gray-500">
+                                {getPastAttemptCount(service)} past attempts
+                              </span>
+                            </Tooltip>
+                          )}
+                        </>
                       )}
                     </TableCell>
                     <TableCell>
-                      <EndpointCell endpoint={service.endpoint} />
+                      {service.metadataOnly ? (
+                        <LoadingValue
+                          label="Endpoint"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        <EndpointCell endpoint={service.endpoint} />
+                      )}
                     </TableCell>
-                    <TableCell>{formatUptime(service.uptime)}</TableCell>
-                    <TableCell>{service.policy || '-'}</TableCell>
-                    <TableCell>{service.requestedResources || '-'}</TableCell>
+                    <TableCell>
+                      {service.metadataOnly && service.uptime == null ? (
+                        <LoadingValue
+                          label="Uptime"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        formatUptime(service.uptime)
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {service.metadataOnly && !service.policy ? (
+                        <LoadingValue
+                          label="Policy"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        service.policy || '-'
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {service.metadataOnly && !service.requestedResources ? (
+                        <LoadingValue
+                          label="Resources"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        service.requestedResources || '-'
+                      )}
+                    </TableCell>
                   </TableRow>
                 ))
               ) : (

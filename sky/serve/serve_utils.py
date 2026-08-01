@@ -1958,18 +1958,22 @@ def resolve_target_qps_for_gpu_shape(
 
 
 def get_service_status_pickled(
-        service_names: list[str] | None,
-        pool: bool,
-        summary_only: bool = False,
-        include_target_num_replicas: bool | None = None
+    service_names: list[str] | None,
+    pool: bool,
+    summary_only: bool = False,
+    include_target_num_replicas: bool | None = None,
+    metadata_only: bool = False,
 ) -> list[dict[str, str]]:
+    if summary_only and metadata_only:
+        raise ValueError(
+            'summary_only and metadata_only are mutually exclusive.')
     if service_names is None:
         # Get all names for the requested mode only.
         service_names = serve_state.get_glob_service_names(None, pool=pool)
     if not service_names:
         return []
     if include_target_num_replicas is None:
-        include_target_num_replicas = not summary_only
+        include_target_num_replicas = not summary_only and not metadata_only
     # Fan out across services. Each `_get_service_status` is dominated by
     # I/O (controller HTTP + DB reads) so threads parallelize well; the
     # cap on max_workers keeps memory and DB-connection pressure bounded.
@@ -1984,17 +1988,21 @@ def get_service_status_pickled(
     def _run_in_context(name: str) -> dict[str, Any] | None:
         kwargs = {
             'pool': pool,
-            'with_replica_info': not summary_only,
+            'with_replica_info': not summary_only and not metadata_only,
             'with_replica_counts': summary_only,
             'with_target_num_replicas': include_target_num_replicas,
+            'status_snapshot_only': metadata_only,
         }
         # Service summaries are metadata-only dashboard snapshots. Avoid
         # parsing, redacting, and dumping one YAML document per service on
         # every poll. Pool summaries deliberately keep YAML because pool
         # lifecycle consumers parse it back into a launchable task.
-        if summary_only and not pool:
+        if (summary_only and not pool) or metadata_only:
             kwargs['with_yaml'] = False
-        return parent_ctx.copy().run(_get_service_status, name, **kwargs)
+        status = parent_ctx.copy().run(_get_service_status, name, **kwargs)
+        if status is not None and metadata_only:
+            status['metadata_only'] = True
+        return status
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -2018,11 +2026,11 @@ def get_service_status_pickled(
 
 
 # TODO (kyuds): remove when serve codegen is removed
-def get_service_status_encoded(
-        service_names: list[str] | None,
-        pool: bool,
-        summary_only: bool = False,
-        include_target_num_replicas: bool | None = None) -> str:
+def get_service_status_encoded(service_names: list[str] | None,
+                               pool: bool,
+                               summary_only: bool = False,
+                               include_target_num_replicas: bool | None = None,
+                               metadata_only: bool = False) -> str:
     # We have to use payload_type here to avoid the issue of
     # message_utils.decode_payload() not being able to correctly decode the
     # message with <sky-payload> tags.
@@ -2030,6 +2038,7 @@ def get_service_status_encoded(
         service_names,
         pool,
         summary_only=summary_only,
+        metadata_only=metadata_only,
         include_target_num_replicas=include_target_num_replicas)
     return message_utils.encode_payload(service_statuses,
                                         payload_type='service_status')
@@ -3654,16 +3663,43 @@ class ServeCodeGen:
     ]
 
     @classmethod
-    def get_service_status(
-            cls,
-            service_names: list[str] | None,
-            pool: bool,
-            summary_only: bool = False,
-            include_target_num_replicas: bool | None = None) -> str:
+    def get_service_status(cls,
+                           service_names: list[str] | None,
+                           pool: bool,
+                           summary_only: bool = False,
+                           include_target_num_replicas: bool | None = None,
+                           metadata_only: bool = False) -> str:
+        if metadata_only:
+            # Serve v9 controllers already expose the slim lifecycle snapshot
+            # used by control paths, but do not understand the metadata_only
+            # RPC field. Build the projection from that primitive so existing
+            # services benefit immediately after an API-server rollout instead
+            # of silently materializing the full historical replica inventory.
+            metadata_code = [
+                f'names = {service_names!r}',
+                ('names = serve_state.get_glob_service_names('
+                 f'None, pool={pool}) if names is None else names'),
+                ('statuses = [serve_utils._get_service_status('
+                 f'name, pool={pool}, with_replica_info=False, '
+                 'with_yaml=False, with_target_num_replicas=False, '
+                 'status_snapshot_only=True) for name in names]'),
+                ('statuses = [status for status in statuses '
+                 'if status is not None]'),
+                ('_ = [status.update({"metadata_only": True}) '
+                 'for status in statuses]'),
+                'statuses = sorted(statuses, key=lambda status: status["name"])',
+                ('pickled = [{key: serve_utils.base64.b64encode('
+                 'serve_utils.pickle.dumps(value)).decode("utf-8") '
+                 'for key, value in status.items()} for status in statuses]'),
+                ('msg = serve_utils.message_utils.encode_payload('
+                 'pickled, payload_type="service_status")'),
+                'print(msg, end="", flush=True)',
+            ]
+            return cls._build(metadata_code)
         # summary_only is only forwarded to controllers whose lib version
         # understands it (v6+); older controllers just return the full
         # payload — a graceful degradation, never an error.
-        code = [
+        code: list[str | None] = [
             f'kwargs={{}} if serve_version < 3 else {{"pool": {pool}}}',
             ('kwargs.update({"summary_only": '
              f'{summary_only}}}) if serve_version >= 6 else None'),
