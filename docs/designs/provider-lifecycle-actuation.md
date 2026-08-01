@@ -5631,7 +5631,7 @@ controls the producer boundary; it never licenses reuse across attempts.
 | SCP | F0 | instance, image, and region plus accelerator and image catalogs; scalar result with typed failover error |
 | Seeweb | F0 after normalization | instance, accelerator, Docker image, region, and mutable `ClusterName`; nested GPU data and cluster-name reference require canonical detachment |
 | Shadeform | F0 | resource and region plus conditional feasibility lookup; scalar result |
-| Slurm | F2 | local Slurm and SkyPilot config plus live SSH partition, node, and GRES reads; TTL cache writes and nested `sbatch_options` aliases |
+| Slurm | F3 plus F2 | local Slurm and SkyPilot config plus live SSH partition, node, and GRES reads; TTL cache writes and nested `sbatch_options` aliases; returned `slurm_private_key` is an SSH `IdentityFile` credential path and must be split before snapshot promotion |
 | Vast | F3 after F1 | config and opaque `create_instance_kwargs`; returned nested values can contain registry, command, environment, or other secrets |
 | Verda | F1 | explicit inputs plus `SKYPILOT_VERDA_IMAGE_ID`; scalar result after validation |
 | vSphere | F0 | instance, region, and zones plus accelerator catalog; scalar result |
@@ -5644,7 +5644,9 @@ bounded attempt snapshot after characterization. F1 providers first need one
 coherent ambient resolution. F2 providers need one explicitly placed live-read
 stage and must name cache effects. F3 providers must split public render values
 from secret or request-scoped execution context before any snapshot promotion.
-IBM, Yotta, and Vast are prohibited from whole-result snapshotting.
+Slurm's `slurm_private_key` is credential-path execution context, not a public
+render value; recursive detachment cannot make it snapshot-safe. IBM, Slurm,
+Yotta, and Vast are prohibited from whole-result snapshotting.
 
 The first callback result becomes authoritative only after promotion. A
 stateful second result, later catalog mutation, callback replacement after the
@@ -6927,3 +6929,25 @@ only bounded reason and count tags. Re-review returned `PURSUE` with no
 remaining blocker. This verdict approves design and characterization work. It
 does not authorize single-callback promotion before the descriptor and live
 provider gates close.
+
+### Review 24
+
+Verdict: `PURSUE` for the corrected M4 deploy-variable snapshot foundation
+and DigitalOcean pilot subsection at SHA-256
+`7188af83f30eac72dffb5ac9d85d461a2511d8b6e7b3529401787b19b03f012f`.
+The executable removal manifest remains at SHA-256
+`a8ff84b514d73bc81d2c063821ad189e6c4f130bbb975f17040320408f1dedd1`.
+
+Exact-diff review first returned `RESHAPE` because Slurm's producer exposes an
+SSH identity-file path, the DigitalOcean writer test proved only repeatability,
+the producer tests used a nonexistent instance type and impossible
+multi-accelerator projection, and the lifecycle tests simulated rather than
+observed the real writer boundary. The corrected design classifies Slurm as
+`F3 plus F2` and prohibits whole-result snapshotting until credential context
+is split. The characterization corpus now uses real `Resources`, catalog-valid
+DigitalOcean CPU and GPU types, the real built-in writer path, fixed normalized
+render and config-hash oracles, and an observed
+`Resources.make_deploy_variables()` boundary. A second challenge found that
+the full writer oracle still used a synthetic instance type; after replacing
+it with catalog-backed `g-2vcpu-8gb` in valid `nyc1`, re-review returned
+`PURSUE` with no remaining blocker.
