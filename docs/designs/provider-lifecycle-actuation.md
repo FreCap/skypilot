@@ -4579,6 +4579,242 @@ producer, queue, fetcher, heartbeater, worker, or deployment seal. Runtime
 roles verify the lineage only; the Helm migration job remains the sole DDL
 owner. Local and controller SQLite never initialize or emulate this lineage.
 
+#### M3-S2 exact inert PostgreSQL foundation
+
+This subsection is the canonical M3-S2 relational, runtime, rollback, and test
+contract. M3-S2 uses Alembic section `lifecycle_actions_db`, numeric revision
+`001`, version table `alembic_version_lifecycle_actions_db`, migration directory
+`sky/schemas/db/lifecycle_actions`, and runtime package
+`sky/lifecycle_actions`. It is a separate PostgreSQL-only lineage on the
+ordinary central engine. It does not use an engine namespace or create another
+connection pool. The only lifecycle data tables are the following two tables;
+the Alembic version table is metadata.
+
+Revision `001` owns literal migration DDL equivalent to this exact shape. The
+runtime SQLAlchemy metadata independently declares the same columns,
+PostgreSQL types, order, defaults, nullability, primary keys, and named checks.
+The migration must not import runtime metadata.
+
+```sql
+CREATE TABLE lifecycle_store_identity (
+    store_key TEXT NOT NULL,
+    store_uuid UUID NOT NULL,
+    schema_version INTEGER NOT NULL,
+    writer_authority_digest TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+
+    CONSTRAINT pk_lifecycle_store_identity
+        PRIMARY KEY (store_key),
+    CONSTRAINT ck_lifecycle_store_identity_singleton
+        CHECK (store_key = 'global'),
+    CONSTRAINT ck_lifecycle_store_identity_uuid_v4
+        CHECK (
+            store_uuid::text ~
+            '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        ),
+    CONSTRAINT ck_lifecycle_store_identity_schema_version
+        CHECK (schema_version = 1),
+    CONSTRAINT ck_lifecycle_store_identity_writer_authority_format
+        CHECK (
+            writer_authority_digest IS NULL OR
+            writer_authority_digest ~ '^[0-9a-f]{64}$'
+        ),
+    CONSTRAINT ck_lifecycle_store_identity_m3s2_unsealed
+        CHECK (writer_authority_digest IS NULL),
+    CONSTRAINT ck_lifecycle_store_identity_created_at_finite
+        CHECK (isfinite(created_at))
+);
+
+CREATE TABLE lifecycle_ownership_scopes (
+    domain TEXT NOT NULL,
+    operation_subset TEXT NOT NULL,
+    store_mode TEXT NOT NULL,
+    routing_mode TEXT NOT NULL,
+    minimum_lifecycle_version INTEGER NOT NULL,
+    ownership_epoch BIGINT NOT NULL,
+    authority_generation BIGINT NOT NULL,
+    writer_implementation_digest TEXT NULL,
+    reconciler_implementation_digest TEXT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+
+    CONSTRAINT pk_lifecycle_ownership_scopes
+        PRIMARY KEY (domain, operation_subset, store_mode),
+    CONSTRAINT ck_lifecycle_ownership_scopes_domain
+        CHECK (domain = 'VOLUME'),
+    CONSTRAINT ck_lifecycle_ownership_scopes_operation_subset
+        CHECK (operation_subset = 'KUBERNETES_PVC_OWNED_LIFECYCLE_V1'),
+    CONSTRAINT ck_lifecycle_ownership_scopes_store_mode
+        CHECK (store_mode = 'CENTRAL_POSTGRESQL'),
+    CONSTRAINT ck_lifecycle_ownership_scopes_routing_mode
+        CHECK (
+            routing_mode IN
+                ('DARK', 'LEGACY_OPEN', 'DRAINING', 'ACTION_OPEN')
+        ),
+    CONSTRAINT ck_lifecycle_ownership_scopes_minimum_version
+        CHECK (minimum_lifecycle_version >= 0),
+    CONSTRAINT ck_lifecycle_ownership_scopes_ownership_epoch
+        CHECK (ownership_epoch >= 1),
+    CONSTRAINT ck_lifecycle_ownership_scopes_authority_generation
+        CHECK (authority_generation >= 0),
+    CONSTRAINT ck_lifecycle_ownership_scopes_writer_digest
+        CHECK (
+            writer_implementation_digest IS NULL OR
+            writer_implementation_digest ~ '^[0-9a-f]{64}$'
+        ),
+    CONSTRAINT ck_lifecycle_ownership_scopes_reconciler_digest
+        CHECK (
+            reconciler_implementation_digest IS NULL OR
+            reconciler_implementation_digest ~ '^[0-9a-f]{64}$'
+        ),
+    CONSTRAINT ck_lifecycle_ownership_scopes_m3s2_inert
+        CHECK (
+            routing_mode = 'DARK' AND
+            minimum_lifecycle_version = 0 AND
+            ownership_epoch = 1 AND
+            authority_generation = 0 AND
+            writer_implementation_digest IS NULL AND
+            reconciler_implementation_digest IS NULL
+        ),
+    CONSTRAINT ck_lifecycle_ownership_scopes_updated_at_finite
+        CHECK (isfinite(updated_at))
+);
+```
+
+There is no unique constraint on `store_uuid`: the singleton key check and
+primary key already limit the table to one row, so a UUID uniqueness index
+would add no revision-001 invariant. There is no foreign key between the two
+tables and no non-constraint index. Semantic columns have no server defaults;
+every seed value is explicit. Only the two database timestamps use
+`clock_timestamp()` defaults.
+
+The broad routing enum documents the eventual vocabulary, but the named
+M3-S2 inert check dominates it and makes every non-`DARK` or otherwise changed
+shape illegal in revision `001`. The unsealed check likewise makes even a
+well-formed writer-authority digest illegal. M3-S3 must leave both inert checks
+unchanged. A separately reviewed activation-schema revision must explicitly
+drop them and replace them with the complete legal cross-column routing, seal,
+epoch, generation, and implementation-digest matrix before Release N can move
+the pilot from `DARK`. That revision widens the domain, operation-subset, or
+store-mode checks only if it also adds a reviewed scope. Its downgrade first
+proves the exact revision-001 seed shape, restores these inert checks, and
+fails otherwise.
+
+Revision `001` rejects every non-PostgreSQL dialect before issuing DDL. In one
+ordinary Alembic transaction it creates identity, creates scopes, generates
+one UUID with `uuid.uuid4()`, and performs two plain inserts without
+`ON CONFLICT`, adoption, replacement, or repair:
+
+- identity is exactly `('global', <uuid4>, 1, NULL, <database time>)`;
+- scope is exactly
+  `('VOLUME', 'KUBERNETES_PVC_OWNED_LIFECYCLE_V1',
+  'CENTRAL_POSTGRESQL', 'DARK', 0, 1, 0, NULL, NULL, <database time>)`.
+
+PostgreSQL transactional DDL makes a failed create or seed atomic. Concurrent
+first initialization is owned by `safe_alembic_upgrade()` and its
+section-specific PostgreSQL advisory lock plus post-lock revision recheck. The
+migration itself performs no conflict-ignore insert. Independent contenders
+therefore converge on the UUID generated by the one winning migration rather
+than replacing or adopting it.
+
+The central initialization order is global state, config, Serve, jobs,
+optional PostgreSQL requests, lifecycle actions, then physical capacity.
+Global state remains first so bootstrap can prove the shared effective schema
+is empty, and capacity remains last. The lifecycle branch is entered only when
+the global engine dialect is PostgreSQL. The Helm migration job runs the
+lineage in `upgrade` or explicit fresh-install `bootstrap` mode. API,
+controller, executor, and any enabled image-worker roles use `verify` mode.
+SQLite never imports or initializes this lineage through the central entry
+point, and a direct private initializer rejects SQLite before Alembic can
+create a lifecycle table or version stamp.
+
+The public runtime surface is limited to `initialize_and_verify()`,
+`read_foundation()`, and frozen store, scope, and foundation snapshot types.
+It exposes no raw engine, connection, session, transaction, insert, update,
+delete, transition, seal, grant, producer, reconciler, or worker API. Its
+private `DatabaseManager` has no engine namespace. Every public read executes
+explicit known-column `SELECT` statements in a PostgreSQL read-only
+transaction, so a later additive revision can add columns without breaking an
+M3-S2 reader and an accidental DML statement fails at the database boundary.
+
+After `safe_alembic_upgrade()` succeeds in the configured mode, startup reads
+all identity rows and requires exactly one frozen snapshot with:
+
+- key `global`;
+- a native RFC 4122 variant UUID at version 4;
+- schema version 1;
+- null writer-authority digest; and
+- a finite, timezone-aware database creation time.
+
+It then reads the exact pilot primary key and requires one frozen snapshot with
+`DARK`, minimum version 0, ownership epoch 1, authority generation 0, both
+implementation digests null, and a finite, timezone-aware database update
+time. A missing, extra, malformed, incompatible, or changed required row fails
+startup. Runtime verification never calls `uuid4()`, inserts, repairs, or
+replaces a seed. It deliberately ignores additional scope rows introduced by
+a later reviewed migration while still requiring the exact pilot row. A later
+pilot activation consequently makes an old M3-S2 process fail startup, which
+is part of the rollback gate.
+
+Downgrade is one PostgreSQL transaction. Before any read it executes
+`LOCK TABLE lifecycle_ownership_scopes, lifecycle_store_identity IN ACCESS
+EXCLUSIVE MODE`. While both locks are held, it reads every row and proves there
+is exactly one valid UUIDv4 `global` identity with schema version 1, null
+authority digest, and finite creation time, plus exactly one scope with the
+exact inert pilot key and values above. Missing, extra, activated, sealed,
+malformed, or otherwise changed data raises before deletion or table drop. On
+the exact inert dataset it deletes the scope seed, deletes the identity seed,
+drops scopes, and drops identity, without `CASCADE`. Alembic owns removal of
+the revision row; its empty version table may remain. Any rejected downgrade
+leaves both tables, both rows, and revision `001` unchanged.
+
+The exact M3-S2 test contract includes:
+
+1. Literal migration versus runtime metadata parity for column order,
+   PostgreSQL types, defaults, nullability, named constraints, primary keys,
+   and indexes, plus an exact two-data-table assertion.
+2. Exact seed, UUIDv4 and RFC variant, finite database timestamps, null
+   digests, epoch, generation, and version checks.
+3. Constraint tests that reject wrong keys, non-v4 UUIDs, schema versions,
+   malformed digests and ranges, plus well-formed but forbidden seals,
+   implementation digests, non-`DARK` modes, and positive changed epochs or
+   generations.
+4. Upgrade, bootstrap, verify, uninitialized-lineage rejection, and acceptance
+   of a simulated later numeric revision only while the pilot remains
+   compatible.
+5. Two independent migration processes contending on one isolated PostgreSQL
+   schema, proving one revision, one UUID, one pilot, and no replacement.
+6. Frozen public readers executed with a connection that rejects DML, no raw
+   engine or mutation surface, configured-mode forwarding, and SQLite
+   rejection with no lifecycle table or version stamp.
+7. Runtime rejection of missing, extra, malformed, sealed, or changed required
+   seeds, no UUID generation or repair, and compatibility with a separately
+   widened future additional scope.
+8. Post-revision backup and clone preservation of the same UUID and successful
+   verification, plus failure of a stamped clone missing either seed. A fork
+   created before revision `001` may receive a different UUID; M3-S2 claims no
+   historical-clone exclusivity because `DARK` owns no external effect.
+9. Guarded downgrade success and independent failures for every missing,
+   extra, sealed, activated, or changed row. Each failure proves both tables,
+   both seeds, and revision `001` remain atomically unchanged.
+10. Conflicting-lock tests for both tables, central initialization ordering,
+    fresh-process revision maps and seeds, and an import/diff boundary proving
+    no lifecycle consumer, volume handler, provider callback, router, worker,
+    or SQLite path entered the slice.
+
+M3-S2 deployment changes the candidate image and runs the existing blocking
+Helm migration hook with `--reuse-values`; it changes no chart resource or
+feature value. Before upgrade, the rendered diff must prove the migration job
+uses the exact candidate digest in upgrade mode, every central runtime role
+uses verify mode, no role remains pinned to an incompatible older image, and
+no enabled optional worker is unintentionally rolled through an inherited API
+image. Qualification proves hook completion precedes candidate pod creation,
+reads the exact revision, constraints, tables, and seeds directly, runs the
+public verifier, checks health and readiness without volume mutation traffic,
+and monitors Kubernetes and Datadog for migration, PostgreSQL, readiness,
+restart, and 5xx regressions. Normal rollback is image-only and leaves the
+inert additive tables in place. Database downgrade is a separate maintenance
+operation subject to the exact lock-and-proof contract above.
+
 M3-S3 cannot add the remaining tables until a dedicated exact-DDL review fixes
 their table and column types, closed values and legal row shapes, generic
 versus volume-specific identity model, immutable binding persistence,
@@ -5960,3 +6196,30 @@ Independent review against base
 review and the PostgreSQL schema adversarial review independently returned
 `PURSUE` on the exact corrected digest. The characterization corpus remains
 unchanged and passing.
+
+### Review 21
+
+Verdict: `PURSUE` for the M3-S2 exact inert PostgreSQL foundation subsection at
+SHA-256
+`1e3c78b35ee24b2d8c1d74536ab5f02621977cc8c3b72bbdb6faed001168fdc4`.
+
+The first exact-DDL pass returned `RESHAPE` because the scratch proposal
+admitted active routing states and well-formed authority digests in revision
+`001`, created a redundant UUID uniqueness index, exposed an engine-shaped
+runtime surface, and tested same-process migration serialization rather than
+independent contenders. It also needed explicit clone preservation,
+database-enforced read-only snapshots, atomic failed-downgrade assertions, and
+direct SQLite rejection.
+
+The corrected contract pins the only legal revision-001 scope to the exact
+unsealed `DARK` seed in named database checks. Any later activation revision
+must explicitly replace those checks with the reviewed legal transition
+matrix and prove the exact inert shape before restoring them on downgrade. The
+runtime exposes only frozen snapshots, the guarded downgrade locks both tables
+before reading, and the test contract now covers independent processes,
+post-revision clones, no repair, DML rejection, and complete rollback
+atomicity.
+
+Independent source-convention review returned `PASS`, PostgreSQL schema review
+returned `PURSUE`, and deployment and rollback review returned `PASS` on the
+exact digest. No implementation began before those verdicts.

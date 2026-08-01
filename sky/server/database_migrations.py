@@ -32,6 +32,11 @@ def initialize_central_databases() -> None:
         from sky.server.requests import postgres as request_postgres
         request_postgres.initialize_and_get_db()
     if global_engine.dialect.name == 'postgresql':
+        # Lifecycle actions share the ordinary PostgreSQL engine and must be
+        # initialized before capacity, which remains the final central lineage.
+        # pylint: disable=import-outside-toplevel
+        from sky.lifecycle_actions import state as lifecycle_actions_state
+        lifecycle_actions_state.initialize_and_verify()
         capacity_config.validate_runtime_capability(capacity_configuration,
                                                     revision='001')
         # Capacity is initialized last. It shares the ordinary PostgreSQL
