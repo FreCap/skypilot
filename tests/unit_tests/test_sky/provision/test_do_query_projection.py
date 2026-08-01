@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -43,7 +44,8 @@ class _RecordingRow:
 def test_project_query_instances_empty_result():
     instances = _RecordingInstances({})
 
-    result = query_projection.project_query_instances(instances)
+    result = query_projection.project_query_instances(instances,
+                                                      status_lib.ClusterStatus)
 
     assert type(result) is dict
     assert not result
@@ -71,7 +73,8 @@ def test_project_query_instances_all_states_order_and_input_unchanged():
     }
     original = copy.deepcopy(instances)
 
-    result = query_projection.project_query_instances(instances)
+    result = query_projection.project_query_instances(instances,
+                                                      status_lib.ClusterStatus)
 
     assert list(result.items()) == [
         ('node-new', (status_lib.ClusterStatus.INIT, None)),
@@ -99,7 +102,8 @@ def test_project_query_instances_duplicate_names_keep_first_position_last_value(
         },
     }
 
-    result = query_projection.project_query_instances(instances)
+    result = query_projection.project_query_instances(instances,
+                                                      status_lib.ClusterStatus)
 
     assert list(result.items()) == [
         ('duplicate', (status_lib.ClusterStatus.STOPPED, None)),
@@ -120,7 +124,8 @@ def test_project_query_instances_reads_values_once_and_fields_in_legacy_order():
         }, accesses),
     })
 
-    result = query_projection.project_query_instances(instances)
+    result = query_projection.project_query_instances(instances,
+                                                      status_lib.ClusterStatus)
 
     assert list(result.items()) == [
         ('node-first', (status_lib.ClusterStatus.UP, None)),
@@ -168,7 +173,8 @@ def test_project_query_instances_failure_semantics_without_retry(
         {'provider-key': _RecordingRow('row', row_values, accesses)})
 
     with pytest.raises(expected_exception) as exception_info:
-        query_projection.project_query_instances(instances)
+        query_projection.project_query_instances(instances,
+                                                 status_lib.ClusterStatus)
 
     assert str(exception_info.value) == expected_message
     assert instances.values_calls == 1
@@ -194,8 +200,9 @@ def test_direct_query_calls_helper_and_projector_once_with_exact_objects(
     )
 
     filter_instances.assert_called_once_with('cloud-name', status_filters=None)
-    projector.assert_called_once_with(helper_result)
+    projector.assert_called_once_with(helper_result, status_lib.ClusterStatus)
     assert projector.call_args.args[0] is helper_result
+    assert projector.call_args.args[1] is status_lib.ClusterStatus
     assert result is projected_result
 
 
@@ -215,6 +222,31 @@ def test_direct_query_rejects_missing_provider_config_before_calls(
     assert exception_info.value.args == (('cloud-name', None),)
     filter_instances.assert_not_called()
     projector.assert_not_called()
+
+
+def test_direct_query_uses_current_instance_status_binding(
+        monkeypatch: pytest.MonkeyPatch):
+    replacement_init = object()
+    replacement_status = SimpleNamespace(INIT=replacement_init,
+                                         UP=object(),
+                                         STOPPED=object())
+    monkeypatch.setattr(do_instance, 'status_lib',
+                        SimpleNamespace(ClusterStatus=replacement_status))
+    filter_instances = mock.Mock(
+        return_value={'provider-key': {
+            'name': 'node',
+            'status': 'new',
+        }})
+    monkeypatch.setattr(do_instance.utils, 'filter_instances', filter_instances)
+
+    result = do_instance.query_instances(
+        'display-name',
+        'cloud-name',
+        provider_config={'region': 'test-region'},
+    )
+
+    filter_instances.assert_called_once_with('cloud-name', status_filters=None)
+    assert result == {'node': (replacement_init, None)}
 
 
 def test_facade_query_preserves_projector_result_identity(
@@ -240,5 +272,6 @@ def test_facade_query_preserves_projector_result_identity(
     )
 
     filter_instances.assert_called_once_with('cloud-name', status_filters=None)
-    projector.assert_called_once_with(helper_result)
+    projector.assert_called_once_with(helper_result, status_lib.ClusterStatus)
+    assert projector.call_args.args[1] is status_lib.ClusterStatus
     assert result is projected_result
