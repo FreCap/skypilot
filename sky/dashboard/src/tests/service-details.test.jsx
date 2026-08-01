@@ -170,6 +170,79 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.replicasLoading).toBe(false);
   });
 
+  it('keeps summary-only manual and polling refreshes off the full read', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'initial-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [
+          { name: 'svc', status: 'manual-summary', summaryOnly: true },
+        ],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'poll-summary', summaryOnly: true }],
+      });
+
+    const { result, unmount } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc', loadFull: false })
+    );
+    let mounted = true;
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(result.current.serviceData.status).toBe('initial-summary');
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await result.current.refreshData();
+      });
+      expect(result.current.serviceData.status).toBe('manual-summary');
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+      expect(dashboardCache.invalidate.mock.calls).toEqual([
+        [getServices, detailSummaryArgs('svc')],
+      ]);
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+      expect(result.current.serviceData.status).toBe('poll-summary');
+      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+      expect(dashboardCache.invalidate.mock.calls).toEqual([
+        [getServices, detailSummaryArgs('svc')],
+        [getServices, detailSummaryArgs('svc')],
+      ]);
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
+
   it('coalesces concurrent forced refreshes for the same service', async () => {
     const refreshedSummary = deferred();
     const refreshedFull = deferred();
