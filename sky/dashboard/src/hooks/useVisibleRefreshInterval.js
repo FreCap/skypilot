@@ -19,7 +19,7 @@ export function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
         return;
       }
 
-      const now = Date.now();
+      const now = window.performance.now();
       if (
         source === 'interval' &&
         lastVisibilityRefreshAtRef.current !== null &&

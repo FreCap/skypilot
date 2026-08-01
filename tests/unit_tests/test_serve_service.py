@@ -1120,6 +1120,128 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
                                        expected_lifecycle_epoch=31)
 
 
+def test_cleanup_skips_tail_sleep_after_final_success():
+    events = []
+
+    class SynchronousThread:
+
+        def __init__(self, target, args, kwargs):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs
+            self.format_exc = None
+            self.started = False
+
+        def is_alive(self):
+            return False
+
+        def start(self):
+            events.append('start')
+            self.started = True
+            self._target(*self._args, **self._kwargs)
+
+        def join(self):
+            assert self.started
+            events.append('join')
+
+    replica = mock.Mock(replica_id=1,
+                        cluster_name='svc-a-r1',
+                        status_property=mock.Mock())
+    lifecycle_lock = mock.Mock(epoch=31)
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[replica]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value={'svc-a-r1'}), \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True), \
+         mock.patch.object(serve_state,
+                           'remove_replica', return_value=True) as remove, \
+         mock.patch.object(service.controller_utils,
+                           'can_terminate', return_value=True), \
+         mock.patch.object(service.thread_utils,
+                           'SafeThread', SynchronousThread), \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster'), \
+         mock.patch.object(service.time,
+                           'sleep', side_effect=lambda _: events.append(
+                               'sleep')), \
+         mock.patch.object(service,
+                           'cleanup_storage_intents',
+                           side_effect=lambda *_: events.append('storage') or
+                           True):
+        failed = service._cleanup('svc', True, 'incarnation-a', 4242,
+                                  '10.4.7.7', lifecycle_lock)
+
+    assert not failed
+    assert events == ['start', 'sleep', 'join', 'storage']
+    remove.assert_called_once_with('svc',
+                                   1,
+                                   expected_service_hash='incarnation-a',
+                                   expected_lifecycle_epoch=31)
+
+
+def test_cleanup_skips_tail_sleep_after_final_start_failure():
+    events = []
+
+    class FailingThread:
+
+        def __init__(self, **_):
+            self.format_exc = None
+
+        def is_alive(self):
+            return False
+
+        def start(self):
+            events.append('start')
+            raise RuntimeError('thread unavailable')
+
+    replica = mock.Mock(replica_id=1,
+                        cluster_name='svc-a-r1',
+                        status_property=mock.Mock())
+    lifecycle_lock = mock.Mock(epoch=31)
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[replica]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value={'svc-a-r1'}), \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True), \
+         mock.patch.object(serve_state, 'remove_replica') as remove, \
+         mock.patch.object(service.controller_utils,
+                           'can_terminate', return_value=True), \
+         mock.patch.object(service.thread_utils, 'SafeThread', FailingThread), \
+         mock.patch.object(service.time,
+                           'sleep', side_effect=lambda _: events.append(
+                               'sleep')), \
+         mock.patch.object(service,
+                           'cleanup_storage_intents',
+                           side_effect=lambda *_: events.append('storage') or
+                           True):
+        failed = service._cleanup('svc', True, 'incarnation-a', 4242,
+                                  '10.4.7.7', lifecycle_lock)
+
+    assert failed
+    assert events == ['start', 'storage']
+    remove.assert_not_called()
+
+
 def test_cleanup_cluster_inventory_uncertainty_keeps_replica_rows():
     replica = mock.Mock(replica_id=1, cluster_name='svc-a-r1')
     lifecycle_lock = mock.Mock(epoch=31)

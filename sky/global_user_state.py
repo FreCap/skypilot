@@ -30,6 +30,7 @@ from sky import global_user_state_cluster_yaml
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
 from sky import global_user_state_service_account_tokens
+from sky import global_user_state_storage
 from sky import global_user_state_system_config
 from sky import models
 from sky import sky_logging
@@ -3045,146 +3046,65 @@ def set_allowed_clouds(allowed_clouds: list[str], workspace: str) -> None:
 def add_or_update_storage(storage_name: str,
                           storage_handle: 'Storage.StorageMetadata',
                           storage_status: status_lib.StorageStatus):
-    engine = _db_manager.get_engine()
-    storage_launched_at = int(time.time())
-    handle = pickle.dumps(storage_handle)
-    last_use = common_utils.get_current_command()
-
-    def status_check(status):
-        return status in status_lib.StorageStatus
-
-    if not status_check(storage_status):
-        raise ValueError(f'Error in updating global state. Storage Status '
-                         f'{storage_status} is passed in incorrectly')
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(storage_table).values(
-            name=storage_name,
-            handle=handle,
-            last_use=last_use,
-            launched_at=storage_launched_at,
-            status=storage_status.value)
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[storage_table.c.name],
-            set_={
-                storage_table.c.handle: handle,
-                storage_table.c.last_use: last_use,
-                storage_table.c.launched_at: storage_launched_at,
-                storage_table.c.status: storage_status.value
-            })
-        session.execute(do_update_stmt)
-        session.commit()
+    global_user_state_storage.add_or_update_storage(
+        _db_manager.get_engine(), orm.Session, sqlite, postgresql,
+        storage_table, storage_name, storage_handle, storage_status)
 
 
 @metrics_lib.time_me
 def remove_storage(storage_name: str):
     """Removes Storage from Database"""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(storage_table).filter_by(name=storage_name).delete()
-        session.commit()
+    global_user_state_storage.remove_storage(_db_manager.get_engine(),
+                                             orm.Session, storage_table,
+                                             storage_name)
 
 
 @metrics_lib.time_me
 def set_storage_status(storage_name: str,
                        status: status_lib.StorageStatus) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        count = session.query(storage_table).filter_by(
-            name=storage_name).update({storage_table.c.status: status.value})
-        session.commit()
-    assert count <= 1, count
-    if count == 0:
-        raise ValueError(f'Storage {storage_name} not found.')
+    global_user_state_storage.set_storage_status(_db_manager.get_engine(),
+                                                 orm.Session, storage_table,
+                                                 storage_name, status)
 
 
 @metrics_lib.time_me
 def get_storage_status(storage_name: str) -> status_lib.StorageStatus | None:
-    engine = _db_manager.get_engine()
-    assert storage_name is not None, 'storage_name cannot be None'
-    with orm.Session(engine) as session:
-        row = session.query(storage_table).filter_by(name=storage_name).first()
-    if row:
-        return status_lib.StorageStatus[row.status]
-    return None
+    return global_user_state_storage.get_storage_status(
+        _db_manager.get_engine(), orm.Session, storage_table, storage_name)
 
 
 @metrics_lib.time_me
 def set_storage_handle(storage_name: str,
                        handle: 'Storage.StorageMetadata') -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        count = session.query(storage_table).filter_by(
-            name=storage_name).update(
-                {storage_table.c.handle: pickle.dumps(handle)})
-        session.commit()
-    assert count <= 1, count
-    if count == 0:
-        raise ValueError(f'Storage{storage_name} not found.')
+    global_user_state_storage.set_storage_handle(_db_manager.get_engine(),
+                                                 orm.Session, storage_table,
+                                                 storage_name, handle)
 
 
 @metrics_lib.time_me
 def get_handle_from_storage_name(
         storage_name: str | None) -> Optional['Storage.StorageMetadata']:
-    engine = _db_manager.get_engine()
-    if storage_name is None:
-        return None
-    with orm.Session(engine) as session:
-        row = session.query(storage_table).filter_by(name=storage_name).first()
-    if row:
-        return pickle.loads(row.handle)
-    return None
+    return global_user_state_storage.get_handle_from_storage_name(
+        _db_manager.get_engine(), orm.Session, storage_table, storage_name)
 
 
 @metrics_lib.time_me
 def get_glob_storage_name(storage_name: str) -> list[str]:
-    engine = _db_manager.get_engine()
-    assert storage_name is not None, 'storage_name cannot be None'
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            rows = session.query(storage_table).filter(
-                storage_table.c.name.op('GLOB')(storage_name)).all()
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            rows = session.query(storage_table).filter(
-                storage_table.c.name.op('SIMILAR TO')(
-                    _glob_to_similar(storage_name))).all()
-        else:
-            raise ValueError('Unsupported database dialect')
-    return [row.name for row in rows]
+    return global_user_state_storage.get_glob_storage_name(
+        _db_manager.get_engine(), orm.Session, storage_table, storage_name,
+        _glob_to_similar)
 
 
 @metrics_lib.time_me
 def get_storage_names_start_with(starts_with: str) -> list[str]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(storage_table).filter(
-            storage_table.c.name.like(f'{starts_with}%')).all()
-    return [row.name for row in rows]
+    return global_user_state_storage.get_storage_names_start_with(
+        _db_manager.get_engine(), orm.Session, storage_table, starts_with)
 
 
 @metrics_lib.time_me
 def get_storage() -> list[dict[str, Any]]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(storage_table).all()
-    records = []
-    for row in rows:
-        # TODO: use namedtuple instead of dict
-        records.append({
-            'name': row.name,
-            'launched_at': row.launched_at,
-            'handle': pickle.loads(row.handle),
-            'last_use': row.last_use,
-            'status': status_lib.StorageStatus[row.status],
-        })
-    return records
+    return global_user_state_storage.get_storage(_db_manager.get_engine(),
+                                                 orm.Session, storage_table)
 
 
 @metrics_lib.time_me
