@@ -376,9 +376,9 @@ def _closed_object_shallow(value: Any, *, name: str,
     iterative leaf validator first.
     """
 
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise TypeError(f'{name} must be an object.')
-    if any(not isinstance(key, str) for key in value):
+    if any(type(key) is not str for key in value):
         raise TypeError(f'{name} keys must be text.')
     if set(value) != keys:
         raise ValueError(f'{name} has unknown or missing fields.')
@@ -1175,6 +1175,12 @@ class ProviderRepoArtifactRefV1:
         {'repo_path', 'byte_size', 'sha256'})
 
     def __post_init__(self) -> None:
+        if type(self.repo_path) is not str:
+            raise TypeError('artifact.repo_path must be text.')
+        if type(self.byte_size) is not int:
+            raise TypeError('artifact.byte_size must be an integer.')
+        if type(self.sha256) is not str:
+            raise TypeError('artifact.sha256 must be text.')
         object.__setattr__(self, 'repo_path',
                            _text(self.repo_path, name='artifact.repo_path'))
         object.__setattr__(
@@ -1186,7 +1192,9 @@ class ProviderRepoArtifactRefV1:
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderRepoArtifactRefV1':
-        raw = _closed_object(value, name='artifact reference', keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='artifact reference',
+                                     keys=cls._KEYS)
         return cls(**raw)
 
     def canonical_value(self) -> JsonObject:
@@ -2654,6 +2662,8 @@ class ProviderLabelV1(_CanonicalContract):
     _KEYS: ClassVar[frozenset[str]] = frozenset({'key', 'value'})
 
     def __post_init__(self) -> None:
+        if type(self.key) is not str or type(self.value) is not str:
+            raise TypeError('label key and value must be text.')
         object.__setattr__(
             self, 'key',
             _text(self.key,
@@ -2667,7 +2677,7 @@ class ProviderLabelV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderLabelV1':
-        raw = _closed_object(value, name='label', keys=cls._KEYS)
+        raw = _closed_object_shallow(value, name='label', keys=cls._KEYS)
         return cls(**raw)
 
     def canonical_value(self) -> JsonObject:
@@ -2676,10 +2686,10 @@ class ProviderLabelV1(_CanonicalContract):
 
 def _provider_label_tuple(value: Any, *,
                           name: str) -> tuple[ProviderLabelV1, ...]:
-    if not isinstance(value, tuple):
+    if type(value) is not tuple:
         raise TypeError(f'{name} must be a tuple.')
     if (len(value) > _MAX_LIST_ITEMS or
-            any(not isinstance(label, ProviderLabelV1) for label in value)):
+            any(type(label) is not ProviderLabelV1 for label in value)):
         raise ValueError(f'{name} must contain at most 256 typed labels.')
     label_keys = tuple(label.key for label in value)
     if label_keys != tuple(sorted(set(label_keys))):
@@ -3983,6 +3993,8 @@ class ProviderAnnotationV1(_CanonicalContract):
     _KEYS: ClassVar[frozenset[str]] = frozenset({'key', 'value'})
 
     def __post_init__(self) -> None:
+        if type(self.key) is not str or type(self.value) is not str:
+            raise TypeError('annotation key and value must be text.')
         object.__setattr__(self, 'key', _text(self.key, name='annotation.key'))
         object.__setattr__(self, 'value',
                            _text(self.value, name='annotation.value'))
@@ -3990,7 +4002,7 @@ class ProviderAnnotationV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderAnnotationV1':
-        raw = _closed_object(value, name='annotation', keys=cls._KEYS)
+        raw = _closed_object_shallow(value, name='annotation', keys=cls._KEYS)
         return cls(**raw)
 
     def canonical_value(self) -> JsonObject:
@@ -3999,15 +4011,26 @@ class ProviderAnnotationV1(_CanonicalContract):
 
 def _provider_annotation_tuple(value: Any, *,
                                name: str) -> tuple[ProviderAnnotationV1, ...]:
-    if not isinstance(value, tuple):
+    if type(value) is not tuple:
         raise TypeError(f'{name} must be a tuple.')
-    if (len(value) > _MAX_LIST_ITEMS or
-            any(not isinstance(annotation, ProviderAnnotationV1)
-                for annotation in value)):
+    if (len(value) > _MAX_LIST_ITEMS or any(
+            type(annotation) is not ProviderAnnotationV1
+            for annotation in value)):
         raise ValueError(f'{name} must contain at most 256 typed annotations.')
     keys = tuple(annotation.key for annotation in value)
     if keys != tuple(sorted(set(keys))):
         raise ValueError(f'{name} must be sorted by unique key.')
+    return value
+
+
+def _provider_bounded_raw_list(value: Any, *, name: str) -> list[Any]:
+    """Validate a provider wire list before copying or parsing its children."""
+
+    if type(value) is not list:
+        raise TypeError(f'{name} must be a list.')
+    if len(value) > _MAX_LIST_ITEMS:
+        raise ValueError(
+            f'{name} must contain at most {_MAX_LIST_ITEMS} items.')
     return value
 
 
@@ -4016,10 +4039,12 @@ def _sorted_text_tuple(value: Any,
                        name: str,
                        minimum_items: int = 0,
                        maximum_bytes: int = _MAX_TEXT_BYTES) -> tuple[str, ...]:
-    if not isinstance(value, tuple):
+    if type(value) is not tuple:
         raise TypeError(f'{name} must be a tuple.')
     if not minimum_items <= len(value) <= _MAX_LIST_ITEMS:
         raise ValueError(f'{name} must contain {minimum_items}..256 values.')
+    if any(type(item) is not str for item in value):
+        raise TypeError(f'{name} must contain exact text values.')
     normalized = tuple(
         _text(item, name=f'{name}[{index}]', maximum_bytes=maximum_bytes)
         for index, item in enumerate(value))
@@ -4049,6 +4074,9 @@ class ProviderKubernetesServiceAccountProjectionV1(_CanonicalContract):
     })
 
     def __post_init__(self) -> None:
+        for field in ('namespace', 'name', 'uid', 'resource_version'):
+            if type(getattr(self, field)) is not str:
+                raise TypeError(f'service_account.{field} must be text.')
         object.__setattr__(
             self, 'namespace',
             _text(self.namespace,
@@ -4080,13 +4108,13 @@ class ProviderKubernetesServiceAccountProjectionV1(_CanonicalContract):
     @classmethod
     def from_value(
             cls, value: Any) -> 'ProviderKubernetesServiceAccountProjectionV1':
-        raw = _closed_object(value,
-                             name='service-account projection',
-                             keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='service-account projection',
+                                     keys=cls._KEYS)
         for field in ('labels', 'annotations', 'image_pull_secrets',
                       'legacy_secret_refs'):
-            if not isinstance(raw[field], list):
-                raise TypeError(f'service-account {field} must be a list.')
+            _provider_bounded_raw_list(raw[field],
+                                       name=f'service-account {field}')
         return cls(
             namespace=raw['namespace'],
             name=raw['name'],
@@ -4256,6 +4284,8 @@ class ProviderKubernetesNamespacePrerequisiteSpecV1(_CanonicalContract):
         {'kind', 'labels', 'annotations'})
 
     def __post_init__(self) -> None:
+        if type(self.kind) not in (str, ProviderKubernetesPrerequisiteKindV1):
+            raise TypeError('Namespace prerequisite kind must be text.')
         kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
                            self.kind,
                            name='namespace prerequisite kind')
@@ -4274,14 +4304,13 @@ class ProviderKubernetesNamespacePrerequisiteSpecV1(_CanonicalContract):
     @classmethod
     def from_value(
             cls, value: Any) -> 'ProviderKubernetesNamespacePrerequisiteSpecV1':
-        raw = _closed_object(value,
-                             name='Namespace prerequisite spec',
-                             keys=cls._KEYS)
-        if not isinstance(raw['labels'], list):
-            raise TypeError('Namespace prerequisite labels must be a list.')
-        if not isinstance(raw['annotations'], list):
-            raise TypeError(
-                'Namespace prerequisite annotations must be a list.')
+        raw = _closed_object_shallow(value,
+                                     name='Namespace prerequisite spec',
+                                     keys=cls._KEYS)
+        _provider_bounded_raw_list(raw['labels'],
+                                   name='Namespace prerequisite labels')
+        _provider_bounded_raw_list(raw['annotations'],
+                                   name='Namespace prerequisite annotations')
         return cls(
             kind=raw['kind'],
             labels=tuple(
@@ -4310,6 +4339,8 @@ class ProviderKubernetesServiceAccountPrerequisiteSpecV1(_CanonicalContract):
     _KEYS: ClassVar[frozenset[str]] = frozenset({'kind', 'projection'})
 
     def __post_init__(self) -> None:
+        if type(self.kind) not in (str, ProviderKubernetesPrerequisiteKindV1):
+            raise TypeError('ServiceAccount prerequisite kind must be text.')
         kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
                            self.kind,
                            name='ServiceAccount prerequisite kind')
@@ -4317,8 +4348,8 @@ class ProviderKubernetesServiceAccountPrerequisiteSpecV1(_CanonicalContract):
             raise ValueError(
                 'ServiceAccount prerequisite spec kind is invalid.')
         object.__setattr__(self, 'kind', kind)
-        if not isinstance(self.projection,
-                          ProviderKubernetesServiceAccountProjectionV1):
+        if type(self.projection) is not (
+                ProviderKubernetesServiceAccountProjectionV1):
             raise TypeError('ServiceAccount prerequisite projection has an '
                             'invalid type.')
         _ = self.canonical_bytes
@@ -4327,9 +4358,9 @@ class ProviderKubernetesServiceAccountPrerequisiteSpecV1(_CanonicalContract):
     def from_value(
             cls,
             value: Any) -> 'ProviderKubernetesServiceAccountPrerequisiteSpecV1':
-        raw = _closed_object(value,
-                             name='ServiceAccount prerequisite spec',
-                             keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='ServiceAccount prerequisite spec',
+                                     keys=cls._KEYS)
         return cls(
             kind=raw['kind'],
             projection=ProviderKubernetesServiceAccountProjectionV1.from_value(
@@ -4361,22 +4392,28 @@ class _ProviderKubernetesManifestPrerequisiteSpecV1(_CanonicalContract):
     _EXPECTED_CONTRACT: ClassVar[str]
 
     def __post_init__(self) -> None:
+        if type(self.kind) not in (str, ProviderKubernetesPrerequisiteKindV1):
+            raise TypeError('manifest prerequisite kind must be text.')
         kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
                            self.kind,
                            name='manifest prerequisite kind')
         if kind is not self._EXPECTED_KIND:
             raise ValueError('manifest prerequisite spec kind is invalid.')
         object.__setattr__(self, 'kind', kind)
-        if self.contract != self._EXPECTED_CONTRACT:
+        if type(self.contract) is not str:
+            raise TypeError('manifest prerequisite contract must be text.')
+        contract = _text(self.contract, name='manifest prerequisite contract')
+        if contract != self._EXPECTED_CONTRACT:
             raise ValueError('manifest prerequisite contract is invalid.')
-        if not isinstance(self.manifest, ProviderRepoArtifactRefV1):
+        object.__setattr__(self, 'contract', contract)
+        if type(self.manifest) is not ProviderRepoArtifactRefV1:
             raise TypeError('prerequisite manifest has an invalid type.')
         _ = self.canonical_bytes
 
     @classmethod
     def from_value(cls: type[_ProviderKubernetesManifestPrerequisiteSpecT],
                    value: Any) -> _ProviderKubernetesManifestPrerequisiteSpecT:
-        raw = _closed_object(
+        raw = _closed_object_shallow(
             value,
             name=f'{cls._EXPECTED_KIND.value} prerequisite spec',
             keys=cls._KEYS)
@@ -4429,10 +4466,12 @@ ProviderKubernetesPrerequisiteSpecV1 = (
 
 def _provider_kubernetes_prerequisite_spec_from_value(
         value: Any) -> ProviderKubernetesPrerequisiteSpecV1:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise TypeError('Kubernetes prerequisite spec must be an object.')
     if 'kind' not in value:
         raise ValueError('Kubernetes prerequisite spec is missing kind.')
+    if type(value['kind']) is not str:
+        raise TypeError('Kubernetes prerequisite spec kind must be text.')
     kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
                        value['kind'],
                        name='Kubernetes prerequisite spec kind')
@@ -4482,10 +4521,14 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
     )
 
     def __post_init__(self) -> None:
+        if type(self.role) not in (str, ProviderKubernetesPrerequisiteRoleV1):
+            raise TypeError('Kubernetes prerequisite role must be text.')
         role = _enum_value(ProviderKubernetesPrerequisiteRoleV1,
                            self.role,
                            name='Kubernetes prerequisite role')
         object.__setattr__(self, 'role', role)
+        if type(self.kind) not in (str, ProviderKubernetesPrerequisiteKindV1):
+            raise TypeError('Kubernetes prerequisite kind must be text.')
         kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
                            self.kind,
                            name='Kubernetes prerequisite kind')
@@ -4495,12 +4538,17 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
             raise ValueError('Kubernetes prerequisite kind does not match its '
                              'semantic role.')
         dispatch = PROVIDER_KUBERNETES_PREREQUISITE_KIND_MAP_V1[kind]
+        if type(self.api_version) is not str:
+            raise TypeError('Kubernetes prerequisite api_version must be text.')
         api_version = _text(self.api_version,
                             name='Kubernetes prerequisite api_version')
         if api_version != dispatch.api_version:
             raise ValueError('Kubernetes prerequisite API version does not '
                              'match its kind.')
         object.__setattr__(self, 'api_version', api_version)
+        if self.namespace is not None and type(self.namespace) is not str:
+            raise TypeError('Kubernetes prerequisite namespace must be text '
+                            'or null.')
         namespace = _optional_text(self.namespace,
                                    name='Kubernetes prerequisite namespace',
                                    maximum_bytes=_MAX_SHORT_TEXT_BYTES)
@@ -4510,6 +4558,9 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
                              'its kind scope.')
         object.__setattr__(self, 'namespace', namespace)
         for field in ('name', 'uid', 'resource_version'):
+            if type(getattr(self, field)) is not str:
+                raise TypeError(f'Kubernetes prerequisite {field} must be '
+                                'text.')
             object.__setattr__(
                 self, field,
                 _text(getattr(self, field),
@@ -4517,11 +4568,13 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
         if self.deletion_timestamp is not None:
             raise ValueError('Kubernetes prerequisite deletion_timestamp must '
                              'be null.')
-        if not isinstance(self.spec, self._SPEC_TYPES):
+        if type(self.spec) not in self._SPEC_TYPES:
             raise TypeError('Kubernetes prerequisite spec has an invalid type.')
         if self.spec.kind is not kind:
             raise ValueError('Kubernetes prerequisite outer and spec kinds do '
                              'not match.')
+        if type(self.spec_sha256) is not str:
+            raise TypeError('Kubernetes prerequisite spec_sha256 must be text.')
         spec_sha256 = _sha256(self.spec_sha256,
                               name='Kubernetes prerequisite spec_sha256')
         if spec_sha256 != self.spec.sha256:
@@ -4541,9 +4594,9 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderKubernetesPrerequisiteV1':
-        raw = _closed_object(value,
-                             name='Kubernetes prerequisite',
-                             keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes prerequisite',
+                                     keys=cls._KEYS)
         return cls(role=raw['role'],
                    api_version=raw['api_version'],
                    kind=raw['kind'],
@@ -4569,6 +4622,67 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
             'spec': self.spec.canonical_value(),
             'spec_sha256': self.spec_sha256,
         }
+
+
+def _provider_kubernetes_prerequisite_inventory_tuple(
+        value: Any, *,
+        name: str) -> tuple[ProviderKubernetesPrerequisiteV1, ...]:
+    """Validate the exact bare 12-role prerequisite inventory."""
+
+    if type(value) is not tuple:
+        raise TypeError(f'{name} must be a tuple.')
+    expected_count = len(PROVIDER_KUBERNETES_PREREQUISITE_ROLE_MAP_V1)
+    if len(value) != expected_count:
+        raise ValueError(f'{name} must contain exactly {expected_count} '
+                         'prerequisites.')
+    if any(
+            type(item) is not ProviderKubernetesPrerequisiteV1
+            for item in value):
+        raise ValueError(f'{name} must contain exact typed prerequisites.')
+    expected_roles = tuple(
+        entry.role for entry in PROVIDER_KUBERNETES_PREREQUISITE_ROLE_MAP_V1)
+    if tuple(item.role for item in value) != expected_roles:
+        raise ValueError(f'{name} does not match the exact role-map order.')
+
+    authority_release = value[0]
+    for alias in (value[3], value[4]):
+        authority_value = authority_release.canonical_value()
+        alias_value = alias.canonical_value()
+        del authority_value['role']
+        del alias_value['role']
+        if canonical_json_bytes(authority_value) != canonical_json_bytes(
+                alias_value):
+            raise ValueError(f'{name} required Namespace aliases must be '
+                             'byte-equal after omitting only role.')
+
+    # The two LB Namespace roles above are the only aliases.  Collapse those
+    # two duplicate semantic roles and require every remaining live key and UID
+    # to be unique, including across prerequisite kinds.
+    nonaliased = (value[0], value[1], value[2], *value[5:])
+    live_keys = tuple((item.api_version, item.kind, item.namespace, item.name)
+                      for item in nonaliased)
+    live_uids = tuple(item.uid for item in nonaliased)
+    if (len(set(live_keys)) != len(live_keys) or
+            len(set(live_uids)) != len(live_uids)):
+        raise ValueError(f'{name} nonaliased prerequisites must have distinct '
+                         'live keys and UIDs.')
+    return value
+
+
+def _provider_kubernetes_prerequisite_inventory_from_value(
+        value: Any, *,
+        name: str) -> tuple[ProviderKubernetesPrerequisiteV1, ...]:
+    """Parse the bare inventory after a bounded raw-list cardinality check."""
+
+    if type(value) is not list:
+        raise TypeError(f'{name} must be a list.')
+    expected_count = len(PROVIDER_KUBERNETES_PREREQUISITE_ROLE_MAP_V1)
+    if len(value) != expected_count:
+        raise ValueError(f'{name} must contain exactly {expected_count} '
+                         'prerequisites.')
+    return _provider_kubernetes_prerequisite_inventory_tuple(tuple(
+        ProviderKubernetesPrerequisiteV1.from_value(item) for item in value),
+                                                             name=name)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6765,12 +6879,21 @@ class ProviderKubernetesEndpointCallerWorkloadV1(_CanonicalContract):
     })
 
     def __post_init__(self) -> None:
+        for field in ('api_version', 'kind', 'namespace', 'name', 'uid',
+                      'resource_version', 'service_account_name'):
+            if type(getattr(self, field)) is not str:
+                raise TypeError(f'endpoint caller workload {field} must be '
+                                'text.')
         if self.api_version != 'apps/v1':
             raise ValueError('endpoint caller workload api_version must be '
                              'apps/v1.')
         if self.kind != 'Deployment':
             raise ValueError(
                 'endpoint caller workload kind must be Deployment.')
+        if (type(self.generation) is not int or
+                type(self.observed_generation) is not int):
+            raise TypeError('endpoint caller workload generations must be '
+                            'integers.')
         object.__setattr__(
             self, 'namespace',
             _text(self.namespace,
@@ -6818,13 +6941,12 @@ class ProviderKubernetesEndpointCallerWorkloadV1(_CanonicalContract):
     @classmethod
     def from_value(cls,
                    value: Any) -> 'ProviderKubernetesEndpointCallerWorkloadV1':
-        raw = _closed_object(value,
-                             name='endpoint caller workload',
-                             keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='endpoint caller workload',
+                                     keys=cls._KEYS)
         for field in ('selector', 'pod_template_labels'):
-            if not isinstance(raw[field], list):
-                raise TypeError(
-                    f'endpoint caller workload {field} must be a list.')
+            _provider_bounded_raw_list(raw[field],
+                                       name=f'endpoint caller workload {field}')
         return cls(
             api_version=raw['api_version'],
             kind=raw['kind'],
@@ -6882,11 +7004,17 @@ class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
     })
 
     def __post_init__(self) -> None:
+        if type(self.role) not in (str, ProviderKubernetesEndpointCallerRoleV1):
+            raise TypeError('endpoint caller role must be text.')
         object.__setattr__(
             self, 'role',
             _enum_value(ProviderKubernetesEndpointCallerRoleV1,
                         self.role,
                         name='endpoint caller role'))
+        for field in ('namespace', 'namespace_uid', 'service_account_name',
+                      'service_account_uid'):
+            if type(getattr(self, field)) is not str:
+                raise TypeError(f'endpoint caller {field} must be text.')
         object.__setattr__(
             self, 'namespace',
             _text(self.namespace,
@@ -6901,17 +7029,19 @@ class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
             self, 'pod_selector',
             _provider_label_tuple(self.pod_selector,
                                   name='endpoint caller pod_selector'))
-        if not isinstance(self.workload,
-                          ProviderKubernetesEndpointCallerWorkloadV1):
+        if type(self.workload) is not (
+                ProviderKubernetesEndpointCallerWorkloadV1):
             raise TypeError('endpoint caller workload has an invalid type.')
         _ = self.canonical_bytes
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointCallerV1':
-        raw = _closed_object(value, name='endpoint caller', keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='endpoint caller',
+                                     keys=cls._KEYS)
         pod_selector = raw['pod_selector']
-        if not isinstance(pod_selector, list):
-            raise TypeError('endpoint caller pod_selector must be a list.')
+        _provider_bounded_raw_list(pod_selector,
+                                   name='endpoint caller pod_selector')
         return cls(
             role=raw['role'],
             namespace=raw['namespace'],
@@ -6944,7 +7074,7 @@ def _provider_kubernetes_endpoint_prerequisite_projection_tuple(
 ) -> tuple[ProviderKubernetesPrerequisiteV1, ...]:
     """Validate the exact typed five-role launch endpoint projection."""
 
-    if not isinstance(value, tuple):
+    if type(value) is not tuple:
         raise TypeError(f'{name} must be a tuple.')
     expected_roles = (
         ProviderKubernetesPrerequisiteRoleV1.ENDPOINT_NETWORK_POLICY,
@@ -6953,9 +7083,9 @@ def _provider_kubernetes_endpoint_prerequisite_projection_tuple(
         ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_1_NAMESPACE,
         ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_1_SERVICE_ACCOUNT,
     )
-    if (len(value) != len(expected_roles) or
-            any(not isinstance(item, ProviderKubernetesPrerequisiteV1)
-                for item in value)):
+    if (len(value) != len(expected_roles) or any(
+            type(item) is not ProviderKubernetesPrerequisiteV1
+            for item in value)):
         raise ValueError(f'{name} must contain the exact five typed role '
                          'projections.')
     if tuple(item.role for item in value) != expected_roles:
@@ -6982,8 +7112,12 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
               ...]] = tuple(ProviderKubernetesEndpointCallerRoleV1)
 
     def __post_init__(self) -> None:
+        if type(self.mode) is not str:
+            raise TypeError('endpoint mode must be text.')
         if self.mode != 'podip':
             raise ValueError('endpoint mode must be podip.')
+        if type(self.application_port) is not str:
+            raise TypeError('endpoint application_port must be text.')
         object.__setattr__(
             self, 'application_port',
             _decimal_port_text(self.application_port,
@@ -6995,9 +7129,10 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
             _provider_kubernetes_endpoint_prerequisite_projection_tuple(
                 self.prerequisite_projection,
                 name='endpoint prerequisite_projection'))
-        if (not isinstance(self.required_callers, tuple) or len(
+        if (type(self.required_callers) is not tuple or len(
                 self.required_callers) != len(self._EXPECTED_CALLER_ROLES) or
-                any(not isinstance(item, ProviderKubernetesEndpointCallerV1)
+                any(
+                    type(item) is not ProviderKubernetesEndpointCallerV1
                     for item in self.required_callers)):
             raise ValueError('endpoint required_callers must contain the exact '
                              'two typed caller projections.')
@@ -7025,8 +7160,7 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
         callers = self.required_callers
         for caller, namespace, service_account in zip(
                 callers, (namespace_zero, namespace_one), service_accounts):
-            if not isinstance(
-                    service_account.spec,
+            if type(service_account.spec) is not (
                     ProviderKubernetesServiceAccountPrerequisiteSpecV1):
                 raise ValueError('endpoint ServiceAccount projection has an '
                                  'invalid typed spec.')
@@ -7075,15 +7209,21 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointContractV1':
-        raw = _closed_object(value,
-                             name='Kubernetes endpoint contract',
-                             keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes endpoint contract',
+                                     keys=cls._KEYS)
         prerequisite_projection = raw['prerequisite_projection']
         required_callers = raw['required_callers']
-        if not isinstance(prerequisite_projection, list):
-            raise TypeError('endpoint prerequisite_projection must be a list.')
-        if not isinstance(required_callers, list):
-            raise TypeError('endpoint required_callers must be a list.')
+        _provider_bounded_raw_list(prerequisite_projection,
+                                   name='endpoint prerequisite_projection')
+        _provider_bounded_raw_list(required_callers,
+                                   name='endpoint required_callers')
+        if len(prerequisite_projection) != 5:
+            raise ValueError('endpoint prerequisite_projection must contain '
+                             'the exact five role projections.')
+        if len(required_callers) != 2:
+            raise ValueError('endpoint required_callers must contain the exact '
+                             'two caller projections.')
         return cls(mode=raw['mode'],
                    application_port=raw['application_port'],
                    ambient_fallback=raw['ambient_fallback'],

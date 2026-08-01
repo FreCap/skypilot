@@ -16,14 +16,15 @@ composition remains pending; bounded resource values and the generic
 prerequisite/object-plan/renderer foundations, exact prerequisite role/kind map
 and role-dispatched prerequisite leaf, and launch-only endpoint
 projection/workload leaves are implemented and independently verified, while
-the enclosing 12-record inventory validator, named capsule composition, and
-request-body renderer/normalizer artifacts are design-frozen and code-pending;
+the enclosing exact 12-record inventory validator is implemented and
+independently verified and named capsule composition and request-body
+renderer/normalizer artifacts remain design-frozen and code-pending;
 foundational runtime/job/endpoint leaves now include the closed Skylet job-spec,
 submit-request, retained-evidence, and policy-boundary-proof leaves and are
 independently verified; the policy-free request-identity, scheduling, storage,
 metadata, security, object-mutation-effect, and exact launch/down mutation
 contract leaves are implemented and independently verified, while contextual
-action-bound submit comparison, enclosing inventory/capsule and execution-config
+action-bound submit comparison, enclosing capsule and execution-config
 composition, and live preflight remain pending; runtime provider propagation,
 observation, and shadow instrumentation remain pending
 
@@ -4316,9 +4317,11 @@ alias, distinct-key/UID, cross-namespace, retained-byte, and negative mutation
 tests. The focused suites plus the adjacent provider-value, execution-foundation,
 legacy invocation, Serve033, completed-down, Kubernetes-scope, and naming suites
 pass together. Independent adversarial review accepted these context-free
-leaves. This evidence does not claim execution-capsule composition, contextual
-policy or retained-request comparison, renderer/normalizer artifacts, provider
-I/O, or authority.
+leaves. Endpoint direct and wire probes additionally reject scalar, tuple,
+list, and typed-child subclasses, nested cycles, and 10,000-item raw
+collections before recursive parsing. This evidence does not claim
+execution-capsule composition, contextual policy or retained-request
+comparison, renderer/normalizer artifacts, provider I/O, or authority.
 
 Further P1 leaf verification evidence on 2026-08-01: the policy-free request
 identity, scheduling, storage, metadata, security, object-mutation-effect, and
@@ -4331,8 +4334,24 @@ collection subclasses, equality/length-spoofing scalars, and typed-child
 subclasses with hidden wire fields. The focused suite and the adjacent 11-file
 provider DTO suite pass together; independent adversarial review accepted the
 leaves. This evidence does not claim prepared-request identity provenance, the
-enclosing 12-role prerequisite inventory, capsule/config composition, policy
-subject projection, provider effect emission, I/O, or authority.
+capsule/config composition, policy subject projection, provider effect
+emission, I/O, or authority.
+
+Further P1 inventory verification evidence on 2026-08-01: the private bare-list
+validator accepts exactly the 12 prerequisite records in literal role-map order,
+requires the release/LB Namespace alias group to be byte-equal after omitting
+only `role`, and rejects every other duplicate logical key or UID. Focused tests
+cover missing/extra/swapped roles, each side of the required alias comparison,
+same-key and same-UID collisions, cross-kind UID reuse, exact direct types, and
+positive same-name cases whose kind or Namespace keeps the logical keys
+distinct. The prerequisite wire parser now validates closed outer shapes and
+all raw collection cardinalities before child parsing; exact-length cyclic
+records, cyclic leaf scalars, list subclasses, and 10,000-item nested lists
+therefore reject with bounded contract errors rather than recursive
+serialization. The focused suite passes, and independent adversarial review
+accepted the exact inventory implementation and ownership boundary. This
+evidence does not claim the launch-only endpoint-to-inventory equality, any
+other capsule cross-field binding, provider I/O, or authority.
 
 First-deployment cutover evidence on 2026-08-01: read-only `boltz-test`
 inspection found API schema 004, Serve 031, global-user-state 027, and no API or

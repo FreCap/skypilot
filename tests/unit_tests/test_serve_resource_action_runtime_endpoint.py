@@ -20,6 +20,75 @@ _ARTIFACT_ROLES = (
 )
 
 
+class _TupleSubclass(tuple):
+    """Noncanonical tuple subtype used by direct-construction probes."""
+
+
+class _ListSubclass(list):
+    """Noncanonical list subtype used by wire-parser probes."""
+
+
+class _EqualitySpoofingString(str):
+    """Text whose Python equality lies about its canonical value."""
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        return False
+
+    __hash__ = str.__hash__
+
+
+class _IntegerSubclass(int):
+    """Noncanonical integer subtype used by direct-construction probes."""
+
+
+class _LengthSpoofingBytes(bytes):
+    """Bytes whose Python length lies about its encoded size."""
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _BoundSpoofingString(str):
+    """Oversize text whose encoded byte string reports a short length."""
+
+    def encode(self, encoding: str = 'utf-8', errors: str = 'strict') -> bytes:
+        return _LengthSpoofingBytes(super().encode(encoding, errors))
+
+
+class _UncontractedEndpointPrerequisite(actions.ProviderKubernetesPrerequisiteV1
+                                       ):
+    """Prerequisite subtype with an undeclared canonical field."""
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
+class _UncontractedEndpointCaller(actions.ProviderKubernetesEndpointCallerV1):
+    """Endpoint-caller subtype with an undeclared canonical field."""
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
+class _UncontractedEndpointWorkload(
+        actions.ProviderKubernetesEndpointCallerWorkloadV1):
+    """Endpoint-workload subtype with an undeclared canonical field."""
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
 def _artifact(path: str, marker: str = 'a') -> dict:
     return {'repo_path': path, 'byte_size': 17, 'sha256': marker * 64}
 
@@ -708,9 +777,17 @@ def test_endpoint_requires_typed_direct_tuples() -> None:
         dataclasses.replace(parsed,
                             prerequisite_projection=list(
                                 parsed.prerequisite_projection))
+    with pytest.raises(TypeError, match='must be a tuple'):
+        dataclasses.replace(parsed,
+                            prerequisite_projection=_TupleSubclass(
+                                parsed.prerequisite_projection))
     with pytest.raises(ValueError, match='two typed'):
         dataclasses.replace(parsed,
                             required_callers=list(parsed.required_callers))
+    with pytest.raises(ValueError, match='two typed'):
+        dataclasses.replace(parsed,
+                            required_callers=_TupleSubclass(
+                                parsed.required_callers))
 
     caller = parsed.required_callers[0]
     with pytest.raises(TypeError, match='must be a tuple'):
@@ -723,12 +800,102 @@ def test_endpoint_requires_typed_direct_tuples() -> None:
         dataclasses.replace(workload, selector=list(workload.selector))
 
 
+def test_endpoint_rejects_direct_typed_child_subclasses() -> None:
+    endpoint = actions.ProviderKubernetesEndpointContractV1.from_value(
+        _endpoint())
+    prerequisite = endpoint.prerequisite_projection[0]
+    hidden_prerequisite = _UncontractedEndpointPrerequisite(
+        role=prerequisite.role,
+        api_version=prerequisite.api_version,
+        kind=prerequisite.kind,
+        namespace=prerequisite.namespace,
+        name=prerequisite.name,
+        uid=prerequisite.uid,
+        resource_version=prerequisite.resource_version,
+        deletion_timestamp=prerequisite.deletion_timestamp,
+        spec=prerequisite.spec,
+        spec_sha256=prerequisite.spec_sha256)
+    with pytest.raises(ValueError, match='exact five typed'):
+        dataclasses.replace(
+            endpoint,
+            prerequisite_projection=(hidden_prerequisite,
+                                     *endpoint.prerequisite_projection[1:]))
+
+    caller = endpoint.required_callers[0]
+    hidden_caller = _UncontractedEndpointCaller(
+        role=caller.role,
+        namespace=caller.namespace,
+        namespace_uid=caller.namespace_uid,
+        pod_selector=caller.pod_selector,
+        service_account_name=caller.service_account_name,
+        service_account_uid=caller.service_account_uid,
+        workload=caller.workload)
+    with pytest.raises(ValueError, match='two typed'):
+        dataclasses.replace(endpoint,
+                            required_callers=(hidden_caller,
+                                              endpoint.required_callers[1]))
+
+    workload = caller.workload
+    hidden_workload = _UncontractedEndpointWorkload(
+        api_version=workload.api_version,
+        kind=workload.kind,
+        namespace=workload.namespace,
+        name=workload.name,
+        uid=workload.uid,
+        resource_version=workload.resource_version,
+        generation=workload.generation,
+        observed_generation=workload.observed_generation,
+        deletion_timestamp=workload.deletion_timestamp,
+        selector=workload.selector,
+        pod_template_labels=workload.pod_template_labels,
+        service_account_name=workload.service_account_name,
+        automount_service_account_token=(
+            workload.automount_service_account_token))
+    with pytest.raises(TypeError, match='workload has an invalid type'):
+        dataclasses.replace(caller, workload=hidden_workload)
+
+
+def test_endpoint_rejects_direct_scalar_subclasses() -> None:
+    endpoint = actions.ProviderKubernetesEndpointContractV1.from_value(
+        _endpoint())
+    with pytest.raises(TypeError, match='mode must be text'):
+        dataclasses.replace(endpoint, mode=_EqualitySpoofingString('not-podip'))
+    with pytest.raises(TypeError, match='application_port must be text'):
+        dataclasses.replace(endpoint,
+                            application_port=_EqualitySpoofingString('8080'))
+
+    caller = endpoint.required_callers[0]
+    with pytest.raises(TypeError, match='namespace must be text'):
+        dataclasses.replace(caller, namespace=_BoundSpoofingString('x' * 2_000))
+    workload = caller.workload
+    with pytest.raises(TypeError, match='api_version must be text'):
+        dataclasses.replace(workload,
+                            api_version=_EqualitySpoofingString('wrong'))
+    with pytest.raises(TypeError, match='kind must be text'):
+        dataclasses.replace(workload,
+                            kind=_EqualitySpoofingString('not-a-deployment'))
+    with pytest.raises(TypeError, match='name must be text'):
+        dataclasses.replace(workload, name=_BoundSpoofingString('x' * 2_000))
+    with pytest.raises(TypeError, match='generations must be integers'):
+        dataclasses.replace(workload,
+                            generation=_IntegerSubclass(workload.generation))
+    with pytest.raises(TypeError, match='generations must be integers'):
+        dataclasses.replace(workload,
+                            observed_generation=_IntegerSubclass(
+                                workload.observed_generation))
+
+
 @pytest.mark.parametrize('field',
                          ['prerequisite_projection', 'required_callers'])
 def test_endpoint_requires_wire_lists(field: str) -> None:
     raw = _endpoint()
     raw[field] = tuple(raw[field])
     with pytest.raises((TypeError, ValueError)):
+        actions.ProviderKubernetesEndpointContractV1.from_value(raw)
+
+    raw = _endpoint()
+    raw[field] = _ListSubclass(raw[field])
+    with pytest.raises(TypeError, match='must be a list'):
         actions.ProviderKubernetesEndpointContractV1.from_value(raw)
 
 
@@ -738,6 +905,45 @@ def test_endpoint_caller_workload_requires_wire_lists(field: str) -> None:
     raw[field] = tuple(raw[field])
     with pytest.raises((TypeError, ValueError)):
         actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
+
+    raw = _caller_workload(0)
+    raw[field] = _ListSubclass(raw[field])
+    with pytest.raises(TypeError, match='must be a list'):
+        actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
+
+
+def test_endpoint_parsers_bound_raw_lists_before_child_parse() -> None:
+    for field in ('prerequisite_projection', 'required_callers'):
+        raw = _endpoint()
+        raw[field] = [object()] * 10_000
+        with pytest.raises(ValueError, match='at most 256'):
+            actions.ProviderKubernetesEndpointContractV1.from_value(raw)
+
+    raw = _caller(0)
+    raw['pod_selector'] = [object()] * 10_000
+    with pytest.raises(ValueError, match='at most 256'):
+        actions.ProviderKubernetesEndpointCallerV1.from_value(raw)
+
+    for field in ('selector', 'pod_template_labels'):
+        raw = _caller_workload(0)
+        raw[field] = [object()] * 10_000
+        with pytest.raises(ValueError, match='at most 256'):
+            actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
+
+
+def test_endpoint_parsers_reject_nested_cycles_without_recursion() -> None:
+    raw = _endpoint()
+    caller = raw['required_callers'][0]
+    caller['workload'] = caller
+    with pytest.raises((TypeError, ValueError)):
+        actions.ProviderKubernetesEndpointContractV1.from_value(raw)
+
+    raw = _endpoint()
+    label = {'key': 'app'}
+    label['value'] = label
+    raw['required_callers'][0]['workload']['selector'] = [label]
+    with pytest.raises((TypeError, ValueError)):
+        actions.ProviderKubernetesEndpointContractV1.from_value(raw)
 
 
 def test_leafs_accept_structural_values_without_cross_capsule_authority(

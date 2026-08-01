@@ -1,5 +1,7 @@
 """Pure prerequisite, object-plan, and renderer contract tests."""
 
+# pylint: disable=protected-access
+
 import builtins
 import copy
 import dataclasses
@@ -32,6 +34,104 @@ _DEFAULT_PREREQUISITE_ROLES = {
     'ValidatingAdmissionPolicy': 'validating_admission_policy',
     'ValidatingAdmissionPolicyBinding': 'validating_admission_policy_binding',
 }
+
+
+class _UncontractedPrerequisite(actions.ProviderKubernetesPrerequisiteV1):
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
+class _TupleSubclass(tuple):
+    pass
+
+
+class _ListSubclass(list):
+    pass
+
+
+class _DictSubclass(dict):
+    pass
+
+
+class _EqualitySpoofingString(str):
+    """Text whose Python equality lies about its canonical value."""
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        return False
+
+    __hash__ = str.__hash__
+
+
+class _HashSpoofingString(str):
+
+    def __hash__(self) -> int:
+        return super().__hash__() ^ 1
+
+
+class _LengthSpoofingBytes(bytes):
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _BoundSpoofingString(str):
+
+    def encode(self, encoding: str = 'utf-8', errors: str = 'strict') -> bytes:
+        return _LengthSpoofingBytes(super().encode(encoding, errors))
+
+
+class _IntegerSubclass(int):
+    pass
+
+
+class _UncontractedLabel(actions.ProviderLabelV1):
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
+class _UncontractedAnnotation(actions.ProviderAnnotationV1):
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
+class _UncontractedNamespaceSpec(
+        actions.ProviderKubernetesNamespacePrerequisiteSpecV1):
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
+class _UncontractedServiceAccountProjection(
+        actions.ProviderKubernetesServiceAccountProjectionV1):
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+
+class _UncontractedArtifact(actions.ProviderRepoArtifactRefV1):
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
 
 
 def _artifact(path: str = 'contracts/reviewed.json', marker: str = 'a') -> dict:
@@ -145,6 +245,80 @@ def _prerequisite(kind: str, *, role: str | None = None) -> dict:
     }
 
 
+def _set_namespace_identity(raw: dict, *, name: str, uid: str) -> None:
+    raw['name'] = name
+    raw['uid'] = uid
+
+
+def _set_service_account_identity(raw: dict, *, namespace: str, name: str,
+                                  uid: str) -> None:
+    raw['namespace'] = namespace
+    raw['name'] = name
+    raw['uid'] = uid
+    projection = raw['spec']['projection']
+    projection['namespace'] = namespace
+    projection['name'] = name
+    projection['uid'] = uid
+    raw['spec_sha256'] = actions.canonical_sha256(raw['spec'])
+
+
+def _prerequisite_inventory() -> list[dict]:
+    authority_release = _prerequisite('Namespace',
+                                      role='authority_release_namespace')
+    _set_namespace_identity(authority_release,
+                            name='skypilot-ha',
+                            uid='uid-skypilot-ha')
+    target = _prerequisite('Namespace', role='target_namespace')
+    _set_namespace_identity(target, name='serve-canary', uid='uid-serve-canary')
+    kube_system = _prerequisite('Namespace', role='kube_system_namespace')
+    _set_namespace_identity(kube_system,
+                            name='kube-system',
+                            uid='uid-kube-system')
+    lb_slot_zero_namespace = copy.deepcopy(authority_release)
+    lb_slot_zero_namespace['role'] = 'serve_lb_slot_0_namespace'
+    lb_slot_one_namespace = copy.deepcopy(authority_release)
+    lb_slot_one_namespace['role'] = 'serve_lb_slot_1_namespace'
+
+    caller = _prerequisite('ServiceAccount', role='caller_service_account')
+    _set_service_account_identity(caller,
+                                  namespace='skypilot-ha',
+                                  name='authority-worker',
+                                  uid='uid-authority-worker')
+    workload = _prerequisite('ServiceAccount', role='workload_service_account')
+    _set_service_account_identity(workload,
+                                  namespace='serve-canary',
+                                  name='serve-workload',
+                                  uid='uid-serve-workload')
+    lb_slot_zero = _prerequisite('ServiceAccount',
+                                 role='serve_lb_slot_0_service_account')
+    _set_service_account_identity(lb_slot_zero,
+                                  namespace='skypilot-ha',
+                                  name='serve-lb-slot-0',
+                                  uid='uid-serve-lb-slot-0')
+    lb_slot_one = _prerequisite('ServiceAccount',
+                                role='serve_lb_slot_1_service_account')
+    _set_service_account_identity(lb_slot_one,
+                                  namespace='skypilot-ha',
+                                  name='serve-lb-slot-1',
+                                  uid='uid-serve-lb-slot-1')
+    return [
+        authority_release,
+        target,
+        kube_system,
+        lb_slot_zero_namespace,
+        lb_slot_one_namespace,
+        caller,
+        workload,
+        lb_slot_zero,
+        lb_slot_one,
+        _prerequisite('NetworkPolicy', role='endpoint_network_policy'),
+        _prerequisite('ValidatingAdmissionPolicy',
+                      role='validating_admission_policy'),
+        _prerequisite('ValidatingAdmissionPolicyBinding',
+                      role='validating_admission_policy_binding'),
+    ]
+
+
 def _identity_labels() -> list[dict]:
     return [{
         'key': 'skypilot-cluster-name',
@@ -256,6 +430,352 @@ def test_prerequisite_role_map_is_exact_and_immutable() -> None:
         entries[0].sequence = 1  # type: ignore[misc]
     with pytest.raises(TypeError):
         operator.setitem(entries, 0, entries[1])
+
+
+def test_prerequisite_inventory_roundtrips_exact_bare_role_map() -> None:
+    raw = _prerequisite_inventory()
+    parsed = actions._provider_kubernetes_prerequisite_inventory_from_value(
+        raw, name='test prerequisite inventory')
+
+    assert [item.canonical_value() for item in parsed] == raw
+    assert tuple(item.role.value for item in parsed) == tuple(
+        role for role, _ in _PREREQUISITE_ROLE_KINDS)
+    assert actions._provider_kubernetes_prerequisite_inventory_tuple(
+        parsed, name='test prerequisite inventory') is parsed
+
+
+def test_prerequisite_inventory_bounds_raw_cardinality_before_child_parse(
+) -> None:
+    raw = _prerequisite_inventory()
+    with pytest.raises(TypeError, match='must be a list'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            tuple(raw), name='test prerequisite inventory')
+    with pytest.raises(TypeError, match='must be a list'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            _ListSubclass(raw), name='test prerequisite inventory')
+    for value in ([], raw[:-1], [object()] * 10_000):
+        with pytest.raises(ValueError, match='exactly 12'):
+            actions._provider_kubernetes_prerequisite_inventory_from_value(
+                value, name='test prerequisite inventory')
+
+    cycle: list[object] = []
+    cycle.append(cycle)
+    with pytest.raises(ValueError, match='exactly 12'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            cycle, name='test prerequisite inventory')
+
+
+def test_prerequisite_inventory_requires_exact_direct_types() -> None:
+    parsed = actions._provider_kubernetes_prerequisite_inventory_from_value(
+        _prerequisite_inventory(), name='test prerequisite inventory')
+    with pytest.raises(TypeError, match='must be a tuple'):
+        actions._provider_kubernetes_prerequisite_inventory_tuple(
+            list(parsed), name='test prerequisite inventory')
+    with pytest.raises(TypeError, match='must be a tuple'):
+        actions._provider_kubernetes_prerequisite_inventory_tuple(
+            _TupleSubclass(parsed), name='test prerequisite inventory')
+
+    first = parsed[0]
+    uncontracted = _UncontractedPrerequisite(
+        role=first.role,
+        api_version=first.api_version,
+        kind=first.kind,
+        namespace=first.namespace,
+        name=first.name,
+        uid=first.uid,
+        resource_version=first.resource_version,
+        deletion_timestamp=first.deletion_timestamp,
+        spec=first.spec,
+        spec_sha256=first.spec_sha256)
+    assert uncontracted.canonical_value()['uncontracted'] == 'hidden'
+    with pytest.raises(ValueError, match='exact typed prerequisites'):
+        actions._provider_kubernetes_prerequisite_inventory_tuple(
+            (uncontracted, *parsed[1:]), name='test prerequisite inventory')
+
+
+def test_prerequisite_wire_requires_exact_dicts_and_keys() -> None:
+    raw = _prerequisite_inventory()
+    raw[0] = _DictSubclass(raw[0])
+    with pytest.raises(TypeError, match='must be an object'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+    raw = _prerequisite_inventory()
+    first = raw[0]
+    role = first.pop('role')
+    first[_HashSpoofingString('role')] = role
+    with pytest.raises(TypeError, match='keys must be text'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+@pytest.mark.parametrize('mutation', [
+    'api_version',
+    'manifest_contract',
+    'spec_sha256',
+    'service_account_name',
+    'duplicate_uid_hash',
+    'duplicate_key_hash',
+])
+def test_prerequisite_wire_rejects_scalar_equality_or_hash_spoofing(
+        mutation: str) -> None:
+    raw = _prerequisite_inventory()
+    if mutation == 'api_version':
+        raw[0]['api_version'] = _EqualitySpoofingString('wrong-api')
+    elif mutation == 'manifest_contract':
+        raw[9]['spec']['contract'] = _EqualitySpoofingString('wrong-contract')
+    elif mutation == 'spec_sha256':
+        raw[0]['spec_sha256'] = _EqualitySpoofingString('f' * 64)
+    elif mutation == 'service_account_name':
+        raw[5]['name'] = _EqualitySpoofingString('wrong-name')
+    elif mutation == 'duplicate_uid_hash':
+        raw[1]['uid'] = _HashSpoofingString(raw[0]['uid'])
+    else:
+        raw[1]['name'] = _HashSpoofingString(raw[0]['name'])
+    with pytest.raises(TypeError):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+def test_shallow_prerequisite_leaves_reject_bound_spoofing_scalars() -> None:
+    oversized = _BoundSpoofingString('x' * 2_000)
+    with pytest.raises(TypeError):
+        actions.ProviderLabelV1.from_value({'key': oversized, 'value': 'value'})
+    with pytest.raises(TypeError):
+        actions.ProviderAnnotationV1.from_value({
+            'key': 'example.com/key',
+            'value': oversized
+        })
+    with pytest.raises(TypeError):
+        actions.ProviderRepoArtifactRefV1.from_value({
+            'repo_path': oversized,
+            'byte_size': 1,
+            'sha256': 'a' * 64,
+        })
+    with pytest.raises(TypeError):
+        actions.ProviderRepoArtifactRefV1.from_value({
+            'repo_path': 'artifact.json',
+            'byte_size': _IntegerSubclass(2**100),
+            'sha256': 'a' * 64,
+        })
+
+
+def test_prerequisite_tree_rejects_nested_typed_subclasses() -> None:
+    parsed = actions._provider_kubernetes_prerequisite_inventory_from_value(
+        _prerequisite_inventory(), name='test prerequisite inventory')
+    namespace = parsed[0]
+    assert type(namespace.spec) is (
+        actions.ProviderKubernetesNamespacePrerequisiteSpecV1)
+    namespace_spec = namespace.spec
+    label = namespace_spec.labels[0]
+    annotation = namespace_spec.annotations[0]
+    with pytest.raises(ValueError, match='typed labels'):
+        dataclasses.replace(namespace_spec,
+                            labels=(_UncontractedLabel(label.key, label.value),
+                                    *namespace_spec.labels[1:]))
+    with pytest.raises(ValueError, match='typed annotations'):
+        dataclasses.replace(namespace_spec,
+                            annotations=(_UncontractedAnnotation(
+                                annotation.key, annotation.value),
+                                         *namespace_spec.annotations[1:]))
+    with pytest.raises(TypeError, match='must be a tuple'):
+        dataclasses.replace(namespace_spec,
+                            labels=_TupleSubclass(namespace_spec.labels))
+
+    hidden_spec = _UncontractedNamespaceSpec(
+        kind=namespace_spec.kind,
+        labels=namespace_spec.labels,
+        annotations=namespace_spec.annotations)
+    with pytest.raises(TypeError, match='spec has an invalid type'):
+        dataclasses.replace(namespace,
+                            spec=hidden_spec,
+                            spec_sha256=hidden_spec.sha256)
+
+    service_account = parsed[5]
+    assert type(service_account.spec) is (
+        actions.ProviderKubernetesServiceAccountPrerequisiteSpecV1)
+    projection = service_account.spec.projection
+    hidden_projection = _UncontractedServiceAccountProjection(
+        namespace=projection.namespace,
+        name=projection.name,
+        uid=projection.uid,
+        resource_version=projection.resource_version,
+        labels=projection.labels,
+        annotations=projection.annotations,
+        automount_service_account_token=(
+            projection.automount_service_account_token),
+        image_pull_secrets=projection.image_pull_secrets,
+        legacy_secret_refs=projection.legacy_secret_refs)
+    with pytest.raises(TypeError, match='projection has an invalid type'):
+        dataclasses.replace(service_account.spec, projection=hidden_projection)
+
+    manifest_prerequisite = parsed[9]
+    assert type(manifest_prerequisite.spec) is (
+        actions.ProviderKubernetesNetworkPolicyPrerequisiteSpecV1)
+    manifest = manifest_prerequisite.spec.manifest
+    hidden_manifest = _UncontractedArtifact(manifest.repo_path,
+                                            manifest.byte_size, manifest.sha256)
+    with pytest.raises(TypeError, match='manifest has an invalid type'):
+        dataclasses.replace(manifest_prerequisite.spec,
+                            manifest=hidden_manifest)
+
+
+@pytest.mark.parametrize('mutation',
+                         ['missing', 'extra', 'swap', 'duplicate_role'])
+def test_prerequisite_inventory_rejects_role_map_order_or_cardinality(
+        mutation: str) -> None:
+    raw = _prerequisite_inventory()
+    if mutation == 'missing':
+        raw.pop()
+    elif mutation == 'extra':
+        raw.append(copy.deepcopy(raw[-1]))
+    elif mutation == 'swap':
+        raw[1], raw[2] = raw[2], raw[1]
+    else:
+        raw[1] = copy.deepcopy(raw[0])
+    expected = 'exactly 12' if mutation in ('missing', 'extra') else 'role-map'
+    with pytest.raises(ValueError, match=expected):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+@pytest.mark.parametrize('alias_index', [0, 3, 4])
+@pytest.mark.parametrize('field', ['name', 'uid', 'resource_version', 'spec'])
+def test_prerequisite_inventory_requires_byte_equal_namespace_aliases(
+        alias_index: int, field: str) -> None:
+    raw = _prerequisite_inventory()
+    alias = raw[alias_index]
+    if field == 'spec':
+        alias['spec']['labels'].append({'key': 'zz-extra', 'value': 'value'})
+        alias['spec_sha256'] = actions.canonical_sha256(alias['spec'])
+    else:
+        alias[field] = f'different-{field}'
+    with pytest.raises(ValueError, match='Namespace aliases'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+def test_prerequisite_inventory_does_not_normalize_alias_role_order() -> None:
+    raw = _prerequisite_inventory()
+    raw[3], raw[4] = raw[4], raw[3]
+    with pytest.raises(ValueError, match='role-map'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+@pytest.mark.parametrize('mutation', [
+    'namespace_same_key',
+    'namespace_same_uid',
+    'service_account_same_key',
+    'service_account_same_uid',
+    'cross_kind_same_uid',
+])
+def test_prerequisite_inventory_rejects_every_nonalias_collision(
+        mutation: str) -> None:
+    raw = _prerequisite_inventory()
+    authority_release, target = raw[0], raw[1]
+    caller, workload = raw[5], raw[6]
+    if mutation == 'namespace_same_key':
+        target['name'] = authority_release['name']
+    elif mutation == 'namespace_same_uid':
+        target['uid'] = authority_release['uid']
+    elif mutation == 'service_account_same_key':
+        _set_service_account_identity(workload,
+                                      namespace=caller['namespace'],
+                                      name=caller['name'],
+                                      uid=workload['uid'])
+    elif mutation == 'service_account_same_uid':
+        _set_service_account_identity(workload,
+                                      namespace=workload['namespace'],
+                                      name=workload['name'],
+                                      uid=caller['uid'])
+    else:
+        raw[9]['uid'] = target['uid']
+    with pytest.raises(ValueError, match='distinct live keys and UIDs'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+def test_prerequisite_inventory_allows_distinct_cross_kind_or_namespace_keys(
+) -> None:
+    raw = _prerequisite_inventory()
+    caller, workload, network_policy = raw[5], raw[6], raw[9]
+    _set_service_account_identity(workload,
+                                  namespace=workload['namespace'],
+                                  name=caller['name'],
+                                  uid=workload['uid'])
+    network_policy['name'] = workload['name']
+
+    parsed = actions._provider_kubernetes_prerequisite_inventory_from_value(
+        raw, name='test prerequisite inventory')
+
+    assert parsed[5].name == parsed[6].name
+    assert parsed[5].namespace != parsed[6].namespace
+    assert parsed[6].name == parsed[9].name
+    assert parsed[6].kind != parsed[9].kind
+
+
+def test_prerequisite_inventory_leaves_caller_automount_for_capsule_binding(
+) -> None:
+    parsed = actions._provider_kubernetes_prerequisite_inventory_from_value(
+        _prerequisite_inventory(), name='test prerequisite inventory')
+
+    assert parsed[5].spec.projection.automount_service_account_token is False
+
+
+def test_prerequisite_parser_rejects_nested_cycles_without_recursion() -> None:
+    raw = _prerequisite_inventory()
+    raw[0]['spec'] = raw[0]
+    with pytest.raises((TypeError, ValueError)):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+    raw = _prerequisite_inventory()
+    label = {'key': 'app'}
+    label['value'] = label
+    raw[0]['spec']['labels'] = [label]
+    with pytest.raises((TypeError, ValueError)):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+    raw = _prerequisite_inventory()
+    artifact = {
+        'repo_path': 'prerequisites/network-policy.json',
+        'byte_size': 1
+    }
+    artifact['sha256'] = artifact
+    raw[9]['spec']['manifest'] = artifact
+    with pytest.raises((TypeError, ValueError)):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+@pytest.mark.parametrize(('role_index', 'field'), [
+    (0, 'labels'),
+    (0, 'annotations'),
+    (5, 'labels'),
+    (5, 'annotations'),
+    (5, 'image_pull_secrets'),
+    (5, 'legacy_secret_refs'),
+])
+def test_prerequisite_parser_bounds_nested_lists_before_child_parse(
+        role_index: int, field: str) -> None:
+    raw = _prerequisite_inventory()
+    spec = raw[role_index]['spec']
+    target = spec if role_index == 0 else spec['projection']
+    target[field] = [object()] * 10_000
+
+    with pytest.raises(ValueError, match='at most 256'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
+
+
+def test_prerequisite_parser_rejects_nested_list_subclasses() -> None:
+    raw = _prerequisite_inventory()
+    raw[0]['spec']['labels'] = _ListSubclass(raw[0]['spec']['labels'])
+    with pytest.raises(TypeError, match='must be a list'):
+        actions._provider_kubernetes_prerequisite_inventory_from_value(
+            raw, name='test prerequisite inventory')
 
 
 def test_object_role_map_is_exact_immutable_and_drives_topology() -> None:
