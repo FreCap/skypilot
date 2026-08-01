@@ -4123,22 +4123,42 @@ hostname, context, or image, and is preserved by backup and authoritative
 restore. Database state alone cannot distinguish a source from its clone. The
 same row therefore carries a nullable SHA-256 digest of an external 256-bit
 writer-authority seal. The seal itself is not stored in this database or its
-backup. Every later legacy-intent producer, action producer, reconciler, and
-worker must present the seal and match the digest in the same preflight that
-checks its scoped ownership epoch. A dark store has a null digest and cannot
-write lifecycle work.
+backup. Seal possession and its database digest are proof material, not
+exclusive authority. A dark store has a null digest and cannot write lifecycle
+work.
 
-An authoritative restore may mount the original seal only after an audited
-procedure has fenced the source deployment and proved that no other holder can
-write. A clone without that explicit transfer remains writer-disabled even
-though it copied the store UUID and ownership rows. A fork may receive a new
-store UUID and new seal only after proving that it has no action-owned volume
-and no nonterminal, quarantined, or cleanup-required action; terminal evidence
-keeps its original store UUID. Copying both the database and deployment secret
-outside either procedure is unsupported split-brain, detected by the
-deployment authority audit rather than treated as a valid restore. This keeps
-two writable control planes from sharing action identity or provider ownership
-after an ordinary database clone.
+Before any scope may leave `DARK`, the deployment must acquire an externally
+enforced, short-lived, renewable single-writer grant by compare-and-set. The
+grant record is keyed only by store UUID and exact scope key. Its value carries
+the authority generation. Acquisition or transfer compares the expected prior
+generation and cannot replace any unexpired grant except a same-holder renewal;
+using generation as part of the record key is prohibited because two
+generations could then remain live. The grant is issued only through
+deployment-specific workload identity and is excluded from the database, Helm
+values, deployment backups, and ordinary secret copying. Its signed or
+attested payload binds the store UUID, scope key, authority generation, target
+ownership epoch, deployment identity, writer and reconciler implementation
+digests, serial, issue time, and expiry. Every later legacy-intent producer,
+action producer, reconciler, worker, and underlying provider attempt must
+freshly validate that live grant plus the seal digest and scoped epoch. Cached
+seal or grant possession is insufficient. Datadog observes expiry or
+split-brain signals but never grants authority.
+
+An authoritative restore or transfer first enters `DRAINING`, fences the
+source workload identity and its provider-call credentials or provider-call
+authority proxy, and revokes the old grant or waits for its expiry. It then
+waits the reviewed maximum check-to-call, provider-call, and hidden-SDK-retry
+ambiguity horizon and reconciles any call that may have escaped to readback or
+quarantine. Only after that proof may it increment the authority generation
+and ownership epoch and issue a target-bound grant. Grant expiry alone is
+insufficient because a paused old holder could have validated immediately
+before expiry and call afterward. A database and secret clone cannot acquire
+the source's unexpired external grant. A fork may receive a new store UUID,
+seal, and authority lineage only after proving that it has no action-owned
+volume and no nonterminal, quarantined, or cleanup-required action; terminal
+evidence keeps its original store UUID. The exact external grant service,
+credential fence, ambiguity horizon, and transfer protocol require the later
+activation review and are not implemented by the inert M3-S2 slice.
 
 Action UUIDv5 namespace is
 `e4abeb94-a9e7-4722-a9e7-2776d6d9e18b`. Effect UUIDv5 namespace is
@@ -4373,7 +4393,8 @@ is closed to `DARK`, `LEGACY_OPEN`, `DRAINING`, or `ACTION_OPEN`. `DARK` is an
 inert expanded schema that current legacy handlers do not consult and from
 which no lifecycle producer or worker may claim authority. The scoped row also
 stores `minimum_lifecycle_version`, a monotonically increasing ownership
-epoch, and nullable selected writer and reconciler implementation digests.
+epoch, a monotonically increasing authority generation, and nullable selected
+writer and reconciler implementation digests.
 
 Before a later compatibility release changes `DARK` to `LEGACY_OPEN`, every
 API, controller, executor, or worker process eligible to run a volume handler
@@ -4542,12 +4563,13 @@ exactly two tables: `lifecycle_store_identity` and
 random UUIDv4, schema version 1, null writer-authority digest, and database
 creation time, plus exactly one volume-pilot scope row with the key above,
 `DARK`, minimum version 0, ownership epoch 1, null writer and reconciler
-digests, and database update time. Startup fails closed on a missing,
-non-singleton, malformed, or schema-version-mismatched store identity, and the
-runtime repository exposes no operation that can replace its UUID. Downgrade
-may remove only those exact inert seed rows after locking both tables and
-proving there are no other rows; otherwise it fails closed. The lineage's
-Alembic version table is migration metadata, not a third lifecycle data table.
+digests, authority generation 0, and database update time. Startup fails closed
+on a missing, non-singleton, malformed, or schema-version-mismatched store
+identity, and the runtime repository exposes no operation that can replace its
+UUID. Downgrade may remove only those exact inert seed rows after locking both
+tables and proving there are no other rows; otherwise it fails closed. The
+lineage's Alembic version table is migration metadata, not a third lifecycle
+data table.
 
 M3-S2 adds no sidecar, process-capability, binding, legacy-intent, action,
 request-correlation, attempt, effect, evidence, compatibility-adapter,
@@ -5309,8 +5331,9 @@ identity evidence.
   producer against the already-expanded M3-S3 schema while the selected scope
   is still `DARK`. Every API, controller, executor, or worker role capable of
   executing that scope must run N or later and pass mixed-version
-  qualification. One guarded transaction may then bind the external
-  writer-authority seal, increment the epoch, and move only that scope to
+  qualification. One guarded transition must first acquire the external grant
+  for the next authority generation, then bind the writer-authority seal,
+  increment the authority generation and epoch, and move only that scope to
   `LEGACY_OPEN`. Release N+1 cannot enable the action writer before that
   transition and its qualification window complete.
 - Release N also makes every legacy mutation admission in the selected scope
@@ -5906,7 +5929,7 @@ review also returned `PURSUE`.
 
 Verdict: `PURSUE` for the corrected M3-S1 contract at exact
 heading-through-before-Cleanup SHA-256
-`61995e1f7bf3e1cf97f44747c1938adcd9f86e08ac5d6f1df0541e5c445e4a9e`.
+`60fba2aa5323a7bbd224582991177ebeada66f1e1d6af743ba75f8ee6f1cca99`.
 This verdict supersedes Review 19 for implementation scope while preserving it
 as the history of the earlier review.
 
@@ -5920,8 +5943,10 @@ review also rejected enabling create authority before its dependency-closed
 UID-scoped delete and cleanup path was qualified.
 
 The corrected contract retains live provider identity on the durable sidecar,
-uses an external writer-authority seal plus a scope-keyed ownership epoch,
-defines `DARK`, separates M3-S2 from Release N, and narrows M3-S2 to exactly two
+uses an external writer-authority seal, renewable exclusive grant, and a
+scope-keyed ownership epoch and authority generation, plus a source workload,
+provider-call-authority, and ambiguity-horizon transfer fence. It defines
+`DARK`, separates M3-S2 from Release N, and narrows M3-S2 to exactly two
 PostgreSQL-only lifecycle data tables and two inert seed rows. The full graph,
 process capabilities, immutable bindings, payload bytes, correlations,
 evidence cardinality, identity anchors, per-effect tombstones, and restricted
@@ -5931,7 +5956,7 @@ qualified while disabled, then enabled together as one dependency-closed
 owned-PVC lifecycle scope.
 
 Independent review against base
-`26a52a759304d3ff085920d0f6298cd78089e8fc` returned `PASS`. The dstack-boundary
+`cb51285f90b54314ff76d1fbb59a779bbd059a0e` returned `PASS`. The dstack-boundary
 review and the PostgreSQL schema adversarial review independently returned
 `PURSUE` on the exact corrected digest. The characterization corpus remains
 unchanged and passing.
