@@ -28,6 +28,7 @@ from sqlalchemy.ext import asyncio as sql_async
 from sky import global_user_state_cloud_checks
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
+from sky import global_user_state_service_account_tokens
 from sky import models
 from sky import sky_logging
 from sky import skypilot_config
@@ -3423,47 +3424,17 @@ def add_service_account_token(token_id: str,
     """Add a service account token to the database."""
     engine = _db_manager.get_engine()
     created_at = int(time.time())
-
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
-        insert_stmnt = insert_func(service_account_token_table).values(
-            token_id=token_id,
-            token_name=token_name,
-            token_hash=token_hash,
-            created_at=created_at,
-            expires_at=expires_at,
-            creator_user_hash=creator_user_hash,
-            service_account_user_id=service_account_user_id)
-        session.execute(insert_stmnt)
-        session.commit()
+    global_user_state_service_account_tokens.add_service_account_token(
+        engine, orm.Session, sqlite.insert, postgresql.insert, token_id,
+        token_name, token_hash, creator_user_hash, service_account_user_id,
+        expires_at, created_at)
 
 
 @metrics_lib.time_me
 def get_service_account_token(token_id: str) -> dict[str, Any] | None:
     """Get a service account token by token_id."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(service_account_token_table).filter_by(
-            token_id=token_id).first()
-    if row is None:
-        return None
-    return {
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    }
+    return global_user_state_service_account_tokens.get_service_account_token(
+        _db_manager.get_engine(), orm.Session, token_id)
 
 
 @metrics_lib.time_me
@@ -3475,41 +3446,15 @@ def get_service_account_token_by_hash(token_hash: str) -> dict[str, Any] | None:
     take effect (the DB row's hash is updated on rotation, so old JWTs
     stop matching). Relies on the unique index on token_hash.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(service_account_token_table).filter_by(
-            token_hash=token_hash).first()
-    if row is None:
-        return None
-    return {
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    }
+    return global_user_state_service_account_tokens.get_service_account_token_by_hash(
+        _db_manager.get_engine(), orm.Session, token_hash)
 
 
 @metrics_lib.time_me
 def get_user_service_account_tokens(user_hash: str) -> list[dict[str, Any]]:
     """Get all service account tokens for a user (as creator)."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(service_account_token_table).filter_by(
-            creator_user_hash=user_hash).all()
-    return [{
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    } for row in rows]
+    return global_user_state_service_account_tokens.get_user_service_account_tokens(
+        _db_manager.get_engine(), orm.Session, user_hash)
 
 
 @metrics_lib.time_me
@@ -3518,11 +3463,8 @@ def update_service_account_token_last_used(token_id: str) -> None:
     engine = _db_manager.get_engine()
     last_used_at = int(time.time())
 
-    with orm.Session(engine) as session:
-        session.query(service_account_token_table).filter_by(
-            token_id=token_id).update(
-                {service_account_token_table.c.last_used_at: last_used_at})
-        session.commit()
+    global_user_state_service_account_tokens.update_service_account_token_last_used(
+        engine, orm.Session, token_id, last_used_at)
 
 
 @db_retries.retry
@@ -3533,12 +3475,8 @@ def delete_service_account_token(token_id: str) -> bool:
     Returns:
         True if token was found and deleted.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        result = session.query(service_account_token_table).filter_by(
-            token_id=token_id).delete()
-        session.commit()
-    return result > 0
+    return global_user_state_service_account_tokens.delete_service_account_token(
+        _db_manager.get_engine(), orm.Session, token_id)
 
 
 @metrics_lib.time_me
@@ -3555,20 +3493,9 @@ def rotate_service_account_token(token_id: str,
     engine = _db_manager.get_engine()
     current_time = int(time.time())
 
-    with orm.Session(engine) as session:
-        count = session.query(service_account_token_table).filter_by(
-            token_id=token_id
-        ).update({
-            service_account_token_table.c.token_hash: new_token_hash,
-            service_account_token_table.c.expires_at: new_expires_at,
-            service_account_token_table.c.last_used_at: None,  # Reset last used
-            # Update creation time
-            service_account_token_table.c.created_at: current_time,
-        })
-        session.commit()
-
-    if count == 0:
-        raise ValueError(f'Service account token {token_id} not found.')
+    global_user_state_service_account_tokens.rotate_service_account_token(
+        engine, orm.Session, token_id, new_token_hash, new_expires_at,
+        current_time)
 
 
 @db_retries.retry
@@ -3710,48 +3637,15 @@ def get_expired_service_account_tokens_by_name_prefix(
     Tokens with no expiration are excluded. The LIKE pattern is built with
     SQLAlchemy parameterization so the prefix cannot inject SQL.
     """
-    engine = _db_manager.get_engine()
-    # Escape the LIKE metacharacters in the prefix so callers can pass an
-    # arbitrary string without it being treated as a pattern.
-    escaped_prefix = name_prefix.replace('\\', '\\\\').replace('%',
-                                                               '\\%').replace(
-                                                                   '_', '\\_')
-    like_pattern = f'{escaped_prefix}%'
-    with orm.Session(engine) as session:
-        rows = session.query(service_account_token_table).filter(
-            service_account_token_table.c.token_name.like(like_pattern,
-                                                          escape='\\'),
-            service_account_token_table.c.expires_at.isnot(None),
-            service_account_token_table.c.expires_at < now,
-        ).all()
-    return [{
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    } for row in rows]
+    return global_user_state_service_account_tokens.get_expired_service_account_tokens_by_name_prefix(
+        _db_manager.get_engine(), orm.Session, name_prefix, now)
 
 
 @metrics_lib.time_me
 def get_all_service_account_tokens() -> list[dict[str, Any]]:
     """Get all service account tokens across all users (for admin access)."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(service_account_token_table).all()
-    return [{
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    } for row in rows]
+    return global_user_state_service_account_tokens.get_all_service_account_tokens(
+        _db_manager.get_engine(), orm.Session)
 
 
 @metrics_lib.time_me
