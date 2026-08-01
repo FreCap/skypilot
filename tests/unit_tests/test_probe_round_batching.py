@@ -341,7 +341,8 @@ class TestProbeRoundBatching(unittest.TestCase):
         # fed the round's returned snapshot.
         self.assertEqual(full_read.call_count, 1)
         status_update.assert_called_once_with('svc', [info],
-                                              manager._update_mode)
+                                              manager._update_mode,
+                                              target_num_replicas=None)
         ownership_wait.assert_called_once_with(10)
 
     def test_no_tracked_replicas_skips_probe_round_work(self):

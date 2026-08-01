@@ -274,6 +274,170 @@ class TestBackgroundDutyOwnershipLifecycle:
 
         mgr._probe_all_replicas.assert_not_called()
 
+    def test_prober_uses_authoritative_autoscaler_target_for_status(self):
+        mgr = self._stopped_manager()
+        mgr._ownership_lost = mock.Mock(spec=threading.Event)
+        mgr._ownership_lost.is_set.return_value = False
+        mgr._ownership_lost.wait.return_value = True
+        mgr._probe_all_replicas = mock.Mock(return_value=[])
+        mgr._target_num_replicas_lock = threading.Lock()
+        mgr._target_num_replicas = 0
+        mgr._target_num_replicas_generation = 0
+        mgr._status_epoch_lock = threading.Lock()
+        mgr._status_epoch_generation = 0
+        mgr.latest_version = 1
+        mgr._service_name = 'svc'
+        mgr._update_mode = serve_utils.UpdateMode.ROLLING
+        mgr._tick_version_spec_cache = {}
+        mgr._db_fence_kwargs = mock.Mock(return_value={})
+        mgr._get_endpoint_probe_interval_seconds = mock.Mock(return_value=1)
+
+        with mock.patch.object(
+                replica_managers.serve_utils,
+                'set_service_status_and_active_versions_from_replica'
+        ) as set_st:
+            mgr._replica_prober()
+
+        set_st.assert_called_once_with('svc', [],
+                                       serve_utils.UpdateMode.ROLLING,
+                                       target_num_replicas=0)
+
+    def test_autoscaler_target_publication_is_version_fenced(self):
+        mgr = replica_managers.ReplicaManager.__new__(
+            replica_managers.ReplicaManager)
+        mgr.lock = threading.Lock()
+        mgr._target_num_replicas_lock = threading.Lock()
+        mgr.latest_version = 2
+        mgr._target_num_replicas = None
+        mgr._target_num_replicas_generation = 0
+
+        assert not mgr.publish_target_num_replicas(0, expected_version=1)
+        assert mgr.get_target_num_replicas() is None
+        assert mgr.publish_target_num_replicas(0, expected_version=2)
+        assert mgr.get_target_num_replicas() == 0
+
+        with pytest.raises(ValueError, match='nonnegative integer'):
+            mgr.publish_target_num_replicas(-1, expected_version=2)
+        with pytest.raises(ValueError, match='nonnegative integer'):
+            mgr.publish_target_num_replicas(True, expected_version=2)
+
+    def test_status_write_serializes_version_transition(self):
+        mgr = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        mgr._target_num_replicas_lock = threading.Lock()
+        mgr._target_num_replicas = 0
+        mgr._target_num_replicas_generation = 0
+        mgr._status_epoch_lock = threading.Lock()
+        mgr._status_epoch_generation = 0
+        mgr.latest_version = 1
+        mgr._service_name = 'svc'
+        mgr._update_mode = serve_utils.UpdateMode.ROLLING
+        mgr._db_fence_kwargs = mock.Mock(return_value={})
+        status_write_entered = threading.Event()
+        release_status_write = threading.Event()
+        version_transition_started = threading.Event()
+        version_transitioned = threading.Event()
+
+        def _write_status(*args, **kwargs):
+            del args, kwargs
+            status_write_entered.set()
+            assert release_status_write.wait(timeout=5)
+
+        def _transition_version():
+            version_transition_started.set()
+            mgr._transition_status_epoch_for_version(
+                2, serve_utils.UpdateMode.BLUE_GREEN)
+            version_transitioned.set()
+
+        writer = threading.Thread(
+            target=mgr._set_service_status_from_replica_infos, args=([],))
+        transition = threading.Thread(target=_transition_version)
+        with mock.patch.object(
+                replica_managers.serve_utils,
+                'set_service_status_and_active_versions_from_replica',
+                side_effect=_write_status) as set_st:
+            writer.start()
+            assert status_write_entered.wait(timeout=5)
+            transition.start()
+            assert version_transition_started.wait(timeout=5)
+            assert not version_transitioned.wait(timeout=0.1)
+            release_status_write.set()
+            writer.join(timeout=5)
+            transition.join(timeout=5)
+
+        assert not writer.is_alive()
+        assert not transition.is_alive()
+        set_st.assert_called_once_with('svc', [],
+                                       serve_utils.UpdateMode.ROLLING,
+                                       target_num_replicas=0)
+        assert mgr.latest_version == 2
+        assert mgr._update_mode == serve_utils.UpdateMode.BLUE_GREEN
+        assert mgr.get_target_num_replicas() is None
+
+    def test_prober_discards_snapshot_when_status_epoch_changes(self):
+        mgr = self._stopped_manager()
+        mgr._ownership_lost = mock.Mock(spec=threading.Event)
+        mgr._ownership_lost.is_set.return_value = False
+        mgr._ownership_lost.wait.return_value = True
+        mgr._target_num_replicas_lock = threading.Lock()
+        mgr._target_num_replicas = 0
+        mgr._target_num_replicas_generation = 0
+        mgr._status_epoch_lock = threading.Lock()
+        mgr._status_epoch_generation = 0
+        mgr.latest_version = 1
+        mgr._service_name = 'svc'
+        mgr._update_mode = serve_utils.UpdateMode.ROLLING
+        mgr._tick_version_spec_cache = {}
+        mgr._db_fence_kwargs = mock.Mock(return_value={})
+        mgr._get_endpoint_probe_interval_seconds = mock.Mock(return_value=1)
+
+        def _probe_and_transition():
+            mgr._transition_status_epoch_for_version(
+                2, serve_utils.UpdateMode.BLUE_GREEN)
+            return []
+
+        mgr._probe_all_replicas = mock.Mock(side_effect=_probe_and_transition)
+        with mock.patch.object(
+                replica_managers.serve_utils,
+                'set_service_status_and_active_versions_from_replica'
+        ) as set_st:
+            mgr._replica_prober()
+
+        set_st.assert_not_called()
+
+    def test_status_write_retries_same_version_target_change_once(self):
+        mgr = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        mgr._target_num_replicas_lock = threading.Lock()
+        mgr._target_num_replicas = 0
+        mgr._target_num_replicas_generation = 0
+        mgr._status_epoch_lock = threading.Lock()
+        mgr._status_epoch_generation = 0
+        mgr.latest_version = 1
+        mgr._service_name = 'svc'
+        mgr._update_mode = serve_utils.UpdateMode.ROLLING
+        mgr._db_fence_kwargs = mock.Mock(return_value={})
+
+        def _write_status(*args, **kwargs):
+            del args, kwargs
+            if set_st.call_count == 1:
+                assert mgr.publish_target_num_replicas(1, expected_version=1)
+
+        with mock.patch.object(
+                replica_managers.serve_utils,
+                'set_service_status_and_active_versions_from_replica',
+                side_effect=_write_status) as set_st:
+            mgr._set_service_status_from_replica_infos([])
+
+        assert set_st.call_args_list == [
+            mock.call('svc', [],
+                      serve_utils.UpdateMode.ROLLING,
+                      target_num_replicas=0),
+            mock.call('svc', [],
+                      serve_utils.UpdateMode.ROLLING,
+                      target_num_replicas=1),
+        ]
+
     def test_ownership_loss_interrupts_interval_before_next_round(self):
         mgr = self._stopped_manager()
         mgr._ownership_lost = mock.Mock(spec=threading.Event)
@@ -1178,6 +1342,8 @@ class TestUpdateVersionBatchesPriorVersionYamls:
 
     def test_reuses_preflight_spot_placer_for_new_task(self):
         mgr = _make_manager()
+        assert mgr.publish_target_num_replicas(
+            3, expected_version=mgr.latest_version)
         old_placer = mock.Mock(name='old_placer')
         new_placer = mock.Mock(name='new_placer')
         mgr._spot_placer = old_placer
@@ -1212,6 +1378,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         build_placer.assert_not_called()
         new_placer.inherit_preemption_state.assert_called_once_with(old_placer)
         assert mgr._spot_placer is new_placer
+        assert mgr.get_target_num_replicas() is None
 
     def test_reuses_distinct_old_version_yamls(self):
         mgr = _make_manager()

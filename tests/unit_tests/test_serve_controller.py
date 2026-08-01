@@ -1832,7 +1832,11 @@ class TestAutoscalerRuntimeSnapshot:
     def test_run_autoscaler_uses_runtime_snapshot_for_active_versions(self):
         ctrl = _make_controller()
         ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
         ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
         ctrl._autoscaler.get_decision_interval.return_value = 0
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
 
@@ -1858,6 +1862,92 @@ class TestAutoscalerRuntimeSnapshot:
 
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            0, expected_version=2)
+
+    def test_run_autoscaler_withholds_rebuilt_blind_target(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = False
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
+        ctrl._autoscaler.get_decision_interval.return_value = 0
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            None, expected_version=2)
+        ctrl._autoscaler.get_final_target_num_replicas.assert_not_called()
+
+    def test_run_autoscaler_publishes_fill_capacity_target(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = True
+        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
+        ctrl._autoscaler.get_decision_interval.return_value = 0
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            3, expected_version=2)
+
+    def test_run_autoscaler_ignores_disabled_stale_fill_target(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
+        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
+        ctrl._autoscaler.get_decision_interval.return_value = 0
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            0, expected_version=2)
 
     def test_incomplete_exact_logical_tick_revokes_prior_target(self):
         ctrl = _make_controller()
