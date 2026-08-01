@@ -16,6 +16,7 @@ import datetime
 import enum
 import json
 import re
+import types
 from typing import Any, ClassVar, TypeVar
 import uuid
 
@@ -39,6 +40,7 @@ _MAX_POSTGRES_INTEGER = 2**31 - 1
 _UTC_TIMESTAMP_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:'
                                r'[0-9]{2}\.[0-9]{6}Z$')
 _DECIMAL_INTEGER_RE = re.compile(r'^(0|[1-9][0-9]*)$')
+_DECIMAL_PORT_RE = re.compile(r'^[1-9][0-9]{0,4}$')
 WORKER_REGISTRATION_MAX_AGE = datetime.timedelta(minutes=5)
 
 PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1 = (
@@ -416,6 +418,16 @@ def _optional_text(value: Any,
     if value is None:
         return None
     return _text(value, name=name, maximum_bytes=maximum_bytes)
+
+
+def _decimal_port_text(value: Any, *, name: str) -> str:
+    """Validate canonical decimal text for a workload or management port."""
+
+    port = _text(value, name=name, maximum_bytes=_MAX_SHORT_TEXT_BYTES)
+    if (_DECIMAL_PORT_RE.fullmatch(port) is None or int(port) > 65_535):
+        raise ValueError(
+            f'{name} must be canonical decimal port text in 1..65535.')
+    return port
 
 
 def _sha256(value: Any, *, name: str) -> str:
@@ -2446,6 +2458,1202 @@ class ProviderLabelV1(_CanonicalContract):
 
     def canonical_value(self) -> JsonObject:
         return dataclasses.asdict(self)
+
+
+def _provider_label_tuple(value: Any, *,
+                          name: str) -> tuple[ProviderLabelV1, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f'{name} must be a tuple.')
+    if (len(value) > _MAX_LIST_ITEMS or
+            any(not isinstance(label, ProviderLabelV1) for label in value)):
+        raise ValueError(f'{name} must contain at most 256 typed labels.')
+    label_keys = tuple(label.key for label in value)
+    if label_keys != tuple(sorted(set(label_keys))):
+        raise ValueError(f'{name} must be sorted by unique key.')
+    return value
+
+
+class ProviderPodTopologyMutableObjectKindV1(str, enum.Enum):
+    """Closed Kubernetes kinds mutated by the direct-Pod topology."""
+
+    SERVICE = 'Service'
+    POD = 'Pod'
+
+
+class ProviderObjectRoleV1(str, enum.Enum):
+    """Closed role order for the direct-Pod topology."""
+
+    HEAD_SSH_SERVICE = 'head_ssh_service'
+    HEAD_SERVICE = 'head_service'
+    HEAD_POD = 'head_pod'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPodTopologyMutableObjectV1(_CanonicalContract):
+    """One role-specific mutable object in a direct-Pod topology."""
+
+    kind: ProviderPodTopologyMutableObjectKindV1
+    role: ProviderObjectRoleV1
+    name: str
+    labels: tuple[ProviderLabelV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'kind', 'role', 'name', 'labels'})
+    _ROLE_KINDS: ClassVar[dict[
+        ProviderObjectRoleV1, ProviderPodTopologyMutableObjectKindV1]] = {
+            ProviderObjectRoleV1.HEAD_SSH_SERVICE:
+                ProviderPodTopologyMutableObjectKindV1.SERVICE,
+            ProviderObjectRoleV1.HEAD_SERVICE:
+                ProviderPodTopologyMutableObjectKindV1.SERVICE,
+            ProviderObjectRoleV1.HEAD_POD:
+                ProviderPodTopologyMutableObjectKindV1.POD,
+        }
+
+    def __post_init__(self) -> None:
+        kind = _enum_value(ProviderPodTopologyMutableObjectKindV1,
+                           self.kind,
+                           name='topology mutable-object kind')
+        role = _enum_value(ProviderObjectRoleV1,
+                           self.role,
+                           name='topology mutable-object role')
+        object.__setattr__(self, 'kind', kind)
+        object.__setattr__(self, 'role', role)
+        if kind is not self._ROLE_KINDS[role]:
+            raise ValueError('topology mutable-object role and kind mismatch.')
+        object.__setattr__(
+            self, 'name', _text(self.name, name='topology.mutable_object.name'))
+        object.__setattr__(
+            self, 'labels',
+            _provider_label_tuple(self.labels,
+                                  name='topology mutable-object labels'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderPodTopologyMutableObjectV1':
+        raw = _closed_object(value,
+                             name='topology mutable object',
+                             keys=cls._KEYS)
+        labels = raw['labels']
+        if not isinstance(labels, list):
+            raise TypeError('topology mutable-object labels must be a list.')
+        return cls(kind=raw['kind'],
+                   role=raw['role'],
+                   name=raw['name'],
+                   labels=tuple(
+                       ProviderLabelV1.from_value(label) for label in labels))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'kind': self.kind.value,
+            'role': self.role.value,
+            'name': self.name,
+            'labels': [label.canonical_value() for label in self.labels],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPodTopologyV1(_CanonicalContract):
+    """Exact one-Pod/two-Service provider topology."""
+
+    version: int
+    kind: str
+    node_count: int
+    application_port: str
+    resources_ports: tuple[str, ...]
+    mutable_objects: tuple[ProviderPodTopologyMutableObjectV1, ...]
+    shared_prerequisites: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'kind', 'node_count', 'application_port', 'resources_ports',
+        'mutable_objects', 'shared_prerequisites'
+    })
+    _EXPECTED_ROLES: ClassVar[tuple[ProviderObjectRoleV1, ...]] = (
+        ProviderObjectRoleV1.HEAD_SSH_SERVICE,
+        ProviderObjectRoleV1.HEAD_SERVICE,
+        ProviderObjectRoleV1.HEAD_POD,
+    )
+    _DISPLAY_LABEL: ClassVar[str] = 'skypilot-cluster-name'
+    _CLUSTER_UUID_LABEL: ClassVar[str] = 'skypilot.co/cluster-record-uuid'
+    _REPLICA_UUID_LABEL: ClassVar[str] = 'skypilot.co/serve-replica-incarnation'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='pod topology version')
+        if self.kind != 'single_direct_pod_two_services':
+            raise ValueError('pod topology kind is unsupported.')
+        if (not isinstance(self.node_count, int) or
+                isinstance(self.node_count, bool) or self.node_count != 1):
+            raise ValueError('pod topology node_count must be integer 1.')
+        object.__setattr__(
+            self, 'application_port',
+            _decimal_port_text(self.application_port,
+                               name='topology.application_port'))
+        if not isinstance(self.resources_ports, tuple):
+            raise TypeError('topology resources_ports must be a tuple.')
+        resources_ports = tuple(
+            _decimal_port_text(port, name='topology.resources_ports')
+            for port in self.resources_ports)
+        if resources_ports != (self.application_port,):
+            raise ValueError('topology resources_ports must contain exactly '
+                             'the application port.')
+        object.__setattr__(self, 'resources_ports', resources_ports)
+        if (not isinstance(self.mutable_objects, tuple) or
+                len(self.mutable_objects) != len(self._EXPECTED_ROLES) or
+                any(not isinstance(item, ProviderPodTopologyMutableObjectV1)
+                    for item in self.mutable_objects)):
+            raise ValueError('pod topology mutable_objects must be the exact '
+                             'three typed role entries.')
+        roles = tuple(item.role for item in self.mutable_objects)
+        if roles != self._EXPECTED_ROLES:
+            raise ValueError('pod topology mutable_objects have invalid order.')
+        if self.shared_prerequisites != 'preexisting_read_only':
+            raise ValueError('pod topology shared prerequisites are '
+                             'unsupported.')
+        ssh_service, head_service, head_pod = self.mutable_objects
+        workload_name = head_service.name
+        if (head_pod.name != workload_name or
+                ssh_service.name != f'{workload_name}-ssh' or
+                not workload_name.endswith('-head') or
+                len(workload_name) == len('-head')):
+            raise ValueError('pod topology mutable-object names are '
+                             'inconsistent.')
+        complete_label_maps = tuple(
+            item.labels for item in self.mutable_objects)
+        if len(set(complete_label_maps)) != len(complete_label_maps):
+            raise ValueError('pod topology complete role label maps must be '
+                             'pairwise distinct.')
+        provider_cluster_name = workload_name[:-len('-head')]
+        required_label_keys = (self._DISPLAY_LABEL, self._CLUSTER_UUID_LABEL,
+                               self._REPLICA_UUID_LABEL)
+        shared_values: dict[str, str] | None = None
+        for item in self.mutable_objects:
+            labels = {label.key: label.value for label in item.labels}
+            if any(key not in labels for key in required_label_keys):
+                raise ValueError('every topology mutable object requires the '
+                                 'three provider identity labels.')
+            identity_values = {key: labels[key] for key in required_label_keys}
+            if shared_values is None:
+                shared_values = identity_values
+            elif identity_values != shared_values:
+                raise ValueError('topology identity label values must match '
+                                 'across all mutable objects.')
+        assert shared_values is not None
+        if shared_values[self._DISPLAY_LABEL] != provider_cluster_name:
+            raise ValueError('topology display-cluster label does not match '
+                             'the workload name.')
+        for key in (self._CLUSTER_UUID_LABEL, self._REPLICA_UUID_LABEL):
+            _uuid(shared_values[key], name=f'topology label {key}')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderPodTopologyV1':
+        raw = _closed_object(value, name='pod topology', keys=cls._KEYS)
+        resources_ports = raw['resources_ports']
+        mutable_objects = raw['mutable_objects']
+        if not isinstance(resources_ports, list):
+            raise TypeError('topology resources_ports must be a list.')
+        if not isinstance(mutable_objects, list):
+            raise TypeError('topology mutable_objects must be a list.')
+        return cls(version=raw['version'],
+                   kind=raw['kind'],
+                   node_count=raw['node_count'],
+                   application_port=raw['application_port'],
+                   resources_ports=tuple(resources_ports),
+                   mutable_objects=tuple(
+                       ProviderPodTopologyMutableObjectV1.from_value(item)
+                       for item in mutable_objects),
+                   shared_prerequisites=raw['shared_prerequisites'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'kind': 'single_direct_pod_two_services',
+            'node_count': 1,
+            'application_port': self.application_port,
+            'resources_ports': list(self.resources_ports),
+            'mutable_objects': [
+                item.canonical_value() for item in self.mutable_objects
+            ],
+            'shared_prerequisites': 'preexisting_read_only',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPodImageV1(_CanonicalContract):
+    """Fixed explicit digest-qualified workload image contract."""
+
+    source: str
+    qualification: ProviderOCIImageQualificationV1
+    auth_strategy: str
+    implementation_contract: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'source', 'qualification', 'auth_strategy', 'implementation_contract'})
+
+    def __post_init__(self) -> None:
+        if self.source != 'explicit':
+            raise ValueError('pod image source must be explicit.')
+        if not isinstance(self.qualification, ProviderOCIImageQualificationV1):
+            raise TypeError('pod image qualification has an invalid type.')
+        if self.auth_strategy != 'anonymous':
+            raise ValueError('pod image auth strategy must be anonymous.')
+        if (self.implementation_contract
+                != 'kubernetes_serve_prebooted_runtime_v1'):
+            raise ValueError('pod image implementation contract is '
+                             'unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderPodImageV1':
+        raw = _closed_object(value, name='pod image', keys=cls._KEYS)
+        return cls(source=raw['source'],
+                   qualification=ProviderOCIImageQualificationV1.from_value(
+                       raw['qualification']),
+                   auth_strategy=raw['auth_strategy'],
+                   implementation_contract=raw['implementation_contract'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'source': 'explicit',
+            'qualification': self.qualification.canonical_value(),
+            'auth_strategy': 'anonymous',
+            'implementation_contract': 'kubernetes_serve_prebooted_runtime_v1',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesConfigProjectionV1(_CanonicalContract):
+    """Closed provider-effective configuration reads for the v1 renderer."""
+
+    version: int
+    workspace: str
+    context_mode: str
+    target_namespace: str
+    port_mode: str
+    built_in_provider: bool
+    custom_provider_implementation: None
+    custom_provisioner: None
+    custom_template: None
+    custom_pod_config: None
+    custom_metadata: tuple[Any, ...]
+    global_labels: tuple[Any, ...]
+    runtime_class_name: None
+    priority_class_name: None
+    queue: None
+    kueue: bool
+    dws: bool
+    autoscaler: None
+    detected_network_type: str
+    persistent_volumes: tuple[Any, ...]
+    object_stores: tuple[Any, ...]
+    file_mounts: tuple[Any, ...]
+    workdir: None
+    fuse: bool
+    docker_cache: bool
+    auto_mounts: bool
+    tls_material: None
+    managed_secrets: tuple[Any, ...]
+    task_secrets: tuple[Any, ...]
+    service_account_bootstrap: bool
+    rbac_bootstrap: bool
+    config_access_inventory: ProviderRepoArtifactRefV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'workspace', 'context_mode', 'target_namespace', 'port_mode',
+        'built_in_provider', 'custom_provider_implementation',
+        'custom_provisioner', 'custom_template', 'custom_pod_config',
+        'custom_metadata', 'global_labels', 'runtime_class_name',
+        'priority_class_name', 'queue', 'kueue', 'dws', 'autoscaler',
+        'detected_network_type', 'persistent_volumes', 'object_stores',
+        'file_mounts', 'workdir', 'fuse', 'docker_cache', 'auto_mounts',
+        'tls_material', 'managed_secrets', 'task_secrets',
+        'service_account_bootstrap', 'rbac_bootstrap', 'config_access_inventory'
+    })
+    _NULL_FIELDS: ClassVar[tuple[str, ...]] = ('custom_provider_implementation',
+                                               'custom_provisioner',
+                                               'custom_template',
+                                               'custom_pod_config',
+                                               'runtime_class_name',
+                                               'priority_class_name', 'queue',
+                                               'autoscaler', 'workdir',
+                                               'tls_material')
+    _EMPTY_FIELDS: ClassVar[tuple[str,
+                                  ...]] = ('custom_metadata', 'global_labels',
+                                           'persistent_volumes',
+                                           'object_stores', 'file_mounts',
+                                           'managed_secrets', 'task_secrets')
+    _FALSE_FIELDS: ClassVar[tuple[str, ...]] = ('kueue', 'dws', 'fuse',
+                                                'docker_cache', 'auto_mounts',
+                                                'service_account_bootstrap',
+                                                'rbac_bootstrap')
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='config projection version')
+        object.__setattr__(
+            self, 'workspace',
+            _text(self.workspace, name='config_projection.workspace'))
+        object.__setattr__(
+            self, 'target_namespace',
+            _text(self.target_namespace,
+                  name='config_projection.target_namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        if self.context_mode != 'in_cluster':
+            raise ValueError('config projection context_mode must be '
+                             'in_cluster.')
+        if self.port_mode != 'podip':
+            raise ValueError('config projection port_mode must be podip.')
+        _boolean(self.built_in_provider,
+                 name='config_projection.built_in_provider')
+        if not self.built_in_provider:
+            raise ValueError('config projection requires built_in_provider.')
+        for field in self._NULL_FIELDS:
+            if getattr(self, field) is not None:
+                raise ValueError(f'config projection {field} must be null.')
+        for field in self._EMPTY_FIELDS:
+            value = getattr(self, field)
+            if not isinstance(value, tuple):
+                raise TypeError(f'config projection {field} must be a tuple.')
+            if value:
+                raise ValueError(f'config projection {field} must be empty.')
+        for field in self._FALSE_FIELDS:
+            value = getattr(self, field)
+            _boolean(value, name=f'config_projection.{field}')
+            if value:
+                raise ValueError(f'config projection {field} must be false.')
+        if self.detected_network_type != 'default':
+            raise ValueError('config projection detected_network_type must be '
+                             'default.')
+        if not isinstance(self.config_access_inventory,
+                          ProviderRepoArtifactRefV1):
+            raise TypeError('config access inventory has an invalid type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesConfigProjectionV1':
+        raw = _closed_object(value, name='config projection', keys=cls._KEYS)
+        normalized = dict(raw)
+        for field in cls._EMPTY_FIELDS:
+            items = raw[field]
+            if not isinstance(items, list):
+                raise TypeError(f'config projection {field} must be a list.')
+            normalized[field] = tuple(items)
+        normalized['config_access_inventory'] = (
+            ProviderRepoArtifactRefV1.from_value(
+                raw['config_access_inventory']))
+        return cls(**normalized)
+
+    def canonical_value(self) -> JsonObject:
+        value: JsonObject = dataclasses.asdict(self)
+        for field in self._EMPTY_FIELDS:
+            value[field] = []
+        return value
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderPolicyModeEvidenceV1(_CanonicalContract):
+    """Typed proof that policy and managed-secret modes are absent."""
+
+    admin_policy_entrypoint: None
+    admin_policy_applied: bool
+    managed_secrets_provider: None
+    managed_secret_reference_count: int
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'admin_policy_entrypoint', 'admin_policy_applied',
+        'managed_secrets_provider', 'managed_secret_reference_count'
+    })
+
+    def __post_init__(self) -> None:
+        if self.admin_policy_entrypoint is not None:
+            raise ValueError('admin policy entrypoint must be null.')
+        _boolean(self.admin_policy_applied,
+                 name='policy_modes.admin_policy_applied')
+        if self.admin_policy_applied:
+            raise ValueError('admin policy applied must be false.')
+        if self.managed_secrets_provider is not None:
+            raise ValueError('managed-secrets provider must be null.')
+        _nonnegative_integer(self.managed_secret_reference_count,
+                             name='policy_modes.managed_secret_reference_count')
+        if self.managed_secret_reference_count != 0:
+            raise ValueError('managed-secret reference count must be zero.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderPolicyModeEvidenceV1':
+        raw = _closed_object(value, name='policy modes', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAnnotationV1(_CanonicalContract):
+    """One sorted, nonsecret provider annotation with generic text bounds."""
+
+    key: str
+    value: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'key', 'value'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'key', _text(self.key, name='annotation.key'))
+        object.__setattr__(self, 'value',
+                           _text(self.value, name='annotation.value'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderAnnotationV1':
+        raw = _closed_object(value, name='annotation', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+def _provider_annotation_tuple(value: Any, *,
+                               name: str) -> tuple[ProviderAnnotationV1, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f'{name} must be a tuple.')
+    if (len(value) > _MAX_LIST_ITEMS or
+            any(not isinstance(annotation, ProviderAnnotationV1)
+                for annotation in value)):
+        raise ValueError(f'{name} must contain at most 256 typed annotations.')
+    keys = tuple(annotation.key for annotation in value)
+    if keys != tuple(sorted(set(keys))):
+        raise ValueError(f'{name} must be sorted by unique key.')
+    return value
+
+
+def _sorted_text_tuple(value: Any,
+                       *,
+                       name: str,
+                       minimum_items: int = 0,
+                       maximum_bytes: int = _MAX_TEXT_BYTES) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f'{name} must be a tuple.')
+    if not minimum_items <= len(value) <= _MAX_LIST_ITEMS:
+        raise ValueError(f'{name} must contain {minimum_items}..256 values.')
+    normalized = tuple(
+        _text(item, name=f'{name}[{index}]', maximum_bytes=maximum_bytes)
+        for index, item in enumerate(value))
+    if normalized != tuple(sorted(set(normalized))):
+        raise ValueError(f'{name} must be sorted and duplicate-free.')
+    return normalized
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesServiceAccountProjectionV1(_CanonicalContract):
+    """Bounded live projection of one Kubernetes ServiceAccount."""
+
+    namespace: str
+    name: str
+    uid: str
+    resource_version: str
+    labels: tuple[ProviderLabelV1, ...]
+    annotations: tuple[ProviderAnnotationV1, ...]
+    automount_service_account_token: bool
+    image_pull_secrets: tuple[str, ...]
+    legacy_secret_refs: tuple[str, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'namespace', 'name', 'uid', 'resource_version', 'labels', 'annotations',
+        'automount_service_account_token', 'image_pull_secrets',
+        'legacy_secret_refs'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'namespace',
+            _text(self.namespace,
+                  name='service_account.namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        for field in ('name', 'uid', 'resource_version'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field), name=f'service_account.{field}'))
+        object.__setattr__(
+            self, 'labels',
+            _provider_label_tuple(self.labels, name='service-account labels'))
+        object.__setattr__(
+            self, 'annotations',
+            _provider_annotation_tuple(self.annotations,
+                                       name='service-account annotations'))
+        _boolean(self.automount_service_account_token,
+                 name='service_account.automount_service_account_token')
+        object.__setattr__(
+            self, 'image_pull_secrets',
+            _sorted_text_tuple(self.image_pull_secrets,
+                               name='service-account image-pull secrets'))
+        object.__setattr__(
+            self, 'legacy_secret_refs',
+            _sorted_text_tuple(self.legacy_secret_refs,
+                               name='service-account legacy secret refs'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls, value: Any) -> 'ProviderKubernetesServiceAccountProjectionV1':
+        raw = _closed_object(value,
+                             name='service-account projection',
+                             keys=cls._KEYS)
+        for field in ('labels', 'annotations', 'image_pull_secrets',
+                      'legacy_secret_refs'):
+            if not isinstance(raw[field], list):
+                raise TypeError(f'service-account {field} must be a list.')
+        return cls(
+            namespace=raw['namespace'],
+            name=raw['name'],
+            uid=raw['uid'],
+            resource_version=raw['resource_version'],
+            labels=tuple(
+                ProviderLabelV1.from_value(item) for item in raw['labels']),
+            annotations=tuple(
+                ProviderAnnotationV1.from_value(item)
+                for item in raw['annotations']),
+            automount_service_account_token=raw[
+                'automount_service_account_token'],
+            image_pull_secrets=tuple(raw['image_pull_secrets']),
+            legacy_secret_refs=tuple(raw['legacy_secret_refs']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'namespace': self.namespace,
+            'name': self.name,
+            'uid': self.uid,
+            'resource_version': self.resource_version,
+            'labels': [label.canonical_value() for label in self.labels],
+            'annotations': [
+                annotation.canonical_value() for annotation in self.annotations
+            ],
+            'automount_service_account_token':
+                self.automount_service_account_token,
+            'image_pull_secrets': list(self.image_pull_secrets),
+            'legacy_secret_refs': list(self.legacy_secret_refs),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesSelfIdentityV1(_CanonicalContract):
+    """Closed nonsecret SelfSubjectReview identity."""
+
+    username: str
+    uid: str
+    groups: tuple[str, ...]
+    extra_keys: tuple[Any, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'username', 'uid', 'groups', 'extra_keys'})
+    _GROUP_PREFIX: ClassVar[tuple[str, str]] = ('system:authenticated',
+                                                'system:serviceaccounts')
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'username',
+                           _text(self.username, name='self_identity.username'))
+        object.__setattr__(self, 'uid', _text(self.uid,
+                                              name='self_identity.uid'))
+        if not isinstance(self.groups, tuple):
+            raise TypeError('self identity groups must be a tuple.')
+        if len(self.groups) != 3 or self.groups[:2] != self._GROUP_PREFIX:
+            raise ValueError('self identity groups must have the exact '
+                             'authenticated service-account order.')
+        namespace_group_prefix = 'system:serviceaccounts:'
+        namespace_group = _text(self.groups[2], name='self_identity.groups[2]')
+        if not namespace_group.startswith(namespace_group_prefix):
+            raise ValueError('self identity namespace group is invalid.')
+        _text(namespace_group[len(namespace_group_prefix):],
+              name='self_identity.caller_namespace',
+              maximum_bytes=_MAX_SHORT_TEXT_BYTES)
+        object.__setattr__(self, 'groups',
+                           (*self._GROUP_PREFIX, namespace_group))
+        if not isinstance(self.extra_keys, tuple):
+            raise TypeError('self identity extra_keys must be a tuple.')
+        if self.extra_keys:
+            raise ValueError('self identity extra_keys must be empty.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesSelfIdentityV1':
+        raw = _closed_object(value, name='self identity', keys=cls._KEYS)
+        groups = raw['groups']
+        extra_keys = raw['extra_keys']
+        if not isinstance(groups, list):
+            raise TypeError('self identity groups must be a list.')
+        if not isinstance(extra_keys, list):
+            raise TypeError('self identity extra_keys must be a list.')
+        return cls(username=raw['username'],
+                   uid=raw['uid'],
+                   groups=tuple(groups),
+                   extra_keys=tuple(extra_keys))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'username': self.username,
+            'uid': self.uid,
+            'groups': list(self.groups),
+            'extra_keys': [],
+        }
+
+
+class ProviderKubernetesApiGroupV1(str, enum.Enum):
+    """Closed API groups used by the v1 provider session."""
+
+    CORE = ''
+    APPS = 'apps'
+    NETWORKING = 'networking.k8s.io'
+    ADMISSION_REGISTRATION = 'admissionregistration.k8s.io'
+    AUTHENTICATION = 'authentication.k8s.io'
+    AUTHORIZATION = 'authorization.k8s.io'
+
+
+class ProviderKubernetesResourceV1(str, enum.Enum):
+    """Closed Kubernetes resources used by the v1 provider session."""
+
+    NAMESPACES = 'namespaces'
+    SERVICE_ACCOUNTS = 'serviceaccounts'
+    PODS = 'pods'
+    SERVICES = 'services'
+    REPLICA_SETS = 'replicasets'
+    DEPLOYMENTS = 'deployments'
+    NETWORK_POLICIES = 'networkpolicies'
+    VALIDATING_ADMISSION_POLICIES = 'validatingadmissionpolicies'
+    VALIDATING_ADMISSION_POLICY_BINDINGS = ('validatingadmissionpolicybindings')
+    SELF_SUBJECT_REVIEWS = 'selfsubjectreviews'
+    SELF_SUBJECT_RULES_REVIEWS = 'selfsubjectrulesreviews'
+    SELF_SUBJECT_ACCESS_REVIEWS = 'selfsubjectaccessreviews'
+
+
+class ProviderKubernetesVerbV1(str, enum.Enum):
+    """Closed Kubernetes verbs admitted to typed review evidence."""
+
+    GET = 'get'
+    CREATE = 'create'
+    DELETE = 'delete'
+    LIST = 'list'
+    WATCH = 'watch'
+    PATCH = 'patch'
+    UPDATE = 'update'
+    DELETE_COLLECTION = 'deletecollection'
+
+
+PROVIDER_KUBERNETES_API_GROUP_RESOURCE_MAP_V1 = types.MappingProxyType({
+    ProviderKubernetesApiGroupV1.CORE: frozenset({
+        ProviderKubernetesResourceV1.NAMESPACES,
+        ProviderKubernetesResourceV1.PODS,
+        ProviderKubernetesResourceV1.SERVICE_ACCOUNTS,
+        ProviderKubernetesResourceV1.SERVICES,
+    }),
+    ProviderKubernetesApiGroupV1.ADMISSION_REGISTRATION: frozenset({
+        ProviderKubernetesResourceV1.VALIDATING_ADMISSION_POLICIES,
+        ProviderKubernetesResourceV1.VALIDATING_ADMISSION_POLICY_BINDINGS,
+    }),
+    ProviderKubernetesApiGroupV1.APPS: frozenset({
+        ProviderKubernetesResourceV1.DEPLOYMENTS,
+        ProviderKubernetesResourceV1.REPLICA_SETS,
+    }),
+    ProviderKubernetesApiGroupV1.AUTHENTICATION: frozenset(
+        {ProviderKubernetesResourceV1.SELF_SUBJECT_REVIEWS}),
+    ProviderKubernetesApiGroupV1.AUTHORIZATION: frozenset({
+        ProviderKubernetesResourceV1.SELF_SUBJECT_ACCESS_REVIEWS,
+        ProviderKubernetesResourceV1.SELF_SUBJECT_RULES_REVIEWS,
+    }),
+    ProviderKubernetesApiGroupV1.NETWORKING: frozenset(
+        {ProviderKubernetesResourceV1.NETWORK_POLICIES}),
+})
+
+
+def _sorted_enum_tuple(enum_type: type[_EnumT], value: Any, *, name: str,
+                       minimum_items: int) -> tuple[_EnumT, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f'{name} must be a tuple.')
+    if not minimum_items <= len(value) <= _MAX_LIST_ITEMS:
+        raise ValueError(f'{name} must contain {minimum_items}..256 values.')
+    parsed = tuple(
+        _enum_value(enum_type, item, name=f'{name}[{index}]')
+        for index, item in enumerate(value))
+    serialized = tuple(item.value for item in parsed)
+    if serialized != tuple(sorted(set(serialized))):
+        raise ValueError(f'{name} must be sorted and duplicate-free.')
+    return parsed
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesResourceRuleV1(_CanonicalContract):
+    """One canonical resource rule from SelfSubjectRulesReview."""
+
+    api_groups: tuple[ProviderKubernetesApiGroupV1, ...]
+    resources: tuple[ProviderKubernetesResourceV1, ...]
+    resource_names: tuple[str, ...]
+    verbs: tuple[ProviderKubernetesVerbV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'api_groups', 'resources', 'resource_names', 'verbs'})
+
+    def __post_init__(self) -> None:
+        api_groups = _sorted_enum_tuple(ProviderKubernetesApiGroupV1,
+                                        self.api_groups,
+                                        name='resource_rule.api_groups',
+                                        minimum_items=1)
+        if len(api_groups) != 1:
+            raise ValueError('resource rule requires exactly one API group.')
+        resources = _sorted_enum_tuple(ProviderKubernetesResourceV1,
+                                       self.resources,
+                                       name='resource_rule.resources',
+                                       minimum_items=1)
+        if any(resource not in PROVIDER_KUBERNETES_API_GROUP_RESOURCE_MAP_V1[
+                api_groups[0]] for resource in resources):
+            raise ValueError('resource rule contains a resource outside its '
+                             'API group.')
+        resource_names = _sorted_text_tuple(self.resource_names,
+                                            name='resource_rule.resource_names')
+        verbs = _sorted_enum_tuple(ProviderKubernetesVerbV1,
+                                   self.verbs,
+                                   name='resource_rule.verbs',
+                                   minimum_items=1)
+        object.__setattr__(self, 'api_groups', api_groups)
+        object.__setattr__(self, 'resources', resources)
+        object.__setattr__(self, 'resource_names', resource_names)
+        object.__setattr__(self, 'verbs', verbs)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesResourceRuleV1':
+        raw = _closed_object(value, name='resource rule', keys=cls._KEYS)
+        for field in cls._KEYS:
+            if not isinstance(raw[field], list):
+                raise TypeError(f'resource rule {field} must be a list.')
+        return cls(api_groups=tuple(raw['api_groups']),
+                   resources=tuple(raw['resources']),
+                   resource_names=tuple(raw['resource_names']),
+                   verbs=tuple(raw['verbs']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'api_groups': [item.value for item in self.api_groups],
+            'resources': [item.value for item in self.resources],
+            'resource_names': list(self.resource_names),
+            'verbs': [item.value for item in self.verbs],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesNonResourceRuleV1(_CanonicalContract):
+    """The sole nonresource rule allowed by the v1 provider session."""
+
+    urls: tuple[str, ...]
+    verbs: tuple[str, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'urls', 'verbs'})
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.urls, tuple) or not isinstance(
+                self.verbs, tuple):
+            raise TypeError('nonresource rule fields must be tuples.')
+        if self.urls != ('/version',) or self.verbs != ('get',):
+            raise ValueError('nonresource rule must be exactly GET /version.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesNonResourceRuleV1':
+        raw = _closed_object(value, name='nonresource rule', keys=cls._KEYS)
+        if not isinstance(raw['urls'], list) or not isinstance(
+                raw['verbs'], list):
+            raise TypeError('nonresource rule fields must be lists.')
+        return cls(urls=tuple(raw['urls']), verbs=tuple(raw['verbs']))
+
+    def canonical_value(self) -> JsonObject:
+        return {'urls': ['/version'], 'verbs': ['get']}
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesRulesReviewV1(_CanonicalContract):
+    """Complete canonical SelfSubjectRulesReview evidence."""
+
+    namespace: str
+    incomplete: bool
+    evaluation_error: bool
+    resource_rules: tuple[ProviderKubernetesResourceRuleV1, ...]
+    non_resource_rules: tuple[ProviderKubernetesNonResourceRuleV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'namespace', 'incomplete', 'evaluation_error', 'resource_rules',
+        'non_resource_rules'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'namespace',
+            _text(self.namespace,
+                  name='rules_review.namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        for field in ('incomplete', 'evaluation_error'):
+            value = getattr(self, field)
+            _boolean(value, name=f'rules_review.{field}')
+            if value:
+                raise ValueError(f'rules review {field} must be false.')
+        if (not isinstance(self.resource_rules, tuple) or
+                not 1 <= len(self.resource_rules) <= _MAX_LIST_ITEMS or
+                any(not isinstance(rule, ProviderKubernetesResourceRuleV1)
+                    for rule in self.resource_rules)):
+            raise ValueError('rules review resource_rules must contain 1..256 '
+                             'typed rules.')
+        rule_bytes = tuple(rule.canonical_bytes for rule in self.resource_rules)
+        if rule_bytes != tuple(sorted(set(rule_bytes))):
+            raise ValueError('rules review resource_rules must be sorted and '
+                             'duplicate-free by canonical bytes.')
+        if (not isinstance(self.non_resource_rules, tuple) or
+                len(self.non_resource_rules) != 1 or
+                not isinstance(self.non_resource_rules[0],
+                               ProviderKubernetesNonResourceRuleV1)):
+            raise ValueError('rules review requires exactly one typed '
+                             'nonresource rule.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesRulesReviewV1':
+        raw = _closed_object(value, name='rules review', keys=cls._KEYS)
+        if not isinstance(raw['resource_rules'], list):
+            raise TypeError('rules review resource_rules must be a list.')
+        if not isinstance(raw['non_resource_rules'], list):
+            raise TypeError('rules review non_resource_rules must be a list.')
+        return cls(namespace=raw['namespace'],
+                   incomplete=raw['incomplete'],
+                   evaluation_error=raw['evaluation_error'],
+                   resource_rules=tuple(
+                       ProviderKubernetesResourceRuleV1.from_value(rule)
+                       for rule in raw['resource_rules']),
+                   non_resource_rules=tuple(
+                       ProviderKubernetesNonResourceRuleV1.from_value(rule)
+                       for rule in raw['non_resource_rules']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'namespace': self.namespace,
+            'incomplete': False,
+            'evaluation_error': False,
+            'resource_rules': [
+                rule.canonical_value() for rule in self.resource_rules
+            ],
+            'non_resource_rules': [
+                rule.canonical_value() for rule in self.non_resource_rules
+            ],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesResourceAccessV1(_CanonicalContract):
+    """One typed Kubernetes resource access-review input."""
+
+    api_group: ProviderKubernetesApiGroupV1
+    resource: ProviderKubernetesResourceV1
+    subresource: None
+    verb: ProviderKubernetesVerbV1
+    namespace: str | None
+    name: str | None
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'api_group', 'resource', 'subresource', 'verb', 'namespace', 'name'})
+
+    def __post_init__(self) -> None:
+        api_group = _enum_value(ProviderKubernetesApiGroupV1,
+                                self.api_group,
+                                name='resource_access.api_group')
+        resource = _enum_value(ProviderKubernetesResourceV1,
+                               self.resource,
+                               name='resource_access.resource')
+        if resource not in PROVIDER_KUBERNETES_API_GROUP_RESOURCE_MAP_V1[
+                api_group]:
+            raise ValueError('resource access contains a resource outside its '
+                             'API group.')
+        if self.subresource is not None:
+            raise ValueError('resource access subresource must be null.')
+        verb = _enum_value(ProviderKubernetesVerbV1,
+                           self.verb,
+                           name='resource_access.verb')
+        object.__setattr__(
+            self, 'namespace',
+            _optional_text(self.namespace,
+                           name='resource_access.namespace',
+                           maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(
+            self, 'name', _optional_text(self.name,
+                                         name='resource_access.name'))
+        object.__setattr__(self, 'api_group', api_group)
+        object.__setattr__(self, 'resource', resource)
+        object.__setattr__(self, 'verb', verb)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesResourceAccessV1':
+        raw = _closed_object(value, name='resource access', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'api_group': self.api_group.value,
+            'resource': self.resource.value,
+            'subresource': None,
+            'verb': self.verb.value,
+            'namespace': self.namespace,
+            'name': self.name,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesNonResourceAccessV1(_CanonicalContract):
+    """The sole nonresource access-review input in v1."""
+
+    verb: str
+    path: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'verb', 'path'})
+
+    def __post_init__(self) -> None:
+        if self.verb != 'get' or self.path != '/version':
+            raise ValueError('nonresource access must be exactly GET /version.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesNonResourceAccessV1':
+        raw = _closed_object(value, name='nonresource access', keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {'verb': 'get', 'path': '/version'}
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesAccessDecisionV1(_CanonicalContract):
+    """One ordered expected and observed authorization decision."""
+
+    check_sequence: int
+    resource: ProviderKubernetesResourceAccessV1 | None
+    non_resource: ProviderKubernetesNonResourceAccessV1 | None
+    expected_allowed: bool
+    observed_allowed: bool
+    observed_denied: bool
+    evaluation_error: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'check_sequence', 'resource', 'non_resource', 'expected_allowed',
+        'observed_allowed', 'observed_denied', 'evaluation_error'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'check_sequence',
+            _nonnegative_integer(self.check_sequence,
+                                 name='access_decision.check_sequence'))
+        if ((self.resource is None) == (self.non_resource is None) or
+            (self.resource is not None and
+             not isinstance(self.resource, ProviderKubernetesResourceAccessV1))
+                or (self.non_resource is not None and not isinstance(
+                    self.non_resource, ProviderKubernetesNonResourceAccessV1))):
+            raise ValueError('access decision requires exactly one typed '
+                             'resource discriminator.')
+        for field in ('expected_allowed', 'observed_allowed', 'observed_denied',
+                      'evaluation_error'):
+            _boolean(getattr(self, field), name=f'access_decision.{field}')
+        if self.evaluation_error:
+            raise ValueError('access decision evaluation_error must be false.')
+        if self.observed_allowed != self.expected_allowed:
+            raise ValueError('access decision observed result differs from '
+                             'its expectation.')
+        if self.observed_allowed and self.observed_denied:
+            raise ValueError('an allowed access decision cannot also be '
+                             'observed denied.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesAccessDecisionV1':
+        raw = _closed_object(value, name='access decision', keys=cls._KEYS)
+        return cls(
+            check_sequence=raw['check_sequence'],
+            resource=(None if raw['resource'] is None else
+                      ProviderKubernetesResourceAccessV1.from_value(
+                          raw['resource'])),
+            non_resource=(None if raw['non_resource'] is None else
+                          ProviderKubernetesNonResourceAccessV1.from_value(
+                              raw['non_resource'])),
+            expected_allowed=raw['expected_allowed'],
+            observed_allowed=raw['observed_allowed'],
+            observed_denied=raw['observed_denied'],
+            evaluation_error=raw['evaluation_error'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'check_sequence': self.check_sequence,
+            'resource': (None if self.resource is None else
+                         self.resource.canonical_value()),
+            'non_resource': (None if self.non_resource is None else
+                             self.non_resource.canonical_value()),
+            'expected_allowed': self.expected_allowed,
+            'observed_allowed': self.observed_allowed,
+            'observed_denied': self.observed_denied,
+            'evaluation_error': False,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesAuthorizationEvidenceV1(_CanonicalContract):
+    """Complete content-addressed Kubernetes authorization evidence."""
+
+    identity: ProviderKubernetesSelfIdentityV1
+    rules: ProviderKubernetesRulesReviewV1
+    rules_sha256: str
+    access_matrix_contract: ProviderRepoArtifactRefV1
+    access_decisions: tuple[ProviderKubernetesAccessDecisionV1, ...]
+    access_decisions_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'identity', 'rules', 'rules_sha256', 'access_matrix_contract',
+        'access_decisions', 'access_decisions_sha256'
+    })
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, ProviderKubernetesSelfIdentityV1):
+            raise TypeError('authorization identity has an invalid type.')
+        if not isinstance(self.rules, ProviderKubernetesRulesReviewV1):
+            raise TypeError('authorization rules have an invalid type.')
+        object.__setattr__(
+            self, 'rules_sha256',
+            _sha256(self.rules_sha256, name='authorization.rules_sha256'))
+        if self.rules_sha256 != self.rules.sha256:
+            raise ValueError('authorization rules hash does not match its '
+                             'embedded preimage.')
+        if not isinstance(self.access_matrix_contract,
+                          ProviderRepoArtifactRefV1):
+            raise TypeError('authorization access-matrix contract has an '
+                            'invalid type.')
+        if (not isinstance(self.access_decisions, tuple) or
+                not 1 <= len(self.access_decisions) <= _MAX_LIST_ITEMS or
+                any(not isinstance(decision, ProviderKubernetesAccessDecisionV1)
+                    for decision in self.access_decisions)):
+            raise ValueError('authorization access_decisions must contain '
+                             '1..256 typed decisions.')
+        sequences = tuple(
+            decision.check_sequence for decision in self.access_decisions)
+        if sequences != tuple(range(len(self.access_decisions))):
+            raise ValueError('authorization access_decisions must be a '
+                             'contiguous zero-based sequence.')
+        object.__setattr__(
+            self, 'access_decisions_sha256',
+            _sha256(self.access_decisions_sha256,
+                    name='authorization.access_decisions_sha256'))
+        decisions_value = [
+            decision.canonical_value() for decision in self.access_decisions
+        ]
+        if self.access_decisions_sha256 != canonical_sha256(decisions_value):
+            raise ValueError('authorization access-decisions hash does not '
+                             'match its embedded preimage.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesAuthorizationEvidenceV1':
+        raw = _closed_object(value,
+                             name='authorization evidence',
+                             keys=cls._KEYS)
+        decisions = raw['access_decisions']
+        if not isinstance(decisions, list):
+            raise TypeError('authorization access_decisions must be a list.')
+        return cls(identity=ProviderKubernetesSelfIdentityV1.from_value(
+            raw['identity']),
+                   rules=ProviderKubernetesRulesReviewV1.from_value(
+                       raw['rules']),
+                   rules_sha256=raw['rules_sha256'],
+                   access_matrix_contract=ProviderRepoArtifactRefV1.from_value(
+                       raw['access_matrix_contract']),
+                   access_decisions=tuple(
+                       ProviderKubernetesAccessDecisionV1.from_value(decision)
+                       for decision in decisions),
+                   access_decisions_sha256=raw['access_decisions_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'identity': self.identity.canonical_value(),
+            'rules': self.rules.canonical_value(),
+            'rules_sha256': self.rules_sha256,
+            'access_matrix_contract':
+                self.access_matrix_contract.canonical_value(),
+            'access_decisions': [
+                decision.canonical_value() for decision in self.access_decisions
+            ],
+            'access_decisions_sha256': self.access_decisions_sha256,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesPrincipalsV1(_CanonicalContract):
+    """Caller/workload principals and the caller's exact authorization."""
+
+    caller: ProviderKubernetesServiceAccountProjectionV1
+    workload: ProviderKubernetesServiceAccountProjectionV1
+    caller_authorization: ProviderKubernetesAuthorizationEvidenceV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'caller', 'workload', 'caller_authorization'})
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.caller,
+                          ProviderKubernetesServiceAccountProjectionV1):
+            raise TypeError('caller service account has an invalid type.')
+        if not isinstance(self.workload,
+                          ProviderKubernetesServiceAccountProjectionV1):
+            raise TypeError('workload service account has an invalid type.')
+        if not isinstance(self.caller_authorization,
+                          ProviderKubernetesAuthorizationEvidenceV1):
+            raise TypeError('caller authorization has an invalid type.')
+        if not self.caller.automount_service_account_token:
+            raise ValueError('caller ServiceAccount token automount must be '
+                             'true.')
+        if self.workload.automount_service_account_token:
+            raise ValueError('workload ServiceAccount token automount must be '
+                             'false.')
+        if (self.workload.image_pull_secrets or
+                self.workload.legacy_secret_refs):
+            raise ValueError('workload ServiceAccount secret references must '
+                             'be empty.')
+        caller_name = (self.caller.namespace, self.caller.name)
+        workload_name = (self.workload.namespace, self.workload.name)
+        if ((caller_name == workload_name)
+                != (self.caller.uid == self.workload.uid)):
+            raise ValueError('caller/workload ServiceAccount names and UIDs '
+                             'contradict one another.')
+        authorization = self.caller_authorization
+        expected_username = (
+            f'system:serviceaccount:{self.caller.namespace}:{self.caller.name}')
+        expected_groups = ('system:authenticated', 'system:serviceaccounts',
+                           f'system:serviceaccounts:{self.caller.namespace}')
+        if (authorization.identity.username != expected_username or
+                authorization.identity.uid != self.caller.uid or
+                authorization.identity.groups != expected_groups):
+            raise ValueError('caller SelfSubjectReview identity does not match '
+                             'the caller ServiceAccount.')
+        if authorization.rules.namespace != self.workload.namespace:
+            raise ValueError('rules-review namespace must equal the workload '
+                             'ServiceAccount namespace.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesPrincipalsV1':
+        raw = _closed_object(value,
+                             name='Kubernetes principals',
+                             keys=cls._KEYS)
+        return cls(
+            caller=ProviderKubernetesServiceAccountProjectionV1.from_value(
+                raw['caller']),
+            workload=ProviderKubernetesServiceAccountProjectionV1.from_value(
+                raw['workload']),
+            caller_authorization=(
+                ProviderKubernetesAuthorizationEvidenceV1.from_value(
+                    raw['caller_authorization'])))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'caller': self.caller.canonical_value(),
+            'workload': self.workload.canonical_value(),
+            'caller_authorization': self.caller_authorization.canonical_value(),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
