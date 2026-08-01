@@ -7,6 +7,7 @@ import uuid
 from sky import sky_logging
 from sky.provision import common
 from sky.provision.do import constants
+from sky.provision.do import query_projection
 from sky.provision.do import utils
 from sky.utils import status_lib
 
@@ -261,18 +262,7 @@ def query_instances(
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     instances = utils.filter_instances(cluster_name_on_cloud,
                                        status_filters=None)
-
-    status_map = {
-        'new': status_lib.ClusterStatus.INIT,
-        'archive': status_lib.ClusterStatus.INIT,
-        'active': status_lib.ClusterStatus.UP,
-        'off': status_lib.ClusterStatus.STOPPED,
-    }
-    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
-    for instance_meta in instances.values():
-        status = status_map[instance_meta['status']]
-        statuses[instance_meta['name']] = (status, None)
-    return statuses
+    return query_projection.project_query_instances(instances)
 
 
 def open_ports(
