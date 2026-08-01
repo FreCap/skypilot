@@ -14,6 +14,7 @@ import {
   EditIcon,
 } from 'lucide-react';
 import { useMobile } from '@/hooks/useMobile';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import { ContextDetails } from '@/components/infra-context-details';
 import {
   InfrastructureSection,
@@ -186,7 +187,6 @@ export function GPUs() {
   const [kubeLoading, setKubeLoading] = useState(true);
   const [cloudLoading, setCloudLoading] = useState(true);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
-  const refreshDataRef = React.useRef(null);
   const isMobile = useMobile();
   const [kubeDataLoaded, setKubeDataLoaded] = useState(false);
   const [cloudDataLoaded, setCloudDataLoaded] = useState(false);
@@ -727,16 +727,6 @@ export function GPUs() {
     }
   };
 
-  // Effect for assigning the latest refresh entrypoint to refreshDataRef.
-  useEffect(() => {
-    refreshDataRef.current = startRefresh;
-    return () => {
-      if (refreshDataRef.current === startRefresh) {
-        refreshDataRef.current = null;
-      }
-    };
-  }, [startRefresh]);
-
   // Compute allGPUs (aggregated totals) whenever perContextGPUs changes
   useEffect(() => {
     const gpuSummary = {};
@@ -773,25 +763,9 @@ export function GPUs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Effect for interval refresh.
-  useEffect(() => {
-    let isCurrent = true;
-    const interval = setInterval(() => {
-      if (
-        isCurrent &&
-        refreshDataRef.current &&
-        window.document.visibilityState === 'visible'
-      ) {
-        // Calls the latest fetchData from the ref, with showLoadingIndicators: false
-        refreshDataRef.current({ showLoadingIndicators: false });
-      }
-    }, REFRESH_INTERVAL);
-
-    return () => {
-      isCurrent = false;
-      clearInterval(interval);
-    };
-  }, []); // Remove REFRESH_INTERVAL as it's a constant
+  useVisibleRefreshInterval(!isInitialLoad, REFRESH_INTERVAL, () => {
+    startRefresh({ showLoadingIndicators: false });
+  });
 
   // Reset states when component unmounts
   useEffect(() => {
@@ -847,15 +821,13 @@ export function GPUs() {
     // — without this, dots stay frozen on stale data until the slower
     // sky-check pass finishes.
     await Promise.all([
-      refreshDataRef.current
-        ? refreshDataRef.current({
-            showLoadingIndicators: true,
-            forceRefresh: true, // Force refresh to run sky check
-          })
-        : Promise.resolve(),
+      startRefresh({
+        showLoadingIndicators: true,
+        forceRefresh: true, // Force refresh to run sky check
+      }),
       refreshExtraInfra(),
     ]);
-  }, [refreshExtraInfra]);
+  }, [refreshExtraInfra, startRefresh]);
 
   // Effect for keyboard shortcut (Cmd+R / Ctrl+R) to force refresh
   useEffect(() => {

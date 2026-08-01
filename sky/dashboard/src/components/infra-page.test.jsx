@@ -235,6 +235,57 @@ describe('Infra page refresh lifecycle', () => {
     jest.useRealTimers();
   });
 
+  it('refreshes immediately on visibility restore without an adjacent duplicate', async () => {
+    jest.useFakeTimers();
+
+    const { unmount } = render(<GPUs />);
+    await screen.findByText('initial-context');
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(1);
+
+    Object.defineProperty(window.document, 'visibilityState', {
+      configurable: true,
+      value: 'hidden',
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(999);
+      await Promise.resolve();
+    });
+    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(1);
+
+    Object.defineProperty(window.document, 'visibilityState', {
+      configurable: true,
+      value: 'visible',
+    });
+    await act(async () => {
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(3);
+
+    unmount();
+    window.document.dispatchEvent(new Event('visibilitychange'));
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(3);
+  });
+
   it('keeps the newest manual refresh when an older background refresh resolves later', async () => {
     jest.useFakeTimers();
     const backgroundContexts = deferred();
