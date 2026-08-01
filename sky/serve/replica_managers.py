@@ -1637,6 +1637,42 @@ class SkyPilotReplicaManager(ReplicaManager):
             kwargs['expected_controller_owner'] = controller_owner
         return kwargs
 
+    def _resource_action_fence_kwargs(self) -> dict[str, Any] | None:
+        """Snapshot the current fence for a later locked action admission.
+
+        A lifecycle epoch fences one API lifecycle operation; it is not a
+        stable controller credential and legitimately advances during updates.
+        The action store revalidates this optimistic snapshot under the
+        service-row lock, so a concurrent advance safely rejects admission.
+        """
+        service_hash = getattr(self, '_service_hash', None)
+        controller_owner = getattr(self, '_controller_owner', None)
+        if service_hash is None or controller_owner is None:
+            return None
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to snapshot the current resource-action '
+                           f'fence: {common_utils.format_exception(e)}')
+            return None
+        if owner is None:
+            return None
+        service_status = owner.get('status')
+        if (owner.get('hash') != service_hash or
+            (owner.get('controller_pid'),
+             owner.get('controller_ip')) != controller_owner or
+                not isinstance(service_status, serve_state.ServiceStatus) or
+                service_status in
+                serve_state.ServiceStatus.replica_launch_blocking_statuses()):
+            return None
+        lifecycle_epoch = owner.get('lifecycle_epoch')
+        if (type(lifecycle_epoch) is not int or lifecycle_epoch <= 0):
+            return None
+        return {
+            'expected_controller_owner': controller_owner,
+            'expected_lifecycle_epoch': lifecycle_epoch,
+        }
+
     def _service_launch_authorization(self) -> bool | None:
         """Return True/False for proven authority/loss, None if unverifiable."""
         service_hash = getattr(self, '_service_hash', None)
