@@ -5,10 +5,12 @@
 import ast
 import hashlib
 import inspect
+import json
+import subprocess
+import sys
 import textwrap
 
 import click
-from click import testing as click_testing
 import pytest
 
 from sky.client.cli import command
@@ -114,10 +116,25 @@ def test_jobs_queue_bodies_are_unchanged(name: str, value: object) -> None:
 @pytest.mark.parametrize('path,expected_hash', _HELP_HASHES.items())
 def test_jobs_queue_help_is_unchanged(path: tuple[str, ...],
                                       expected_hash: str) -> None:
-    result = click_testing.CliRunner().invoke(command.cli, [*path, '--help'])
+    script = '''
+import json
+import sys
+from click import testing
+from sky.client.cli import command
 
-    assert result.exit_code == 0, result.output
-    assert hashlib.sha256(result.output.encode()).hexdigest() == expected_hash
+result = testing.CliRunner().invoke(
+    command.cli, [*sys.argv[1:], '--help'], terminal_width=80)
+if result.exit_code != 0:
+    raise result.exception or RuntimeError(result.output)
+print('__SKYPILOT_HELP__' + json.dumps(result.output))
+'''
+    result = subprocess.run([sys.executable, '-c', script, *path],
+                            check=True,
+                            capture_output=True,
+                            text=True)
+    help_output = json.loads(result.stdout.rsplit('__SKYPILOT_HELP__', 1)[1])
+
+    assert hashlib.sha256(help_output.encode()).hexdigest() == expected_hash
 
 
 def test_jobs_queue_projection_constants_are_unchanged() -> None:
