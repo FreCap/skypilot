@@ -352,7 +352,7 @@ artifacts:
   locators:
   - kind: python_ast_pattern
     path: sky/provision/__init__.py
-    symbol: _ProvisionerResolution.implementation
+    symbol: _ProvisionerResolution.resolve_operation
     pattern: legacy_module = self.legacy_registration.module if self.legacy_registration is not None else
       None
   - kind: runtime_metadata
@@ -360,9 +360,9 @@ artifacts:
     name: _legacy_mixed_owner_diagnostics
   - kind: python_ast_pattern
     path: sky/provision/__init__.py
-    symbol: _ProvisionerResolution.implementation
-    pattern: "if legacy_module is not None:\n    implementation = getattr(legacy_module, method_name,\
-      \ None)\n    if implementation is not None:\n        return implementation"
+    symbol: _ProvisionerResolution.resolve_operation
+    pattern: return _ResolvedProvisionerOperation(owner=_ProvisionerOperationOwnerV1.LEGACY,
+      authoritative_implementation=implementation)
   replacement: Strict facet ownership through ProvisionerBundleV1
   dependencies:
   - PLA-M1-001
@@ -15290,6 +15290,114 @@ artifacts:
   retained_references:
   - docs/designs/provider-lifecycle-actuation.md
   - tests/unit_tests/test_sky/server/test_provider_registration_barrier.py
+  evidence: {}
+  blocker: null
+- id: PLA-M4-102
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_head_selection
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/instance.py
+    symbol: _get_head_instance
+  replacement: Shared immutable cluster inventory and pure next-action planner
+  dependencies:
+  - PLA-M4-103
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_legacy_head_selector
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_head_selection_and_ambiguity_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_head_selection_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_shared_head_planner_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_legacy_head_selector_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local head selector owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-103
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_target_count_head_repair_and_create_policy
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: run_instances
+    call: _get_head_instance
+  - kind: python_ast_pattern
+    path: sky/provision/do/instance.py
+    symbol: run_instances
+    pattern: to_start_count = config.count - len(exist_instances)
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: run_instances
+    call: utils.rename_instance
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: run_instances
+    call: utils.create_instance
+  replacement: Shared immutable inventory planner plus provider-local single-effect node actuation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_legacy_target_and_create_policy
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_target_head_create_and_identity_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_target_and_create_policy_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_shared_cluster_planner_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_legacy_target_and_create_policy_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local target and create policy owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
   evidence: {}
   blocker: null
 - id: PLA-M5-001

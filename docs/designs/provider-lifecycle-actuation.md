@@ -6155,6 +6155,569 @@ executor, controller, and general regression safety, but does not qualify the
 DigitalOcean route. Without credentialed DigitalOcean access, the rollout must
 stop at shadow mode.
 
+#### Rejected M4 query-capability planner shadow
+
+Status: rejected before any runtime commit by Review 28. This section is
+retained as an auditable rejected alternative and is not authorized for
+implementation. The active prerequisite is the typed resolved provider
+operation foundation below.
+
+This lifecycle audit is pinned to SkyPilot
+`e61407e93acc8e4566476feceb1da0166f48470d` and dstack
+`c9ebdaad6bbaa3105061d79f6ab52af9d609e99d`.
+
+dstack has a useful responsibility boundary that SkyPilot does not yet have.
+Its VM backends expose short create, terminate, and provisioning-observation
+operations. The server pipeline owns repeated observation, deadlines, and
+state transitions. The DigitalOcean implementation, for example, returns an
+incomplete `JobProvisioningData` after create and later fills its address via
+`update_provisioning_data()`. This does not make dstack's whole pipeline a
+drop-in design for SkyPilot, and several dstack providers still contain local
+waits. The transferable rule is narrower: provider code should translate and
+submit provider-native operations, while one shared owner should decide the
+next cluster step from an immutable observation.
+
+SkyPilot currently repeats that second responsibility in provider modules.
+Every concrete new-provisioner `run_instances()` owns some combination of
+target-count policy, head selection, stopped-node reuse, create ordering,
+polling, timeouts, result projection, and cleanup. DigitalOcean makes the
+boundary especially visible. Its `run_instances()` performs seven different
+time-varying reads around waits and effects, starts every stopped node even
+when `resume_stopped_nodes` is false, selects heads by provider page order,
+uses random names, and proves readiness by counts rather than by intended
+provider identities. Its stop and terminate paths likewise prove global
+counts rather than the state or absence of every submitted target. The generic
+post-run `wait_instances()` adds no safety because the DigitalOcean
+implementation is a no-op. A single pre-mutation observation cannot reconstruct
+those histories or truthfully predict the final `ProvisionRecord`.
+
+The first pilot therefore introduces two foundations with deliberately
+different evidence levels:
+
+1. a provider-neutral, pure, one-step cluster planner exercised against a
+   frozen DigitalOcean corpus; and
+2. a duplicate-preserving DigitalOcean inventory sidecar and exact query
+   projector shadowed from the same provider response as the authoritative
+   legacy `query_instances()` result.
+
+The first pilot has no actuation path. It does not add a required method to
+`InstanceLifecycleV1`, select dispatch, call a provider from the planner, or
+claim end-to-end `run_instances()` or `ProvisionRecord` parity.
+
+##### Raw capture, semantic inventory, and legacy evidence
+
+`DigitalOceanInventoryCaptureResultV1` is a closed union produced during one
+existing paginated droplet-list traversal. Success is exact type
+`DigitalOceanInventoryCaptureSuccessV1` and contains only recursively
+immutable DigitalOcean node rows, a bounded legacy response order, a canonical
+semantic inventory, and successful capture evidence. Failure is exact type
+`DigitalOceanInventoryCaptureFailureV1` and contains only one closed reason
+plus saturated page and row counts. Failure contains no node, response order,
+partial inventory, or digest. Constructors reject every other combination.
+The legacy instance mapping remains a plain new `dict` with the same
+last-value-wins and first-key-position behavior as today. It is not stored in
+the semantic inventory. Raw provider mappings, SDK objects, clients,
+credentials, provider configuration, tags, networks, arbitrary nested values,
+request identifiers, cursor URLs, and exception text never enter a frozen
+value.
+
+`DigitalOceanNodeRefV1` has `provider_instance_id` and
+`legacy_instance_name`. The former is the canonical decimal DigitalOcean
+droplet ID and is the only candidate future effect identity. The latter is the
+current droplet name and exists for legacy projection only.
+`DigitalOceanNodeObservationV1` adds the closed
+`DigitalOceanNativeStateV1`, closed `NodeRoleV1`, and provider region. The
+native state grammar is exactly `new`, `archive`, `active`, and `off`.
+Operation-specific projectors retain that grammar: query maps `new` and
+`archive` to `INIT`, `active` to `UP`, and `off` to `STOPPED`, while launch
+projection rejects `archive` instead of normalizing it to `new`. Role is
+`HEAD` only when the exact name ends in `-head`, `WORKER` only when it ends in
+`-worker`, and `UNCLASSIFIED` otherwise.
+
+A normal row must be an exact string-keyed `dict`. `id`, `name`, and `status`
+are read from exact scalar values. Provider region is read only from exact
+nested shape `row['region']['slug']`, where both dictionaries have exact
+string keys and `slug` is an exact bounded string. Missing, subclassed,
+aliased, malformed, or over-bound region shape makes only the sidecar fail.
+Unexpected exact-string keys and their values are ignored without access.
+
+The canonical semantic inventory has these exact fields:
+
+- `schema_version`, exactly `1`;
+- `provider_name`, exactly `do` for this adapter;
+- `cluster_name_on_cloud`;
+- `ownership_kind`, exactly `LEGACY_CLUSTER_TAG`;
+- `incarnation_kind`, exactly `UNKNOWN`;
+- `actuation_eligible`, exactly false;
+- canonical nodes sorted by the UTF-8 bytes of
+  `(provider_instance_id, legacy_instance_name)`; and
+- `semantic_sha256`, computed from canonical compact JSON of every preceding
+  field and canonical node, excluding the digest field itself.
+
+Capture also retains `legacy_response_order` as a bounded tuple of provider
+IDs and `capture_sha256`, which includes that order. Response order is excluded
+from `semantic_sha256`. Page count and closed capture codes are evidence and
+are not planner input. Equal semantic inventories produced by different page
+order therefore have the same semantic digest and pure plan, while their
+capture digests and legacy projections may differ. Neither digest is a
+provider version, redaction boundary, ownership proof, effect fence, or
+telemetry value.
+
+`project_digitalocean_launch_inventory_v1()` is the only adapter into the
+provider-neutral `NodeInventoryV1`. It receives the explicit launch request
+because read-only `query_instances()` has no requested-region argument. It
+translates native `new`, `active`, and `off` into `PENDING`, `READY`, and
+`STOPPED`; preserves provider and legacy identities, role, observed region,
+ownership, incarnation, and the source semantic digest; verifies every
+observed region against the request; and returns a closed not-representable
+result for `archive` or any DigitalOcean-specific ambiguity. The query
+projector reads the native capture directly, so no universal state conversion
+can erase DigitalOcean semantics. Requested region is never guessed from
+provider config or one observed node and is excluded from the raw semantic
+digest.
+
+Capture reads only an exact allowlist of exact built-in scalar and container
+types. It accepts exact `dict`, `list`, `str`, and non-boolean `int` values,
+then manually copies required scalars into tuples. Subclasses, hostile
+descriptors, noncanonical or negative IDs, invalid UTF-8, missing fields,
+source alias mutation during capture, and unknown state tokens produce one
+closed failure code. Capture never calls `str()`, `repr()`, generic deep copy,
+generic serialization, or hashing on an unvalidated provider value. Frozen
+constructors repeat exact-type, tuple, enum, and bound validation so callers
+cannot create nominally frozen objects containing mutable leaves. Identifiers
+are excluded from repr, generic serialization, and pickling.
+
+V1 sidecar limits are 32 observed pages, 1,024 observed nodes, 50 rows per
+requested page, 1 to 1,024 UTF-8 bytes for `cluster_name_on_cloud`, 64 ASCII
+bytes for an ID, 255 UTF-8 bytes for a node name, 1 to 64 UTF-8 bytes for an
+observed region, 32 UTF-8 bytes for a native state token, and 2,048 UTF-8 bytes
+for an inspected next cursor. Every string must have exact type `str` and
+encode as strict UTF-8 with no surrogate. These are diagnostic eligibility
+limits only. They never truncate or terminate the authoritative legacy
+traversal. After any limit is crossed, legacy collection continues unchanged
+and the sidecar retains only a closed overflow code, not a partial inventory.
+Repeated or backward cursors, malformed response shape, duplicate provider
+IDs, and more than 50 returned rows on one requested page likewise make the
+sidecar ineligible without changing legacy behavior.
+
+`DigitalOceanCaptureFailureReasonV1` is exactly
+`INVALID_RESPONSE_CONTAINER`, `INVALID_DROPLETS_CONTAINER`,
+`INVALID_LINKS_CONTAINER`, `INVALID_PAGE_SIZE`, `PAGE_LIMIT`, `NODE_LIMIT`,
+`INVALID_NODE_CONTAINER`, `INVALID_NODE_ID`, `INVALID_NODE_NAME`,
+`INVALID_NATIVE_STATE`, `INVALID_NODE_REGION`, `INVALID_CLUSTER_NAME`,
+`DUPLICATE_PROVIDER_ID`, `SOURCE_MUTATED`, `INVALID_CURSOR`, and
+`CURSOR_LIMIT`. The fixed enum order is the diagnostic sort order. Provider
+exceptions remain legacy exceptions and never become capture-failure reasons.
+
+Duplicate droplet names are preserved in response evidence and canonical
+nodes so the audit exposes the current dictionary collapse. A duplicate
+provider ID rejects capture. A duplicate legacy name, multiple heads,
+unclassified role, cross-region node, or archived node makes launch planning
+`NOT_REPRESENTABLE`; it is never resolved by arbitrary ordering. Unknown
+incarnation is instead a mandatory promotion blocker on every otherwise valid
+diagnostic plan. Current resources carry only name-scoped cluster tags, so
+`actuation_eligible` remains false and no plan action is executable. Promotion
+requires a reserved durable incarnation marker and a reviewed compatibility
+policy for older unmarked resources.
+
+The historical DigitalOcean cluster-name limit is not an authority gate.
+`DO._max_cluster_name_length()` returns 247, while the normal writer resolves
+the public `max_cluster_name_length()` and currently receives null. The random
+worker grammar adds 12 bytes, making values above 243 unsafe for a 255-byte
+provider name. Shadow accepts a bounded compatibility string but classifies
+create requirements above 243 bytes as
+`NOT_REPRESENTABLE(NAME_LENGTH_UNSAFE)`. Fixing the public/private method drift
+and replacing random names with a reviewed deterministic grammar are separate
+prerequisites for create promotion.
+
+##### Pure one-step planner
+
+`ClusterPlanRequestV1` contains only `cluster_name_on_cloud`, `region`,
+`desired_count`, and exact boolean `resume_stopped_nodes`. Desired count must
+have exact type `int`, excluding `bool`, and be between 1 and 1,024 for V1.
+Cluster name must be exact `str`, strict UTF-8, 1 to 1,024 bytes, and equal the
+inventory cluster name. Requested region must be exact `str`, strict UTF-8,
+and 1 to 64 bytes. Values outside that grammar are
+`NOT_REPRESENTABLE(INVALID_REQUEST_SHAPE)` shadow inputs; they do not change
+current legacy validation or exceptions.
+
+`NodeRefV1` contains exact bounded strings `provider_instance_id` and
+`legacy_instance_name`. `NodeObservationV1` contains one ref, exact
+`NodeStateV1`, exact `NodeRoleV1`, and exact bounded `provider_region`.
+`NodeInventoryV1` contains schema version, exact provider and cluster strings,
+`NodeOwnershipKindV1`, `NodeIncarnationKindV1`, exact false
+`actuation_eligible`, canonical node tuple, and source semantic digest. Direct
+constructors validate the same closed grammar as adapter construction.
+
+`plan_cluster_next_action_v1(request, inventory)` is mechanically pure. It
+cannot import or call provider adaptors, clients, credentials, environment or
+configuration readers, clocks, UUID or random generators, sleeps, logging,
+telemetry, mutable module state, or callbacks. It returns one recursively
+immutable `ClusterNextActionPlanV1` with the schema version, source semantic
+digest, request, `execution_authority`, canonical state partitions, unique
+selected head if present, one closed next action, disposition, and sorted
+blockers. `execution_authority` is exactly `PlanExecutionAuthorityV1.NONE` in
+V1. Construction rejects any other authority, callable, method that could
+submit, or executable handle.
+
+The dispositions are `COMPLETE`, `WAIT`, `WOULD_SUBMIT`, `REJECT`, and
+`NOT_REPRESENTABLE`; there is no `SUBMIT` value. The next-action union is
+closed and has these exact payloads:
+
+- `WaitForReobservationV1(nodes)` contains a canonical nonempty tuple of refs;
+- `ResumeNodesV1(nodes)` contains canonical nonempty exact provider refs;
+- `AssignHeadV1(node)` contains the canonical-minimum ready ref and is valid
+  only when ready count equals desired and no head exists;
+- `CreateSlotsV1(slots)` contains a nonempty tuple of
+  `CreateSlotV1(ordinal, role)`, ordinals exactly `0..n-1`, and a head slot at
+  ordinal zero only when required;
+- `CompleteV1()` has no payload;
+- `RejectV1(reason, nodes)` has one `RejectReasonV1` and canonical affected
+  refs; and
+- `NotRepresentableV1(reason, nodes)` has one
+  `NotRepresentableReasonV1` and canonical affected refs.
+
+Plan blockers are a duplicate-free tuple in fixed `PlanBlockerV1` enum order.
+No action contains a create or rename name. The DigitalOcean projection adds
+`RANDOM_LEGACY_HEAD_NAME` and `LEGACY_STALE_HEAD_RETURN` for head assignment,
+and `RANDOM_LEGACY_CREATE_IDENTITY` for every create requirement. These are
+promotion blockers even when the diagnostic action shape otherwise matches.
+The complete V1 blocker order is `LEGACY_CLUSTER_TAG_ONLY`,
+`INCARNATION_UNKNOWN`, `LEGACY_IGNORES_RESUME_POLICY`,
+`RANDOM_LEGACY_HEAD_NAME`, `LEGACY_STALE_HEAD_RETURN`, and
+`RANDOM_LEGACY_CREATE_IDENTITY`.
+
+`RejectReasonV1` is exactly `TOO_MANY_READY` and `TOO_MANY_OWNED`.
+`NotRepresentableReasonV1` is exactly `INVALID_REQUEST_SHAPE`,
+`V1_COUNT_LIMIT`, `DUPLICATE_LEGACY_NAME`, `MULTIPLE_HEADS`,
+`UNCLASSIFIED_ROLE`, `CROSS_REGION_NODE`, `ARCHIVED_NODE_PRESENT`, and
+`NAME_LENGTH_UNSAFE`. Capture failure is not a not-representable plan and
+cannot reach the planner.
+
+Planning order is exact:
+
+1. validate request scope, inventory identity, bounds, roles, region, native
+   projection, duplicate names, head uniqueness, and ownership truth;
+2. return `WAIT` when any pending node requires a fresh observation;
+3. when resume is true, reject if ready plus stopped exceeds desired;
+   otherwise reject when ready alone exceeds desired;
+4. when resume is true and stopped nodes fill a positive deficit, return one
+   canonical `ResumeNodesV1`; when resume is false, stopped nodes do not count
+   toward desired and DigitalOcean's current always-resume behavior is an
+   explicit `LEGACY_IGNORES_RESUME_POLICY` delta;
+5. if ready count is below desired, return `CreateSlotsV1`, including a head
+   slot first only when no unique ready head exists;
+6. if ready count equals desired but no head exists, return one deterministic
+   `AssignHeadV1`; and
+7. return `COMPLETE` only when ready count equals desired and exactly one head
+   exists.
+
+Every nonterminal decision requires a new inventory before another decision.
+The planner does not emit a loop, deadline, retry policy, provider mutation,
+cleanup, final identity set, or `ProvisionRecord`. Same request plus same
+semantic inventory produces byte-identical canonical plan JSON independent of
+provider response order. `to_canonical_json_bytes()` is the only supported
+serialization for a plan and is closed to its public scalar, enum, tuple, and
+null fields. Generic dataclass, pickle, and object serializers are prohibited.
+
+##### Query shadow integration and compatibility containment
+
+The first live hook is read-only `query_instances()`, not `run_instances()`.
+Public `sky.provision.do.instance.query_instances()` and public
+`filter_instances()` remain capture-disabled legacy delegates. The shared
+provision facade is the only owner that knows the selected route. When it has
+pinned the exact built-in DigitalOcean resolution with no strict or legacy
+registration, it enters `ProviderDiagnosticRouteV1` carrying one private
+process-local capability token and then invokes that already-pinned legacy
+callable exactly once. The built-in query can request the private carrier only
+while that exact token is active. A direct call, strict or legacy plugin,
+partial plugin fallback, delegating wrapper, whole-module or method
+replacement, `filter_instances` monkeypatch, custom module attribute
+resolution, wrong process, nested invocation, reused token, or failed
+executable seal cannot activate capture. It invokes only the already-selected
+legacy owner. The token is single-use, exact-context, PID-bound,
+unserializable, and reset after fork. It is a compatibility-routing capability,
+not provider authority, authentication, or a security boundary.
+
+Within the tokenized built-in route, the current traversal is factored through
+a private exact owner with an exact legacy-only mode and an exact capture mode.
+The unchanged public helper always uses legacy-only mode, which constructs no
+sidecar and runs no capture, projector, comparator, or diagnostic. Capture mode
+returns the ordinary plain dictionary plus the closed capture result from the
+same rows and is reachable only through the consumed private token. Admission
+also requires the facade, module, public helper, private traversal owner, query
+function, function objects, executable code, defaults, and static attribute
+resolution to match sealed built-in values. The token, admission branch, and
+capture mode are temporary compatibility artifacts and receive exact removal
+rows in the same pull request after their runtime commit SHA exists.
+
+The exact route performs one provider traversal. It constructs the legacy
+mapping with current filtering, overwrite, and insertion-order behavior,
+builds the authoritative query result first, and immediately returns or raises
+if legacy behavior fails. Only after a successful legacy result does it run
+the frozen legacy projector and comparator. The pure projector iterates the
+ordered legacy evidence and must match both result values and item order.
+Ordinary shadow exceptions are contained as closed outcomes. Cancellation,
+`KeyboardInterrupt`, `SystemExit`, and other `BaseException` control signals
+retain normal propagation. There is no second provider call, no second legacy
+call, no fallback after shadow work, and no change to the returned plain
+dictionary. Diagnostic formatting and logging run inside the same containment
+boundary, so an ordinary logging failure cannot change the legacy result.
+
+Existing Datadog collection remains the only telemetry plane. The hook emits
+no per-query match log. For `MISMATCH`, `NOT_REPRESENTABLE`, `CAPTURE_FAILURE`,
+or `SHADOW_ERROR`, it may emit one warning per exact closed
+`(contract, outcome, reason)` tuple per process generation. A PID-sensitive,
+fork-reset, bounded set no larger than the finite enum cross-product suppresses
+every repeat. Counts saturate at their V1 limits. Diagnostic formatting,
+suppression, and logging are inside containment. Logs never include cluster or
+node identities, inventory or value-derived digests, provider values,
+exception text, config, credentials, or raw responses. This slice creates no
+metrics store, database table, persisted report, timer, or identity-keyed
+cardinality.
+
+The query hook proves only same-read identity capture and status projection.
+The pure next-action planner remains offline corpus evidence in this slice.
+Live launch comparison becomes eligible only after each relevant legacy read
+is factored through the same frozen observation boundary. Even then, each
+comparison is one next decision, never an end-to-end prediction.
+
+##### Characterization, rollout, and removal gates
+
+The frozen corpus covers empty and multi-page responses; 1,024-node and
+overflow boundaries; finite repeated or backward cursor traces; malformed
+response shape; duplicate IDs and names; all four native states and unknown
+state; hostile
+container and scalar subclasses; source alias mutation; field byte limits;
+page permutations; and secret-like values in every ignored response and
+configuration location. It proves that ignored and malformed values never
+reach snapshot repr, plans, exceptions, logs, pickles, or diagnostics.
+
+An actually repeated provider cursor can keep today's unchanged legacy loop
+alive forever, in which case no sidecar result exists and no diagnostic can be
+emitted. Repeated-cursor capture assertions are therefore finite offline
+evidence only until a separately reviewed pagination timeout changes legacy
+behavior.
+
+Planner cases cover empty create with a head slot; complete unique-head
+clusters; head assignment; create workers with and without a head; pending
+wait; stopped-node resume and no-resume divergence; ready or owned excess;
+multiple heads; unclassified names; archives; cross-region nodes; duplicate
+names; desired counts 0, `True`, 1,024, and 1,025; name lengths 243, 244, and
+247; input permutation; byte-identical repeated plans; and tripwires for every
+forbidden I/O or ambient dependency.
+
+Compatibility tests prove exact cold and warm provider call counts, page
+parameters and order, ordinary result type, content and insertion order,
+legacy exception object and cause, plugin and monkeypatch routing, no shadow on
+failed identity seals, source detachment, comparator failure containment, and
+zero UUID, sleep, client, credential, config, clock, logging, or telemetry
+access from the pure planner. Direct public query plus every launch, stop,
+terminate, cluster-info, and status-filtered helper path proves zero capture,
+projector, comparator, token, and diagnostic work. Legacy lifecycle
+characterization separately records the seven launch reads, unbounded pending
+wait, 96-poll bounded waits,
+always-resume behavior, branch-dependent resumed IDs, stale head ID after
+rename, random create identities, count-only readiness, multiple-head
+inconsistency, and count-only stop and terminate completion. Those tests are
+evidence, not authorization to preserve the defects.
+
+The runtime change is deployed as an exact image with the shadow unable to
+mutate. Without a credentialed DigitalOcean account, Kubernetes rollout proves
+only import and general API, controller, and executor safety. It does not count
+as a DigitalOcean canary. Promotion remains prohibited until credentialed
+create, observe, stop, terminate, cleanup, and provider-absence tests pass with
+durable incarnation and action identity.
+
+`PLA-GAP-001` remains the dependency-closed owner for every DigitalOcean and
+cross-provider lifecycle responsibility not migrated by this pilot. After the
+runtime commit exists, a later bookkeeping commit in the same pull request
+adds exact removal rows whose `introduced_by` is that runtime SHA for the route
+token, query shadow selector, private carrier mode, comparator, diagnostic
+limiter, and emission. That commit lands and passes the manifest checker before
+any image build or deployment. The immutable inventory and pure planner are
+intended permanent owners; only temporary comparison and compatibility routing
+are `must_remove`. Later promotion rows replace the
+legacy `_get_head_instance`, target-count, start, create, readiness, stop,
+terminate, and `ProvisionRecord` owners only after their separate evidence
+gates close.
+
+#### M4 typed resolved provider operation foundation
+
+This foundation applies the narrowest lesson needed before a shared cluster
+reconciler can safely call provider primitives. dstack keeps many provider
+backends comparatively short because its shared pipeline owns the surrounding
+workflow and calls typed backend operations. SkyPilot cannot move that workflow
+until a routed operation has one explicit owner and the exact callable selected
+for that invocation. Selecting a provider and then resolving a module attribute
+again during execution leaves a race between selection and invocation. The
+foundation therefore changes operation resolution, not provider behavior.
+
+`sky.provision.provider_facets` adds the exact callable protocol
+`QueryInstancesFnV1` and the frozen
+`BuiltinQueryInstancesDiagnosticV1`. The diagnostic facet contains exactly:
+
+- `authoritative_implementation: QueryInstancesFnV1`; and
+- `diagnostic_implementation: QueryInstancesFnV1`.
+
+`ProvisionerBundleV1` appends the defaulted field
+`builtin_query_instances_diagnostic` after all existing fields so existing
+positional construction remains compatible. A caller of the public strict
+registration API must not populate this field. Strict registration rejects a
+non-`None` diagnostic facet because this is a private opt-in seam reserved for
+in-tree built-in modules. Rejection occurs before validation or mutation of
+either registration map. The field participates in exact idempotent bundle
+comparison even though public registration cannot populate it.
+
+`sky.provision` adds private operation-resolution types. The unique enum
+`_ProvisionerOperationOwnerV1` has exactly `STRICT`, `LEGACY`, and `BUILTIN`.
+The frozen `_ResolvedProvisionerOperation` contains `owner`,
+`authoritative_implementation`, and an optional `diagnostic_implementation`.
+Its `implementation` property returns the diagnostic callable when present and
+otherwise the authoritative callable. `BUILTIN` describes ownership of one
+operation, not exclusive ownership of the whole provider.
+
+`_ProvisionerResolution.resolve_operation(method_name)` preserves the existing
+precedence and returns one typed operation:
+
+1. a strict lifecycle implementation returns owner `STRICT`;
+2. a non-`None` legacy module attribute returns owner `LEGACY`;
+3. a built-in fallback returns owner `BUILTIN`; and
+4. an unavailable operation returns `None`.
+
+The mixed-owner warning remains immediately before a built-in lifecycle
+fallback. A partial legacy registration can therefore resolve its missing
+operation to `BUILTIN`, with the existing warning-once behavior. The typed
+built-in bundle keeps `LegacyInstanceLifecycleAdapter` as its compatibility
+surface, but operation resolution reads the raw built-in method exactly once
+and constructs the authoritative invocation from that exact object. The
+value-returning lifecycle methods use the selected raw callable directly.
+Pinned wrappers for `stop_instances`, `terminate_instances`, and
+`wait_instances` invoke the selected raw callable but discard its return value,
+preserving the adapter's current `None` result even if a monkeypatch returns a
+sentinel. A monkeypatch applied before an operation resolution is observed; a
+change after resolution cannot redirect that invocation. Resolution never
+caches a bundle, module, or operation, so the next facade call observes the
+next current binding.
+
+`_make_builtin_bundle()` may discover one private static module binding named
+`_QUERY_INSTANCES_DIAGNOSTIC_V1` using `inspect.getattr_static`. It accepts the
+binding only when its exact type is
+`BuiltinQueryInstancesDiagnosticV1` and both stored callables pass runtime
+validation. Validation uses the same parameter names, kinds, and defaults as
+`InstanceLifecycleV1.query_instances` after dropping protocol `self`; both
+fields must be exact undecorated Python functions with synchronous declarations
+and no `__wrapped__` binding. Validation derives the actual declaration from a
+clean function built only from the candidate's exact `__code__`, `__globals__`,
+`__name__`, `__defaults__`, `__closure__`, and `__kwdefaults__`; it never asks
+`inspect.signature()` to interpret the candidate or its writable signature
+metadata. This makes `__signature__`, `__text_signature__`, `_partialmethod`,
+and equivalent inspection overrides irrelevant. This is the closed shape of
+the intended in-tree module functions. Bound methods, callable classes or
+instances, partials, cache wrappers, decorated or cyclic functions, custom
+call descriptors, signature-spoofed functions, and any other callable shape
+are invalid even when they expose a compatible apparent signature. A missing
+binding, subclass, descriptor result mismatch, noncallable, coroutine or
+async-generator function, invalid callable shape, variadic or otherwise
+incompatible code-derived signature, or ordinary static-discovery failure is
+treated as no facet. Invalid diagnostic metadata must not make authoritative
+provider resolution fail. No provider defines the binding in this foundation
+slice, so all production calls keep their current implementation and result.
+
+The resolver attaches the optional diagnostic implementation only when every
+condition below holds:
+
+- the requested method is exactly `query_instances`;
+- the selected operation owner is `BUILTIN`;
+- there is no legacy registration for the provider, including a partial one;
+- the built-in bundle has an exact runtime-valid diagnostic facet; and
+- the facet's authoritative implementation is, by identity, the raw built-in
+  module `query_instances` observed for this resolution.
+
+The resolver uses the same single raw attribute object for authoritative
+invocation and diagnostic identity admission; it performs no second module
+lookup. The identity condition invalidates a stale facet after an attribute
+monkeypatch. Rebuilding the built-in bundle through the existing late-bound
+module getter on every resolution preserves both attribute monkeypatches and
+whole-module replacement between facade calls. A replacement module can opt in
+only by supplying its own exact valid facet. Selection never branches on a
+provider name.
+
+The generic facade performs one resolution and one invocation:
+
+```python
+operation = resolution.resolve_operation(func.__name__)
+if operation is not None:
+    return operation.implementation(*args, **kwargs)
+return func(provider_name, *args, **kwargs)
+```
+
+It does not invoke an authoritative query and then a diagnostic query. A future
+provider diagnostic must own its single provider traversal, contain any shadow
+failure internally, and return the authoritative result. The generic facade
+must not catch a diagnostic exception and retry the authoritative callable,
+because retrying may issue a second provider operation. Exceptions from the
+selected authoritative or diagnostic callable propagate unchanged. Public
+signatures, decorator order, metadata, `__wrapped__`, argument binding, and
+default-body fallback remain unchanged.
+
+This foundation explicitly excludes provider diagnostics, facade authorities,
+route or executable seals, admission tokens, context variables, locks, process
+or fork state, and provider-specific facade branches. It does not introduce a
+live planner, immutable inventory, or DigitalOcean capture path. Those require
+their own design and evidence after this resolution seam is established.
+
+The focused contract suite must prove:
+
+1. exact `STRICT`, `LEGACY`, and `BUILTIN` ownership;
+2. strict precedence over both other sources and legacy precedence over a
+   built-in;
+3. partial-legacy built-in fallback with the warning emitted once;
+4. built-in attribute and whole-module replacements made before resolution are
+   invoked, while a descriptor returning a different callable on each lookup
+   is read once and its first callable is invoked;
+5. a missing built-in operation resolves to `None` and reaches the facade
+   default;
+6. old positional and keyword bundle construction defaults the diagnostic
+   field to `None`;
+7. strict registration rejects a populated diagnostic facet before either
+   registration map changes;
+8. an exact valid fake built-in facet selects its diagnostic implementation
+   exactly once with the facade arguments and does not separately invoke the
+   authoritative implementation;
+9. replacing the raw authoritative query invalidates the facet;
+10. any legacy registration suppresses the facet, including on a built-in
+    fallback;
+11. the query facet never attaches to any other operation;
+12. noncallable, coroutine, variadic, wrong-default, and wrong-parameter
+    diagnostics are absent while the authoritative operation still runs;
+    both fields reject async generators, decorated or cyclic functions, bound
+    methods, callable classes or instances, partials, cache wrappers, and
+    unknown call descriptors or signature overrides;
+13. a built-in stop callable returning a sentinel still yields `None`;
+14. a subprocess can import and reload `sky.provision`;
+15. one direct `_ProvisionerResolution` fixture containing strict, legacy, and
+    built-in sources proves exact precedence, owner, and callable identity,
+    independently of public last-registration-wins behavior; and
+16. the existing public signature and metadata characterization remains
+    unchanged.
+
+The repository test gate includes the focused provider-facet suite, the full
+provision unit suite, formatting, type checking, linting, import checks, and
+the existing migration-removal checker. Deployment is required because this
+changes the generic provision facade. The exact built image must be deployed to
+the test control plane and prove database migration completion, API-server,
+controller, and executor readiness, direct health, stable restarts, and clean
+logs. Because no provider enables the diagnostic facet in this slice, the
+rollout is control-plane regression evidence only. It cannot claim a provider
+route or data-plane operation was exercised.
+
+This foundation adds no temporary compatibility machinery and closes no
+removal row. Existing `PLA-M4-102` and `PLA-M4-103` continue to track legacy
+DigitalOcean responsibilities, but this slice neither introduces nor removes
+those owners. The next slice may add a provider-local diagnostic facet only
+after its exact one-traversal contract and failure containment are accepted.
+
 ### M5: Serve and pools
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
@@ -7495,3 +8058,155 @@ exact-string item scans, identity comparisons, child lock reinitialization,
 signed Cloud MROs, and frozen-projection equality as the final completeness
 backstop. These corrections require one final exact-diff adversarial re-review
 before the runtime commit.
+
+### Review 26
+
+Verdict: `PURSUE` for the implemented read-only provider-registry audit and
+exact-image rollout. The final tested source head was
+`1ac0bbe433f75bd9f3ef9737e2b695393fd85419`, with contract SHA-256
+`72ea561d0f8a64d5f6292229ff16a8f6699380c99184b4353237c73a4e7bb2c8`.
+All 31 visible checks passed on that exact head, no review or unresolved thread
+remained, and PR 1141 merged normally without administrator bypass as
+`8c2b5c01d34893e046852220cdda100bcae62427`. Its exact parents are
+`b1c5f73339ee458e030cec642a8ab45cb43943c5` and
+`1ac0bbe433f75bd9f3ef9737e2b695393fd85419`.
+
+The exact merge was built as linux/amd64 and pushed by digest
+`sha256:8a96571aaa0bfd4f0cabea4236f7d948cfb0b923ae6c29994422b83409ac1ee5`.
+Four changed runtime file hashes matched the detached merge checkout, and a
+read-only-root container smoke captured 25 entries, three aliases, zero issues,
+and a conformant main-process snapshot. Helm revision 52 deployed that digest
+to the `skypilot-ha` API, controller, executor, and migration hook while
+retaining the PostgreSQL request backend, database secret, existing release
+values, and disabled physical-capacity default. The migration completed once
+with exit zero.
+
+Three stabilization samples through `2026-08-01T14:41:20Z` found two desired,
+updated, ready, and available replicas for each runtime role. All six runtime
+pods used the exact digest with zero restarts. Direct readiness passed for both
+API pods, both controllers, both executors, and the API service. The final
+20-minute application-log scan found no error, critical, traceback, exception,
+fatal, or panic match. Initial scheduling and startup-probe warnings ended by
+`2026-08-01T14:26:53Z`; Karpenter had consolidated one newly added
+underutilized node, the disruption budget preserved availability, and the
+replacement became ready. Existing Datadog agents were ready on every node
+hosting a runtime pod. No workload pod or service existed in
+`skypilot-ha-workloads`, so this rollout provides no data-plane traffic claim.
+
+This closes implementation and release qualification for the read-only audit.
+It does not close its removal rows, authorize descriptor dispatch, or qualify
+any provider mutation path.
+
+### Review 27
+
+Verdict: `PURSUE` for the exact M4 shared cluster next-action planner and
+DigitalOcean inventory pilot contract at SHA-256
+`bf5a549bc51f36ae1e7f41a79b137b033fdec232b0064de269fb69640ba39333`
+and removal manifest at SHA-256
+`52c3ca898c9ac056769c48b2147ae6b46a2992997140524a2b3a474bb9b4eb87`.
+
+The first adversarial pass returned `RESHAPE` because a delegating plugin could
+activate a public built-in shadow without route context, non-actuatable
+inventories still exposed a `SUBMIT` disposition, capture failure could coexist
+with partial inventory, plan payloads and deterministic head selection were
+underspecified, random create identity was not a blocker, provider-region
+shape was implicit, warnings were unbounded, and a truly repeated cursor could
+prevent any diagnostic result. The corrected contract uses one facade-pinned,
+single-use, PID-bound private route capability; keeps public delegates
+capture-disabled; makes capture a disjoint success/failure union; fixes
+execution authority to `NONE` and disposition to `WOULD_SUBMIT`; closes every
+action, reason, and blocker payload; reads only exact
+`row['region']['slug']`; rate-limits warnings over a finite closed key set; and
+classifies repeated-cursor evidence as finite and offline until legacy
+pagination changes.
+
+A second implementation-sequencing pass returned `RESHAPE` because the private
+traversal did not distinguish legacy-only from capture mode, the removal-row
+dependency direction was reversed, and new rows used a legacy provider alias.
+The corrected design gives every public and non-query path zero capture work,
+makes `PLA-M4-102` depend on callsite removal in `PLA-M4-103`, uses canonical
+provider `do`, and requires the exact runtime-SHA bookkeeping commit in the
+same pull request before image build or deployment. A final string-safety pass
+required exact strict UTF-8 bounds for cluster and requested-region input and a
+closed cluster-scope capture failure; those are now part of constructor and
+adapter validation.
+
+Independent contract and implementation re-reviews then returned `PURSUE` with
+no concrete blocker. The current-phase removal checker, checker tests, and
+`git diff --check` pass. This verdict authorizes implementation of the
+read-only same-response query shadow and offline pure planner only. It grants
+no node-actuation, retry, cleanup, provider dispatch, or `ProvisionRecord`
+authority.
+
+### Review 28
+
+Verdict: `PURSUE` for the M4 typed resolved provider operation foundation at
+SHA-256
+`bbbdd42ec8c804ea3b832eee0040fe2efb97f8c73834662dd8bca9b4bcc92cb2`.
+The locator-only removal manifest is at SHA-256
+`712420900df178e7f166b21a43d23304e016a4e80a8453a04c480ae2ac1a6ce5`.
+
+Implementation of the Review 27 query-capability planner shadow was rejected
+before any runtime or test commit. Independent runtime review reproduced a
+race in which the facade verified one built-in query and the legacy adapter
+resolved and invoked a replacement. It also reproduced a second race in which
+DigitalOcean admission verified one capture helper and later dynamic lookup
+invoked a replacement whose exception displaced the legacy result. The same
+review found that closure state was outside the claimed executable seal.
+Independent simplicity review found an import-and-reload regression from
+issuing a singleton diagnostic authority twice, generic-facade work on every
+provider call for a DigitalOcean-only feature, duplicate seals without an
+authoritative security boundary, and a live hook that compared only query
+projection while the proposed shared planner remained test-only. The rejected
+machinery was deleted from the worktree and never committed.
+
+The replacement contract first returned `RESHAPE` because a built-in
+`LegacyInstanceLifecycleAdapter` still performed a second attribute lookup,
+the diagnostic protocol did not runtime-validate either callable, and public
+registration could not construct the simultaneous ownership state required to
+prove precedence. The corrected contract resolves one raw built-in callable,
+pins it for that invocation while preserving legacy void-return behavior,
+treats invalid static diagnostic metadata as absent, rejects strict diagnostic
+registration before mutation, and requires a direct all-sources resolution
+fixture. Re-review of the exact section returned `PURSUE` with no concrete
+blocker.
+
+Renaming the resolver method made the two source locators for the still-open
+`PLA-M1-003` legacy method-level fallback stale. The manifest update changes
+only those symbols and their exact return pattern. It does not change the
+obligation, status, dependencies, gates, or removal authority.
+
+This verdict authorizes only the typed resolution foundation and its optional
+but unused built-in query diagnostic field. No provider may define that field
+in this slice. It grants no query shadow, inventory, planner, provider
+actuation, retry, cleanup, or `ProvisionRecord` authority.
+
+### Review 29
+
+Verdict: `PURSUE` for the implemented M4 typed resolved provider operation
+foundation at contract SHA-256
+`a82453de8a074a076f3dc96e61cb547b3263e366e076bab7c3ddc91ccd9ef3a8`.
+The locator-only removal manifest remains at SHA-256
+`712420900df178e7f166b21a43d23304e016a4e80a8453a04c480ae2ac1a6ce5`.
+
+The first implementation review reproduced that callable objects with async
+`__call__` and equality-colliding defaults could pass validation. Subsequent
+passes found async generators, class and static method descriptors, partial and
+cache wrappers, intermediate async `__wrapped__` layers, callable classes,
+custom call descriptors, and writable `__signature__`, `__text_signature__`,
+and `_partialmethod` metadata. The contract was corrected before each
+implementation change. Its final closed admission shape is an exact bare
+Python function with no `__wrapped__`, synchronous declaration, exact-type
+defaults, and a signature derived from a clean function built from code and
+real defaults rather than candidate inspection metadata. Every other shape is
+absent metadata and leaves the authoritative provider operation selected.
+
+The final independent runtime review returned `LGTM` and the final simplicity
+review returned `PASS`. The focused provider-facet suite passes 120 tests, the
+complete provision suite passes 405 tests, the removal-checker suite passes 25
+tests, and the current-phase manifest checker passes. YAPF, isort, mypy,
+pylint, dashboard lint, and dashboard formatting pass on the scoped files.
+
+This review still grants no provider diagnostic binding or provider behavior
+claim. It authorizes only the generic typed resolver and the unused private
+built-in facet seam for exact-image control-plane regression rollout.
