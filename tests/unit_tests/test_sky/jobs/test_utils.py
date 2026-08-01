@@ -1138,6 +1138,9 @@ class TestStreamLogsByIdTaskFiltering:
             'get_all_task_ids_names_statuses_logs',
             lambda jid: task_info,
         )
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_task_id_name_status_log',
+                            lambda jid, task_id: task_info[task_id])
 
         # Task filter is int 1, should match task_id=1 (eval)
         # We need to verify the filter finds the right task by checking
@@ -1176,6 +1179,9 @@ class TestStreamLogsByIdTaskFiltering:
             'get_all_task_ids_names_statuses_logs',
             lambda jid: task_info,
         )
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_task_id_name_status_log',
+                            lambda jid, task_id: task_info[task_id])
         monkeypatch.setattr(
             jobs_utils.managed_job_state, 'get_latest_task_id_status',
             mock.Mock(side_effect=AssertionError('scalar latest-task poll '

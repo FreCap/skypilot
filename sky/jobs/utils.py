@@ -1601,22 +1601,20 @@ def stream_logs_by_id(job_id: int,
                 job_msg = ('\nFailure reason: '
                            f'{managed_job_state.get_failure_reason(job_id)}')
             log_file_ever_existed = False
-            terminal_task_info = (
-                managed_job_state.get_all_task_ids_names_statuses_logs(job_id))
-            assert terminal_task_info is not None, job_id
-            total_tasks = len(terminal_task_info)
-            # Filter tasks if task filter is specified
-            if task is not None:
-                terminal_task_info = [
-                    t for t in terminal_task_info
-                    if matches_task_filter(t[0], t[1], task)
-                ]
-                if not terminal_task_info:
-                    valid_range = (f'0-{total_tasks - 1}'
-                                   if total_tasks > 1 else '0')
+            if filtered_task_id is not None:
+                terminal_task_row = managed_job_state.get_task_id_name_status_log(
+                    job_id, filtered_task_id)
+                if terminal_task_row is None:
+                    valid_range = f'0-{num_tasks - 1}' if num_tasks > 1 else '0'
                     return (f'No task found matching {task!r} in job {job_id}. '
                             f'Valid task IDs are {valid_range}.',
                             exceptions.JobExitCode.NOT_FOUND)
+                terminal_task_info = [terminal_task_row]
+            else:
+                terminal_task_info = (
+                    managed_job_state.get_all_task_ids_names_statuses_logs(
+                        job_id))
+                assert terminal_task_info is not None, job_id
             num_tasks = len(terminal_task_info)
             for (task_id, task_name, task_status, log_file,
                  logs_cleaned_at) in terminal_task_info:
