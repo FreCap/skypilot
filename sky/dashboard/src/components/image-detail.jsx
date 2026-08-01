@@ -36,6 +36,7 @@ import {
   firstImageCursorHistory,
   retreatImageCursorHistory,
 } from '@/data/image-cursor-history';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 const ARTIFACT_COLLECTIONS = [
   'releases',
@@ -199,6 +200,8 @@ export function ImageDetail() {
   const lastRequestStart = useRef(null);
   const collectionControllers = useRef({});
   const loadedScope = useRef(null);
+  const nextPollDueAtRef = useRef(null);
+  const pollingEnabledRef = useRef(false);
   const requestScopeRef = useRef(requestScope);
   requestScopeRef.current = requestScope;
   const requestStateIsCurrent = requestState.scope === requestScope;
@@ -250,6 +253,9 @@ export function ImageDetail() {
         scope,
         startedAt: owner.startedAt,
       };
+      if (source !== 'initial') {
+        nextPollDueAtRef.current = owner.startedAt + IMAGE_DETAIL_POLL_MS;
+      }
       const isCurrentRequest = () =>
         !owner.revoked &&
         requestOwner.current === owner &&
@@ -318,6 +324,20 @@ export function ImageDetail() {
               current.scope === scope ? { ...current, loading: false } : current
             );
             requestOwner.current = null;
+            if (
+              owner.source !== 'initial' &&
+              owner.source !== 'manual' &&
+              pollingEnabledRef.current &&
+              window.document.visibilityState === 'visible' &&
+              Object.keys(collectionControllers.current).length === 0
+            ) {
+              if (
+                nextPollDueAtRef.current !== null &&
+                performance.now() >= nextPollDueAtRef.current
+              ) {
+                void startLoad('poll');
+              }
+            }
           }
         }
       })();
@@ -507,97 +527,61 @@ export function ImageDetail() {
       ),
     [collectionCursorStacks]
   );
+  const pollingEnabled = hasNonterminal && viewingFirstCollectionPages;
+  pollingEnabledRef.current = pollingEnabled;
 
   useEffect(() => {
-    if (!hasNonterminal || !viewingFirstCollectionPages) return undefined;
-    let active = true;
-    let timer = null;
-    let nextPollAt = performance.now() + IMAGE_DETAIL_POLL_MS;
-    const clearTimer = () => {
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-    const scheduleAfter = (delay) => {
-      nextPollAt = performance.now() + delay;
-      clearTimer();
-      if (!active || window.document.visibilityState !== 'visible') {
-        return;
-      }
-      timer = setTimeout(run, delay);
-    };
-    const scheduleFromLastStart = (fallbackDelay = IMAGE_DETAIL_POLL_MS) => {
-      const lastStart = lastRequestStart.current;
-      const delay =
-        lastStart?.scope === requestScope
-          ? Math.max(
-              0,
-              IMAGE_DETAIL_POLL_MS - (performance.now() - lastStart.startedAt)
-            )
-          : fallbackDelay;
-      scheduleAfter(delay);
-    };
+    if (!pollingEnabled) {
+      nextPollDueAtRef.current = null;
+      return;
+    }
+    nextPollDueAtRef.current = performance.now() + IMAGE_DETAIL_POLL_MS;
+  }, [pollingEnabled, requestScope]);
 
-    const run = async () => {
-      if (!active) return;
-      clearTimer();
-      if (window.document.visibilityState !== 'visible') {
-        return;
+  const refreshWhenVisible = useCallback(
+    (refreshSource) => {
+      if (!pollingEnabledRef.current) {
+        return false;
       }
-      const lastStart = lastRequestStart.current;
-      if (lastStart?.scope === requestScope) {
-        const remaining =
-          IMAGE_DETAIL_POLL_MS - (performance.now() - lastStart.startedAt);
-        if (remaining > 0) {
-          scheduleAfter(remaining);
-          return;
-        }
+      if (
+        nextPollDueAtRef.current !== null &&
+        performance.now() < nextPollDueAtRef.current
+      ) {
+        return false;
       }
       if (Object.keys(collectionControllers.current).length > 0) {
-        scheduleAfter(IMAGE_DETAIL_POLL_MS);
-        return;
+        return false;
       }
       const owner = requestOwner.current;
-      const request =
-        owner?.scope === requestScope ? owner.promise : startLoad('poll');
-      await request;
-      scheduleFromLastStart();
-    };
-
-    const handleVisibilityChange = () => {
-      clearTimer();
-      if (window.document.visibilityState === 'visible') {
-        const remaining = Math.max(0, nextPollAt - performance.now());
-        if (remaining === 0) {
-          void run();
-          return;
-        }
-        timer = setTimeout(run, remaining);
+      if (owner?.scope === requestScope) {
+        return false;
       }
-    };
-
-    if (window.document.visibilityState === 'visible') {
-      timer = setTimeout(run, IMAGE_DETAIL_POLL_MS);
-    }
-    window.document.addEventListener(
-      'visibilitychange',
-      handleVisibilityChange
-    );
-    return () => {
-      active = false;
-      clearTimer();
-      window.document.removeEventListener(
-        'visibilitychange',
-        handleVisibilityChange
+      void startLoad(
+        refreshSource === 'visibilitychange' ? 'visibility' : 'poll'
       );
-      const owner = requestOwner.current;
-      if (owner?.scope === requestScope && owner.source === 'poll') {
-        owner.revoked = true;
-        owner.controller.abort();
-      }
-    };
-  }, [hasNonterminal, requestScope, startLoad, viewingFirstCollectionPages]);
+      return true;
+    },
+    [requestScope, startLoad]
+  );
+
+  useVisibleRefreshInterval(
+    pollingEnabled,
+    IMAGE_DETAIL_POLL_MS,
+    refreshWhenVisible
+  );
+
+  useEffect(() => {
+    if (pollingEnabled) {
+      return undefined;
+    }
+    const owner = requestOwner.current;
+    if (owner?.scope === requestScope && owner.source === 'poll') {
+      owner.revoked = true;
+      owner.controller.abort();
+      requestOwner.current = null;
+    }
+    return undefined;
+  }, [pollingEnabled, requestScope]);
 
   if (loading && !detail) {
     return (
