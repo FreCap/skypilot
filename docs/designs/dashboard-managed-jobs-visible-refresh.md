@@ -40,7 +40,8 @@ lifecycle instead of duplicating it.
 The helper records a visibility-triggered refresh timestamp. If the existing
 periodic timer fires within the same interval window, it skips that one tick to
 avoid a redundant request. It does not replace or bypass the consumers'
-in-flight ownership.
+in-flight ownership. The timestamp uses the browser's monotonic performance
+clock so wall-clock corrections cannot suppress later polling.
 
 ## Alternatives Considered
 
@@ -55,11 +56,12 @@ returns to inspect it.
 
 ## Changed-Path-to-Test Matrix
 
-| Changed path                            | Invariant                                                                                                                                                    | Test and command                                                                                                            |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `sky/dashboard/src/components/jobs.jsx` | Hidden pool ticks do no work; visibility restore refreshes once; an adjacent interval does not duplicate the refresh; unmount removes the listener and timer | `sky/dashboard/src/components/jobs.test.jsx`; `npm --prefix sky/dashboard test -- --runInBand src/components/jobs.test.jsx` |
-| `sky/dashboard/src/components/jobs.jsx` | Hidden job ticks do no work; visibility restore refreshes once through the existing automatic owner                                                          | `sky/dashboard/src/components/jobs.test.jsx`; same command                                                                  |
-| `sky/dashboard/src/components/jobs.jsx` | Initial/manual ownership, stale pool and job response fencing, dynamic batch intervals, cache reuse, and automatic refresh serialization remain intact       | Existing lifecycle cases in `sky/dashboard/src/components/jobs.test.jsx`; same command                                      |
+| Changed path                                           | Invariant                                                                                                                                                    | Test and command                                                                                                            |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `sky/dashboard/src/components/jobs.jsx`                | Hidden pool ticks do no work; visibility restore refreshes once; an adjacent interval does not duplicate the refresh; unmount removes the listener and timer | `sky/dashboard/src/components/jobs.test.jsx`; `npm --prefix sky/dashboard test -- --runInBand src/components/jobs.test.jsx` |
+| `sky/dashboard/src/hooks/useVisibleRefreshInterval.js` | A backward wall-clock correction after visibility restore suppresses only the adjacent tick, and later polling resumes                                       | `sky/dashboard/src/components/jobs.test.jsx`; same command                                                                  |
+| `sky/dashboard/src/components/jobs.jsx`                | Hidden job ticks do no work; visibility restore refreshes once through the existing automatic owner                                                          | `sky/dashboard/src/components/jobs.test.jsx`; same command                                                                  |
+| `sky/dashboard/src/components/jobs.jsx`                | Initial/manual ownership, stale pool and job response fencing, dynamic batch intervals, cache reuse, and automatic refresh serialization remain intact       | Existing lifecycle cases in `sky/dashboard/src/components/jobs.test.jsx`; same command                                      |
 
 ## Performance Evidence
 
