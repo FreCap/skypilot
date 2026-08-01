@@ -564,6 +564,7 @@ export function EstimatedSpend() {
       const role = await getCurrentUserRole();
       if (generation !== requestState.current.generation) return;
       if (role.roleFetchFailed) {
+        setForbidden(false);
         // A failed role lookup is an error, not a permission denial: keep
         // the error UI so the next refresh cycle retries.
         throw new Error('Failed to fetch current role');
@@ -579,9 +580,6 @@ export function EstimatedSpend() {
         endDate: dateRange.endDate,
       });
       if (generation !== requestState.current.generation) return;
-      if (!estimate.group_by && groupBy !== 'job') {
-        setGroupBy('job');
-      }
       setData(estimate);
       setLastFetchedAt(new Date());
     } catch (fetchError) {
@@ -589,6 +587,7 @@ export function EstimatedSpend() {
       if (fetchError.status === 403) {
         setForbidden(true);
       } else {
+        setForbidden(false);
         setError(fetchError);
       }
     } finally {

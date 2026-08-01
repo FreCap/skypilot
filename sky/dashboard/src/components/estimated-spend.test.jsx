@@ -596,11 +596,46 @@ test('does not invent purchase-option costs for a legacy server response', async
   render(<EstimatedSpend />);
 
   expect(await screen.findByText('Managed job #42')).toBeTruthy();
+  expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
+  expect(getEstimatedSpend).toHaveBeenCalledTimes(1);
   expect(screen.queryByLabelText('Group spend by')).not.toBeTruthy();
   expect(screen.queryByRole('columnheader', { name: 'Spot' })).not.toBeTruthy();
   expect(
     screen.queryByRole('columnheader', { name: 'On-demand' })
   ).not.toBeTruthy();
+});
+
+test('replaces a stale forbidden banner with a later role-fetch failure', async () => {
+  jest.useFakeTimers();
+  getCurrentUserRole
+    .mockResolvedValueOnce({ role: 'user' })
+    .mockResolvedValueOnce({
+      id: 'local',
+      name: 'local',
+      role: null,
+      roleFetchFailed: true,
+    });
+  getEstimatedSpend.mockResolvedValue(response(30, 10));
+
+  render(<EstimatedSpend />);
+
+  try {
+    expect(await screen.findByText('Admin access required')).toBeTruthy();
+    expect(getEstimatedSpend).not.toHaveBeenCalled();
+
+    await act(async () => {
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve();
+    });
+
+    expect(
+      await screen.findByText('Failed to fetch current role')
+    ).toBeTruthy();
+    expect(screen.queryByText('Admin access required')).not.toBeTruthy();
+    expect(getEstimatedSpend).not.toHaveBeenCalled();
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 test('renders daily per-service request volume and counting semantics', async () => {
