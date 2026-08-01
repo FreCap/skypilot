@@ -13,13 +13,16 @@ in progress; the closed Kubernetes transport/scope leaf is implemented and
 independently verified; topology/image/config-policy/principal/authorization
 foundation leaves are implemented and locally verified; full execution-config
 composition remains pending; bounded resource values and the generic
-prerequisite/object-plan/renderer foundations are implemented and independently
-verified, while the exact role-scoped prerequisite inventory, named capsule
-composition, and request-body renderer/normalizer artifacts are design-frozen
-and code-pending; foundational runtime/job/endpoint leaves are implemented and
-independently verified, while action-bound submit comparison and exact endpoint
-projection remain code-pending; runtime provider propagation, observation, and
-shadow instrumentation remain pending
+prerequisite/object-plan/renderer foundations, exact prerequisite role/kind map
+and role-dispatched prerequisite leaf, and launch-only endpoint
+projection/workload leaves are implemented and independently verified, while
+the enclosing 12-record inventory validator, named capsule composition, and
+request-body renderer/normalizer artifacts are design-frozen and code-pending;
+foundational runtime/job/endpoint leaves now include the closed Skylet job-spec,
+submit-request, retained-evidence, and policy-boundary-proof leaves and are
+independently verified, while contextual action-bound submit comparison,
+execution-config composition, and live preflight remain pending; runtime
+provider propagation, observation, and shadow instrumentation remain pending
 
 Last updated: 2026-08-01
 
@@ -4301,6 +4304,19 @@ observed on `boltz-test`; independent adversarial re-review accepted the leaf.
 This does not claim live URL or X.509 normalization, preflight, execution-config
 closure, or representability authority.
 
+Additional P1 leaf verification evidence on 2026-08-01: the exact 12-role
+prerequisite role/kind map, launch-only five-role endpoint projection, two
+Deployment caller projections, Namespace/ServiceAccount identity graph, closed
+Skylet job-spec/submit-request/retained-evidence values, and context-free policy
+boundary proof pass their focused canonical-wire, closed-shape, type/bound,
+alias, distinct-key/UID, cross-namespace, retained-byte, and negative mutation
+tests. The focused suites plus the adjacent provider-value, execution-foundation,
+legacy invocation, Serve033, completed-down, Kubernetes-scope, and naming suites
+pass together. Independent adversarial review accepted these context-free
+leaves. This evidence does not claim execution-capsule composition, contextual
+policy or retained-request comparison, renderer/normalizer artifacts, provider
+I/O, or authority.
+
 First-deployment cutover evidence on 2026-08-01: read-only `boltz-test`
 inspection found API schema 004, Serve 031, global-user-state 027, and no API or
 Serve resource-action tables. Helm revision 51 has every role on baseline
@@ -4798,8 +4814,9 @@ absence result through a public API.
   on the selected Boltz canary path, and verify the down preflight performs zero
   LB Deployment GETs.
 - Implementation and contract verification of execution config and access
-  inventory, the two nonrecursive policy-subject projectors, complete preflight
-  seeds and controller/executor dual policy-absence proof sequence,
+  inventory, the two nonrecursive policy-subject projectors and their contextual
+  consumption, complete preflight seeds and controller/executor dual
+  policy-absence proof sequence,
   preparation/counted-slot gate,
   normalized spec/partial UID-qualified adoption/deletion, redacted invocation
   builder, private handler claim filter, and request-handler pre-I/O/

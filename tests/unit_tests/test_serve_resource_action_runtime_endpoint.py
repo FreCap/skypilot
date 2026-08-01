@@ -120,6 +120,7 @@ def _network_policy_prerequisite(*, uid: str = 'uid-network-policy') -> dict:
         'manifest': _artifact('prerequisites/network-policy.json', 'c'),
     }
     return {
+        'role': 'endpoint_network_policy',
         'api_version': 'networking.k8s.io/v1',
         'kind': 'NetworkPolicy',
         'namespace': 'serve-canary',
@@ -132,14 +133,15 @@ def _network_policy_prerequisite(*, uid: str = 'uid-network-policy') -> dict:
     }
 
 
-def _namespace_prerequisite() -> dict:
+def _namespace_prerequisite(slot: int) -> dict:
     spec = {'kind': 'Namespace', 'labels': [], 'annotations': []}
     return {
+        'role': f'serve_lb_slot_{slot}_namespace',
         'api_version': 'v1',
         'kind': 'Namespace',
         'namespace': None,
-        'name': 'lb-a',
-        'uid': 'uid-lb-a',
+        'name': 'skypilot-ha',
+        'uid': 'uid-skypilot-ha',
         'resource_version': '18',
         'deletion_timestamp': None,
         'spec': spec,
@@ -147,36 +149,99 @@ def _namespace_prerequisite() -> dict:
     }
 
 
-def _caller(slot: int,
-            *,
-            namespace: str | None = None,
-            empty_selector: bool = False) -> dict:
-    selector = [] if empty_selector else [{
+def _service_account_prerequisite(slot: int) -> dict:
+    projection = {
+        'namespace': 'skypilot-ha',
+        'name': f'serve-lb-{slot}',
+        'uid': f'uid-serve-lb-{slot}',
+        'resource_version': str(20 + slot),
+        'labels': [],
+        'annotations': [],
+        'automount_service_account_token': False,
+        'image_pull_secrets': [],
+        'legacy_secret_refs': [],
+    }
+    spec = {'kind': 'ServiceAccount', 'projection': projection}
+    return {
+        'role': f'serve_lb_slot_{slot}_service_account',
+        'api_version': 'v1',
+        'kind': 'ServiceAccount',
+        'namespace': projection['namespace'],
+        'name': projection['name'],
+        'uid': projection['uid'],
+        'resource_version': projection['resource_version'],
+        'deletion_timestamp': None,
+        'spec': spec,
+        'spec_sha256': actions.canonical_sha256(spec),
+    }
+
+
+def _selector(slot: int) -> list[dict]:
+    return [{
         'key': 'app',
         'value': 'serve-lb'
     }, {
         'key': 'slot',
         'value': str(slot)
     }]
-    namespace = namespace or f'lb-{slot}'
+
+
+def _caller_workload(slot: int) -> dict:
+    return {
+        'api_version': 'apps/v1',
+        'kind': 'Deployment',
+        'namespace': 'skypilot-ha',
+        'name': f'serve-lb-{slot}',
+        'uid': f'uid-serve-lb-deployment-{slot}',
+        'resource_version': str(30 + slot),
+        'generation': 7,
+        'observed_generation': 7,
+        'deletion_timestamp': None,
+        'selector': _selector(slot),
+        'pod_template_labels': [{
+            'key': 'app',
+            'value': 'serve-lb'
+        }, {
+            'key': 'component',
+            'value': 'load-balancer'
+        }, {
+            'key': 'slot',
+            'value': str(slot)
+        }],
+        'service_account_name': f'serve-lb-{slot}',
+        'automount_service_account_token': False,
+    }
+
+
+def _caller(slot: int,
+            *,
+            namespace: str | None = None,
+            empty_selector: bool = False) -> dict:
+    selector = [] if empty_selector else _selector(slot)
+    namespace = namespace or 'skypilot-ha'
     return {
         'role': f'serve_lb_slot_{slot}',
         'namespace': namespace,
-        'namespace_uid': f'uid-{namespace}',
+        'namespace_uid': 'uid-skypilot-ha',
         'pod_selector': selector,
         'service_account_name': f'serve-lb-{slot}',
         'service_account_uid': f'uid-serve-lb-{slot}',
+        'workload': _caller_workload(slot),
     }
 
 
 def _endpoint() -> dict:
-    # networking.k8s.io sorts before v1 under the exact protocol key.
-    prerequisites = [_network_policy_prerequisite(), _namespace_prerequisite()]
     return {
         'mode': 'podip',
         'application_port': '8080',
         'ambient_fallback': False,
-        'network_prerequisites': prerequisites,
+        'prerequisite_projection': [
+            _network_policy_prerequisite(),
+            _namespace_prerequisite(0),
+            _service_account_prerequisite(0),
+            _namespace_prerequisite(1),
+            _service_account_prerequisite(1),
+        ],
         'required_callers': [_caller(0), _caller(1)],
     }
 
@@ -348,6 +413,62 @@ def test_post_provision_requires_wire_list_and_typed_direct_tuple() -> None:
                             runtime_artifacts=list(parsed.runtime_artifacts))
 
 
+def test_endpoint_caller_workload_roundtrip_and_structural_boundary() -> None:
+    raw = _caller_workload(0)
+    parsed = actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
+    assert parsed.canonical_value() == raw
+    assert parsed.sha256 == actions.canonical_sha256(raw)
+    assert actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(
+        parsed.canonical_value()).canonical_bytes == parsed.canonical_bytes
+
+    # Generation freshness is endpoint authority, not standalone leaf shape.
+    raw['observed_generation'] = 6
+    structurally_valid = (
+        actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw))
+    assert structurally_valid.observed_generation != structurally_valid.generation
+
+
+@pytest.mark.parametrize('field', ['selector', 'pod_template_labels'])
+def test_endpoint_caller_workload_rejects_noncanonical_label_sets(
+        field: str) -> None:
+    raw = _caller_workload(0)
+    raw[field].reverse()
+    with pytest.raises(ValueError, match='sorted'):
+        actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
+
+    raw = _caller_workload(0)
+    raw[field].append(copy.deepcopy(raw[field][0]))
+    with pytest.raises(ValueError, match='sorted'):
+        actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('api_version', 'v1'),
+    ('kind', 'Pod'),
+    ('namespace', ''),
+    ('name', ''),
+    ('uid', ''),
+    ('resource_version', ''),
+    ('generation', 0),
+    ('generation', True),
+    ('observed_generation', 0),
+    ('deletion_timestamp', '2026-08-01T00:00:00Z'),
+    ('selector', []),
+    ('selector', {}),
+    ('pod_template_labels', []),
+    ('pod_template_labels', {}),
+    ('service_account_name', ''),
+    ('automount_service_account_token', True),
+    ('automount_service_account_token', 0),
+])
+def test_endpoint_caller_workload_rejects_invalid_shape(field: str,
+                                                        value: object) -> None:
+    raw = _caller_workload(0)
+    raw[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
+
+
 def test_endpoint_caller_roundtrip_and_selector_canonicality() -> None:
     raw = _caller(0)
     parsed = actions.ProviderKubernetesEndpointCallerV1.from_value(raw)
@@ -372,6 +493,7 @@ def test_endpoint_caller_roundtrip_and_selector_canonicality() -> None:
     ('pod_selector', {}),
     ('service_account_name', ''),
     ('service_account_uid', ''),
+    ('workload', {}),
 ])
 def test_endpoint_caller_rejects_invalid_shape(field: str,
                                                value: object) -> None:
@@ -388,6 +510,12 @@ def test_endpoint_roundtrip_exact_prerequisite_and_caller_order() -> None:
     assert parsed.canonical_value() == raw
     assert tuple(caller.role.value for caller in parsed.required_callers) == (
         'serve_lb_slot_0', 'serve_lb_slot_1')
+    assert tuple(prerequisite.role.value
+                 for prerequisite in parsed.prerequisite_projection) == (
+                     'endpoint_network_policy', 'serve_lb_slot_0_namespace',
+                     'serve_lb_slot_0_service_account',
+                     'serve_lb_slot_1_namespace',
+                     'serve_lb_slot_1_service_account')
     assert parsed.sha256 == actions.canonical_sha256(raw)
     assert actions.ProviderKubernetesEndpointContractV1.from_value(
         parsed.canonical_value()).canonical_bytes == parsed.canonical_bytes
@@ -410,16 +538,147 @@ def test_endpoint_rejects_caller_role_drift(mutation: str) -> None:
         actions.ProviderKubernetesEndpointContractV1.from_value(raw)
 
 
-def test_endpoint_rejects_unsorted_or_duplicate_prerequisite_key() -> None:
+@pytest.mark.parametrize('mutation',
+                         ['reverse', 'duplicate', 'missing', 'extra', 'empty'])
+def test_endpoint_rejects_prerequisite_projection_role_drift(
+        mutation: str) -> None:
     raw = _endpoint()
-    raw['network_prerequisites'].reverse()
-    with pytest.raises(ValueError, match='sorted'):
+    projection = raw['prerequisite_projection']
+    if mutation == 'reverse':
+        projection.reverse()
+    elif mutation == 'duplicate':
+        projection[1] = copy.deepcopy(projection[0])
+    elif mutation == 'missing':
+        projection.pop()
+    elif mutation == 'extra':
+        projection.append(copy.deepcopy(projection[-1]))
+    else:
+        projection.clear()
+    with pytest.raises(ValueError, match='projection|roles'):
+        actions.ProviderKubernetesEndpointContractV1.from_value(raw)
+
+
+def test_endpoint_rejects_legacy_generic_network_prerequisites() -> None:
+    raw = _endpoint()
+    raw['network_prerequisites'] = raw.pop('prerequisite_projection')
+    with pytest.raises(ValueError, match='unknown or missing'):
         actions.ProviderKubernetesEndpointContractV1.from_value(raw)
 
     raw = _endpoint()
-    raw['network_prerequisites'].insert(
-        1, _network_policy_prerequisite(uid='different-uid'))
-    with pytest.raises(ValueError, match='sorted'):
+    raw['prerequisite_projection'] = [
+        _network_policy_prerequisite(),
+        _namespace_prerequisite(0),
+    ]
+    with pytest.raises(ValueError, match='exact five'):
+        actions.ProviderKubernetesEndpointContractV1.from_value(raw)
+
+
+@pytest.mark.parametrize('field', ['name', 'uid', 'resource_version', 'spec'])
+def test_endpoint_namespace_aliases_differ_only_by_role(field: str) -> None:
+    raw = _endpoint()
+    namespace_one = raw['prerequisite_projection'][3]
+    if field == 'spec':
+        namespace_one['spec']['labels'] = [{'key': 'slot', 'value': 'one'}]
+        namespace_one['spec_sha256'] = actions.canonical_sha256(
+            namespace_one['spec'])
+    else:
+        namespace_one[field] = f'different-{field}'
+    with pytest.raises(ValueError, match='aliases'):
+        actions.ProviderKubernetesEndpointContractV1.from_value(raw)
+
+
+@pytest.mark.parametrize('mutation', [
+    'caller_namespace',
+    'caller_namespace_uid',
+    'caller_service_account_name',
+    'caller_service_account_uid',
+    'service_account_namespace',
+    'service_account_automount',
+    'service_account_image_pull_secret',
+    'service_account_legacy_secret',
+    'workload_namespace',
+    'workload_service_account',
+    'workload_selector',
+    'workload_template_labels',
+    'workload_observed_generation',
+    'shared_service_account_key',
+    'shared_service_account_uid',
+    'shared_deployment_name',
+    'shared_deployment_uid',
+])
+def test_endpoint_rejects_every_internal_projection_mismatch(
+        mutation: str) -> None:
+    raw = _endpoint()
+    caller_zero, caller_one = raw['required_callers']
+    service_account_zero = raw['prerequisite_projection'][2]
+    service_account_one = raw['prerequisite_projection'][4]
+    if mutation == 'caller_namespace':
+        caller_one['namespace'] = 'other-namespace'
+    elif mutation == 'caller_namespace_uid':
+        caller_one['namespace_uid'] = 'other-namespace-uid'
+    elif mutation == 'caller_service_account_name':
+        caller_one['service_account_name'] = 'other-service-account'
+    elif mutation == 'caller_service_account_uid':
+        caller_one['service_account_uid'] = 'other-service-account-uid'
+    elif mutation == 'service_account_namespace':
+        service_account_one['namespace'] = 'other-namespace'
+        service_account_one['spec']['projection'][
+            'namespace'] = 'other-namespace'
+        service_account_one['spec_sha256'] = actions.canonical_sha256(
+            service_account_one['spec'])
+    elif mutation == 'service_account_automount':
+        service_account_one['spec']['projection'][
+            'automount_service_account_token'] = True
+        service_account_one['spec_sha256'] = actions.canonical_sha256(
+            service_account_one['spec'])
+    elif mutation == 'service_account_image_pull_secret':
+        service_account_one['spec']['projection']['image_pull_secrets'] = [
+            'pull-secret'
+        ]
+        service_account_one['spec_sha256'] = actions.canonical_sha256(
+            service_account_one['spec'])
+    elif mutation == 'service_account_legacy_secret':
+        service_account_one['spec']['projection']['legacy_secret_refs'] = [
+            'legacy-secret'
+        ]
+        service_account_one['spec_sha256'] = actions.canonical_sha256(
+            service_account_one['spec'])
+    elif mutation == 'workload_namespace':
+        caller_one['workload']['namespace'] = 'other-namespace'
+    elif mutation == 'workload_service_account':
+        caller_one['workload']['service_account_name'] = 'other-service-account'
+    elif mutation == 'workload_selector':
+        caller_one['workload']['selector'][1]['value'] = 'different'
+    elif mutation == 'workload_template_labels':
+        caller_one['workload']['pod_template_labels'].pop()
+    elif mutation == 'workload_observed_generation':
+        caller_one['workload']['observed_generation'] = 6
+    elif mutation == 'shared_service_account_key':
+        service_account_one['name'] = service_account_zero['name']
+        service_account_one['spec']['projection'][
+            'name'] = service_account_zero['name']
+        service_account_one['spec_sha256'] = actions.canonical_sha256(
+            service_account_one['spec'])
+        caller_one['service_account_name'] = service_account_zero['name']
+        caller_one['workload']['service_account_name'] = service_account_zero[
+            'name']
+    elif mutation == 'shared_service_account_uid':
+        service_account_one['uid'] = service_account_zero['uid']
+        service_account_one['spec']['projection']['uid'] = service_account_zero[
+            'uid']
+        service_account_one['spec_sha256'] = actions.canonical_sha256(
+            service_account_one['spec'])
+        caller_one['service_account_uid'] = service_account_zero['uid']
+    elif mutation == 'shared_deployment_name':
+        caller_one['workload']['name'] = caller_zero['workload']['name']
+    else:
+        caller_one['workload']['uid'] = caller_zero['workload']['uid']
+    expected_message = None
+    if mutation.startswith('shared_service_account'):
+        expected_message = 'endpoint ServiceAccounts must be distinct'
+    elif mutation.startswith('shared_deployment'):
+        expected_message = 'endpoint caller Deployments must be distinct'
+    with pytest.raises(ValueError, match=expected_message):
         actions.ProviderKubernetesEndpointContractV1.from_value(raw)
 
 
@@ -431,7 +690,7 @@ def test_endpoint_rejects_unsorted_or_duplicate_prerequisite_key() -> None:
     ('application_port', 8080),
     ('ambient_fallback', True),
     ('ambient_fallback', 0),
-    ('network_prerequisites', {}),
+    ('prerequisite_projection', {}),
     ('required_callers', {}),
 ])
 def test_endpoint_rejects_wrong_literals_or_wire_collections(
@@ -447,11 +706,38 @@ def test_endpoint_requires_typed_direct_tuples() -> None:
         _endpoint())
     with pytest.raises(TypeError, match='must be a tuple'):
         dataclasses.replace(parsed,
-                            network_prerequisites=list(
-                                parsed.network_prerequisites))
+                            prerequisite_projection=list(
+                                parsed.prerequisite_projection))
     with pytest.raises(ValueError, match='two typed'):
         dataclasses.replace(parsed,
                             required_callers=list(parsed.required_callers))
+
+    caller = parsed.required_callers[0]
+    with pytest.raises(TypeError, match='must be a tuple'):
+        dataclasses.replace(caller, pod_selector=list(caller.pod_selector))
+    with pytest.raises(TypeError, match='invalid type'):
+        dataclasses.replace(caller, workload={})
+
+    workload = caller.workload
+    with pytest.raises(TypeError, match='must be a tuple'):
+        dataclasses.replace(workload, selector=list(workload.selector))
+
+
+@pytest.mark.parametrize('field',
+                         ['prerequisite_projection', 'required_callers'])
+def test_endpoint_requires_wire_lists(field: str) -> None:
+    raw = _endpoint()
+    raw[field] = tuple(raw[field])
+    with pytest.raises((TypeError, ValueError)):
+        actions.ProviderKubernetesEndpointContractV1.from_value(raw)
+
+
+@pytest.mark.parametrize('field', ['selector', 'pod_template_labels'])
+def test_endpoint_caller_workload_requires_wire_lists(field: str) -> None:
+    raw = _caller_workload(0)
+    raw[field] = tuple(raw[field])
+    with pytest.raises((TypeError, ValueError)):
+        actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(raw)
 
 
 def test_leafs_accept_structural_values_without_cross_capsule_authority(
@@ -467,24 +753,33 @@ def test_leafs_accept_structural_values_without_cross_capsule_authority(
     assert (post.job_submission.contract.state_store_schema_artifact
             != post.job_submission.durability.schema_artifact)
 
-    caller_zero = _caller(0, namespace='LB Namespace', empty_selector=True)
-    caller_one = _caller(1, namespace='LB Namespace', empty_selector=True)
-    # Caller identity equality, empty selectors, and an empty prerequisite
-    # collection remain structural here; preflight/capsule owns live equality.
-    for field in ('namespace_uid', 'service_account_name',
-                  'service_account_uid'):
-        caller_one[field] = caller_zero[field]
-    endpoint_raw = {
-        'mode': 'podip',
-        'application_port': '9999',
-        'ambient_fallback': False,
-        'network_prerequisites': [],
-        'required_callers': [caller_zero, caller_one],
-    }
-    endpoint = actions.ProviderKubernetesEndpointContractV1.from_value(
-        endpoint_raw)
-    assert not endpoint.network_prerequisites
-    assert all(not caller.pod_selector for caller in endpoint.required_callers)
+    caller_raw = _caller(0,
+                         namespace='structurally-valid-other-namespace',
+                         empty_selector=True)
+    caller = actions.ProviderKubernetesEndpointCallerV1.from_value(caller_raw)
+    assert not caller.pod_selector
+    assert caller.namespace != caller.workload.namespace
+
+    workload_raw = _caller_workload(0)
+    workload_raw['observed_generation'] = 6
+    workload_raw['service_account_name'] = 'structurally-valid-other-sa'
+    workload = actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value(
+        workload_raw)
+    assert workload.observed_generation != workload.generation
+
+    service_account_raw = _service_account_prerequisite(0)
+    service_account_raw['spec']['projection'][
+        'automount_service_account_token'] = True
+    service_account_raw['spec_sha256'] = actions.canonical_sha256(
+        service_account_raw['spec'])
+    service_account = actions.ProviderKubernetesPrerequisiteV1.from_value(
+        service_account_raw)
+    assert service_account.spec.projection.automount_service_account_token
+
+    endpoint_raw = _endpoint()
+    endpoint_raw['required_callers'][0] = caller_raw
+    with pytest.raises(ValueError):
+        actions.ProviderKubernetesEndpointContractV1.from_value(endpoint_raw)
 
 
 def test_pure_runtime_endpoint_leaves_never_open_artifacts_or_live_state(
@@ -511,6 +806,8 @@ def test_pure_runtime_endpoint_leaves_never_open_artifacts_or_live_state(
      actions.ProviderKubernetesProvisionRuntimeMetadataV1.from_value),
     (_job_submission, actions.ProviderKubernetesJobSubmissionV1.from_value),
     (_post_provision, actions.ProviderKubernetesPostProvisionV1.from_value),
+    (lambda: _caller_workload(0),
+     actions.ProviderKubernetesEndpointCallerWorkloadV1.from_value),
     (lambda: _caller(0), actions.ProviderKubernetesEndpointCallerV1.from_value),
     (_endpoint, actions.ProviderKubernetesEndpointContractV1.from_value),
 ])

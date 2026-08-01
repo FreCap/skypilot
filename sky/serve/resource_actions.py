@@ -41,7 +41,7 @@ _MAX_POSTGRES_BIGINT = 2**63 - 1
 _MAX_POSTGRES_INTEGER = 2**31 - 1
 _UTC_TIMESTAMP_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:'
                                r'[0-9]{2}\.[0-9]{6}Z$')
-_DECIMAL_INTEGER_RE = re.compile(r'^(0|[1-9][0-9]*)$')
+_DECIMAL_INTEGER_RE = re.compile(r'^(?:0|[1-9][0-9]{0,18})$')
 _DECIMAL_PORT_RE = re.compile(r'^[1-9][0-9]{0,4}$')
 _CANONICAL_POSITIVE_DECIMAL_RE = re.compile(
     r'^(?:[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]{0,2}[1-9])$')
@@ -447,6 +447,17 @@ def _decimal_port_text(value: Any, *, name: str) -> str:
         raise ValueError(
             f'{name} must be canonical decimal port text in 1..65535.')
     return port
+
+
+def _decimal_integer_text(value: Any, *, name: str) -> str:
+    """Validate canonical nonnegative decimal text in signed-int64 bounds."""
+
+    decimal_text = _text(value, name=name)
+    if (_DECIMAL_INTEGER_RE.fullmatch(decimal_text) is None or
+            int(decimal_text) > _MAX_POSTGRES_BIGINT):
+        raise ValueError(f'{name} must be canonical decimal integer text in '
+                         f'0..{_MAX_POSTGRES_BIGINT}.')
+    return decimal_text
 
 
 def _canonical_positive_decimal_text(value: Any, *, name: str) -> str:
@@ -3893,6 +3904,76 @@ class ProviderPolicyModeEvidenceV1(_CanonicalContract):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderPolicyBoundaryProofV1(_CanonicalContract):
+    """Context-free proof that one policy boundary preserved its projection."""
+
+    version: int
+    boundary: str
+    config_projection_sha256: str
+    modes: ProviderPolicyModeEvidenceV1
+    policy_subject_sha256: str
+    projection_before_sha256: str
+    projection_after_sha256: str
+    projections_equal: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'boundary', 'config_projection_sha256', 'modes',
+        'policy_subject_sha256', 'projection_before_sha256',
+        'projection_after_sha256', 'projections_equal'
+    })
+    _BOUNDARIES: ClassVar[frozenset[str]] = frozenset(
+        {'serve_controller_prepare', 'api_executor_pre_io'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='policy boundary proof version')
+        if self.boundary not in self._BOUNDARIES:
+            raise ValueError('policy boundary proof boundary is unsupported.')
+        for field in ('config_projection_sha256', 'policy_subject_sha256',
+                      'projection_before_sha256', 'projection_after_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field),
+                        name=f'policy_boundary_proof.{field}'))
+        if not isinstance(self.modes, ProviderPolicyModeEvidenceV1):
+            raise TypeError('policy boundary proof modes has an invalid type.')
+        if self.projection_before_sha256 != self.projection_after_sha256:
+            raise ValueError('policy boundary proof projections must have '
+                             'equal hashes.')
+        _boolean(self.projections_equal,
+                 name='policy_boundary_proof.projections_equal')
+        if not self.projections_equal:
+            raise ValueError('policy boundary proof projections_equal must be '
+                             'true.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderPolicyBoundaryProofV1':
+        raw = _closed_object(value,
+                             name='policy boundary proof',
+                             keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   boundary=raw['boundary'],
+                   config_projection_sha256=raw['config_projection_sha256'],
+                   modes=ProviderPolicyModeEvidenceV1.from_value(raw['modes']),
+                   policy_subject_sha256=raw['policy_subject_sha256'],
+                   projection_before_sha256=raw['projection_before_sha256'],
+                   projection_after_sha256=raw['projection_after_sha256'],
+                   projections_equal=raw['projections_equal'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'boundary': self.boundary,
+            'config_projection_sha256': self.config_projection_sha256,
+            'modes': self.modes.canonical_value(),
+            'policy_subject_sha256': self.policy_subject_sha256,
+            'projection_before_sha256': self.projection_before_sha256,
+            'projection_after_sha256': self.projection_after_sha256,
+            'projections_equal': True,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderAnnotationV1(_CanonicalContract):
     """One sorted, nonsecret provider annotation with generic text bounds."""
 
@@ -4048,6 +4129,24 @@ class ProviderKubernetesPrerequisiteKindV1(str, enum.Enum):
     VALIDATING_ADMISSION_POLICY_BINDING = 'ValidatingAdmissionPolicyBinding'
 
 
+class ProviderKubernetesPrerequisiteRoleV1(str, enum.Enum):
+    """Exact semantic roles in the first Kubernetes prerequisite inventory."""
+
+    AUTHORITY_RELEASE_NAMESPACE = 'authority_release_namespace'
+    TARGET_NAMESPACE = 'target_namespace'
+    KUBE_SYSTEM_NAMESPACE = 'kube_system_namespace'
+    SERVE_LB_SLOT_0_NAMESPACE = 'serve_lb_slot_0_namespace'
+    SERVE_LB_SLOT_1_NAMESPACE = 'serve_lb_slot_1_namespace'
+    CALLER_SERVICE_ACCOUNT = 'caller_service_account'
+    WORKLOAD_SERVICE_ACCOUNT = 'workload_service_account'
+    SERVE_LB_SLOT_0_SERVICE_ACCOUNT = 'serve_lb_slot_0_service_account'
+    SERVE_LB_SLOT_1_SERVICE_ACCOUNT = 'serve_lb_slot_1_service_account'
+    ENDPOINT_NETWORK_POLICY = 'endpoint_network_policy'
+    VALIDATING_ADMISSION_POLICY = 'validating_admission_policy'
+    VALIDATING_ADMISSION_POLICY_BINDING = (
+        'validating_admission_policy_binding')
+
+
 @dataclasses.dataclass(frozen=True)
 class _ProviderKubernetesPrerequisiteKindMapEntryV1:
     """One immutable API-version and scope dispatch entry."""
@@ -4072,6 +4171,76 @@ PROVIDER_KUBERNETES_PREREQUISITE_KIND_MAP_V1 = types.MappingProxyType({
     ProviderKubernetesPrerequisiteKindV1.VALIDATING_ADMISSION_POLICY_BINDING:
         _ProviderKubernetesPrerequisiteKindMapEntryV1(
             api_version='admissionregistration.k8s.io/v1', scope='cluster'),
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProviderKubernetesPrerequisiteRoleMapEntryV1:
+    """One immutable role, position, and kind dispatch entry."""
+
+    sequence: int
+    role: ProviderKubernetesPrerequisiteRoleV1
+    kind: ProviderKubernetesPrerequisiteKindV1
+
+
+PROVIDER_KUBERNETES_PREREQUISITE_ROLE_MAP_V1 = (
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=0,
+        role=ProviderKubernetesPrerequisiteRoleV1.AUTHORITY_RELEASE_NAMESPACE,
+        kind=ProviderKubernetesPrerequisiteKindV1.NAMESPACE),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=1,
+        role=ProviderKubernetesPrerequisiteRoleV1.TARGET_NAMESPACE,
+        kind=ProviderKubernetesPrerequisiteKindV1.NAMESPACE),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=2,
+        role=ProviderKubernetesPrerequisiteRoleV1.KUBE_SYSTEM_NAMESPACE,
+        kind=ProviderKubernetesPrerequisiteKindV1.NAMESPACE),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=3,
+        role=ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_0_NAMESPACE,
+        kind=ProviderKubernetesPrerequisiteKindV1.NAMESPACE),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=4,
+        role=ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_1_NAMESPACE,
+        kind=ProviderKubernetesPrerequisiteKindV1.NAMESPACE),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=5,
+        role=ProviderKubernetesPrerequisiteRoleV1.CALLER_SERVICE_ACCOUNT,
+        kind=ProviderKubernetesPrerequisiteKindV1.SERVICE_ACCOUNT),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=6,
+        role=ProviderKubernetesPrerequisiteRoleV1.WORKLOAD_SERVICE_ACCOUNT,
+        kind=ProviderKubernetesPrerequisiteKindV1.SERVICE_ACCOUNT),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=7,
+        role=(ProviderKubernetesPrerequisiteRoleV1.
+              SERVE_LB_SLOT_0_SERVICE_ACCOUNT),
+        kind=ProviderKubernetesPrerequisiteKindV1.SERVICE_ACCOUNT),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=8,
+        role=(ProviderKubernetesPrerequisiteRoleV1.
+              SERVE_LB_SLOT_1_SERVICE_ACCOUNT),
+        kind=ProviderKubernetesPrerequisiteKindV1.SERVICE_ACCOUNT),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=9,
+        role=ProviderKubernetesPrerequisiteRoleV1.ENDPOINT_NETWORK_POLICY,
+        kind=ProviderKubernetesPrerequisiteKindV1.NETWORK_POLICY),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=10,
+        role=ProviderKubernetesPrerequisiteRoleV1.VALIDATING_ADMISSION_POLICY,
+        kind=(
+            ProviderKubernetesPrerequisiteKindV1.VALIDATING_ADMISSION_POLICY)),
+    _ProviderKubernetesPrerequisiteRoleMapEntryV1(
+        sequence=11,
+        role=(ProviderKubernetesPrerequisiteRoleV1.
+              VALIDATING_ADMISSION_POLICY_BINDING),
+        kind=(ProviderKubernetesPrerequisiteKindV1.
+              VALIDATING_ADMISSION_POLICY_BINDING)),
+)
+
+_PROVIDER_KUBERNETES_PREREQUISITE_ROLE_DISPATCH_V1 = types.MappingProxyType({
+    entry.role: entry for entry in PROVIDER_KUBERNETES_PREREQUISITE_ROLE_MAP_V1
 })
 
 
@@ -4289,6 +4458,7 @@ def _provider_kubernetes_prerequisite_spec_from_value(
 class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
     """Pure typed identity and content commitment for one prerequisite."""
 
+    role: ProviderKubernetesPrerequisiteRoleV1
     api_version: str
     kind: ProviderKubernetesPrerequisiteKindV1
     namespace: str | None
@@ -4300,8 +4470,8 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
     spec_sha256: str
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
-        'api_version', 'kind', 'namespace', 'name', 'uid', 'resource_version',
-        'deletion_timestamp', 'spec', 'spec_sha256'
+        'role', 'api_version', 'kind', 'namespace', 'name', 'uid',
+        'resource_version', 'deletion_timestamp', 'spec', 'spec_sha256'
     })
     _SPEC_TYPES: ClassVar[tuple[type[Any], ...]] = (
         ProviderKubernetesNamespacePrerequisiteSpecV1,
@@ -4312,10 +4482,18 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
     )
 
     def __post_init__(self) -> None:
+        role = _enum_value(ProviderKubernetesPrerequisiteRoleV1,
+                           self.role,
+                           name='Kubernetes prerequisite role')
+        object.__setattr__(self, 'role', role)
         kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
                            self.kind,
                            name='Kubernetes prerequisite kind')
         object.__setattr__(self, 'kind', kind)
+        if kind is not _PROVIDER_KUBERNETES_PREREQUISITE_ROLE_DISPATCH_V1[
+                role].kind:
+            raise ValueError('Kubernetes prerequisite kind does not match its '
+                             'semantic role.')
         dispatch = PROVIDER_KUBERNETES_PREREQUISITE_KIND_MAP_V1[kind]
         api_version = _text(self.api_version,
                             name='Kubernetes prerequisite api_version')
@@ -4366,7 +4544,8 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
         raw = _closed_object(value,
                              name='Kubernetes prerequisite',
                              keys=cls._KEYS)
-        return cls(api_version=raw['api_version'],
+        return cls(role=raw['role'],
+                   api_version=raw['api_version'],
                    kind=raw['kind'],
                    namespace=raw['namespace'],
                    name=raw['name'],
@@ -4379,6 +4558,7 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
 
     def canonical_value(self) -> JsonObject:
         return {
+            'role': self.role.value,
             'api_version': self.api_version,
             'kind': self.kind.value,
             'namespace': self.namespace,
@@ -5958,6 +6138,327 @@ class ProviderSkyletJobContractV1(_CanonicalContract):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderSkyletJobSpecV1(_CanonicalContract):
+    """Closed policy-free Skylet job rendered for one Serve replica."""
+
+    version: int
+    schema_id: str
+    source: ProviderLaunchSourceV1
+    command_profile: str
+    entrypoint_artifact_role: str
+    replica_id: str
+    environment_replica_id: str
+    working_directory: None
+    setup: None
+    mounts: tuple[Any, ...]
+    secrets: tuple[Any, ...]
+    lifecycle: str
+    restart_policy: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'schema_id', 'source', 'command_profile',
+        'entrypoint_artifact_role', 'replica_id', 'environment',
+        'working_directory', 'setup', 'mounts', 'secrets', 'lifecycle',
+        'restart_policy'
+    })
+    _ENVIRONMENT_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'SKYPILOT_SERVE_REPLICA_ID'})
+    _SCHEMA_ID: ClassVar[str] = 'skypilot.serve.prebooted-canary-job.v1'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Skylet job spec version')
+        if self.schema_id != self._SCHEMA_ID:
+            raise ValueError('Skylet job spec schema_id is unsupported.')
+        if not isinstance(self.source, ProviderLaunchSourceV1):
+            raise TypeError('Skylet job spec source has an invalid type.')
+        if self.command_profile != 'image_serve_canary_entrypoint_v1':
+            raise ValueError('Skylet job spec command_profile is unsupported.')
+        if self.entrypoint_artifact_role != 'serve_canary_entrypoint':
+            raise ValueError('Skylet job spec entrypoint_artifact_role is '
+                             'unsupported.')
+        object.__setattr__(
+            self, 'replica_id',
+            _decimal_integer_text(self.replica_id,
+                                  name='Skylet job spec replica_id'))
+        object.__setattr__(
+            self, 'environment_replica_id',
+            _decimal_integer_text(
+                self.environment_replica_id,
+                name=('Skylet job spec '
+                      'environment.SKYPILOT_SERVE_REPLICA_ID')))
+        if self.replica_id != self.environment_replica_id:
+            raise ValueError('Skylet job spec replica ID copies must be '
+                             'byte-equal.')
+        if self.working_directory is not None:
+            raise ValueError('Skylet job spec working_directory must be null.')
+        if self.setup is not None:
+            raise ValueError('Skylet job spec setup must be null.')
+        for field in ('mounts', 'secrets'):
+            value = getattr(self, field)
+            if not isinstance(value, tuple):
+                raise TypeError(f'Skylet job spec {field} must be a tuple.')
+            if value:
+                raise ValueError(f'Skylet job spec {field} must be empty.')
+        if self.lifecycle != 'long_running_until_pod_delete':
+            raise ValueError('Skylet job spec lifecycle is unsupported.')
+        if self.restart_policy != 'same_pod_same_logical_job':
+            raise ValueError('Skylet job spec restart_policy is unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderSkyletJobSpecV1':
+        raw = _closed_object(value, name='Skylet job spec', keys=cls._KEYS)
+        environment = _closed_object(raw['environment'],
+                                     name='Skylet job spec environment',
+                                     keys=cls._ENVIRONMENT_KEYS)
+        for field in ('mounts', 'secrets'):
+            if not isinstance(raw[field], list):
+                raise TypeError(f'Skylet job spec {field} must be a list.')
+        return cls(
+            version=raw['version'],
+            schema_id=raw['schema_id'],
+            source=ProviderLaunchSourceV1.from_value(raw['source']),
+            command_profile=raw['command_profile'],
+            entrypoint_artifact_role=raw['entrypoint_artifact_role'],
+            replica_id=raw['replica_id'],
+            environment_replica_id=environment['SKYPILOT_SERVE_REPLICA_ID'],
+            working_directory=raw['working_directory'],
+            setup=raw['setup'],
+            mounts=tuple(raw['mounts']),
+            secrets=tuple(raw['secrets']),
+            lifecycle=raw['lifecycle'],
+            restart_policy=raw['restart_policy'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'schema_id': self._SCHEMA_ID,
+            'source': self.source.canonical_value(),
+            'command_profile': 'image_serve_canary_entrypoint_v1',
+            'entrypoint_artifact_role': 'serve_canary_entrypoint',
+            'replica_id': self.replica_id,
+            'environment': {
+                'SKYPILOT_SERVE_REPLICA_ID': self.environment_replica_id
+            },
+            'working_directory': None,
+            'setup': None,
+            'mounts': [],
+            'secrets': [],
+            'lifecycle': 'long_running_until_pod_delete',
+            'restart_policy': 'same_pod_same_logical_job',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderSkyletSubmitRequestV1(_CanonicalContract):
+    """Idempotent Skylet submit request retaining the complete job spec."""
+
+    protocol: str
+    submission_key: uuid.UUID
+    job_contract_sha256: str
+    job_spec: ProviderSkyletJobSpecV1
+    job_spec_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'protocol', 'submission_key', 'job_contract_sha256', 'job_spec',
+        'job_spec_sha256'
+    })
+    _PROTOCOL: ClassVar[str] = 'skylet_idempotent_submit_v1'
+
+    def __post_init__(self) -> None:
+        if self.protocol != self._PROTOCOL:
+            raise ValueError('Skylet submit request protocol is unsupported.')
+        object.__setattr__(
+            self, 'submission_key',
+            _uuid(self.submission_key,
+                  name='Skylet submit request submission_key'))
+        object.__setattr__(
+            self, 'job_contract_sha256',
+            _sha256(self.job_contract_sha256,
+                    name='Skylet submit request job_contract_sha256'))
+        if not isinstance(self.job_spec, ProviderSkyletJobSpecV1):
+            raise TypeError('Skylet submit request job_spec has an invalid '
+                            'type.')
+        object.__setattr__(
+            self, 'job_spec_sha256',
+            _sha256(self.job_spec_sha256,
+                    name='Skylet submit request job_spec_sha256'))
+        if self.job_spec_sha256 != self.job_spec.sha256:
+            raise ValueError('Skylet submit request job_spec_sha256 does not '
+                             'match job_spec.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderSkyletSubmitRequestV1':
+        raw = _closed_object(value,
+                             name='Skylet submit request',
+                             keys=cls._KEYS)
+        return cls(protocol=raw['protocol'],
+                   submission_key=raw['submission_key'],
+                   job_contract_sha256=raw['job_contract_sha256'],
+                   job_spec=ProviderSkyletJobSpecV1.from_value(raw['job_spec']),
+                   job_spec_sha256=raw['job_spec_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'protocol': self._PROTOCOL,
+            'submission_key': str(self.submission_key),
+            'job_contract_sha256': self.job_contract_sha256,
+            'job_spec': self.job_spec.canonical_value(),
+            'job_spec_sha256': self.job_spec_sha256,
+        }
+
+
+class ProviderSkyletJobReadDispositionV1(str, enum.Enum):
+    """Closed outcomes of one exact Skylet job-record read."""
+
+    PRESENT = 'present'
+    NOT_FOUND = 'not_found'
+    CONFLICT = 'conflict'
+    UNCERTAIN = 'uncertain'
+
+
+class ProviderSkyletJobDurableStateV1(str, enum.Enum):
+    """Closed durable lifecycle states returned by Skylet readback."""
+
+    COMMITTED_PENDING_START = 'COMMITTED_PENDING_START'
+    START_INTENT = 'START_INTENT'
+    START_COMMITTED = 'START_COMMITTED'
+    RUNNING = 'RUNNING'
+    RECOVERY_PENDING = 'RECOVERY_PENDING'
+    SUCCEEDED = 'SUCCEEDED'
+    FAILED = 'FAILED'
+    BLOCKED = 'BLOCKED'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderSkyletJobEvidenceV1(_CanonicalContract):
+    """Context-free typed evidence from one keyed Skylet job read."""
+
+    protocol: str
+    submission_key: uuid.UUID
+    job_contract_sha256: str
+    job_spec_sha256: str
+    retained_submit_request: ProviderSkyletSubmitRequestV1 | None
+    state_store_uuid: uuid.UUID
+    read_disposition: ProviderSkyletJobReadDispositionV1
+    durable_state: ProviderSkyletJobDurableStateV1 | None
+    job_id: int | None
+    run_epoch: int | None
+    record_revision: int | None
+    observed_at: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'protocol', 'submission_key', 'job_contract_sha256', 'job_spec_sha256',
+        'retained_submit_request', 'state_store_uuid', 'read_disposition',
+        'durable_state', 'job_id', 'run_epoch', 'record_revision', 'observed_at'
+    })
+    _PROTOCOL: ClassVar[str] = 'skylet_idempotent_submit_v1'
+
+    def __post_init__(self) -> None:
+        if self.protocol != self._PROTOCOL:
+            raise ValueError('Skylet job evidence protocol is unsupported.')
+        object.__setattr__(
+            self, 'submission_key',
+            _uuid(self.submission_key,
+                  name='Skylet job evidence submission_key'))
+        for field in ('job_contract_sha256', 'job_spec_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field),
+                        name=f'Skylet job evidence {field}'))
+        if (self.retained_submit_request is not None and not isinstance(
+                self.retained_submit_request, ProviderSkyletSubmitRequestV1)):
+            raise TypeError('Skylet job evidence retained_submit_request has '
+                            'an invalid type.')
+        if (self.retained_submit_request is not None and
+                self.retained_submit_request.submission_key
+                != self.submission_key):
+            raise ValueError('Skylet job evidence retained request must use '
+                             'the top-level submission key.')
+        object.__setattr__(
+            self, 'state_store_uuid',
+            _uuid(self.state_store_uuid,
+                  name='Skylet job evidence state_store_uuid'))
+        disposition = _enum_value(ProviderSkyletJobReadDispositionV1,
+                                  self.read_disposition,
+                                  name='Skylet job evidence read_disposition')
+        object.__setattr__(self, 'read_disposition', disposition)
+        state = self.durable_state
+        if state is not None:
+            state = _enum_value(ProviderSkyletJobDurableStateV1,
+                                state,
+                                name='Skylet job evidence durable_state')
+            object.__setattr__(self, 'durable_state', state)
+        if self.job_id is not None:
+            _positive_integer(self.job_id, name='Skylet job evidence job_id')
+        if self.run_epoch is not None:
+            _nonnegative_integer(self.run_epoch,
+                                 name='Skylet job evidence run_epoch')
+        if self.record_revision is not None:
+            _positive_integer(self.record_revision,
+                              name='Skylet job evidence record_revision')
+        object.__setattr__(
+            self, 'observed_at',
+            _timestamp(self.observed_at,
+                       name='Skylet job evidence observed_at'))
+        present_or_conflict = disposition in (
+            ProviderSkyletJobReadDispositionV1.PRESENT,
+            ProviderSkyletJobReadDispositionV1.CONFLICT)
+        response_values = (self.retained_submit_request, state, self.job_id,
+                           self.run_epoch, self.record_revision)
+        if present_or_conflict and any(
+                value is None for value in response_values):
+            raise ValueError('present and conflict Skylet job evidence '
+                             'requires complete retained record values.')
+        if not present_or_conflict and any(
+                value is not None for value in response_values):
+            raise ValueError('not_found and uncertain Skylet job evidence '
+                             'requires null retained record values.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderSkyletJobEvidenceV1':
+        raw = _closed_object(value, name='Skylet job evidence', keys=cls._KEYS)
+        return cls(
+            protocol=raw['protocol'],
+            submission_key=raw['submission_key'],
+            job_contract_sha256=raw['job_contract_sha256'],
+            job_spec_sha256=raw['job_spec_sha256'],
+            retained_submit_request=(None if raw['retained_submit_request']
+                                     is None else
+                                     ProviderSkyletSubmitRequestV1.from_value(
+                                         raw['retained_submit_request'])),
+            state_store_uuid=raw['state_store_uuid'],
+            read_disposition=raw['read_disposition'],
+            durable_state=raw['durable_state'],
+            job_id=raw['job_id'],
+            run_epoch=raw['run_epoch'],
+            record_revision=raw['record_revision'],
+            observed_at=raw['observed_at'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'protocol': self._PROTOCOL,
+            'submission_key': str(self.submission_key),
+            'job_contract_sha256': self.job_contract_sha256,
+            'job_spec_sha256': self.job_spec_sha256,
+            'retained_submit_request':
+                (None if self.retained_submit_request is None else
+                 self.retained_submit_request.canonical_value()),
+            'state_store_uuid': str(self.state_store_uuid),
+            'read_disposition': self.read_disposition.value,
+            'durable_state': (
+                None if self.durable_state is None else self.durable_state.value
+            ),
+            'job_id': self.job_id,
+            'run_epoch': self.run_epoch,
+            'record_revision': self.record_revision,
+            'observed_at': self.observed_at,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderSkyletDurabilityContractV1(_CanonicalContract):
     """Pure description of the reviewed node-local Skylet durability path."""
 
@@ -6239,6 +6740,131 @@ class ProviderKubernetesEndpointCallerRoleV1(str, enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderKubernetesEndpointCallerWorkloadV1(_CanonicalContract):
+    """Pure typed projection of one frozen load-balancer Deployment."""
+
+    api_version: str
+    kind: str
+    namespace: str
+    name: str
+    uid: str
+    resource_version: str
+    generation: int
+    observed_generation: int
+    deletion_timestamp: None
+    selector: tuple[ProviderLabelV1, ...]
+    pod_template_labels: tuple[ProviderLabelV1, ...]
+    service_account_name: str
+    automount_service_account_token: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'api_version', 'kind', 'namespace', 'name', 'uid', 'resource_version',
+        'generation', 'observed_generation', 'deletion_timestamp', 'selector',
+        'pod_template_labels', 'service_account_name',
+        'automount_service_account_token'
+    })
+
+    def __post_init__(self) -> None:
+        if self.api_version != 'apps/v1':
+            raise ValueError('endpoint caller workload api_version must be '
+                             'apps/v1.')
+        if self.kind != 'Deployment':
+            raise ValueError(
+                'endpoint caller workload kind must be Deployment.')
+        object.__setattr__(
+            self, 'namespace',
+            _text(self.namespace,
+                  name='endpoint caller workload namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        for field in ('name', 'uid', 'resource_version',
+                      'service_account_name'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field),
+                      name=f'endpoint caller workload {field}'))
+        object.__setattr__(
+            self, 'generation',
+            _positive_integer(self.generation,
+                              name='endpoint caller workload generation'))
+        object.__setattr__(
+            self, 'observed_generation',
+            _positive_integer(
+                self.observed_generation,
+                name='endpoint caller workload observed_generation'))
+        if self.deletion_timestamp is not None:
+            raise ValueError('endpoint caller workload deletion_timestamp must '
+                             'be null.')
+        selector = _provider_label_tuple(
+            self.selector, name='endpoint caller workload selector')
+        if not selector:
+            raise ValueError('endpoint caller workload selector must be '
+                             'nonempty.')
+        object.__setattr__(self, 'selector', selector)
+        pod_template_labels = _provider_label_tuple(
+            self.pod_template_labels,
+            name='endpoint caller workload pod_template_labels')
+        if not pod_template_labels:
+            raise ValueError(
+                'endpoint caller workload pod_template_labels must '
+                'be nonempty.')
+        object.__setattr__(self, 'pod_template_labels', pod_template_labels)
+        if _boolean(self.automount_service_account_token,
+                    name=('endpoint caller workload '
+                          'automount_service_account_token')):
+            raise ValueError('endpoint caller workload token automount must be '
+                             'false.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesEndpointCallerWorkloadV1':
+        raw = _closed_object(value,
+                             name='endpoint caller workload',
+                             keys=cls._KEYS)
+        for field in ('selector', 'pod_template_labels'):
+            if not isinstance(raw[field], list):
+                raise TypeError(
+                    f'endpoint caller workload {field} must be a list.')
+        return cls(
+            api_version=raw['api_version'],
+            kind=raw['kind'],
+            namespace=raw['namespace'],
+            name=raw['name'],
+            uid=raw['uid'],
+            resource_version=raw['resource_version'],
+            generation=raw['generation'],
+            observed_generation=raw['observed_generation'],
+            deletion_timestamp=raw['deletion_timestamp'],
+            selector=tuple(
+                ProviderLabelV1.from_value(item) for item in raw['selector']),
+            pod_template_labels=tuple(
+                ProviderLabelV1.from_value(item)
+                for item in raw['pod_template_labels']),
+            service_account_name=raw['service_account_name'],
+            automount_service_account_token=raw[
+                'automount_service_account_token'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'api_version': 'apps/v1',
+            'kind': 'Deployment',
+            'namespace': self.namespace,
+            'name': self.name,
+            'uid': self.uid,
+            'resource_version': self.resource_version,
+            'generation': self.generation,
+            'observed_generation': self.observed_generation,
+            'deletion_timestamp': None,
+            'selector': [label.canonical_value() for label in self.selector],
+            'pod_template_labels': [
+                label.canonical_value() for label in self.pod_template_labels
+            ],
+            'service_account_name': self.service_account_name,
+            'automount_service_account_token': False,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
     """Bounded nonsecret identity and Pod selector for one endpoint caller."""
 
@@ -6248,10 +6874,11 @@ class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
     pod_selector: tuple[ProviderLabelV1, ...]
     service_account_name: str
     service_account_uid: str
+    workload: ProviderKubernetesEndpointCallerWorkloadV1
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
         'role', 'namespace', 'namespace_uid', 'pod_selector',
-        'service_account_name', 'service_account_uid'
+        'service_account_name', 'service_account_uid', 'workload'
     })
 
     def __post_init__(self) -> None:
@@ -6274,6 +6901,9 @@ class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
             self, 'pod_selector',
             _provider_label_tuple(self.pod_selector,
                                   name='endpoint caller pod_selector'))
+        if not isinstance(self.workload,
+                          ProviderKubernetesEndpointCallerWorkloadV1):
+            raise TypeError('endpoint caller workload has an invalid type.')
         _ = self.canonical_bytes
 
     @classmethod
@@ -6289,7 +6919,9 @@ class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
             pod_selector=tuple(
                 ProviderLabelV1.from_value(item) for item in pod_selector),
             service_account_name=raw['service_account_name'],
-            service_account_uid=raw['service_account_uid'])
+            service_account_uid=raw['service_account_uid'],
+            workload=ProviderKubernetesEndpointCallerWorkloadV1.from_value(
+                raw['workload']))
 
     def canonical_value(self) -> JsonObject:
         return {
@@ -6301,28 +6933,33 @@ class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
             ],
             'service_account_name': self.service_account_name,
             'service_account_uid': self.service_account_uid,
+            'workload': self.workload.canonical_value(),
         }
 
 
-def _provider_kubernetes_prerequisite_tuple(
+def _provider_kubernetes_endpoint_prerequisite_projection_tuple(
     value: Any,
     *,
     name: str,
 ) -> tuple[ProviderKubernetesPrerequisiteV1, ...]:
-    """Validate one sorted, duplicate-free prerequisite collection."""
+    """Validate the exact typed five-role launch endpoint projection."""
 
     if not isinstance(value, tuple):
         raise TypeError(f'{name} must be a tuple.')
-    if (len(value) > _MAX_LIST_ITEMS or
+    expected_roles = (
+        ProviderKubernetesPrerequisiteRoleV1.ENDPOINT_NETWORK_POLICY,
+        ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_0_NAMESPACE,
+        ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_0_SERVICE_ACCOUNT,
+        ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_1_NAMESPACE,
+        ProviderKubernetesPrerequisiteRoleV1.SERVE_LB_SLOT_1_SERVICE_ACCOUNT,
+    )
+    if (len(value) != len(expected_roles) or
             any(not isinstance(item, ProviderKubernetesPrerequisiteV1)
                 for item in value)):
-        raise ValueError(f'{name} must contain at most 256 typed '
-                         'prerequisites.')
-    keys = tuple(
-        (item.api_version, item.kind.value, item.namespace or '', item.name)
-        for item in value)
-    if keys != tuple(sorted(set(keys))):
-        raise ValueError(f'{name} must be sorted by unique logical key.')
+        raise ValueError(f'{name} must contain the exact five typed role '
+                         'projections.')
+    if tuple(item.role for item in value) != expected_roles:
+        raise ValueError(f'{name} roles are not in exact protocol order.')
     return value
 
 
@@ -6333,12 +6970,12 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
     mode: str
     application_port: str
     ambient_fallback: bool
-    network_prerequisites: tuple[ProviderKubernetesPrerequisiteV1, ...]
+    prerequisite_projection: tuple[ProviderKubernetesPrerequisiteV1, ...]
     required_callers: tuple[ProviderKubernetesEndpointCallerV1, ...]
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
-        'mode', 'application_port', 'ambient_fallback', 'network_prerequisites',
-        'required_callers'
+        'mode', 'application_port', 'ambient_fallback',
+        'prerequisite_projection', 'required_callers'
     })
     _EXPECTED_CALLER_ROLES: ClassVar[
         tuple[ProviderKubernetesEndpointCallerRoleV1,
@@ -6354,10 +6991,10 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
         if _boolean(self.ambient_fallback, name='endpoint ambient_fallback'):
             raise ValueError('endpoint ambient_fallback must be false.')
         object.__setattr__(
-            self, 'network_prerequisites',
-            _provider_kubernetes_prerequisite_tuple(
-                self.network_prerequisites,
-                name='endpoint network_prerequisites'))
+            self, 'prerequisite_projection',
+            _provider_kubernetes_endpoint_prerequisite_projection_tuple(
+                self.prerequisite_projection,
+                name='endpoint prerequisite_projection'))
         if (not isinstance(self.required_callers, tuple) or len(
                 self.required_callers) != len(self._EXPECTED_CALLER_ROLES) or
                 any(not isinstance(item, ProviderKubernetesEndpointCallerV1)
@@ -6368,25 +7005,91 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
         if roles != self._EXPECTED_CALLER_ROLES:
             raise ValueError('endpoint caller roles are not in the exact '
                              'protocol order.')
+        self._validate_internal_projection()
         _ = self.canonical_bytes
+
+    def _validate_internal_projection(self) -> None:
+        (_, namespace_zero, service_account_zero, namespace_one,
+         service_account_one) = self.prerequisite_projection
+
+        namespace_zero_value = namespace_zero.canonical_value()
+        namespace_one_value = namespace_one.canonical_value()
+        del namespace_zero_value['role']
+        del namespace_one_value['role']
+        if canonical_json_bytes(namespace_zero_value) != canonical_json_bytes(
+                namespace_one_value):
+            raise ValueError('endpoint Namespace aliases must be byte-equal '
+                             'after omitting only role.')
+
+        service_accounts = (service_account_zero, service_account_one)
+        callers = self.required_callers
+        for caller, namespace, service_account in zip(
+                callers, (namespace_zero, namespace_one), service_accounts):
+            if not isinstance(
+                    service_account.spec,
+                    ProviderKubernetesServiceAccountPrerequisiteSpecV1):
+                raise ValueError('endpoint ServiceAccount projection has an '
+                                 'invalid typed spec.')
+            service_account_projection = service_account.spec.projection
+            if (caller.namespace != namespace.name or
+                    caller.namespace_uid != namespace.uid or
+                    service_account.namespace != caller.namespace or
+                    caller.service_account_name != service_account.name or
+                    caller.service_account_uid != service_account.uid):
+                raise ValueError('endpoint caller identity does not match its '
+                                 'prerequisite projections.')
+            if (service_account_projection.automount_service_account_token or
+                    service_account_projection.image_pull_secrets or
+                    service_account_projection.legacy_secret_refs):
+                raise ValueError('endpoint ServiceAccount must disable token '
+                                 'automount and secret references.')
+
+            workload = caller.workload
+            if (workload.namespace != caller.namespace or
+                    workload.service_account_name
+                    != caller.service_account_name):
+                raise ValueError('endpoint caller workload ServiceAccount '
+                                 'association is invalid.')
+            if workload.selector != caller.pod_selector:
+                raise ValueError('endpoint caller workload selector does not '
+                                 'match the caller selector.')
+            template_labels = {(label.key, label.value)
+                               for label in workload.pod_template_labels}
+            if any((label.key, label.value) not in template_labels
+                   for label in workload.selector):
+                raise ValueError('endpoint caller workload template labels do '
+                                 'not contain its selector.')
+            if workload.observed_generation != workload.generation:
+                raise ValueError('endpoint caller workload generation is not '
+                                 'fully observed.')
+
+        if ((service_account_zero.namespace, service_account_zero.name)
+                == (service_account_one.namespace, service_account_one.name) or
+                service_account_zero.uid == service_account_one.uid):
+            raise ValueError('endpoint ServiceAccounts must be distinct.')
+        workload_zero, workload_one = (caller.workload for caller in callers)
+        if ((workload_zero.namespace, workload_zero.name)
+                == (workload_one.namespace, workload_one.name) or
+                workload_zero.uid == workload_one.uid):
+            raise ValueError('endpoint caller Deployments must be distinct.')
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointContractV1':
         raw = _closed_object(value,
                              name='Kubernetes endpoint contract',
                              keys=cls._KEYS)
-        network_prerequisites = raw['network_prerequisites']
+        prerequisite_projection = raw['prerequisite_projection']
         required_callers = raw['required_callers']
-        if not isinstance(network_prerequisites, list):
-            raise TypeError('endpoint network_prerequisites must be a list.')
+        if not isinstance(prerequisite_projection, list):
+            raise TypeError('endpoint prerequisite_projection must be a list.')
         if not isinstance(required_callers, list):
             raise TypeError('endpoint required_callers must be a list.')
         return cls(mode=raw['mode'],
                    application_port=raw['application_port'],
                    ambient_fallback=raw['ambient_fallback'],
-                   network_prerequisites=tuple(
+                   prerequisite_projection=tuple(
                        ProviderKubernetesPrerequisiteV1.from_value(item)
-                       for item in network_prerequisites),
+                       for item in prerequisite_projection),
                    required_callers=tuple(
                        ProviderKubernetesEndpointCallerV1.from_value(item)
                        for item in required_callers))
@@ -6396,9 +7099,9 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
             'mode': 'podip',
             'application_port': self.application_port,
             'ambient_fallback': False,
-            'network_prerequisites': [
+            'prerequisite_projection': [
                 prerequisite.canonical_value()
-                for prerequisite in self.network_prerequisites
+                for prerequisite in self.prerequisite_projection
             ],
             'required_callers': [
                 caller.canonical_value() for caller in self.required_callers
@@ -6442,12 +7145,8 @@ class ProviderLaunchInvocationV1(_CanonicalContract):
             raise TypeError('launch.source has an invalid type.')
         if not isinstance(self.resources, ProviderPodResourceSnapshotV1):
             raise TypeError('launch.resources has an invalid type.')
-        replica_id_text = _text(
-            self.replica_id_text,
-            name='launch.replica_env.SKYPILOT_SERVE_REPLICA_ID')
-        if _DECIMAL_INTEGER_RE.fullmatch(replica_id_text) is None:
-            raise ValueError('launch replica ID must be canonical decimal '
-                             'integer text.')
+        replica_id_text = _decimal_integer_text(self.replica_id_text,
+                                                name='launch replica ID')
         object.__setattr__(self, 'replica_id_text', replica_id_text)
         object.__setattr__(
             self, 'security_group_scope',

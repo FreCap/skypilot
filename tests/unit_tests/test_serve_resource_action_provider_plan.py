@@ -3,6 +3,7 @@
 import builtins
 import copy
 import dataclasses
+import operator
 
 import pytest
 
@@ -10,6 +11,27 @@ from sky.serve import resource_actions as actions
 
 _CLUSTER_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
+_PREREQUISITE_ROLE_KINDS = (
+    ('authority_release_namespace', 'Namespace'),
+    ('target_namespace', 'Namespace'),
+    ('kube_system_namespace', 'Namespace'),
+    ('serve_lb_slot_0_namespace', 'Namespace'),
+    ('serve_lb_slot_1_namespace', 'Namespace'),
+    ('caller_service_account', 'ServiceAccount'),
+    ('workload_service_account', 'ServiceAccount'),
+    ('serve_lb_slot_0_service_account', 'ServiceAccount'),
+    ('serve_lb_slot_1_service_account', 'ServiceAccount'),
+    ('endpoint_network_policy', 'NetworkPolicy'),
+    ('validating_admission_policy', 'ValidatingAdmissionPolicy'),
+    ('validating_admission_policy_binding', 'ValidatingAdmissionPolicyBinding'),
+)
+_DEFAULT_PREREQUISITE_ROLES = {
+    'Namespace': 'target_namespace',
+    'ServiceAccount': 'workload_service_account',
+    'NetworkPolicy': 'endpoint_network_policy',
+    'ValidatingAdmissionPolicy': 'validating_admission_policy',
+    'ValidatingAdmissionPolicyBinding': 'validating_admission_policy_binding',
+}
 
 
 def _artifact(path: str = 'contracts/reviewed.json', marker: str = 'a') -> dict:
@@ -80,7 +102,7 @@ def _prerequisite_spec(kind: str) -> dict:
     }
 
 
-def _prerequisite(kind: str) -> dict:
+def _prerequisite(kind: str, *, role: str | None = None) -> dict:
     api_versions = {
         'Namespace': 'v1',
         'ServiceAccount': 'v1',
@@ -110,6 +132,7 @@ def _prerequisite(kind: str) -> dict:
     }
     spec = _prerequisite_spec(kind)
     return {
+        'role': role or _DEFAULT_PREREQUISITE_ROLES[kind],
         'api_version': api_versions[kind],
         'kind': kind,
         'namespace': namespaces[kind],
@@ -218,6 +241,23 @@ def test_prerequisite_kind_map_is_exact_and_immutable() -> None:
         entry.scope = 'namespaced'  # type: ignore[misc]
 
 
+def test_prerequisite_role_map_is_exact_and_immutable() -> None:
+    entries = actions.PROVIDER_KUBERNETES_PREREQUISITE_ROLE_MAP_V1
+    assert [
+        (entry.sequence, entry.role.value, entry.kind.value)
+        for entry in entries
+    ] == [(sequence, role, kind)
+          for sequence, (role, kind) in enumerate(_PREREQUISITE_ROLE_KINDS)]
+    assert tuple(
+        role.value
+        for role in actions.ProviderKubernetesPrerequisiteRoleV1) == tuple(
+            role for role, _ in _PREREQUISITE_ROLE_KINDS)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        entries[0].sequence = 1  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        operator.setitem(entries, 0, entries[1])
+
+
 def test_object_role_map_is_exact_immutable_and_drives_topology() -> None:
     entries = actions.PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1
     assert [(entry.plan_sequence, entry.role.value, entry.kind.value,
@@ -237,28 +277,43 @@ def test_object_role_map_is_exact_immutable_and_drives_topology() -> None:
     }
 
 
-@pytest.mark.parametrize(('kind', 'spec_type'), [
-    ('Namespace', actions.ProviderKubernetesNamespacePrerequisiteSpecV1),
-    ('ServiceAccount',
-     actions.ProviderKubernetesServiceAccountPrerequisiteSpecV1),
-    ('NetworkPolicy',
-     actions.ProviderKubernetesNetworkPolicyPrerequisiteSpecV1),
-    ('ValidatingAdmissionPolicy',
-     actions.ProviderKubernetesValidatingAdmissionPolicyPrerequisiteSpecV1),
-    ('ValidatingAdmissionPolicyBinding', actions.
-     ProviderKubernetesValidatingAdmissionPolicyBindingPrerequisiteSpecV1),
-])
-def test_all_prerequisite_variants_roundtrip_and_recompute_hash(
-        kind: str, spec_type: type) -> None:
-    raw = _prerequisite(kind)
+@pytest.mark.parametrize(('role', 'kind'), _PREREQUISITE_ROLE_KINDS)
+def test_all_prerequisite_roles_roundtrip_and_recompute_hash(
+        role: str, kind: str) -> None:
+    spec_types = {
+        'Namespace': actions.ProviderKubernetesNamespacePrerequisiteSpecV1,
+        'ServiceAccount':
+            actions.ProviderKubernetesServiceAccountPrerequisiteSpecV1,
+        'NetworkPolicy':
+            actions.ProviderKubernetesNetworkPolicyPrerequisiteSpecV1,
+        'ValidatingAdmissionPolicy':
+            actions.
+            ProviderKubernetesValidatingAdmissionPolicyPrerequisiteSpecV1,
+        'ValidatingAdmissionPolicyBinding':
+            actions.
+            ProviderKubernetesValidatingAdmissionPolicyBindingPrerequisiteSpecV1,
+    }
+    raw = _prerequisite(kind, role=role)
     parsed = actions.ProviderKubernetesPrerequisiteV1.from_value(raw)
 
-    assert isinstance(parsed.spec, spec_type)
+    assert isinstance(parsed.spec, spec_types[kind])
+    assert parsed.role.value == role
     assert parsed.canonical_value() == raw
     assert parsed.spec_sha256 == parsed.spec.sha256
     assert parsed.sha256 == actions.canonical_sha256(raw)
     assert actions.ProviderKubernetesPrerequisiteV1.from_value(
         parsed.canonical_value()).canonical_bytes == parsed.canonical_bytes
+
+
+@pytest.mark.parametrize(('role', 'expected_kind'), _PREREQUISITE_ROLE_KINDS)
+def test_every_prerequisite_role_rejects_a_wrong_kind(
+        role: str, expected_kind: str) -> None:
+    wrong_kind = ('ServiceAccount'
+                  if expected_kind != 'ServiceAccount' else 'Namespace')
+    raw = _prerequisite(wrong_kind)
+    raw['role'] = role
+    with pytest.raises(ValueError, match='semantic role'):
+        actions.ProviderKubernetesPrerequisiteV1.from_value(raw)
 
 
 @pytest.mark.parametrize(('kind', 'contract'), [
@@ -357,6 +412,16 @@ def test_prerequisite_is_closed_and_requires_typed_direct_spec() -> None:
     with pytest.raises(TypeError, match='invalid type'):
         actions.ProviderKubernetesPrerequisiteV1(**
                                                  raw)  # type: ignore[arg-type]
+
+    raw = _prerequisite('Namespace')
+    raw['role'] = 'unknown'
+    with pytest.raises(ValueError, match='role'):
+        actions.ProviderKubernetesPrerequisiteV1.from_value(raw)
+
+    raw = _prerequisite('Namespace')
+    del raw['role']
+    with pytest.raises(ValueError, match='unknown or missing'):
+        actions.ProviderKubernetesPrerequisiteV1.from_value(raw)
 
 
 @pytest.mark.parametrize('role',
