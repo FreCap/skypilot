@@ -963,6 +963,37 @@ def test_get_task_log_stream_snapshot_missing_task_is_one_query(
     assert counts['n'] == 1, counts
 
 
+def test_get_task_id_name_status_log_reads_one_task_row(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine,
+                 job_id,
+                 2,
+                 status=ManagedJobStatus.SUCCEEDED,
+                 local_log_file='/tmp/task-2.log',
+                 logs_cleaned_at=123.0)
+
+    with _count_sql_statements(engine) as counts:
+        row = state.get_task_id_name_status_log(job_id, 2)
+
+    assert row == (2, 'task-2', ManagedJobStatus.SUCCEEDED, '/tmp/task-2.log',
+                   123.0)
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_id_name_status_log_missing_task_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+
+    with _count_sql_statements(engine) as counts:
+        row = state.get_task_id_name_status_log(job_id, 999)
+
+    assert row is None
+    assert counts['n'] == 1, counts
+
+
 def test_get_pool_and_current_cluster_name_reads_one_row(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn

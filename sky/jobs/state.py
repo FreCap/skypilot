@@ -720,6 +720,30 @@ def get_all_task_ids_names_statuses_logs(
                 for row in id_names]
 
 
+@db_retries.retry
+def get_task_id_name_status_log(
+    job_id: int, task_id: int
+) -> tuple[int, str, ManagedJobStatus, str | None, float | None] | None:
+    """Return one task row used by the terminal log-follow path."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                spot_table.c.task_id,
+                spot_table.c.task_name,
+                spot_table.c.status,
+                spot_table.c.local_log_file,
+                spot_table.c.logs_cleaned_at,
+            ).where(
+                sqlalchemy.and_(
+                    spot_table.c.spot_job_id == job_id,
+                    spot_table.c.task_id == task_id,
+                ))).fetchone()
+    if row is None:
+        return None
+    return row[0], row[1], ManagedJobStatus(row[2]), row[3], row[4]
+
+
 def get_num_tasks(job_id: int) -> int:
     return len(_get_all_task_ids_statuses(job_id))
 
