@@ -2585,6 +2585,90 @@ def test_set_service_status_from_replica_active_versions_ready_only():
     assert set_st.call_args.kwargs['active_versions'] == [2]
 
 
+@pytest.mark.parametrize(
+    ('replica_statuses', 'target_num_replicas', 'expected_service_status'), [
+        ([serve_state.ReplicaStatus.FAILED_PROVISION
+         ], 0, serve_state.ServiceStatus.NO_REPLICA),
+        ([
+            serve_state.ReplicaStatus.FAILED,
+            serve_state.ReplicaStatus.FAILED_INITIAL_DELAY,
+            serve_state.ReplicaStatus.FAILED_PROBING,
+            serve_state.ReplicaStatus.FAILED_PROVISION,
+        ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_INITIAL_DELAY
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_PROBING
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_PROVISION
+         ], 1, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_PROVISION
+         ], None, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_CLEANUP
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.UNKNOWN
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([
+            serve_state.ReplicaStatus.READY,
+            serve_state.ReplicaStatus.FAILED_PROVISION,
+        ], 0, serve_state.ServiceStatus.READY),
+        ([
+            serve_state.ReplicaStatus.FAILED_PROVISION,
+            serve_state.ReplicaStatus.PROVISIONING,
+        ], 0, serve_state.ServiceStatus.FAILED),
+    ])
+def test_set_service_status_from_replica_distinguishes_idle_failure_history(
+        replica_statuses, target_num_replicas, expected_service_status):
+    replica_infos = [
+        _FakeReplicaInfo(status, version=1) for status in replica_statuses
+    ]
+    record = {
+        'status': serve_state.ServiceStatus.READY,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
+    with mock.patch.object(serve_state,
+                           'get_service_controller_owner',
+                           return_value=record), \
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner') as set_st:
+        serve_utils.set_service_status_and_active_versions_from_replica(
+            'svc',
+            replica_infos,
+            serve_utils.UpdateMode.ROLLING,
+            target_num_replicas=target_num_replicas)
+
+    set_st.assert_called_once()
+    assert set_st.call_args.args[4] == expected_service_status
+
+
+def test_idle_failed_provision_status_transition_is_persisted(_mock_serve_db):
+    _insert_orphan_service_row(_mock_serve_db, 'svc-idle')
+    _insert_version_spec(_mock_serve_db, 'svc-idle', 1, min_replicas=0)
+    replica_infos = [
+        _FakeReplicaInfo(serve_state.ReplicaStatus.FAILED_PROVISION, version=1)
+    ]
+
+    serve_utils.set_service_status_and_active_versions_from_replica(
+        'svc-idle',
+        replica_infos,
+        serve_utils.UpdateMode.ROLLING,
+        target_num_replicas=0)
+    assert serve_state.get_service_controller_owner(
+        'svc-idle')['status'] == serve_state.ServiceStatus.NO_REPLICA
+
+    serve_utils.set_service_status_and_active_versions_from_replica(
+        'svc-idle',
+        replica_infos,
+        serve_utils.UpdateMode.ROLLING,
+        target_num_replicas=1)
+    assert serve_state.get_service_controller_owner(
+        'svc-idle')['status'] == serve_state.ServiceStatus.FAILED
+
+
 def test_get_latest_version_with_min_replicas_batches_spec_reads(
         _mock_serve_db):
     _insert_version_spec(_mock_serve_db, 'svc', 1, min_replicas=1)

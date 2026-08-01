@@ -1227,6 +1227,73 @@ class ReplicaManager:
 
         # Newest version among the currently provisioned and launched replicas
         self.latest_version: int = version
+        # Published only after an autoscaler decision tick has produced an
+        # authoritative target. None preserves failure reporting across
+        # controller startup and version transitions until that first tick.
+        self._target_num_replicas_lock = threading.Lock()
+        self._target_num_replicas: int | None = None
+        self._target_num_replicas_generation = 0
+        # Status writes are serialized only with applied-version transitions,
+        # not with autoscaler target publication. This keeps scaling responsive
+        # while preventing an old probe from committing across an update.
+        # Lock order is self.lock -> status epoch -> target; never reverse it.
+        self._status_epoch_lock = threading.Lock()
+        self._status_epoch_generation = 0
+
+    def _get_target_num_replicas_lock(self):
+        lock = getattr(self, '_target_num_replicas_lock', None)
+        if lock is None:
+            # Compatibility for embedders and tests that construct a manager
+            # without running the current base constructor.
+            lock = threading.Lock()
+            self._target_num_replicas_lock = lock
+        return lock
+
+    def _get_status_epoch_lock(self):
+        lock = getattr(self, '_status_epoch_lock', None)
+        if lock is None:
+            # Compatibility for embedders and tests that construct a manager
+            # without running the current base constructor.
+            lock = threading.Lock()
+            self._status_epoch_lock = lock
+        return lock
+
+    def publish_target_num_replicas(self, target_num_replicas: int | None,
+                                    expected_version: int) -> bool:
+        """Publish autoscaler intent for target-aware status aggregation."""
+        if (target_num_replicas is not None and
+            (type(target_num_replicas) is not int or  # pylint: disable=unidiomatic-typecheck
+             target_num_replicas < 0)):
+            raise ValueError(
+                'target_num_replicas must be a nonnegative integer '
+                'or None.')
+        with self._get_target_num_replicas_lock():
+            if expected_version != self.latest_version:
+                return False
+            if target_num_replicas != getattr(self, '_target_num_replicas',
+                                              None):
+                self._target_num_replicas_generation = getattr(
+                    self, '_target_num_replicas_generation', 0) + 1
+            self._target_num_replicas = target_num_replicas
+            return True
+
+    def get_target_num_replicas(self) -> int | None:
+        """Return the latest version-fenced authoritative autoscaler target."""
+        with self._get_target_num_replicas_lock():
+            return getattr(self, '_target_num_replicas', None)
+
+    def _transition_status_epoch_for_version(
+            self, version: int, update_mode: serve_utils.UpdateMode) -> None:
+        """Atomically advance status aggregation to a new applied version."""
+        with self._get_status_epoch_lock():
+            with self._get_target_num_replicas_lock():
+                self._target_num_replicas = None
+                self._target_num_replicas_generation = getattr(
+                    self, '_target_num_replicas_generation', 0) + 1
+                self.latest_version = version
+                self._update_mode = update_mode
+                self._status_epoch_generation = getattr(
+                    self, '_status_epoch_generation', 0) + 1
 
     def update_lb_in_flight(self,
                             in_flight_by_url: dict[str, int] | None,
@@ -6958,11 +7025,44 @@ class SkyPilotReplicaManager(ReplicaManager):
                 snapshot.append(refreshed_info)
         return snapshot
 
+    def _set_service_status_from_replica_infos(
+            self,
+            replica_infos: list[ReplicaInfo],
+            expected_status_epoch: int | None = None) -> None:
+        """Write status from a stable target snapshot without blocking scale."""
+        with self._get_status_epoch_lock():
+            if (expected_status_epoch is not None and
+                    expected_status_epoch != getattr(
+                        self, '_status_epoch_generation', 0)):
+                return
+            for _ in range(2):
+                with self._get_target_num_replicas_lock():
+                    target_num_replicas = getattr(self, '_target_num_replicas',
+                                                  None)
+                    update_mode = self._update_mode
+                    target_generation = getattr(
+                        self, '_target_num_replicas_generation', 0)
+                serve_utils.set_service_status_and_active_versions_from_replica(
+                    self._service_name,
+                    replica_infos,
+                    update_mode,
+                    target_num_replicas=target_num_replicas,
+                    **self._db_fence_kwargs())
+                with self._get_target_num_replicas_lock():
+                    if target_generation == getattr(
+                            self, '_target_num_replicas_generation', 0):
+                        return
+                ownership_lost = getattr(self, '_ownership_lost', None)
+                if ownership_lost is not None and ownership_lost.is_set():
+                    return
+
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""
         while not self._ownership_lost.is_set():
             logger.debug('Running replica prober.')
             try:
+                with self._get_status_epoch_lock():
+                    status_epoch = getattr(self, '_status_epoch_generation', 0)
                 # Reuse the probe round's end-of-round snapshot instead of
                 # re-reading (and re-deserializing) the whole fleet from the
                 # DB a second time per tick.
@@ -6970,9 +7070,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # TODO(zhwu): when there are multiple load balancers, we need
                 # to make sure the active_versions are the union of all
                 # versions of all load balancers.
-                serve_utils.set_service_status_and_active_versions_from_replica(
-                    self._service_name, replica_infos, self._update_mode,
-                    **self._db_fence_kwargs())
+                self._set_service_status_from_replica_infos(
+                    replica_infos, expected_status_epoch=status_epoch)
 
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the
@@ -7084,9 +7183,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._handoff_logical_retirements_for_version_update(
                     replica_infos))
 
-        self.latest_version = version
+        # The previous version's target is not authoritative for the new
+        # policy. Keep status derivation conservative until the new autoscaler
+        # completes a decision tick and publishes its version-fenced target.
+        self._transition_status_epoch_for_version(version, update_mode)
         self.yaml_content = new_yaml_content
-        self._update_mode = update_mode
         self._uses_logical_replicas = new_uses_logical_replicas
         version_specs = getattr(self, '_version_specs', None)
         if version_specs is None:
