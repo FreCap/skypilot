@@ -744,19 +744,23 @@ def test_quota_consult_hit_and_failure(monkeypatch):
     assert not backend._quota_cooldown_is_active(key)
 
 
-def _call_retry_zones(provisioner, to_provision):
+def _call_retry_zones(provisioner,
+                      to_provision,
+                      *,
+                      dryrun=False,
+                      skip_if_config_hash_matches=None):
     return provisioner._retry_zones(
         to_provision=to_provision,
         num_nodes=1,
         requested_resources={to_provision},
-        dryrun=False,
+        dryrun=dryrun,
         stream_logs=False,
         cluster_name='test-cluster',
         cloud_user_identity=['arn:aws:iam::123456789012:role/test', 'acct'],
         prev_cluster_status=None,
         prev_handle=None,
         prev_cluster_ever_up=False,
-        skip_if_config_hash_matches=None,
+        skip_if_config_hash_matches=skip_if_config_hash_matches,
         volume_mounts=None,
         task=None,
     )
@@ -978,6 +982,256 @@ def test_retry_zones_passes_template_override_to_config_writer(
     assert config_kwargs['extra_template_variables'] == {
         'plugin_value': 'yes',
     }
+
+
+def _configure_new_provisioner_callback_attempt(tmp_path,
+                                                monkeypatch,
+                                                events,
+                                                provider_outcomes,
+                                                *,
+                                                config_hash='generated-hash',
+                                                bulk_error=None):
+    """Configures one isolated current new-provisioner attempt."""
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._local_wheel_path = None
+    provisioner._wheel_hash = None
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = None
+    provisioner._is_launched_by_jobs_controller = False
+    to_provision = _to_provision(use_spot=False)
+    outcomes = iter(provider_outcomes)
+    provider_call_count = 0
+    writer_results = []
+
+    def make_deploy_resources_variables(self,
+                                        resources,
+                                        cluster_name,
+                                        region,
+                                        zones,
+                                        num_nodes,
+                                        dryrun=False,
+                                        volume_mounts=None):
+        del self, resources, cluster_name, region, zones, num_nodes, dryrun
+        del volume_mounts
+        nonlocal provider_call_count
+        stage = 'writer' if provider_call_count == 0 else 'post_bulk'
+        provider_call_count += 1
+        events.append(f'deploy_vars:{stage}')
+        outcome = next(outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def write_cluster_config(resources, num_nodes, template, cluster_name,
+                             local_wheel_path, wheel_hash, *, region, zones,
+                             dryrun, volume_mounts, **kwargs):
+        del template, local_wheel_path, wheel_hash, kwargs
+        events.append('config_writer')
+        writer_results.append(
+            resources.cloud.make_deploy_resources_variables(
+                resources,
+                backend.resources_utils.ClusterName(cluster_name,
+                                                    'test-cluster-on-cloud'),
+                region,
+                zones,
+                num_nodes,
+                dryrun,
+                volume_mounts,
+            ))
+        return {
+            'ray': '/tmp/cluster.yaml',
+            'cluster_name_on_cloud': 'test-cluster-on-cloud',
+            'config_hash': config_hash,
+        }
+
+    provision_record = provision_common.ProvisionRecord(
+        provider_name='aws',
+        region='us-east-1',
+        zone='us-east-1a',
+        cluster_name='test-cluster-on-cloud',
+        head_instance_id='head',
+        resumed_instance_ids=['head'],
+        created_instance_ids=[],
+    )
+
+    def bulk_provision(*args, **kwargs):
+        del args, kwargs
+        events.append('bulk_provision')
+        if bulk_error is not None:
+            raise bulk_error
+        return provision_record
+
+    bulk_provision_mock = mock.Mock(side_effect=bulk_provision)
+    cleanup_mock = mock.Mock()
+    monkeypatch.setattr(clouds.AWS, 'make_deploy_resources_variables',
+                        make_deploy_resources_variables)
+    monkeypatch.setattr(clouds.AWS, 'get_accelerators_from_instance_type',
+                        lambda *_: {'L4': 1})
+    monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-east-1a')]]))
+    monkeypatch.setattr(provisioner, '_insufficient_resources_msg',
+                        lambda *_, **__: 'test resources unavailable')
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(backend.provision_lib,
+                        'get_provisioner_template_override', lambda *_: None)
+    monkeypatch.setattr(backend, '_get_cluster_config_template',
+                        lambda *_: '/tmp/template')
+    monkeypatch.setattr(backend.backend_utils, 'write_cluster_config',
+                        write_cluster_config)
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_: None)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        bulk_provision_mock)
+    monkeypatch.setattr(backend.CloudVmRayBackend, 'post_teardown_cleanup',
+                        cleanup_mock)
+    monkeypatch.setattr(backend.FailoverCloudErrorHandlerV2,
+                        'update_blocklist_on_error', lambda *_, **__: None)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+
+    return (provisioner, to_provision, provision_record, bulk_provision_mock,
+            cleanup_mock, writer_results)
+
+
+def test_new_provisioner_post_bulk_callback_is_authoritative(
+        tmp_path, monkeypatch):
+    events = []
+    writer_variables = {'custom_resources': 'writer-value'}
+    post_bulk_variables = {'custom_resources': 'post-bulk-value'}
+    (provisioner, to_provision, provision_record, bulk_provision, cleanup,
+     writer_results) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [writer_variables, post_bulk_variables],
+     )
+
+    result = _call_retry_zones(provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'deploy_vars:writer',
+        'bulk_provision',
+        'deploy_vars:post_bulk',
+    ]
+    assert writer_results == [writer_variables]
+    assert result['resources_vars'] == post_bulk_variables
+    assert result['provision_record'] is provision_record
+    bulk_provision.assert_called_once()
+    cleanup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('dryrun', 'config_hash', 'matching_hash', 'provisioning_skipped'),
+    [
+        (True, 'dryrun-hash', None, False),
+        (False, 'same-hash', 'same-hash', True),
+    ],
+    ids=['dryrun', 'matching-config-hash'],
+)
+def test_new_provisioner_short_circuit_skips_bulk_and_post_bulk_callback(
+        tmp_path, monkeypatch, dryrun, config_hash, matching_hash,
+        provisioning_skipped):
+    events = []
+    writer_variables = {'custom_resources': 'writer-value'}
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     writer_results) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [writer_variables],
+         config_hash=config_hash,
+     )
+
+    result = _call_retry_zones(
+        provisioner,
+        to_provision,
+        dryrun=dryrun,
+        skip_if_config_hash_matches=matching_hash,
+    )
+
+    assert events == ['config_writer', 'deploy_vars:writer']
+    assert writer_results == [writer_variables]
+    assert result['provisioning_skipped'] is provisioning_skipped
+    bulk_provision.assert_not_called()
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_bulk_failure_skips_post_bulk_callback_and_cleans_up(
+        tmp_path, monkeypatch):
+    events = []
+    bulk_error = RuntimeError('bulk mutation failed')
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [{
+             'custom_resources': 'writer-value'
+         }],
+         bulk_error=bulk_error,
+     )
+
+    with pytest.raises(exceptions.ResourcesUnavailableError) as exc_info:
+        _call_retry_zones(provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'deploy_vars:writer',
+        'bulk_provision',
+    ]
+    assert exc_info.value.failover_history == [bulk_error]
+    bulk_provision.assert_called_once()
+    cleanup.assert_called_once()
+
+
+def test_new_provisioner_post_bulk_callback_failure_is_after_mutation_and_cleans_up(
+        tmp_path, monkeypatch):
+    events = []
+    callback_error = RuntimeError('post-bulk callback failed')
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [
+             {
+                 'custom_resources': 'writer-value'
+             },
+             callback_error,
+         ],
+     )
+
+    with pytest.raises(exceptions.ResourcesUnavailableError) as exc_info:
+        _call_retry_zones(provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'deploy_vars:writer',
+        'bulk_provision',
+        'deploy_vars:post_bulk',
+    ]
+    assert exc_info.value.failover_history == [callback_error]
+    bulk_provision.assert_called_once()
+    cleanup.assert_called_once()
 
 
 def test_provision_with_retries_preserves_nested_terminal_failure(

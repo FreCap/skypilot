@@ -463,6 +463,129 @@ def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
     assert rendered_config['replacement_renderer_authoritative'] is True
 
 
+def _builtin_do_writer_kwargs(monkeypatch, tmp_path, test_name):
+    """Return one hermetic built-in DigitalOcean writer invocation."""
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+
+    input_dir = tmp_path / 'do-writer-inputs'
+    input_dir.mkdir(exist_ok=True)
+    private_key_path = input_dir / 'test-key'
+    private_key_path.write_text('test-private-key', encoding='utf-8')
+    wheel_path = input_dir / 'sky.whl'
+    wheel_path.write_bytes(b'test-wheel')
+
+    monkeypatch.setattr('sky.catalog.instance_type_exists',
+                        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr('sky.catalog.get_accelerators_from_instance_type',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
+                        lambda: (str(private_key_path), 'test-public-key'))
+    monkeypatch.setattr(backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_args: {})
+    monkeypatch.setattr(backend_utils.logs, 'get_logging_agent', lambda: None)
+    monkeypatch.setattr(common_utils, 'get_user_hash', lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend_utils.sky, '__version__', '1.0.0')
+
+    output_path = tmp_path / test_name / 'cluster.yaml'
+    monkeypatch.setattr(backend_utils, '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    return ({
+        'to_provision': Resources(cloud=clouds.DO(),
+                                  instance_type='test-do-type'),
+        'num_nodes': 2,
+        'cluster_config_template': 'do-ray.yml.j2',
+        'cluster_name': 'display',
+        'local_wheel_path': wheel_path,
+        'wheel_hash': 'b1bd84059bc0342f7843fcbe04ab563e',
+        'region': clouds.Region(name='nyc1'),
+        'dryrun': True,
+        'keep_launch_fields_in_existing_config': True,
+    }, output_path)
+
+
+def test_builtin_do_writer_is_byte_and_hash_deterministic(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_do_writer_kwargs(
+        monkeypatch, tmp_path, 'do-deterministic')
+
+    first_result = backend_utils.write_cluster_config(**writer_kwargs)
+    first_bytes = pathlib.Path(first_result['ray']).read_bytes()
+    first_real_hash = backend_utils._deterministic_cluster_yaml_hash(
+        first_result['ray'])
+
+    second_result = backend_utils.write_cluster_config(**writer_kwargs)
+    second_bytes = pathlib.Path(second_result['ray']).read_bytes()
+    second_real_hash = backend_utils._deterministic_cluster_yaml_hash(
+        second_result['ray'])
+
+    assert first_result['ray'] == f'{output_path}.tmp'
+    assert second_result['ray'] == first_result['ray']
+    assert second_bytes == first_bytes
+    assert first_result['config_hash'] == first_real_hash
+    assert second_result['config_hash'] == second_real_hash
+    assert second_result['config_hash'] == first_result['config_hash']
+
+
+def test_builtin_do_writer_restores_existing_cluster_before_hash_and_name(
+        monkeypatch, tmp_path):
+    writer_kwargs, _ = _builtin_do_writer_kwargs(monkeypatch, tmp_path,
+                                                 'do-existing-cluster')
+    baseline_result = backend_utils.write_cluster_config(**writer_kwargs)
+    old_yaml = yaml_utils.read_yaml(baseline_result['ray'])
+    old_yaml['cluster_name'] = 'restored-do-name'
+    old_yaml['provider']['region'] = 'restored-region'
+    old_yaml_content = yaml_utils.dump_yaml_str(old_yaml)
+
+    monkeypatch.setattr(backend_utils.global_user_state, 'get_cluster_yaml_str',
+                        lambda _yaml_path: old_yaml_content)
+    stored_yaml = {}
+
+    def _capture_cluster_yaml(cluster_name, content):
+        stored_yaml['cluster_name'] = cluster_name
+        stored_yaml['content'] = content
+
+    monkeypatch.setattr(backend_utils.global_user_state, 'set_cluster_yaml',
+                        _capture_cluster_yaml)
+    monkeypatch.setattr(backend_utils, '_add_auth_to_cluster_config',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend_utils, '_optimize_file_mounts',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend_utils.usage_lib.messages.usage,
+                        'update_ray_yaml', lambda *_args, **_kwargs: None)
+
+    real_hash = backend_utils._deterministic_cluster_yaml_hash
+    hash_observations = []
+
+    def _recording_real_hash(yaml_path):
+        observed_yaml = yaml_utils.read_yaml(yaml_path)
+        digest = real_hash(yaml_path)
+        hash_observations.append((observed_yaml, digest))
+        return digest
+
+    monkeypatch.setattr(backend_utils, '_deterministic_cluster_yaml_hash',
+                        _recording_real_hash)
+    writer_kwargs['dryrun'] = False
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    assert len(hash_observations) == 1
+    hashed_yaml, real_restored_hash = hash_observations[0]
+    assert hashed_yaml['cluster_name'] == 'restored-do-name'
+    assert hashed_yaml['provider']['region'] == 'restored-region'
+    assert result['cluster_name_on_cloud'] == 'restored-do-name'
+    assert result['config_hash'] == real_restored_hash
+    assert stored_yaml['cluster_name'] == 'display'
+    assert yaml_utils.safe_load(
+        stored_yaml['content'])['cluster_name'] == 'restored-do-name'
+
+
 @pytest.mark.parametrize(
     ('scenario', 'cloud', 'region_name', 'config_cloud', 'host_network',
      'network_type'), [
