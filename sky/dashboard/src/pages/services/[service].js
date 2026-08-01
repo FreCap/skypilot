@@ -34,7 +34,12 @@ import {
   formatDuration,
   formatFullTimestamp,
 } from '@/components/utils';
-import { EndpointCell, formatUptime } from '@/components/services';
+import {
+  EndpointCell,
+  ServiceHealthBadge,
+  formatUptime,
+  getPastAttemptCount,
+} from '@/components/services';
 import { ServeHistorySection } from '@/components/serve-history';
 import { ServiceVersionHistory } from '@/components/service-version-history';
 import { ServicePlacement } from '@/components/service-placement';
@@ -60,7 +65,6 @@ const REPLICA_HISTORICAL_FAILURE_STATUSES = new Set([
   'FAILED_INITIAL_DELAY',
   'FAILED_PROBING',
   'FAILED_PROVISION',
-  'UNKNOWN',
 ]);
 
 const SERVICE_HISTORY_HOURS = 24;
@@ -150,15 +154,19 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
     () => [
       {
         serviceNames: [serviceName],
-        summaryOnly: true,
-        includeTargetReplicas: true,
-        historyHours: SERVICE_HISTORY_HOURS,
+        metadataOnly: true,
       },
     ],
     [serviceName]
   );
   const fullArgs = useMemo(
-    () => [{ serviceNames: [serviceName] }],
+    () => [
+      {
+        serviceNames: [serviceName],
+        includeTargetReplicas: true,
+        historyHours: SERVICE_HISTORY_HOURS,
+      },
+    ],
     [serviceName]
   );
 
@@ -168,7 +176,7 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
 
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
-  //   1. summary_only — near-instant; renders the header/summary card.
+  //   1. metadata_only - near-instant; renders the header/summary card.
   //   2. full — per-replica table; takes tens of seconds at fleet scale,
   //      fills in when it lands.
   const fetchData = useCallback(
@@ -187,6 +195,7 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       const hasVisibleCurrentFullServiceData =
         hasVisibleCurrentServiceData &&
         visibleServiceDataRef.current?.summaryOnly !== true &&
+        visibleServiceDataRef.current?.metadataOnly !== true &&
         Array.isArray(visibleServiceDataRef.current?.replicas);
       if (
         source === 'initial' &&
@@ -238,7 +247,14 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       requestVersionRef.current = requestVersion;
       setLoading(true);
       setReplicasLoading(loadFullRequest);
-      setHistoryLoading(loadSummary);
+      setHistoryLoading(loadFullRequest);
+      if (loadFullRequest) {
+        setServiceData((previous) =>
+          previous?.name === serviceName && previous.enrichmentUnavailable
+            ? { ...previous, enrichmentUnavailable: false }
+            : previous
+        );
+      }
       if (resetHistory && loadSummary) {
         setReplicaHistory(null);
       }
@@ -261,6 +277,7 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       let refreshPromise;
       refreshPromise = (async () => {
         const promises = [];
+        let metadataPromise = Promise.resolve();
         if (loadSummary) {
           const summaryPromise = dashboardCache
             .get(getServices, summaryArgs)
@@ -270,7 +287,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
                 (s) => s.name === serviceName
               );
               summaryServiceLanded = Boolean(found);
-              setReplicaHistory(found?.replicaHistory || null);
               if (fullServiceLanded) return;
               setServiceData((previous) => {
                 if (!found) return null;
@@ -289,6 +305,7 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
                   ...found,
                   replicas: previous.replicas,
                   summaryOnly: false,
+                  metadataOnly: false,
                 };
               });
               finishLoadingIfReady(Boolean(found));
@@ -305,28 +322,49 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
               }
               if (isCurrentRequest()) {
                 finishLoadingIfReady();
-                setHistoryLoading(false);
               }
             });
+          metadataPromise = summaryPromise;
           promises.push(summaryPromise);
         }
         if (loadFullRequest) {
-          const fullPromise = dashboardCache
-            .get(getServices, fullArgs)
-            .then(({ services }) => {
+          const fullPromise = metadataPromise
+            .then(() => {
+              if (!isCurrentRequest()) return null;
+              return dashboardCache.get(getServices, fullArgs);
+            })
+            .then((response) => {
+              if (response === null) return;
+              const { services } = response;
               if (!isCurrentRequest()) return;
               const found = (services || []).find(
                 (s) => s.name === serviceName
               );
               fullServiceLanded = Boolean(found);
+              if (found) {
+                setReplicaHistory(found.replicaHistory || null);
+              }
               if (found || !summaryServiceLanded) {
                 setServiceData(found || null);
+              } else {
+                setServiceData((previous) =>
+                  previous?.name === serviceName &&
+                  (previous.metadataOnly || previous.summaryOnly)
+                    ? { ...previous, enrichmentUnavailable: true }
+                    : previous
+                );
               }
               finishLoadingIfReady(Boolean(found));
             })
             .catch((error) => {
               if (isCurrentRequest()) {
                 console.error('Failed to fetch service replicas:', error);
+                setServiceData((previous) =>
+                  previous?.name === serviceName &&
+                  (previous.metadataOnly || previous.summaryOnly)
+                    ? { ...previous, enrichmentUnavailable: true }
+                    : previous
+                );
               }
             })
             .finally(() => {
@@ -334,6 +372,7 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
               if (isCurrentRequest()) {
                 finishLoadingIfReady();
                 setReplicasLoading(false);
+                setHistoryLoading(false);
               }
             });
           promises.push(fullPromise);
@@ -549,11 +588,23 @@ function ServiceDetails() {
             <ServicePlacement serviceName={serviceName} />
           ) : (
             <>
+              {currentServiceData.enrichmentUnavailable && (
+                <div
+                  role="alert"
+                  className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+                >
+                  Computed replica, placement, pricing, and history details
+                  could not be loaded. The persisted service state below is
+                  still available. Refresh to retry.
+                </div>
+              )}
               <ServiceDetailCard
                 serviceData={currentServiceData}
                 requestHistory={replicaHistory}
                 pricingLoading={
-                  replicasLoading && currentServiceData.summaryOnly
+                  replicasLoading &&
+                  (currentServiceData.summaryOnly ||
+                    currentServiceData.metadataOnly)
                 }
               />
               <AcceleratorCapacityCard serviceData={currentServiceData} />
@@ -564,11 +615,21 @@ function ServiceDetails() {
               />
               <ReplicaPlacementCard
                 replicas={currentServiceData.replicas}
-                loading={replicasLoading && currentServiceData.summaryOnly}
+                unavailable={currentServiceData.enrichmentUnavailable}
+                loading={
+                  replicasLoading &&
+                  (currentServiceData.summaryOnly ||
+                    currentServiceData.metadataOnly)
+                }
               />
               <ReplicasCard
                 replicas={currentServiceData.replicas}
-                loading={replicasLoading && currentServiceData.summaryOnly}
+                unavailable={currentServiceData.enrichmentUnavailable}
+                loading={
+                  replicasLoading &&
+                  (currentServiceData.summaryOnly ||
+                    currentServiceData.metadataOnly)
+                }
               />
             </>
           )
@@ -681,6 +742,14 @@ export function ServiceDetailCard({
   requestHistory = null,
   pricingLoading = false,
 }) {
+  const pastAttemptCount = getPastAttemptCount(serviceData);
+  const metadataDeferred = serviceData.metadataOnly === true;
+  const metadataUnavailable = serviceData.enrichmentUnavailable === true;
+  const deferredValue = (
+    <span className="text-gray-400">
+      {metadataUnavailable ? 'Unavailable' : 'Loading...'}
+    </span>
+  );
   const hourlyCostDetails = [];
   if (serviceData.spotHourlyCost > 0) {
     hourlyCostDetails.push(`Spot ${formatUsd(serviceData.spotHourlyCost)}/hr`);
@@ -760,7 +829,9 @@ export function ServiceDetailCard({
           <div className="grid grid-cols-2 gap-6">
             <div>
               <div className="text-gray-600 font-medium text-base">Status</div>
-              <div className="text-base mt-1">
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-base">
+                <ServiceHealthBadge service={serviceData} />
+                <span className="text-xs text-gray-500">SkyServe state:</span>
                 <StatusBadge status={serviceData.status} />
               </div>
             </div>
@@ -771,7 +842,9 @@ export function ServiceDetailCard({
             <div>
               <div className="text-gray-600 font-medium text-base">Uptime</div>
               <div className="text-base mt-1">
-                {formatUptime(serviceData.uptime)}
+                {metadataDeferred && serviceData.uptime == null
+                  ? deferredValue
+                  : formatUptime(serviceData.uptime)}
               </div>
             </div>
             <div>
@@ -781,61 +854,69 @@ export function ServiceDetailCard({
                   : 'Replicas (ready/non-failed)'}
               </div>
               <div className="text-base mt-1">
-                {serviceData.replicasReady}/{serviceData.replicasTotal}
-                {serviceData.replicasFailed > 0 && (
-                  <span className="text-red-700">
-                    {' '}
-                    (+{serviceData.replicasFailed}{' '}
-                    {usesLogicalReplicas
-                      ? 'failed or cleanup-uncertain slots, including history'
-                      : 'failed or cleanup-uncertain replicas, including history'}
-                    )
+                {serviceData.replicasReady == null ? (
+                  <span className="text-gray-400">
+                    {metadataUnavailable
+                      ? 'Replica health unavailable.'
+                      : 'Loading replica health...'}
                   </span>
-                )}
-                {serviceData.targetReplicas != null && (
-                  <span className="text-gray-500">
-                    {' '}
-                    (target: {serviceData.targetReplicas})
-                  </span>
+                ) : (
+                  <>
+                    {serviceData.replicasReady}/{serviceData.replicasTotal}
+                    {serviceData.targetReplicas != null && (
+                      <span className="text-gray-500">
+                        {' '}
+                        (target: {serviceData.targetReplicas})
+                      </span>
+                    )}
+                  </>
                 )}
               </div>
-              {usesLogicalReplicas && (
-                <div className="text-sm text-gray-500 mt-1">
-                  {serviceData.physicalReplicasReady}/
-                  {serviceData.physicalReplicasTotal} physical backends
-                  {' (ready/non-failed)'}
-                  {serviceData.physicalReplicasFailed > 0 && (
-                    <span className="text-red-700">
-                      {' '}
-                      (+{serviceData.physicalReplicasFailed} failed or
-                      cleanup-uncertain{' '}
-                      {serviceData.physicalReplicasFailed === 1
-                        ? 'backend'
-                        : 'backends'}
-                      , including history)
-                    </span>
-                  )}
+              {pastAttemptCount > 0 && (
+                <div className="mt-1 text-sm text-gray-500">
+                  {pastAttemptCount} past{' '}
+                  {pastAttemptCount === 1 ? 'attempt' : 'attempts'} retained for
+                  operational history. SkyServe replaced them automatically, so
+                  no action is required while the serving target remains met.
                 </div>
               )}
+              {usesLogicalReplicas &&
+                serviceData.physicalReplicasReady != null && (
+                  <div className="text-sm text-gray-500 mt-1">
+                    {serviceData.physicalReplicasReady}/
+                    {serviceData.physicalReplicasTotal} physical backends
+                    {' (ready/non-failed)'}
+                  </div>
+                )}
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
                 Endpoint
               </div>
               <div className="text-base mt-1">
-                <EndpointCell endpoint={serviceData.endpoint} />
+                {metadataDeferred ? (
+                  deferredValue
+                ) : (
+                  <EndpointCell endpoint={serviceData.endpoint} />
+                )}
               </div>
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">Policy</div>
-              <div className="text-base mt-1">{serviceData.policy || '-'}</div>
+              <div className="text-base mt-1">
+                {metadataDeferred && !serviceData.policy
+                  ? deferredValue
+                  : serviceData.policy || '-'}
+              </div>
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
                 Load Balancing Policy
               </div>
               <div className="text-base mt-1">
-                {serviceData.loadBalancingPolicy || '-'}
+                {metadataDeferred && !serviceData.loadBalancingPolicy
+                  ? deferredValue
+                  : serviceData.loadBalancingPolicy || '-'}
               </div>
             </div>
             <div>
@@ -843,7 +924,9 @@ export function ServiceDetailCard({
                 Requested Resources
               </div>
               <div className="text-base mt-1">
-                {serviceData.requestedResources || '-'}
+                {metadataDeferred && !serviceData.requestedResources
+                  ? deferredValue
+                  : serviceData.requestedResources || '-'}
               </div>
             </div>
             <div>
@@ -853,9 +936,11 @@ export function ServiceDetailCard({
               <div className="text-base mt-1">
                 {serviceData.estimatedHourlyCost != null
                   ? `${formatUsd(serviceData.estimatedHourlyCost)}/hr`
-                  : pricingLoading
-                    ? 'Loading replica prices...'
-                    : '-'}
+                  : metadataDeferred
+                    ? deferredValue
+                    : pricingLoading
+                      ? 'Loading replica prices...'
+                      : '-'}
               </div>
               {hourlyCostDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">
@@ -870,7 +955,9 @@ export function ServiceDetailCard({
               <div className="text-base mt-1">
                 {serviceData.requestRate != null
                   ? formatRequestRate(serviceData.requestRate)
-                  : '-'}
+                  : metadataDeferred
+                    ? deferredValue
+                    : '-'}
               </div>
               {requestDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">
@@ -887,18 +974,24 @@ export function ServiceDetailCard({
                   ? `${formatUsd(serviceData.costPerThousandRequests)}${
                       serviceData.hourlyCostExcludedReplicaCount > 0 ? '+' : ''
                     }`
-                  : serviceData.hourlyCostExcludedReplicaCount > 0
-                    ? 'Unknown'
-                    : '-'}
+                  : metadataDeferred
+                    ? deferredValue
+                    : serviceData.hourlyCostExcludedReplicaCount > 0
+                      ? 'Unknown'
+                      : '-'}
               </div>
               <div className="text-xs text-gray-500 mt-1">
-                {excludedCostDetails.length > 0
-                  ? serviceData.costPerThousandRequests != null
-                    ? `Known lower bound at the recent request rate · ${excludedCostDetails.join(' · ')}`
-                    : serviceData.pricedReplicaCount > 0
-                      ? `No recent request rate · ${excludedCostDetails.join(' · ')}`
-                      : `No pricing available · ${excludedCostDetails.join(' · ')}`
-                  : 'Current fleet cost at the recent request rate'}
+                {metadataDeferred
+                  ? metadataUnavailable
+                    ? 'Request and pricing data are unavailable. Refresh to retry.'
+                    : 'Loading request and pricing data.'
+                  : excludedCostDetails.length > 0
+                    ? serviceData.costPerThousandRequests != null
+                      ? `Known lower bound at the recent request rate · ${excludedCostDetails.join(' · ')}`
+                      : serviceData.pricedReplicaCount > 0
+                        ? `No recent request rate · ${excludedCostDetails.join(' · ')}`
+                        : `No pricing available · ${excludedCostDetails.join(' · ')}`
+                    : 'Current fleet cost at the recent request rate'}
               </div>
             </div>
             <div>
@@ -906,7 +999,9 @@ export function ServiceDetailCard({
                 Elected Version
               </div>
               <div className="text-base mt-1">
-                {serviceData.electedVersion ?? '-'}
+                {metadataDeferred && serviceData.electedVersion == null
+                  ? deferredValue
+                  : (serviceData.electedVersion ?? '-')}
               </div>
             </div>
             <div>
@@ -917,7 +1012,9 @@ export function ServiceDetailCard({
                 {serviceData.activeVersions &&
                 serviceData.activeVersions.length > 0
                   ? serviceData.activeVersions.join(', ')
-                  : '-'}
+                  : metadataDeferred
+                    ? deferredValue
+                    : '-'}
               </div>
             </div>
             {serviceData.serviceYaml && (
@@ -990,7 +1087,11 @@ function ServiceYamlSection({ serviceYaml }) {
   );
 }
 
-export function ReplicaPlacementCard({ replicas, loading }) {
+export function ReplicaPlacementCard({
+  replicas,
+  loading,
+  unavailable = false,
+}) {
   const rows = getReplicaPlacementBreakdown(replicas);
 
   return (
@@ -1069,7 +1170,11 @@ export function ReplicaPlacementCard({ replicas, loading }) {
                     colSpan={REPLICA_PLACEMENT_COLUMNS.length + 4}
                     className="text-center py-6 text-gray-500"
                   >
-                    {loading ? 'Loading attempt placement…' : 'No replicas.'}
+                    {loading
+                      ? 'Loading attempt placement…'
+                      : unavailable
+                        ? 'Replica placement unavailable. Refresh to retry.'
+                        : 'No replicas.'}
                   </TableCell>
                 </TableRow>
               )}
@@ -1125,7 +1230,7 @@ export function sortReplicas(replicas, sortConfig) {
     .map(({ replica }) => replica);
 }
 
-export function ReplicasCard({ replicas, loading }) {
+export function ReplicasCard({ replicas, loading, unavailable = false }) {
   const [sortConfig, setSortConfig] = useState({
     key: 'id',
     direction: 'ascending',
@@ -1134,6 +1239,26 @@ export function ReplicasCard({ replicas, loading }) {
     () => sortReplicas(replicas, sortConfig),
     [replicas, sortConfig]
   );
+  const currentReplicas = useMemo(
+    () =>
+      sortedReplicas.filter(
+        (replica) => !REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
+      ),
+    [sortedReplicas]
+  );
+  const historicalReplicas = useMemo(
+    () =>
+      (Array.isArray(replicas) ? replicas : []).filter((replica) =>
+        REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
+      ),
+    [replicas]
+  );
+  const boundedHistoricalReplicas = useMemo(() => {
+    const mostRecent = [...historicalReplicas]
+      .sort((left, right) => Number(right.id) - Number(left.id))
+      .slice(0, 50);
+    return sortReplicas(mostRecent, sortConfig);
+  }, [historicalReplicas, sortConfig]);
 
   const requestSort = (key) => {
     setSortConfig((current) => ({
@@ -1166,6 +1291,100 @@ export function ReplicasCard({ replicas, loading }) {
     );
   };
 
+  const renderReplicaTable = (rows, emptyMessage) => (
+    <Card>
+      <div className="overflow-x-auto rounded-lg">
+        <Table className="min-w-full">
+          <TableHeader>
+            <TableRow>
+              {sortableHeader('ID', 'id')}
+              {sortableHeader('Status', 'status')}
+              {sortableHeader('Version', 'version')}
+              {sortableHeader('Resources', 'resources')}
+              {sortableHeader('Est. $/hr', 'hourlyCost')}
+              {sortableHeader('Region', 'region')}
+              {sortableHeader('Endpoint', 'endpoint')}
+              {sortableHeader('Ready in', 'timeToReadySeconds')}
+              {sortableHeader('Launched', 'launched_at')}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.length > 0 ? (
+              rows.map((replica) => (
+                <TableRow key={replica.id}>
+                  <TableCell>{replica.id}</TableCell>
+                  <TableCell>
+                    <StatusBadge status={replica.status} />
+                  </TableCell>
+                  <TableCell>{replica.version ?? '-'}</TableCell>
+                  <TableCell>
+                    {replica.resources_str ? (
+                      <NonCapitalizedTooltip
+                        content={
+                          replica.resources_str_full || replica.resources_str
+                        }
+                        className="text-sm text-muted-foreground"
+                      >
+                        <span>
+                          {replica.infra
+                            ? `${replica.infra} (${replica.resources_str})`
+                            : replica.resources_str}
+                          {replica.is_spot ? ' [spot]' : ''}
+                        </span>
+                      </NonCapitalizedTooltip>
+                    ) : (
+                      '-'
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {replica.hourlyCost != null
+                      ? formatUsd(replica.hourlyCost)
+                      : '-'}
+                  </TableCell>
+                  <TableCell>{replica.region || '-'}</TableCell>
+                  <TableCell>
+                    <EndpointCell endpoint={replica.endpoint} />
+                  </TableCell>
+                  <TableCell>
+                    {replica.timeToReadySeconds != null ? (
+                      <NonCapitalizedTooltip
+                        content={`Ready at ${formatFullTimestamp(
+                          new Date(replica.ready_at * 1000)
+                        )}`}
+                      >
+                        <span className="border-b border-dotted border-gray-400 cursor-help">
+                          {formatDuration(replica.timeToReadySeconds)}
+                        </span>
+                      </NonCapitalizedTooltip>
+                    ) : (
+                      '-'
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {replica.launched_at
+                      ? formatFullTimestamp(
+                          new Date(replica.launched_at * 1000)
+                        )
+                      : '-'}
+                  </TableCell>
+                </TableRow>
+              ))
+            ) : (
+              <TableRow>
+                <TableCell
+                  colSpan={9}
+                  className="text-center py-6 text-gray-500"
+                >
+                  {emptyMessage}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </div>
+    </Card>
+  );
+
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">
@@ -1177,97 +1396,32 @@ export function ReplicasCard({ replicas, loading }) {
           </span>
         )}
       </div>
-      <Card>
-        <div className="overflow-x-auto rounded-lg">
-          <Table className="min-w-full">
-            <TableHeader>
-              <TableRow>
-                {sortableHeader('ID', 'id')}
-                {sortableHeader('Status', 'status')}
-                {sortableHeader('Version', 'version')}
-                {sortableHeader('Resources', 'resources')}
-                {sortableHeader('Est. $/hr', 'hourlyCost')}
-                {sortableHeader('Region', 'region')}
-                {sortableHeader('Endpoint', 'endpoint')}
-                {sortableHeader('Ready in', 'timeToReadySeconds')}
-                {sortableHeader('Launched', 'launched_at')}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {sortedReplicas.length > 0 ? (
-                sortedReplicas.map((replica) => (
-                  <TableRow key={replica.id}>
-                    <TableCell>{replica.id}</TableCell>
-                    <TableCell>
-                      <StatusBadge status={replica.status} />
-                    </TableCell>
-                    <TableCell>{replica.version ?? '-'}</TableCell>
-                    <TableCell>
-                      {replica.resources_str ? (
-                        <NonCapitalizedTooltip
-                          content={
-                            replica.resources_str_full || replica.resources_str
-                          }
-                          className="text-sm text-muted-foreground"
-                        >
-                          <span>
-                            {replica.infra
-                              ? `${replica.infra} (${replica.resources_str})`
-                              : replica.resources_str}
-                            {replica.is_spot ? ' [spot]' : ''}
-                          </span>
-                        </NonCapitalizedTooltip>
-                      ) : (
-                        '-'
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {replica.hourlyCost != null
-                        ? formatUsd(replica.hourlyCost)
-                        : '-'}
-                    </TableCell>
-                    <TableCell>{replica.region || '-'}</TableCell>
-                    <TableCell>
-                      <EndpointCell endpoint={replica.endpoint} />
-                    </TableCell>
-                    <TableCell>
-                      {replica.timeToReadySeconds != null ? (
-                        <NonCapitalizedTooltip
-                          content={`Ready at ${formatFullTimestamp(
-                            new Date(replica.ready_at * 1000)
-                          )}`}
-                        >
-                          <span className="border-b border-dotted border-gray-400 cursor-help">
-                            {formatDuration(replica.timeToReadySeconds)}
-                          </span>
-                        </NonCapitalizedTooltip>
-                      ) : (
-                        '-'
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {replica.launched_at
-                        ? formatFullTimestamp(
-                            new Date(replica.launched_at * 1000)
-                          )
-                        : '-'}
-                    </TableCell>
-                  </TableRow>
-                ))
-              ) : (
-                <TableRow>
-                  <TableCell
-                    colSpan={9}
-                    className="text-center py-6 text-gray-500"
-                  >
-                    No replicas.
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </div>
-      </Card>
+      {renderReplicaTable(
+        currentReplicas,
+        loading
+          ? 'Replica details are loading.'
+          : unavailable
+            ? 'Replica details unavailable. Refresh to retry.'
+            : 'No current replicas.'
+      )}
+      {historicalReplicas.length > 0 && (
+        <details className="mt-3 rounded-lg border bg-white px-4 py-3">
+          <summary className="cursor-pointer font-medium text-gray-700">
+            Past attempts ({historicalReplicas.length})
+          </summary>
+          <p className="mb-3 mt-2 text-sm text-gray-500">
+            These terminal attempts are retained to explain automatic retries
+            and provisioning history. They do not indicate a current service
+            failure.
+          </p>
+          {renderReplicaTable(boundedHistoricalReplicas, 'No past attempts.')}
+          {historicalReplicas.length > boundedHistoricalReplicas.length && (
+            <p className="mt-2 text-sm text-gray-500">
+              Showing the 50 most recent attempts.
+            </p>
+          )}
+        </details>
+      )}
     </div>
   );
 }

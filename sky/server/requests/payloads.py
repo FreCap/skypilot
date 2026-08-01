@@ -1291,6 +1291,9 @@ class ServeStatusBody(RequestBody):
     # Skip per-replica info; return cheap replica_status_counts instead.
     # Used by the dashboard for fast list/header rendering at fleet scale.
     summary_only: bool = False
+    # Return persisted service metadata without replica counts/details,
+    # autoscaler data, history, YAML, endpoint resolution, or provider calls.
+    metadata_only: bool = False
     # Optional override for target_num_replicas. If unset, the server keeps
     # full status behavior (include targets) but leaves summary-only requests
     # on the cheap DB-only path.
@@ -1298,6 +1301,9 @@ class ServeStatusBody(RequestBody):
     # Include aggregate physical-machine history for one named service.
     # Central history is PostgreSQL-only and retained for up to 72 hours.
     history_hours: int | None = None
+    # Summary responses skip endpoint resolution by default because it requires
+    # Kubernetes reads. Dashboard list enrichment opts in after metadata lands.
+    include_endpoints: bool = False
 
 
 class ServePlacementBody(RequestBody):

@@ -27,10 +27,12 @@ class GetServiceStatusRequestConverter:
         pool: bool,
         summary_only: bool = False,
         include_target_num_replicas: bool | None = None,
+        metadata_only: bool = False,
     ) -> 'servev1_pb2.GetServiceStatusRequest':
         request = servev1_pb2.GetServiceStatusRequest()
         request.pool = pool
         request.summary_only = summary_only
+        request.metadata_only = metadata_only
         if include_target_num_replicas is not None:
             request.include_target_num_replicas = include_target_num_replicas
         if service_names is not None:
@@ -40,7 +42,7 @@ class GetServiceStatusRequestConverter:
     @classmethod
     def from_proto(
         cls, proto: 'servev1_pb2.GetServiceStatusRequest'
-    ) -> tuple[list[str] | None, bool, bool, bool | None]:
+    ) -> tuple[list[str] | None, bool, bool, bool | None, bool]:
         pool = proto.pool
         if proto.HasField('service_names'):
             service_names = list(proto.service_names.names)
@@ -51,7 +53,7 @@ class GetServiceStatusRequestConverter:
         else:
             include_target_num_replicas = None
         return (service_names, pool, proto.summary_only,
-                include_target_num_replicas)
+                include_target_num_replicas, proto.metadata_only)
 
 
 class GetServiceStatusResponseConverter:
@@ -126,14 +128,16 @@ class RpcRunner:
         service_names: list[str] | None,
         pool: bool,
         summary_only: bool = False,
-        include_target_num_replicas: bool | None = None
+        include_target_num_replicas: bool | None = None,
+        metadata_only: bool = False,
     ) -> list[dict[str, Any]]:
         assert handle.is_grpc_enabled_with_flag
         request = GetServiceStatusRequestConverter.to_proto(
             service_names,
             pool,
             summary_only,
-            include_target_num_replicas=include_target_num_replicas)
+            include_target_num_replicas=include_target_num_replicas,
+            metadata_only=metadata_only)
         response = backend_utils.invoke_skylet_with_retries(
             lambda: backends.SkyletClient(handle.get_grpc_channel()
                                          ).get_service_status(request))

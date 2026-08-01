@@ -1974,6 +1974,16 @@ class TestGetServiceStatusSnapshot:
             'hash': row['hash'],
             'lifecycle_epoch': row['lifecycle_epoch'],
             'resource_scope': 'scope-a',
+            'uptime': row['uptime'],
+            'policy': 'policy',
+            'requested_resources_str': '1x[CPU:1+]',
+            'load_balancing_policy': 'round_robin',
+            'tls_encrypted': False,
+            'version': row['current_version'],
+            'elected_version': row['current_version'],
+            'active_versions': [],
+            'logical_replica_semantics': False,
+            'replica_unit': 'physical_backend',
         }
 
     def test_require_version_rejects_orphan_service_row(self, _mock_serve_db):

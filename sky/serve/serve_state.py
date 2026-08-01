@@ -1338,6 +1338,14 @@ def get_service_status_snapshot(
             services_table.c.hash,
             services_table.c.lifecycle_epoch,
             services_table.c.resource_scope,
+            services_table.c.uptime,
+            services_table.c.policy,
+            services_table.c.requested_resources_str,
+            services_table.c.load_balancing_policy,
+            services_table.c.tls_encrypted,
+            services_table.c.current_version,
+            services_table.c.active_versions,
+            services_table.c.logical_replica_semantics,
         ).where(services_table.c.name == service_name)
         if require_version:
             query = query.where(sqlalchemy.exists().where(
@@ -1358,6 +1366,21 @@ def get_service_status_snapshot(
         'hash': mapping['hash'],
         'lifecycle_epoch': mapping['lifecycle_epoch'],
         'resource_scope': mapping['resource_scope'],
+        'uptime': mapping['uptime'],
+        'policy': mapping['policy'],
+        'requested_resources_str': mapping['requested_resources_str'],
+        'load_balancing_policy': mapping['load_balancing_policy'],
+        'tls_encrypted': bool(mapping['tls_encrypted']),
+        # This slim query deliberately avoids the latest-version join. The
+        # elected version is the best persisted version available without
+        # deserializing latest-version metadata; summary enrichment replaces it.
+        'version': mapping['current_version'],
+        'elected_version': mapping['current_version'],
+        'active_versions': (json.loads(mapping['active_versions'])
+                            if mapping['active_versions'] else []),
+        'logical_replica_semantics': bool(mapping['logical_replica_semantics']),
+        'replica_unit': ('logical_slot' if mapping['logical_replica_semantics']
+                         else 'physical_backend'),
     }
 
 

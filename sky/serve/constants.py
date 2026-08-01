@@ -783,7 +783,9 @@ POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 #        can skip per-service autoscaler HTTP fetches unless they render it.
 # v8.0 - Added per-GPU logical replica semantics and logical capacity hints.
 # v9.0 - Added the authenticated, read-only placement snapshot endpoint.
-SERVE_VERSION = 9
+# v10.0 - Added metadata_only to get_service_status for progressive dashboard
+#         rendering without replica, autoscaler, history, or endpoint reads.
+SERVE_VERSION = 10
 
 TERMINATE_REPLICA_VERSION_MISMATCH_ERROR = (
     'The version of service is outdated and does not support manually '
