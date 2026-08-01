@@ -7,6 +7,7 @@ import {
   waitFor,
 } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { formatFullTimestamp } from '@/components/utils';
 
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
@@ -25,6 +26,8 @@ jest.mock('@/data/connectors/services', () => {
   return {
     ...actual,
     getServiceHistory: jest.fn(),
+    getServiceReplicaSummaries: jest.fn(),
+    getServiceReplicas: jest.fn(),
   };
 });
 
@@ -51,7 +54,12 @@ jest.mock('@/components/service-placement', () => ({
 }));
 
 import dashboardCache from '@/lib/cache';
-import { getServiceHistory, getServices } from '@/data/connectors/services';
+import {
+  getServiceHistory,
+  getServiceReplicaSummaries,
+  getServiceReplicas,
+  getServices,
+} from '@/data/connectors/services';
 import ServiceDetailsPage, {
   AcceleratorCapacityCard,
   getReplicaPlacementBreakdown,
@@ -61,6 +69,7 @@ import ServiceDetailsPage, {
   sortReplicas,
   useServiceDetails,
   useServiceHistory,
+  useServiceReplicaData,
 } from '@/pages/services/[service]';
 
 describe('AcceleratorCapacityCard', () => {
@@ -1692,6 +1701,447 @@ describe('useServiceHistory independent loading', () => {
   });
 });
 
+describe('useServiceReplicaData bounded loading', () => {
+  const directSummary = (overrides = {}) => ({
+    available: true,
+    summaries: [
+      {
+        name: 'svc',
+        serviceHash: 'hash-a',
+        replicaStatusCounts: { READY: 2, FAILED_PROVISION: 3 },
+        replicasReady: 2,
+        replicasTotal: 2,
+        currentOrUncertainCount: 2,
+        pastAttemptCount: 3,
+        ...overrides,
+      },
+    ],
+  });
+  const directPage = (scope, overrides = {}) => ({
+    available: true,
+    serviceName: 'svc',
+    serviceHash: 'hash-a',
+    scope,
+    total: 0,
+    nextCursor: null,
+    observedAt: 100,
+    replicas: [],
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    dashboardCache.get.mockResolvedValue({
+      services: [
+        {
+          name: 'svc',
+          serviceHash: 'hash-a',
+          status: 'READY',
+          summaryOnly: true,
+          replicas: [],
+        },
+      ],
+    });
+    getServiceReplicaSummaries.mockResolvedValue(directSummary());
+    getServiceReplicas.mockResolvedValue(
+      directPage('current_or_uncertain', {
+        total: 2,
+        replicas: [
+          { id: 3, status: 'READY' },
+          { id: 2, status: 'FAILED_CLEANUP' },
+        ],
+      })
+    );
+  });
+
+  it('fans out bounded reads after the hash anchor and defers past attempts', async () => {
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+
+    await waitFor(() => expect(result.current.currentPage.total).toBe(2));
+    expect(getServiceReplicaSummaries).toHaveBeenCalledWith({
+      serviceNames: ['svc'],
+    });
+    expect(getServiceReplicas).toHaveBeenCalledTimes(1);
+    expect(getServiceReplicas).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: 'current_or_uncertain',
+        limit: 50,
+      })
+    );
+    expect(dashboardCache.get).not.toHaveBeenCalledWith(
+      getServices,
+      detailFullArgs('svc')
+    );
+
+    getServiceReplicas.mockResolvedValueOnce(
+      directPage('past_attempts', {
+        total: 3,
+        nextCursor: 'past-2',
+        replicas: [{ id: 10, status: 'FAILED_PROVISION' }],
+      })
+    );
+    await act(async () => result.current.openPastAttempts());
+    expect(getServiceReplicas).toHaveBeenLastCalledWith(
+      expect.objectContaining({ scope: 'past_attempts', cursor: null })
+    );
+    expect(result.current.pastPage.replicas.map((row) => row.id)).toEqual([10]);
+  });
+
+  it('loads more explicitly and deduplicates replica IDs', async () => {
+    getServiceReplicas
+      .mockResolvedValueOnce(
+        directPage('current_or_uncertain', {
+          total: 3,
+          nextCursor: 'current-2',
+          replicas: [
+            { id: 3, status: 'READY' },
+            { id: 2, status: 'STARTING' },
+          ],
+        })
+      )
+      .mockResolvedValueOnce(
+        directPage('current_or_uncertain', {
+          total: 3,
+          replicas: [
+            { id: 2, status: 'STARTING' },
+            { id: 1, status: 'PROVISIONING' },
+          ],
+        })
+      );
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+    await waitFor(() =>
+      expect(result.current.currentPage.nextCursor).toBe('current-2')
+    );
+
+    await act(async () => result.current.loadMoreCurrent());
+
+    expect(result.current.currentPage.replicas.map((row) => row.id)).toEqual([
+      3, 2, 1,
+    ]);
+    expect(getServiceReplicas).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: 'current-2' })
+    );
+  });
+
+  it('does not let load-more supersede an in-flight first-page refresh', async () => {
+    getServiceReplicas.mockResolvedValueOnce(
+      directPage('current_or_uncertain', {
+        total: 3,
+        nextCursor: 'current-2',
+        replicas: [
+          { id: 3, status: 'READY' },
+          { id: 2, status: 'STARTING' },
+        ],
+      })
+    );
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+    await waitFor(() =>
+      expect(result.current.currentPage.nextCursor).toBe('current-2')
+    );
+
+    const refreshedPage = deferred();
+    getServiceReplicas.mockReturnValueOnce(refreshedPage.promise);
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshReplicas();
+    });
+    await waitFor(() => expect(result.current.currentPage.loading).toBe(true));
+    const callsDuringRefresh = getServiceReplicas.mock.calls.length;
+
+    await act(async () => result.current.loadMoreCurrent());
+    expect(getServiceReplicas).toHaveBeenCalledTimes(callsDuringRefresh);
+
+    await act(async () => {
+      refreshedPage.resolve(
+        directPage('current_or_uncertain', {
+          total: 1,
+          replicas: [{ id: 4, status: 'READY' }],
+        })
+      );
+      await refreshedPage.promise;
+      await refreshPromise;
+    });
+    expect(result.current.currentPage.replicas).toEqual([
+      { id: 4, status: 'READY' },
+    ]);
+  });
+
+  it('keeps last-good rows when a direct refresh fails', async () => {
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+    await waitFor(() => expect(result.current.currentPage.total).toBe(2));
+    getServiceReplicas.mockRejectedValueOnce(new Error('temporarily down'));
+
+    await act(async () => result.current.refreshReplicas());
+
+    expect(result.current.currentPage.replicas.map((row) => row.id)).toEqual([
+      3, 2,
+    ]);
+    expect(result.current.currentPage.refreshUnavailable).toBe(true);
+    expect(result.current.currentPage.loading).toBe(false);
+    consoleError.mockRestore();
+  });
+
+  it('treats a modern not-found page as an identity invalidation', async () => {
+    const onServiceHashMismatch = jest.fn();
+    getServiceReplicas.mockResolvedValueOnce({
+      available: false,
+      reason: 'not_found',
+      legacyFallback: false,
+      replicas: [],
+      total: 0,
+      nextCursor: null,
+    });
+
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+        onServiceHashMismatch,
+      })
+    );
+
+    await waitFor(() => expect(onServiceHashMismatch).toHaveBeenCalledTimes(1));
+    expect(result.current.currentPage.unavailable).toBe(true);
+  });
+
+  it('uses the full controller path for non-consolidated topology', async () => {
+    getServiceReplicaSummaries.mockResolvedValueOnce({
+      available: false,
+      reason: 'non_consolidated',
+      legacyFallback: true,
+      summaries: [],
+    });
+    dashboardCache.get.mockImplementation((_connector, [options]) => {
+      if (options.summaryOnly) {
+        return Promise.resolve({
+          services: [
+            {
+              name: 'svc',
+              serviceHash: 'hash-a',
+              status: 'READY',
+              summaryOnly: true,
+              replicas: [],
+            },
+          ],
+        });
+      }
+      return Promise.resolve({
+        services: [
+          {
+            name: 'svc',
+            serviceHash: 'hash-a',
+            status: 'READY',
+            replicas: [
+              { id: 1, status: 'READY' },
+              { id: 2, status: 'FAILED_PROVISION' },
+            ],
+          },
+        ],
+      });
+    });
+
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+
+    await waitFor(() => expect(result.current.legacyService).not.toBeNull());
+    expect(result.current.currentPage.replicas).toEqual([
+      { id: 1, status: 'READY' },
+    ]);
+    expect(result.current.pastPage.replicas).toEqual([
+      { id: 2, status: 'FAILED_PROVISION' },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledWith(
+      getServices,
+      detailFullArgs('svc')
+    );
+  });
+
+  it('fences an older forced legacy response', async () => {
+    const initialFull = deferred();
+    const refreshedFull = deferred();
+    let fullCall = 0;
+    dashboardCache.get.mockImplementation((_connector, [options]) => {
+      if (options.summaryOnly) {
+        return Promise.resolve({
+          services: [{ name: 'svc', status: 'READY', summaryOnly: true }],
+        });
+      }
+      fullCall += 1;
+      return fullCall === 1 ? initialFull.promise : refreshedFull.promise;
+    });
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: null,
+        metadataReady: true,
+      })
+    );
+    await waitFor(() => expect(fullCall).toBe(1));
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshReplicas();
+    });
+    await waitFor(() => expect(fullCall).toBe(2));
+    await act(async () => {
+      refreshedFull.resolve({
+        services: [
+          {
+            name: 'svc',
+            status: 'FRESH',
+            replicas: [{ id: 2, status: 'READY' }],
+          },
+        ],
+      });
+      await refreshedFull.promise;
+      await refreshPromise;
+    });
+    await act(async () => {
+      initialFull.resolve({
+        services: [
+          {
+            name: 'svc',
+            status: 'STALE',
+            replicas: [{ id: 1, status: 'READY' }],
+          },
+        ],
+      });
+      await initialFull.promise;
+    });
+
+    expect(result.current.legacyService.status).toBe('FRESH');
+    expect(result.current.currentPage.replicas).toEqual([
+      { id: 2, status: 'READY' },
+    ]);
+  });
+
+  it('deduplicates a replica that moves from current to past', async () => {
+    getServiceReplicas
+      .mockResolvedValueOnce(
+        directPage('current_or_uncertain', {
+          total: 1,
+          replicas: [{ id: 5, status: 'SHUTTING_DOWN' }],
+        })
+      )
+      .mockResolvedValueOnce(
+        directPage('past_attempts', {
+          total: 1,
+          replicas: [{ id: 5, status: 'FAILED_PROVISION' }],
+        })
+      );
+    const { result } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+    await waitFor(() => expect(result.current.currentPage.total).toBe(1));
+    await act(async () => result.current.openPastAttempts());
+
+    expect(result.current.currentPage.replicas).toEqual([]);
+    expect(result.current.currentPage.total).toBe(0);
+    expect(result.current.pastPage.replicas).toEqual([
+      { id: 5, status: 'FAILED_PROVISION' },
+    ]);
+  });
+
+  it('drops a late page from the previous route generation', async () => {
+    const serviceAPage = deferred();
+    dashboardCache.get.mockImplementation((_connector, [options]) => {
+      const name = options.serviceNames[0];
+      return Promise.resolve({
+        services: [
+          {
+            name,
+            serviceHash: name === 'svc-a' ? 'hash-a' : 'hash-b',
+            status: 'READY',
+            summaryOnly: true,
+            replicas: [],
+          },
+        ],
+      });
+    });
+    getServiceReplicaSummaries
+      .mockResolvedValueOnce(
+        directSummary({ name: 'svc-a', serviceHash: 'hash-a' })
+      )
+      .mockResolvedValueOnce(
+        directSummary({ name: 'svc-b', serviceHash: 'hash-b' })
+      );
+    getServiceReplicas
+      .mockReturnValueOnce(serviceAPage.promise)
+      .mockResolvedValueOnce({
+        ...directPage('current_or_uncertain', {
+          serviceName: 'svc-b',
+          serviceHash: 'hash-b',
+          total: 1,
+          replicas: [{ id: 2, status: 'READY' }],
+        }),
+      });
+
+    const { result, rerender } = renderHook(
+      ({ serviceName, serviceHash }) =>
+        useServiceReplicaData({
+          serviceName,
+          serviceHash,
+          metadataReady: true,
+        }),
+      {
+        initialProps: { serviceName: 'svc-a', serviceHash: 'hash-a' },
+      }
+    );
+    rerender({ serviceName: 'svc-b', serviceHash: 'hash-b' });
+    await waitFor(() => expect(result.current.currentPage.total).toBe(1));
+
+    await act(async () => {
+      serviceAPage.resolve(
+        directPage('current_or_uncertain', {
+          serviceName: 'svc-a',
+          serviceHash: 'hash-a',
+          total: 1,
+          replicas: [{ id: 1, status: 'READY' }],
+        })
+      );
+      await serviceAPage.promise;
+    });
+
+    expect(result.current.currentPage.replicas).toEqual([
+      { id: 2, status: 'READY' },
+    ]);
+  });
+});
+
 describe('ServiceDetails route ownership rendering', () => {
   beforeEach(() => {
     jest.resetAllMocks();
@@ -1710,37 +2160,30 @@ describe('ServiceDetails route ownership rendering', () => {
 
   it('shows route loading instead of the previous service while a new route is in flight', async () => {
     const nextSummary = deferred();
-    const nextFull = deferred();
     const routerState = {
       isReady: true,
       query: { service: 'svc-a' },
     };
     mockUseRouter.mockImplementation(() => routerState);
 
-    dashboardCache.get
-      .mockResolvedValueOnce({
-        services: [
-          { name: 'svc-a', status: 'READY', summaryOnly: true, replicas: [] },
-        ],
-      })
-      .mockResolvedValueOnce({
-        services: [{ name: 'svc-a', status: 'READY', replicas: [] }],
-      });
+    dashboardCache.get.mockResolvedValueOnce({
+      services: [
+        { name: 'svc-a', status: 'READY', summaryOnly: true, replicas: [] },
+      ],
+    });
 
     const { rerender } = render(<ServiceDetailsPage />);
 
     await waitFor(() =>
       expect(screen.getAllByText('svc-a')).not.toHaveLength(0)
     );
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
 
-    dashboardCache.get
-      .mockImplementationOnce(() => nextSummary.promise)
-      .mockImplementationOnce(() => nextFull.promise);
+    dashboardCache.get.mockImplementationOnce(() => nextSummary.promise);
     routerState.query = { service: 'svc-b' };
     rerender(<ServiceDetailsPage />);
 
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
 
     expect(screen.getByText('Loading service details...')).toBeInTheDocument();
     expect(screen.queryByText('Service not found.')).not.toBeInTheDocument();
@@ -1757,20 +2200,16 @@ describe('ServiceDetails route ownership rendering', () => {
           },
         ],
       });
-      nextFull.resolve({
-        services: [{ name: 'svc-b', status: 'READY', replicas: [] }],
-      });
-      await Promise.all([nextSummary.promise, nextFull.promise]);
+      await nextSummary.promise;
     });
 
     expect(screen.getAllByText('svc-b')).not.toHaveLength(0);
-    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
   it('does not reuse a previous snapshot when returning through an A-B-A route cycle', async () => {
     const serviceBSummary = deferred();
     const freshServiceASummary = deferred();
-    const freshServiceAFull = deferred();
     const routerState = {
       isReady: true,
       query: { service: 'svc-a' },
@@ -1788,12 +2227,8 @@ describe('ServiceDetails route ownership rendering', () => {
           },
         ],
       })
-      .mockResolvedValueOnce({
-        services: [{ name: 'svc-a', status: 'STALE-A', replicas: [] }],
-      })
       .mockImplementationOnce(() => serviceBSummary.promise)
-      .mockImplementationOnce(() => freshServiceASummary.promise)
-      .mockImplementationOnce(() => freshServiceAFull.promise);
+      .mockImplementationOnce(() => freshServiceASummary.promise);
 
     const { rerender } = render(<ServiceDetailsPage />);
     await waitFor(() =>
@@ -1802,11 +2237,11 @@ describe('ServiceDetails route ownership rendering', () => {
 
     routerState.query = { service: 'svc-b' };
     rerender(<ServiceDetailsPage />);
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
 
     routerState.query = { service: 'svc-a' };
     rerender(<ServiceDetailsPage />);
-    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
     rerender(<ServiceDetailsPage />);
 
     expect(screen.getByText('Loading service details...')).toBeInTheDocument();
@@ -1823,17 +2258,11 @@ describe('ServiceDetails route ownership rendering', () => {
           },
         ],
       });
-      freshServiceAFull.resolve({
-        services: [{ name: 'svc-a', status: 'FRESH-A', replicas: [] }],
-      });
-      await Promise.all([
-        freshServiceASummary.promise,
-        freshServiceAFull.promise,
-      ]);
+      await freshServiceASummary.promise;
     });
 
     expect(screen.getAllByText('FRESH-A')).not.toHaveLength(0);
-    expect(dashboardCache.get).toHaveBeenCalledTimes(5);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
 
     await act(async () => {
       serviceBSummary.resolve({
@@ -1908,7 +2337,7 @@ describe('ServiceDetails route ownership rendering', () => {
     expect(screen.getByRole('tab', { name: 'Placement' })).toBeInTheDocument();
   });
 
-  it('keeps placement loads summary-only until overview needs replicas', async () => {
+  it('keeps placement metadata-only and uses bounded reads on overview', async () => {
     const routerState = {
       isReady: true,
       query: { service: 'svc', tab: 'placement' },
@@ -1916,7 +2345,36 @@ describe('ServiceDetails route ownership rendering', () => {
     mockUseRouter.mockImplementation(() => routerState);
 
     dashboardCache.get.mockResolvedValueOnce({
-      services: [{ name: 'svc', status: 'READY', summaryOnly: true }],
+      services: [
+        {
+          name: 'svc',
+          serviceHash: 'hash-a',
+          status: 'READY',
+          metadataOnly: true,
+        },
+      ],
+    });
+    getServiceReplicaSummaries.mockResolvedValue({
+      available: true,
+      summaries: [
+        {
+          name: 'svc',
+          serviceHash: 'hash-a',
+          replicaStatusCounts: { READY: 1 },
+          replicasReady: 1,
+          replicasTotal: 1,
+          currentOrUncertainCount: 1,
+          pastAttemptCount: 0,
+        },
+      ],
+    });
+    getServiceReplicas.mockResolvedValue({
+      available: true,
+      serviceHash: 'hash-a',
+      scope: 'current_or_uncertain',
+      total: 1,
+      nextCursor: null,
+      replicas: [{ id: 1, status: 'READY' }],
     });
 
     const { rerender } = render(<ServiceDetailsPage />);
@@ -1933,17 +2391,123 @@ describe('ServiceDetails route ownership rendering', () => {
     );
 
     dashboardCache.get.mockResolvedValueOnce({
-      services: [{ name: 'svc', status: 'READY', replicas: [] }],
+      services: [
+        {
+          name: 'svc',
+          serviceHash: 'hash-a',
+          status: 'READY',
+          summaryOnly: true,
+          replicas: [],
+        },
+      ],
     });
     routerState.query = { service: 'svc' };
     rerender(<ServiceDetailsPage />);
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
-    expect(dashboardCache.get).toHaveBeenNthCalledWith(
-      2,
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(2, getServices, [
+      {
+        serviceNames: ['svc'],
+        summaryOnly: true,
+        includeTargetReplicas: true,
+        includeEndpoints: true,
+      },
+    ]);
+    expect(getServiceReplicaSummaries).toHaveBeenCalledWith({
+      serviceNames: ['svc'],
+    });
+    expect(getServiceReplicas).toHaveBeenCalledWith(
+      expect.objectContaining({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        scope: 'current_or_uncertain',
+        limit: 50,
+      })
+    );
+    expect(dashboardCache.get).not.toHaveBeenCalledWith(
       getServices,
       detailFullArgs('svc')
     );
+  });
+
+  it('keeps legacy full-status past attempts capped at 50 rows', async () => {
+    mockUseRouter.mockReturnValue({
+      isReady: true,
+      query: { service: 'svc' },
+    });
+    const historical = Array.from({ length: 60 }, (_, index) => ({
+      id: index + 1,
+      status: 'FAILED_PROVISION',
+      version: 1,
+    }));
+    const fullService = {
+      name: 'svc',
+      serviceHash: null,
+      status: 'READY',
+      metadataOnly: false,
+      summaryOnly: false,
+      replicasReady: 1,
+      replicasTotal: 1,
+      replicasFailed: 60,
+      targetReplicas: 1,
+      replicaStatusCounts: { READY: 1, FAILED_PROVISION: 60 },
+      replicas: [{ id: 61, status: 'READY', version: 1 }, ...historical],
+      acceleratorCapacity: [],
+      activeVersions: [1],
+      hourlyCostExclusionReasons: {},
+    };
+    dashboardCache.get.mockImplementation((_connector, [options]) => {
+      if (options.metadataOnly) {
+        return Promise.resolve({
+          services: [
+            {
+              ...fullService,
+              metadataOnly: true,
+              replicasReady: null,
+              replicasTotal: null,
+              replicasFailed: null,
+              replicaStatusCounts: null,
+              replicas: [],
+            },
+          ],
+        });
+      }
+      if (options.historyHours) {
+        return Promise.resolve({
+          services: [
+            {
+              name: 'svc',
+              serviceHash: null,
+              replicaHistory: {
+                available: true,
+                samples: [],
+                requestSamples: [],
+                predictionTimeSamples: [],
+                autoscalerSamples: [],
+              },
+            },
+          ],
+        });
+      }
+      if (options.summaryOnly) {
+        return Promise.resolve({
+          services: [{ ...fullService, summaryOnly: true, replicas: [] }],
+        });
+      }
+      return Promise.resolve({ services: [fullService] });
+    });
+
+    render(<ServiceDetailsPage />);
+
+    const summary = await screen.findByText('Past attempts (60)');
+    const details = summary.closest('details');
+    expect(details).not.toHaveAttribute('open');
+    expect(within(details).getAllByRole('row')).toHaveLength(51);
+    expect(
+      within(details).getByText('Showing the 50 most recent attempts.')
+    ).toBeInTheDocument();
+    expect(getServiceReplicaSummaries).not.toHaveBeenCalled();
+    expect(getServiceReplicas).not.toHaveBeenCalled();
   });
 
   it('reuses an existing full snapshot when overview is revisited', async () => {
@@ -2447,5 +3011,91 @@ describe('service replica table sorting', () => {
     expect(
       within(details).getByText('Showing the 50 most recent attempts.')
     ).toBeInTheDocument();
+  });
+
+  it('loads current and past pages explicitly with independent placeholders', async () => {
+    const user = userEvent.setup();
+    const onLoadMoreCurrent = jest.fn();
+    const onOpenPast = jest.fn();
+    const onLoadMorePast = jest.fn();
+    const { rerender } = render(
+      <ReplicasCard
+        replicas={[{ id: 3, status: 'READY', version: 1 }]}
+        loading={false}
+        currentTotal={3}
+        currentNextCursor="current-2"
+        onLoadMoreCurrent={onLoadMoreCurrent}
+        pastReplicas={[]}
+        pastTotal={2}
+        pastLoading
+        pastNextCursor="past-2"
+        onOpenPast={onOpenPast}
+        onLoadMorePast={onLoadMorePast}
+      />
+    );
+
+    expect(
+      screen.getByText('Showing 1 of 3 current or uncertain')
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Load more replicas' })
+    );
+    expect(onLoadMoreCurrent).toHaveBeenCalledTimes(1);
+    expect(onOpenPast).not.toHaveBeenCalled();
+
+    await user.click(screen.getByText('Past attempts (2)'));
+    expect(onOpenPast).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Past attempts are loading.')).toBeVisible();
+    const pastLoadMore = screen.getByRole('button', {
+      name: 'Load more past attempts',
+    });
+    expect(pastLoadMore).toBeDisabled();
+    await user.click(pastLoadMore);
+    expect(onLoadMorePast).not.toHaveBeenCalled();
+
+    rerender(
+      <ReplicasCard
+        replicas={[{ id: 3, status: 'READY', version: 1 }]}
+        loading={false}
+        currentTotal={3}
+        currentNextCursor="current-2"
+        onLoadMoreCurrent={onLoadMoreCurrent}
+        pastReplicas={[]}
+        pastTotal={2}
+        pastNextCursor="past-2"
+        onOpenPast={onOpenPast}
+        onLoadMorePast={onLoadMorePast}
+      />
+    );
+    await user.click(
+      screen.getByRole('button', { name: 'Load more past attempts' })
+    );
+    expect(onLoadMorePast).toHaveBeenCalledTimes(1);
+  });
+
+  it('labels fields omitted from the direct projection and shows creation time', () => {
+    render(
+      <ReplicasCard
+        replicas={[
+          {
+            id: 7,
+            status: 'FAILED_CLEANUP',
+            version: 2,
+            createdAt: 1751600000,
+            directProjection: true,
+          },
+        ]}
+        loading={false}
+        currentTotal={1}
+        pastReplicas={[]}
+        pastTotal={0}
+      />
+    );
+
+    expect(screen.getAllByText('Not loaded')).toHaveLength(4);
+    expect(screen.getByRole('columnheader', { name: 'Created' })).toBeVisible();
+    expect(
+      screen.getByText(formatFullTimestamp(new Date(1751600000 * 1000)))
+    ).toBeVisible();
   });
 });

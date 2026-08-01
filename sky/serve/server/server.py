@@ -6,6 +6,7 @@ import enum
 import fastapi
 
 from sky import sky_logging
+from sky.serve import serve_dashboard
 from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -31,6 +32,11 @@ class StatusHistorySection(str, enum.Enum):
     REPLICAS = 'replicas'
     PREDICTION = 'prediction'
     AUTOSCALER = 'autoscaler'
+
+
+class ReplicaScope(str, enum.Enum):
+    CURRENT_OR_UNCERTAIN = serve_dashboard.CURRENT_OR_UNCERTAIN_SCOPE
+    PAST_ATTEMPTS = serve_dashboard.PAST_ATTEMPTS_SCOPE
 
 
 def _require_admin(request: fastapi.Request) -> None:
@@ -176,6 +182,56 @@ async def status_history(
             status_code=409,
             detail='Service incarnation changed. Refresh and retry.')
     return history
+
+
+@router.get('/replica-summaries')
+async def replica_summaries(
+        service_name: list[str] | None = fastapi.Query(default=None),) -> dict:
+    """Read compact persisted counts without contacting a controller."""
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        return serve_dashboard.unavailable_replica_summaries('non_consolidated')
+    return await asyncio.to_thread(serve_dashboard.get_replica_summaries,
+                                   service_name)
+
+
+@router.get('/{service_name}/replicas')
+async def replica_page(
+    service_name: str,
+    expected_service_hash: str = fastapi.Query(min_length=1),
+    scope: ReplicaScope = fastapi.Query(),
+    limit: int = fastapi.Query(default=50, ge=1, le=100),
+    cursor: str | None = fastapi.Query(default=None,
+                                       min_length=1,
+                                       max_length=4096),
+) -> dict:
+    """Read one bounded persisted replica page without controller work."""
+    scope_value = scope.value
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        return serve_dashboard.unavailable_replica_page(service_name,
+                                                        expected_service_hash,
+                                                        scope_value,
+                                                        'non_consolidated')
+    try:
+        return await asyncio.to_thread(
+            serve_dashboard.get_replica_page,
+            service_name,
+            expected_service_hash,
+            scope_value,
+            limit,
+            cursor,
+        )
+    except serve_dashboard.ServiceNotFoundError as exc:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.') from exc
+    except (serve_dashboard.ServiceHashMismatchError,
+            serve_dashboard.ReplicaCursorMismatchError) as exc:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation or replica cursor changed. Refresh '
+            'and retry.') from exc
+    except serve_dashboard.InvalidReplicaCursorError as exc:
+        raise fastapi.HTTPException(status_code=422,
+                                    detail='Invalid replica cursor.') from exc
 
 
 @router.post('/{service_name}/versions/elect')

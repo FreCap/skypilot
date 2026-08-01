@@ -2,7 +2,7 @@
 
 _Created: 2026-08-01_
 
-_Status: v0 deployed; v1a merged; v1b implemented pending merge; v1c accepted_
+_Status: v0 deployed; v1a-v1b merged; v1c implemented and pending merge_
 _Last updated: 2026-08-01_
 
 ## Problems
@@ -68,8 +68,8 @@ Production profiling shows that v0's deferred full request remains expensive, so
 The API contracts are:
 
 - `GET /serve/{service_name}/history?hours=N&section=S&expected_service_hash=H` returns only the requested aggregate history sections, where repeated `section` values select `requests`, `replicas`, `prediction`, or `autoscaler`. `hours` is bounded to the 72-hour retention contract. A hash mismatch returns `409` rather than mixing same-name service incarnations.
-- `GET /serve/replica-summaries?service_name=N` returns one batched persisted projection for the selected or all non-pool services: service hash, replica unit, physical status counts, logical planned-capacity counts, current-or-uncertain count, past-attempt count, and observation time. The query scans normalized compact state once rather than issuing one query per service.
-- `GET /serve/{service_name}/replicas?scope=current_or_uncertain|past_attempts&limit=N&cursor=C&expected_service_hash=H` returns a descending, cursor-paginated lightweight replica projection with `1 <= limit <= 100` and a default of 50. The response includes `total` and `next_cursor`, so disclosure counts and pagination do not depend on loaded rows. Both scopes expose explicit load-more behavior; current or uncertain rows are never silently truncated, while past pages remain inside their disclosure. Rich current-row pricing and endpoint enrichment may arrive separately; past attempts never resolve handles, endpoints, or pricing.
+- `GET /serve/replica-summaries?service_name=N` accepts repeated optional `service_name` filters and returns `{available, observed_at, summaries}`. Each snake-case summary contains `service_name`, `service_hash`, `replica_unit`, `replica_status_counts`, `replica_capacity_counts`, `current_or_uncertain_count`, and `past_attempt_count`. The two totals count physical attempt rows; logical planned capacity remains a separate histogram. Omitting the filter selects all non-pool services. The query scans normalized compact state once rather than issuing one query per service.
+- `GET /serve/{service_name}/replicas?scope=current_or_uncertain|past_attempts&limit=N&cursor=C&expected_service_hash=H` returns `{available, service_name, service_hash, scope, replica_unit, observed_at, total, replicas, next_cursor}` with snake-case, descending, cursor-paginated lightweight rows. The physical-row `total` uses the same scope classification as the summary, so disclosure counts and pagination do not depend on loaded rows. `1 <= limit <= 100`, with a default of 50. Both scopes expose explicit load-more behavior; current or uncertain rows are never silently truncated, while past pages remain inside their disclosure. Rich current-row pricing and endpoint enrichment may arrive separately; past attempts never resolve handles, endpoints, or pricing.
 
 All three routes preserve the read permissions of `POST /serve/status`: authenticated viewers are explicitly allowlisted for the three exact GET patterns, while write operations remain unavailable. They return no credentials, handles, stored YAML, or secrets. SkyServe status is currently a global read rather than workspace-filtered; these routes do not broaden that visibility. If status gains workspace filtering, the dashboard routes must use the same authorization helper rather than maintaining a second policy.
 
@@ -85,15 +85,15 @@ During v1b, the existing full replica status request remains but no longer carri
 
 The controller-backed summary remains the authoritative fresh source for autoscaler target and request-pressure fields. Minute history may render first but must retain its observation time and must not be presented as a fresh target. If one independent enrichment fails, the last good data in other sections remains visible and only that section offers refresh-to-retry guidance.
 
-The API version advances to 66 for the new routes. Existing clients and all existing `/serve/status` behavior remain unchanged. The new dashboard assets are served by the same API-server release that owns the routes; an already-open page spanning a server rollback may show the affected section as unavailable until reload, but must keep the last good snapshot rather than blanking the page.
+Direct selected-range history introduced in v1b requires API version 66. The replica-summary and replica-page routes introduced in v1c require API version 67, because an exact v1b server legitimately reports version 66 while returning `404` for those later routes. The dashboard therefore uses separate capability constants: a replica-route `404` from version 66 triggers the v0 full-status fallback, while the same `404` from version 67 is a real missing-service result. Existing clients and all existing `/serve/status` behavior remain unchanged. The new dashboard assets are served by the same API-server release that owns the routes; an already-open page spanning a server rollback may show the affected section as unavailable until reload, but must keep the last good snapshot rather than blanking the page.
 
 This v1 does not change the clusters dashboard. Production measured the active cluster list at about 0.58 seconds and workspaces at about 0.27 seconds, so cluster cache seeding and future pagination-plugin preload guards are lower-priority, independently shippable follow-ups.
 
 Deliver v1 as three mergeable milestones to keep review and rollback boundaries narrow:
 
 1. v1a starts list metadata and summary concurrently and makes either arrival order monotonic. Merged in PR #1147.
-2. v1b adds capability-gated selected-range direct history while retaining the existing full replica path and fallback. Implemented pending merge.
-3. v1c adds the direct batched replica-summary projection and current/past replica pagination, then removes the eager full replica request from Overview.
+2. v1b adds capability-gated selected-range direct history while retaining the existing full replica path and fallback. Merged in PR #1151.
+3. v1c adds the direct batched replica-summary projection and current/past replica pagination, then removes the eager full replica request from Overview. Implemented and pending merge.
 
 Each milestone updates this canonical design in place, runs its focused frontend and backend tests, and passes the complete CI rollup on its exact pushed SHA before merge. Later milestones start from the verified merge of the preceding milestone rather than an unmerged stack.
 
@@ -113,7 +113,7 @@ Returning every replica and collapsing it client-side preserves the old API shap
 
 The v1 implementation areas include the Serve dashboard REST router, indexed Serve-state page queries, API-version constants, `sky/dashboard/src/data/connectors/services.jsx`, the services list, the service detail hook, history range controls, and focused tests. Preserve request-version and service-hash fencing, cache-key separation, visibility refresh behavior, last-good snapshots, and all existing `/serve/status` defaults. No central database migration is required because the replica table already has `(service_name, status)` and primary-key `(service_name, replica_id)` indexes.
 
-Tests must cover direct-route bounds and hash mismatches, current versus past classification, cursor stability, handle-free serialization, selected-range history loading, independent failure states, stale responses, route changes, retained last-good data during refresh, concurrent list merging in either arrival order, and paginated past-attempt disclosure. Build the dashboard and manually verify the services list and `boltz-l4-fleet` detail route before merge. Production deployment remains a separate explicitly authorized action.
+Tests must cover direct-route bounds and hash mismatches, the distinct v66-history and v67-replica capability gates, current versus past classification, cursor stability, handle-free serialization, selected-range history loading, independent failure states, stale responses, route changes, retained last-good data during refresh, concurrent list merging in either arrival order, and paginated past-attempt disclosure. Build the dashboard and manually verify the services list and `boltz-l4-fleet` detail route before merge. Production deployment remains a separate explicitly authorized action.
 
 ## Release and rollback
 

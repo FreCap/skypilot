@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 66  # Direct persisted SkyServe dashboard history
+API_VERSION = 67  # Direct persisted SkyServe dashboard replica reads
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -113,8 +113,16 @@ MIN_OPERATIONAL_EVENTS_API_VERSION = 64
 # Minimum API version with metadata-only SkyServe status projections.
 MIN_SERVE_PROGRESSIVE_STATUS_API_VERSION = 65
 
-# Minimum API version with direct SkyServe dashboard history and replica reads.
-MIN_SERVE_DASHBOARD_DIRECT_READS_API_VERSION = 66
+# Minimum API version with direct persisted SkyServe dashboard history reads.
+MIN_SERVE_DASHBOARD_HISTORY_API_VERSION = 66
+
+# Backward-compatible name introduced with the history route. It refers only
+# to the v1b history capability; replica reads have their own later gate.
+MIN_SERVE_DASHBOARD_DIRECT_READS_API_VERSION = (
+    MIN_SERVE_DASHBOARD_HISTORY_API_VERSION)
+
+# Minimum API version with batched summaries and paginated replica reads.
+MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67
 
 # Minimum server API version that exposes the admin-only, low-cardinality
 # operator notification inbox used by the dashboard.

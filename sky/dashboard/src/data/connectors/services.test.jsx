@@ -13,12 +13,15 @@ import { apiClient } from '@/data/connectors/client';
 import {
   electServiceVersion,
   getServiceHistory,
+  getServiceReplicaSummaries,
+  getServiceReplicas,
   getServicePlacement,
   getServiceVersions,
   getServices,
   normalizeAcceleratorBreakdown,
   normalizeReplicaHistory,
   normalizeService,
+  normalizeServiceReplicaSummary,
   normalizeServicePlacement,
   normalizeReplica,
 } from '@/data/connectors/services';
@@ -755,6 +758,216 @@ describe('getServiceHistory', () => {
         hours: 1,
       })
     ).rejects.toThrow('Service history response was malformed');
+  });
+});
+
+describe('direct replica projections', () => {
+  function directResponse(payload, { status = 200, apiVersion = '66' } = {}) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: () => apiVersion },
+      json: async () => payload,
+    };
+  }
+
+  it('normalizes physical rows separately from logical capacity', () => {
+    expect(
+      normalizeServiceReplicaSummary({
+        service_name: 'svc',
+        service_hash: 'hash-a',
+        replica_unit: 'logical_slot',
+        replica_status_counts: {
+          READY: 1,
+          PROVISIONING: 1,
+          FAILED_PROVISION: 2,
+        },
+        replica_capacity_counts: {
+          READY: 8,
+          PROVISIONING: 4,
+          FAILED_PROVISION: 12,
+        },
+        current_or_uncertain_count: 2,
+        past_attempt_count: 2,
+      })
+    ).toMatchObject({
+      name: 'svc',
+      serviceHash: 'hash-a',
+      replicaUnit: 'logical',
+      replicasReady: 8,
+      replicasTotal: 12,
+      replicasFailed: 12,
+      physicalReplicasReady: 1,
+      physicalReplicasTotal: 2,
+      physicalReplicasFailed: 2,
+      currentOrUncertainCount: 2,
+      pastAttemptCount: 2,
+    });
+  });
+
+  it('requests batched summaries with repeated service names', async () => {
+    apiClient.get.mockResolvedValue(
+      directResponse({
+        available: true,
+        observed_at: 123,
+        summaries: [
+          {
+            service_name: 'svc-a',
+            service_hash: 'hash-a',
+            replica_unit: 'physical',
+            replica_status_counts: { READY: 1 },
+            replica_capacity_counts: { READY: 1 },
+            current_or_uncertain_count: 1,
+            past_attempt_count: 0,
+          },
+        ],
+      })
+    );
+
+    const result = await getServiceReplicaSummaries({
+      serviceNames: ['svc-a', 'svc-b'],
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/serve/replica-summaries?service_name=svc-a&service_name=svc-b'
+    );
+    expect(result.summaries[0]).toMatchObject({
+      name: 'svc-a',
+      serviceHash: 'hash-a',
+      observedAt: 123,
+      replicasReady: 1,
+    });
+  });
+
+  it('capability-gates summary 404s and topology fallback', async () => {
+    apiClient.get.mockResolvedValueOnce(
+      directResponse({}, { status: 404, apiVersion: '66' })
+    );
+    await expect(getServiceReplicaSummaries()).resolves.toMatchObject({
+      reason: 'unsupported',
+      legacyFallback: true,
+    });
+
+    apiClient.get.mockResolvedValueOnce(
+      directResponse({}, { status: 404, apiVersion: '67' })
+    );
+    await expect(getServiceReplicaSummaries()).resolves.toMatchObject({
+      reason: 'not_found',
+      legacyFallback: false,
+    });
+
+    apiClient.get.mockResolvedValueOnce(
+      directResponse({ available: false, reason: 'non_consolidated' })
+    );
+    await expect(getServiceReplicaSummaries()).resolves.toMatchObject({
+      reason: 'non_consolidated',
+      legacyFallback: true,
+    });
+  });
+
+  it('requests a bounded replica page and marks omitted enrichment', async () => {
+    apiClient.get.mockResolvedValue(
+      directResponse({
+        available: true,
+        service_name: 'svc',
+        service_hash: 'hash-a',
+        scope: 'current_or_uncertain',
+        replica_unit: 'physical',
+        observed_at: 200,
+        total: 2,
+        next_cursor: 'cursor-2',
+        replicas: [
+          {
+            replica_id: 7,
+            status: 'FAILED_CLEANUP',
+            version: 3,
+            created_at: 190,
+          },
+        ],
+      })
+    );
+
+    const result = await getServiceReplicas({
+      serviceName: 'svc/name',
+      serviceHash: 'hash-a',
+      scope: 'current_or_uncertain',
+      limit: 50,
+      cursor: 'cursor-1',
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/serve/svc%2Fname/replicas?scope=current_or_uncertain&limit=50&expected_service_hash=hash-a&cursor=cursor-1'
+    );
+    expect(result).toMatchObject({
+      available: true,
+      serviceHash: 'hash-a',
+      total: 2,
+      nextCursor: 'cursor-2',
+      replicas: [
+        {
+          id: 7,
+          status: 'FAILED_CLEANUP',
+          createdAt: 190,
+          directProjection: true,
+          launched_at: null,
+        },
+      ],
+    });
+  });
+
+  it('surfaces page hash conflicts and only falls back on old-server 404s', async () => {
+    apiClient.get.mockResolvedValueOnce(
+      directResponse({}, { status: 409, apiVersion: '66' })
+    );
+    await expect(
+      getServiceReplicas({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        scope: 'past_attempts',
+      })
+    ).rejects.toMatchObject({ code: 'SERVICE_HASH_MISMATCH' });
+
+    apiClient.get.mockResolvedValueOnce(
+      directResponse({}, { status: 404, apiVersion: '66' })
+    );
+    await expect(
+      getServiceReplicas({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        scope: 'past_attempts',
+      })
+    ).resolves.toMatchObject({
+      reason: 'unsupported',
+      legacyFallback: true,
+    });
+
+    apiClient.get.mockResolvedValueOnce(
+      directResponse({}, { status: 404, apiVersion: '67' })
+    );
+    await expect(
+      getServiceReplicas({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        scope: 'past_attempts',
+      })
+    ).resolves.toMatchObject({
+      reason: 'not_found',
+      legacyFallback: false,
+    });
+
+    apiClient.get.mockResolvedValueOnce(
+      directResponse({ available: false, reason: 'non_consolidated' })
+    );
+    await expect(
+      getServiceReplicas({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        scope: 'past_attempts',
+      })
+    ).resolves.toMatchObject({
+      reason: 'non_consolidated',
+      legacyFallback: true,
+    });
   });
 });
 
