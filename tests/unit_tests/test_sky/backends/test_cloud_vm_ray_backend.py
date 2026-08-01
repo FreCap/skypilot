@@ -1124,6 +1124,7 @@ class TestCloudVmRayBackendLockedProvision:
             prev_handle=None,
         )
         provisioner = MagicMock()
+        provisioner.release_fresh_provision_evidence_lease.return_value = None
         provisioner.provision_with_retries.return_value = {
             'provisioning_skipped': False,
             'ray': '/tmp/cluster.yaml',

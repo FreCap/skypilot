@@ -380,6 +380,29 @@ kebab-case filename such as
 
 ## Pull Request Guidelines
 
+### Transitional Feature PR Stacks
+
+When a feature introduces temporary transition, compatibility, dual-write,
+rollout, or fallback code that should be removed after the new behavior is
+confirmed, create the removal change at the same time as the feature change.
+
+- Submit the feature/transition PR and the cleanup/removal PR as a stack using
+  [gh-stack](https://github.github.com/gh-stack/). Do not leave the cleanup as
+  only a TODO or a future issue.
+- When an initiative replaces an old solution with a better-architected one,
+  mark the old path as deprecated in the code, user/operator documentation,
+  and canonical design as applicable. Immediately create the stacked PR that
+  removes the deprecated path; do not wait until after rollout to author it.
+- Keep the removal PR in draft or otherwise blocked until the feature's
+  documented validation and rollout gates have passed. The feature PR must
+  link to the removal PR, and the removal PR must state its exact merge gate.
+- Include tests in both PRs: the transition PR must test mixed/rollout states,
+  while the removal PR must test the final steady state without the temporary
+  path.
+- Record both PRs and the evidence required to unblock removal in the canonical
+  design document. Update the stacked removal PR whenever implementation or
+  rollout decisions change.
+
 1. **Branch from improvements**, create descriptive branch name
 2. **Run `format.sh`** before committing
 3. **Add tests** for core system changes

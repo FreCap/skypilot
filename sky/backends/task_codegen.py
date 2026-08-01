@@ -13,6 +13,7 @@ import colorama
 from sky import sky_logging
 from sky.skylet import constants
 from sky.skylet import log_lib
+from sky.skylet import system_oom_recovery
 from sky.utils import accelerator_registry
 from sky.utils import ux_utils
 
@@ -140,56 +141,7 @@ class TaskCodeGen:
         Returns:
             Bash script as string
         """
-        return textwrap.dedent(f"""\
-
-        __skypilot_user_exit_code=$?
-        # Only waits if cached mount is enabled (RCLONE_MOUNT_CACHED_LOG_DIR is not empty)
-        # findmnt alone is not enough, as some clouds (e.g. AWS on ARM64) uses
-        # rclone for normal mounts as well.
-        if [ $(findmnt -t fuse.rclone --noheading | wc -l) -gt 0 ] && \
-           [ -d {constants.RCLONE_MOUNT_CACHED_LOG_DIR} ] && \
-           [ "$(ls -A {constants.RCLONE_MOUNT_CACHED_LOG_DIR})" ]; then
-            FLUSH_START_TIME=$(date +%s)
-            flushed=0
-            # extra second on top of --vfs-cache-poll-interval to
-            # avoid race condition between rclone log line creation and this check.
-            sleep 1
-            while [ $flushed -eq 0 ]; do
-                # sleep for the same interval as --vfs-cache-poll-interval
-                sleep {constants.RCLONE_CACHE_REFRESH_INTERVAL}
-                flushed=1
-                for file in {constants.RCLONE_MOUNT_CACHED_LOG_DIR}/*; do
-                    exitcode=0
-                    tac $file | grep "vfs cache: cleaned:" -m 1 | grep "in use 0, to upload 0, uploading 0" -q || exitcode=$?
-                    if [ $exitcode -ne 0 ]; then
-                        ELAPSED=$(($(date +%s) - FLUSH_START_TIME))
-                        # Extract the last vfs cache status line to show what we're waiting for
-                        CACHE_STATUS=$(tac $file | grep "vfs cache: cleaned:" -m 1 | sed 's/.*vfs cache: cleaned: //' 2>/dev/null)
-                        # Extract currently uploading files from recent log lines (show up to 2 files)
-                        UPLOADING_FILES=$(tac $file | head -30 | grep -E "queuing for upload" | head -2 | sed 's/.*INFO  : //' | sed 's/: vfs cache:.*//' | tr '\\n' ',' | sed 's/,$//' | sed 's/,/, /g' 2>/dev/null)
-                        # Build status message with available info
-                        if [ -n "$CACHE_STATUS" ] && [ -n "$UPLOADING_FILES" ]; then
-                            echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s) [${{CACHE_STATUS}}] uploading: ${{UPLOADING_FILES}}"
-                        elif [ -n "$CACHE_STATUS" ]; then
-                            echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s) [${{CACHE_STATUS}}]"
-                        else
-                            # Fallback: show last non-empty line from log
-                            LAST_LINE=$(tac $file | grep -v "^$" | head -1 | sed 's/.*INFO  : //' | sed 's/.*ERROR : //' | sed 's/.*NOTICE: //' 2>/dev/null)
-                            if [ -n "$LAST_LINE" ]; then
-                                echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s) ${{LAST_LINE}}"
-                            else
-                                echo "skypilot: cached mount is still uploading (elapsed: ${{ELAPSED}}s)"
-                            fi
-                        fi
-                        flushed=0
-                        break
-                    fi
-                done
-            done
-            TOTAL_FLUSH_TIME=$(($(date +%s) - FLUSH_START_TIME))
-            echo "skypilot: cached mount upload complete (took ${{TOTAL_FLUSH_TIME}}s)"
-        fi
-        exit $__skypilot_user_exit_code""")
+        return system_oom_recovery.build_rclone_flush_script()
 
     @staticmethod
     def build_task_bash_script(bash_script: str,
@@ -254,13 +206,17 @@ class TaskCodeGen:
         assert not self._has_epilogue, 'add_epilogue() called twice?'
         self._has_epilogue = True
 
-        self._code += [
-            textwrap.dedent(f"""\
+        failed_status_update = self._build_final_status_update(
+            'job_lib.JobStatus.FAILED')
+        succeeded_status_update = self._build_final_status_update(
+            'job_lib.JobStatus.SUCCEEDED')
+
+        epilogue = textwrap.dedent(f"""\
             if sum(returncodes) != 0:
                 # Save exit codes to job metadata for potential recovery logic
                 if int(constants.SKYLET_VERSION) >= 28:
                     job_lib.set_exit_codes({self.job_id!r}, returncodes)
-                job_lib.set_status({self.job_id!r}, job_lib.JobStatus.FAILED)
+                __FAILED_STATUS_UPDATE__
                 # Schedule the next pending job immediately to make the job
                 # scheduling more efficient.
                 job_lib.scheduler.schedule_step()
@@ -282,14 +238,24 @@ class TaskCodeGen:
                 # Need this to set the job status in ray job to be FAILED.
                 sys.exit(1)
             else:
-                job_lib.set_status({self.job_id!r}, job_lib.JobStatus.SUCCEEDED)
+                __SUCCEEDED_STATUS_UPDATE__
                 # Schedule the next pending job immediately to make the job
                 # scheduling more efficient.
                 job_lib.scheduler.schedule_step()
                 # This waits for all streaming logs to finish.
                 time.sleep(0.5)
             """)
-        ]
+        epilogue = epilogue.replace(
+            '__FAILED_STATUS_UPDATE__',
+            failed_status_update.replace('\n', '\n    '))
+        epilogue = epilogue.replace(
+            '__SUCCEEDED_STATUS_UPDATE__',
+            succeeded_status_update.replace('\n', '\n    '))
+        self._code.append(epilogue)
+
+    def _build_final_status_update(self, status_expression: str) -> str:
+        """Return generated code that records one final local job status."""
+        return f'job_lib.set_status({self.job_id!r}, {status_expression})'
 
     def build(self) -> str:
         """Returns the entire generated program."""
@@ -311,6 +277,25 @@ class RayCodeGen(TaskCodeGen):
       >> codegen.add_epilogue()
       >> code = codegen.build()
     """
+
+    def __init__(
+        self,
+        system_oom_recovery_plan: (system_oom_recovery.RecoveryLaunchPlan |
+                                   None) = None,
+    ) -> None:
+        super().__init__()
+        if (system_oom_recovery_plan is not None and
+                not isinstance(system_oom_recovery_plan,
+                               system_oom_recovery.RecoveryLaunchPlan)):
+            raise TypeError(
+                'system_oom_recovery_plan must be a RecoveryLaunchPlan')
+        if (system_oom_recovery_plan is not None and
+                system_oom_recovery_plan.execution_envelope is not None and
+                system_oom_recovery_plan.execution_envelope.environment):
+            raise ValueError(
+                'RayCodeGen requires an unbound recovery execution envelope')
+        self._system_oom_recovery_plan = system_oom_recovery_plan
+        self._num_run_tasks = 0
 
     def add_prologue(self, job_id: int) -> None:
         assert not self._has_prologue, 'add_prologue() called twice?'
@@ -340,6 +325,15 @@ class RayCodeGen(TaskCodeGen):
             """))
 
         self._add_skylet_imports()
+        if self._system_oom_recovery_plan is not None:
+            self._code.append('from sky.skylet import system_oom_recovery')
+            self._code.append(
+                'system_oom_recovery.validate_runtime_capability()')
+            plan_dict = self._system_oom_recovery_plan.to_dict()
+            self._code.append(
+                'system_oom_recovery_plan = '
+                'system_oom_recovery.RecoveryLaunchPlan.from_dict('
+                f'{plan_dict!r}, allow_bound=False)')
 
         self._add_constants()
 
@@ -411,6 +405,13 @@ class RayCodeGen(TaskCodeGen):
             """))
 
         self._add_logging_functions()
+        recovery_logging_function = None
+        if self._system_oom_recovery_plan is not None:
+            recovery_logging_function = (
+                'run_bash_command_with_log_and_return_pid_with_system_oom_recovery'
+            )
+            self._code.append(
+                inspect.getsource(getattr(log_lib, recovery_logging_function)))
 
         self._code += [
             'run_bash_command_with_log = run_bash_command_with_log',
@@ -419,6 +420,13 @@ class RayCodeGen(TaskCodeGen):
             'autostop_lib.set_last_active_time_to_now()',
             f'job_lib.set_status({job_id!r}, job_lib.JobStatus.PENDING)',
         ]
+        if recovery_logging_function is not None:
+            self._code += [
+                f'{recovery_logging_function} = ray.remote('
+                f'{recovery_logging_function})',
+                'task_submitters = []',
+                'attempt_contexts = []',
+            ]
 
     def add_setup(
         self,
@@ -577,6 +585,9 @@ class RayCodeGen(TaskCodeGen):
                  env_vars: dict[str, str] | None = None) -> None:
         # TODO(zhwu): The resources limitation for multi-node ray.tune and
         # horovod should be considered.
+        if self._system_oom_recovery_plan is not None:
+            assert num_nodes == 1, (
+                'System OOM recovery only supports one run task.')
         for i in range(num_nodes):
             # Ray's per-node resources, to constrain scheduling each command to
             # the corresponding node, represented by private IPs.
@@ -596,6 +607,11 @@ class RayCodeGen(TaskCodeGen):
                       gang_scheduling_id: int = 0) -> None:
         """Generates code for a ray remote task that runs a bash command."""
         assert self._has_setup, 'Call add_setup() before add_task().'
+        task_index = self._num_run_tasks
+        self._num_run_tasks += 1
+        if self._system_oom_recovery_plan is not None:
+            assert task_index == 0, (
+                'System OOM recovery only supports one run task.')
 
         task_cpu_demand = resources_dict.pop('CPU')
         # Build remote_task.options(...)
@@ -618,6 +634,11 @@ class RayCodeGen(TaskCodeGen):
             'scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy('  # pylint: disable=line-too-long
             'placement_group=pg, '
             f'placement_group_bundle_index={gang_scheduling_id})')
+        if self._system_oom_recovery_plan is not None:
+            # Keep the generated driver as the only retry authority.  A Ray
+            # retry here could overlap the replacement submitted after the
+            # old command scope has been positively cleaned up.
+            options.append('max_retries=0')
 
         sky_env_vars_dict_str = [
             textwrap.dedent(f"""\
@@ -637,15 +658,69 @@ class RayCodeGen(TaskCodeGen):
                      f'{options_str}')
         unset_ray_env_vars = ' && '.join(
             [f'unset {var}' for var in UNSET_RAY_ENV_VARS])
-        task_bash_script = (self.build_task_bash_script(
-            bash_script, env_prefix=unset_ray_env_vars)
-                            if bash_script is not None else None)
+        if (self._system_oom_recovery_plan is not None and
+                self._system_oom_recovery_plan.profile_version
+                == system_oom_recovery.PROFILE_VERSION_OWNED_CONTAINER):
+            spec = self._system_oom_recovery_plan.owned_container_spec
+            assert spec is not None
+            if bash_script != spec.render():
+                raise ValueError(
+                    'v2 system-OOM task.run is not the canonical owned spec')
+            # The v2 supervisor applies the typed prelude and postlude. It must
+            # never receive or execute an inferred shell representation.
+            task_bash_script = None
+        else:
+            task_bash_script = (self.build_task_bash_script(
+                bash_script, env_prefix=unset_ray_env_vars)
+                                if bash_script is not None else None)
+        if self._system_oom_recovery_plan is not None:
+            submitter_name = f'submit_task_attempt_{task_index}'
+            submission_code = textwrap.indent(
+                textwrap.dedent(f"""\
+                def {submitter_name}(attempt_number, attempt_context):
+                    future = run_bash_command_with_log_and_return_pid_with_system_oom_recovery \\
+                        .options(name=name_str, {options_str}) \\
+                        .remote(
+                            script,
+                            log_path,
+                            env_vars=sky_env_vars_dict,
+                            stream_logs=True,
+                            with_ray=True,
+                            recovery_context=attempt_context,
+                            recovery_plan=system_oom_recovery_plan,
+                        )
+                    return future
+
+                task_submitters.append({submitter_name})
+                task_attempt_context = system_oom_recovery.new_attempt_context(
+                    {self.job_id!r}, {task_index!r}, 0,
+                    system_oom_recovery_plan)
+                task_future = {submitter_name}(0, task_attempt_context)
+                futures.append(task_future)
+                attempt_contexts.append(task_attempt_context)"""), ' ' * 12)
+        else:
+            submission_code = textwrap.indent(
+                textwrap.dedent(f"""\
+                futures.append(run_bash_command_with_log_and_return_pid \\
+                        .options(name=name_str, {options_str}) \\
+                        .remote(
+                            script,
+                            log_path,
+                            env_vars=sky_env_vars_dict,
+                            stream_logs=True,
+                            with_ray=True,
+                        ))"""), ' ' * 12)
+        script_guard = 'script is not None'
+        if self._system_oom_recovery_plan is not None:
+            script_guard += (
+                ' or system_oom_recovery_plan.profile_version == '
+                'system_oom_recovery.PROFILE_VERSION_OWNED_CONTAINER')
         self._code += [
             sky_env_vars_dict_str,
             textwrap.dedent(f"""\
         script = {task_bash_script!r}
 
-        if script is not None:
+        if {script_guard}:
             sky_env_vars_dict['{constants.SKYPILOT_NUM_GPUS_PER_NODE}'] = {int(math.ceil(num_gpus))!r}
 
             ip = gang_scheduling_id_to_ip[{gang_scheduling_id!r}]
@@ -666,21 +741,44 @@ class RayCodeGen(TaskCodeGen):
 
             sky_env_vars_dict['SKYPILOT_INTERNAL_JOB_ID'] = {self.job_id}
 
-            futures.append(run_bash_command_with_log_and_return_pid \\
-                    .options(name=name_str, {options_str}) \\
-                    .remote(
-                        script,
-                        log_path,
-                        env_vars=sky_env_vars_dict,
-                        stream_logs=True,
-                        with_ray=True,
-                    ))""")
+{submission_code}""")
         ]
 
     def add_epilogue(self) -> None:
         """Generates code that waits for all tasks, then exits."""
-        self._code.append('returncodes, _ = get_or_fail(futures, pg)')
+        if self._system_oom_recovery_plan is not None:
+            assert self._num_run_tasks == 1, (
+                'System OOM recovery requires exactly one run task.')
+            self._code.append(
+                textwrap.dedent(f"""\
+                returncodes, _ = system_oom_recovery.get_or_fail_with_recovery(
+                    ray,
+                    ray_util,
+                    futures[0],
+                    pg,
+                    task_submitters[0],
+                    attempt_contexts[0],
+                    {self.job_id!r},
+                    system_oom_recovery_plan,
+                )"""))
+        else:
+            self._code.append('returncodes, _ = get_or_fail(futures, pg)')
         super().add_epilogue()
+
+    def _build_final_status_update(self, status_expression: str) -> str:
+        if self._system_oom_recovery_plan is None:
+            return super()._build_final_status_update(status_expression)
+        # Cancellation and structured EXHAUSTED+FAILED are terminal decisions
+        # made under the same per-job lock as replay submission.  The generated
+        # driver's generic epilogue must not overwrite either one after the
+        # recovery helper returns.
+        return textwrap.dedent(f"""\
+            with job_lib.job_status_lock({self.job_id!r}):
+                current_job_status = job_lib.get_status_no_lock({self.job_id!r})
+                if (current_job_status is not None and
+                        not current_job_status.is_terminal()):
+                    job_lib._set_status_no_lock(  # pylint: disable=protected-access
+                        {self.job_id!r}, {status_expression})""")
 
 
 class SlurmCodeGen(TaskCodeGen):

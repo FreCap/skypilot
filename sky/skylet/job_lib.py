@@ -2,11 +2,15 @@
 
 This is a remote utility module that provides job queue functionality.
 """
+from collections.abc import Iterator
 from collections.abc import Sequence
+import contextlib
+import dataclasses
 import enum
 import functools
 import getpass
 import json
+import math
 import os
 import pathlib
 import signal
@@ -41,6 +45,10 @@ else:
 logger = sky_logging.init_logger(__name__)
 
 _JOB_STATUS_LOCK = '~/.sky/locks/.job_{}.lock'
+JOB_SYSTEM_RECOVERY_API_VERSION = 1
+_JOB_SYSTEM_RECOVERY_SCHEMA_VERSION = 1
+JOB_SYSTEM_RECOVERY_SUMMARY_MAX_CHARS = 8192
+_JOB_STATUS_SYSTEM_RECOVERY_PAYLOAD_VERSION = 1
 # JOB_CMD_IDENTIFIER is used for identifying the process retrieved
 # with pid is the same driver process to guard against the case where
 # the same pid is reused by a different process.
@@ -51,6 +59,15 @@ def _get_lock_path(job_id: int) -> str:
     lock_path = os.path.expanduser(_JOB_STATUS_LOCK.format(job_id))
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     return lock_path
+
+
+@contextlib.contextmanager
+def job_status_lock(job_id: int) -> Iterator[None]:
+    """Acquires the lock shared by a job's status and recovery state."""
+    # TODO(mraheja): remove pylint disabling when filelock version updated.
+    # pylint: disable=abstract-class-instantiated
+    with filelock.FileLock(_get_lock_path(job_id)):
+        yield
 
 
 class JobInfoLoc(enum.IntEnum):
@@ -112,6 +129,14 @@ def create_table(cursor, conn):
         run_cmd TEXT,
         submit INTEGER,
         created_time INTEGER
+    )""")
+
+    # Keep system recovery state in a companion table instead of adding a
+    # column to ``jobs``. Older skylets use positional INSERTs into ``jobs``;
+    # preserving its exact layout makes a runtime rollback safe.
+    cursor.execute("""CREATE TABLE IF NOT EXISTS job_system_recovery(
+        job_id INTEGER PRIMARY KEY,
+        info_json TEXT NOT NULL
     )""")
 
     db_utils.add_column_to_table(cursor, conn, 'jobs', 'end_at', 'FLOAT')
@@ -260,6 +285,269 @@ class JobStatus(enum.Enum):
         if self not in enum_to_protobuf:
             raise ValueError(f'Unknown JobStatus value: {self}')
         return enum_to_protobuf[self]
+
+
+class JobSystemRecoveryPhase(enum.Enum):
+    """Monotonic phases for a driver-owned system recovery attempt."""
+
+    ARMED = 'ARMED'
+    WAITING_CLEANUP = 'WAITING_CLEANUP'
+    WAITING_MEMORY = 'WAITING_MEMORY'
+    RESUBMITTING = 'RESUBMITTING'
+    RETRY_SUBMITTED = 'RETRY_SUBMITTED'
+    EXHAUSTED = 'EXHAUSTED'
+
+    @classmethod
+    def from_protobuf(
+        cls,
+        protobuf_value: 'jobsv1_pb2.JobSystemRecoveryPhase',
+    ) -> Optional['JobSystemRecoveryPhase']:
+        """Convert a protobuf enum value to a recovery phase."""
+        protobuf_to_enum = {
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_ARMED: cls.ARMED,
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_WAITING_CLEANUP:
+                cls.WAITING_CLEANUP,
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_WAITING_MEMORY:
+                cls.WAITING_MEMORY,
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_RESUBMITTING: cls.RESUBMITTING,
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_RETRY_SUBMITTED:
+                cls.RETRY_SUBMITTED,
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_EXHAUSTED: cls.EXHAUSTED,
+        }
+        return protobuf_to_enum.get(protobuf_value)
+
+    def to_protobuf(self) -> 'jobsv1_pb2.JobSystemRecoveryPhase':
+        """Convert to a protobuf enum value."""
+        enum_to_protobuf = {
+            JobSystemRecoveryPhase.ARMED:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_ARMED,
+            JobSystemRecoveryPhase.WAITING_CLEANUP:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_WAITING_CLEANUP,
+            JobSystemRecoveryPhase.WAITING_MEMORY:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_WAITING_MEMORY,
+            JobSystemRecoveryPhase.RESUBMITTING:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_RESUBMITTING,
+            JobSystemRecoveryPhase.RETRY_SUBMITTED:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_RETRY_SUBMITTED,
+            JobSystemRecoveryPhase.EXHAUSTED:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_EXHAUSTED,
+        }
+        return enum_to_protobuf[self]
+
+
+class JobSystemRecoveryDetailStatus(enum.Enum):
+    """Validity/presence of one optional recovery detail record."""
+
+    UNSPECIFIED = 'UNSPECIFIED'
+    ABSENT = 'ABSENT'
+    PRESENT = 'PRESENT'
+    MALFORMED = 'MALFORMED'
+
+    @classmethod
+    def from_protobuf(
+        cls,
+        value: 'jobsv1_pb2.JobSystemRecoveryDetailStatus',
+    ) -> 'JobSystemRecoveryDetailStatus':
+        mapping = {
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_ABSENT: cls.ABSENT,
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT: cls.PRESENT,
+            jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED:
+                cls.MALFORMED,
+        }
+        if value == jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED:
+            return cls.UNSPECIFIED
+        return mapping.get(value, cls.MALFORMED)
+
+    def to_protobuf(self) -> 'jobsv1_pb2.JobSystemRecoveryDetailStatus':
+        mapping = {
+            self.UNSPECIFIED:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED,
+            self.ABSENT: jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_ABSENT,
+            self.PRESENT: jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT,
+            self.MALFORMED:
+                jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED,
+        }
+        return mapping[self]
+
+
+@dataclasses.dataclass(frozen=True)
+class JobSystemRecoveryInfo:
+    """Persisted state for one driver-owned system recovery sequence."""
+
+    capability: str
+    phase: JobSystemRecoveryPhase
+    original_attempt_id: str
+    replacement_attempt_id: str | None
+    task_index: int
+    node_boot_id: str
+    occurrence_count: int
+    armed_at: float
+    updated_at: float
+    event_id: str | None = None
+    reason: str | None = None
+    occurred_at: float | None = None
+    deadline_at: float | None = None
+    summary: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capability, str) or not self.capability:
+            raise ValueError('capability must be non-empty')
+        if not isinstance(self.phase, JobSystemRecoveryPhase):
+            raise ValueError('phase must be a JobSystemRecoveryPhase')
+        if (not isinstance(self.original_attempt_id, str) or
+                not self.original_attempt_id):
+            raise ValueError('original_attempt_id must be non-empty')
+        if (self.replacement_attempt_id is not None and
+            (not isinstance(self.replacement_attempt_id, str) or
+             not self.replacement_attempt_id)):
+            raise ValueError('replacement_attempt_id must be non-empty')
+        if self.replacement_attempt_id == self.original_attempt_id:
+            raise ValueError('replacement attempt must differ from original')
+        if not isinstance(self.node_boot_id, str) or not self.node_boot_id:
+            raise ValueError('node_boot_id must be non-empty')
+        for name, value in (('event_id', self.event_id),
+                            ('reason', self.reason), ('summary', self.summary)):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f'{name} must be a string')
+        for name, value in (
+            ('task_index', self.task_index),
+            ('occurrence_count', self.occurrence_count),
+        ):
+            if (isinstance(value, bool) or not isinstance(value, int) or
+                    value < 0):
+                raise ValueError(f'{name} must be a nonnegative integer')
+        for name, value in (
+            ('armed_at', self.armed_at),
+            ('updated_at', self.updated_at),
+            ('occurred_at', self.occurred_at),
+            ('deadline_at', self.deadline_at),
+        ):
+            if value is None:
+                continue
+            try:
+                finite = (not isinstance(value, bool) and
+                          isinstance(value,
+                                     (int, float)) and math.isfinite(value))
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise ValueError(f'{name} must be a finite timestamp')
+        if self.updated_at < self.armed_at:
+            raise ValueError('updated_at must not precede armed_at')
+        if (self.summary is not None and
+                len(self.summary) > JOB_SYSTEM_RECOVERY_SUMMARY_MAX_CHARS):
+            raise ValueError(
+                'summary exceeds '
+                f'{JOB_SYSTEM_RECOVERY_SUMMARY_MAX_CHARS} characters')
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to the versioned JSON representation."""
+        return {
+            'schema_version': _JOB_SYSTEM_RECOVERY_SCHEMA_VERSION,
+            'capability': self.capability,
+            'phase': self.phase.value,
+            'original_attempt_id': self.original_attempt_id,
+            'replacement_attempt_id': self.replacement_attempt_id,
+            'task_index': self.task_index,
+            'node_boot_id': self.node_boot_id,
+            'occurrence_count': self.occurrence_count,
+            'armed_at': self.armed_at,
+            'updated_at': self.updated_at,
+            'event_id': self.event_id,
+            'reason': self.reason,
+            'occurred_at': self.occurred_at,
+            'deadline_at': self.deadline_at,
+            'summary': self.summary,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> 'JobSystemRecoveryInfo':
+        """Parse and validate the versioned JSON representation."""
+        expected_fields = {
+            'schema_version', 'capability', 'phase', 'original_attempt_id',
+            'replacement_attempt_id', 'task_index', 'node_boot_id',
+            'occurrence_count', 'armed_at', 'updated_at', 'event_id', 'reason',
+            'occurred_at', 'deadline_at', 'summary'
+        }
+        if not isinstance(value, dict):
+            raise ValueError('Recovery info must be a JSON object')
+        if set(value) != expected_fields:
+            raise ValueError('Recovery info has invalid fields')
+        schema_version = value.get('schema_version')
+        if (type(schema_version) is not int or  # pylint: disable=unidiomatic-typecheck
+                schema_version != _JOB_SYSTEM_RECOVERY_SCHEMA_VERSION):
+            raise ValueError('Unsupported job system recovery schema version: '
+                             f'{schema_version!r}')
+        try:
+            phase = JobSystemRecoveryPhase(value['phase'])
+            return cls(
+                capability=value['capability'],
+                phase=phase,
+                original_attempt_id=value['original_attempt_id'],
+                replacement_attempt_id=value.get('replacement_attempt_id'),
+                task_index=value['task_index'],
+                node_boot_id=value['node_boot_id'],
+                occurrence_count=value['occurrence_count'],
+                armed_at=value['armed_at'],
+                updated_at=value['updated_at'],
+                event_id=value.get('event_id'),
+                reason=value.get('reason'),
+                occurred_at=value.get('occurred_at'),
+                deadline_at=value.get('deadline_at'),
+                summary=value.get('summary'),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f'Invalid job system recovery info: {e}') from e
+
+    def to_protobuf(self) -> 'jobsv1_pb2.JobSystemRecoveryInfo':
+        """Convert to the gRPC representation."""
+        kwargs: dict[str, Any] = {
+            'capability': self.capability,
+            'phase': self.phase.to_protobuf(),
+            'original_attempt_id': self.original_attempt_id,
+            'task_index': self.task_index,
+            'node_boot_id': self.node_boot_id,
+            'occurrence_count': self.occurrence_count,
+            'armed_at': self.armed_at,
+            'updated_at': self.updated_at,
+        }
+        for name in ('event_id', 'reason', 'occurred_at', 'deadline_at',
+                     'summary', 'replacement_attempt_id'):
+            value = getattr(self, name)
+            if value is not None:
+                kwargs[name] = value
+        return jobsv1_pb2.JobSystemRecoveryInfo(**kwargs)
+
+    @classmethod
+    def from_protobuf(
+        cls,
+        value: 'jobsv1_pb2.JobSystemRecoveryInfo',
+    ) -> 'JobSystemRecoveryInfo':
+        """Convert from the gRPC representation."""
+        phase = JobSystemRecoveryPhase.from_protobuf(value.phase)
+        if phase is None:
+            raise ValueError(
+                f'Unknown job system recovery phase: {value.phase}')
+
+        def _optional(name: str) -> Any | None:
+            return getattr(value, name) if value.HasField(name) else None
+
+        return cls(
+            capability=value.capability,
+            phase=phase,
+            original_attempt_id=value.original_attempt_id,
+            replacement_attempt_id=_optional('replacement_attempt_id'),
+            task_index=value.task_index,
+            node_boot_id=value.node_boot_id,
+            occurrence_count=value.occurrence_count,
+            armed_at=value.armed_at,
+            updated_at=value.updated_at,
+            event_id=_optional('event_id'),
+            reason=_optional('reason'),
+            occurred_at=_optional('occurred_at'),
+            deadline_at=_optional('deadline_at'),
+            summary=_optional('summary'),
+        )
 
 
 # We have two steps for job submissions:
@@ -568,7 +856,7 @@ def get_statuses_payload(job_ids: list[int | None]) -> str:
 
 
 @init_db
-def get_statuses(job_ids: list[int]) -> dict[int, str | None]:
+def get_statuses(job_ids: list[int | None]) -> dict[int | None, str | None]:
     assert _DB is not None
     # Per-job lock is not required here, since the staled job status will not
     # affect the caller.
@@ -576,10 +864,321 @@ def get_statuses(job_ids: list[int]) -> dict[int, str | None]:
     rows = _DB.cursor.execute(
         f'SELECT job_id, status FROM jobs WHERE job_id IN ({query_str})',
         job_ids)
-    statuses: dict[int, str | None] = {job_id: None for job_id in job_ids}
+    statuses: dict[int | None, str | None] = {
+        job_id: None for job_id in job_ids
+    }
     for (job_id, status) in rows:
         statuses[job_id] = status
     return statuses
+
+
+def _serialize_job_system_recovery_info(info: JobSystemRecoveryInfo) -> str:
+    return json.dumps(info.to_dict(), sort_keys=True, separators=(',', ':'))
+
+
+def _deserialize_job_system_recovery_info(
+        info_json: str) -> JobSystemRecoveryInfo:
+    try:
+        value = json.loads(info_json)
+    except (TypeError, json.JSONDecodeError) as e:
+        raise ValueError(f'Invalid job system recovery JSON: {e}') from e
+    return JobSystemRecoveryInfo.from_dict(value)
+
+
+def _get_job_system_recovery_info_no_lock(
+        job_id: int) -> JobSystemRecoveryInfo | None:
+    assert _DB is not None
+    row = _DB.cursor.execute(
+        'SELECT info_json FROM job_system_recovery WHERE job_id=(?)',
+        (job_id,)).fetchone()
+    if row is None:
+        return None
+    return _deserialize_job_system_recovery_info(row[0])
+
+
+def _validate_armed_job_system_recovery_info(
+        info: JobSystemRecoveryInfo) -> None:
+    if info.phase != JobSystemRecoveryPhase.ARMED:
+        raise ValueError('Initial recovery phase must be ARMED')
+    if info.event_id is not None or info.reason is not None:
+        raise ValueError('ARMED recovery must not have an event or reason')
+    if info.occurrence_count != 0 or info.occurred_at is not None:
+        raise ValueError('ARMED recovery must not have an occurrence')
+    if info.deadline_at is not None:
+        raise ValueError('ARMED recovery must not have a deadline')
+    if info.replacement_attempt_id is not None:
+        raise ValueError('ARMED recovery must not have a replacement attempt')
+
+
+_JOB_SYSTEM_RECOVERY_ALLOWED_TRANSITIONS = {
+    JobSystemRecoveryPhase.ARMED: {
+        JobSystemRecoveryPhase.WAITING_CLEANUP,
+        JobSystemRecoveryPhase.EXHAUSTED,
+    },
+    JobSystemRecoveryPhase.WAITING_CLEANUP: {
+        JobSystemRecoveryPhase.WAITING_MEMORY,
+        JobSystemRecoveryPhase.EXHAUSTED,
+    },
+    JobSystemRecoveryPhase.WAITING_MEMORY: {
+        JobSystemRecoveryPhase.RESUBMITTING,
+        JobSystemRecoveryPhase.EXHAUSTED,
+    },
+    JobSystemRecoveryPhase.RESUBMITTING: {
+        JobSystemRecoveryPhase.RETRY_SUBMITTED,
+        JobSystemRecoveryPhase.EXHAUSTED,
+    },
+    JobSystemRecoveryPhase.RETRY_SUBMITTED: {JobSystemRecoveryPhase.EXHAUSTED,},
+    JobSystemRecoveryPhase.EXHAUSTED: set(),
+}
+
+
+def _validate_job_system_recovery_transition(
+        current: JobSystemRecoveryInfo, updated: JobSystemRecoveryInfo) -> None:
+    if updated.phase not in _JOB_SYSTEM_RECOVERY_ALLOWED_TRANSITIONS[
+            current.phase]:
+        raise ValueError(f'Invalid recovery phase transition: '
+                         f'{current.phase.value} -> {updated.phase.value}')
+    for name in ('capability', 'original_attempt_id', 'task_index',
+                 'node_boot_id', 'armed_at'):
+        if getattr(current, name) != getattr(updated, name):
+            raise ValueError(f'Recovery identity field changed: {name}')
+    if current.event_id is not None and updated.event_id != current.event_id:
+        raise ValueError('Recovery event_id changed')
+    if (current.event_id is None and
+            updated.phase != JobSystemRecoveryPhase.EXHAUSTED and
+            updated.event_id is None):
+        raise ValueError('Recovery event_id must be set after ARMED')
+    if current.reason is not None and updated.reason != current.reason:
+        raise ValueError('Recovery reason changed')
+    if current.occurred_at is not None and updated.occurred_at != current.occurred_at:
+        raise ValueError('Recovery occurred_at changed')
+    if current.deadline_at is not None and updated.deadline_at != current.deadline_at:
+        raise ValueError('Recovery deadline_at changed')
+    if updated.updated_at < current.updated_at:
+        raise ValueError('Recovery updated_at moved backwards')
+
+    is_resubmission = (current.phase == JobSystemRecoveryPhase.WAITING_MEMORY
+                       and updated.phase == JobSystemRecoveryPhase.RESUBMITTING)
+    if is_resubmission:
+        if (current.replacement_attempt_id is not None or
+                updated.replacement_attempt_id is None):
+            raise ValueError('RESUBMITTING must allocate one replacement')
+    elif updated.replacement_attempt_id != current.replacement_attempt_id:
+        raise ValueError('Recovery replacement identity changed unexpectedly')
+
+    if (current.phase == JobSystemRecoveryPhase.ARMED and
+            updated.phase == JobSystemRecoveryPhase.WAITING_CLEANUP):
+        if (updated.occurrence_count != 1 or updated.event_id is None or
+                updated.reason is None or updated.occurred_at is None or
+                updated.deadline_at is None):
+            raise ValueError('WAITING_CLEANUP must record the first event')
+    elif updated.phase == JobSystemRecoveryPhase.EXHAUSTED:
+        if updated.occurrence_count not in (current.occurrence_count,
+                                            current.occurrence_count + 1):
+            raise ValueError('EXHAUSTED occurrence_count advanced invalidly')
+    elif updated.occurrence_count != current.occurrence_count:
+        raise ValueError('Recovery occurrence_count changed unexpectedly')
+
+
+@init_db
+def arm_job_system_recovery(job_id: int, info: JobSystemRecoveryInfo) -> bool:
+    """Persist an eligible recovery capability for a running job."""
+    assert _DB is not None
+    _validate_armed_job_system_recovery_info(info)
+    with job_status_lock(job_id):
+        if get_status_no_lock(job_id) != JobStatus.RUNNING:
+            return False
+        current = _get_job_system_recovery_info_no_lock(job_id)
+        if current is not None:
+            return current == info
+        try:
+            _DB.cursor.execute(
+                'INSERT INTO job_system_recovery(job_id, info_json) '
+                'VALUES (?, ?)',
+                (job_id, _serialize_job_system_recovery_info(info)))
+            _DB.conn.commit()
+        except Exception:
+            _DB.conn.rollback()
+            raise
+        return True
+
+
+@init_db
+def transition_job_system_recovery_no_lock(
+    job_id: int,
+    expected_phase: JobSystemRecoveryPhase,
+    info: JobSystemRecoveryInfo,
+) -> bool:
+    """CAS a recovery phase while the caller holds ``job_status_lock``."""
+    assert _DB is not None
+    if get_status_no_lock(job_id) != JobStatus.RUNNING:
+        return False
+    current = _get_job_system_recovery_info_no_lock(job_id)
+    if current is None:
+        return False
+    if current == info:
+        return True
+    if current.phase != expected_phase:
+        return False
+    _validate_job_system_recovery_transition(current, info)
+    try:
+        update_cursor = _DB.cursor.execute(
+            'UPDATE job_system_recovery SET info_json=(?) WHERE job_id=(?)',
+            (_serialize_job_system_recovery_info(info), job_id))
+        if update_cursor.rowcount != 1:
+            _DB.conn.rollback()
+            return False
+        _DB.conn.commit()
+    except Exception:
+        _DB.conn.rollback()
+        raise
+    return True
+
+
+def transition_job_system_recovery(
+    job_id: int,
+    expected_phase: JobSystemRecoveryPhase,
+    info: JobSystemRecoveryInfo,
+) -> bool:
+    """Atomically compare and advance a running job's recovery phase."""
+    with job_status_lock(job_id):
+        return transition_job_system_recovery_no_lock(job_id, expected_phase,
+                                                      info)
+
+
+@init_db
+def exhaust_job_system_recovery_no_lock(
+    job_id: int,
+    expected_phase: JobSystemRecoveryPhase,
+    info: JobSystemRecoveryInfo,
+) -> bool:
+    """Atomically persist EXHAUSTED and terminal FAILED.
+
+    The caller must hold ``job_status_lock``. A concurrent cancellation that
+    reached the database first wins and this method returns False.
+    """
+    assert _DB is not None
+    if info.phase != JobSystemRecoveryPhase.EXHAUSTED:
+        raise ValueError('Exhausted recovery info must use EXHAUSTED phase')
+    _DB.cursor.execute('BEGIN IMMEDIATE')
+    try:
+        status_row = _DB.cursor.execute(
+            'SELECT status FROM jobs WHERE job_id=(?)', (job_id,)).fetchone()
+        current = _get_job_system_recovery_info_no_lock(job_id)
+        if current == info and status_row is not None and status_row[
+                0] == JobStatus.FAILED.value:
+            _DB.conn.commit()
+            return True
+        if (status_row is None or status_row[0] != JobStatus.RUNNING.value or
+                current is None or current.phase != expected_phase):
+            _DB.conn.rollback()
+            return False
+        _validate_job_system_recovery_transition(current, info)
+        _DB.cursor.execute(
+            'UPDATE job_system_recovery SET info_json=(?) WHERE job_id=(?)',
+            (_serialize_job_system_recovery_info(info), job_id))
+        status_cursor = _DB.cursor.execute(
+            'UPDATE jobs SET status=(?), end_at=(?) '
+            'WHERE job_id=(?) AND status=(?)',
+            (JobStatus.FAILED.value, time.time(), job_id,
+             JobStatus.RUNNING.value))
+        if status_cursor.rowcount != 1:
+            _DB.conn.rollback()
+            return False
+        _DB.conn.commit()
+        return True
+    except Exception:
+        _DB.conn.rollback()
+        raise
+
+
+def exhaust_job_system_recovery(
+    job_id: int,
+    expected_phase: JobSystemRecoveryPhase,
+    info: JobSystemRecoveryInfo,
+) -> bool:
+    """Persist terminal recovery state under the per-job lock."""
+    with job_status_lock(job_id):
+        return exhaust_job_system_recovery_no_lock(job_id, expected_phase, info)
+
+
+def fail_job_system_recovery_no_lock(job_id: int) -> None:
+    """Fail a still-running job while the caller holds its status lock."""
+    if get_status_no_lock(job_id) == JobStatus.RUNNING:
+        _set_status_no_lock(job_id, JobStatus.FAILED)
+
+
+@init_db
+def get_job_system_recovery_info(job_id: int) -> JobSystemRecoveryInfo | None:
+    """Return optional recovery state without affecting ordinary status."""
+    try:
+        return _get_job_system_recovery_info_no_lock(job_id)
+    except ValueError as e:
+        logger.warning('Ignoring malformed system recovery state for job '
+                       f'{job_id}: {e}')
+        return None
+
+
+@init_db
+def get_job_system_recovery_details(
+    job_ids: Sequence[int],
+) -> tuple[dict[int, JobSystemRecoveryInfo], dict[
+        int, JobSystemRecoveryDetailStatus]]:
+    """Return valid details plus explicit per-job validity/presence."""
+    assert _DB is not None
+    if not job_ids:
+        return {}, {}
+    requested_job_ids = set(job_ids)
+    rows = _DB.cursor.execute(
+        'SELECT job_id, info_json FROM job_system_recovery '
+        f'WHERE job_id IN ({",".join(["?"] * len(job_ids))})', list(job_ids))
+    infos: dict[int, JobSystemRecoveryInfo] = {}
+    detail_statuses = {
+        job_id: JobSystemRecoveryDetailStatus.ABSENT
+        for job_id in requested_job_ids
+    }
+    for job_id, info_json in rows:
+        try:
+            infos[job_id] = _deserialize_job_system_recovery_info(info_json)
+            detail_statuses[job_id] = JobSystemRecoveryDetailStatus.PRESENT
+        except ValueError as e:
+            detail_statuses[job_id] = JobSystemRecoveryDetailStatus.MALFORMED
+            logger.warning('Ignoring malformed system recovery state for job '
+                           f'{job_id}: {e}')
+    return infos, detail_statuses
+
+
+def get_job_system_recovery_infos(
+        job_ids: Sequence[int]) -> dict[int, JobSystemRecoveryInfo]:
+    """Return valid recovery records for compatibility callers."""
+    return get_job_system_recovery_details(job_ids)[0]
+
+
+def get_statuses_with_system_recovery_payload(job_ids: list[int | None]) -> str:
+    """Encode statuses and optional recovery details in one SSH payload."""
+    statuses = get_statuses(job_ids)
+    concrete_job_ids = [job_id for job_id in job_ids if job_id is not None]
+    try:
+        recovery_infos, detail_statuses = get_job_system_recovery_details(
+            concrete_job_ids)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning('Ignoring optional system recovery details while '
+                       f'encoding job statuses: {e}')
+        recovery_infos = {}
+        detail_statuses = {
+            job_id: JobSystemRecoveryDetailStatus.MALFORMED
+            for job_id in concrete_job_ids
+        }
+    return message_utils.encode_payload({
+        'version': _JOB_STATUS_SYSTEM_RECOVERY_PAYLOAD_VERSION,
+        'job_statuses': statuses,
+        'system_recovery_infos': {
+            job_id: info.to_dict() for job_id, info in recovery_infos.items()
+        },
+        'system_recovery_detail_statuses': {
+            job_id: status.value for job_id, status in detail_statuses.items()
+        },
+    })
 
 
 @init_db
@@ -623,10 +1222,10 @@ def get_jobs_info(user_hash: str | None = None,
     return jobs_info
 
 
-def load_statuses_payload(
-        statuses_payload: str) -> dict[int | None, JobStatus | None]:
-    original_statuses = message_utils.decode_payload(statuses_payload)
-    statuses = dict()
+def _load_statuses_dict(
+    original_statuses: dict[str, str | None],
+) -> dict[int | None, JobStatus | None]:
+    statuses: dict[int | None, JobStatus | None] = {}
     for job_id, status in original_statuses.items():
         # json.dumps will convert all keys to strings. Integers will
         # become string representations of integers, e.g. "1" instead of 1;
@@ -636,6 +1235,95 @@ def load_statuses_payload(
         statuses[json.loads(job_id)] = (JobStatus(status)
                                         if status is not None else None)
     return statuses
+
+
+def load_statuses_payload(
+        statuses_payload: str) -> dict[int | None, JobStatus | None]:
+    original_statuses = message_utils.decode_payload(statuses_payload)
+    return _load_statuses_dict(original_statuses)
+
+
+def load_statuses_with_system_recovery_payload(
+    payload: str,
+) -> tuple[dict[int | None, JobStatus | None], dict[int, JobSystemRecoveryInfo],
+           dict[int, JobSystemRecoveryDetailStatus]]:
+    """Decode the new SSH envelope or a legacy status-only payload."""
+    decoded = message_utils.decode_payload(payload)
+    if not isinstance(decoded, dict) or 'job_statuses' not in decoded:
+        statuses = _load_statuses_dict(decoded)
+        return statuses, {}, {
+            job_id: JobSystemRecoveryDetailStatus.UNSPECIFIED
+            for job_id in statuses
+            if isinstance(job_id, int)
+        }
+
+    statuses = _load_statuses_dict(decoded['job_statuses'])
+    detail_statuses = {
+        job_id: JobSystemRecoveryDetailStatus.UNSPECIFIED
+        for job_id in statuses
+        if isinstance(job_id, int)
+    }
+    payload_version = decoded.get('version')
+    if (type(payload_version) is not int or  # pylint: disable=unidiomatic-typecheck
+            payload_version != _JOB_STATUS_SYSTEM_RECOVERY_PAYLOAD_VERSION):
+        logger.warning('Ignoring unsupported job status recovery payload '
+                       f'version: {payload_version!r}')
+        return statuses, {}, {
+            job_id: JobSystemRecoveryDetailStatus.MALFORMED
+            for job_id in detail_statuses
+        }
+
+    serialized_statuses = decoded.get('system_recovery_detail_statuses')
+    if not isinstance(serialized_statuses, dict):
+        logger.warning('Recovery detail status map is missing or malformed')
+        return statuses, {}, {
+            job_id: JobSystemRecoveryDetailStatus.MALFORMED
+            for job_id in detail_statuses
+        }
+    for raw_job_id, serialized_status in serialized_statuses.items():
+        job_id: object = None
+        try:
+            job_id = json.loads(raw_job_id)
+            if isinstance(job_id, bool) or not isinstance(job_id, int):
+                raise ValueError(f'invalid job ID {job_id!r}')
+            detail_statuses[job_id] = JobSystemRecoveryDetailStatus(
+                serialized_status)
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.warning('Ignoring malformed recovery detail status entry '
+                           f'for job {raw_job_id!r}: {e}')
+            if isinstance(job_id, int):
+                detail_statuses[job_id] = (
+                    JobSystemRecoveryDetailStatus.MALFORMED)
+
+    recovery_infos: dict[int, JobSystemRecoveryInfo] = {}
+    serialized_infos = decoded.get('system_recovery_infos', {})
+    if not isinstance(serialized_infos, dict):
+        logger.warning('Ignoring malformed system recovery info map')
+        return statuses, recovery_infos, {
+            job_id: JobSystemRecoveryDetailStatus.MALFORMED
+            for job_id in detail_statuses
+        }
+    for raw_job_id, serialized_info in serialized_infos.items():
+        job_id = None
+        try:
+            job_id = json.loads(raw_job_id)
+            if isinstance(job_id, bool) or not isinstance(job_id, int):
+                raise ValueError(f'invalid job ID {job_id!r}')
+            recovery_infos[job_id] = JobSystemRecoveryInfo.from_dict(
+                serialized_info)
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.warning('Ignoring malformed system recovery payload entry '
+                           f'for job {raw_job_id!r}: {e}')
+            if isinstance(job_id, int):
+                detail_statuses[job_id] = (
+                    JobSystemRecoveryDetailStatus.MALFORMED)
+    for job_id in tuple(detail_statuses):
+        detail_status = detail_statuses[job_id]
+        if ((detail_status == JobSystemRecoveryDetailStatus.PRESENT)
+                != (job_id in recovery_infos)):
+            detail_statuses[job_id] = JobSystemRecoveryDetailStatus.MALFORMED
+            recovery_infos.pop(job_id, None)
+    return statuses, recovery_infos, detail_statuses
 
 
 @init_db

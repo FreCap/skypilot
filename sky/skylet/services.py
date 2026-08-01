@@ -435,7 +435,35 @@ class JobsServiceImpl(jobsv1_pb2_grpc.JobsServiceServicer):
             for job_id, status in job_statuses.items():
                 job_statuses[job_id] = job_lib.JobStatus(status).to_protobuf(
                 ) if status is not None else jobsv1_pb2.JOB_STATUS_UNSPECIFIED
-            return jobsv1_pb2.GetJobStatusResponse(job_statuses=job_statuses)
+            try:
+                recovery_infos, detail_statuses = (
+                    job_lib.get_job_system_recovery_details(job_ids))
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Ignoring optional system recovery details '
+                               f'while serving job statuses: {e}')
+                recovery_infos = {}
+                detail_statuses = {
+                    job_id: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
+                    for job_id in job_ids
+                }
+            recovery_proto_infos: dict[int,
+                                       jobsv1_pb2.JobSystemRecoveryInfo] = {}
+            for job_id, info in recovery_infos.items():
+                try:
+                    recovery_proto_infos[job_id] = info.to_protobuf()
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Ignoring malformed optional system recovery detail '
+                        f'for job {job_id}: {e}')
+                    detail_statuses[job_id] = (
+                        job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+            return jobsv1_pb2.GetJobStatusResponse(
+                job_statuses=job_statuses,
+                system_recovery_infos=recovery_proto_infos,
+                system_recovery_detail_statuses={
+                    job_id: detail_status.to_protobuf()
+                    for job_id, detail_status in detail_statuses.items()
+                })
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 

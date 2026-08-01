@@ -44,6 +44,23 @@ enum JobStatus {
   JOB_STATUS_CANCELLED = 9;
 }
 
+enum JobSystemRecoveryPhase {
+  JOB_SYSTEM_RECOVERY_PHASE_UNSPECIFIED = 0;
+  JOB_SYSTEM_RECOVERY_PHASE_ARMED = 1;
+  JOB_SYSTEM_RECOVERY_PHASE_WAITING_CLEANUP = 2;
+  JOB_SYSTEM_RECOVERY_PHASE_WAITING_MEMORY = 3;
+  JOB_SYSTEM_RECOVERY_PHASE_RESUBMITTING = 4;
+  JOB_SYSTEM_RECOVERY_PHASE_RETRY_SUBMITTED = 5;
+  JOB_SYSTEM_RECOVERY_PHASE_EXHAUSTED = 6;
+}
+
+enum JobSystemRecoveryDetailStatus {
+  JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED = 0;
+  JOB_SYSTEM_RECOVERY_DETAIL_STATUS_ABSENT = 1;
+  JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT = 2;
+  JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED = 3;
+}
+
 message AddJobRequest {
   optional string job_name = 1;
   string username = 2;
@@ -150,8 +167,27 @@ message GetJobStatusRequest {
   repeated int64 job_ids = 1;
 }
 
+message JobSystemRecoveryInfo {
+  string capability = 1;
+  JobSystemRecoveryPhase phase = 2;
+  optional string event_id = 3;
+  string original_attempt_id = 4;
+  uint32 task_index = 5;
+  optional string replacement_attempt_id = 6;
+  string node_boot_id = 7;
+  optional string reason = 8;
+  uint32 occurrence_count = 9;
+  double armed_at = 10;
+  optional double occurred_at = 11;
+  double updated_at = 12;
+  optional double deadline_at = 13;
+  optional string summary = 14;
+}
+
 message GetJobStatusResponse {
   map<int64, JobStatus> job_statuses = 1;
+  map<int64, JobSystemRecoveryInfo> system_recovery_infos = 2;
+  map<int64, JobSystemRecoveryDetailStatus> system_recovery_detail_statuses = 3;
 }
 
 message GetJobSubmittedTimestampRequest {

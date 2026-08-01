@@ -11,6 +11,7 @@ from typing import Literal
 from sky import sky_logging as sky_logging
 from sky.skylet import constants as constants
 from sky.skylet import job_lib as job_lib
+from sky.skylet import system_oom_recovery as system_oom_recovery
 from sky.utils import context
 from sky.utils import log_utils as log_utils
 
@@ -136,6 +137,18 @@ def run_bash_command_with_log(bash_command: str,
 def run_bash_command_with_log_and_return_pid(
         bash_command: str,
         log_path: str,
+        env_vars: dict[str, str] | None = ...,
+        stream_logs: bool = ...,
+        with_ray: bool = ...,
+        streaming_prefix: str | None = ...) -> dict[str, int | str]:
+    ...
+
+
+def run_bash_command_with_log_and_return_pid_with_system_oom_recovery(
+        bash_command: str | None,
+        log_path: str,
+        recovery_context: dict[str, object],
+        recovery_plan: system_oom_recovery.RecoveryLaunchPlan,
         env_vars: dict[str, str] | None = ...,
         stream_logs: bool = ...,
         with_ray: bool = ...,

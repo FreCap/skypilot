@@ -42,6 +42,7 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_file_sync
 from sky.backends import cloud_vm_resource_handle_serialization
 from sky.backends import skylet_client
+from sky.backends import system_oom_recovery as backend_system_oom_recovery
 from sky.backends import task_codegen
 from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
@@ -65,12 +66,14 @@ from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
+from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.server import common as server_common
 from sky.server.requests import requests as requests_lib
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.skylet import log_lib
+from sky.skylet import system_oom_recovery as skylet_system_oom_recovery
 from sky.usage import usage_lib
 from sky.utils import annotations
 from sky.utils import cluster_utils
@@ -766,11 +769,77 @@ class RetryingVmProvisioner:
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
         self._workload_type = workload_type
         self._active_cluster_hash: str | None = None
+        self._fresh_provision_evidence_lease: (
+            backend_system_oom_recovery.FreshProvisionEvidenceLease |
+            None) = None
 
     @property
     def active_cluster_hash(self) -> str | None:
         """Returns the cluster generation owned by this provisioning run."""
         return self._active_cluster_hash
+
+    def release_fresh_provision_evidence_lease(
+        self,
+    ) -> backend_system_oom_recovery.FreshProvisionEvidenceLease | None:
+        """Move this provisioner's one-shot evidence lease to its backend."""
+        lease = getattr(self, '_fresh_provision_evidence_lease', None)
+        self._fresh_provision_evidence_lease = None
+        return lease
+
+    def _reset_fresh_provision_evidence(self) -> None:
+        """Invalidate any unreleased proof held by this provisioner."""
+        lease = getattr(self, '_fresh_provision_evidence_lease', None)
+        self._fresh_provision_evidence_lease = None
+        if lease is not None:
+            lease.take()
+
+    def _record_fresh_provision_evidence(
+        self,
+        provision_record: provision_common.ProvisionRecord,
+        handle: 'CloudVmRayResourceHandle',
+        *,
+        requested_node_count: int,
+        cluster_existed: bool,
+        dryrun: bool,
+    ) -> None:
+        """Capture one exact full-create result in a one-shot lease."""
+        self._reset_fresh_provision_evidence()
+        launch_context = self._extra_launch_context or {}
+        service_name = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        cloud = handle.launched_resources.cloud
+        if (self._workload_type != 'service' or
+                not isinstance(service_name, str) or not service_name or
+                not isinstance(service_hash, str) or not service_hash or
+                self._active_cluster_hash is None or cloud is None):
+            return
+        try:
+            evidence_factory = (backend_system_oom_recovery.
+                                FreshProvisionEvidence.from_provision_record)
+            evidence = evidence_factory(
+                provision_record,
+                request_id=common_utils.get_current_request_id(),
+                workspace=skypilot_config.get_active_workspace(),
+                cluster_name=handle.cluster_name,
+                cluster_name_on_cloud=handle.cluster_name_on_cloud,
+                cluster_hash=self._active_cluster_hash,
+                provider_name=cloud.canonical_name(),
+                requested_node_count=requested_node_count,
+                service_name=service_name,
+                service_hash=service_hash,
+                cluster_existed=cluster_existed,
+                dryrun=dryrun,
+                provisioning_skipped=False)
+        except Exception as error:  # pylint: disable=broad-except
+            # Provisioning itself succeeded and retains its established
+            # capacity/leadership behavior.  Only optional recovery is lost.
+            logger.debug('System-OOM fresh-provision evidence was not created: '
+                         f'{common_utils.format_exception(error)}')
+            return
+        self._fresh_provision_evidence_lease = (
+            backend_system_oom_recovery.FreshProvisionEvidenceLease(evidence))
 
     def _yield_zones(
             self, to_provision: resources_lib.Resources, num_nodes: int,
@@ -1342,6 +1411,12 @@ class RetryingVmProvisioner:
                         config_dict['provision_record'] = provision_record
                         config_dict['resources_vars'] = resources_vars
                         config_dict['handle'] = handle
+                        self._record_fresh_provision_evidence(
+                            provision_record,
+                            handle,
+                            requested_node_count=num_nodes,
+                            cluster_existed=cluster_exists,
+                            dryrun=dryrun)
                         # A full fresh create proves that this exact demand can
                         # launch now. Reusing orphaned/resumed nodes, or only
                         # creating the missing subset, proves neither the
@@ -1930,6 +2005,7 @@ class RetryingVmProvisioner:
         prev_cluster_status = to_provision_config.prev_cluster_status
         prev_handle = to_provision_config.prev_handle
         prev_cluster_ever_up = to_provision_config.prev_cluster_ever_up
+        self._reset_fresh_provision_evidence()
         self._active_cluster_hash = to_provision_config.prev_cluster_hash
         launchable_retries_disabled = (self._dag is None or
                                        self._optimize_target is None)
@@ -2994,6 +3070,14 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._extra_launch_context: dict[str, Any] = {}
         self._is_launched_by_jobs_controller = False
         self._workload_type = 'cluster'
+        # Serializes the one decision that can consume a fresh-provider-create
+        # lease with the job-ID allocation it authorizes.  The lease itself is
+        # neither copied nor persisted on a cluster handle.
+        self._system_oom_recovery_submission_lock = threading.Lock()
+        self._fresh_provision_evidence_generation = 0
+        self._fresh_provision_evidence_lease: (
+            backend_system_oom_recovery.FreshProvisionEvidenceLease |
+            None) = None
         # Optional planner (via register_info): used under the per-cluster lock
         # to produce a fresh concrete plan when neither a reusable snapshot nor
         # a caller plan is available.
@@ -3007,6 +3091,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     # --- Implementation of Backend APIs ---
 
     def register_info(self, **kwargs) -> None:
+        self._reset_fresh_provision_evidence()
         self._dag = kwargs.pop('dag', self._dag)
         self._optimize_target = kwargs.pop(
             'optimize_target',
@@ -3023,6 +3108,123 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # reusable snapshot/caller plan exists. Keeps optimizer in upper layer.
         self._planner = kwargs.pop('planner', self._planner)
         assert not kwargs, f'Unexpected kwargs: {kwargs}'
+
+    def _reset_fresh_provision_evidence(self) -> int:
+        """Invalidate prior evidence and return the new binding generation."""
+        with self._system_oom_recovery_submission_lock:
+            lease = self._fresh_provision_evidence_lease
+            self._fresh_provision_evidence_lease = None
+            if lease is not None:
+                lease.take()
+            self._fresh_provision_evidence_generation += 1
+            return self._fresh_provision_evidence_generation
+
+    def _bind_fresh_provision_evidence(
+        self,
+        lease: backend_system_oom_recovery.FreshProvisionEvidenceLease | None,
+        generation: int,
+    ) -> bool:
+        """Bind a provision result only if no reset has overtaken it."""
+        if lease is None:
+            return False
+        if not isinstance(
+                lease, backend_system_oom_recovery.FreshProvisionEvidenceLease):
+            raise TypeError('lease must be FreshProvisionEvidenceLease.')
+        with self._system_oom_recovery_submission_lock:
+            if generation != self._fresh_provision_evidence_generation:
+                lease.take()
+                return False
+            if self._fresh_provision_evidence_lease is not None:
+                # Two successful results attempting to occupy the same
+                # generation are ambiguous.  Invalidate both leases instead
+                # of retaining whichever one happened to bind first.
+                self._fresh_provision_evidence_lease.take()
+                self._fresh_provision_evidence_lease = None
+                lease.take()
+                return False
+            self._fresh_provision_evidence_lease = lease
+            return True
+
+    def _fresh_provision_evidence_matches_handle(
+        self,
+        evidence: backend_system_oom_recovery.FreshProvisionEvidence,
+        handle: CloudVmRayResourceHandle,
+    ) -> bool:
+        """Revalidate one consumed payload against the submission handle."""
+        cloud = handle.launched_resources.cloud
+        if (evidence.request_id != common_utils.get_current_request_id() or
+                evidence.workspace != skypilot_config.get_active_workspace() or
+                evidence.cluster_name != handle.cluster_name or
+                evidence.cluster_name_on_cloud != handle.cluster_name_on_cloud
+                or evidence.cluster_hash
+                != global_user_state.get_cluster_hash_for_name(
+                    handle.cluster_name) or
+                evidence.requested_node_count != handle.launched_nodes or
+                cloud is None or
+                evidence.provider_name != cloud.canonical_name()):
+            return False
+        service_name = self._extra_launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash = self._extra_launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        if (evidence.service_name != service_name or
+                evidence.service_hash != service_hash):
+            return False
+        cluster_info = handle.cached_cluster_info
+        if (cluster_info is None or
+                cluster_info.provider_name != evidence.provider_name or
+                cluster_info.head_instance_id != evidence.head_instance_id or
+                cluster_info.num_instances != evidence.requested_node_count or
+                any(
+                    len(instances) != 1
+                    for instances in cluster_info.instances.values()) or
+                set(cluster_info.instances) != set(
+                    evidence.created_instance_ids)):
+            return False
+        return True
+
+    def _consume_system_oom_recovery_plan_no_lock(
+        self,
+        handle: CloudVmRayResourceHandle,
+        task: task_lib.Task,
+    ) -> skylet_system_oom_recovery.RecoveryLaunchPlan | None:
+        """Consume the lease and make one fail-closed submission decision.
+
+        The caller holds ``_system_oom_recovery_submission_lock`` across job-ID
+        allocation and this method.  Clearing the backend slot before any
+        validation means every mismatch and exception consumes the decision.
+        """
+        lease = self._fresh_provision_evidence_lease
+        self._fresh_provision_evidence_lease = None
+        if lease is None:
+            return None
+        evidence = lease.take()
+        if evidence is None:
+            return None
+        try:
+            if (self._workload_type != 'service' or task.num_nodes != 1 or
+                    task.num_nodes * handle.num_ips_per_node != 1 or
+                    task.run is None or task.managed_job_dag is not None or
+                    handle.launched_nodes != 1 or
+                    isinstance(handle.launched_resources.cloud,
+                               (clouds.Kubernetes, clouds.Slurm)) or
+                    not handle.provision_runtime_metadata.has_ray or
+                    not handle.provision_runtime_metadata.has_job_queue or
+                    not self._fresh_provision_evidence_matches_handle(
+                        evidence, handle)):
+                return None
+            profile = serve_system_oom_recovery.match_trusted_profile(
+                task, self._extra_launch_context)
+            if profile is None:
+                return None
+            return profile.launch_plan()
+        except Exception as error:  # pylint: disable=broad-except
+            # Recovery is an optional capability.  Once the lease is consumed,
+            # any malformed optional state falls back to ordinary execution;
+            # it must not fail an otherwise valid service launch.
+            logger.warning('Disabling system-OOM recovery for this submission: '
+                           f'{common_utils.format_exception(error)}')
+            return None
 
     def check_resources_fit_cluster(
         self,
@@ -3235,6 +3437,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
     ) -> tuple[CloudVmRayResourceHandle | None, bool]:
+        evidence_generation = self._reset_fresh_provision_evidence()
         with contextlib.ExitStack() as lock_stack:
             lock_stack.enter_context(
                 lock_events.DistributedLockEvent(lock_id,
@@ -3290,6 +3493,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 # in if retry_until_up is set, which will kick off new "rounds"
                 # of optimization infinitely.
                 retry_provisioner: RetryingVmProvisioner | None = None
+                provision_evidence_lease: (
+                    backend_system_oom_recovery.FreshProvisionEvidenceLease |
+                    None) = None
                 try:
                     retry_provisioner = RetryingVmProvisioner(
                         self.log_dir,
@@ -3312,6 +3518,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     config_dict = retry_provisioner.provision_with_retries(
                         task, to_provision_config, dryrun, stream_logs,
                         skip_unnecessary_provisioning)
+                    provision_evidence_lease = (
+                        retry_provisioner.
+                        release_fresh_provision_evidence_lease())
                     break
                 except exceptions.ResourcesUnavailableError as e:
                     failed_cluster_hash = (retry_provisioner.active_cluster_hash
@@ -3471,6 +3680,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 self._update_after_cluster_provisioned(
                     handle, to_provision_config.prev_handle, task,
                     prev_cluster_status, config_hash, cluster_hash)
+                self._bind_fresh_provision_evidence(provision_evidence_lease,
+                                                    evidence_generation)
                 return handle, False
 
             cluster_config_file = config_dict['ray']
@@ -3536,6 +3747,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             self._update_after_cluster_provisioned(
                 handle, to_provision_config.prev_handle, task,
                 prev_cluster_status, config_hash, cluster_hash)
+            self._bind_fresh_provision_evidence(provision_evidence_lease,
+                                                evidence_generation)
             return handle, False
 
     def _open_ports(self, handle: CloudVmRayResourceHandle) -> None:
@@ -4324,8 +4537,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             logger.info(f'Dryrun complete. Would have run:\n{task}')
             return None
 
-        job_id, log_dir = self._add_job(handle, task_copy.name, resources_str,
-                                        task.metadata_json)
+        with self._system_oom_recovery_submission_lock:
+            job_id, log_dir = self._add_job(handle, task_copy.name,
+                                            resources_str, task.metadata_json)
+            recovery_plan = self._consume_system_oom_recovery_plan_no_lock(
+                handle, task_copy)
 
         num_actual_nodes = task.num_nodes * handle.num_ips_per_node
         # Case: task_lib.Task(run, num_nodes=N) or TPU VM Pods
@@ -4333,7 +4549,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             self._execute_task_n_nodes(handle, task_copy, job_id, log_dir)
         else:
             # Case: task_lib.Task(run, num_nodes=1)
-            self._execute_task_one_node(handle, task_copy, job_id, log_dir)
+            self._execute_task_one_node(handle,
+                                        task_copy,
+                                        job_id,
+                                        log_dir,
+                                        recovery_plan=recovery_plan)
 
         return job_id
 
@@ -4489,6 +4709,81 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             )
         statuses = job_lib.load_statuses_payload(stdout)
         return statuses
+
+    def get_job_status_with_system_recovery(
+        self,
+        handle: CloudVmRayResourceHandle,
+        job_ids: list[int] | None = None,
+        stream_logs: bool = True,
+    ) -> tuple[dict[int | None, job_lib.JobStatus | None], dict[
+            int, job_lib.JobSystemRecoveryInfo], dict[
+                int, job_lib.JobSystemRecoveryDetailStatus]]:
+        """Get statuses and optional typed recovery detail in one round trip.
+
+        This is an explicit internal capability for SkyServe.  The established
+        ``get_job_status()`` path above stays independent, so an optional
+        recovery-detail lookup can never make ordinary status unavailable.
+        """
+        if handle.is_grpc_enabled_with_flag:
+            try:
+                request = jobsv1_pb2.GetJobStatusRequest(job_ids=job_ids)
+                response = backend_utils.invoke_skylet_with_retries(
+                    lambda: SkyletClient(handle.get_grpc_channel()
+                                        ).get_job_status(request))
+                statuses: dict[int | None, job_lib.JobStatus | None] = {
+                    job_id: job_lib.JobStatus.from_protobuf(proto_status)
+                    for job_id, proto_status in response.job_statuses.items()
+                }
+                recovery_infos: dict[int, job_lib.JobSystemRecoveryInfo] = {}
+                detail_statuses = {
+                    job_id: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+                    for job_id in statuses
+                    if isinstance(job_id, int)
+                }
+                for job_id, proto_status in (
+                        response.system_recovery_detail_statuses.items()):
+                    detail_statuses[job_id] = (
+                        job_lib.JobSystemRecoveryDetailStatus.from_protobuf(
+                            proto_status))
+                for job_id, proto_info in response.system_recovery_infos.items(
+                ):
+                    try:
+                        recovery_infos[job_id] = (job_lib.JobSystemRecoveryInfo.
+                                                  from_protobuf(proto_info))
+                    except ValueError as error:
+                        detail_statuses[job_id] = (
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+                        logger.warning(
+                            'Ignoring malformed system recovery state for job '
+                            f'{job_id}: {error}')
+                for job_id in tuple(detail_statuses):
+                    if ((detail_statuses[job_id] ==
+                         job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+                            != (job_id in recovery_infos)):
+                        detail_statuses[job_id] = (
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+                        recovery_infos.pop(job_id, None)
+                return statuses, recovery_infos, detail_statuses
+            except exceptions.SKYLET_GRPC_FALLBACK_ERRORS as error:
+                logger.debug(f'gRPC failed, falling back to SSH: {error}')
+
+        code = job_lib.JobLibCodeGen.get_job_status_with_system_recovery(
+            job_ids)
+        returncode, stdout, stderr = self.run_on_head(handle,
+                                                      code,
+                                                      stream_logs=stream_logs,
+                                                      require_outputs=True,
+                                                      separate_stderr=True)
+        subprocess_utils.handle_returncode(returncode, code,
+                                           'Failed to get job status.', stderr)
+        if not stdout:
+            raise exceptions.CommandFailureException(
+                command=code,
+                failure='produced no output',
+                error_msg='Failed to get job status.',
+                detailed_reason=f'stderr="{stderr}"',
+            )
+        return job_lib.load_statuses_with_system_recovery_payload(stdout)
 
     def cancel_jobs(self,
                     handle: CloudVmRayResourceHandle,
@@ -6337,7 +6632,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         return None
 
     def _get_task_codegen_class(
-            self, handle: CloudVmRayResourceHandle) -> task_codegen.TaskCodeGen:
+        self,
+        handle: CloudVmRayResourceHandle,
+        recovery_plan: skylet_system_oom_recovery.RecoveryLaunchPlan |
+        None = None,
+    ) -> task_codegen.TaskCodeGen:
         """Returns the appropriate TaskCodeGen for the given handle."""
         if isinstance(handle.launched_resources.cloud, clouds.Slurm):
             assert (handle.cached_cluster_info
@@ -6359,11 +6658,18 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 container_name,
             )
         else:
-            return task_codegen.RayCodeGen()
+            return task_codegen.RayCodeGen(
+                system_oom_recovery_plan=recovery_plan)
 
-    def _execute_task_one_node(self, handle: CloudVmRayResourceHandle,
-                               task: task_lib.Task, job_id: int,
-                               remote_log_dir: str) -> None:
+    def _execute_task_one_node(
+        self,
+        handle: CloudVmRayResourceHandle,
+        task: task_lib.Task,
+        job_id: int,
+        remote_log_dir: str,
+        recovery_plan: skylet_system_oom_recovery.RecoveryLaunchPlan |
+        None = None
+    ) -> None:
         # Launch the command as a Ray task.
         log_dir = os.path.join(remote_log_dir, 'tasks')
 
@@ -6373,7 +6679,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
         task_env_vars = self._get_task_env_vars(task, job_id, handle)
 
-        codegen = self._get_task_codegen_class(handle)
+        if recovery_plan is not None:
+            logger.info('Enabling bounded same-VM system-OOM recovery with '
+                        f'capability {recovery_plan.capability!r}.')
+        codegen = self._get_task_codegen_class(handle, recovery_plan)
 
         codegen.add_prologue(job_id)
         codegen.add_setup(

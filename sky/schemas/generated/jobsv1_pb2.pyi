@@ -19,6 +19,23 @@ class JobStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     JOB_STATUS_FAILED: _ClassVar[JobStatus]
     JOB_STATUS_FAILED_SETUP: _ClassVar[JobStatus]
     JOB_STATUS_CANCELLED: _ClassVar[JobStatus]
+
+class JobSystemRecoveryPhase(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    JOB_SYSTEM_RECOVERY_PHASE_UNSPECIFIED: _ClassVar[JobSystemRecoveryPhase]
+    JOB_SYSTEM_RECOVERY_PHASE_ARMED: _ClassVar[JobSystemRecoveryPhase]
+    JOB_SYSTEM_RECOVERY_PHASE_WAITING_CLEANUP: _ClassVar[JobSystemRecoveryPhase]
+    JOB_SYSTEM_RECOVERY_PHASE_WAITING_MEMORY: _ClassVar[JobSystemRecoveryPhase]
+    JOB_SYSTEM_RECOVERY_PHASE_RESUBMITTING: _ClassVar[JobSystemRecoveryPhase]
+    JOB_SYSTEM_RECOVERY_PHASE_RETRY_SUBMITTED: _ClassVar[JobSystemRecoveryPhase]
+    JOB_SYSTEM_RECOVERY_PHASE_EXHAUSTED: _ClassVar[JobSystemRecoveryPhase]
+
+class JobSystemRecoveryDetailStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED: _ClassVar[JobSystemRecoveryDetailStatus]
+    JOB_SYSTEM_RECOVERY_DETAIL_STATUS_ABSENT: _ClassVar[JobSystemRecoveryDetailStatus]
+    JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT: _ClassVar[JobSystemRecoveryDetailStatus]
+    JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED: _ClassVar[JobSystemRecoveryDetailStatus]
 JOB_STATUS_UNSPECIFIED: JobStatus
 JOB_STATUS_INIT: JobStatus
 JOB_STATUS_PENDING: JobStatus
@@ -29,6 +46,17 @@ JOB_STATUS_SUCCEEDED: JobStatus
 JOB_STATUS_FAILED: JobStatus
 JOB_STATUS_FAILED_SETUP: JobStatus
 JOB_STATUS_CANCELLED: JobStatus
+JOB_SYSTEM_RECOVERY_PHASE_UNSPECIFIED: JobSystemRecoveryPhase
+JOB_SYSTEM_RECOVERY_PHASE_ARMED: JobSystemRecoveryPhase
+JOB_SYSTEM_RECOVERY_PHASE_WAITING_CLEANUP: JobSystemRecoveryPhase
+JOB_SYSTEM_RECOVERY_PHASE_WAITING_MEMORY: JobSystemRecoveryPhase
+JOB_SYSTEM_RECOVERY_PHASE_RESUBMITTING: JobSystemRecoveryPhase
+JOB_SYSTEM_RECOVERY_PHASE_RETRY_SUBMITTED: JobSystemRecoveryPhase
+JOB_SYSTEM_RECOVERY_PHASE_EXHAUSTED: JobSystemRecoveryPhase
+JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED: JobSystemRecoveryDetailStatus
+JOB_SYSTEM_RECOVERY_DETAIL_STATUS_ABSENT: JobSystemRecoveryDetailStatus
+JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT: JobSystemRecoveryDetailStatus
+JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED: JobSystemRecoveryDetailStatus
 
 class AddJobRequest(_message.Message):
     __slots__ = ("job_name", "username", "run_timestamp", "resources_str", "metadata")
@@ -204,8 +232,40 @@ class GetJobStatusRequest(_message.Message):
     job_ids: _containers.RepeatedScalarFieldContainer[int]
     def __init__(self, job_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
+class JobSystemRecoveryInfo(_message.Message):
+    __slots__ = ("capability", "phase", "event_id", "original_attempt_id", "task_index", "replacement_attempt_id", "node_boot_id", "reason", "occurrence_count", "armed_at", "occurred_at", "updated_at", "deadline_at", "summary")
+    CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    PHASE_FIELD_NUMBER: _ClassVar[int]
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    ORIGINAL_ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_INDEX_FIELD_NUMBER: _ClassVar[int]
+    REPLACEMENT_ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    NODE_BOOT_ID_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    OCCURRENCE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    ARMED_AT_FIELD_NUMBER: _ClassVar[int]
+    OCCURRED_AT_FIELD_NUMBER: _ClassVar[int]
+    UPDATED_AT_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_AT_FIELD_NUMBER: _ClassVar[int]
+    SUMMARY_FIELD_NUMBER: _ClassVar[int]
+    capability: str
+    phase: JobSystemRecoveryPhase
+    event_id: str
+    original_attempt_id: str
+    task_index: int
+    replacement_attempt_id: str
+    node_boot_id: str
+    reason: str
+    occurrence_count: int
+    armed_at: float
+    occurred_at: float
+    updated_at: float
+    deadline_at: float
+    summary: str
+    def __init__(self, capability: _Optional[str] = ..., phase: _Optional[_Union[JobSystemRecoveryPhase, str]] = ..., event_id: _Optional[str] = ..., original_attempt_id: _Optional[str] = ..., task_index: _Optional[int] = ..., replacement_attempt_id: _Optional[str] = ..., node_boot_id: _Optional[str] = ..., reason: _Optional[str] = ..., occurrence_count: _Optional[int] = ..., armed_at: _Optional[float] = ..., occurred_at: _Optional[float] = ..., updated_at: _Optional[float] = ..., deadline_at: _Optional[float] = ..., summary: _Optional[str] = ...) -> None: ...
+
 class GetJobStatusResponse(_message.Message):
-    __slots__ = ("job_statuses",)
+    __slots__ = ("job_statuses", "system_recovery_infos", "system_recovery_detail_statuses")
     class JobStatusesEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -213,9 +273,27 @@ class GetJobStatusResponse(_message.Message):
         key: int
         value: JobStatus
         def __init__(self, key: _Optional[int] = ..., value: _Optional[_Union[JobStatus, str]] = ...) -> None: ...
+    class SystemRecoveryInfosEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: int
+        value: JobSystemRecoveryInfo
+        def __init__(self, key: _Optional[int] = ..., value: _Optional[_Union[JobSystemRecoveryInfo, _Mapping]] = ...) -> None: ...
+    class SystemRecoveryDetailStatusesEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: int
+        value: JobSystemRecoveryDetailStatus
+        def __init__(self, key: _Optional[int] = ..., value: _Optional[_Union[JobSystemRecoveryDetailStatus, str]] = ...) -> None: ...
     JOB_STATUSES_FIELD_NUMBER: _ClassVar[int]
+    SYSTEM_RECOVERY_INFOS_FIELD_NUMBER: _ClassVar[int]
+    SYSTEM_RECOVERY_DETAIL_STATUSES_FIELD_NUMBER: _ClassVar[int]
     job_statuses: _containers.ScalarMap[int, JobStatus]
-    def __init__(self, job_statuses: _Optional[_Mapping[int, JobStatus]] = ...) -> None: ...
+    system_recovery_infos: _containers.MessageMap[int, JobSystemRecoveryInfo]
+    system_recovery_detail_statuses: _containers.ScalarMap[int, JobSystemRecoveryDetailStatus]
+    def __init__(self, job_statuses: _Optional[_Mapping[int, JobStatus]] = ..., system_recovery_infos: _Optional[_Mapping[int, JobSystemRecoveryInfo]] = ..., system_recovery_detail_statuses: _Optional[_Mapping[int, JobSystemRecoveryDetailStatus]] = ...) -> None: ...
 
 class GetJobSubmittedTimestampRequest(_message.Message):
     __slots__ = ("job_id",)
