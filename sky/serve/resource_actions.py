@@ -4902,6 +4902,589 @@ class ProviderKubernetesRendererV1(_CanonicalContract):
         }
 
 
+class ProviderWorkloadArtifactRoleV1(str, enum.Enum):
+    """Exact runtime-artifact role order for the prebooted workload."""
+
+    RAY_RUNTIME = 'ray_runtime'
+    SKYLET_RUNTIME = 'skylet_runtime'
+    SKYLET_JOB_PROTOCOL = 'skylet_job_protocol'
+    SKYLET_STATE_SCHEMA = 'skylet_state_schema'
+    STARTUP_PROBE = 'startup_probe'
+    SERVE_CANARY_ENTRYPOINT = 'serve_canary_entrypoint'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderWorkloadArtifactBindingV1(_CanonicalContract):
+    """One typed content-addressed workload-runtime artifact binding."""
+
+    role: ProviderWorkloadArtifactRoleV1
+    workload_image_digest: str
+    installed_root: str
+    source_manifest: ProviderRepoArtifactRefV1
+    image_build_attestation: ProviderRepoArtifactRefV1
+    measurement_contract: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'role', 'workload_image_digest', 'installed_root', 'source_manifest',
+        'image_build_attestation', 'measurement_contract'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'role',
+            _enum_value(ProviderWorkloadArtifactRoleV1,
+                        self.role,
+                        name='workload artifact role'))
+        object.__setattr__(
+            self, 'workload_image_digest',
+            _sha256_digest(self.workload_image_digest,
+                           name='workload artifact image digest'))
+        object.__setattr__(
+            self, 'installed_root',
+            _text(self.installed_root, name='workload artifact installed_root'))
+        if not isinstance(self.source_manifest, ProviderRepoArtifactRefV1):
+            raise TypeError('workload artifact source_manifest has an invalid '
+                            'type.')
+        if not isinstance(self.image_build_attestation,
+                          ProviderRepoArtifactRefV1):
+            raise TypeError('workload artifact image_build_attestation has an '
+                            'invalid type.')
+        if self.measurement_contract != 'canonical_regular_file_tree_v1':
+            raise ValueError('workload artifact measurement contract is '
+                             'unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderWorkloadArtifactBindingV1':
+        raw = _closed_object(value,
+                             name='workload artifact binding',
+                             keys=cls._KEYS)
+        return cls(role=raw['role'],
+                   workload_image_digest=raw['workload_image_digest'],
+                   installed_root=raw['installed_root'],
+                   source_manifest=ProviderRepoArtifactRefV1.from_value(
+                       raw['source_manifest']),
+                   image_build_attestation=ProviderRepoArtifactRefV1.from_value(
+                       raw['image_build_attestation']),
+                   measurement_contract=raw['measurement_contract'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'role': self.role.value,
+            'workload_image_digest': self.workload_image_digest,
+            'installed_root': self.installed_root,
+            'source_manifest': self.source_manifest.canonical_value(),
+            'image_build_attestation':
+                self.image_build_attestation.canonical_value(),
+            'measurement_contract': 'canonical_regular_file_tree_v1',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderSkyletJobContractV1(_CanonicalContract):
+    """Checked-in schema and renderer bindings for one closed Skylet job."""
+
+    schema_id: str
+    schema_artifact: ProviderRepoArtifactRefV1
+    renderer_artifact: ProviderRepoArtifactRefV1
+    state_store_schema_artifact: ProviderRepoArtifactRefV1
+    protocol_artifact_role: ProviderWorkloadArtifactRoleV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'schema_id', 'schema_artifact', 'renderer_artifact',
+        'state_store_schema_artifact', 'protocol_artifact_role'
+    })
+    _SCHEMA_ID: ClassVar[str] = 'skypilot.serve.prebooted-canary-job.v1'
+
+    def __post_init__(self) -> None:
+        if self.schema_id != self._SCHEMA_ID:
+            raise ValueError('Skylet job schema_id is unsupported.')
+        for field in ('schema_artifact', 'renderer_artifact',
+                      'state_store_schema_artifact'):
+            if not isinstance(getattr(self, field), ProviderRepoArtifactRefV1):
+                raise TypeError(f'Skylet job {field} has an invalid type.')
+        protocol_role = _enum_value(ProviderWorkloadArtifactRoleV1,
+                                    self.protocol_artifact_role,
+                                    name='Skylet job protocol_artifact_role')
+        if protocol_role is not ProviderWorkloadArtifactRoleV1.SKYLET_JOB_PROTOCOL:
+            raise ValueError('Skylet job protocol_artifact_role is '
+                             'unsupported.')
+        object.__setattr__(self, 'protocol_artifact_role', protocol_role)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderSkyletJobContractV1':
+        raw = _closed_object(value, name='Skylet job contract', keys=cls._KEYS)
+        return cls(
+            schema_id=raw['schema_id'],
+            schema_artifact=ProviderRepoArtifactRefV1.from_value(
+                raw['schema_artifact']),
+            renderer_artifact=ProviderRepoArtifactRefV1.from_value(
+                raw['renderer_artifact']),
+            state_store_schema_artifact=ProviderRepoArtifactRefV1.from_value(
+                raw['state_store_schema_artifact']),
+            protocol_artifact_role=raw['protocol_artifact_role'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'schema_id': self._SCHEMA_ID,
+            'schema_artifact': self.schema_artifact.canonical_value(),
+            'renderer_artifact': self.renderer_artifact.canonical_value(),
+            'state_store_schema_artifact':
+                self.state_store_schema_artifact.canonical_value(),
+            'protocol_artifact_role': self.protocol_artifact_role.value,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderSkyletDurabilityContractV1(_CanonicalContract):
+    """Pure description of the reviewed node-local Skylet durability path."""
+
+    volume_name: str
+    volume_kind: str
+    store: str
+    schema_artifact: ProviderRepoArtifactRefV1
+    transaction_contract: str
+    drain_order: str
+    launcher_contract: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'volume_name', 'volume_kind', 'store', 'schema_artifact',
+        'transaction_contract', 'drain_order', 'launcher_contract'
+    })
+
+    def __post_init__(self) -> None:
+        expected = {
+            'volume_name': 'skylet-state',
+            'volume_kind': 'emptyDir',
+            'store': 'sqlite_wal_synchronous_full_v1',
+            'transaction_contract': 'job_and_start_outbox_same_transaction_v1',
+            'drain_order': 'job_id_ascending',
+            'launcher_contract': 'durable_run_token_and_post_exec_handshake_v1',
+        }
+        for field, literal in expected.items():
+            if getattr(self, field) != literal:
+                raise ValueError(f'Skylet durability {field} is unsupported.')
+        if not isinstance(self.schema_artifact, ProviderRepoArtifactRefV1):
+            raise TypeError('Skylet durability schema_artifact has an invalid '
+                            'type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderSkyletDurabilityContractV1':
+        raw = _closed_object(value,
+                             name='Skylet durability contract',
+                             keys=cls._KEYS)
+        return cls(volume_name=raw['volume_name'],
+                   volume_kind=raw['volume_kind'],
+                   store=raw['store'],
+                   schema_artifact=ProviderRepoArtifactRefV1.from_value(
+                       raw['schema_artifact']),
+                   transaction_contract=raw['transaction_contract'],
+                   drain_order=raw['drain_order'],
+                   launcher_contract=raw['launcher_contract'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'volume_name': 'skylet-state',
+            'volume_kind': 'emptyDir',
+            'store': 'sqlite_wal_synchronous_full_v1',
+            'schema_artifact': self.schema_artifact.canonical_value(),
+            'transaction_contract': 'job_and_start_outbox_same_transaction_v1',
+            'drain_order': 'job_id_ascending',
+            'launcher_contract': 'durable_run_token_and_post_exec_handshake_v1',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesProvisionRuntimeMetadataV1(_CanonicalContract):
+    """Exact asserted no-op metadata for the prebooted runtime."""
+
+    runtime_setup_done: bool
+    has_ray: bool
+    has_skylet: bool
+    has_job_queue: bool
+    workdir_synced: bool
+    file_mounts_synced: bool
+    setup_done: bool
+    run_started: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'runtime_setup_done', 'has_ray', 'has_skylet', 'has_job_queue',
+        'workdir_synced', 'file_mounts_synced', 'setup_done', 'run_started'
+    })
+    _EXPECTED: ClassVar[Mapping[str, bool]] = types.MappingProxyType({
+        'runtime_setup_done': True,
+        'has_ray': True,
+        'has_skylet': True,
+        'has_job_queue': True,
+        'workdir_synced': False,
+        'file_mounts_synced': False,
+        'setup_done': True,
+        'run_started': False,
+    })
+
+    def __post_init__(self) -> None:
+        for field, expected in self._EXPECTED.items():
+            actual = _boolean(getattr(self, field),
+                              name=f'provision_runtime_metadata.{field}')
+            if actual is not expected:
+                raise ValueError(f'provision_runtime_metadata.{field} has an '
+                                 'unsupported value.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls, value: Any) -> 'ProviderKubernetesProvisionRuntimeMetadataV1':
+        raw = _closed_object(value,
+                             name='provision runtime metadata',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dict(self._EXPECTED)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesJobSubmissionV1(_CanonicalContract):
+    """Closed action-keyed Skylet job-submission configuration."""
+
+    protocol: str
+    submission_key_source: str
+    run_source: ProviderLaunchSourceV1
+    contract: ProviderSkyletJobContractV1
+    durability: ProviderSkyletDurabilityContractV1
+    job_spec_profile: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'protocol', 'submission_key_source', 'run_source', 'contract',
+        'durability', 'job_spec_profile'
+    })
+
+    def __post_init__(self) -> None:
+        if self.protocol != 'skylet_idempotent_submit_v1':
+            raise ValueError('job submission protocol is unsupported.')
+        if self.submission_key_source != 'launch_action_id':
+            raise ValueError('job submission key source is unsupported.')
+        if not isinstance(self.run_source, ProviderLaunchSourceV1):
+            raise TypeError('job submission run_source has an invalid type.')
+        if not isinstance(self.contract, ProviderSkyletJobContractV1):
+            raise TypeError('job submission contract has an invalid type.')
+        if not isinstance(self.durability, ProviderSkyletDurabilityContractV1):
+            raise TypeError('job submission durability has an invalid type.')
+        if self.job_spec_profile != 'ProviderSkyletJobSpecV1':
+            raise ValueError('job submission job_spec_profile is unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesJobSubmissionV1':
+        raw = _closed_object(value, name='job submission', keys=cls._KEYS)
+        return cls(
+            protocol=raw['protocol'],
+            submission_key_source=raw['submission_key_source'],
+            run_source=ProviderLaunchSourceV1.from_value(raw['run_source']),
+            contract=ProviderSkyletJobContractV1.from_value(raw['contract']),
+            durability=ProviderSkyletDurabilityContractV1.from_value(
+                raw['durability']),
+            job_spec_profile=raw['job_spec_profile'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'protocol': 'skylet_idempotent_submit_v1',
+            'submission_key_source': 'launch_action_id',
+            'run_source': self.run_source.canonical_value(),
+            'contract': self.contract.canonical_value(),
+            'durability': self.durability.canonical_value(),
+            'job_spec_profile': 'ProviderSkyletJobSpecV1',
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesPostProvisionV1(_CanonicalContract):
+    """Closed prebooted runtime and action-keyed job configuration."""
+
+    runtime_mode: str
+    runtime_artifacts: tuple[ProviderWorkloadArtifactBindingV1, ...]
+    provision_runtime_metadata: ProviderKubernetesProvisionRuntimeMetadataV1
+    sync_workdir: str
+    sync_file_mounts: str
+    user_setup: str
+    pre_exec_hooks_autostop: str
+    management_transport: str
+    management_port: str
+    ssh_fallback: bool
+    job_submission: ProviderKubernetesJobSubmissionV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'runtime_mode', 'runtime_artifacts', 'provision_runtime_metadata',
+        'sync_workdir', 'sync_file_mounts', 'user_setup',
+        'pre_exec_hooks_autostop', 'management_transport', 'management_port',
+        'ssh_fallback', 'job_submission'
+    })
+    _EXPECTED_ARTIFACT_ROLES: ClassVar[tuple[ProviderWorkloadArtifactRoleV1,
+                                             ...]] = tuple(
+                                                 ProviderWorkloadArtifactRoleV1)
+
+    def __post_init__(self) -> None:
+        if self.runtime_mode != 'prebooted_ray_skylet_v1':
+            raise ValueError('post-provision runtime_mode is unsupported.')
+        if (not isinstance(self.runtime_artifacts, tuple) or len(
+                self.runtime_artifacts) != len(self._EXPECTED_ARTIFACT_ROLES) or
+                any(not isinstance(item, ProviderWorkloadArtifactBindingV1)
+                    for item in self.runtime_artifacts)):
+            raise ValueError('post-provision runtime_artifacts must contain '
+                             'the exact six typed role bindings.')
+        roles = tuple(item.role for item in self.runtime_artifacts)
+        if roles != self._EXPECTED_ARTIFACT_ROLES:
+            raise ValueError('post-provision runtime artifact roles are not in '
+                             'the exact protocol order.')
+        if not isinstance(self.provision_runtime_metadata,
+                          ProviderKubernetesProvisionRuntimeMetadataV1):
+            raise TypeError('post-provision runtime metadata has an invalid '
+                            'type.')
+        expected_literals = {
+            'sync_workdir': 'assert_absent_skip',
+            'sync_file_mounts': 'assert_absent_skip',
+            'user_setup': 'assert_null_skip',
+            'pre_exec_hooks_autostop': 'assert_absent_skip',
+            'management_transport': 'skylet_grpc_only',
+        }
+        for field, expected in expected_literals.items():
+            if getattr(self, field) != expected:
+                raise ValueError(f'post-provision {field} is unsupported.')
+        management_port = _decimal_port_text(
+            self.management_port, name='post-provision management_port')
+        if management_port != '46590':
+            raise ValueError('post-provision management_port must be 46590.')
+        object.__setattr__(self, 'management_port', management_port)
+        if _boolean(self.ssh_fallback, name='post-provision ssh_fallback'):
+            raise ValueError('post-provision ssh_fallback must be false.')
+        if not isinstance(self.job_submission,
+                          ProviderKubernetesJobSubmissionV1):
+            raise TypeError(
+                'post-provision job_submission has an invalid type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesPostProvisionV1':
+        raw = _closed_object(value,
+                             name='Kubernetes post-provision contract',
+                             keys=cls._KEYS)
+        runtime_artifacts = raw['runtime_artifacts']
+        if not isinstance(runtime_artifacts, list):
+            raise TypeError('post-provision runtime_artifacts must be a list.')
+        return cls(runtime_mode=raw['runtime_mode'],
+                   runtime_artifacts=tuple(
+                       ProviderWorkloadArtifactBindingV1.from_value(item)
+                       for item in runtime_artifacts),
+                   provision_runtime_metadata=(
+                       ProviderKubernetesProvisionRuntimeMetadataV1.from_value(
+                           raw['provision_runtime_metadata'])),
+                   sync_workdir=raw['sync_workdir'],
+                   sync_file_mounts=raw['sync_file_mounts'],
+                   user_setup=raw['user_setup'],
+                   pre_exec_hooks_autostop=raw['pre_exec_hooks_autostop'],
+                   management_transport=raw['management_transport'],
+                   management_port=raw['management_port'],
+                   ssh_fallback=raw['ssh_fallback'],
+                   job_submission=ProviderKubernetesJobSubmissionV1.from_value(
+                       raw['job_submission']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'runtime_mode': 'prebooted_ray_skylet_v1',
+            'runtime_artifacts': [
+                artifact.canonical_value()
+                for artifact in self.runtime_artifacts
+            ],
+            'provision_runtime_metadata':
+                self.provision_runtime_metadata.canonical_value(),
+            'sync_workdir': 'assert_absent_skip',
+            'sync_file_mounts': 'assert_absent_skip',
+            'user_setup': 'assert_null_skip',
+            'pre_exec_hooks_autostop': 'assert_absent_skip',
+            'management_transport': 'skylet_grpc_only',
+            'management_port': '46590',
+            'ssh_fallback': False,
+            'job_submission': self.job_submission.canonical_value(),
+        }
+
+
+class ProviderKubernetesEndpointCallerRoleV1(str, enum.Enum):
+    """Exact caller order for both warm-standby Serve load balancers."""
+
+    SERVE_LB_SLOT_0 = 'serve_lb_slot_0'
+    SERVE_LB_SLOT_1 = 'serve_lb_slot_1'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
+    """Bounded nonsecret identity and Pod selector for one endpoint caller."""
+
+    role: ProviderKubernetesEndpointCallerRoleV1
+    namespace: str
+    namespace_uid: str
+    pod_selector: tuple[ProviderLabelV1, ...]
+    service_account_name: str
+    service_account_uid: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'role', 'namespace', 'namespace_uid', 'pod_selector',
+        'service_account_name', 'service_account_uid'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'role',
+            _enum_value(ProviderKubernetesEndpointCallerRoleV1,
+                        self.role,
+                        name='endpoint caller role'))
+        object.__setattr__(
+            self, 'namespace',
+            _text(self.namespace,
+                  name='endpoint caller namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        for field in ('namespace_uid', 'service_account_name',
+                      'service_account_uid'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field), name=f'endpoint caller {field}'))
+        object.__setattr__(
+            self, 'pod_selector',
+            _provider_label_tuple(self.pod_selector,
+                                  name='endpoint caller pod_selector'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointCallerV1':
+        raw = _closed_object(value, name='endpoint caller', keys=cls._KEYS)
+        pod_selector = raw['pod_selector']
+        if not isinstance(pod_selector, list):
+            raise TypeError('endpoint caller pod_selector must be a list.')
+        return cls(
+            role=raw['role'],
+            namespace=raw['namespace'],
+            namespace_uid=raw['namespace_uid'],
+            pod_selector=tuple(
+                ProviderLabelV1.from_value(item) for item in pod_selector),
+            service_account_name=raw['service_account_name'],
+            service_account_uid=raw['service_account_uid'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'role': self.role.value,
+            'namespace': self.namespace,
+            'namespace_uid': self.namespace_uid,
+            'pod_selector': [
+                label.canonical_value() for label in self.pod_selector
+            ],
+            'service_account_name': self.service_account_name,
+            'service_account_uid': self.service_account_uid,
+        }
+
+
+def _provider_kubernetes_prerequisite_tuple(
+    value: Any,
+    *,
+    name: str,
+) -> tuple[ProviderKubernetesPrerequisiteV1, ...]:
+    """Validate one sorted, duplicate-free prerequisite collection."""
+
+    if not isinstance(value, tuple):
+        raise TypeError(f'{name} must be a tuple.')
+    if (len(value) > _MAX_LIST_ITEMS or
+            any(not isinstance(item, ProviderKubernetesPrerequisiteV1)
+                for item in value)):
+        raise ValueError(f'{name} must contain at most 256 typed '
+                         'prerequisites.')
+    keys = tuple(
+        (item.api_version, item.kind.value, item.namespace or '', item.name)
+        for item in value)
+    if keys != tuple(sorted(set(keys))):
+        raise ValueError(f'{name} must be sorted by unique logical key.')
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesEndpointContractV1(_CanonicalContract):
+    """Pure frozen Pod-IP endpoint and caller projection."""
+
+    mode: str
+    application_port: str
+    ambient_fallback: bool
+    network_prerequisites: tuple[ProviderKubernetesPrerequisiteV1, ...]
+    required_callers: tuple[ProviderKubernetesEndpointCallerV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'mode', 'application_port', 'ambient_fallback', 'network_prerequisites',
+        'required_callers'
+    })
+    _EXPECTED_CALLER_ROLES: ClassVar[
+        tuple[ProviderKubernetesEndpointCallerRoleV1,
+              ...]] = tuple(ProviderKubernetesEndpointCallerRoleV1)
+
+    def __post_init__(self) -> None:
+        if self.mode != 'podip':
+            raise ValueError('endpoint mode must be podip.')
+        object.__setattr__(
+            self, 'application_port',
+            _decimal_port_text(self.application_port,
+                               name='endpoint application_port'))
+        if _boolean(self.ambient_fallback, name='endpoint ambient_fallback'):
+            raise ValueError('endpoint ambient_fallback must be false.')
+        object.__setattr__(
+            self, 'network_prerequisites',
+            _provider_kubernetes_prerequisite_tuple(
+                self.network_prerequisites,
+                name='endpoint network_prerequisites'))
+        if (not isinstance(self.required_callers, tuple) or len(
+                self.required_callers) != len(self._EXPECTED_CALLER_ROLES) or
+                any(not isinstance(item, ProviderKubernetesEndpointCallerV1)
+                    for item in self.required_callers)):
+            raise ValueError('endpoint required_callers must contain the exact '
+                             'two typed caller projections.')
+        roles = tuple(item.role for item in self.required_callers)
+        if roles != self._EXPECTED_CALLER_ROLES:
+            raise ValueError('endpoint caller roles are not in the exact '
+                             'protocol order.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointContractV1':
+        raw = _closed_object(value,
+                             name='Kubernetes endpoint contract',
+                             keys=cls._KEYS)
+        network_prerequisites = raw['network_prerequisites']
+        required_callers = raw['required_callers']
+        if not isinstance(network_prerequisites, list):
+            raise TypeError('endpoint network_prerequisites must be a list.')
+        if not isinstance(required_callers, list):
+            raise TypeError('endpoint required_callers must be a list.')
+        return cls(mode=raw['mode'],
+                   application_port=raw['application_port'],
+                   ambient_fallback=raw['ambient_fallback'],
+                   network_prerequisites=tuple(
+                       ProviderKubernetesPrerequisiteV1.from_value(item)
+                       for item in network_prerequisites),
+                   required_callers=tuple(
+                       ProviderKubernetesEndpointCallerV1.from_value(item)
+                       for item in required_callers))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'mode': 'podip',
+            'application_port': self.application_port,
+            'ambient_fallback': False,
+            'network_prerequisites': [
+                prerequisite.canonical_value()
+                for prerequisite in self.network_prerequisites
+            ],
+            'required_callers': [
+                caller.canonical_value() for caller in self.required_callers
+            ],
+        }
+
+
 @dataclasses.dataclass(frozen=True)
 class ProviderLaunchInvocationV1(_CanonicalContract):
     """Redacted provider-effective launch invocation."""

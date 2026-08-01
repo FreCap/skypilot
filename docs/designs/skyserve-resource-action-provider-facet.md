@@ -10,6 +10,7 @@ independently verified; topology/image/config-policy/principal/authorization
 foundation leaves are implemented and locally verified; full execution-config
 composition remains pending; bounded resource values and prerequisite,
 object-plan, and renderer leaves are implemented and independently verified;
+runtime/job/endpoint leaves are implemented and independently verified;
 runtime provider propagation, observation, and shadow instrumentation remain
 pending
 
