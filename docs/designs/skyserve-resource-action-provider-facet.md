@@ -1988,13 +1988,18 @@ ProviderPolicyBoundaryProofV1 = {
   projections_equal: true
 }
 
+ProviderAnnotationV1 = {
+  key: Text,    # 1..1,024 UTF-8 bytes
+  value: Text  # 1..1,024 UTF-8 bytes
+}
+
 ProviderKubernetesServiceAccountProjectionV1 = {
   namespace: Text,
   name: Text,
   uid: Text,
   resource_version: Text,
   labels: [{key: Text, value: Text}],
-  annotations: [{key: Text, value: Text}],
+  annotations: [ProviderAnnotationV1],
   automount_service_account_token: Boolean,
   image_pull_secrets: [Text],
   legacy_secret_refs: [Text]
@@ -2141,7 +2146,7 @@ ProviderKubernetesPrerequisiteV1 = {
 
 ProviderKubernetesPrerequisiteSpecV1 = one of:
   {kind: "Namespace", labels: [{key: Text, value: Text}],
-   annotations: [{key: Text, value: Text}], deletion_timestamp: null}
+   annotations: [ProviderAnnotationV1], deletion_timestamp: null}
   {kind: "ServiceAccount",
    projection: ProviderKubernetesServiceAccountProjectionV1}
   {kind: "NetworkPolicy", contract: "serve_action_network_policy_v1",
