@@ -26,7 +26,7 @@ import {
 } from '@/components/ui/table';
 import { Card } from '@/components/ui/card';
 import { StatusBadge } from '@/components/elements/StatusBadge';
-import { getServices } from '@/data/connectors/services';
+import { getServiceHistory, getServices } from '@/data/connectors/services';
 import dashboardCache from '@/lib/cache';
 import {
   CustomTooltip as Tooltip,
@@ -67,7 +67,7 @@ const REPLICA_HISTORICAL_FAILURE_STATUSES = new Set([
   'FAILED_PROVISION',
 ]);
 
-const SERVICE_HISTORY_HOURS = 24;
+const DEFAULT_SERVICE_HISTORY_HOURS = 1;
 
 function getReplicaPlacementStatusBucket(replica) {
   const { status } = replica;
@@ -142,10 +142,8 @@ export function getReplicaPlacementBreakdown(replicas) {
 
 export function useServiceDetails({ serviceName, loadFull = true }) {
   const [serviceData, setServiceData] = useState(null);
-  const [replicaHistory, setReplicaHistory] = useState(null);
   const [loading, setLoading] = useState(true);
   const [replicasLoading, setReplicasLoading] = useState(true);
-  const [historyLoading, setHistoryLoading] = useState(true);
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
   const visibleServiceDataRef = useRef(null);
@@ -164,7 +162,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       {
         serviceNames: [serviceName],
         includeTargetReplicas: true,
-        historyHours: SERVICE_HISTORY_HOURS,
       },
     ],
     [serviceName]
@@ -182,7 +179,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
   const fetchData = useCallback(
     ({
       invalidate = false,
-      resetHistory = false,
       source = 'refresh',
       supersede = false,
       loadFullRequest = loadFull,
@@ -205,7 +201,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       ) {
         setLoading(false);
         setReplicasLoading(false);
-        setHistoryLoading(false);
         return Promise.resolve();
       }
       const loadSummary =
@@ -231,7 +226,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       ) {
         setLoading(false);
         setReplicasLoading(false);
-        setHistoryLoading(false);
         return Promise.resolve();
       }
       if (invalidate) {
@@ -247,16 +241,12 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       requestVersionRef.current = requestVersion;
       setLoading(true);
       setReplicasLoading(loadFullRequest);
-      setHistoryLoading(loadFullRequest);
       if (loadFullRequest) {
         setServiceData((previous) =>
           previous?.name === serviceName && previous.enrichmentUnavailable
             ? { ...previous, enrichmentUnavailable: false }
             : previous
         );
-      }
-      if (resetHistory && loadSummary) {
-        setReplicaHistory(null);
       }
       const isCurrentRequest = () =>
         requestVersionRef.current === requestVersion;
@@ -341,9 +331,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
                 (s) => s.name === serviceName
               );
               fullServiceLanded = Boolean(found);
-              if (found) {
-                setReplicaHistory(found.replicaHistory || null);
-              }
               if (found || !summaryServiceLanded) {
                 setServiceData(found || null);
               } else {
@@ -372,7 +359,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
               if (isCurrentRequest()) {
                 finishLoadingIfReady();
                 setReplicasLoading(false);
-                setHistoryLoading(false);
               }
             });
           promises.push(fullPromise);
@@ -401,7 +387,6 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       initialLoadServiceNameRef.current !== serviceName;
     initialLoadServiceNameRef.current = serviceName;
     fetchData({
-      resetHistory: true,
       source: 'initial',
       requireFreshSummary,
     });
@@ -437,11 +422,229 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
 
   return {
     serviceData,
-    replicaHistory,
     loading,
     replicasLoading,
-    historyLoading,
     refreshData,
+  };
+}
+
+export function useServiceHistory({
+  serviceName,
+  serviceHash,
+  metadataReady,
+  enabled = true,
+  onServiceHashMismatch,
+}) {
+  const hasMetadata = metadataReady ?? Boolean(serviceHash);
+  const [replicaHistory, setReplicaHistory] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(
+    Boolean(enabled && serviceName)
+  );
+  const visibleHistoryRef = useRef(null);
+  const identityRef = useRef(null);
+  const loadedHoursRef = useRef(0);
+  const desiredHoursRef = useRef(DEFAULT_SERVICE_HISTORY_HOURS);
+  const requestVersionRef = useRef(0);
+  const activeRequestRef = useRef(null);
+
+  useEffect(() => {
+    visibleHistoryRef.current = replicaHistory;
+  }, [replicaHistory]);
+
+  const fetchHistory = useCallback(
+    ({ hours, force = false, supersede = false } = {}) => {
+      const requestedHours = Math.max(
+        1,
+        Math.min(24, Number(hours) || desiredHoursRef.current)
+      );
+      desiredHoursRef.current = requestedHours;
+      if (!enabled || !serviceName || !hasMetadata) {
+        setHistoryLoading(Boolean(enabled && serviceName));
+        return Promise.resolve();
+      }
+      const identity = `${serviceName}:${serviceHash ?? '<legacy>'}`;
+      if (
+        !force &&
+        identityRef.current === identity &&
+        loadedHoursRef.current >= requestedHours &&
+        visibleHistoryRef.current?.serviceHash === serviceHash
+      ) {
+        return Promise.resolve();
+      }
+      const active = activeRequestRef.current;
+      if (
+        active?.identity === identity &&
+        active.hours >= requestedHours &&
+        !force &&
+        !supersede
+      ) {
+        return active.promise;
+      }
+
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      setHistoryLoading(true);
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion &&
+        identityRef.current === identity;
+
+      let requestPromise;
+      requestPromise = (async () => {
+        try {
+          let history = serviceHash
+            ? await getServiceHistory({
+                serviceName,
+                serviceHash,
+                hours: requestedHours,
+              })
+            : { legacyFallback: true };
+          if (history.legacyFallback) {
+            const legacyArgs = [
+              {
+                serviceNames: [serviceName],
+                summaryOnly: true,
+                historyHours: requestedHours,
+              },
+            ];
+            if (force) {
+              dashboardCache.invalidate(getServices, legacyArgs);
+            }
+            const { services } = await dashboardCache.get(
+              getServices,
+              legacyArgs
+            );
+            const service = (services || []).find(
+              (candidate) => candidate.name === serviceName
+            );
+            if (service?.serviceHash && service.serviceHash !== serviceHash) {
+              const error = new Error('The service incarnation changed.');
+              error.code = 'SERVICE_HASH_MISMATCH';
+              throw error;
+            }
+            history = service?.replicaHistory || {
+              available: false,
+              reason: 'legacy_history_unavailable',
+            };
+          }
+          if (history.serviceHash && history.serviceHash !== serviceHash) {
+            const error = new Error('The service incarnation changed.');
+            error.code = 'SERVICE_HASH_MISMATCH';
+            throw error;
+          }
+          if (!isCurrentRequest()) return;
+          const ownedHistory = { ...history, serviceHash };
+          visibleHistoryRef.current = ownedHistory;
+          loadedHoursRef.current = requestedHours;
+          setReplicaHistory(ownedHistory);
+        } catch (error) {
+          if (!isCurrentRequest()) return;
+          if (error?.code === 'SERVICE_HASH_MISMATCH') {
+            const unavailable = {
+              available: false,
+              reason: 'service_changed',
+              serviceHash,
+            };
+            visibleHistoryRef.current = unavailable;
+            loadedHoursRef.current = 0;
+            setReplicaHistory(unavailable);
+            void onServiceHashMismatch?.();
+            return;
+          }
+          console.error('Failed to fetch service history:', error);
+          if (visibleHistoryRef.current?.serviceHash === serviceHash) {
+            const staleHistory = {
+              ...visibleHistoryRef.current,
+              refreshUnavailable: true,
+            };
+            visibleHistoryRef.current = staleHistory;
+            setReplicaHistory(staleHistory);
+          } else {
+            const unavailable = {
+              available: false,
+              reason: 'temporarily_unavailable',
+              serviceHash,
+            };
+            visibleHistoryRef.current = unavailable;
+            setReplicaHistory(unavailable);
+          }
+        } finally {
+          if (isCurrentRequest()) {
+            setHistoryLoading(false);
+          }
+          if (activeRequestRef.current?.promise === requestPromise) {
+            activeRequestRef.current = null;
+          }
+        }
+      })();
+      activeRequestRef.current = {
+        identity,
+        hours: requestedHours,
+        promise: requestPromise,
+      };
+      return requestPromise;
+    },
+    [enabled, hasMetadata, onServiceHashMismatch, serviceHash, serviceName]
+  );
+
+  useEffect(() => {
+    const identity =
+      serviceName && hasMetadata
+        ? `${serviceName}:${serviceHash ?? '<legacy>'}`
+        : null;
+    if (identityRef.current !== identity) {
+      identityRef.current = identity;
+      loadedHoursRef.current = 0;
+      desiredHoursRef.current = DEFAULT_SERVICE_HISTORY_HOURS;
+      visibleHistoryRef.current = null;
+      setReplicaHistory(null);
+    }
+    requestVersionRef.current += 1;
+    activeRequestRef.current = null;
+    if (!enabled || !identity) {
+      setHistoryLoading(Boolean(enabled && serviceName));
+      return undefined;
+    }
+    void fetchHistory({
+      hours: desiredHoursRef.current,
+      force: loadedHoursRef.current === 0,
+    });
+    return () => {
+      requestVersionRef.current += 1;
+      activeRequestRef.current = null;
+    };
+  }, [enabled, fetchHistory, hasMetadata, serviceHash, serviceName]);
+
+  const loadHistoryHours = useCallback(
+    (hours) => fetchHistory({ hours }),
+    [fetchHistory]
+  );
+  const refreshHistory = useCallback(
+    () =>
+      fetchHistory({
+        hours: desiredHoursRef.current,
+        force: true,
+        supersede: true,
+      }),
+    [fetchHistory]
+  );
+  const refreshWhenVisible = useCallback(() => {
+    void fetchHistory({
+      hours: desiredHoursRef.current,
+      force: true,
+    });
+  }, [fetchHistory]);
+
+  useVisibleRefreshInterval(
+    Boolean(enabled && serviceName && hasMetadata),
+    60 * 1000,
+    refreshWhenVisible
+  );
+
+  return {
+    replicaHistory,
+    historyLoading,
+    loadHistoryHours,
+    refreshHistory,
   };
 }
 
@@ -456,17 +659,22 @@ function ServiceDetails() {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const activeServiceNameRef = useRef(serviceName);
   const isMobile = useMobile();
-  const {
-    serviceData,
-    replicaHistory,
-    loading,
-    replicasLoading,
-    historyLoading,
-    refreshData,
-  } = useServiceDetails({
-    serviceName,
-    loadFull: activeTab === 'overview',
-  });
+  const { serviceData, loading, replicasLoading, refreshData } =
+    useServiceDetails({
+      serviceName,
+      loadFull: activeTab === 'overview',
+    });
+  const { replicaHistory, historyLoading, loadHistoryHours, refreshHistory } =
+    useServiceHistory({
+      serviceName,
+      serviceHash:
+        serviceData?.name === serviceName ? serviceData.serviceHash : null,
+      metadataReady:
+        serviceData?.name === serviceName &&
+        Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
+      enabled: activeTab === 'overview',
+      onServiceHashMismatch: refreshData,
+    });
 
   useEffect(() => {
     if (activeServiceNameRef.current !== serviceName) {
@@ -491,7 +699,7 @@ function ServiceDetails() {
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
-    await refreshData();
+    await Promise.all([refreshData(), refreshHistory()]);
     setIsRefreshing(false);
   };
 
@@ -593,9 +801,9 @@ function ServiceDetails() {
                   role="alert"
                   className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
                 >
-                  Computed replica, placement, pricing, and history details
-                  could not be loaded. The persisted service state below is
-                  still available. Refresh to retry.
+                  Computed replica, placement, and pricing details could not be
+                  loaded. The persisted service state and independently loaded
+                  history below are still available. Refresh to retry.
                 </div>
               )}
               <ServiceDetailCard
@@ -612,6 +820,7 @@ function ServiceDetails() {
                 key={serviceName}
                 history={replicaHistory}
                 loading={historyLoading}
+                onHoursChange={loadHistoryHours}
               />
               <ReplicaPlacementCard
                 replicas={currentServiceData.replicas}

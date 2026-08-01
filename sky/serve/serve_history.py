@@ -1,5 +1,6 @@
 """PostgreSQL-backed aggregate history for SkyServe status and requests."""
 
+from collections.abc import Collection
 import datetime
 from typing import Any
 
@@ -19,6 +20,8 @@ DEFAULT_HISTORY_HOURS = 12
 RETENTION_HOURS = 72
 BUCKET_SECONDS = 60
 ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION = 2
+STATUS_HISTORY_SECTIONS = frozenset(
+    {'requests', 'replicas', 'prediction', 'autoscaler'})
 
 metadata = sqlalchemy.MetaData()
 
@@ -1333,12 +1336,68 @@ def record_autoscaler_snapshot(
     return 1
 
 
+def _normalize_status_history_sections(
+    sections: Collection[str] | None,) -> frozenset[str]:
+    if sections is None:
+        return STATUS_HISTORY_SECTIONS
+    if isinstance(sections, str):
+        raise ValueError('sections must be a collection of section names, not '
+                         'a string.')
+    try:
+        requested_sections = frozenset(sections)
+    except TypeError as e:
+        raise ValueError('sections must contain only section names.') from e
+    if any(not isinstance(section, str) for section in requested_sections):
+        raise ValueError('sections must contain only string section names.')
+    invalid_sections = requested_sections - STATUS_HISTORY_SECTIONS
+    if not requested_sections or invalid_sections:
+        expected = ', '.join(sorted(STATUS_HISTORY_SECTIONS))
+        raise ValueError('sections must contain at least one of '
+                         f'{expected}; got {sorted(invalid_sections)!r}.')
+    return requested_sections
+
+
+def unavailable_status_history(reason: str,
+                               sections: Collection[str] | None = None
+                              ) -> dict[str, Any]:
+    """Build a stable unavailable response for selected history sections."""
+    requested_sections = _normalize_status_history_sections(sections)
+    response: dict[str, Any] = {
+        'available': False,
+        'reason': reason,
+        'bucket_seconds': BUCKET_SECONDS,
+        'retention_hours': RETENTION_HOURS,
+    }
+    if 'replicas' in requested_sections:
+        response['samples'] = []
+    if 'requests' in requested_sections:
+        response.update({
+            'request_samples': [],
+            'rejection_history_available': False,
+            'request_window_seconds':
+                constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
+            'requests_last_hour': 0,
+        })
+    if 'prediction' in requested_sections:
+        response.update({
+            'prediction_time_samples': [],
+            'prediction_time_histogram_version':
+                constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+            'prediction_time_bucket_upper_bounds_seconds': list(
+                constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
+        })
+    if 'autoscaler' in requested_sections:
+        response['autoscaler_samples'] = []
+    return response
+
+
 def get_status_history(
         service_name: str,
         hours: int = DEFAULT_HISTORY_HOURS,
         version: int | None = None,
         timestamp: float | None = None,
-        expected_service_hash: str | None = None) -> dict[str, Any]:
+        expected_service_hash: str | None = None,
+        sections: Collection[str] | None = None) -> dict[str, Any]:
     """Return ordered aggregate history for the current service incarnation."""
     if (not isinstance(hours, int) or isinstance(hours, bool) or hours < 1 or
             hours > RETENTION_HOURS):
@@ -1352,107 +1411,87 @@ def get_status_history(
             expected_service_hash, str) or not expected_service_hash):
         raise ValueError('expected_service_hash must be a non-empty string, '
                          f'got {expected_service_hash!r}.')
+    requested_sections = _normalize_status_history_sections(sections)
 
     engine = _postgres_engine()
     if engine is None:
-        return {
-            'available': False,
-            'bucket_seconds': BUCKET_SECONDS,
-            'retention_hours': RETENTION_HOURS,
-            'samples': [],
-            'request_samples': [],
-            'prediction_time_samples': [],
-            'autoscaler_samples': [],
-            'prediction_time_histogram_version':
-                constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
-            'prediction_time_bucket_upper_bounds_seconds': list(
-                constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
-            'rejection_history_available': False,
-            'request_window_seconds':
-                constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
-            'requests_last_hour': 0,
-        }
+        return unavailable_status_history('postgres_required',
+                                          requested_sections)
 
     observed_at = _utc_datetime(timestamp)
     window_start = observed_at - datetime.timedelta(hours=hours)
     services = serve_state.services_table
     history = serve_replica_status_history_table
     with orm.Session(engine) as session:
-        service_predicates = [
-            services.c.name == service_name,
-            services.c.pool == 0,
-        ]
-        if expected_service_hash is not None:
-            service_predicates.append(services.c.hash == expected_service_hash)
         service_hash = session.execute(
             sqlalchemy.select(services.c.hash).where(
-                *service_predicates)).scalar_one_or_none()
+                services.c.name == service_name,
+                services.c.pool == 0)).scalar_one_or_none()
         if service_hash is None:
-            return {
-                'available': False,
-                'bucket_seconds': BUCKET_SECONDS,
-                'retention_hours': RETENTION_HOURS,
-                'samples': [],
-                'request_samples': [],
-                'prediction_time_samples': [],
-                'autoscaler_samples': [],
-                'prediction_time_histogram_version':
-                    constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
-                'prediction_time_bucket_upper_bounds_seconds': list(
-                    constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
-                'rejection_history_available': False,
-                'request_window_seconds':
-                    constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
-                'requests_last_hour': 0,
-            }
-        predicates = [
-            history.c.service_name == service_name,
-            history.c.service_hash == service_hash,
-            history.c.bucket_start >= window_start,
-            history.c.bucket_start <= observed_at,
-        ]
-        if version is not None:
-            predicates.append(history.c.version == version)
-        rows = session.execute(
-            sqlalchemy.select(history).where(*predicates).order_by(
-                history.c.bucket_start, history.c.version)).mappings().all()
-        request_history = serve_request_activity_history_table
-        request_rows = session.execute(
-            sqlalchemy.select(
-                request_history.c.bucket_start,
-                sqlalchemy.func.sum(  # pylint: disable=not-callable
-                    request_history.c.request_count).label('request_count'),
-                sqlalchemy.func.sum(  # pylint: disable=not-callable
-                    request_history.c.rejected_count).label('rejected_count'),
-                sqlalchemy.func.bool_and(  # pylint: disable=not-callable
-                    request_history.c.rejection_count_available).label(
-                        'rejection_count_available'),
-                sqlalchemy.func.bool_or(  # pylint: disable=not-callable
-                    request_history.c.rejection_count_available).label(
-                        'rejection_count_supported'),
-            ).where(
-                request_history.c.service_name == service_name,
-                request_history.c.service_hash == service_hash,
-                request_history.c.bucket_start >= window_start,
-                request_history.c.bucket_start <= observed_at,
-            ).group_by(request_history.c.bucket_start).order_by(
-                request_history.c.bucket_start)).all()
-        prediction_history = serve_prediction_time_history_table
-        prediction_rows = session.execute(
-            sqlalchemy.select(prediction_history).where(
-                prediction_history.c.service_name == service_name,
-                prediction_history.c.service_hash == service_hash,
-                prediction_history.c.bucket_start >= window_start,
-                prediction_history.c.bucket_start <= observed_at,
-            ).order_by(prediction_history.c.bucket_start)).mappings().all()
-        autoscaler_history = serve_autoscaler_history_table
-        autoscaler_rows = session.execute(
-            sqlalchemy.select(autoscaler_history).where(
-                autoscaler_history.c.service_name == service_name,
-                autoscaler_history.c.service_hash == service_hash,
-                autoscaler_history.c.bucket_start >= window_start,
-                autoscaler_history.c.bucket_start <= observed_at,
-            ).order_by(autoscaler_history.c.bucket_start)).mappings().all()
+            return unavailable_status_history('service_not_found',
+                                              requested_sections)
+        if (expected_service_hash is not None and
+                service_hash != expected_service_hash):
+            return unavailable_status_history('service_hash_mismatch',
+                                              requested_sections)
+        rows = []
+        request_rows = []
+        prediction_rows = []
+        autoscaler_rows = []
+        if 'replicas' in requested_sections:
+            predicates = [
+                history.c.service_name == service_name,
+                history.c.service_hash == service_hash,
+                history.c.bucket_start >= window_start,
+                history.c.bucket_start <= observed_at,
+            ]
+            if version is not None:
+                predicates.append(history.c.version == version)
+            rows = session.execute(
+                sqlalchemy.select(history).where(*predicates).order_by(
+                    history.c.bucket_start,
+                    history.c.version)).mappings().all()
+        if 'requests' in requested_sections:
+            request_history = serve_request_activity_history_table
+            request_rows = session.execute(
+                sqlalchemy.select(
+                    request_history.c.bucket_start,
+                    sqlalchemy.func.sum(  # pylint: disable=not-callable
+                        request_history.c.request_count).label('request_count'),
+                    sqlalchemy.func.sum(  # pylint: disable=not-callable
+                        request_history.c.rejected_count).label(
+                            'rejected_count'),
+                    sqlalchemy.func.bool_and(  # pylint: disable=not-callable
+                        request_history.c.rejection_count_available).label(
+                            'rejection_count_available'),
+                    sqlalchemy.func.bool_or(  # pylint: disable=not-callable
+                        request_history.c.rejection_count_available).label(
+                            'rejection_count_supported'),
+                ).where(
+                    request_history.c.service_name == service_name,
+                    request_history.c.service_hash == service_hash,
+                    request_history.c.bucket_start >= window_start,
+                    request_history.c.bucket_start <= observed_at,
+                ).group_by(request_history.c.bucket_start).order_by(
+                    request_history.c.bucket_start)).all()
+        if 'prediction' in requested_sections:
+            prediction_history = serve_prediction_time_history_table
+            prediction_rows = session.execute(
+                sqlalchemy.select(prediction_history).where(
+                    prediction_history.c.service_name == service_name,
+                    prediction_history.c.service_hash == service_hash,
+                    prediction_history.c.bucket_start >= window_start,
+                    prediction_history.c.bucket_start <= observed_at,
+                ).order_by(prediction_history.c.bucket_start)).mappings().all()
+        if 'autoscaler' in requested_sections:
+            autoscaler_history = serve_autoscaler_history_table
+            autoscaler_rows = session.execute(
+                sqlalchemy.select(autoscaler_history).where(
+                    autoscaler_history.c.service_name == service_name,
+                    autoscaler_history.c.service_hash == service_hash,
+                    autoscaler_history.c.bucket_start >= window_start,
+                    autoscaler_history.c.bucket_start <= observed_at,
+                ).order_by(autoscaler_history.c.bucket_start)).mappings().all()
 
     samples = []
     for row in rows:
@@ -1546,23 +1585,33 @@ def get_status_history(
         sample['request_count']
         for sample in request_samples
         if sample['timestamp'] >= request_window_start.timestamp())
-    return {
+    response: dict[str, Any] = {
         'available': True,
         'service_hash': service_hash,
         'bucket_seconds': BUCKET_SECONDS,
         'retention_hours': RETENTION_HOURS,
         'window_start': window_start.timestamp(),
         'window_end': observed_at.timestamp(),
-        'samples': samples,
-        'request_samples': request_samples,
-        'prediction_time_samples': prediction_time_samples,
-        'autoscaler_samples': autoscaler_samples,
-        'prediction_time_histogram_version':
-            constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
-        'prediction_time_bucket_upper_bounds_seconds': list(
-            constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
-        'rejection_history_available': any(
-            row.rejection_count_supported for row in request_rows),
-        'request_window_seconds': constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
-        'requests_last_hour': requests_last_hour,
     }
+    if 'replicas' in requested_sections:
+        response['samples'] = samples
+    if 'requests' in requested_sections:
+        response.update({
+            'request_samples': request_samples,
+            'rejection_history_available': any(
+                row.rejection_count_supported for row in request_rows),
+            'request_window_seconds':
+                constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
+            'requests_last_hour': requests_last_hour,
+        })
+    if 'prediction' in requested_sections:
+        response.update({
+            'prediction_time_samples': prediction_time_samples,
+            'prediction_time_histogram_version':
+                constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+            'prediction_time_bucket_upper_bounds_seconds': list(
+                constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
+        })
+    if 'autoscaler' in requested_sections:
+        response['autoscaler_samples'] = autoscaler_samples
+    return response

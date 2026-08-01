@@ -20,6 +20,14 @@ jest.mock('@/lib/cache', () => ({
   },
 }));
 
+jest.mock('@/data/connectors/services', () => {
+  const actual = jest.requireActual('@/data/connectors/services');
+  return {
+    ...actual,
+    getServiceHistory: jest.fn(),
+  };
+});
+
 const mockUseRouter = jest.fn();
 
 jest.mock('next/router', () => ({
@@ -43,7 +51,7 @@ jest.mock('@/components/service-placement', () => ({
 }));
 
 import dashboardCache from '@/lib/cache';
-import { getServices } from '@/data/connectors/services';
+import { getServiceHistory, getServices } from '@/data/connectors/services';
 import ServiceDetailsPage, {
   AcceleratorCapacityCard,
   getReplicaPlacementBreakdown,
@@ -52,6 +60,7 @@ import ServiceDetailsPage, {
   ServiceDetailCard,
   sortReplicas,
   useServiceDetails,
+  useServiceHistory,
 } from '@/pages/services/[service]';
 
 describe('AcceleratorCapacityCard', () => {
@@ -128,7 +137,6 @@ function detailFullArgs(serviceName) {
     {
       serviceNames: [serviceName],
       includeTargetReplicas: true,
-      historyHours: 24,
     },
   ];
 }
@@ -143,6 +151,17 @@ function setDocumentVisibility(value) {
 describe('useServiceDetails stale-response fencing', () => {
   beforeEach(() => {
     jest.resetAllMocks();
+    getServiceHistory.mockResolvedValue({
+      available: true,
+      serviceHash: 'hash-a',
+      bucketSeconds: 60,
+      windowStart: 0,
+      windowEnd: 3600,
+      samples: [],
+      requestSamples: [],
+      predictionTimeSamples: [],
+      autoscalerSamples: [],
+    });
   });
 
   afterEach(() => {
@@ -455,7 +474,6 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.serviceData.status).toBe('initial-summary');
     expect(result.current.loading).toBe(false);
     expect(result.current.replicasLoading).toBe(true);
-    expect(result.current.historyLoading).toBe(true);
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
     await act(async () => {
@@ -474,10 +492,6 @@ describe('useServiceDetails stale-response fencing', () => {
 
     expect(result.current.serviceData.status).toBe('initial-full');
     expect(result.current.serviceData.replicas).toEqual(['r1']);
-    expect(result.current.replicaHistory).toEqual({
-      currentReadyReplicas: 1,
-    });
-    expect(result.current.historyLoading).toBe(false);
   });
 
   it('keeps metadata visible after an empty full-detail response', async () => {
@@ -547,7 +561,6 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.serviceData.status).toBe('READY');
     expect(result.current.serviceData.enrichmentUnavailable).toBe(true);
     expect(result.current.replicasLoading).toBe(false);
-    expect(result.current.historyLoading).toBe(false);
     consoleError.mockRestore();
   });
 
@@ -608,7 +621,6 @@ describe('useServiceDetails stale-response fencing', () => {
     });
 
     expect(result.current.loading).toBe(true);
-    expect(result.current.historyLoading).toBe(true);
     expect(result.current.replicasLoading).toBe(true);
     expect(result.current.serviceData).toBe(null);
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
@@ -1471,9 +1483,229 @@ describe('useServiceDetails stale-response fencing', () => {
   });
 });
 
+describe('useServiceHistory independent loading', () => {
+  const directHistory = (serviceHash = 'hash-a') => ({
+    available: true,
+    serviceHash,
+    bucketSeconds: 60,
+    windowStart: 0,
+    windowEnd: 3600,
+    samples: [],
+    requestSamples: [],
+    predictionTimeSamples: [],
+    autoscalerSamples: [],
+  });
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    getServiceHistory.mockResolvedValue(directHistory());
+  });
+
+  it('waits for the metadata hash, then loads only the initial hour', async () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ serviceHash }) =>
+        useServiceHistory({
+          serviceName: 'svc',
+          serviceHash,
+        }),
+      { initialProps: { serviceHash: null } }
+    );
+
+    expect(getServiceHistory).not.toHaveBeenCalled();
+    expect(result.current.historyLoading).toBe(true);
+
+    rerender({ serviceHash: 'hash-a' });
+    await waitFor(() => expect(result.current.replicaHistory).not.toBeNull());
+
+    expect(getServiceHistory).toHaveBeenCalledWith({
+      serviceName: 'svc',
+      serviceHash: 'hash-a',
+      hours: 1,
+    });
+    expect(result.current.historyLoading).toBe(false);
+    unmount();
+  });
+
+  it('fetches a larger selected range and reuses it for smaller presets', async () => {
+    const { result, unmount } = renderHook(() =>
+      useServiceHistory({ serviceName: 'svc', serviceHash: 'hash-a' })
+    );
+    await waitFor(() => expect(result.current.replicaHistory).not.toBeNull());
+
+    await act(async () => {
+      await result.current.loadHistoryHours(12);
+    });
+    expect(getServiceHistory).toHaveBeenLastCalledWith({
+      serviceName: 'svc',
+      serviceHash: 'hash-a',
+      hours: 12,
+    });
+    expect(getServiceHistory).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await result.current.loadHistoryHours(1);
+    });
+    expect(getServiceHistory).toHaveBeenCalledTimes(2);
+    unmount();
+  });
+
+  it('falls back to controller-backed status when direct reads are unavailable', async () => {
+    getServiceHistory.mockResolvedValue({
+      available: false,
+      reason: 'non_consolidated',
+      legacyFallback: true,
+    });
+    dashboardCache.get.mockResolvedValue({
+      services: [
+        {
+          name: 'svc',
+          serviceHash: 'hash-a',
+          replicaHistory: directHistory(),
+        },
+      ],
+    });
+
+    const { result, unmount } = renderHook(() =>
+      useServiceHistory({ serviceName: 'svc', serviceHash: 'hash-a' })
+    );
+    await waitFor(() => expect(result.current.replicaHistory).not.toBeNull());
+
+    expect(dashboardCache.get).toHaveBeenCalledWith(getServices, [
+      {
+        serviceNames: ['svc'],
+        summaryOnly: true,
+        historyHours: 1,
+      },
+    ]);
+    expect(result.current.replicaHistory.available).toBe(true);
+    unmount();
+  });
+
+  it('uses controller-backed history for a landed legacy service without a hash', async () => {
+    dashboardCache.get.mockResolvedValue({
+      services: [
+        {
+          name: 'svc',
+          serviceHash: null,
+          replicaHistory: directHistory(null),
+        },
+      ],
+    });
+
+    const { result, unmount } = renderHook(() =>
+      useServiceHistory({
+        serviceName: 'svc',
+        serviceHash: null,
+        metadataReady: true,
+      })
+    );
+    await waitFor(() => expect(result.current.replicaHistory).not.toBeNull());
+
+    expect(getServiceHistory).not.toHaveBeenCalled();
+    expect(dashboardCache.get).toHaveBeenCalledWith(getServices, [
+      {
+        serviceNames: ['svc'],
+        summaryOnly: true,
+        historyHours: 1,
+      },
+    ]);
+    expect(result.current.replicaHistory).toMatchObject({
+      available: true,
+      serviceHash: null,
+    });
+    expect(result.current.historyLoading).toBe(false);
+    unmount();
+  });
+
+  it('drops a late history response from the previous service identity', async () => {
+    const oldHistory = deferred();
+    getServiceHistory
+      .mockImplementationOnce(() => oldHistory.promise)
+      .mockResolvedValueOnce(directHistory('hash-b'));
+    const { result, rerender, unmount } = renderHook(
+      ({ serviceName, serviceHash }) =>
+        useServiceHistory({ serviceName, serviceHash }),
+      {
+        initialProps: { serviceName: 'svc-a', serviceHash: 'hash-a' },
+      }
+    );
+
+    rerender({ serviceName: 'svc-b', serviceHash: 'hash-b' });
+    await waitFor(() =>
+      expect(result.current.replicaHistory?.serviceHash).toBe('hash-b')
+    );
+
+    await act(async () => {
+      oldHistory.resolve(directHistory('hash-a'));
+      await oldHistory.promise;
+    });
+    expect(result.current.replicaHistory.serviceHash).toBe('hash-b');
+    unmount();
+  });
+
+  it('keeps last-good history visible when a refresh fails', async () => {
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    const { result, unmount } = renderHook(() =>
+      useServiceHistory({ serviceName: 'svc', serviceHash: 'hash-a' })
+    );
+    await waitFor(() => expect(result.current.replicaHistory).not.toBeNull());
+
+    getServiceHistory.mockRejectedValueOnce(new Error('temporary failure'));
+    await act(async () => {
+      await result.current.refreshHistory();
+    });
+
+    expect(result.current.replicaHistory).toMatchObject({
+      available: true,
+      serviceHash: 'hash-a',
+      refreshUnavailable: true,
+    });
+    expect(result.current.historyLoading).toBe(false);
+    expect(consoleError).toHaveBeenCalledWith(
+      'Failed to fetch service history:',
+      expect.any(Error)
+    );
+    consoleError.mockRestore();
+    unmount();
+  });
+
+  it('invalidates history when the service incarnation changes', async () => {
+    const onServiceHashMismatch = jest.fn();
+    const mismatch = new Error('service changed');
+    mismatch.code = 'SERVICE_HASH_MISMATCH';
+    getServiceHistory.mockRejectedValueOnce(mismatch);
+
+    const { result, unmount } = renderHook(() =>
+      useServiceHistory({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        onServiceHashMismatch,
+      })
+    );
+    await waitFor(() =>
+      expect(result.current.replicaHistory?.reason).toBe('service_changed')
+    );
+
+    expect(result.current.replicaHistory.available).toBe(false);
+    expect(onServiceHashMismatch).toHaveBeenCalledTimes(1);
+    unmount();
+  });
+});
+
 describe('ServiceDetails route ownership rendering', () => {
   beforeEach(() => {
     jest.resetAllMocks();
+    getServiceHistory.mockResolvedValue({
+      available: true,
+      serviceHash: 'hash-a',
+      bucketSeconds: 60,
+      windowStart: 0,
+      windowEnd: 3600,
+      samples: [],
+      requestSamples: [],
+      predictionTimeSamples: [],
+      autoscalerSamples: [],
+    });
   });
 
   it('shows route loading instead of the previous service while a new route is in flight', async () => {

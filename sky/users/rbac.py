@@ -187,6 +187,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'POST'
     },
     {
+        'path': '/serve/:service_name/history',
+        'method': 'GET'
+    },
+    {
         'path': '/serve/logs',
         'method': 'POST'
     },

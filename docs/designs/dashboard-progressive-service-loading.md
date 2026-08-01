@@ -2,7 +2,7 @@
 
 _Created: 2026-08-01_
 
-_Status: v0 deployed; v1a implemented pending merge; v1b-v1c accepted_
+_Status: v0 deployed; v1a merged; v1b implemented pending merge; v1c accepted_
 _Last updated: 2026-08-01_
 
 ## Problems
@@ -81,6 +81,8 @@ The dashboard starts the list metadata and summary requests together and renders
 
 Past attempts are not requested until the disclosure is opened. Further pages load explicitly and retain the existing neutral explanation that replaced attempts are diagnostic history, not a current incident. Current or uncertain rows remain visible outside the disclosure, including cleanup failures and unknown states that may require verification. The direct replica query filters and bounds rows before deserializing replica state or resolving optional current-row cluster records. The existing full-status fallback continues to provide YAML on non-consolidated or older servers; lazy YAML is outside this performance slice.
 
+During v1b, the existing full replica status request remains but no longer carries history. Direct selected-range history loads independently after the metadata hash anchor. A 404 from an older server or `non_consolidated` response falls back to a controller-backed summary status request for the selected history range, while the full replica request continues independently. A landed legacy service row whose nullable hash was never backfilled also uses that controller-backed path instead of waiting indefinitely for a hash. This keeps the compatibility path complete without making the modern path transfer the same history twice.
+
 The controller-backed summary remains the authoritative fresh source for autoscaler target and request-pressure fields. Minute history may render first but must retain its observation time and must not be presented as a fresh target. If one independent enrichment fails, the last good data in other sections remains visible and only that section offers refresh-to-retry guidance.
 
 The API version advances to 66 for the new routes. Existing clients and all existing `/serve/status` behavior remain unchanged. The new dashboard assets are served by the same API-server release that owns the routes; an already-open page spanning a server rollback may show the affected section as unavailable until reload, but must keep the last good snapshot rather than blanking the page.
@@ -89,8 +91,8 @@ This v1 does not change the clusters dashboard. Production measured the active c
 
 Deliver v1 as three mergeable milestones to keep review and rollback boundaries narrow:
 
-1. v1a starts list metadata and summary concurrently and makes either arrival order monotonic.
-2. v1b adds capability-gated selected-range direct history while retaining the existing full replica path and fallback.
+1. v1a starts list metadata and summary concurrently and makes either arrival order monotonic. Merged in PR #1147.
+2. v1b adds capability-gated selected-range direct history while retaining the existing full replica path and fallback. Implemented pending merge.
 3. v1c adds the direct batched replica-summary projection and current/past replica pagination, then removes the eager full replica request from Overview.
 
 Each milestone updates this canonical design in place, runs its focused frontend and backend tests, and passes the complete CI rollup on its exact pushed SHA before merge. Later milestones start from the verified merge of the preceding milestone rather than an unmerged stack.

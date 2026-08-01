@@ -195,4 +195,38 @@ describe('ServeHistorySection', () => {
       { start: 120, end: 300 },
     ]);
   });
+
+  it('requests a longer preset while keeping the current history visible', () => {
+    const onHoursChange = jest.fn();
+    render(
+      <ServeHistorySection
+        history={history}
+        loading
+        onHoursChange={onHoursChange}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '12h' }));
+
+    expect(onHoursChange).toHaveBeenCalledWith(12);
+    expect(screen.getByText('Latest ready')).toBeInTheDocument();
+  });
+
+  it('renders explicit loading and unavailable placeholders', () => {
+    const { rerender } = render(<ServeHistorySection history={null} loading />);
+    expect(
+      screen.getByText('Loading request and capacity history...')
+    ).toBeInTheDocument();
+
+    rerender(
+      <ServeHistorySection
+        history={{ available: false, reason: 'temporarily_unavailable' }}
+      />
+    );
+    expect(
+      screen.getByText(
+        /Request and capacity history is temporarily unavailable/
+      )
+    ).toBeInTheDocument();
+  });
 });

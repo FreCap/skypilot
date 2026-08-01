@@ -1,5 +1,9 @@
 import { apiClient } from './client';
-import { CLUSTER_NOT_UP_ERROR } from '@/data/connectors/constants';
+import {
+  API_VERSION_HEADER,
+  CLUSTER_NOT_UP_ERROR,
+  SERVE_DASHBOARD_DIRECT_READS_API_VERSION,
+} from '@/data/connectors/constants';
 
 // Normalize a raw replica_info entry from the /serve/status response.
 // The REST encoder (`encode_serve_status`) serializes replica statuses to
@@ -362,6 +366,8 @@ export function normalizeReplicaHistory(history) {
   const requestsLastHour = Number(history.requests_last_hour);
   return {
     available,
+    reason: history.reason || null,
+    serviceHash: history.service_hash || null,
     bucketSeconds: Number(history.bucket_seconds) || 60,
     retentionHours: Number(history.retention_hours) || 72,
     windowStart: Number(history.window_start) || null,
@@ -589,6 +595,7 @@ export function normalizeService(record) {
 
   return {
     name: record.name,
+    serviceHash: record.hash || null,
     status: record.status,
     // Epoch timestamp of when the service first became ready (see
     // serve_state.set_service_uptime); the UI renders `now - uptime`.
@@ -741,6 +748,58 @@ export async function getServices(options = {}) {
     console.error('Error fetching services:', error);
     throw error;
   }
+}
+
+const SERVICE_HISTORY_SECTIONS = [
+  'requests',
+  'replicas',
+  'prediction',
+  'autoscaler',
+];
+
+export async function getServiceHistory({
+  serviceName,
+  serviceHash,
+  hours = 1,
+  sections = SERVICE_HISTORY_SECTIONS,
+}) {
+  const params = new URLSearchParams({
+    hours: String(hours),
+    expected_service_hash: serviceHash,
+  });
+  sections.forEach((section) => params.append('section', section));
+  const response = await apiClient.get(
+    `/serve/${encodeURIComponent(serviceName)}/history?${params.toString()}`
+  );
+  const serverApiVersion = Number(response.headers?.get?.(API_VERSION_HEADER));
+  if (response.status === 404) {
+    const legacyFallback =
+      !Number.isInteger(serverApiVersion) ||
+      serverApiVersion < SERVE_DASHBOARD_DIRECT_READS_API_VERSION;
+    return {
+      available: false,
+      reason: legacyFallback ? 'unsupported' : 'not_found',
+      legacyFallback,
+    };
+  }
+  if (response.status === 409) {
+    const error = new Error('The service incarnation changed.');
+    error.code = 'SERVICE_HASH_MISMATCH';
+    throw error;
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Service history request failed with status ${response.status}`
+    );
+  }
+  const history = normalizeReplicaHistory(await response.json());
+  if (!history) {
+    throw new Error('Service history response was malformed');
+  }
+  return {
+    ...history,
+    legacyFallback: history?.reason === 'non_consolidated',
+  };
 }
 
 function finiteOrNull(value) {
