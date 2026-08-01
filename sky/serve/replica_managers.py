@@ -568,6 +568,9 @@ def launch_cluster(
 
     if availability_max_retry is None:
         availability_max_retry = max_retry
+    # TODO(fcapponi): DEPRECATED resource-action retry/request association
+    # owner. Remove at M5 after action-only launch proves its rollback gate;
+    # never use this loop for an eligible authoritative service.
     retry_cnt = 0
     availability_retry_cnt = 0
     backoff = common_utils.Backoff(_RETRY_INIT_GAP_SECONDS)
@@ -935,6 +938,9 @@ def terminate_cluster(cluster_name: str,
     cluster_record = global_user_state.get_cluster_from_name(cluster_name)
     cluster_workspace = (cluster_record.get('workspace')
                          if cluster_record is not None else None)
+    # TODO(fcapponi): DEPRECATED resource-action retry owner. Remove at M5
+    # after action-only down proves its rollback gate; never use this loop for
+    # an eligible authoritative service.
     retry_cnt = 0
     backoff = common_utils.Backoff()
     while True:
@@ -1815,6 +1821,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         tests, and upgrade/recovery paths that reconstruct a manager without
         replaying the newest initializer in full.
         """
+        # TODO(fcapponi): DEPRECATED resource-action retry-clock owner. Remove
+        # at M5 after action-only down proves its rollback gate.
         attempts: dict[int, int] | None = getattr(
             self, '_failed_cleanup_retry_attempts', None)
         retry_at: dict[int, float] | None = getattr(self,
@@ -1889,8 +1897,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                self._spot_placer,
                                                task.num_nodes)
         self._fill_skip_last_log_time: float = 0.0
-        # TODO(tian): Store launch/down request id in the replica table, to make
-        # the manager more persistent.
+        # TODO(fcapponi): DEPRECATED resource-action owners. Remove these
+        # launch/down thread pools, request/cancellation maps, and cleanup retry
+        # clocks at M5 after action-only launch/down proves its rollback gate;
+        # never use them for an eligible authoritative service.
         self._launch_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
         self._replica_to_request_id: thread_utils.ThreadSafeDict[
@@ -2033,6 +2043,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         Runs in the dedicated recovery thread started by __init__, which
         holds the manager lock for the whole pass (see __init__ for the
         lock-ordering handshake with the daemon threads)."""
+        # TODO(fcapponi): DEPRECATED status-inference owner. Remove the
+        # launch/down reconstruction branches at M5 after durable action links
+        # become the sole recovery source for eligible authoritative services.
         if self._launch_thread_pool or self._down_thread_pool:
             # Only possible on a RETRY of a partially-completed recovery
             # pass: the per-replica enqueues below skip anything already in
@@ -3916,6 +3929,9 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: str | None) -> None:
+        # TODO(fcapponi): DEPRECATED resource-action result reducer. Remove at
+        # M5 for eligible authoritative services after the durable reducer
+        # owns this projection.
         if format_exc is not None:
             logger.error(f'Down thread for replica {info.replica_id} '
                          f'exited abnormally with exception {format_exc}.')
@@ -3978,6 +3994,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             is_scale_down: bool = False,
             purge: bool = False,
             in_flight_drain_cap_seconds: int | None = None) -> None:
+        # TODO(fcapponi): DEPRECATED resource-action scheduler. Remove at M5
+        # for eligible authoritative services after durable down admission
+        # owns scheduling and retry.
         left_in_record = not (is_scale_down or purge)
         if left_in_record:
             assert sync_down_logs, (
@@ -4206,6 +4225,9 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _reconcile_failed_cleanup(self,
                                   replica_infos: list[ReplicaInfo]) -> None:
         """Re-drive every durable cleanup failure until absence is proven."""
+        # TODO(fcapponi): DEPRECATED resource-action retry scheduler. Remove at
+        # M5 for eligible authoritative services after database-clock action
+        # retries own cleanup.
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in replica_infos:
@@ -6028,6 +6050,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         the fly. If any of them finished, it will update the status of the
         corresponding replica.
         """
+        # TODO(fcapponi): DEPRECATED launch/down mutation owner. Remove its
+        # eligible authoritative branches at M5 after action-only execution
+        # and the compatible rollback gate are proven.
         # A pre-field SCHEDULED retirement stays off-route across an upgrade
         # until current replacement capacity proves it can be re-driven.
         self._reconcile_legacy_uncertain_logical_retirements()

@@ -2696,6 +2696,9 @@ def _terminate_failed_services_locked(
     if not _still_owns():
         return _purge_ownership_failure(
             service_name, 'ownership lost after cluster inventory snapshot')
+    # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
+    # failed-service purge submission path at M5 for eligible authoritative
+    # services after durable down actions cover purge and rollback.
     to_terminate = [
         info for info in replica_infos
         if info.cluster_name in existing_cluster_names
@@ -2907,6 +2910,9 @@ def _terminate_orphaned_service_children_impl(
             return _purge_ownership_failure(
                 service_name,
                 'ownership lost after orphan cluster inventory snapshot')
+        # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove
+        # this orphan purge submission path at M5 for eligible authoritative
+        # services after durable down actions cover purge and rollback.
         to_terminate = [
             info for info in replica_infos
             if info.cluster_name in existing_cluster_names

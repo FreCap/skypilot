@@ -441,6 +441,9 @@ def _cleanup(service_name: str,
                 'replicas.')
         logger.info(f'Removed {len(absent_replica_infos)} replica records '
                     'whose clusters are absent from the cluster inventory.')
+    # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
+    # whole-service thread loop at M5 for eligible authoritative services after
+    # durable down actions cover cleanup and rollback.
     info2thr: dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
     for info in replica_infos:
