@@ -17,6 +17,10 @@ passes AWS, Kubernetes, Helm, and Time providers.
   PostgreSQL driver. GCP or Azure login also requires Bash and `gcloud` or `az`.
 - On the machine running Terraform: authenticated `aws` and `kubectl`, Bash,
   `mktemp`, registry access, and network access to the EKS API.
+- For proxied EKS API access, set `KUBE_PROXY_URL` in the Terraform process
+  environment. At execution time the reconciliation command adds it to
+  `aws eks update-kubeconfig` as `--proxy-url`, without storing the URL in
+  Terraform configuration or state. Leaving it unset preserves direct access.
 - When an External Secret input is enabled: External Secrets Operator CRDs and
   the configured ClusterSecretStore. If `eso_secrets_reader_role_name` is set,
   this state also owns an inline read policy on that existing role.
