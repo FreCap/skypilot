@@ -83,7 +83,7 @@ contracts.
 ## Responsibility Deduplication Review
 
 This review compares the current SkyPilot tree with
-`dstackai/dstack@ccef71f46b8e61ce3c139d3c147911b6dd19f8a2`. It extends the
+`dstackai/dstack@c9ebdaad6bbaa3105061d79f6ab52af9d609e99d`. It extends the
 original three concepts with the ownership changes required to remove
 duplication rather than only type it.
 
@@ -5394,6 +5394,281 @@ ambiguous provider response, readback, and cleanup.
 - generate conformance from descriptor capabilities and keep providers without
   live promotion evidence on the legacy bulk facet.
 
+#### M4 deploy-variable snapshot foundation and DigitalOcean pilot
+
+This callback audit is pinned to SkyPilot
+`289482c9327a8011f6ba0f503bcf978dcc24fb57` and dstack
+`c9ebdaad6bbaa3105061d79f6ab52af9d609e99d`.
+
+The two deploy-variable callbacks currently have different lifecycle positions.
+`write_cluster_config()` calls `Resources.make_deploy_variables()` and the
+provider callback before rendering. A successful new-provisioner mutation then
+calls `Cloud.make_deploy_resources_variables()` again. Only
+`custom_resources` from that second result reaches post-provision runtime setup;
+all other fields are discarded, and the whole result is unused when the
+provisioner reports that runtime setup is already complete. This callback is
+therefore not a general runtime-bootstrap plan. M4 replaces it with a typed
+provider deploy snapshot and one explicitly declared runtime projection.
+
+This subsection refines M4 ordering. Read-only registry audit, the dormant
+registration and descriptor foundation, and shadow-only deploy snapshot
+comparison may land before `SkyletCapabilitiesV1` because they select no
+transport and authorize no external effect. `SkyletCapabilitiesV1` remains a
+prerequisite for the first node-actuation promotion. A provider's single
+deploy-variable callback may become authoritative independently only after the
+descriptor and snapshot gates below close and a credentialed provider canary
+passes. The existing post-bulk callback remains authoritative before that
+point.
+
+The implementation stack is fixed:
+
+1. Commit this exact design, the complete producer coverage gap, and
+   characterization tests.
+2. Add `ProviderRegistryAuditSnapshotV1` as read-only evidence with no dispatch
+   authority.
+3. Add dormant `ProviderRegistrationV1` and `ProviderDescriptorV1`; legacy
+   registries remain the dispatch owners.
+4. Add `ProviderDeploySnapshotV1` and DigitalOcean shadow comparison while the
+   second callback remains authoritative.
+5. Make the exact built-in DigitalOcean route single-callback only after an
+   exact-image create, runtime-setup, status, down, and provider-absence canary.
+
+Each runtime commit that introduces a temporary selector, comparator,
+diagnostic branch, or compatibility router must add its exact locator to the
+executable removal manifest in a later commit whose `introduced_by` is the
+actual runtime commit SHA. The global post-bulk callback remains owned by
+`PLA-M2-009`; DigitalOcean promotion cannot complete that row.
+
+##### Descriptor and route contract
+
+`ProviderRegistrationV1` is the validated input to the existing coordinator.
+It contains the canonical provider name, immutable aliases, the complete set
+of migrated facets, expected legacy projections, and a stable verifiable
+implementation digest. It is rejected if an alias is ambiguous, a declared
+facet is incomplete, or its executable artifact fingerprint cannot be
+verified. It does not itself mutate a compatibility registry.
+
+`ProviderDescriptorV1` is the coordinator's recursively immutable output. It
+contains schema version 1, canonical provider name, sorted aliases, stable
+implementation digest, process-local descriptor generation, registration
+source, expected-partial classification, and the exact optional facet objects.
+The process-local generation detects replacement within one process. It is not
+durable identity and never substitutes for the stable implementation digest.
+
+Shadow capture may use the dormant descriptor only as read-only evidence; it
+does not select lifecycle dispatch and the dynamically resolved second callback
+remains authoritative. Authoritative snapshot routing is selected and pinned
+before provider mutation. Eligibility for DigitalOcean promotion requires all
+of the following:
+
+- the authoritative exact built-in DigitalOcean descriptor and exact deploy
+  snapshot facet;
+- the exact built-in `DO` Cloud class, not a subclass;
+- the checked and subsequently invoked built-in
+  `DO.make_deploy_resources_variables` producer identity;
+- the exact built-in `Resources.make_deploy_variables`, config writer,
+  DigitalOcean physical template, and renderer owners;
+- no registered plugin template, arbitrary template, nonempty or replaced
+  failover override, instance method replacement, wrapper, or delegating
+  override.
+
+A strict plugin may opt in only through its own complete reviewed descriptor
+and separate live qualification. A legacy registration always blocks built-in
+snapshot eligibility, even when the built-in bundle is still discoverable for
+compatibility fallback. Any failed promotion gate before provider mutation runs
+the complete legacy two-callback lifecycle. In authoritative mode the selected
+route and checked producer reference are retained for the attempt. Once
+provider mutation begins, that attempt never changes route or falls back to a
+newly resolved legacy callback. Shadow mode deliberately retains the current
+dynamic second resolution and records replacement as comparison evidence.
+
+##### `ProviderDeploySnapshotV1`
+
+`ProviderDeploySnapshotV1` is a request-local, process-memory-only value with
+these exact fields:
+
+- `schema_version`, exactly `1`;
+- `canonical_provider`;
+- `descriptor_generation`;
+- `descriptor_implementation_digest`;
+- `producer_contract`, initially
+  `make_deploy_resources_variables.digitalocean.v1`;
+- `producer_identity_digest`, derived from the checked release artifact;
+- `values`, a detached `FrozenJSONDict` containing the provider projection;
+- `runtime_projection_contract`, initially
+  `ray_custom_resources_from_deploy_variables.v1`;
+- `process_comparison_token`, an HMAC-SHA-256 over canonical compact JSON of
+  the preceding public metadata and `values`, keyed by one random process-local
+  256-bit key.
+
+Construction accepts only null, exact booleans, finite integers or floats,
+bounded UTF-8 strings, string-keyed objects, and arrays. It rejects cycles,
+duplicate logical keys, non-string keys, non-finite numbers, and values beyond
+depth 8, 128 aggregate entries, 4 KiB per string, or 32 KiB canonical bytes.
+The DigitalOcean pilot narrows this further to its scalar output grammar. The
+snapshot cannot contain clients, credentials, credential paths, raw user
+configuration, provider responses, telemetry payload values, or an arbitrary
+plugin object. Each facet supplies a closed field allowlist and value grammar;
+an undeclared field fails capture instead of being generically frozen. Snapshot
+repr and errors expose only provider, contract, and schema. The comparison key
+is generated after process start, never exposed, logged, serialized, or
+persisted, and rotates on process restart. The token is used only to avoid
+repeated canonicalization during same-process equality checks. It is not a
+redaction boundary and never reaches telemetry. Telemetry emits only bounded
+reason and count tags, never `values` or any value-derived digest.
+
+`to_legacy_runtime_variables()` is the only public projection. It validates the
+declared runtime projection contract and returns a new mutable mapping. The
+DigitalOcean V1 projector reads only `custom_resources`; no duplicated mutable
+or frozen field can disagree with `values`.
+
+The process comparison token is separate from the cluster config hash.
+DigitalOcean's `custom_resources` is not rendered by `do-ray.yml.j2`, and the
+cluster hash
+also has restoration and file-mount semantics unrelated to this provider
+projection. The snapshot may freeze a rendered provider delta, but it never
+owns raw catalog acquisition or competes with `RawOfferSnapshotV1`.
+
+The snapshot provides within-attempt coherence only. It is not persisted before
+I/O, cannot recover a process crash, and is not an idempotency or effect fence.
+Any future durable form requires a separate schema, redaction, retention, and
+mixed-version design.
+
+##### Attempt ownership and consumption
+
+The existing public `write_cluster_config()` signature and dictionary return
+remain unchanged and snapshot-free. Direct calls, wrappers, replacements, and
+plugins can reach only that contract. When the backend resolves the exact
+built-in public writer and every promotion or shadow owner gate passes, it
+instead invokes one shared private implementation through an exact checked
+reference. That implementation returns `DeployConfigWriteResultV1`, a private
+linear carrier containing the ordinary `config_dict` plus at most one
+`ProviderDeploySnapshotV1`. The public writer delegates to the same
+implementation with snapshot capture disabled and unwraps only `config_dict`,
+so rendering and restoration have one owner.
+
+`DeployConfigWriteResultV1` is an exact-type context manager and never appears
+in a public annotation or return. Its `take_snapshot()` succeeds at most once,
+replaces the held reference with null, and returns the snapshot. Its
+`discard_snapshot()` is idempotent. `__exit__` always discards any untaken
+snapshot, including on `BaseException`. The backend's context scope encloses
+config-hash and dry-run decisions, provider mutation, the shadow callback or
+authoritative runtime projection, and assignment of the existing public
+`resources_vars` mapping. Only `config_dict` can escape that scope.
+
+The private writer captures one fresh snapshot after the first checked provider
+callback for each physical config, zone, and cloud-specific failover attempt.
+An error from that first callback is authoritative for that attempt and returns
+no carrier. A failed attempt's snapshot is discarded by the carrier and is
+never reused by another retry, zone, provider, template, or outer optimizer
+attempt. A replacement of either the private implementation or result type
+fails the pre-I/O gate and uses the complete public legacy path.
+
+In shadow mode the post-bulk callback remains authoritative. The attempt
+compares a separately validated and frozen second result with the snapshot by
+exact value equality, using the process token only as a fast inequality check.
+It then takes and releases the private snapshot and returns the existing mutable
+`resources_vars` projection unchanged. Stable equality, intentional drift,
+callback error, and comparison failure are distinct events; comparison failure
+never changes legacy control flow.
+
+In authoritative mode the attempt takes the snapshot, thaws only the declared
+runtime projection to a fresh legacy-shaped mapping, releases the snapshot, and
+never calls the provider producer again. Dry run and config-hash skip leave the
+snapshot untaken so context exit discards it before returning. Bulk failure,
+cleanup, cancellation, `Exception`, and `BaseException` likewise exit through
+the carrier cleanup. Both the normal runtime-setup path and
+`runtime_setup_done=True` path consume it. No carrier or snapshot may remain in
+a public return, config YAML, template variables, config hash, cluster handle,
+global state, exception, or log record.
+Existing-cluster YAML restoration remains authoritative and completes before
+the config hash and cluster name are returned. It cannot be overwritten by the
+snapshot.
+
+##### DigitalOcean freshness classification
+
+The exact built-in DigitalOcean producer is the first candidate because its
+return contains only scalar values and it performs no provider mutation or
+credentialed API call.
+
+| Input or observation | Current behavior | Pilot contract |
+| --- | --- | --- |
+| `resources.assert_launchable()` | validates and returns the launchable resource | consumed once by the checked producer |
+| instance type | returned as `instance_type` | frozen for the attempt |
+| accelerator catalog projection | looked up from the instance type and compact-JSON encoded | frozen for the attempt; later catalog drift is an intentional delta |
+| cloud image mapping | selects the global image or the current region entry | frozen for the attempt |
+| region | returned and used for regional image selection | frozen for the attempt |
+| cluster name, zones, node count, dry-run flag, volume mounts | ignored by the built-in producer | invariance is characterized, including a restored existing-cluster name |
+| ambient config, credentials, provider API | not read | any future read changes the producer contract and implementation digest, invalidating promotion |
+| return mutability | a fresh mutable dict containing immutable scalar leaves | detached into `FrozenJSONDict`; every legacy projection is a new dict |
+
+The provider-wide audit uses four freshness classes. `F0` consumes explicit
+attempt inputs plus the service catalog. `F1` also resolves local ambient
+configuration, environment, or a credential profile. `F2` performs live
+provider or cluster discovery and may mutate a cache. `F3` returns secret-bearing
+or opaque execution context that must be split from the public deploy snapshot.
+Every class is recaptured for each physical retry or failover attempt. The class
+controls the producer boundary; it never licenses reuse across attempts.
+
+| Provider producer | Class | Freshness, side effect, and mutability finding |
+| --- | --- | --- |
+| AWS | F2 | regional and workspace config plus conditional EC2, EFA, and AMI reads; LRU and persistent AMI cache writes; ingress and EFA option aliases require recursive detachment |
+| Azure | F1 | resource-group config and Azure CLI subscription profile; subscription cache mutation; fresh cloud-init list |
+| Cudo | F0 | instance type and region plus accelerator catalog; scalar result |
+| DigitalOcean | F0 | instance type, image, and region plus accelerator catalog; no provider I/O; scalar result |
+| Fluidstack | F0 | instance type and region plus accelerator catalog; scalar result |
+| GCP | F2 | workspace, task, ADC, and project state plus conditional Compute zone and disk reads; auth caches and nested volume and option values |
+| Hyperbolic | F0 | instance type plus accelerator catalog; fixed one-node projection |
+| IBM | F3 plus F2 | credential YAML and conditional VPC image listing; nested result currently includes plaintext IAM API key and cannot enter a generic snapshot |
+| Kubernetes | F2 | kubeconfig, layered config, image catalog, and extensive live node, label, accelerator, and network reads; deeply mutable result |
+| Lambda | F0 | instance type and region plus accelerator catalog; fresh GPU option list |
+| Mithril | F1 | environment and repeatedly read profile, project, and API-key YAML; public scalar result only after one coherent local-config resolution |
+| Nebius | F2 | filesystem, static-IP, security-group, project, credential, and conditional IAM project-list reads; mutable filesystem and environment aliases |
+| OCI | F2 | profile and credentials plus conditional availability-domain and OS-image reads; module-global tenancy-prefix mutation |
+| Paperspace | F0 | instance type and region plus accelerator catalog; scalar result |
+| Prime Intellect | F0 | instance type, region, and first zone plus accelerator catalog; scalar result |
+| RunPod | F0 | instance, image, spot, Docker username, region, zone, volume validation, and pricing catalogs; public scalar result |
+| SCP | F0 | instance, image, and region plus accelerator and image catalogs; scalar result with typed failover error |
+| Seeweb | F0 after normalization | instance, accelerator, Docker image, region, and mutable `ClusterName`; nested GPU data and cluster-name reference require canonical detachment |
+| Shadeform | F0 | resource and region plus conditional feasibility lookup; scalar result |
+| Slurm | F2 | local Slurm and SkyPilot config plus live SSH partition, node, and GRES reads; TTL cache writes and nested `sbatch_options` aliases |
+| Vast | F3 after F1 | config and opaque `create_instance_kwargs`; returned nested values can contain registry, command, environment, or other secrets |
+| Verda | F1 | explicit inputs plus `SKYPILOT_VERDA_IMAGE_ID`; scalar result after validation |
+| vSphere | F0 | instance, region, and zones plus accelerator catalog; scalar result |
+| Yotta | F3 | explicit inputs and catalogs, but returns the mutable password-bearing `DockerLoginConfig` object by reference |
+
+No concrete producer consumes a provisioning result or newly created node
+identity. The eventual second-callback removal is therefore valid for every
+built-in, but the migration boundary differs by class. F0 providers can use a
+bounded attempt snapshot after characterization. F1 providers first need one
+coherent ambient resolution. F2 providers need one explicitly placed live-read
+stage and must name cache effects. F3 providers must split public render values
+from secret or request-scoped execution context before any snapshot promotion.
+IBM, Yotta, and Vast are prohibited from whole-result snapshotting.
+
+The first callback result becomes authoritative only after promotion. A
+stateful second result, later catalog mutation, callback replacement after the
+route is pinned, or a legacy second-callback exception after successful bulk
+mutation is then an intentional compatibility delta. Those deltas must be
+named in tests and release evidence. They must not be hidden as parity.
+
+DigitalOcean shadow and promotion qualification covers absent, global, and
+regional image IDs; no accelerator and accelerator JSON; output bytes and the
+real deterministic config hash; exact callback order and counts; restored
+cluster names; dry-run, hash-skip, bulk-failure, retry, and runtime-ready paths;
+stateful drift and second-callback failure after mutation; recursive detachment,
+redaction, and complete snapshot consumption; every owner-gate failure; and
+stable `ProvisionRecord`, runtime custom resources, cleanup, and absence.
+
+Kubernetes remains entirely legacy in this pilot. At the pinned source it has
+two effective-Pod reads while writing YAML and one post-bulk read. The corpus
+must retain those three reads, including fresh ambient state and a third-read
+failure after mutation, until its separate mutable-input and Pod-projection
+migration closes. A Kubernetes deployment validates import, API-server,
+executor, controller, and general regression safety, but does not qualify the
+DigitalOcean route. Without credentialed DigitalOcean access, the rollout must
+stop at shadow mode.
+
 ### M5: Serve and pools
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
@@ -6626,3 +6901,29 @@ schema and historical-migration evidence, classifies SQLite compatibility as
 incomplete `must_remove` work, adds transitional M3 obligations, and splits
 volume core mutation from the exact daemon owner. The manifest and checker do
 not yet exist, so no claim of executable enforcement is made by this review.
+
+### Review 23
+
+Verdict: `PURSUE` for the M4 deploy-variable snapshot foundation and
+DigitalOcean pilot subsection at SHA-256
+`15815eeb688472d3a02a0e3c2c97d23528619ba3b026ebbedeb704c124a076bd`
+and the executable removal manifest at SHA-256
+`a8ff84b514d73bc81d2c063821ad189e6c4f130bbb975f17040320408f1dedd1`.
+
+The first challenge returned `RESHAPE` because a DigitalOcean-only backend
+branch would have bypassed the documented registry audit, registration, and
+descriptor prerequisites. The corrected design adds the reusable stack, exact
+snapshot and attempt contracts, the complete 24-producer freshness inventory,
+`PLA-GAP-004`, provider-terminal `PLA-M2-009` gates, and a credentialed
+DigitalOcean canary before authority.
+
+The second challenge returned `RESHAPE` because the snapshot had no exact
+private carrier across the writer boundary and its unsalted value digest was
+incorrectly described as redacted telemetry. The final contract keeps the
+public writer dictionary snapshot-free, carries the snapshot only in an
+exact-type linear context that discards it on every exit path, and limits the
+value-derived comparison token to keyed process-local equality. Telemetry gets
+only bounded reason and count tags. Re-review returned `PURSUE` with no
+remaining blocker. This verdict approves design and characterization work. It
+does not authorize single-callback promotion before the descriptor and live
+provider gates close.
