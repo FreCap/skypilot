@@ -25,6 +25,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import asyncio as sql_async
 
+from sky import global_user_state_cloud_checks
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
 from sky import models
@@ -35,7 +36,6 @@ from sky.skylet import constants
 from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import context_utils
-from sky.utils import registry
 from sky.utils import status_lib
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
@@ -49,9 +49,6 @@ if typing.TYPE_CHECKING:
     from sky.data import Storage
 
 logger = sky_logging.init_logger(__name__)
-
-_ENABLED_CLOUDS_KEY_PREFIX = 'enabled_clouds_'
-_ALLOWED_CLOUDS_KEY_PREFIX = 'allowed_clouds_'
 
 DEFAULT_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 DEBUG_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
@@ -89,6 +86,16 @@ _operator_notification_insert_func = (
     global_user_state_notifications._operator_notification_insert_func)
 _next_operator_notification_sequence = (
     global_user_state_notifications._next_operator_notification_sequence)
+# Cloud-check key helpers are stateless direct aliases.  Retain their
+# historical facade identity for protected import and inspection compatibility.
+_get_enabled_clouds_key = (
+    global_user_state_cloud_checks._get_enabled_clouds_key)
+_get_enabled_clouds_key.__module__ = __name__
+_get_check_results_key = global_user_state_cloud_checks._get_check_results_key
+_get_check_results_key.__module__ = __name__
+_get_allowed_clouds_key = (
+    global_user_state_cloud_checks._get_allowed_clouds_key)
+_get_allowed_clouds_key.__module__ = __name__
 # pylint: enable=protected-access
 
 
@@ -2964,61 +2971,18 @@ def get_cluster_names_start_with(starts_with: str) -> list[str]:
 @metrics_lib.time_me
 def get_cached_enabled_clouds(cloud_capability: 'cloud.CloudCapability',
                               workspace: str) -> list['clouds.Cloud']:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(config_table).filter_by(
-            key=_get_enabled_clouds_key(cloud_capability, workspace)).first()
-    ret = []
-    if row:
-        ret = json.loads(row.value)
-    enabled_clouds: list[clouds.Cloud] = []
-    for c in ret:
-        try:
-            cloud = registry.CLOUD_REGISTRY.from_str(c)
-        except ValueError:
-            # Handle the case for the clouds whose support has been
-            # removed from SkyPilot, e.g., 'local' was a cloud in the past
-            # and may be stored in the database for users before #3037.
-            # We should ignore removed clouds and continue.
-            continue
-        if cloud is not None:
-            enabled_clouds.append(cloud)
-    return enabled_clouds
+    return global_user_state_cloud_checks.get_cached_enabled_clouds(
+        _db_manager.get_engine(), cloud_capability, workspace)
 
 
 @metrics_lib.time_me
 def set_enabled_clouds(enabled_clouds: list[str],
                        cloud_capability: 'cloud.CloudCapability',
                        workspace: str) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(config_table).values(
-            key=_get_enabled_clouds_key(cloud_capability, workspace),
-            value=json.dumps(enabled_clouds))
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[config_table.c.key],
-            set_={config_table.c.value: json.dumps(enabled_clouds)})
-        session.execute(do_update_stmt)
-        session.commit()
-
-
-def _get_enabled_clouds_key(cloud_capability: 'cloud.CloudCapability',
-                            workspace: str) -> str:
-    return _ENABLED_CLOUDS_KEY_PREFIX + workspace + '_' + cloud_capability.value
-
-
-_CHECK_RESULTS_KEY_PREFIX = 'check_results_'
-
-
-def _get_check_results_key(workspace: str) -> str:
-    return f'{_CHECK_RESULTS_KEY_PREFIX}{workspace}'
+    global_user_state_cloud_checks.set_enabled_clouds(_db_manager.get_engine(),
+                                                      enabled_clouds,
+                                                      cloud_capability,
+                                                      workspace)
 
 
 @metrics_lib.time_me
@@ -3029,19 +2993,8 @@ def get_cached_check_results(
     Shape:
         {cloud_repr: {context_or_empty_str: {"enabled": bool, "reason": str}}}.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(config_table).filter_by(
-            key=_get_check_results_key(workspace)).first()
-    if row is None or row.value is None:
-        return {}
-    try:
-        return json.loads(row.value)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning(
-            f'Corrupt check_results row for workspace {workspace!r}; '
-            f'returning empty dict.')
-        return {}
+    return global_user_state_cloud_checks.get_cached_check_results(
+        _db_manager.get_engine(), workspace, logger)
 
 
 @metrics_lib.time_me
@@ -3065,93 +3018,24 @@ def set_check_results(
     for contexts that have since been removed from a cloud will linger
     until the next full-workspace run rewrites the row.
     """
-    engine = _db_manager.get_engine()
-    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-        insert_func = sqlite.insert
-    elif engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-        insert_func = postgresql.insert
-    else:
-        raise ValueError('Unsupported database dialect')
-
-    key = _get_check_results_key(workspace)
-    with orm.Session(engine) as session:
-        if is_full_workspace_run:
-            new_value = results
-        else:
-            # Read-modify-write under the default session isolation. This
-            # is NOT race-safe against concurrent scoped writes for
-            # different clouds in the same workspace: SQLAlchemy
-            # `orm.Session` does not acquire row locks, and under the
-            # default isolation (READ COMMITTED on Postgres, deferred on
-            # SQLite) two interleaved RMW cycles can clobber each
-            # other's per-cloud updates. The blast radius is limited
-            # (one scoped run's leaves get overwritten until the next
-            # write rewrites the row) and the source-of-truth
-            # enabled_clouds_* rows are unaffected, so we accept the
-            # race here rather than serialize through a per-workspace
-            # advisory lock. If this row ever becomes load-bearing for
-            # correctness, switch to `with_for_update()` (postgres) and
-            # an explicit BEGIN IMMEDIATE (sqlite).
-            row = session.query(config_table).filter_by(key=key).first()
-            existing: dict[str, dict[str, dict[str, Any]]] = {}
-            if row is not None and row.value is not None:
-                try:
-                    existing = json.loads(row.value)
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(f'Corrupt check_results row for workspace '
-                                   f'{workspace!r}; replacing.')
-                    existing = {}
-            new_value = dict(existing)
-            for cloud_repr, ctx_dict in results.items():
-                existing_for_cloud = new_value.get(cloud_repr)
-                if not isinstance(existing_for_cloud, dict):
-                    existing_for_cloud = {}
-                new_value[cloud_repr] = {**existing_for_cloud, **ctx_dict}
-
-        serialized = json.dumps(new_value)
-        insert_stmnt = insert_func(config_table).values(key=key,
-                                                        value=serialized)
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[config_table.c.key],
-            set_={config_table.c.value: serialized})
-        session.execute(do_update_stmt)
-        session.commit()
+    global_user_state_cloud_checks.set_check_results(
+        _db_manager.get_engine(),
+        results,
+        workspace,
+        logger,
+        is_full_workspace_run=is_full_workspace_run)
 
 
 @metrics_lib.time_me
 def get_allowed_clouds(workspace: str) -> list[str]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(config_table).filter_by(
-            key=_get_allowed_clouds_key(workspace)).first()
-    if row:
-        return json.loads(row.value)
-    return []
+    return global_user_state_cloud_checks.get_allowed_clouds(
+        _db_manager.get_engine(), workspace)
 
 
 @metrics_lib.time_me
 def set_allowed_clouds(allowed_clouds: list[str], workspace: str) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(config_table).values(
-            key=_get_allowed_clouds_key(workspace),
-            value=json.dumps(allowed_clouds))
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[config_table.c.key],
-            set_={config_table.c.value: json.dumps(allowed_clouds)})
-        session.execute(do_update_stmt)
-        session.commit()
-
-
-def _get_allowed_clouds_key(workspace: str) -> str:
-    return _ALLOWED_CLOUDS_KEY_PREFIX + workspace
+    global_user_state_cloud_checks.set_allowed_clouds(_db_manager.get_engine(),
+                                                      allowed_clouds, workspace)
 
 
 @metrics_lib.time_me
