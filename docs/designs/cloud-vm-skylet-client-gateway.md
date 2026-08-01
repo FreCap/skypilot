@@ -107,6 +107,8 @@ without independent lifecycles.
   `sky.backends.cloud_vm_ray_backend.SkyletClient` remain the same class
   object.
 - The class retains its historical module and pickle identity.
+- Runtime type annotations resolve for every gateway method, as they did at
+  the historical module path.
 - Existing method names, signatures, default timeouts, response types, and
   delegation targets are unchanged.
 - `TailLogs` remains the only streaming method.
@@ -136,6 +138,7 @@ without independent lifecycles.
 | Serve deadline callers | `test_serve_terminate_transport.py`, `test_serve_terminate_validation.py` |
 | health and cancellation transport | `test_skylet_health_service.py`, `test_skylet_grpc_cancellable.py` |
 | import and serialization compatibility | `test_skylet_client_contract.py` |
+| runtime annotation compatibility | `test_skylet_client_contract.py` |
 
 ## Validation evidence
 
@@ -159,6 +162,11 @@ copy, retry, query, or network call.
 The pull-request workflows target `improvements` without changed-path filters.
 The Unit Tests job collects the entire `tests/unit_tests` tree, while format,
 mypy, Pylint, and static-analysis workflows cover the Python implementation.
+
+The post-merge audit found that moving the annotated methods without their
+runtime protobuf and gRPC symbols made `typing.get_type_hints()` raise
+`NameError`. The implementation now keeps those symbols as lazy imports and
+the contract suite resolves annotations for every gateway method.
 
 ## Rollout and rollback
 

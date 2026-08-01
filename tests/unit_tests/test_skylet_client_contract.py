@@ -3,10 +3,12 @@
 import ast
 import base64
 import hashlib
+import inspect
 from pathlib import Path
 import pickle
 import subprocess
 import sys
+import typing
 from unittest import mock
 
 import pytest
@@ -60,6 +62,15 @@ def test_historical_pickle_resolves_in_clean_process():
             'assert client is cloud_vm_ray_backend.SkyletClient')
 
     subprocess.run([sys.executable, '-c', code], check=True)
+
+
+def test_runtime_type_hints_resolve_for_every_gateway_method():
+    methods = inspect.getmembers(cloud_vm_ray_backend.SkyletClient,
+                                 inspect.isfunction)
+
+    assert methods
+    for _, method in methods:
+        assert typing.get_type_hints(method)
 
 
 def test_gateway_implementation_fingerprints():
