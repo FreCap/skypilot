@@ -43,7 +43,7 @@ def configured_migration_mode() -> MigrationMode:
 
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '027'  # qualification phases and repo tombstones
+GLOBAL_USER_STATE_VERSION = '028'  # action-aware cluster record identity
 GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 

@@ -51,6 +51,13 @@ cluster_table = sqlalchemy.Table(
     sqlalchemy.Column('metadata', sqlalchemy.Text, server_default='{}'),
     sqlalchemy.Column('owner', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('cluster_hash', sqlalchemy.Text, server_default=None),
+    # Write-once provider identity for action-aware launches. Ordinary cluster
+    # persistence omits this column so it cannot initialize, clear, or replace
+    # an existing commitment.
+    sqlalchemy.Column('cluster_record_uuid',
+                      sqlalchemy.Uuid,
+                      nullable=True,
+                      server_default=None),
     sqlalchemy.Column('storage_mounts_metadata',
                       sqlalchemy.LargeBinary,
                       server_default=None),
@@ -105,6 +112,15 @@ cluster_table = sqlalchemy.Table(
     # console URLs generated at launch time. Same shape as the `links` field
     # on managed-job rows: a JSON object mapping {label: url}.
     sqlalchemy.Column('links', sqlalchemy.JSON, server_default=None),
+)
+
+_CLUSTER_RECORD_UUID_INDEX = 'uq_clusters_cluster_record_uuid_nonnull'
+sqlalchemy.Index(
+    _CLUSTER_RECORD_UUID_INDEX,
+    cluster_table.c.cluster_record_uuid,
+    unique=True,
+    postgresql_where=cluster_table.c.cluster_record_uuid.is_not(None),
+    sqlite_where=cluster_table.c.cluster_record_uuid.is_not(None),
 )
 
 storage_table = sqlalchemy.Table(
