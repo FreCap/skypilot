@@ -1,9 +1,10 @@
-"""PostgreSQL schema catalog for SkyServe resource-action shadow evidence.
+"""PostgreSQL schema catalogs for SkyServe resource-action evidence.
 
-This metadata is deliberately separate from ``serve_state_schema.Base``.
-Revision 001 uses that legacy metadata for both supported Serve dialects;
-keeping the shadow tables here prevents a fresh SQLite bootstrap from trying
-to create PostgreSQL-only JSONB evidence tables.
+The revision-032 metadata is deliberately frozen and separate from
+``serve_state_schema.Base``.  Historical migration 032 imports ``metadata`` at
+runtime, so revision-033 additions live in a second head metadata graph.  This
+both preserves the 032 catalog and prevents a fresh SQLite bootstrap from
+trying to create PostgreSQL-only JSONB evidence tables.
 """
 
 import sqlalchemy
@@ -44,6 +45,76 @@ _CHILD_PHASES = (
     'COMPLETE',
     'ABANDONED_PRE_SUBMIT',
     'REQUEST_ASSOCIATION_UNKNOWN',
+)
+_COHORT_STATES = (
+    'REGISTERING',
+    'ACCEPTING',
+    'DRAINING',
+    'REMOVAL_AUTHORIZED',
+    'RETIRED',
+)
+_COHORT_REFERENCE_STATES = (
+    'PREPARING',
+    'SHADOW_ACTIVE',
+    'ACTION_ACTIVE',
+    'RELEASED',
+)
+_NORMALIZATION_OUTCOMES = (
+    'REPRESENTABLE',
+    'NOT_REPRESENTABLE',
+)
+_LAUNCH_NOT_REPRESENTABLE_REASONS = (
+    'request_contract',
+    'secret_or_tls_material',
+    'source_mismatch',
+    'policy_configured_or_mutated',
+    'managed_secrets',
+    'multi_task',
+    'multi_node',
+    'multi_resource',
+    'mount_or_storage',
+    'non_kubernetes',
+    'spot',
+    'non_direct_pod_topology',
+    'port_contract',
+    'reserved_label_collision',
+    'mutable_image',
+    'custom_provider_implementation',
+    'preflight_unavailable_or_invalid',
+    'authority_worker_attestation',
+    'authorization_or_principal_drift',
+    'prerequisite_or_network_drift',
+    'admitted_object_contract',
+    'runtime_or_job_contract',
+    'unrepresented_execution_config',
+    'unrepresented_resource',
+    'unfrozen_placement',
+    'unfrozen_identity',
+    'unfrozen_kubernetes_scope',
+    'target_mismatch',
+)
+_DOWN_NOT_REPRESENTABLE_REASONS = (
+    'request_contract',
+    'prior_launch_basis',
+    'target_mismatch',
+    'preflight_unavailable_or_invalid',
+    'authority_worker_attestation',
+    'authorization_or_principal_drift',
+    'prerequisite_or_network_drift',
+    'policy_configured_or_mutated',
+    'unrepresented_execution_config',
+    'unfrozen_kubernetes_scope',
+)
+_TERMINAL_REQUEST_STATUSES = (
+    'SUCCEEDED',
+    'FAILED',
+    'CANCELLED',
+)
+_RETRY_DISPOSITIONS = (
+    'RETRY_SAME_DECISION',
+    'TERMINAL',
+    'REPLAN_NEW_GENERATION',
+    'BLOCK',
 )
 
 
@@ -340,10 +411,364 @@ sqlalchemy.Index(
         "phase IN ('PRE_SUBMIT', 'REQUEST_BOUND')"),
 )
 
-# Uppercase aliases match the central request-store schema catalog style.
-SHADOW_SAMPLES = shadow_samples_table
-SHADOW_ATTEMPTS = shadow_attempts_table
-RESOURCE_ACTION_STATE_METADATA = metadata
+
+def shadow_attempt_effect_trace_columns() -> tuple[sqlalchemy.Column, ...]:
+    """Return fresh revision-033 effect-trace columns."""
+    return (
+        sqlalchemy.Column('legacy_effect_trace',
+                          postgresql.JSONB(none_as_null=True),
+                          nullable=True),
+        sqlalchemy.Column('legacy_effect_trace_sha256',
+                          sqlalchemy.Text,
+                          nullable=True),
+    )
+
+
+# Migration 032 imports ``metadata`` and the lowercase tables above.  Clone
+# them into the current-head graph before extending their physical catalog so a
+# 031 -> 032 upgrade still installs the exact frozen 032 schema.
+head_metadata = sqlalchemy.MetaData()
+shadow_samples_head_table = shadow_samples_table.to_metadata(head_metadata)
+shadow_attempts_head_table = shadow_attempts_table.to_metadata(head_metadata)
+for _column in shadow_attempt_effect_trace_columns():
+    shadow_attempts_head_table.append_column(_column)
+shadow_attempts_head_table.append_constraint(
+    sqlalchemy.CheckConstraint(_optional_json_hash_shape(
+        'legacy_effect_trace', 'legacy_effect_trace_sha256'),
+                               name='ck_serve_ra_shadow_attempts_effect_trace'))
+
+worker_cohorts_table = sqlalchemy.Table(
+    'serve_resource_action_worker_cohorts',
+    head_metadata,
+    sqlalchemy.Column('cohort_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('deployment_uid', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('cohort_identity',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('cohort_identity_sha256', sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column('registration_attestations',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('registration_attestations_sha256',
+                      sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column('lifecycle_state', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('revision',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='1'),
+    sqlalchemy.Column('created_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.Column('state_changed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.Column('retired_at', sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.PrimaryKeyConstraint('cohort_id',
+                                    name='pk_serve_ra_worker_cohorts'),
+    sqlalchemy.UniqueConstraint('deployment_uid',
+                                name='uq_serve_ra_worker_cohorts_deployment'),
+    sqlalchemy.CheckConstraint(
+        'octet_length(cohort_id) BETWEEN 1 AND 1024 AND '
+        'octet_length(deployment_uid) BETWEEN 1 AND 1024',
+        name='ck_serve_ra_worker_cohorts_text_bounds'),
+    sqlalchemy.CheckConstraint(
+        f'{_json_object_shape("cohort_identity")} AND '
+        f"cohort_identity_sha256 ~ '{_SHA256_PATTERN}'",
+        name='ck_serve_ra_worker_cohorts_identity'),
+    sqlalchemy.CheckConstraint(
+        f'{_json_object_shape("registration_attestations")} AND '
+        f"registration_attestations_sha256 ~ '{_SHA256_PATTERN}'",
+        name='ck_serve_ra_worker_cohorts_attestations'),
+    sqlalchemy.CheckConstraint(
+        f'lifecycle_state IN ({_sql_values(_COHORT_STATES)})',
+        name='ck_serve_ra_worker_cohorts_state'),
+    sqlalchemy.CheckConstraint('revision > 0',
+                               name='ck_serve_ra_worker_cohorts_revision'),
+    sqlalchemy.CheckConstraint(
+        'state_changed_at >= created_at AND '
+        "((lifecycle_state = 'RETIRED' AND retired_at IS NOT NULL) OR "
+        "(lifecycle_state <> 'RETIRED' AND retired_at IS NULL)) AND "
+        '(retired_at IS NULL OR retired_at >= state_changed_at)',
+        name='ck_serve_ra_worker_cohorts_timestamps'),
+)
+sqlalchemy.Index('ix_serve_ra_worker_cohorts_state',
+                 worker_cohorts_table.c.lifecycle_state,
+                 worker_cohorts_table.c.state_changed_at,
+                 worker_cohorts_table.c.cohort_id)
+
+worker_cohort_refs_table = sqlalchemy.Table(
+    'serve_resource_action_worker_cohort_refs',
+    head_metadata,
+    sqlalchemy.Column('decision_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('cohort_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('replica_incarnation',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('desired_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('action_type', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('controller_owner_fence', sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column('lifecycle_epoch', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('reference_state', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('revision',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='1'),
+    sqlalchemy.Column('created_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.Column('bound_at', sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.Column('released_at', sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.PrimaryKeyConstraint('decision_id',
+                                    name='pk_serve_ra_worker_cohort_refs'),
+    sqlalchemy.ForeignKeyConstraint(
+        ['cohort_id'], ['serve_resource_action_worker_cohorts.cohort_id'],
+        ondelete='RESTRICT',
+        name='fk_serve_ra_worker_cohort_refs_cohort'),
+    sqlalchemy.CheckConstraint(
+        f"service_hash ~ '{_UUID_PATTERN}' AND "
+        'octet_length(cohort_id) BETWEEN 1 AND 1024 AND '
+        'octet_length(controller_owner_fence) BETWEEN 1 AND 1024',
+        name='ck_serve_ra_worker_cohort_refs_identity'),
+    sqlalchemy.CheckConstraint(
+        'desired_generation > 0 AND lifecycle_epoch > 0 AND revision > 0',
+        name='ck_serve_ra_worker_cohort_refs_counters'),
+    sqlalchemy.CheckConstraint("action_type IN ('launch', 'down')",
+                               name='ck_serve_ra_worker_cohort_refs_action'),
+    sqlalchemy.CheckConstraint(
+        f'reference_state IN ({_sql_values(_COHORT_REFERENCE_STATES)})',
+        name='ck_serve_ra_worker_cohort_refs_state'),
+    sqlalchemy.CheckConstraint(
+        "(reference_state = 'PREPARING' AND bound_at IS NULL AND "
+        'released_at IS NULL) OR '
+        "(reference_state IN ('SHADOW_ACTIVE', 'ACTION_ACTIVE') AND "
+        'bound_at IS NOT NULL AND released_at IS NULL) OR '
+        "(reference_state = 'RELEASED' AND released_at IS NOT NULL)",
+        name='ck_serve_ra_worker_cohort_refs_state_shape'),
+    sqlalchemy.CheckConstraint(
+        '(bound_at IS NULL OR bound_at >= created_at) AND '
+        '(released_at IS NULL OR '
+        'released_at >= COALESCE(bound_at, created_at))',
+        name='ck_serve_ra_worker_cohort_refs_timestamps'),
+)
+sqlalchemy.Index(
+    'ix_serve_ra_worker_cohort_refs_active',
+    worker_cohort_refs_table.c.cohort_id,
+    worker_cohort_refs_table.c.decision_id,
+    postgresql_where=sqlalchemy.text("reference_state <> 'RELEASED'"))
+
+shadow_coverage_table = sqlalchemy.Table(
+    'serve_resource_action_shadow_coverage',
+    head_metadata,
+    sqlalchemy.Column('decision_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('service_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('service_incarnation',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('replica_id', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('replica_incarnation',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('desired_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('action_type', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('normalizer_contract_version',
+                      sqlalchemy.SmallInteger,
+                      nullable=False),
+    sqlalchemy.Column('normalization_outcome', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('not_representable_reason', sqlalchemy.Text),
+    sqlalchemy.Column('worker_cohort_ref_id', postgresql.UUID(as_uuid=True)),
+    sqlalchemy.Column('admitted_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.PrimaryKeyConstraint('decision_id',
+                                    name='pk_serve_ra_shadow_coverage'),
+    sqlalchemy.ForeignKeyConstraint(
+        ['worker_cohort_ref_id'],
+        ['serve_resource_action_worker_cohort_refs.decision_id'],
+        ondelete='RESTRICT',
+        name='fk_serve_ra_shadow_coverage_cohort_ref'),
+    sqlalchemy.UniqueConstraint('service_hash',
+                                'service_incarnation',
+                                'replica_id',
+                                'replica_incarnation',
+                                'desired_generation',
+                                'action_type',
+                                name='uq_serve_ra_shadow_coverage_identity'),
+    sqlalchemy.CheckConstraint(
+        'octet_length(service_name) BETWEEN 1 AND 256 AND '
+        'octet_length(service_hash) = 36',
+        name='ck_serve_ra_shadow_coverage_identity_bounds'),
+    sqlalchemy.CheckConstraint(
+        f"service_hash ~ '{_UUID_PATTERN}' AND "
+        'service_hash = CAST(service_incarnation AS TEXT)',
+        name='ck_serve_ra_shadow_coverage_incarnation'),
+    sqlalchemy.CheckConstraint(
+        'replica_id >= 0 AND desired_generation > 0 AND '
+        'normalizer_contract_version = 1',
+        name='ck_serve_ra_shadow_coverage_counters'),
+    sqlalchemy.CheckConstraint("action_type IN ('launch', 'down')",
+                               name='ck_serve_ra_shadow_coverage_action'),
+    sqlalchemy.CheckConstraint(
+        f'normalization_outcome IN '
+        f'({_sql_values(_NORMALIZATION_OUTCOMES)})',
+        name='ck_serve_ra_shadow_coverage_outcome'),
+    sqlalchemy.CheckConstraint(
+        "(normalization_outcome = 'REPRESENTABLE' AND "
+        'not_representable_reason IS NULL) OR '
+        "(normalization_outcome = 'NOT_REPRESENTABLE' AND "
+        'not_representable_reason IS NOT NULL AND '
+        "((action_type = 'launch' AND not_representable_reason IN "
+        f'({_sql_values(_LAUNCH_NOT_REPRESENTABLE_REASONS)})) OR '
+        "(action_type = 'down' AND not_representable_reason IN "
+        f'({_sql_values(_DOWN_NOT_REPRESENTABLE_REASONS)}))))',
+        name='ck_serve_ra_shadow_coverage_reason'),
+    sqlalchemy.CheckConstraint(
+        'worker_cohort_ref_id IS NULL OR worker_cohort_ref_id = decision_id',
+        name='ck_serve_ra_shadow_coverage_cohort_ref'),
+)
+sqlalchemy.Index('ix_serve_ra_shadow_coverage_promotion',
+                 shadow_coverage_table.c.service_name,
+                 shadow_coverage_table.c.service_hash,
+                 shadow_coverage_table.c.admitted_at,
+                 shadow_coverage_table.c.decision_id)
+sqlalchemy.Index('ix_serve_ra_shadow_coverage_blockers',
+                 shadow_coverage_table.c.service_name,
+                 shadow_coverage_table.c.service_hash,
+                 shadow_coverage_table.c.admitted_at,
+                 shadow_coverage_table.c.decision_id,
+                 postgresql_where=sqlalchemy.text(
+                     "normalization_outcome = 'NOT_REPRESENTABLE'"))
+sqlalchemy.Index(
+    'ix_serve_ra_shadow_coverage_unlinked',
+    shadow_coverage_table.c.admitted_at,
+    shadow_coverage_table.c.decision_id,
+    postgresql_where=sqlalchemy.text('worker_cohort_ref_id IS NULL'))
+
+shadow_coverage_attempts_table = sqlalchemy.Table(
+    'serve_resource_action_shadow_coverage_attempts',
+    head_metadata,
+    sqlalchemy.Column('decision_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('request_sequence', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('logical_attempt', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('request_role', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('phase', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('legacy_request_id', sqlalchemy.Text),
+    sqlalchemy.Column('terminal_request_status', sqlalchemy.Text),
+    sqlalchemy.Column('retry_disposition', sqlalchemy.Text),
+    sqlalchemy.Column('admitted_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.Column('request_bound_at', sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.Column('completed_at', sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.Column('updated_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.PrimaryKeyConstraint(
+        'decision_id',
+        'request_sequence',
+        name='pk_serve_ra_shadow_coverage_attempts'),
+    sqlalchemy.ForeignKeyConstraint(
+        ['decision_id'], ['serve_resource_action_shadow_coverage.decision_id'],
+        ondelete='CASCADE',
+        name='fk_serve_ra_shadow_coverage_attempts_coverage'),
+    sqlalchemy.CheckConstraint('request_sequence > 0 AND logical_attempt > 0',
+                               name='ck_serve_ra_shadow_cov_attempts_counters'),
+    sqlalchemy.CheckConstraint(
+        "request_role IN ('PRIMARY_LAUNCH', 'PRIMARY_DOWN', "
+        "'LAUNCH_CLEANUP_DOWN')",
+        name='ck_serve_ra_shadow_cov_attempts_role'),
+    sqlalchemy.CheckConstraint(f'phase IN ({_sql_values(_CHILD_PHASES)})',
+                               name='ck_serve_ra_shadow_cov_attempts_phase'),
+    sqlalchemy.CheckConstraint(
+        '(legacy_request_id IS NULL OR '
+        'octet_length(legacy_request_id) BETWEEN 1 AND 128)',
+        name='ck_serve_ra_shadow_cov_attempts_request_id'),
+    sqlalchemy.CheckConstraint(
+        'terminal_request_status IS NULL OR '
+        f'terminal_request_status IN '
+        f'({_sql_values(_TERMINAL_REQUEST_STATUSES)})',
+        name='ck_serve_ra_shadow_cov_attempts_terminal_status'),
+    sqlalchemy.CheckConstraint(
+        'retry_disposition IS NULL OR '
+        f'retry_disposition IN ({_sql_values(_RETRY_DISPOSITIONS)})',
+        name='ck_serve_ra_shadow_cov_attempts_retry'),
+    sqlalchemy.CheckConstraint(
+        "(phase = 'PRE_SUBMIT' AND legacy_request_id IS NULL AND "
+        'request_bound_at IS NULL AND completed_at IS NULL AND '
+        'terminal_request_status IS NULL AND retry_disposition IS NULL) OR '
+        "(phase = 'REQUEST_BOUND' AND legacy_request_id IS NOT NULL AND "
+        'request_bound_at IS NOT NULL AND completed_at IS NULL AND '
+        'terminal_request_status IS NULL AND retry_disposition IS NULL) OR '
+        "(phase = 'COMPLETE' AND legacy_request_id IS NOT NULL AND "
+        'request_bound_at IS NOT NULL AND completed_at IS NOT NULL AND '
+        'terminal_request_status IS NOT NULL AND '
+        'retry_disposition IS NOT NULL) OR '
+        "(phase IN ('ABANDONED_PRE_SUBMIT', "
+        "'REQUEST_ASSOCIATION_UNKNOWN') AND legacy_request_id IS NULL AND "
+        'request_bound_at IS NULL AND completed_at IS NOT NULL AND '
+        'terminal_request_status IS NULL AND retry_disposition IS NULL)',
+        name='ck_serve_ra_shadow_cov_attempts_phase_shape'),
+    sqlalchemy.CheckConstraint(
+        'updated_at >= admitted_at AND '
+        '(request_bound_at IS NULL OR request_bound_at >= admitted_at) AND '
+        '(completed_at IS NULL OR completed_at >= admitted_at)',
+        name='ck_serve_ra_shadow_cov_attempts_timestamps'),
+)
+sqlalchemy.Index(
+    'uq_serve_ra_shadow_cov_attempts_request',
+    shadow_coverage_attempts_table.c.legacy_request_id,
+    unique=True,
+    postgresql_where=sqlalchemy.text('legacy_request_id IS NOT NULL'))
+sqlalchemy.Index('ix_serve_ra_shadow_cov_attempts_stale',
+                 shadow_coverage_attempts_table.c.phase,
+                 shadow_coverage_attempts_table.c.admitted_at,
+                 shadow_coverage_attempts_table.c.decision_id,
+                 shadow_coverage_attempts_table.c.request_sequence,
+                 postgresql_where=sqlalchemy.text(
+                     "phase IN ('PRE_SUBMIT', 'REQUEST_BOUND')"))
+
+# A represented parent is retained until its same-ID decision coverage row can
+# be deleted by the typed retention transaction.
+shadow_samples_head_table.append_constraint(
+    sqlalchemy.ForeignKeyConstraint(
+        ['would_be_action_id'],
+        ['serve_resource_action_shadow_coverage.decision_id'],
+        ondelete='RESTRICT',
+        name='fk_serve_ra_shadow_samples_coverage'))
+
+# Uppercase aliases match the central request-store schema catalog style and
+# expose the current head.  Lowercase objects and ``metadata`` remain the exact
+# revision-032 catalog consumed by migration 032.
+REVISION_032_METADATA = metadata
+SHADOW_SAMPLES_032 = shadow_samples_table
+SHADOW_ATTEMPTS_032 = shadow_attempts_table
+SHADOW_SAMPLES = shadow_samples_head_table
+SHADOW_ATTEMPTS = shadow_attempts_head_table
+WORKER_COHORTS = worker_cohorts_table
+WORKER_COHORT_REFS = worker_cohort_refs_table
+SHADOW_COVERAGE = shadow_coverage_table
+SHADOW_COVERAGE_ATTEMPTS = shadow_coverage_attempts_table
+RESOURCE_ACTION_STATE_METADATA = head_metadata
 
 
 def service_columns() -> tuple[sqlalchemy.Column, ...]:
@@ -380,6 +805,18 @@ def replica_columns() -> tuple[sqlalchemy.Column, ...]:
                           sqlalchemy.Uuid(as_uuid=True),
                           nullable=True),
         sqlalchemy.Column('down_shadow_sample_id',
+                          sqlalchemy.Uuid(as_uuid=True),
+                          nullable=True),
+    )
+
+
+def replica_coverage_columns() -> tuple[sqlalchemy.Column, ...]:
+    """Return fresh inert revision-033 coverage-link columns."""
+    return (
+        sqlalchemy.Column('launch_shadow_coverage_id',
+                          sqlalchemy.Uuid(as_uuid=True),
+                          nullable=True),
+        sqlalchemy.Column('down_shadow_coverage_id',
                           sqlalchemy.Uuid(as_uuid=True),
                           nullable=True),
     )

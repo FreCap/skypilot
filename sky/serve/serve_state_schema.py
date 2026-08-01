@@ -153,6 +153,9 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column('sky_cluster_record_uuid', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('launch_action_id', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('down_action_id', sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('launch_shadow_coverage_id',
+                      sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('down_shadow_coverage_id', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('launch_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('down_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
 )

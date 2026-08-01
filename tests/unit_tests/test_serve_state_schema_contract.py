@@ -73,6 +73,8 @@ def test_resource_action_existing_table_columns_are_dialect_portable():
         'sky_cluster_record_uuid',
         'launch_action_id',
         'down_action_id',
+        'launch_shadow_coverage_id',
+        'down_shadow_coverage_id',
         'launch_shadow_sample_id',
         'down_shadow_sample_id',
     }

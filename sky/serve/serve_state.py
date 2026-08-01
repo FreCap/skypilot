@@ -31,9 +31,14 @@ if typing.TYPE_CHECKING:
     from sqlalchemy.engine import row
 
     from sky.serve import replica_managers
+    from sky.serve import resource_action_state
     from sky.serve import service_spec
 
 replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
+# Importing the typed store eagerly forms a cycle through request payloads while
+# ``sky`` is initializing. Keep the action-only path lazy like ReplicaInfo.
+resource_action_state = adaptors_common.LazyImport(
+    'sky.serve.resource_action_state')
 logger = sky_logging.init_logger(__name__)
 
 _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
@@ -1818,6 +1823,8 @@ _ACTION_OWNED_REPLICA_COLUMNS = frozenset({
     'sky_cluster_record_uuid',
     'launch_action_id',
     'down_action_id',
+    'launch_shadow_coverage_id',
+    'down_shadow_coverage_id',
     'launch_shadow_sample_id',
     'down_shadow_sample_id',
 })
@@ -2829,6 +2836,31 @@ def add_or_update_replica(
         session.execute(insert_stmt)
         session.commit()
     return True
+
+
+def add_or_update_replica_with_launch_shadow(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    new_sample: 'resource_action_state.NewShadowSample',
+    *,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+) -> 'resource_action_state.ShadowSampleRecord':
+    """Atomically admit one initial replica intent and its launch shadow.
+
+    This PostgreSQL-only primitive is deliberately separate from generic
+    replica persistence: only it may initialize action-owned identity/link
+    columns, while later status upserts continue to preserve those columns.
+    """
+    engine = _db_manager.get_engine()
+    store = resource_action_state.PostgresServeResourceActionStateStore(engine)
+    replica_values = _replica_row_values(service_name, replica_id, replica_info)
+    with orm.Session(engine) as session, session.begin():
+        return store.admit_launch_replica_in_session(session, new_sample,
+                                                     replica_values,
+                                                     expected_controller_owner,
+                                                     expected_lifecycle_epoch)
 
 
 def add_or_update_replicas(
