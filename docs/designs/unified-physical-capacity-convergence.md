@@ -1480,34 +1480,42 @@ implementation authority.
 
 ### C2 cleanup implementation verification
 
-The cleanup implementation is based on `improvements` commit `24d2eb250` and
-the independently approved retirement-design commit `fa0e3681d`. It deletes
-all seven C2-only production modules and all five C2-only test modules in the
-ledger. The six shared implementation files are byte-for-byte equal to their
-pre-C2 blobs from the first parent of merge `73d80feb9`; no later commit had
-changed those paths. A repository search finds no remaining code, test, or
-chart reference to the deleted modules, projector/repository hooks,
-source/pilot constants, C2 canonical domains/enums, or isolated evidence-pool
-helpers.
+Initial implementation and verification used `improvements` base `24d2eb250`,
+retirement-design commit `fa0e3681d`, and implementation commit `19498f6ad`.
+The two-commit stack was then rebased over path-disjoint PR #1104. The exact
+current anchors are `improvements` base `fa6a2f820`, retirement-design commit
+`d6821f76c`, and implementation commit `521d1253d`. PR #1104 changed only the
+cluster-launch cancellation design, backend utilities, context utilities, and
+their tests; it did not touch a capacity cleanup path.
+
+The implementation deletes all seven C2-only production modules and all five
+C2-only test modules in the ledger. The six shared implementation files are
+byte-for-byte equal to their pre-C2 blobs from the first parent of merge
+`73d80feb9`; no later commit had changed those paths. A repository search finds
+no remaining code, test, or chart reference to the deleted modules,
+projector/repository hooks, source/pilot constants, C2 canonical domains/enums,
+or isolated evidence-pool helpers.
 
 The revision-`001` migration, all five SQLAlchemy tables, state access,
 migration initialization hook, Alembic section, migration constants, C1
 mode/allowlist configuration, and retained C1 tests remain present. No schema
 revision, row deletion, or data rewrite is included.
 
-Local verification completed:
+Local verification completed and the code-sensitive checks were repeated after
+the rebase:
 
 - compile/import checks loaded the retained capacity package and controller
   runtime and found exactly five capacity tables;
-- 94 retained capacity model/state, controller-runtime, and migration tests
-  passed;
-- 14 PostgreSQL schema tests were collected and skipped because no local test
-  PostgreSQL DSN was configured;
+- 85 retained capacity model/state, controller-runtime, and migration tests
+  passed; nine PostgreSQL state tests skipped because this host has no Docker
+  socket;
+- 14 additional PostgreSQL schema tests were collected and skipped because no
+  local test PostgreSQL DSN was configured;
+- the complete `tests/unit_tests/test_sky/server` directory passed;
 - the container migration test could not start because this host has no Docker
   socket, so that exact test remains a CI gate; and
 - YAPF, isort, mypy over 807 source files, pylint at 10.00/10, and dashboard
-  lint/Prettier completed successfully. The formatting wrapper returned its
-  expected nonzero status only because the cleanup changes were not yet staged.
+  lint/Prettier completed successfully on the exact changed files.
 
 This is implementation evidence only. It does not claim that the cleanup image
 has been merged or deployed; the retirement rollout checks above remain open.
