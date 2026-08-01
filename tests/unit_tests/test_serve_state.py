@@ -12,6 +12,7 @@ import json
 import pickle
 import sqlite3
 import types
+import uuid
 
 import pytest
 import sqlalchemy
@@ -391,6 +392,111 @@ def test_replica_state_uses_jsonb_on_postgres():
     state_type = serve_state.replicas_table.c.replica_state.type
     assert isinstance(state_type.dialect_impl(postgresql.dialect()),
                       postgresql.JSONB)
+
+
+def test_resource_action_common_columns_default_to_inert(_mock_serve_db):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+
+    with orm.Session(_mock_serve_db) as session:
+        service = session.execute(
+            sqlalchemy.select(serve_state.services_table).where(
+                serve_state.services_table.c.name == 'svc')).mappings().one()
+        replica = session.execute(
+            sqlalchemy.select(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1)).mappings().one()
+
+    assert service['resource_action_mode'] == 'legacy'
+    assert service['resource_action_mode_changed_at'] is None
+    assert all(replica[name] is None
+               for name in serve_state._ACTION_OWNED_REPLICA_COLUMNS)
+
+
+def test_all_generic_replica_upserts_preserve_action_owned_columns(
+        _mock_serve_db):
+    service_hash = 'incarnation-a'
+    _add_minimal_service('svc', service_hash=service_hash)
+    expected_by_replica = {}
+
+    for replica_id in range(1, 5):
+        assert serve_state.add_or_update_replica('svc', replica_id,
+                                                 _replica(replica_id))
+        action_values = {
+            'replica_incarnation': uuid.UUID(int=replica_id * 100 + 1),
+            'desired_generation': replica_id,
+            'sky_cluster_record_uuid': uuid.UUID(int=replica_id * 100 + 2),
+            'launch_action_id':
+                (uuid.UUID(int=replica_id * 100 + 3) if replica_id % 2 else None
+                ),
+            'down_action_id':
+                (uuid.UUID(int=replica_id * 100 + 4) if replica_id % 2 else None
+                ),
+            'launch_shadow_sample_id':
+                (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 5)
+                ),
+            'down_shadow_sample_id':
+                (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 6)
+                ),
+        }
+        expected_by_replica[replica_id] = action_values
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id ==
+                    replica_id).values(**action_values))
+            session.commit()
+
+    # Ordinary and batch persistence use different statement builders.
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1, version=2))
+    assert serve_state.add_or_update_replicas('svc',
+                                              [(2, _replica(2, version=2))])
+
+    # Paid-capacity admission persists the replica and claim atomically.
+    assert serve_state.try_add_replica_with_paid_capacity_claim(
+        'svc',
+        service_hash,
+        3,
+        _replica(3, version=2),
+        pool_key='test-paid-pool',
+        priority=1,
+        base_limit=1,
+        max_limit=2,
+        now=100.0,
+        success_ttl_seconds=60.0,
+        waiter_ttl_seconds=60.0,
+        expected_controller_owner=None) == 'acquired'
+
+    # Reserved-fill admission has separate PostgreSQL and SQLite upsert
+    # statements. This fixture exercises the SQLite INSERT ... SELECT path.
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(serve_state.reserved_fill_claims_table.insert().values(
+            service_name='svc',
+            pool_key='test-fill-pool',
+            weight=1,
+            floor_replicas=1,
+            gpus_per_replica=1,
+            holdings_fill=1,
+            heartbeat_ts=100.0))
+        session.commit()
+    assert serve_state.add_replica_if_round_epoch('svc',
+                                                  4,
+                                                  _replica(4, version=2),
+                                                  pool_key='test-fill-pool',
+                                                  expected_epoch=1)
+
+    with orm.Session(_mock_serve_db) as session:
+        rows = session.execute(
+            sqlalchemy.select(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name ==
+                'svc')).mappings().all()
+    actual_by_replica = {row['replica_id']: row for row in rows}
+    for replica_id, expected in expected_by_replica.items():
+        assert {
+            name: actual_by_replica[replica_id][name]
+            for name in serve_state._ACTION_OWNED_REPLICA_COLUMNS
+        } == expected
 
 
 def test_replica_reads_do_not_use_pickle(_mock_serve_db, monkeypatch):

@@ -1798,6 +1798,29 @@ _SQLITE_MAX_BIND_PARAMS = 999
 _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE = 300
 _REPLICA_DELETE_CHUNK_SIZE = 500
 _REPLICA_STATE_VERSION = 1
+_LEGACY_REPLICA_ROW_COLUMNS = (
+    'service_name',
+    'replica_id',
+    'replica_info',
+    'replica_state_version',
+    'status',
+    'sky_down_status',
+    'version',
+    'cluster_name',
+    'created_at',
+    'is_spot',
+    'paid_capacity_pool_key',
+    'replica_state',
+)
+_ACTION_OWNED_REPLICA_COLUMNS = frozenset({
+    'replica_incarnation',
+    'desired_generation',
+    'sky_cluster_record_uuid',
+    'launch_action_id',
+    'down_action_id',
+    'launch_shadow_sample_id',
+    'down_shadow_sample_id',
+})
 _PAID_CAPACITY_UNRESOLVED_STATUSES = (
     ReplicaStatus.PENDING.value,
     ReplicaStatus.PROVISIONING.value,
@@ -1810,7 +1833,7 @@ def _replica_row_values(
     """Build the legacy rollback blob and the authoritative query state."""
     replica_state = replica_info.to_storage_dict()
     sky_down_status = replica_info.status_property.sky_down_status
-    return {
+    values = {
         'service_name': service_name,
         'replica_id': replica_id,
         # TODO(fcapponi): After 2026-07-20, delete the pickle column and this
@@ -1829,6 +1852,18 @@ def _replica_row_values(
                                           'paid_capacity_pool_key', None),
         'replica_state': replica_state,
     }
+    assert tuple(values) == _LEGACY_REPLICA_ROW_COLUMNS
+    return values
+
+
+def _replica_conflict_update_values(insert_stmt: Any) -> dict[str, Any]:
+    """Build the generic replica conflict update without action-owned state."""
+    assert _ACTION_OWNED_REPLICA_COLUMNS.isdisjoint(_LEGACY_REPLICA_ROW_COLUMNS)
+    return {
+        column_name: getattr(insert_stmt.excluded, column_name)
+        for column_name in _LEGACY_REPLICA_ROW_COLUMNS
+        if column_name not in ('service_name', 'replica_id')
+    }
 
 
 def _upsert_replica_rows_in_session(
@@ -1838,7 +1873,8 @@ def _upsert_replica_rows_in_session(
     replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
 ) -> None:
     """Upsert replica rows in dialect-safe bounded batches."""
-    chunk_size = (max(1, _SQLITE_MAX_BIND_PARAMS // len(replicas_table.c)) if
+    chunk_size = (max(
+        1, _SQLITE_MAX_BIND_PARAMS // len(_LEGACY_REPLICA_ROW_COLUMNS)) if
                   engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value
                   else _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE)
     insert_func = _upsert_insert_func(engine)
@@ -1851,11 +1887,7 @@ def _upsert_replica_rows_in_session(
         session.execute(
             insert_stmt.on_conflict_do_update(
                 index_elements=['service_name', 'replica_id'],
-                set_={
-                    column.name: getattr(insert_stmt.excluded, column.name)
-                    for column in replicas_table.c
-                    if column.name not in ('service_name', 'replica_id')
-                }))
+                set_=_replica_conflict_update_values(insert_stmt)))
 
 
 def _replica_from_state(
@@ -2505,11 +2537,7 @@ def try_add_replica_with_paid_capacity_claim(
         session.execute(
             replica_insert.on_conflict_do_update(
                 index_elements=['service_name', 'replica_id'],
-                set_={
-                    column.name: getattr(replica_insert.excluded, column.name)
-                    for column in replicas_table.c
-                    if column.name not in ('service_name', 'replica_id')
-                }))
+                set_=_replica_conflict_update_values(replica_insert)))
         claim_insert = _upsert_insert_func(engine)(
             paid_capacity_claims_table).values(service_name=service_name,
                                                service_hash=service_hash,
@@ -2796,11 +2824,7 @@ def add_or_update_replica(
 
         insert_stmt = insert_stmt.on_conflict_do_update(
             index_elements=['service_name', 'replica_id'],
-            set_={
-                column.name: getattr(insert_stmt.excluded, column.name)
-                for column in replicas_table.c
-                if column.name not in ('service_name', 'replica_id')
-            })
+            set_=_replica_conflict_update_values(insert_stmt))
 
         session.execute(insert_stmt)
         session.commit()
@@ -4419,11 +4443,7 @@ def add_replica_if_round_epoch(
                 **row_values)
             insert_stmt = insert_stmt.on_conflict_do_update(
                 index_elements=['service_name', 'replica_id'],
-                set_={
-                    column.name: getattr(insert_stmt.excluded, column.name)
-                    for column in replicas_table.c
-                    if column.name not in ('service_name', 'replica_id')
-                })
+                set_=_replica_conflict_update_values(insert_stmt))
             session.execute(insert_stmt)
             session.commit()
         return True
@@ -4462,11 +4482,7 @@ def add_replica_if_round_epoch(
         [column.name for column in columns], select_stmt)
     insert_stmt = insert_stmt.on_conflict_do_update(
         index_elements=['service_name', 'replica_id'],
-        set_={
-            column.name: getattr(insert_stmt.excluded, column.name)
-            for column in replicas_table.c
-            if column.name not in ('service_name', 'replica_id')
-        })
+        set_=_replica_conflict_update_values(insert_stmt))
     for attempt in range(_SQLITE_FENCE_BUSY_RETRIES):
         try:
             with orm.Session(engine) as session:

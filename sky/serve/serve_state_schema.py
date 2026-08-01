@@ -53,6 +53,16 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_pid', sqlalchemy.Integer,
                       server_default=None),
     sqlalchemy.Column('hash', sqlalchemy.Text, server_default=None),
+    # Serve resource actions are activated explicitly and monotonically.  The
+    # legacy default keeps both existing rows and local SQLite Serve databases
+    # inert until the PostgreSQL-only action helpers promote a service.
+    sqlalchemy.Column('resource_action_mode',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='legacy'),
+    sqlalchemy.Column('resource_action_mode_changed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      server_default=None),
     # Monotonic name-fence token claimed by the lifecycle operation that most
     # recently owns this row.  Unlike ``hash`` (which changes only when the
     # service is recreated), this advances on every up/update/down/purge lock
@@ -134,6 +144,17 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column(
         'replica_state',
         sqlalchemy.JSON().with_variant(postgresql.JSONB(), 'postgresql')),
+    # These columns are initialized and mutated only by typed resource-action
+    # transitions.  Generic ReplicaInfo persistence deliberately omits them.
+    # sqlalchemy.Uuid is native UUID on PostgreSQL and a portable CHAR-backed
+    # UUID on SQLite, keeping the common metadata graph dialect-safe.
+    sqlalchemy.Column('replica_incarnation', sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('desired_generation', sqlalchemy.BigInteger),
+    sqlalchemy.Column('sky_cluster_record_uuid', sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('launch_action_id', sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('down_action_id', sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('launch_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('down_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
 )
 sqlalchemy.Index('replicas_service_status_idx', replicas_table.c.service_name,
                  replicas_table.c.status)
