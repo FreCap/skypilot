@@ -541,6 +541,50 @@ describe('managed jobs page initialization', () => {
       jest.useRealTimers();
     }
   });
+
+  it('resumes pool polling after a backward wall-clock adjustment', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-01-01T01:00:00Z'));
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('hidden');
+    dashboardCache.get.mockResolvedValue({ pools: [] });
+
+    const { unmount } = renderHook(() => useManagedJobsPageData());
+
+    try {
+      await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+      dashboardCache.get.mockClear();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      act(() => {
+        jest.advanceTimersByTime(REFRESH_INTERVAL * 2);
+      });
+
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('managed jobs automatic refresh', () => {
