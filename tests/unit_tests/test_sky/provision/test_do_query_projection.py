@@ -41,6 +41,16 @@ class _RecordingRow:
         return self._values[key]
 
 
+def _dict_key_error_message(value: Any) -> str:
+    """Return this interpreter's ordinary unhashable-dict-key message."""
+    mapping: dict[Any, None] = {}
+    try:
+        mapping[value] = None
+    except TypeError as error:
+        return str(error)
+    raise AssertionError(f'{value!r} is unexpectedly hashable.')
+
+
 def test_project_query_instances_empty_result():
     instances = _RecordingInstances({})
 
@@ -157,8 +167,8 @@ def test_project_query_instances_reads_values_once_and_fields_in_legacy_order():
         ({
             'name': [],
             'status': 'active'
-        }, TypeError, "unhashable type: 'list'", [('row', 'status'),
-                                                  ('row', 'name')]),
+        }, TypeError, _dict_key_error_message([]), [('row', 'status'),
+                                                    ('row', 'name')]),
     ],
     ids=('unknown-state', 'missing-status', 'missing-name', 'unhashable-name'),
 )
