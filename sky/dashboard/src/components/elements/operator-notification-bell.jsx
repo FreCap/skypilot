@@ -7,6 +7,7 @@ import {
   acknowledgeOperatorNotifications,
   getOperatorNotifications,
 } from '@/data/connectors/operator-notifications';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 export const OPERATOR_NOTIFICATION_POLL_MS = 60 * 1000;
 
@@ -108,6 +109,12 @@ export function OperatorNotificationBell({ role, compact = false }) {
     return refreshPromise;
   }, []);
 
+  useVisibleRefreshInterval(
+    role === 'admin',
+    OPERATOR_NOTIFICATION_POLL_MS,
+    () => void refresh(lifecycleVersionRef.current)
+  );
+
   useEffect(() => {
     const lifecycleVersion = lifecycleVersionRef.current + 1;
     lifecycleVersionRef.current = lifecycleVersion;
@@ -125,14 +132,7 @@ export function OperatorNotificationBell({ role, compact = false }) {
       return revokeLifecycle;
     }
     void refresh(lifecycleVersion);
-    const interval = window.setInterval(
-      () => void refresh(lifecycleVersion),
-      OPERATOR_NOTIFICATION_POLL_MS
-    );
-    return () => {
-      revokeLifecycle();
-      window.clearInterval(interval);
-    };
+    return revokeLifecycle;
   }, [refresh, role]);
 
   useEffect(() => {
