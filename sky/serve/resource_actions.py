@@ -8,6 +8,8 @@ logical action IDs reuse the generic resource-action kernel contract.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Mapping
 import dataclasses
 import datetime
@@ -24,6 +26,8 @@ from sky.utils import common_utils
 _MAX_OBJECT_BYTES = 65_536
 _MAX_TEXT_BYTES = 1_024
 _MAX_SHORT_TEXT_BYTES = 253
+_MAX_CA_CERT_DER_BASE64_BYTES = 16_384
+_MAX_CA_CERT_DER_BYTES = 12_288
 _MAX_SERVICE_NAME_BYTES = 256
 _MAX_REQUEST_ID_BYTES = 128
 _MAX_LIST_ITEMS = 256
@@ -538,6 +542,316 @@ class _CanonicalContract:
     @property
     def sha256(self) -> str:
         return canonical_sha256(self.canonical_value())
+
+
+def _canonical_der_base64(value: Any, *, name: str) -> str:
+    """Validate one canonical RFC 4648 encoding of nonempty DER bytes."""
+
+    encoded = _text(value,
+                    name=name,
+                    maximum_bytes=_MAX_CA_CERT_DER_BASE64_BYTES)
+    if not encoded.isascii() or len(encoded) < 4:
+        raise ValueError(f'{name} must be 4..'
+                         f'{_MAX_CA_CERT_DER_BASE64_BYTES} ASCII bytes.')
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f'{name} must be canonical RFC 4648 base64.') from e
+    if (not decoded or len(decoded) > _MAX_CA_CERT_DER_BYTES or
+            base64.b64encode(decoded).decode('ascii') != encoded):
+        raise ValueError(f'{name} must be canonical RFC 4648 base64 of '
+                         '1..12288 DER bytes.')
+    return encoded
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProviderKubernetesServerOriginV1(_CanonicalContract):
+    """Closed normalized server-origin component of a frozen transport."""
+
+    scheme: str
+    host: str
+    port: int
+    path: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'scheme', 'host', 'port', 'path'})
+
+    def __post_init__(self) -> None:
+        if self.scheme != 'https':
+            raise ValueError('kubernetes server origin scheme must be https.')
+        object.__setattr__(
+            self, 'host',
+            _text(self.host, name='kubernetes.transport.server_origin.host'))
+        object.__setattr__(
+            self, 'port',
+            _positive_integer(self.port,
+                              name='kubernetes.transport.server_origin.port'))
+        object.__setattr__(
+            self, 'path',
+            _text(self.path, name='kubernetes.transport.server_origin.path'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> '_ProviderKubernetesServerOriginV1':
+        raw = _closed_object(value,
+                             name='kubernetes server origin',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'scheme': 'https',
+            'host': self.host,
+            'port': self.port,
+            'path': self.path,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesTransportIdentityV1(_CanonicalContract):
+    """Bounded nonsecret transport identity for one Kubernetes API server."""
+
+    version: int
+    server_origin: _ProviderKubernetesServerOriginV1
+    tls_server_name: str | None
+    ca_cert_der_base64: tuple[str, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'server_origin', 'tls_server_name', 'ca_cert_der_base64'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='kubernetes transport version')
+        if not isinstance(self.server_origin,
+                          _ProviderKubernetesServerOriginV1):
+            raise TypeError('kubernetes transport server origin has an '
+                            'invalid type.')
+        object.__setattr__(
+            self, 'tls_server_name',
+            _optional_text(self.tls_server_name,
+                           name='kubernetes.transport.tls_server_name'))
+        if (not isinstance(self.ca_cert_der_base64, tuple) or
+                not 1 <= len(self.ca_cert_der_base64) <= _MAX_LIST_ITEMS):
+            raise ValueError('kubernetes transport CA certificates must be a '
+                             'tuple of 1..256 values.')
+        certificates = tuple(
+            _canonical_der_base64(
+                certificate,
+                name=f'kubernetes.transport.ca_cert_der_base64[{index}]')
+            for index, certificate in enumerate(self.ca_cert_der_base64))
+        if certificates != tuple(sorted(set(certificates))):
+            raise ValueError('kubernetes transport CA certificates must be '
+                             'sorted and duplicate-free.')
+        object.__setattr__(self, 'ca_cert_der_base64', certificates)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesTransportIdentityV1':
+        raw = _closed_object(value,
+                             name='kubernetes transport identity',
+                             keys=cls._KEYS)
+        certificates = raw['ca_cert_der_base64']
+        if not isinstance(certificates, list):
+            raise TypeError('kubernetes transport CA certificates must be a '
+                            'list.')
+        return cls(version=raw['version'],
+                   server_origin=_ProviderKubernetesServerOriginV1.from_value(
+                       raw['server_origin']),
+                   tls_server_name=raw['tls_server_name'],
+                   ca_cert_der_base64=tuple(certificates))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'server_origin': self.server_origin.canonical_value(),
+            'tls_server_name': self.tls_server_name,
+            'ca_cert_der_base64': list(self.ca_cert_der_base64),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesScopeV1(_CanonicalContract):
+    """Frozen bounded identity derived with one live Kubernetes client."""
+
+    version: int
+    context_name: str
+    context_identity: tuple[str, ...]
+    in_cluster: bool
+    namespace: str
+    transport: ProviderKubernetesTransportIdentityV1
+    kube_system_namespace_uid: str
+    target_namespace_uid: str
+    api_server_git_version: str
+    caller_service_account_namespace: str
+    caller_service_account_name: str
+    caller_service_account_uid: str
+    workload_service_account_namespace: str
+    workload_service_account_name: str
+    workload_service_account_uid: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'context_name', 'context_identity', 'in_cluster',
+        'namespace', 'transport', 'kube_system_namespace_uid',
+        'target_namespace_uid', 'api_server_git_version',
+        'caller_service_account_namespace', 'caller_service_account_name',
+        'caller_service_account_uid', 'workload_service_account_namespace',
+        'workload_service_account_name', 'workload_service_account_uid'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='kubernetes scope version')
+        for field in ('context_name', 'kube_system_namespace_uid',
+                      'target_namespace_uid', 'api_server_git_version',
+                      'caller_service_account_name',
+                      'caller_service_account_uid',
+                      'workload_service_account_name',
+                      'workload_service_account_uid'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field), name=f'kubernetes.scope.{field}'))
+        for field in ('namespace', 'caller_service_account_namespace',
+                      'workload_service_account_namespace'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field),
+                      name=f'kubernetes.scope.{field}',
+                      maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        if (not isinstance(self.context_identity, tuple) or
+                not 1 <= len(self.context_identity) <= _MAX_LIST_ITEMS):
+            raise ValueError('kubernetes scope context_identity must be a '
+                             'tuple of 1..256 values.')
+        identity = tuple(
+            _text(item, name=f'kubernetes.scope.context_identity[{index}]')
+            for index, item in enumerate(self.context_identity))
+        object.__setattr__(self, 'context_identity', identity)
+        _boolean(self.in_cluster, name='kubernetes.scope.in_cluster')
+        if not isinstance(self.transport,
+                          ProviderKubernetesTransportIdentityV1):
+            raise TypeError('kubernetes scope transport has an invalid type.')
+        if ((self.namespace == 'kube-system') != (
+                self.target_namespace_uid == self.kube_system_namespace_uid)):
+            raise ValueError('kubernetes target namespace name and namespace '
+                             'UIDs contradict one another.')
+        if self.workload_service_account_namespace != self.namespace:
+            raise ValueError('kubernetes workload service-account namespace '
+                             'must equal the target namespace.')
+        caller_name = (self.caller_service_account_namespace,
+                       self.caller_service_account_name)
+        workload_name = (self.workload_service_account_namespace,
+                         self.workload_service_account_name)
+        if ((caller_name == workload_name)
+                != (self.caller_service_account_uid ==
+                    self.workload_service_account_uid)):
+            raise ValueError('kubernetes service-account names and UIDs '
+                             'contradict one another.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesScopeV1':
+        raw = _closed_object(value,
+                             name='kubernetes scope identity',
+                             keys=cls._KEYS)
+        context_identity = raw['context_identity']
+        if not isinstance(context_identity, list):
+            raise TypeError('kubernetes scope context_identity must be a list.')
+        return cls(
+            version=raw['version'],
+            context_name=raw['context_name'],
+            context_identity=tuple(context_identity),
+            in_cluster=raw['in_cluster'],
+            namespace=raw['namespace'],
+            transport=ProviderKubernetesTransportIdentityV1.from_value(
+                raw['transport']),
+            kube_system_namespace_uid=raw['kube_system_namespace_uid'],
+            target_namespace_uid=raw['target_namespace_uid'],
+            api_server_git_version=raw['api_server_git_version'],
+            caller_service_account_namespace=raw[
+                'caller_service_account_namespace'],
+            caller_service_account_name=raw['caller_service_account_name'],
+            caller_service_account_uid=raw['caller_service_account_uid'],
+            workload_service_account_namespace=raw[
+                'workload_service_account_namespace'],
+            workload_service_account_name=raw['workload_service_account_name'],
+            workload_service_account_uid=raw['workload_service_account_uid'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'context_name': self.context_name,
+            'context_identity': list(self.context_identity),
+            'in_cluster': self.in_cluster,
+            'namespace': self.namespace,
+            'transport': self.transport.canonical_value(),
+            'kube_system_namespace_uid': self.kube_system_namespace_uid,
+            'target_namespace_uid': self.target_namespace_uid,
+            'api_server_git_version': self.api_server_git_version,
+            'caller_service_account_namespace':
+                self.caller_service_account_namespace,
+            'caller_service_account_name': self.caller_service_account_name,
+            'caller_service_account_uid': self.caller_service_account_uid,
+            'workload_service_account_namespace':
+                self.workload_service_account_namespace,
+            'workload_service_account_name': self.workload_service_account_name,
+            'workload_service_account_uid': self.workload_service_account_uid,
+        }
+
+
+class ProviderKubernetesScopeReadDispositionV1(str, enum.Enum):
+    """Closed outcomes of one Kubernetes scope identity read."""
+
+    COMPLETE = 'complete'
+    NOT_FOUND = 'not_found'
+    FORBIDDEN = 'forbidden'
+    TIMEOUT = 'timeout'
+    TRANSPORT_ERROR = 'transport_error'
+    MALFORMED = 'malformed'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesScopeReadV1(_CanonicalContract):
+    """Typed success or failure evidence from one Kubernetes scope read."""
+
+    disposition: ProviderKubernetesScopeReadDispositionV1
+    scope: ProviderKubernetesScopeV1 | None
+    observed_at: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'disposition', 'scope', 'observed_at'})
+
+    def __post_init__(self) -> None:
+        disposition = _enum_value(ProviderKubernetesScopeReadDispositionV1,
+                                  self.disposition,
+                                  name='kubernetes scope read disposition')
+        object.__setattr__(self, 'disposition', disposition)
+        if self.scope is not None and not isinstance(self.scope,
+                                                     ProviderKubernetesScopeV1):
+            raise TypeError('kubernetes scope read scope has an invalid type.')
+        if ((disposition is ProviderKubernetesScopeReadDispositionV1.COMPLETE)
+                != (self.scope is not None)):
+            raise ValueError('complete Kubernetes scope reads require a scope; '
+                             'failed reads require null.')
+        object.__setattr__(
+            self, 'observed_at',
+            _timestamp(self.observed_at,
+                       name='kubernetes.scope_read.observed_at'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesScopeReadV1':
+        raw = _closed_object(value,
+                             name='kubernetes scope read',
+                             keys=cls._KEYS)
+        return cls(disposition=raw['disposition'],
+                   scope=(None if raw['scope'] is None else
+                          ProviderKubernetesScopeV1.from_value(raw['scope'])),
+                   observed_at=raw['observed_at'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'disposition': self.disposition.value,
+            'scope': None
+                     if self.scope is None else self.scope.canonical_value(),
+            'observed_at': self.observed_at,
+        }
 
 
 @dataclasses.dataclass(frozen=True)

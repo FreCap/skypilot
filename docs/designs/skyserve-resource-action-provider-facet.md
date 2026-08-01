@@ -2,11 +2,12 @@
 
 Status: bounded M0 accepted after independent adversarial review; parent M1
 kernel complete; M2 cluster identity, initial immutable provider contracts, and
-typed shadow-store foundations implemented and locally verified; the
-candidate-only normalization boundary, durable coverage handshake, and closed
-Kubernetes transport/execution-config seam are specified but await
-implementation; runtime provider propagation, observation, and shadow
-instrumentation pending
+typed shadow-store and Serve033 coverage/promotion foundations plus the generic
+API006 progress substrate are implemented and locally verified; the
+candidate-only normalization boundary and atomic durable coverage handshake are
+in progress; the closed Kubernetes transport/scope leaf is implemented and
+independently verified, while execution-config closure, runtime provider
+propagation, observation, and shadow instrumentation remain pending
 
 Last updated: 2026-08-01
 
@@ -411,7 +412,7 @@ ProviderKubernetesTransportIdentityV1 = {
   server_origin: {scheme: "https", host: Text,
                   port: PositiveInteger, path: Text},
   tls_server_name: null | Text,
-  ca_cert_der_base64: [CanonicalRfc4648Base64Text]
+  ca_cert_der_base64: [CanonicalRfc4648Base64Text4To16384]
 }
 
 ProviderRepoArtifactRefV1 = {
@@ -640,18 +641,34 @@ both service-account UIDs are exact live Kubernetes `metadata.uid` values. An
 unreadable/missing identity or an authenticated caller other than
 `system:serviceaccount:<namespace>:<name>` is not representable.
 
+The target namespace and namespace UIDs obey
+`(namespace == "kube-system") ==
+(target_namespace_uid == kube_system_namespace_uid)`. The workload
+service-account namespace equals the target namespace. The caller and workload
+service-account `(namespace, name)` pairs are equal if and only if their UIDs
+are equal. These are internal-consistency checks only; live reads and the
+reviewed normalizer establish that the values describe the selected target.
+
 The transport preimage contains only the normalized HTTPS scheme, host, port,
 path, optional TLS server name, and the exact public CA certificate set encoded
-as DER. CA values are sorted and duplicate-free. Userinfo, query strings,
-proxies, insecure verification, ambient system trust, client certificates,
-private keys, tokens, exec/auth-plugin inputs, credential paths, and raw
-kubeconfig are forbidden. Unparseable or over-budget origins/CA bundles are not
-representable. `cluster_fingerprint_sha256` is exactly the lowercase SHA-256 of
-the complete scope object's canonical UTF-8 bytes, so its bounded nonsecret
-preimage is embedded beside the digest. A logical control plane is defined by
-this transport, context identity, and both namespace UIDs; API-server replicas
-behind that origin are equivalent, and a clone preserving the full tuple is
-intentionally the same logical target for v1.
+as DER. The list contains 1..256 values in sorted, duplicate-free order. Each
+canonical RFC 4648 base64 scalar is 4..16,384 ASCII bytes and decodes to a
+nonempty payload of at most 12,288 bytes; the enclosing transport and scope
+objects retain the 65,536-byte canonical-object limit. The pure DTO validates
+only the closed shape, encoding, internal consistency, and bounds: constructing
+one directly or through `from_value` is not representability or authority
+proof. The reviewed live normalizer parses source CA material as X.509 and
+emits the certificate DER; live admission consumes that typed normalization and
+preflight result, never an arbitrary standalone parsed scope. Userinfo, query
+strings, proxies, insecure verification, ambient system trust, client
+certificates, private keys, tokens, exec/auth-plugin inputs, credential paths,
+and raw kubeconfig are forbidden. Unparseable or over-budget origins/CA bundles
+are not representable. `cluster_fingerprint_sha256` is exactly the lowercase
+SHA-256 of the complete scope object's canonical UTF-8 bytes, so its bounded
+nonsecret preimage is embedded beside the digest. A logical control plane is
+defined by this transport, context identity, and both namespace UIDs;
+API-server replicas behind that origin are equivalent, and a clone preserving
+the full tuple is intentionally the same logical target for v1.
 
 Preparation may use one isolated nonmutating `KubernetesApiClientTarget` and
 then close it. Each execution or observation attempt opens exactly one fresh
@@ -2811,9 +2828,10 @@ ordered tuples such as context identity, topology roles, and mutation order
 preserve their specified semantic order. UUIDs are lowercase hyphenated,
 integers are JSON integers, and floats are forbidden. Each text is 1..1,024
 UTF-8 bytes except `cluster_name`, namespace, label keys/values, and ports,
-which are 1..253 bytes; lists contain at most 256 items; the whole canonical
-object is at most 65,536 bytes. SHA fields are 64 lowercase hexadecimal
-characters.
+which are 1..253 bytes, and each canonical DER-certificate base64 scalar, which
+is 4..16,384 ASCII bytes and decodes to 1..12,288 bytes; lists contain at most
+256 items; the whole canonical object is at most 65,536 bytes. SHA fields are
+64 lowercase hexadecimal characters.
 
 The `source` tuple is a content-addressed reference to an immutable retained
 `version_specs` row; the builder verifies the row's exact UTF-8 YAML bytes
@@ -2906,6 +2924,15 @@ mutation is permitted afterward.
   capsules, and closed discriminated preflight wire contract.
 - Add no provider mutation call sites.
 - Build golden fixtures from current provider results with secrets removed.
+
+P1 leaf verification evidence on 2026-08-01: the pure closed Kubernetes
+transport, scope, and scope-read DTOs pass literal canonical-byte/hash,
+round-trip, closed-shape, scalar/list/object-bound, semantic tuple-order,
+namespace/service-account consistency, and failed-read discriminator tests.
+The 16,384-byte CA scalar ceiling covers the 1,036-byte canonical DER base64
+observed on `boltz-test`; independent adversarial re-review accepted the leaf.
+This does not claim live URL or X.509 normalization, preflight, execution-config
+closure, or representability authority.
 
 ### P2: live shadow observation
 
@@ -3299,12 +3326,17 @@ absence result through a public API.
   action-keyed Skylet, mutation-trace, handle/endpoint, and observation fixtures
   against real Kubernetes plus the in-cluster namespace/principal/
   authorization/admission/network preflight on the selected Boltz canary path.
-- Implementation and contract verification of the exact cluster-row UUID
-  primitive, API006 progress, frozen transport/scope, execution config and
-  access inventory, dual policy-absence proof, preparation/counted-slot gate,
+- Implementation and contract verification of execution config and access
+  inventory, dual policy-absence proof, preparation/counted-slot gate,
   normalized spec/partial UID-qualified adoption/deletion, redacted invocation
   builder, private handler claim filter, and request-handler pre-I/O/
-  operation-ID callbacks without duplicating provider policy.
+  operation-ID callbacks without duplicating provider policy. The exact
+  cluster-row UUID primitive and generic API006 progress journal are complete;
+  the Serve-owned cursor validator/reducer remains open.
+- Before the live Kubernetes normalizer is implemented, freeze exact server-URL
+  decomposition and rejection rules, including host, default-port, path, IPv6,
+  IDNA, and percent-encoding handling. The pure transport DTO intentionally
+  does not invent those source-normalization rules.
 - Implementation and verification of cross-attempt cursor carry, effect-fenced
   worker attestation, quiesced superseded partial-launch cleanup, current
   down-only execution authority, the closed effect-body trace, qualified
