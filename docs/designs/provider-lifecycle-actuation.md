@@ -1,14 +1,16 @@
 # Provider and Lifecycle Actuation Architecture
 
 Status: M1, M2 S1, M2 S2a.1, the S2a.2 deterministic-gzip prerequisite and
-source composer, M3-S0, M3-S1, and M3-S2 are merged. M3-S0 passed exact-head
-CI, exact-parent merge verification, staged revisions 49 through 51, and
-bounded monitoring. The test deployment had no managed volume, so positive
-live per-volume parity remains explicitly unproven and the shadow remains
+source composer, M3-S0, M3-S1, and M3-S2 are merged. The M4 typed resolved
+provider operation foundation and DigitalOcean authoritative query projection
+extraction are also merged and deployed. M3-S0 passed exact-head CI,
+exact-parent merge verification, staged revisions 49 through 51, and bounded
+monitoring. The test deployment had no managed volume, so positive live
+per-volume parity remains explicitly unproven and the shadow remains
 diagnostic-only. M3-S2 has an exact locally verified candidate image, but its
 test-cluster deployment remains pending. The M3 action graph, action runtime,
-authoritative volume writer, and M4 implementation still require their
-dedicated exact-design adversarial reviews and activation gates.
+authoritative volume writer, and remaining M4 implementation still require
+their dedicated exact-design adversarial reviews and activation gates.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -6789,6 +6791,131 @@ region, ownership, incarnation, absence, head selection, create, resume, stop,
 terminate, wait, cleanup, retry, `ProvisionRecord`, planner, or reconciliation
 authority. The next shared-reconciler slice still requires a typed immutable
 node observation with deterministic identity and effect/incarnation fencing.
+
+#### M4 DigitalOcean incarnation locator foundation
+
+Status: proposed implementation boundary, pending exact-design adversarial
+review. This slice is pinned to SkyPilot
+`22d64ffe7a344db282904dfe7061847c89e79b8e` and dstack
+`c9ebdaad6bbaa3105061d79f6ab52af9d609e99d`.
+
+dstack demonstrates the useful command/query separation that M4 will adopt:
+its provider create returns bounded provisioning data promptly and a later
+`update_provisioning_data()` observes readiness. Its current DigitalOcean
+implementation nevertheless creates a randomly named droplet with an empty
+tag list. Its pipeline lock token guards the pre-call database refetch and the
+post-call result update, but it does not identify or fence the external create
+itself. A worker that loses its lease after the request is accepted can still
+leave an unowned droplet. SkyPilot must therefore port the separation of
+responsibilities without copying that ownership gap.
+
+SkyPilot already persists a stable `cluster_hash` before new-provisioner
+provider I/O and rejects completion writes for a stale same-name generation.
+The hash currently stops at `CloudVmRayBackend`; DigitalOcean droplets and
+their paired volumes carry only the cluster-name tag. This slice defines the
+smallest bridge, logically named `DigitalOceanIncarnationLocatorV1`. It owns
+only propagation of the existing cluster-generation identity and creation-time
+resource stamping. It adds no new identity store and no second telemetry
+plane.
+
+`ProvisionConfig` appends
+`cluster_incarnation: str | None = None` after every existing field. Existing
+positional and keyword constructors therefore retain their argument mapping.
+An object restored from an older pickle may not have the new attribute, so the
+DigitalOcean consumer reads it with
+`getattr(config, 'cluster_incarnation', None)`. `None` is the exact legacy
+compatibility mode.
+
+`provisioner.bulk_provision()` adds a keyword-only
+`cluster_incarnation: str | None = None` after its existing parameters and
+copies it into the `ProvisionConfig` constructed for bootstrap. The production
+new-provisioner call occurs only after `add_or_update_cluster()` has returned.
+It asserts `_active_cluster_hash is not None` and passes that exact returned
+value. It never re-reads identity by cluster name, derives identity from the
+rendered YAML, or creates a provider-local replacement. New launch, retry,
+resume, and scale therefore reuse the cluster generation already owned by the
+database. Rendered cluster YAML, configuration hashing, public provider
+facets, and `InstanceLifecycleV1` remain unchanged.
+
+DigitalOcean reserves the tag key
+`skypilot-cluster-incarnation`. When the optional value is absent,
+`utils.create_instance()` preserves the exact current tag ordering and request
+shape. When it is present, the value must have exact type `str`, be nonempty,
+use only the DigitalOcean tag grammar of ASCII letters, digits, colons, dashes,
+and underscores, and keep the complete encoded tag within DigitalOcean's
+255-character limit. The provider documents that grammar at
+<https://docs.digitalocean.com/reference/api/reference/tags/>. Validation
+finishes before SSH-key lookup or any droplet, volume, or attachment request.
+
+User-supplied tags retain their current sorting and legacy override behavior
+for `Name`, `ray-cluster-name`, and `skypilot-cluster-name`. A marked request
+rejects any encoded user tag that case-insensitively occupies the reserved
+`skypilot-cluster-incarnation:` namespace. This includes an exact key and a
+key already containing a suffix after the reserved key. The validated marker
+is appended as the only new final tag. The same immutable-by-convention tag
+list is supplied to both the droplet request and its paired volume request.
+The input `config.tags` mapping is not mutated. DigitalOcean bootstrap
+continues to return the exact `ProvisionConfig` object, so the field survives
+without another copy owner.
+
+The marker is durable attribution evidence, not an external-effect fence.
+`cluster_hash` is stable across multiple creates, retries, resume, and scale
+within one cluster generation, so it is not a unique create-attempt identity.
+The current DigitalOcean create remains three unjournaled effects: droplet,
+volume, and attachment. A response lost after any of them remains ambiguous.
+Current stop, termination, and failure cleanup still discover by the
+cluster-name tag and ignore the marker, so stale cleanup can still affect a
+same-name replacement. A new same-name cluster generation receives a distinct
+marker, but that fact grants no cleanup isolation or mutation authority.
+
+Existing unmarked droplets and volumes are never backfilled and are not
+silently adopted into future typed actuation. A later immutable observer may
+classify a resource marker as `MATCH`, `MISSING`, or `MISMATCH` against the
+expected cluster incarnation and use the canonical provider droplet ID as node
+identity. This slice does not add that observer or change `query_instances()`,
+`filter_instances()`, `run_instances()`, `ProvisionRecord`, head selection,
+resume, rename, stop, termination, wait, or query projection behavior. Only a
+future `MATCH` observation can become an actuation candidate, and only after a
+separate authority review.
+
+Before any DigitalOcean mutation subset can promote to the shared reconciler,
+the runtime must also persist a unique effect attempt and exact readback
+locator before provider I/O. That locator must bind provider account scope,
+region, resource kinds, expected bounded cardinality, and the cluster
+incarnation; a synchronous live fence must pass immediately before submission;
+and lost-response handling must quarantine until exact readback and absence
+proof close the ambiguity. The generation marker alone satisfies none of
+those gates.
+
+The focused compatibility suite must prove:
+
+1. old positional and keyword `ProvisionConfig` construction defaults the new
+   field to `None`, and an old config-like object with no attribute retains the
+   exact legacy DigitalOcean request;
+2. direct `bulk_provision()` calls default to legacy mode, while an explicit
+   incarnation reaches the exact bootstrapped `ProvisionConfig`;
+3. the backend passes the exact new or existing hash returned by
+   `add_or_update_cluster()` and does not put it into rendered YAML;
+4. absent incarnation preserves the exact old droplet and volume tag lists,
+   while a valid incarnation appends the exact same marker to both;
+5. invalid type, empty value, invalid grammar, oversize value, and every
+   reserved-namespace collision fail before SSH-key or resource API calls;
+6. input tags remain unchanged and existing user-tag order remains
+   deterministic;
+7. two same-name cluster generations stamp distinct supplied markers without
+   asserting cleanup isolation; and
+8. the merged DigitalOcean query-projector and provider-facet characterization
+   suites remain unchanged and green.
+
+This runtime change requires an exact-image test-cluster deployment. The
+rollout proves migration completion, import safety, API-server, controller,
+and executor health, stable restarts, Datadog node coverage, and clean logs.
+Without credentialed DigitalOcean access it is control-plane regression
+evidence only and cannot claim a DigitalOcean create was exercised. Rollback
+is the ordinary prior-image rollback. Older code ignores the additive resource
+tag, while newer code accepts the default-`None` legacy path. The slice adds no
+database schema, feature flag, metric, event, persisted report, dual execution
+path, or temporary removal-ledger owner.
 
 ### M5: Serve and pools
 
