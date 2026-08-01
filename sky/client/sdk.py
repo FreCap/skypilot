@@ -11,6 +11,7 @@ Usage example:
 
 """
 from collections.abc import Iterator
+import contextlib
 import dataclasses
 import datetime
 import json
@@ -800,73 +801,27 @@ def launch(
 
     Other exceptions may be raised depending on the backend.
     """
-    if cluster_name is None:
-        cluster_name = cluster_utils.generate_cluster_name()
-
-    if clone_disk_from is not None:
-        with ux_utils.print_exception_no_traceback():
-            raise NotImplementedError('clone_disk_from is not implemented yet. '
-                                      'Please contact the SkyPilot team if you '
-                                      'need this feature at slack.skypilot.co.')
-
-    remote_api_version = versions.get_remote_api_version()
-    if wait_for is not None and (remote_api_version is None or
-                                 remote_api_version < 13):
-        logger.warning('wait_for is not supported in your API server. '
-                       'Please upgrade to a newer API server to use it.')
-
-    dag = dag_utils.convert_entrypoint_to_dag(task)
-    # Override the autostop config from command line flags to task YAML.
-    for task in dag.tasks:
-        for resource in task.resources:
-            if remote_api_version is None or remote_api_version < 13:
-                # An older server would not recognize the wait_for field
-                # in the schema, so we need to omit it.
-                resource.override_autostop_config(
-                    down=down, idle_minutes=idle_minutes_to_autostop)
-            else:
-                resource.override_autostop_config(
-                    down=down,
-                    idle_minutes=idle_minutes_to_autostop,
-                    wait_for=wait_for)
-            if resource.autostop_config is not None:
-                # For backward-compatibility, get the final autostop config for
-                # admin policy.
-                # TODO(aylei): remove this after 0.12.0
-                down = resource.autostop_config.down
-                idle_minutes_to_autostop = resource.autostop_config.idle_minutes
-
-    request_options = admin_policy.RequestOptions(
-        cluster_name=cluster_name,
-        idle_minutes_to_autostop=idle_minutes_to_autostop,
-        down=down,
-        dryrun=dryrun)
-    with admin_policy_utils.apply_and_use_config_in_current_request(
-            dag,
-            request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
-            request_options=request_options,
-            at_client_side=True) as dag:
-        prepared_request = prepare_launch_request(
-            dag,
-            cluster_name,
-            request_options,
-            retry_until_up,
-            idle_minutes_to_autostop,
-            dryrun,
-            down,
-            backend,
-            optimize_target,
-            no_setup,
-            clone_disk_from,
-            fast,
-            _need_confirmation,
-            _is_launched_by_jobs_controller,
-            _is_launched_by_sky_serve_controller,
-            _disable_controller_check,
-            _file_mounts_blob_id,
-            _extra_launch_context,
-            _include_credentials,
-        )
+    with _prepared_launch_request_in_current_context(
+            task=task,
+            cluster_name=cluster_name,
+            retry_until_up=retry_until_up,
+            idle_minutes_to_autostop=idle_minutes_to_autostop,
+            wait_for=wait_for,
+            dryrun=dryrun,
+            down=down,
+            backend=backend,
+            optimize_target=optimize_target,
+            no_setup=no_setup,
+            clone_disk_from=clone_disk_from,
+            fast=fast,
+            _need_confirmation=_need_confirmation,
+            _is_launched_by_jobs_controller=_is_launched_by_jobs_controller,
+            _is_launched_by_sky_serve_controller=(
+                _is_launched_by_sky_serve_controller),
+            _disable_controller_check=_disable_controller_check,
+            _file_mounts_blob_id=_file_mounts_blob_id,
+            _extra_launch_context=_extra_launch_context,
+            _include_credentials=_include_credentials) as prepared_request:
         return submit_prepared_launch_request(prepared_request)
 
 
@@ -927,7 +882,167 @@ def _canonical_launch_body_bytes(body: payloads.LaunchBody) -> bytes:
     return _canonical_launch_json_bytes(json.loads(body.model_dump_json()))
 
 
+@contextlib.contextmanager
+def _prepared_launch_request_in_current_context(
+    task: Union['sky.Task', 'sky.Dag'],
+    cluster_name: str | None = None,
+    retry_until_up: bool = False,
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor | None = None,
+    dryrun: bool = False,
+    down: bool = False,  # pylint: disable=redefined-outer-name
+    backend: Optional['backends.Backend'] = None,
+    optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
+    no_setup: bool = False,
+    clone_disk_from: str | None = None,
+    fast: bool = False,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _need_confirmation: bool = False,
+    _is_launched_by_jobs_controller: bool = False,
+    _is_launched_by_sky_serve_controller: bool = False,
+    _disable_controller_check: bool = False,
+    _file_mounts_blob_id: str | None = None,
+    _extra_launch_context: dict[str, Any] | None = None,
+    _include_credentials: bool = False,
+) -> Iterator[PreparedLaunchRequest]:
+    """Yields a frozen launch while its preparation context remains active.
+
+    Public launch submission must occur inside this context because the client
+    admin policy may temporarily override transport configuration. A standalone
+    preparer may retain the yielded immutable request after the context exits.
+    """
+    if cluster_name is None:
+        cluster_name = cluster_utils.generate_cluster_name()
+
+    if clone_disk_from is not None:
+        with ux_utils.print_exception_no_traceback():
+            raise NotImplementedError('clone_disk_from is not implemented yet. '
+                                      'Please contact the SkyPilot team if you '
+                                      'need this feature at slack.skypilot.co.')
+
+    remote_api_version = versions.get_remote_api_version()
+    if wait_for is not None and (remote_api_version is None or
+                                 remote_api_version < 13):
+        logger.warning('wait_for is not supported in your API server. '
+                       'Please upgrade to a newer API server to use it.')
+
+    dag = dag_utils.convert_entrypoint_to_dag(task)
+    # Override the autostop config from command line flags to task YAML.
+    for dag_task in dag.tasks:
+        for resource in dag_task.resources:
+            if remote_api_version is None or remote_api_version < 13:
+                # An older server would not recognize the wait_for field
+                # in the schema, so we need to omit it.
+                resource.override_autostop_config(
+                    down=down, idle_minutes=idle_minutes_to_autostop)
+            else:
+                resource.override_autostop_config(
+                    down=down,
+                    idle_minutes=idle_minutes_to_autostop,
+                    wait_for=wait_for)
+            if resource.autostop_config is not None:
+                # For backward-compatibility, get the final autostop config for
+                # admin policy.
+                # TODO(aylei): remove this after 0.12.0
+                down = resource.autostop_config.down
+                idle_minutes_to_autostop = resource.autostop_config.idle_minutes
+
+    request_options = admin_policy.RequestOptions(
+        cluster_name=cluster_name,
+        idle_minutes_to_autostop=idle_minutes_to_autostop,
+        down=down,
+        dryrun=dryrun)
+    # The context deliberately spans the yield so launch submission observes
+    # the policy's temporary transport configuration.
+    # pylint: disable-next=contextmanager-generator-missing-cleanup
+    with admin_policy_utils.apply_and_use_config_in_current_request(
+            dag,
+            request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
+            request_options=request_options,
+            at_client_side=True) as dag:
+        prepared_request = _freeze_launch_request(
+            dag,
+            cluster_name,
+            request_options,
+            retry_until_up,
+            idle_minutes_to_autostop,
+            dryrun,
+            down,
+            backend,
+            optimize_target,
+            no_setup,
+            clone_disk_from,
+            fast,
+            _need_confirmation,
+            _is_launched_by_jobs_controller,
+            _is_launched_by_sky_serve_controller,
+            _disable_controller_check,
+            _file_mounts_blob_id,
+            _extra_launch_context,
+            _include_credentials,
+        )
+        yield prepared_request
+
+
+@usage_lib.entrypoint('sky.client.sdk.launch')
+@server_common.check_server_healthy_or_start
+@annotations.client_api
+@sky_context.contextual
 def prepare_launch_request(
+    task: Union['sky.Task', 'sky.Dag'],
+    cluster_name: str | None = None,
+    retry_until_up: bool = False,
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor | None = None,
+    dryrun: bool = False,
+    down: bool = False,  # pylint: disable=redefined-outer-name
+    backend: Optional['backends.Backend'] = None,
+    optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
+    no_setup: bool = False,
+    clone_disk_from: str | None = None,
+    fast: bool = False,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _need_confirmation: bool = False,
+    _is_launched_by_jobs_controller: bool = False,
+    _is_launched_by_sky_serve_controller: bool = False,
+    _disable_controller_check: bool = False,
+    _file_mounts_blob_id: str | None = None,
+    _extra_launch_context: dict[str, Any] | None = None,
+    _include_credentials: bool = False,
+) -> PreparedLaunchRequest:
+    """Prepares a launch for inspection and later exact submission.
+
+    This is the non-submitting counterpart of ``launch``. It preserves the
+    same client health, usage, and context boundaries while returning the
+    immutable request produced by the shared launch-preparation pipeline.
+    """
+    with _prepared_launch_request_in_current_context(
+            task=task,
+            cluster_name=cluster_name,
+            retry_until_up=retry_until_up,
+            idle_minutes_to_autostop=idle_minutes_to_autostop,
+            wait_for=wait_for,
+            dryrun=dryrun,
+            down=down,
+            backend=backend,
+            optimize_target=optimize_target,
+            no_setup=no_setup,
+            clone_disk_from=clone_disk_from,
+            fast=fast,
+            _need_confirmation=_need_confirmation,
+            _is_launched_by_jobs_controller=_is_launched_by_jobs_controller,
+            _is_launched_by_sky_serve_controller=(
+                _is_launched_by_sky_serve_controller),
+            _disable_controller_check=_disable_controller_check,
+            _file_mounts_blob_id=_file_mounts_blob_id,
+            _extra_launch_context=_extra_launch_context,
+            _include_credentials=_include_credentials) as prepared_request:
+        return prepared_request
+
+
+def _freeze_launch_request(
     dag: 'sky.Dag',
     cluster_name: str,
     request_options: admin_policy.RequestOptions,
@@ -950,7 +1065,7 @@ def prepare_launch_request(
     _extra_launch_context: dict[str, Any] | None = None,
     _include_credentials: bool = False,
 ) -> PreparedLaunchRequest:
-    """Runs launch preparation and freezes the exact HTTP JSON payload."""
+    """Freezes a launch DAG after high-level policy and option preparation."""
 
     validate(dag, admin_policy_request_options=request_options)
     # The flags have been applied to the task YAML and the backward

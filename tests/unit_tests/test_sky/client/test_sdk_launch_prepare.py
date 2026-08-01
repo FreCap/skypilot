@@ -7,17 +7,12 @@ from unittest import mock
 import pytest
 
 import sky
-from sky import admin_policy
 from sky.client import sdk
 from sky.server import common as server_common
+from sky.skylet import autostop_lib
+from sky.usage import usage_lib
+from sky.utils import context as sky_context
 from sky.utils import dag_utils
-
-
-def _request_options(cluster_name: str) -> admin_policy.RequestOptions:
-    return admin_policy.RequestOptions(cluster_name=cluster_name,
-                                       idle_minutes_to_autostop=None,
-                                       down=False,
-                                       dryrun=False)
 
 
 def _response(request_id: str = 'request-id') -> mock.Mock:
@@ -40,6 +35,8 @@ def prepare_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sdk, 'validate', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sdk.click, 'secho', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sdk.versions, 'get_remote_api_version', lambda: 13)
+    monkeypatch.setattr(server_common, 'check_server_healthy_or_start_fn',
+                        lambda *_args, **_kwargs: None)
 
 
 def _prepare(
@@ -48,11 +45,9 @@ def _prepare(
     cluster_name: str = 'test-cluster',
     extra_launch_context: dict[str, object] | None = None
 ) -> sdk.PreparedLaunchRequest:
-    dag = dag_utils.convert_entrypoint_to_dag(task)
     return sdk.prepare_launch_request(
-        dag,
-        cluster_name,
-        _request_options(cluster_name),
+        task,
+        cluster_name=cluster_name,
         _file_mounts_blob_id='existing-blob',
         _extra_launch_context=extra_launch_context)
 
@@ -62,7 +57,6 @@ def test_public_launch_prepares_policy_and_mount_mutations(
         monkeypatch: pytest.MonkeyPatch) -> None:
     task = sky.Task(run='original')
     prepared_requests: list[sdk.PreparedLaunchRequest] = []
-    original_prepare = sdk.prepare_launch_request
 
     @contextlib.contextmanager
     def _apply_policy(dag, **_kwargs):
@@ -73,21 +67,18 @@ def test_public_launch_prepares_policy_and_mount_mutations(
         dag.tasks[0].update_envs({'MOUNT_MUTATION': 'included'})
         return dag, 'uploaded-blob'
 
-    def _capture_prepare(*args, **kwargs):
-        prepared = original_prepare(*args, **kwargs)
+    def _capture_submit(prepared):
         prepared_requests.append(prepared)
-        return prepared
+        return 'request-id'
 
     monkeypatch.setattr(sdk.admin_policy_utils,
                         'apply_and_use_config_in_current_request',
                         _apply_policy)
     monkeypatch.setattr(sdk.client_common, 'upload_mounts_to_api_server',
                         _upload_mounts)
-    monkeypatch.setattr(sdk, 'prepare_launch_request', _capture_prepare)
+    monkeypatch.setattr(sdk, 'submit_prepared_launch_request', _capture_submit)
     monkeypatch.setattr(server_common, 'check_server_healthy_or_start_fn',
                         lambda *_args, **_kwargs: None)
-    request = mock.Mock(return_value=_response())
-    monkeypatch.setattr(server_common, 'make_authenticated_request', request)
 
     assert sdk.launch(task, cluster_name='test-cluster') == 'request-id'
 
@@ -97,6 +88,208 @@ def test_public_launch_prepares_policy_and_mount_mutations(
     assert prepared_dag.tasks[0].run == 'after-policy'
     assert prepared_dag.tasks[0].envs['MOUNT_MUTATION'] == 'included'
     assert prepared.body.file_mounts_blob_id == 'uploaded-blob'
+
+
+@pytest.mark.usefixtures('prepare_dependencies')
+def test_public_launch_submits_the_identical_prepared_instance(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = object()
+    prepare = mock.Mock(return_value=contextlib.nullcontext(prepared))
+
+    def _submit(candidate):
+        assert candidate is prepared
+        return 'request-id'
+
+    monkeypatch.setattr(sdk, '_prepared_launch_request_in_current_context',
+                        prepare)
+    monkeypatch.setattr(sdk, 'submit_prepared_launch_request', _submit)
+
+    assert sdk.launch(sky.Task(run='echo hello'),
+                      cluster_name='test-cluster') == 'request-id'
+    prepare.assert_called_once()
+
+
+@pytest.mark.usefixtures('prepare_dependencies')
+def test_public_launch_submits_inside_policy_config_scope(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    policy_scope_active = False
+
+    @contextlib.contextmanager
+    def _apply_policy(dag, **_kwargs):
+        nonlocal policy_scope_active
+        policy_scope_active = True
+        try:
+            yield dag
+        finally:
+            policy_scope_active = False
+
+    def _request(method, path, **_kwargs):
+        assert policy_scope_active
+        assert (method, path) == ('POST', '/launch')
+        return _response()
+
+    monkeypatch.setattr(sdk.admin_policy_utils,
+                        'apply_and_use_config_in_current_request',
+                        _apply_policy)
+    monkeypatch.setattr(sdk.client_common, 'upload_mounts_to_api_server',
+                        lambda dag: (dag, None))
+    monkeypatch.setattr(server_common, 'make_authenticated_request', _request)
+
+    assert sdk.launch(sky.Task(run='echo hello'),
+                      cluster_name='test-cluster') == 'request-id'
+    assert not policy_scope_active
+
+
+def test_direct_prepare_preserves_launch_client_boundaries(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = object()
+    health_check = mock.Mock()
+
+    def _prepare_in_context(*_args, **_kwargs):
+        assert sky_context.get() is not None
+        assert usage_lib.messages.usage.entrypoint == 'sky.client.sdk.launch'
+        return contextlib.nullcontext(prepared)
+
+    monkeypatch.setattr(server_common, 'check_server_healthy_or_start_fn',
+                        health_check)
+    monkeypatch.setattr(sdk, '_prepared_launch_request_in_current_context',
+                        _prepare_in_context)
+
+    assert sdk.prepare_launch_request(sky.Task(run='echo hello')) is prepared
+    health_check.assert_called_once_with(False, '127.0.0.1')
+
+
+@pytest.mark.usefixtures('prepare_dependencies')
+def test_high_level_preparation_runs_mutable_steps_once_in_order(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    request_options = []
+    original_convert = sdk.dag_utils.convert_entrypoint_to_dag
+    original_override = sky.Resources.override_autostop_config
+    # pylint: disable=protected-access
+    original_freeze = sdk._freeze_launch_request
+
+    def _convert(entrypoint):
+        events.append('convert')
+        return original_convert(entrypoint)
+
+    def _override(resource, *args, **kwargs):
+        events.append('autostop')
+        return original_override(resource, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def _apply_policy(dag, **kwargs):
+        events.append('policy-enter')
+        request_options.append(kwargs['request_options'])
+        resource = next(iter(dag.tasks[0].resources))
+        assert resource.autostop_config is not None
+        assert resource.autostop_config.idle_minutes == 7
+        assert resource.autostop_config.down
+        assert resource.autostop_config.wait_for == autostop_lib.AutostopWaitFor.JOBS
+        dag.tasks[0].run = 'after-policy'
+        try:
+            yield dag
+        finally:
+            events.append('policy-exit')
+
+    def _validate(*_args, **_kwargs):
+        events.append('validate')
+
+    def _upload(dag):
+        events.append('upload')
+        assert dag.tasks[0].run == 'after-policy'
+        return dag, 'blob-id'
+
+    def _freeze(*args, **kwargs):
+        events.append('freeze-enter')
+        prepared = original_freeze(*args, **kwargs)
+        events.append('freeze-exit')
+        return prepared
+
+    monkeypatch.setattr(sdk.dag_utils, 'convert_entrypoint_to_dag', _convert)
+    monkeypatch.setattr(sky.Resources, 'override_autostop_config', _override)
+    monkeypatch.setattr(sdk.admin_policy_utils,
+                        'apply_and_use_config_in_current_request',
+                        _apply_policy)
+    monkeypatch.setattr(sdk, 'validate', _validate)
+    monkeypatch.setattr(sdk.client_common, 'upload_mounts_to_api_server',
+                        _upload)
+    monkeypatch.setattr(sdk, '_freeze_launch_request', _freeze)
+
+    prepared = sdk.prepare_launch_request(
+        sky.Task(run='before-policy'),
+        cluster_name='test-cluster',
+        idle_minutes_to_autostop=7,
+        wait_for=autostop_lib.AutostopWaitFor.JOBS,
+        down=True)
+
+    assert events == [
+        'convert', 'autostop', 'policy-enter', 'freeze-enter', 'validate',
+        'upload', 'freeze-exit', 'policy-exit'
+    ]
+    assert len(request_options) == 1
+    assert request_options[0].idle_minutes_to_autostop == 7
+    assert request_options[0].down
+    assert prepared.body.file_mounts_blob_id == 'blob-id'
+
+
+@pytest.mark.usefixtures('prepare_dependencies')
+@pytest.mark.parametrize(('remote_api_version', 'expected_wait_for'),
+                         [(12, None), (13, autostop_lib.AutostopWaitFor.JOBS)])
+def test_high_level_preparation_preserves_wait_for_compatibility(
+        monkeypatch: pytest.MonkeyPatch, remote_api_version: int,
+        expected_wait_for: autostop_lib.AutostopWaitFor | None) -> None:
+    monkeypatch.setattr(sdk.versions, 'get_remote_api_version',
+                        lambda: remote_api_version)
+    prepared = sdk.prepare_launch_request(
+        sky.Task(run='echo hello'),
+        cluster_name='test-cluster',
+        idle_minutes_to_autostop=9,
+        wait_for=autostop_lib.AutostopWaitFor.JOBS,
+        _file_mounts_blob_id='existing-blob')
+
+    dag = dag_utils.load_dag_from_yaml_str(prepared.body.task)
+    resource = next(iter(dag.tasks[0].resources))
+    assert resource.autostop_config is not None
+    assert resource.autostop_config.idle_minutes == 9
+    assert resource.autostop_config.wait_for == expected_wait_for
+
+
+@pytest.mark.usefixtures('prepare_dependencies')
+def test_policy_scoped_config_is_frozen_before_scope_exit(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    policy_scope_active = False
+
+    @contextlib.contextmanager
+    def _apply_policy(dag, **_kwargs):
+        nonlocal policy_scope_active
+        policy_scope_active = True
+        try:
+            yield dag
+        finally:
+            policy_scope_active = False
+
+    def _policy_config():
+        assert policy_scope_active
+        return {'kubernetes': {'allowed_contexts': ['policy-context']}}
+
+    monkeypatch.setattr(sdk.admin_policy_utils,
+                        'apply_and_use_config_in_current_request',
+                        _apply_policy)
+    monkeypatch.setattr(sdk.payloads,
+                        'get_override_skypilot_config_from_client',
+                        _policy_config)
+    prepared = sdk.prepare_launch_request(sky.Task(run='echo hello'),
+                                          cluster_name='test-cluster',
+                                          _file_mounts_blob_id='existing-blob')
+
+    assert not policy_scope_active
+    payload = json.loads(prepared.submitted_json)
+    assert payload['override_skypilot_config'] == {
+        'kubernetes': {
+            'allowed_contexts': ['policy-context']
+        }
+    }
 
 
 @pytest.mark.usefixtures('prepare_dependencies')
