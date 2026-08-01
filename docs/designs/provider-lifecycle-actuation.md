@@ -6818,13 +6818,26 @@ only propagation of the existing cluster-generation identity and creation-time
 resource stamping. It adds no new identity store and no second telemetry
 plane.
 
-`ProvisionConfig` appends
-`cluster_incarnation: str | None = None` after every existing field. Existing
-positional and keyword constructors therefore retain their argument mapping.
-An object restored from an older pickle may not have the new attribute, so the
-DigitalOcean consumer reads it with
-`getattr(config, 'cluster_incarnation', None)`. `None` is the exact legacy
-compatibility mode.
+`ProvisionConfig` appends the keyword-only field
+`cluster_incarnation: str | None = dataclasses.field(default=None,
+kw_only=True, repr=False)` after every existing field. All eight existing
+constructor parameters retain their positional and keyword mapping, and an
+out-of-tree dataclass subclass may still append a required positional field.
+The new field is last in `dataclasses.fields()`, participates in equality, and
+is omitted from repr. Its class-level default also makes an object restored
+from an older pickle with no instance-state entry read as `None`; no custom
+pickle state or migration is added. The DigitalOcean consumer still uses
+`getattr(config, 'cluster_incarnation', None)` for older config-like objects.
+`None` is the exact legacy compatibility mode.
+
+`get_redacted_config()` removes `cluster_incarnation` from the copied
+`dataclasses.asdict()` result before returning it. The existing provision-log
+JSON therefore remains byte-for-byte shape-compatible and never emits the raw
+cluster identity. Direct `dataclasses.asdict()` and field enumeration see the
+intentional additive internal field. There is no in-tree persistence or
+reconstruction of `ProvisionConfig`; the compatibility suite nevertheless
+pins a real missing-state pickle round trip, constructor signature, required
+subclass, equality, repr, and field order.
 
 `provisioner.bulk_provision()` adds a keyword-only
 `cluster_incarnation: str | None = None` after its existing parameters and
@@ -6837,15 +6850,31 @@ resume, and scale therefore reuse the cluster generation already owned by the
 database. Rendered cluster YAML, configuration hashing, public provider
 facets, and `InstanceLifecycleV1` remain unchanged.
 
+The existing dynamic `bulk_provision` replacement seam retains its exact old
+call shape. `sky.provision.provisioner` records the exact built-in function in
+one private import-generation alias after definition. The backend reads the
+current callable and that alias exactly once for an invocation. It supplies
+the new keyword only when the two objects are identical. A rebound function,
+replacement module, wrapper, or old-signature monkeypatch receives precisely
+the previous arguments and owns the whole substituted workflow; it receives
+no implicit incarnation authority. There is no `TypeError` fallback and no
+second call after an exception. Reload reconstructs the function and alias
+together, and the next invocation observes that new import generation.
+
 DigitalOcean reserves the tag key
 `skypilot-cluster-incarnation`. When the optional value is absent,
 `utils.create_instance()` preserves the exact current tag ordering and request
-shape. When it is present, the value must have exact type `str`, be nonempty,
-use only the DigitalOcean tag grammar of ASCII letters, digits, colons, dashes,
-and underscores, and keep the complete encoded tag within DigitalOcean's
-255-character limit. The provider documents that grammar at
-<https://docs.digitalocean.com/reference/api/reference/tags/>. Validation
-finishes before SSH-key lookup or any droplet, volume, or attachment request.
+shape. When it is present, the raw value must have exact type `str`; every such
+string, including empty, non-ASCII, surrogate-containing, and arbitrarily long
+legacy values, has one total deterministic encoding. The encoded value is
+exactly `v1-` followed by lowercase hexadecimal SHA-256 of the byte domain
+separator `skypilot-do-cluster-incarnation-v1\0` followed by the raw value
+encoded with UTF-8 `surrogatepass`. No Unicode normalization, truncation, raw
+identity substring, clock, salt, random value, or provider lookup participates.
+The resulting full tag uses only ASCII letters, digits, colon, and dash and has
+a fixed length below DigitalOcean's 255-character limit. The provider
+documents that grammar at
+<https://docs.digitalocean.com/reference/api/reference/tags/>.
 
 User-supplied tags retain their current sorting and legacy override behavior
 for `Name`, `ray-cluster-name`, and `skypilot-cluster-name`. A marked request
@@ -6857,6 +6886,21 @@ list is supplied to both the droplet request and its paired volume request.
 The input `config.tags` mapping is not mutated. DigitalOcean bootstrap
 continues to return the exact `ProvisionConfig` object, so the field survives
 without another copy owner.
+
+One pure DigitalOcean helper owns raw-type validation, total encoding, and
+reserved-namespace collision detection. `run_instances()` calls it before its
+first discovery, resume, rename, or create operation. `create_instance()`
+calls the same helper defensively for direct callers, before SSH-key lookup or
+any droplet, volume, or attachment request. The generic pre-run ephemeral
+volume path has no DigitalOcean mutation: it can create only a Kubernetes PVC
+and skips or rejects every other volume type before provider submission.
+
+The helper raises `InvalidProvisionConfigError`, a `ValueError` subtype in
+`sky.provision.common`. `bulk_provision()` re-raises that exact admission error
+before its broad failure-cleanup branch. An invalid type or reserved collision
+therefore cannot call stop, terminate, ephemeral-volume deletion, or other
+destructive failover cleanup. This bypass is limited to the closed admission
+exception and does not change cleanup for an error after provider mutation.
 
 The marker is durable attribution evidence, not an external-effect fence.
 `cluster_hash` is stable across multiple creates, retries, resume, and scale
@@ -6876,7 +6920,10 @@ identity. This slice does not add that observer or change `query_instances()`,
 `filter_instances()`, `run_instances()`, `ProvisionRecord`, head selection,
 resume, rename, stop, termination, wait, or query projection behavior. Only a
 future `MATCH` observation can become an actuation candidate, and only after a
-separate authority review.
+separate authority review. `MATCH` is necessary but never sufficient: one
+`MISSING` or `MISMATCH` sibling blocks typed mutation for the entire cluster
+generation, as does incomplete inventory. A marker from a stale attempt is
+attribution evidence only and never proves current ownership.
 
 Before any DigitalOcean mutation subset can promote to the shared reconciler,
 the runtime must also persist a unique effect attempt and exact readback
@@ -6889,33 +6936,48 @@ those gates.
 
 The focused compatibility suite must prove:
 
-1. old positional and keyword `ProvisionConfig` construction defaults the new
-   field to `None`, and an old config-like object with no attribute retains the
-   exact legacy DigitalOcean request;
-2. direct `bulk_provision()` calls default to legacy mode, while an explicit
-   incarnation reaches the exact bootstrapped `ProvisionConfig`;
+1. all eight old positional and keyword `ProvisionConfig` parameters retain
+   their signature and default the new field to `None`; a required-field
+   dataclass subclass remains legal; field order, equality, repr, a real
+   missing-state pickle round trip, and the unchanged redacted-log dictionary
+   are exact;
+2. an old config-like object with no attribute retains the exact legacy
+   DigitalOcean request, and direct `bulk_provision()` calls default to legacy
+   mode while an explicit incarnation reaches the exact bootstrapped config;
 3. the backend passes the exact new or existing hash returned by
-   `add_or_update_cluster()` and does not put it into rendered YAML;
+   `add_or_update_cluster()` only to the exact built-in call and never puts it
+   into rendered YAML; an exact-old-signature replacement and a replacement
+   module receive the old argument shape once, including after import reload;
 4. absent incarnation preserves the exact old droplet and volume tag lists,
-   while a valid incarnation appends the exact same marker to both;
-5. invalid type, empty value, invalid grammar, oversize value, and every
-   reserved-namespace collision fail before SSH-key or resource API calls;
-6. input tags remain unchanged and existing user-tag order remains
+   while a marked request appends the exact same V1 marker to both;
+5. encoding is byte-repeatable and domain-separated for ASCII, empty,
+   non-ASCII, lone-surrogate, very long, 255-character, and 256-character raw
+   hashes, always producing the closed fixed-length tag grammar;
+6. invalid raw type and every case-insensitive reserved-namespace collision
+   fail before discovery, SSH-key, droplet, volume, attachment, resume, rename,
+   stop, terminate, or cleanup calls;
+7. input tags remain unchanged and existing user-tag order remains
    deterministic;
-7. two same-name cluster generations stamp distinct supplied markers without
-   asserting cleanup isolation; and
-8. the merged DigitalOcean query-projector and provider-facet characterization
-   suites remain unchanged and green.
+8. a legacy unmarked create followed by a marked same-name create, and two
+   distinct same-name generations, produce the expected mixed attribution
+   without asserting cleanup isolation, current ownership, or mutation
+   eligibility; and
+9. the merged DigitalOcean query-projector, provider-facet, and stale database
+   generation-fence characterization suites remain unchanged and green.
 
 This runtime change requires an exact-image test-cluster deployment. The
 rollout proves migration completion, import safety, API-server, controller,
 and executor health, stable restarts, Datadog node coverage, and clean logs.
 Without credentialed DigitalOcean access it is control-plane regression
 evidence only and cannot claim a DigitalOcean create was exercised. Rollback
-is the ordinary prior-image rollback. Older code ignores the additive resource
-tag, while newer code accepts the default-`None` legacy path. The slice adds no
-database schema, feature flag, metric, event, persisted report, dual execution
-path, or temporary removal-ledger owner.
+is the ordinary prior-image rollback, but its persistent provider consequence
+is explicit: already marked resources retain their tag, the old image ignores
+it, and the old image may create unmarked siblings. A later upgrade must treat
+that mixed generation as ineligible for typed mutation until legacy resources
+are gone or a separately reviewed migration proves ownership and completeness.
+The tag is not removed during rollback. The slice adds no database schema,
+feature flag, metric, event, persisted report, dual execution path, or
+temporary removal-ledger owner.
 
 ### M5: Serve and pools
 
@@ -8446,3 +8508,36 @@ correction passed the focused 12-test suite, full provision and backend-status
 lanes, current removal-manifest gate, combined formatter, type, lint, and
 import/reload checks. Final implementation re-review returned `LGTM`, and final
 simplicity review returned `PASS` with no remaining blocker.
+
+### Review 31
+
+Verdict: `RESHAPE` for the initial M4 DigitalOcean incarnation locator
+foundation committed at `c298cc53d02a13ce601808cff19ddffd2fd239c5`, with
+initial contract SHA-256
+`f638822e151fcf8d1aa90ff8c332f2e7998bfa924cd785b1955981f81ce274e3`.
+
+The marker was judged worth implementing, but the first contract left five
+compatibility and authority gaps. A default base-dataclass field could prevent
+subclasses from adding required fields; the new backend keyword could break an
+exact-old-signature `bulk_provision` replacement and then enter destructive
+cleanup; arbitrary historical cluster hashes were not proved to fit the raw
+DigitalOcean tag grammar; validation inside `create_instance()` occurred after
+earlier resume or rename mutations and its error could invoke cleanup; and a
+per-resource marker match did not address mixed marked and unmarked siblings.
+
+The corrected contract makes the field keyword-only, omits it from repr and
+the existing redacted provision-log shape, and pins equality, field order,
+required subclasses, and a real missing-state pickle round trip. The class
+default is sufficient for missing old instance state, so no custom pickle hook
+is introduced. Exact built-in callable identity gates the new keyword without
+a retry. A domain-separated V1 digest encodes every Python string into one
+fixed tag-safe marker. One pure validator runs before any DigitalOcean
+lifecycle mutation and its closed admission error bypasses destructive
+cleanup. Finally, any missing or mismatched sibling, incomplete inventory, or
+stale attempt blocks future typed mutation for the whole generation, and
+rollback explicitly preserves that mixed-resource consequence.
+
+The reshaped contract has SHA-256
+`16a26ee885670f3e279f51a82461a90fb9e654741a275c88d886b1906980f98f`.
+It requires a fresh exact-contract adversarial and simplicity review before
+implementation.
