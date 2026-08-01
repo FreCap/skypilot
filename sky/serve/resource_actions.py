@@ -2692,6 +2692,47 @@ class ProviderObjectRoleV1(str, enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class _ProviderKubernetesObjectRoleMapEntryV1:
+    """One immutable entry in the direct-Pod object-role protocol map."""
+
+    plan_sequence: int
+    role: ProviderObjectRoleV1
+    kind: ProviderPodTopologyMutableObjectKindV1
+    name_rule: str
+    create_sequence: int
+    delete_sequence: int
+
+
+PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1 = (
+    _ProviderKubernetesObjectRoleMapEntryV1(
+        plan_sequence=0,
+        role=ProviderObjectRoleV1.HEAD_SSH_SERVICE,
+        kind=ProviderPodTopologyMutableObjectKindV1.SERVICE,
+        name_rule='workload_name_plus_-ssh',
+        create_sequence=0,
+        delete_sequence=1),
+    _ProviderKubernetesObjectRoleMapEntryV1(
+        plan_sequence=1,
+        role=ProviderObjectRoleV1.HEAD_SERVICE,
+        kind=ProviderPodTopologyMutableObjectKindV1.SERVICE,
+        name_rule='workload_name',
+        create_sequence=1,
+        delete_sequence=0),
+    _ProviderKubernetesObjectRoleMapEntryV1(
+        plan_sequence=2,
+        role=ProviderObjectRoleV1.HEAD_POD,
+        kind=ProviderPodTopologyMutableObjectKindV1.POD,
+        name_rule='workload_name',
+        create_sequence=2,
+        delete_sequence=2),
+)
+_PROVIDER_KUBERNETES_OBJECT_ROLE_BY_SEQUENCE_V1 = types.MappingProxyType({
+    entry.plan_sequence: entry
+    for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1
+})
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderPodTopologyMutableObjectV1(_CanonicalContract):
     """One role-specific mutable object in a direct-Pod topology."""
 
@@ -2702,15 +2743,12 @@ class ProviderPodTopologyMutableObjectV1(_CanonicalContract):
 
     _KEYS: ClassVar[frozenset[str]] = frozenset(
         {'kind', 'role', 'name', 'labels'})
-    _ROLE_KINDS: ClassVar[dict[
-        ProviderObjectRoleV1, ProviderPodTopologyMutableObjectKindV1]] = {
-            ProviderObjectRoleV1.HEAD_SSH_SERVICE:
-                ProviderPodTopologyMutableObjectKindV1.SERVICE,
-            ProviderObjectRoleV1.HEAD_SERVICE:
-                ProviderPodTopologyMutableObjectKindV1.SERVICE,
-            ProviderObjectRoleV1.HEAD_POD:
-                ProviderPodTopologyMutableObjectKindV1.POD,
-        }
+    _ROLE_KINDS: ClassVar[Mapping[
+        ProviderObjectRoleV1,
+        ProviderPodTopologyMutableObjectKindV1]] = types.MappingProxyType({
+            entry.role: entry.kind
+            for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1
+        })
 
     def __post_init__(self) -> None:
         kind = _enum_value(ProviderPodTopologyMutableObjectKindV1,
@@ -2770,11 +2808,8 @@ class ProviderPodTopologyV1(_CanonicalContract):
         'version', 'kind', 'node_count', 'application_port', 'resources_ports',
         'mutable_objects', 'shared_prerequisites'
     })
-    _EXPECTED_ROLES: ClassVar[tuple[ProviderObjectRoleV1, ...]] = (
-        ProviderObjectRoleV1.HEAD_SSH_SERVICE,
-        ProviderObjectRoleV1.HEAD_SERVICE,
-        ProviderObjectRoleV1.HEAD_POD,
-    )
+    _EXPECTED_ROLES: ClassVar[tuple[ProviderObjectRoleV1, ...]] = tuple(
+        entry.role for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1)
     _DISPLAY_LABEL: ClassVar[str] = 'skypilot-cluster-name'
     _CLUSTER_UUID_LABEL: ClassVar[str] = 'skypilot.co/cluster-record-uuid'
     _REPLICA_UUID_LABEL: ClassVar[str] = 'skypilot.co/serve-replica-incarnation'
@@ -3450,6 +3485,359 @@ class ProviderKubernetesServiceAccountProjectionV1(_CanonicalContract):
                 self.automount_service_account_token,
             'image_pull_secrets': list(self.image_pull_secrets),
             'legacy_secret_refs': list(self.legacy_secret_refs),
+        }
+
+
+class ProviderKubernetesPrerequisiteKindV1(str, enum.Enum):
+    """Closed Kubernetes prerequisite kinds for the first provider cohort."""
+
+    NAMESPACE = 'Namespace'
+    SERVICE_ACCOUNT = 'ServiceAccount'
+    NETWORK_POLICY = 'NetworkPolicy'
+    VALIDATING_ADMISSION_POLICY = 'ValidatingAdmissionPolicy'
+    VALIDATING_ADMISSION_POLICY_BINDING = 'ValidatingAdmissionPolicyBinding'
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProviderKubernetesPrerequisiteKindMapEntryV1:
+    """One immutable API-version and scope dispatch entry."""
+
+    api_version: str
+    scope: str
+
+
+PROVIDER_KUBERNETES_PREREQUISITE_KIND_MAP_V1 = types.MappingProxyType({
+    ProviderKubernetesPrerequisiteKindV1.NAMESPACE:
+        _ProviderKubernetesPrerequisiteKindMapEntryV1(api_version='v1',
+                                                      scope='cluster'),
+    ProviderKubernetesPrerequisiteKindV1.SERVICE_ACCOUNT:
+        _ProviderKubernetesPrerequisiteKindMapEntryV1(api_version='v1',
+                                                      scope='namespaced'),
+    ProviderKubernetesPrerequisiteKindV1.NETWORK_POLICY:
+        _ProviderKubernetesPrerequisiteKindMapEntryV1(
+            api_version='networking.k8s.io/v1', scope='namespaced'),
+    ProviderKubernetesPrerequisiteKindV1.VALIDATING_ADMISSION_POLICY:
+        _ProviderKubernetesPrerequisiteKindMapEntryV1(
+            api_version='admissionregistration.k8s.io/v1', scope='cluster'),
+    ProviderKubernetesPrerequisiteKindV1.VALIDATING_ADMISSION_POLICY_BINDING:
+        _ProviderKubernetesPrerequisiteKindMapEntryV1(
+            api_version='admissionregistration.k8s.io/v1', scope='cluster'),
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesNamespacePrerequisiteSpecV1(_CanonicalContract):
+    """Sorted live Namespace metadata retained as prerequisite evidence."""
+
+    kind: ProviderKubernetesPrerequisiteKindV1
+    labels: tuple[ProviderLabelV1, ...]
+    annotations: tuple[ProviderAnnotationV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'kind', 'labels', 'annotations'})
+
+    def __post_init__(self) -> None:
+        kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
+                           self.kind,
+                           name='namespace prerequisite kind')
+        if kind is not ProviderKubernetesPrerequisiteKindV1.NAMESPACE:
+            raise ValueError('Namespace prerequisite spec kind is invalid.')
+        object.__setattr__(self, 'kind', kind)
+        object.__setattr__(
+            self, 'labels',
+            _provider_label_tuple(self.labels, name='Namespace labels'))
+        object.__setattr__(
+            self, 'annotations',
+            _provider_annotation_tuple(self.annotations,
+                                       name='Namespace annotations'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls, value: Any) -> 'ProviderKubernetesNamespacePrerequisiteSpecV1':
+        raw = _closed_object(value,
+                             name='Namespace prerequisite spec',
+                             keys=cls._KEYS)
+        if not isinstance(raw['labels'], list):
+            raise TypeError('Namespace prerequisite labels must be a list.')
+        if not isinstance(raw['annotations'], list):
+            raise TypeError(
+                'Namespace prerequisite annotations must be a list.')
+        return cls(
+            kind=raw['kind'],
+            labels=tuple(
+                ProviderLabelV1.from_value(item) for item in raw['labels']),
+            annotations=tuple(
+                ProviderAnnotationV1.from_value(item)
+                for item in raw['annotations']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'kind': self.kind.value,
+            'labels': [label.canonical_value() for label in self.labels],
+            'annotations': [
+                annotation.canonical_value() for annotation in self.annotations
+            ],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesServiceAccountPrerequisiteSpecV1(_CanonicalContract):
+    """One typed ServiceAccount projection used as prerequisite evidence."""
+
+    kind: ProviderKubernetesPrerequisiteKindV1
+    projection: ProviderKubernetesServiceAccountProjectionV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'kind', 'projection'})
+
+    def __post_init__(self) -> None:
+        kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
+                           self.kind,
+                           name='ServiceAccount prerequisite kind')
+        if kind is not ProviderKubernetesPrerequisiteKindV1.SERVICE_ACCOUNT:
+            raise ValueError(
+                'ServiceAccount prerequisite spec kind is invalid.')
+        object.__setattr__(self, 'kind', kind)
+        if not isinstance(self.projection,
+                          ProviderKubernetesServiceAccountProjectionV1):
+            raise TypeError('ServiceAccount prerequisite projection has an '
+                            'invalid type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls,
+            value: Any) -> 'ProviderKubernetesServiceAccountPrerequisiteSpecV1':
+        raw = _closed_object(value,
+                             name='ServiceAccount prerequisite spec',
+                             keys=cls._KEYS)
+        return cls(
+            kind=raw['kind'],
+            projection=ProviderKubernetesServiceAccountProjectionV1.from_value(
+                raw['projection']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'kind': self.kind.value,
+            'projection': self.projection.canonical_value(),
+        }
+
+
+_ProviderKubernetesManifestPrerequisiteSpecT = TypeVar(
+    '_ProviderKubernetesManifestPrerequisiteSpecT',
+    bound='_ProviderKubernetesManifestPrerequisiteSpecV1')
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProviderKubernetesManifestPrerequisiteSpecV1(_CanonicalContract):
+    """Shared closed representation for one manifest-backed prerequisite."""
+
+    kind: ProviderKubernetesPrerequisiteKindV1
+    contract: str
+    manifest: ProviderRepoArtifactRefV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'kind', 'contract', 'manifest'})
+    _EXPECTED_KIND: ClassVar[ProviderKubernetesPrerequisiteKindV1]
+    _EXPECTED_CONTRACT: ClassVar[str]
+
+    def __post_init__(self) -> None:
+        kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
+                           self.kind,
+                           name='manifest prerequisite kind')
+        if kind is not self._EXPECTED_KIND:
+            raise ValueError('manifest prerequisite spec kind is invalid.')
+        object.__setattr__(self, 'kind', kind)
+        if self.contract != self._EXPECTED_CONTRACT:
+            raise ValueError('manifest prerequisite contract is invalid.')
+        if not isinstance(self.manifest, ProviderRepoArtifactRefV1):
+            raise TypeError('prerequisite manifest has an invalid type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls: type[_ProviderKubernetesManifestPrerequisiteSpecT],
+                   value: Any) -> _ProviderKubernetesManifestPrerequisiteSpecT:
+        raw = _closed_object(
+            value,
+            name=f'{cls._EXPECTED_KIND.value} prerequisite spec',
+            keys=cls._KEYS)
+        return cls(kind=raw['kind'],
+                   contract=raw['contract'],
+                   manifest=ProviderRepoArtifactRefV1.from_value(
+                       raw['manifest']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'kind': self.kind.value,
+            'contract': self.contract,
+            'manifest': self.manifest.canonical_value(),
+        }
+
+
+class ProviderKubernetesNetworkPolicyPrerequisiteSpecV1(
+        _ProviderKubernetesManifestPrerequisiteSpecV1):
+    """Content-addressed NetworkPolicy prerequisite."""
+
+    _EXPECTED_KIND = ProviderKubernetesPrerequisiteKindV1.NETWORK_POLICY
+    _EXPECTED_CONTRACT = 'serve_action_network_policy_v1'
+
+
+class ProviderKubernetesValidatingAdmissionPolicyPrerequisiteSpecV1(
+        _ProviderKubernetesManifestPrerequisiteSpecV1):
+    """Content-addressed ValidatingAdmissionPolicy prerequisite."""
+
+    _EXPECTED_KIND = (
+        ProviderKubernetesPrerequisiteKindV1.VALIDATING_ADMISSION_POLICY)
+    _EXPECTED_CONTRACT = 'serve_action_validating_policy_v1'
+
+
+class ProviderKubernetesValidatingAdmissionPolicyBindingPrerequisiteSpecV1(
+        _ProviderKubernetesManifestPrerequisiteSpecV1):
+    """Content-addressed ValidatingAdmissionPolicyBinding prerequisite."""
+
+    _EXPECTED_KIND = (ProviderKubernetesPrerequisiteKindV1.
+                      VALIDATING_ADMISSION_POLICY_BINDING)
+    _EXPECTED_CONTRACT = 'serve_action_validating_binding_v1'
+
+
+ProviderKubernetesPrerequisiteSpecV1 = (
+    ProviderKubernetesNamespacePrerequisiteSpecV1 |
+    ProviderKubernetesServiceAccountPrerequisiteSpecV1 |
+    ProviderKubernetesNetworkPolicyPrerequisiteSpecV1 |
+    ProviderKubernetesValidatingAdmissionPolicyPrerequisiteSpecV1 |
+    ProviderKubernetesValidatingAdmissionPolicyBindingPrerequisiteSpecV1)
+
+
+def _provider_kubernetes_prerequisite_spec_from_value(
+        value: Any) -> ProviderKubernetesPrerequisiteSpecV1:
+    if not isinstance(value, Mapping):
+        raise TypeError('Kubernetes prerequisite spec must be an object.')
+    if 'kind' not in value:
+        raise ValueError('Kubernetes prerequisite spec is missing kind.')
+    kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
+                       value['kind'],
+                       name='Kubernetes prerequisite spec kind')
+    if kind is ProviderKubernetesPrerequisiteKindV1.NAMESPACE:
+        return ProviderKubernetesNamespacePrerequisiteSpecV1.from_value(value)
+    if kind is ProviderKubernetesPrerequisiteKindV1.SERVICE_ACCOUNT:
+        return ProviderKubernetesServiceAccountPrerequisiteSpecV1.from_value(
+            value)
+    if kind is ProviderKubernetesPrerequisiteKindV1.NETWORK_POLICY:
+        return ProviderKubernetesNetworkPolicyPrerequisiteSpecV1.from_value(
+            value)
+    if kind is ProviderKubernetesPrerequisiteKindV1.VALIDATING_ADMISSION_POLICY:
+        return ProviderKubernetesValidatingAdmissionPolicyPrerequisiteSpecV1.from_value(
+            value)
+    if kind is (ProviderKubernetesPrerequisiteKindV1.
+                VALIDATING_ADMISSION_POLICY_BINDING):
+        return ProviderKubernetesValidatingAdmissionPolicyBindingPrerequisiteSpecV1.from_value(
+            value)
+    raise AssertionError(f'unhandled Kubernetes prerequisite kind: {kind!r}')
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
+    """Pure typed identity and content commitment for one prerequisite."""
+
+    api_version: str
+    kind: ProviderKubernetesPrerequisiteKindV1
+    namespace: str | None
+    name: str
+    uid: str
+    resource_version: str
+    deletion_timestamp: None
+    spec: ProviderKubernetesPrerequisiteSpecV1
+    spec_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'api_version', 'kind', 'namespace', 'name', 'uid', 'resource_version',
+        'deletion_timestamp', 'spec', 'spec_sha256'
+    })
+    _SPEC_TYPES: ClassVar[tuple[type[Any], ...]] = (
+        ProviderKubernetesNamespacePrerequisiteSpecV1,
+        ProviderKubernetesServiceAccountPrerequisiteSpecV1,
+        ProviderKubernetesNetworkPolicyPrerequisiteSpecV1,
+        ProviderKubernetesValidatingAdmissionPolicyPrerequisiteSpecV1,
+        ProviderKubernetesValidatingAdmissionPolicyBindingPrerequisiteSpecV1,
+    )
+
+    def __post_init__(self) -> None:
+        kind = _enum_value(ProviderKubernetesPrerequisiteKindV1,
+                           self.kind,
+                           name='Kubernetes prerequisite kind')
+        object.__setattr__(self, 'kind', kind)
+        dispatch = PROVIDER_KUBERNETES_PREREQUISITE_KIND_MAP_V1[kind]
+        api_version = _text(self.api_version,
+                            name='Kubernetes prerequisite api_version')
+        if api_version != dispatch.api_version:
+            raise ValueError('Kubernetes prerequisite API version does not '
+                             'match its kind.')
+        object.__setattr__(self, 'api_version', api_version)
+        namespace = _optional_text(self.namespace,
+                                   name='Kubernetes prerequisite namespace',
+                                   maximum_bytes=_MAX_SHORT_TEXT_BYTES)
+        if ((dispatch.scope == 'cluster' and namespace is not None) or
+            (dispatch.scope == 'namespaced' and namespace is None)):
+            raise ValueError('Kubernetes prerequisite namespace does not match '
+                             'its kind scope.')
+        object.__setattr__(self, 'namespace', namespace)
+        for field in ('name', 'uid', 'resource_version'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field),
+                      name=f'Kubernetes prerequisite {field}'))
+        if self.deletion_timestamp is not None:
+            raise ValueError('Kubernetes prerequisite deletion_timestamp must '
+                             'be null.')
+        if not isinstance(self.spec, self._SPEC_TYPES):
+            raise TypeError('Kubernetes prerequisite spec has an invalid type.')
+        if self.spec.kind is not kind:
+            raise ValueError('Kubernetes prerequisite outer and spec kinds do '
+                             'not match.')
+        spec_sha256 = _sha256(self.spec_sha256,
+                              name='Kubernetes prerequisite spec_sha256')
+        if spec_sha256 != self.spec.sha256:
+            raise ValueError(
+                'Kubernetes prerequisite spec hash does not match.')
+        object.__setattr__(self, 'spec_sha256', spec_sha256)
+        if isinstance(self.spec,
+                      ProviderKubernetesServiceAccountPrerequisiteSpecV1):
+            projection = self.spec.projection
+            if (namespace != projection.namespace or
+                    self.name != projection.name or
+                    self.uid != projection.uid or
+                    self.resource_version != projection.resource_version):
+                raise ValueError('ServiceAccount prerequisite outer identity '
+                                 'does not match its projection.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesPrerequisiteV1':
+        raw = _closed_object(value,
+                             name='Kubernetes prerequisite',
+                             keys=cls._KEYS)
+        return cls(api_version=raw['api_version'],
+                   kind=raw['kind'],
+                   namespace=raw['namespace'],
+                   name=raw['name'],
+                   uid=raw['uid'],
+                   resource_version=raw['resource_version'],
+                   deletion_timestamp=raw['deletion_timestamp'],
+                   spec=_provider_kubernetes_prerequisite_spec_from_value(
+                       raw['spec']),
+                   spec_sha256=raw['spec_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'api_version': self.api_version,
+            'kind': self.kind.value,
+            'namespace': self.namespace,
+            'name': self.name,
+            'uid': self.uid,
+            'resource_version': self.resource_version,
+            'deletion_timestamp': None,
+            'spec': self.spec.canonical_value(),
+            'spec_sha256': self.spec_sha256,
         }
 
 
@@ -4256,6 +4644,261 @@ class ProviderLaunchSourceV1(_CanonicalContract):
             'service_version': self.service_version,
             'yaml_content_sha256': self.yaml_content_sha256,
             'workspace': self.workspace,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesObjectPlanV1(_CanonicalContract):
+    """One exact bounded CoreV1 object plan without artifact execution."""
+
+    sequence: int
+    role: ProviderObjectRoleV1
+    api_version: str
+    kind: ProviderPodTopologyMutableObjectKindV1
+    namespace: str
+    name: str
+    required_identity_labels: tuple[ProviderLabelV1, ...]
+    request_body: CanonicalJsonObject
+    request_body_sha256: str
+    requested_semantic: CanonicalJsonObject
+    requested_semantic_sha256: str
+    comparison_contract: str
+    normalization_profile: ProviderRepoArtifactRefV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'sequence', 'role', 'api_version', 'kind', 'namespace', 'name',
+        'required_identity_labels', 'request_body', 'request_body_sha256',
+        'requested_semantic', 'requested_semantic_sha256',
+        'comparison_contract', 'normalization_profile'
+    })
+    _DISPLAY_LABEL: ClassVar[str] = 'skypilot-cluster-name'
+    _CLUSTER_UUID_LABEL: ClassVar[str] = 'skypilot.co/cluster-record-uuid'
+    _REPLICA_UUID_LABEL: ClassVar[str] = (
+        'skypilot.co/serve-replica-incarnation')
+    _REQUIRED_LABEL_KEYS: ClassVar[tuple[str, ...]] = (
+        _DISPLAY_LABEL,
+        _CLUSTER_UUID_LABEL,
+        _REPLICA_UUID_LABEL,
+    )
+
+    def __post_init__(self) -> None:
+        sequence = _nonnegative_integer(self.sequence,
+                                        name='object_plan.sequence')
+        role_entry = _PROVIDER_KUBERNETES_OBJECT_ROLE_BY_SEQUENCE_V1.get(
+            sequence)
+        if role_entry is None:
+            raise ValueError('object plan sequence is unsupported.')
+        role = _enum_value(ProviderObjectRoleV1,
+                           self.role,
+                           name='object_plan.role')
+        kind = _enum_value(ProviderPodTopologyMutableObjectKindV1,
+                           self.kind,
+                           name='object_plan.kind')
+        if role is not role_entry.role or kind is not role_entry.kind:
+            raise ValueError(
+                'object plan sequence, role, and kind do not match.')
+        object.__setattr__(self, 'sequence', sequence)
+        object.__setattr__(self, 'role', role)
+        object.__setattr__(self, 'kind', kind)
+        if self.api_version != 'v1':
+            raise ValueError('object plan api_version must be v1.')
+        object.__setattr__(
+            self, 'namespace',
+            _text(self.namespace,
+                  name='object_plan.namespace',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(self, 'name',
+                           _dns_label(self.name, name='object_plan.name'))
+        labels = _provider_label_tuple(
+            self.required_identity_labels,
+            name='object plan required identity labels')
+        label_keys = tuple(label.key for label in labels)
+        if label_keys != self._REQUIRED_LABEL_KEYS:
+            raise ValueError('object plan requires the exact three sorted '
+                             'identity label keys.')
+        label_values = {label.key: label.value for label in labels}
+        for key in (self._CLUSTER_UUID_LABEL, self._REPLICA_UUID_LABEL):
+            _uuid(label_values[key], name=f'object plan label {key}')
+        name_suffix = ('-head-ssh' if role
+                       is ProviderObjectRoleV1.HEAD_SSH_SERVICE else '-head')
+        if (not self.name.endswith(name_suffix) or
+                len(self.name) == len(name_suffix)):
+            raise ValueError('object plan name does not match its role suffix.')
+        provider_cluster_name = self.name[:-len(name_suffix)]
+        if label_values[self._DISPLAY_LABEL] != provider_cluster_name:
+            raise ValueError(
+                'object plan display identity label does not match '
+                'its generated name.')
+        object.__setattr__(self, 'required_identity_labels', labels)
+        if not isinstance(self.request_body, CanonicalJsonObject):
+            raise TypeError('object plan request_body has an invalid type.')
+        if not isinstance(self.requested_semantic, CanonicalJsonObject):
+            raise TypeError(
+                'object plan requested_semantic has an invalid type.')
+        request_body_sha256 = _sha256(self.request_body_sha256,
+                                      name='object_plan.request_body_sha256')
+        if request_body_sha256 != self.request_body.sha256:
+            raise ValueError('object plan request body hash does not match.')
+        object.__setattr__(self, 'request_body_sha256', request_body_sha256)
+        requested_semantic_sha256 = _sha256(
+            self.requested_semantic_sha256,
+            name='object_plan.requested_semantic_sha256')
+        if requested_semantic_sha256 != self.requested_semantic.sha256:
+            raise ValueError('object plan requested semantic hash does not '
+                             'match.')
+        object.__setattr__(self, 'requested_semantic_sha256',
+                           requested_semantic_sha256)
+        if self.comparison_contract != 'kubernetes_admitted_object_v1':
+            raise ValueError('object plan comparison contract is unsupported.')
+        if not isinstance(self.normalization_profile,
+                          ProviderRepoArtifactRefV1):
+            raise TypeError('object plan normalization profile has an invalid '
+                            'type.')
+        self._validate_request_body(label_values)
+        _ = self.canonical_bytes
+
+    def _validate_request_body(self, required_labels: Mapping[str,
+                                                              str]) -> None:
+        body = self.request_body.canonical_value()
+        if body.get('apiVersion') != self.api_version:
+            raise ValueError('object plan request body apiVersion does not '
+                             'match.')
+        if body.get('kind') != self.kind.value:
+            raise ValueError('object plan request body kind does not match.')
+        metadata = body.get('metadata')
+        if not isinstance(metadata, dict):
+            raise ValueError('object plan request body metadata must be an '
+                             'object.')
+        if (metadata.get('namespace') != self.namespace or
+                metadata.get('name') != self.name):
+            raise ValueError('object plan request body metadata identity does '
+                             'not match.')
+        body_labels = metadata.get('labels')
+        if not isinstance(body_labels, dict):
+            raise ValueError('object plan request body metadata.labels must be '
+                             'an object.')
+        if any(
+                body_labels.get(key) != value
+                for key, value in required_labels.items()):
+            raise ValueError('object plan request body is missing a required '
+                             'identity label.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesObjectPlanV1':
+        shallow = _closed_object_shallow(value,
+                                         name='Kubernetes object plan',
+                                         keys=cls._KEYS)
+        request_body = CanonicalJsonObject.from_value(shallow['request_body'])
+        requested_semantic = CanonicalJsonObject.from_value(
+            shallow['requested_semantic'])
+        raw = _closed_object(shallow,
+                             name='Kubernetes object plan',
+                             keys=cls._KEYS)
+        labels = raw['required_identity_labels']
+        if not isinstance(labels, list):
+            raise TypeError('object plan required_identity_labels must be a '
+                            'list.')
+        return cls(sequence=raw['sequence'],
+                   role=raw['role'],
+                   api_version=raw['api_version'],
+                   kind=raw['kind'],
+                   namespace=raw['namespace'],
+                   name=raw['name'],
+                   required_identity_labels=tuple(
+                       ProviderLabelV1.from_value(label) for label in labels),
+                   request_body=request_body,
+                   request_body_sha256=raw['request_body_sha256'],
+                   requested_semantic=requested_semantic,
+                   requested_semantic_sha256=raw['requested_semantic_sha256'],
+                   comparison_contract=raw['comparison_contract'],
+                   normalization_profile=ProviderRepoArtifactRefV1.from_value(
+                       raw['normalization_profile']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'sequence': self.sequence,
+            'role': self.role.value,
+            'api_version': 'v1',
+            'kind': self.kind.value,
+            'namespace': self.namespace,
+            'name': self.name,
+            'required_identity_labels': [
+                label.canonical_value()
+                for label in self.required_identity_labels
+            ],
+            'request_body': self.request_body.canonical_value(),
+            'request_body_sha256': self.request_body_sha256,
+            'requested_semantic': self.requested_semantic.canonical_value(),
+            'requested_semantic_sha256': self.requested_semantic_sha256,
+            'comparison_contract': 'kubernetes_admitted_object_v1',
+            'normalization_profile':
+                self.normalization_profile.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesRendererV1(_CanonicalContract):
+    """Typed renderer artifact references without resolving their content."""
+
+    contract: str
+    outer_template: ProviderRepoArtifactRefV1
+    node_fragment: ProviderRepoArtifactRefV1
+    binding_schema: ProviderRepoArtifactRefV1
+    config_access_inventory: ProviderRepoArtifactRefV1
+    admitted_object_normalization: ProviderRepoArtifactRefV1
+    source: ProviderLaunchSourceV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'contract', 'outer_template', 'node_fragment', 'binding_schema',
+        'config_access_inventory', 'admitted_object_normalization', 'source'
+    })
+    _ARTIFACT_FIELDS: ClassVar[tuple[str, ...]] = (
+        'outer_template',
+        'node_fragment',
+        'binding_schema',
+        'config_access_inventory',
+        'admitted_object_normalization',
+    )
+
+    def __post_init__(self) -> None:
+        if self.contract != 'serve_prebooted_direct_pod_v1':
+            raise ValueError('Kubernetes renderer contract is unsupported.')
+        for field in self._ARTIFACT_FIELDS:
+            if not isinstance(getattr(self, field), ProviderRepoArtifactRefV1):
+                raise TypeError(f'Kubernetes renderer {field} has an invalid '
+                                'type.')
+        if not isinstance(self.source, ProviderLaunchSourceV1):
+            raise TypeError('Kubernetes renderer source has an invalid type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderKubernetesRendererV1':
+        raw = _closed_object(value, name='Kubernetes renderer', keys=cls._KEYS)
+        return cls(
+            contract=raw['contract'],
+            outer_template=ProviderRepoArtifactRefV1.from_value(
+                raw['outer_template']),
+            node_fragment=ProviderRepoArtifactRefV1.from_value(
+                raw['node_fragment']),
+            binding_schema=ProviderRepoArtifactRefV1.from_value(
+                raw['binding_schema']),
+            config_access_inventory=ProviderRepoArtifactRefV1.from_value(
+                raw['config_access_inventory']),
+            admitted_object_normalization=ProviderRepoArtifactRefV1.from_value(
+                raw['admitted_object_normalization']),
+            source=ProviderLaunchSourceV1.from_value(raw['source']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'contract': 'serve_prebooted_direct_pod_v1',
+            'outer_template': self.outer_template.canonical_value(),
+            'node_fragment': self.node_fragment.canonical_value(),
+            'binding_schema': self.binding_schema.canonical_value(),
+            'config_access_inventory':
+                self.config_access_inventory.canonical_value(),
+            'admitted_object_normalization':
+                self.admitted_object_normalization.canonical_value(),
+            'source': self.source.canonical_value(),
         }
 
 
