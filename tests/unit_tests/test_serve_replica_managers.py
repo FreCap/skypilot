@@ -8287,6 +8287,74 @@ class TestPaidLocationLaunchBudget:
         assert manager._next_replica_id == 9
         assert len(manager._launch_thread_pool) == 8
 
+    def test_aged_full_frontier_opens_only_one_target_backed_third_pool(self):
+        primary = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        hedge = make_location('us-west-2', {'L4': 4}, cloud_name='AWS')
+        third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({primary: 1.0, hedge: 2.0, third: 3.0})
+        manager._service_hash = 'hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        locations = (primary, hedge, third)
+        keys = {
+            location: paid_capacity.pool_key(
+                location, workspace='default',
+                num_nodes=1) for location in locations
+        }
+        budget = paid_capacity.LaunchBudget(
+            remaining_by_location={
+                primary: 0,
+                hedge: 0,
+                third: 4
+            },
+            pool_key_by_location=keys,
+            states_by_pool_key={},
+            globally_managed=True,
+            service_remaining=8,
+            frontier_limit=2,
+            max_frontier_limit=3,
+            frontier_feedback_delay_seconds=30,
+            frontier_key_by_location={
+                location: ('l4',) for location in locations
+            },
+            failure_domain_by_location={
+                location: paid_capacity.failure_domain(location)
+                for location in locations
+            },
+            owned_pool_keys_by_frontier={('l4',): {keys[primary], keys[hedge]}},
+            newest_claimed_at_by_pool_key={
+                keys[primary]: 0,
+                keys[hedge]: 0,
+            })
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(paid_capacity,
+                               'build_launch_budget',
+                               return_value=budget), \
+             mock.patch.object(
+                 paid_capacity,
+                 'try_persist_claim',
+                 return_value=paid_capacity.ClaimResult.ACQUIRED) as claim, \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            manager._scale_up_batch_locked([{'use_spot': True}] * 400)
+
+        assert [call.kwargs['location'] for call in claim.call_args_list
+               ] == [third] * 4
+        assert budget.frontier_limit_overrides == {('l4',): 3}
+        assert budget.service_remaining == 4
+        assert manager._next_replica_id == 5
+        assert len(manager._launch_thread_pool) == 4
+
     def test_atomic_frontier_rejection_persists_nothing(self):
         primary = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
         manager = self._manager({primary: 1.0})

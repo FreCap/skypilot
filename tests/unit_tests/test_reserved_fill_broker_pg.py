@@ -1784,6 +1784,87 @@ class TestPaidCapacityAuthorityPG:
         assert waiters == []
         assert set(pools) == {pool_a, winner_pool}
 
+    def test_expanded_frontier_race_admits_only_one_third_pool(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        location_a, pool_a = self._paid_pool('us-east-1a', 'g6.xlarge')
+        _, pool_b = self._paid_pool('us-east-1b', 'g6.2xlarge')
+        _, pool_c = self._paid_pool('us-east-1c', 'g6.4xlarge')
+        _, pool_d = self._paid_pool('us-east-1d', 'g6.8xlarge')
+        frontier_key = paid_capacity.frontier_key(location_a)
+
+        def _claim(replica_id: int, pool_key: str) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                self._info('svc', replica_id),
+                pool_key=pool_key,
+                priority=20,
+                base_limit=4,
+                max_limit=16,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'),
+                frontier_key=frontier_key,
+                frontier_limit=3,
+                frontier_default_limit=2,
+                frontier_limits_by_key={frontier_key: 3})
+
+        assert _claim(1, pool_a) == 'acquired'
+        assert _claim(2, pool_b) == 'acquired'
+        barrier = threading.Barrier(2)
+        results = {}
+        errors = []
+        result_lock = threading.Lock()
+
+        def _race(replica_id: int, pool_key: str) -> None:
+            try:
+                barrier.wait(timeout=20)
+                result = _claim(replica_id, pool_key)
+                with result_lock:
+                    results[replica_id] = result
+            except Exception as e:  # pylint: disable=broad-except
+                errors.append(e)
+
+        candidates = {3: pool_c, 4: pool_d}
+        threads = [
+            threading.Thread(target=_race, args=(replica_id, pool_key))
+            for replica_id, pool_key in candidates.items()
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), 'expanded frontier thread hung'
+
+        assert not errors, errors
+        assert list(results.values()).count('acquired') == 1
+        assert list(results.values()).count('feedback_pending') == 1
+        winner_id = next(replica_id for replica_id, result in results.items()
+                         if result == 'acquired')
+        winner_pool = candidates[winner_id]
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claims = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.replica_id,
+                    serve_state.paid_capacity_claims_table.c.pool_key).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc')).all()
+            pools = session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_pools_table.c.
+                                  pool_key)).scalars().all()
+
+        assert set(claims) == {
+            (1, pool_a),
+            (2, pool_b),
+            (winner_id, winner_pool),
+        }
+        assert set(pools) == {pool_a, pool_b, winner_pool}
+
     def test_paid_claim_redrive_cannot_change_exact_pool(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
@@ -1900,6 +1981,58 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         assert _claim('low', 'hash-low', 11, 2, pool_a, 20, 105) == 'acquired'
+
+    def test_waiter_cleanup_uses_per_card_dynamic_frontier_limits(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        l4_location, l4_a = self._paid_pool('us-east-1a', 'g6.xlarge')
+        _, l4_b = self._paid_pool('us-east-1b', 'g6.2xlarge')
+        _, l4_waiter = self._paid_pool('us-east-1c', 'g6.4xlarge')
+        a100_location, a100_a = self._paid_pool('us-east-1a',
+                                                'p4d.24xlarge',
+                                                accelerator='A100')
+        _, a100_b = self._paid_pool('us-east-1b',
+                                    'p4de.24xlarge',
+                                    accelerator='A100')
+        _, a100_waiter = self._paid_pool('us-east-1c',
+                                         'p4d.48xlarge',
+                                         accelerator='A100')
+        pool_keys = (l4_a, l4_b, l4_waiter, a100_a, a100_b, a100_waiter)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                sqlalchemy.insert(serve_state.paid_capacity_pools_table), [{
+                    'pool_key': pool_key,
+                    'current_limit': 4,
+                    'successes_since_resize': 0,
+                    'updated_at': 100,
+                } for pool_key in pool_keys])
+            session.execute(
+                sqlalchemy.insert(serve_state.paid_capacity_waiters_table), [{
+                    'pool_key': pool_key,
+                    'service_name': 'svc',
+                    'service_hash': 'hash',
+                    'priority': 20,
+                    'first_wait_at': 100,
+                    'heartbeat_at': 100,
+                } for pool_key in (l4_waiter, a100_waiter)])
+            serve_state._withdraw_ineligible_frontier_waiters_in_session(
+                session,
+                'svc',
+                'hash', [(1, l4_a), (2, l4_b), (3, a100_a), (4, a100_b)],
+                frontier_limit=2,
+                frontier_limits_by_key={
+                    paid_capacity.frontier_key(l4_location): 3,
+                    paid_capacity.frontier_key(a100_location): 2,
+                })
+            session.commit()
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            waiters = session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_waiters_table.c.
+                                  pool_key)).scalars().all()
+        assert waiters == [l4_waiter]
 
     def test_post_commit_waiter_cleanup_failure_keeps_claim_durable(
             self, broker_engine, monkeypatch):
