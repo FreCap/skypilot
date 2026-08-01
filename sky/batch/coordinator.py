@@ -381,20 +381,25 @@ class BatchCoordinator:
         if not within_deadline:
             return
         if succeeded:
-            for record in records:
-                if record['coordinator_token'] != self._worker_token:
-                    continue
+
+            async def _cleanup_durable_worker(record: dict[str, Any]) -> bool:
                 within_deadline, worker_job_id = (
                     await _resolve_durable_worker_job_id(record))
                 if not within_deadline:
-                    return
+                    return False
                 if worker_job_id is None:
-                    continue
+                    return True
                 worker_job_id = int(worker_job_id)
-                if not await _cancel_exact(record['worker_cluster'],
+                return await _cancel_exact(record['worker_cluster'],
                                            worker_job_id,
-                                           record['coordinator_token']):
-                    return
+                                           record['coordinator_token'])
+
+            durable_cleanup_results = await asyncio.gather(
+                *(_cleanup_durable_worker(record)
+                  for record in records
+                  if record['coordinator_token'] == self._worker_token))
+            if not all(durable_cleanup_results):
+                return
 
         while loop.time() < deadline:
             with self._active_workers_lock:

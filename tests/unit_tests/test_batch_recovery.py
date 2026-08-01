@@ -2287,34 +2287,27 @@ async def test_superseded_cleanup_queries_each_owned_cluster_once(monkeypatch):
 
     await batch_coordinator.handle_superseded(timeout=1)
 
-    assert queue.call_args_list == [
-        mock.call('worker-a', skip_finished=True),
-        mock.call('worker-b', skip_finished=True),
+    assert sorted(call.args[0] for call in queue.call_args_list) == [
+        'worker-a', 'worker-b'
     ]
-    assert get.call_args_list == [
-        mock.call('queue-worker-a'),
-        mock.call('cancel-17'),
-        mock.call('queue-worker-b'),
-        mock.call('cancel-18'),
+    assert sorted(call.args[0] for call in get.call_args_list) == [
+        'cancel-17', 'cancel-18', 'queue-worker-a', 'queue-worker-b'
     ]
-    assert cancel.call_args_list == [
-        mock.call('worker-a', job_ids=[17]),
-        mock.call('worker-b', job_ids=[18]),
-    ]
+    assert sorted((call.args[0], tuple(call.kwargs['job_ids']))
+                  for call in cancel.call_args_list) == [('worker-a', (17,)),
+                                                         ('worker-b', (18,))]
     persist_job_id.assert_has_calls([
         mock.call(1, batch_coordinator._worker_token, 'worker-a', 17),
         mock.call(1, batch_coordinator._worker_token, 'worker-b', 18),
-    ])
+    ],
+                                    any_order=True)
     remove_record.assert_has_calls([
-        mock.call(1,
-                  batch_coordinator._worker_token,
-                  'worker-a',
-                  worker_job_id=17),
-        mock.call(1,
-                  batch_coordinator._worker_token,
-                  'worker-b',
-                  worker_job_id=18),
-    ])
+        mock.call(
+            1, batch_coordinator._worker_token, 'worker-a', worker_job_id=17),
+        mock.call(
+            1, batch_coordinator._worker_token, 'worker-b', worker_job_id=18),
+    ],
+                                   any_order=True)
 
 
 @pytest.mark.asyncio
@@ -2370,6 +2363,103 @@ async def test_superseded_cleanup_durable_timeout_starts_no_later_call(
     persist_job_id.assert_not_called()
     cancel.assert_not_called()
     remove_record.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_fans_out_durable_workers(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    records = [{
+        'coordinator_token': batch_coordinator._worker_token,
+        'worker_cluster': 'worker-a',
+        'worker_job_name': 'batch-worker-1-owner-a',
+        'worker_job_id': None,
+        'launch_request_id': 'launch-a',
+    }, {
+        'coordinator_token': batch_coordinator._worker_token,
+        'worker_cluster': 'worker-b',
+        'worker_job_name': 'batch-worker-1-owner-b',
+        'worker_job_id': None,
+        'launch_request_id': None,
+    }]
+    launch_recovery_entered = threading.Event()
+    release_launch_recovery = threading.Event()
+    sibling_cancelled = threading.Event()
+    events = []
+
+    def _get(request_id):
+        events.append(('get', request_id))
+        if request_id == 'launch-a':
+            launch_recovery_entered.set()
+            release_launch_recovery.wait(timeout=5)
+            return 17
+        if request_id == 'queue-worker-b':
+            return [
+                types.SimpleNamespace(job_id=18,
+                                      job_name='batch-worker-1-owner-b')
+            ]
+        if request_id == 'cancel-17':
+            return None
+        if request_id == 'cancel-18':
+            return None
+        raise AssertionError(f'unexpected sdk.get request {request_id!r}')
+
+    def _queue(cluster_name, **_):
+        events.append(('queue', cluster_name))
+        assert cluster_name == 'worker-b'
+        return 'queue-worker-b'
+
+    def _cancel(cluster_name, job_ids):
+        events.append(('cancel', cluster_name, job_ids))
+        if cluster_name == 'worker-a':
+            assert job_ids == [17]
+            return 'cancel-17'
+        assert cluster_name == 'worker-b'
+        assert job_ids == [18]
+        sibling_cancelled.set()
+        return 'cancel-18'
+
+    persist_job_id = mock.Mock(return_value=True)
+    remove_record = mock.Mock(return_value=True)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(return_value=records))
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(side_effect=_get))
+    monkeypatch.setattr(coordinator.sdk, 'queue', mock.Mock(side_effect=_queue))
+    monkeypatch.setattr(coordinator.sdk, 'cancel',
+                        mock.Mock(side_effect=_cancel))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id', persist_job_id)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+
+    cleanup = asyncio.create_task(
+        batch_coordinator.handle_superseded(timeout=2))
+    try:
+        assert await asyncio.to_thread(launch_recovery_entered.wait, 1)
+        assert await asyncio.to_thread(sibling_cancelled.wait, 1)
+    finally:
+        release_launch_recovery.set()
+        await asyncio.gather(cleanup, return_exceptions=True)
+
+    sibling_events = [
+        event for event in events
+        if any(value == 'worker-b' or value == 'queue-worker-b' or
+               value == 'cancel-18' for value in event)
+    ]
+    assert sibling_events == [
+        ('queue', 'worker-b'),
+        ('get', 'queue-worker-b'),
+        ('cancel', 'worker-b', [18]),
+        ('get', 'cancel-18'),
+    ]
+    persist_job_id.assert_has_calls(
+        [mock.call(1, batch_coordinator._worker_token, 'worker-b', 18)])
+    remove_record.assert_has_calls([
+        mock.call(1,
+                  batch_coordinator._worker_token,
+                  'worker-b',
+                  worker_job_id=18)
+    ])
 
 
 @pytest.mark.asyncio
