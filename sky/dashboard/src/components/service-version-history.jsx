@@ -25,6 +25,7 @@ import {
   electServiceVersion,
   getServiceVersions,
 } from '@/data/connectors/services';
+import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
 import { formatYaml } from '@/lib/yamlUtils';
 import { TimestampWithTooltip } from '@/components/utils';
 
@@ -298,11 +299,96 @@ function SplitYamlDiff({ elected, selected, onClose }) {
   );
 }
 
+function VersionYamlViewer({ version, onClose }) {
+  const [yamlKind, setYamlKind] = useState('submitted');
+  const [isCopied, setIsCopied] = useState(false);
+  const yamlField =
+    yamlKind === 'submitted'
+      ? 'submitted_yaml_content'
+      : 'compiled_yaml_content';
+  const yamlContent = version[yamlField];
+  const yamlAvailable = Boolean(
+    typeof yamlContent === 'string' && yamlContent.trim()
+  );
+  const formattedYaml = useMemo(
+    () => (yamlAvailable ? formatYaml(yamlContent) : ''),
+    [yamlAvailable, yamlContent]
+  );
+
+  const selectYamlKind = (kind) => {
+    setYamlKind(kind);
+    setIsCopied(false);
+  };
+
+  const copyYaml = async () => {
+    try {
+      await navigator.clipboard.writeText(formattedYaml);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch (copyError) {
+      console.error('Failed to copy version YAML to clipboard:', copyError);
+    }
+  };
+
+  return (
+    <div className="border-t px-3 py-3">
+      <div className="mb-2 flex items-center justify-between gap-3 text-sm">
+        <div className="flex items-center gap-3">
+          <span className="font-medium">Version {version.version} YAML</span>
+          <div className="flex rounded-md border p-0.5">
+            {['submitted', 'compiled'].map((kind) => (
+              <Button
+                key={kind}
+                variant={yamlKind === kind ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-6 px-2 text-xs capitalize"
+                onClick={() => selectYamlKind(kind)}
+              >
+                {kind}
+              </Button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-1">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={copyYaml}
+            disabled={!yamlAvailable}
+          >
+            {isCopied ? 'Copied!' : 'Copy YAML'}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={onClose}
+          >
+            Close
+          </Button>
+        </div>
+      </div>
+
+      {yamlAvailable ? (
+        <YamlCodeBlock value={formattedYaml} maxHeight="65vh" readOnly />
+      ) : (
+        <div className="rounded-md border bg-gray-50 p-4 text-center text-sm text-gray-500">
+          {yamlKind === 'submitted'
+            ? 'Submitted YAML was not retained for this version.'
+            : 'Compiled YAML is unavailable for this version.'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [history, setHistory] = useState(null);
   const [selectedVersion, setSelectedVersion] = useState(null);
+  const [viewedVersion, setViewedVersion] = useState(null);
   const [electingVersion, setElectingVersion] = useState(null);
   const [error, setError] = useState(null);
   const loadGeneration = useRef(0);
@@ -332,6 +418,7 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
     setLoading(true);
     setHistory(null);
     setSelectedVersion(null);
+    setViewedVersion(null);
     setError(null);
     (async () => {
       try {
@@ -368,6 +455,12 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
       ) || null,
     [history, selectedVersion]
   );
+  const viewed = useMemo(
+    () =>
+      history?.versions?.find((version) => version.version === viewedVersion) ||
+      null,
+    [history, viewedVersion]
+  );
 
   if (!isAdmin && !loading) {
     return (
@@ -388,6 +481,7 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
       await electServiceVersion(serviceName, version);
       await loadHistory();
       setSelectedVersion(null);
+      setViewedVersion(null);
       if (onElectionComplete) await onElectionComplete();
     } catch (electionError) {
       setError(electionError.message);
@@ -445,7 +539,10 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
                 <TableRow
                   key={version.version}
                   data-state={
-                    selectedVersion === version.version ? 'selected' : undefined
+                    selectedVersion === version.version ||
+                    viewedVersion === version.version
+                      ? 'selected'
+                      : undefined
                   }
                 >
                   <TableCell className="px-2 py-1.5 font-medium">
@@ -486,12 +583,28 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
                   </TableCell>
                   <TableCell className="px-2 py-1.5">
                     <div className="flex justify-end gap-1.5">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        aria-label={`View YAML for version ${version.version}`}
+                        aria-pressed={viewedVersion === version.version}
+                        onClick={() => {
+                          setViewedVersion(version.version);
+                          setSelectedVersion(null);
+                        }}
+                      >
+                        View YAML
+                      </Button>
                       {!version.elected && elected && (
                         <Button
                           variant="outline"
                           size="sm"
                           className="h-7 px-2 text-xs"
-                          onClick={() => setSelectedVersion(version.version)}
+                          onClick={() => {
+                            setSelectedVersion(version.version);
+                            setViewedVersion(null);
+                          }}
                         >
                           Compare
                         </Button>
@@ -515,6 +628,14 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
             </TableBody>
           </Table>
         </div>
+      )}
+
+      {viewed && (
+        <VersionYamlViewer
+          key={viewed.version}
+          version={viewed}
+          onClose={() => setViewedVersion(null)}
+        />
       )}
 
       {selected && elected && (
