@@ -5431,16 +5431,12 @@ ambiguous provider response, readback, and cleanup.
 
 Removal is part of completion, not optional follow-up.
 
-The Markdown table below remains authoritative for this design-only review.
-The mandatory next slice, before another compatibility artifact is
-implemented, adds the canonical executable manifest
-`docs/designs/provider-lifecycle-actuation-removals.yaml`, the checker
-`tools/check_lifecycle_removals.py`, focused checker tests, and a CI invocation.
-That slice must transcribe every current row into exact artifacts rather than
-claiming that the files already exist. Once merged, the manifest becomes
-authoritative and this table becomes its generated or manually verified human
-summary. Every manifest row has a stable `PLA-(BASE|M[0-7])-NNN` ID and
-records:
+The canonical executable ledger is
+`docs/designs/provider-lifecycle-actuation-removals.yaml`. It is validated by
+`tools/check_lifecycle_removals.py`, focused checker tests, and static-analysis
+CI. The manifest is authoritative; the Markdown table below is its manually
+verified human summary. Every manifest row has a stable
+`PLA-(BASE|M[0-7])-NNN` ID and records:
 
 - milestone, introducing commit, obligation, disposition, and exact domain,
   store, provider, and operation scope;
@@ -5452,12 +5448,26 @@ records:
 - the only retained-reference allowlist, recorded evidence, any external
   blocker, and the final removal commit and deployment proof.
 
+Known inventory that cannot yet be assigned safely to an executable removal
+row is never omitted. It is recorded under the required top-level
+`coverage_gaps` list with a stable `PLA-GAP-NNN` ID, exact candidate symbols,
+an owning milestone and responsibility, a reason it cannot yet be split, and
+an explicit closure gate. Current-phase validation resolves every candidate
+symbol. Final-phase validation rejects every remaining coverage gap. Artifact
+references to a manifest artifact or coverage gap must resolve to a declared
+ID.
+
 Line numbers are evidence, never identity. Broad scopes such as `migrated` or
 `all promoted providers` are invalid until expanded into exact rows. Semantic
-AST and PostgreSQL catalog checks are authoritative; `rg` is supplementary.
-Released Alembic files are `retain_history` artifacts and remain byte-identical.
-Their live tables, columns, checks, indexes, runtime metadata, and imports are
-separate `must_contract` artifacts removed only by a new forward migration.
+AST checks are authoritative for Python identity. Source-structural checks
+identify SQL objects, while live PostgreSQL catalog proof remains an explicit
+schema gate; `rg` is supplementary. Released migration files are
+`retain_history` artifacts and remain byte-identical. Their live tables,
+columns, checks, indexes, runtime metadata, and imports are separate
+`must_contract` artifacts removed only by a new forward migration.
+A planned `retain_history` row reserves the exact future migration path and
+linked contraction IDs with a null checksum. The checksum and introducing SHA
+become mandatory as soon as that migration exists.
 
 Statuses are `planned`, `present`, `gating`, `ready_to_remove`,
 `removal_in_progress`, `removed`, `blocked`, and `retained_verified`.
@@ -5472,7 +5482,7 @@ are `delete_file`, `delete_symbol`, `delete_branch`, `delete_enum_member`,
 `replace_content`, `contract_live_schema`, `retain_history`, or
 `retain_characterization`. Locator kinds are `python_symbol`,
 `python_attribute`, `python_call_within`, `python_enum_member`,
-`python_ast_pattern`, `path`, `packaged_path`, `sql_object`,
+`python_ast_pattern`, `file_digest`, `path`, `packaged_path`, `sql_object`,
 `runtime_metadata`, `runtime_import`, or `test_node`.
 
 The checker rejects a line-only locator, a wildcard provider or store, an
@@ -5483,7 +5493,28 @@ may enter `blocked` only with `blocked_from_status`, owner, issue, and evidence,
 and may resume only to that recorded status. `removed` requires removal SHA,
 exact-head CI, every source and schema gate, and deployment evidence for a
 runtime-affecting artifact. `retain_history` requires a SHA-256 checksum and
-linked live-schema contraction rows.
+linked live-schema contraction rows. Every `introduced_by` SHA must resolve to
+a commit on the checked HEAD ancestry. CI therefore fetches full history for
+this job. A dependency must already be `removed`, or `retained_verified` for a
+retention obligation, before a dependent artifact can become
+`ready_to_remove`, `removal_in_progress`, or `removed`.
+
+The checker rejects YAML aliases that share mutable gate or evidence objects
+between artifacts. It validates exact qualified calls without accepting a
+same-suffix call on a different owner. A `file_digest` locator is available
+for an exact byte-level compatibility body. Every live SQL contraction must
+have one reverse-linked immutable `retain_history` owner for the migration
+that introduced it, and a migration path cannot have multiple history owners.
+A planned future migration may reserve its exact path without a checksum, but
+must add its checksum and introduction provenance as soon as it exists.
+
+Terminal evidence keeps four facts separate: the removal commit, full CI on
+that exact head, the normal merge commit with both parents, and, for runtime
+artifacts, deployment of the merge commit. Passing local tests, deploying an
+unmerged head, or recording a merge without its exact tested second parent
+cannot complete a row. In a Git checkout, every proof SHA must exist on the
+checked HEAD ancestry and the recorded first and second parents must equal the
+actual parents of a normal two-parent merge commit.
 
 Every retained local or controller SQLite compatibility row is
 `must_remove`. Product deprecation may satisfy its gate, but the artifact is
