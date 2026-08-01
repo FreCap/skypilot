@@ -1436,6 +1436,52 @@ service/owner lock; the promotion transaction locks service, live replicas,
 cleanup intents, coverage by decision ID, coverage-attempts, parents, then
 children before rechecking the minimum 24-hour window and all blockers.
 
+The same locked scan computes `ServeShadowCoverageInventoryV1`; it does not
+trust the caller's `shadow_coverage_complete` Boolean.  Its canonical JSON
+preimage is:
+
+```text
+{
+  version: 1,
+  service_name,
+  service_hash,
+  candidate_since,  # canonical UTC RFC 3339 with six fractional digits
+  decisions: [      # ascending UUID bytes
+    {
+      decision_id,
+      coverage,             # exact CoverageDecisionV1 or null
+      cohort_reference,     # null or {reference: exact
+                            # WorkerCohortReferenceInputV1, reference_state,
+                            # revision, created_at, bound_at, released_at}
+      replica_links,        # ascending (replica_id, action_type); each has
+                            # replica incarnation/generation, coverage ID,
+                            # and represented-sample ID
+      represented_parent,   # null or {would_be_action_id,
+                            # immutable_spec_sha256, provider_plan_sha256,
+                            # phase, parity_class, revision, created_at,
+                            # updated_at, completed_at}
+      coverage_attempts     # exact CoverageAttemptV1 values in sequence order
+    }
+  ]
+}
+```
+
+The decision-ID set is the union of candidate-window coverage, candidate-window
+parents, every nonnull live-replica launch/down coverage or represented-sample
+link, and every non-`RELEASED` cohort reference for this service hash.  A
+coverage-referenced released reference is also projected.  Typed readers first
+recompute every embedded row contract and payload hash; the inventory excludes
+represented children only because the same locked audit independently validates
+their complete parity graph.  The scan fails closed with an explicit promotion
+blocker above 10,000 decisions or 100,000 combined coverage-attempt and replica-
+link rows.  `coverage_inventory_sha256` is lowercase SHA-256 of this canonical
+preimage.  `PromotionBlockerReport` returns the recomputed value, and the
+authority transition requires byte equality with the fresh
+`ActivationGateEvidenceV1.coverage_inventory_sha256` while retaining the same
+locks.  Missing coverage, an unlinked reference, or a malformed row is a
+blocker and remains represented in the inventory; it is never omitted to make
+the caller's evidence match.
+
 The compound admission helper first locks and revalidates the service name,
 incarnation hash, controller owner, nonnull lifecycle epoch, and `shadow` mode;
 then it admits/links coverage and the optional parent in the caller's
