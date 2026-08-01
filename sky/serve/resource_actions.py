@@ -19,6 +19,7 @@ import uuid
 
 from sky.container_images import models as container_image_models
 from sky.server.requests import resource_actions as kernel_actions
+from sky.utils import common_utils
 
 _MAX_OBJECT_BYTES = 65_536
 _MAX_TEXT_BYTES = 1_024
@@ -537,6 +538,89 @@ class _CanonicalContract:
     @property
     def sha256(self) -> str:
         return canonical_sha256(self.canonical_value())
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderWorkloadNameBasisV1(_CanonicalContract):
+    """Frozen inputs for deterministic provider workload names."""
+
+    version: int
+    display_name: str
+    frozen_user_hash: str
+    max_length: int
+    cluster_name_hash_length: int
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'display_name', 'frozen_user_hash', 'max_length',
+        'cluster_name_hash_length'
+    })
+    _MAX_LENGTH: ClassVar[int] = 42
+    _CLUSTER_NAME_HASH_LENGTH: ClassVar[int] = 8
+    # Reserve one display-name character and the two separating dashes when a
+    # long display name needs its collision-resistant hash.
+    _MAX_FROZEN_USER_HASH_LENGTH: ClassVar[int] = (_MAX_LENGTH -
+                                                   _CLUSTER_NAME_HASH_LENGTH -
+                                                   3)
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='workload name basis version')
+        object.__setattr__(
+            self, 'display_name',
+            _text(self.display_name,
+                  name='workload_name_basis.display_name',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(
+            self, 'frozen_user_hash',
+            _text(self.frozen_user_hash,
+                  name='workload_name_basis.frozen_user_hash',
+                  maximum_bytes=self._MAX_FROZEN_USER_HASH_LENGTH))
+        if (not isinstance(self.max_length, int) or
+                isinstance(self.max_length, bool) or
+                self.max_length != self._MAX_LENGTH):
+            raise ValueError('workload name max_length must be integer 42.')
+        if (not isinstance(self.cluster_name_hash_length, int) or
+                isinstance(self.cluster_name_hash_length, bool) or
+                self.cluster_name_hash_length
+                != self._CLUSTER_NAME_HASH_LENGTH):
+            raise ValueError('workload cluster_name_hash_length must be '
+                             'integer 8.')
+        provider_cluster_name = self.provider_cluster_name
+        _dns_label(provider_cluster_name,
+                   name='workload_name_basis.provider_cluster_name')
+        _dns_label(self.workload_name, name='workload_name_basis.workload_name')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderWorkloadNameBasisV1':
+        raw = _closed_object(value,
+                             name='provider workload name basis',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    @property
+    def provider_cluster_name(self) -> str:
+        """Return the frozen historical SkyPilot cloud-cluster name."""
+
+        return common_utils.make_cluster_name_on_cloud_for_user(
+            self.display_name,
+            max_length=self.max_length,
+            cluster_name_hash_length=self.cluster_name_hash_length,
+            user_hash=self.frozen_user_hash)
+
+    @property
+    def workload_name(self) -> str:
+        """Return the direct-Pod topology's workload name."""
+
+        return f'{self.provider_cluster_name}-head'
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'display_name': self.display_name,
+            'frozen_user_hash': self.frozen_user_hash,
+            'max_length': self._MAX_LENGTH,
+            'cluster_name_hash_length': self._CLUSTER_NAME_HASH_LENGTH,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
