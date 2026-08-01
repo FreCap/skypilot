@@ -1874,7 +1874,7 @@ class RetryingVmProvisioner:
             # Retry until ray status is ready. This is to avoid the case where
             # ray cluster is just started but the ray status is not ready yet.
             logger.info('Waiting for ray cluster to be ready remotely.')
-            time.sleep(1)
+            context_utils.sleep_with_cancellation(1)
             returncode, output, _ = backend.run_on_head(
                 handle,
                 instance_setup.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND,
