@@ -15,6 +15,9 @@ mock_provider "aws" {
       arn      = "arn:aws:eks:us-east-2:210987654321:cluster/gpu-pool"
       endpoint = "https://example.eks.amazonaws.com"
       id       = "gpu-pool"
+      vpc_config = [{
+        cluster_security_group_id = "sg-0fedcba9876543210"
+      }]
     }
   }
 }
@@ -151,6 +154,36 @@ run "rejects_an_unsupported_fsx_driver" {
   }
 
   expect_failures = [var.partitions]
+}
+
+run "rejects_public_cluster_api_ingress" {
+  command = plan
+
+  variables {
+    cluster_api_ingress_cidrs = ["0.0.0.0/0"]
+  }
+
+  expect_failures = [var.cluster_api_ingress_cidrs]
+}
+
+run "rejects_invalid_cluster_api_ingress" {
+  command = plan
+
+  variables {
+    cluster_api_ingress_cidrs = ["not-a-cidr"]
+  }
+
+  expect_failures = [var.cluster_api_ingress_cidrs]
+}
+
+run "rejects_duplicate_cluster_api_ingress" {
+  command = plan
+
+  variables {
+    cluster_api_ingress_cidrs = ["10.30.0.0/16", "10.30.0.0/16"]
+  }
+
+  expect_failures = [var.cluster_api_ingress_cidrs]
 }
 
 run "rejects_duplicate_claims_in_one_namespace" {
