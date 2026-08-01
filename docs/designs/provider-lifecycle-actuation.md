@@ -1,15 +1,14 @@
 # Provider and Lifecycle Actuation Architecture
 
 Status: M1, M2 S1, M2 S2a.1, the S2a.2 deterministic-gzip prerequisite and
-source composer, and M3-S0 are merged and deployment-qualified. M3-S0 passed
-exact-head CI, exact-parent merge verification, staged revisions 49 through 51,
-and bounded monitoring. The test deployment had no managed volume, so positive
+source composer, M3-S0, M3-S1, and M3-S2 are merged. M3-S0 passed exact-head
+CI, exact-parent merge verification, staged revisions 49 through 51, and
+bounded monitoring. The test deployment had no managed volume, so positive
 live per-volume parity remains explicitly unproven and the shadow remains
-diagnostic-only. M3-S1 is the next design-and-characterization slice. M3-S2 is
-limited to the inert store-identity and scoped-ownership foundation. The full
-M3 action graph, action runtime, authoritative volume writer, and M4
-implementation still require their dedicated exact-design adversarial reviews
-and activation gates.
+diagnostic-only. M3-S2 has an exact locally verified candidate image, but its
+test-cluster deployment remains pending. The M3 action graph, action runtime,
+authoritative volume writer, and M4 implementation still require their
+dedicated exact-design adversarial reviews and activation gates.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -383,6 +382,127 @@ covers:
 
 Datadog remains the observation plane for shadow mismatch, fallback, and
 legacy-usage counters. No new statistics store is introduced.
+
+### Further dstack review: next three bounded improvements
+
+An additional review compared current SkyPilot at `af20f62b3` with dstack at
+`c9ebdaad6`. It deliberately excluded Datadog, typed provisioner bundles,
+placement-offer propagation, the durable leased-action mechanics above,
+provider descriptors, typed provider failures, and lifecycle events because
+those are already implemented or owned by this design. The following three
+items are the remaining high-value architectural concepts. They are separately
+reviewed workstreams within this migration and become M7 completion
+prerequisites through their removal rows, but they do not expand M3-S3.
+
+#### Negotiated Skylet capabilities and one fallback router
+
+dstack's runner client negotiates a runner or shim version once, then routes
+feature selection through centralized semantic-version thresholds. SkyPilot
+will keep that single selection owner but improve the contract by advertising
+method versions directly instead of copying the version thresholds. SkyPilot
+currently repeats
+`SKYLET_GRPC_FALLBACK_ERRORS` handling in `cloud_vm_ray_backend.py`, `core.py`,
+and several methods of `CloudVmRayBackend`. Managed-jobs utilities and
+`serve_rpc_utils.py` make additional, different flag and gRPC-error routing
+decisions. These owners can therefore select different transports for the
+same cluster incarnation.
+
+SkyPilot will add an immutable `SkyletCapabilitiesV1` response containing the
+Skylet identity and explicit service and method contract versions. One router,
+cached by cluster incarnation and Skylet identity, selects gRPC or the
+characterized legacy transport. The provisional cache key is the cluster
+incarnation plus endpoint and channel generation; a successful response adds
+the returned Skylet boot identity. Concurrent misses and refreshes use one
+single-flight handshake. Incarnation change, channel replacement, or changed
+boot identity invalidates the entry, and every entry has a maximum 60-second
+revalidation interval so an in-place old-Skylet upgrade is discovered. A valid
+capability response or an explicit unsupported-method result may select legacy
+transport only for that interval. Timeout, unavailable, internal, malformed,
+or authentication failure is transient or fatal typed evidence and never
+caches a legacy choice. Capability advertisement, not a scattered semantic
+version comparison or a caught transport exception, becomes the positive
+selection signal.
+
+The first slice is read-only: add backward-compatible `GetCapabilities`, then
+route only `GetJobStatus` through the central selector. Old Skylets return
+`UNIMPLEMENTED` and use the existing transport. No launch, cancellation,
+teardown, or job-state behavior changes in that slice.
+
+The removal gate requires single-flight handshakes with the bounded refresh
+contract above, mixed old and new Skylet qualification, zero unexplained
+fallback for one compatibility release, and repository proof that migrated
+methods have no fallback catch or direct SSH transport outside the router.
+Old-node fallback remains until that gate closes.
+
+#### Shared raw-offer normalization, filtering, and explicit cache policy
+
+dstack separates raw provider inventory from shared requirement filtering,
+and cache construction while preserving provider input order. SkyPilot's
+placement offer carries a selected result safely into actuation, but provider
+Cloud classes still repeat earlier feasibility work across
+`_get_feasible_launchable_resources()`, `regions_with_offering()`,
+`zones_provision_loop()`, price lookup, and accelerator matching.
+
+SkyPilot will introduce an opt-in immutable `RawOfferSnapshotV1`. A provider
+source owns credentialed inventory acquisition, freshness, provider-specific
+fields, input order, and declared modifiers. Shared pure code owns
+normalization, generic resource filtering, rejection reasons, and an explicit
+stable-order policy where ordering is semantically required. A separate exact
+inventory must identify each cache owner, key, freshness source, and
+invalidation rule before shared cache construction or any cache deletion is in
+scope. The optimizer and existing `PlacementOfferV1` remain the owners of
+cross-provider ranking and selected-offer propagation.
+
+The design does not copy dstack's fixed cache TTL, JSON-string cache keys,
+mutable offer modifiers, or assumption that one catalog implementation fits
+every provider. Freshness and invalidation are typed provider inputs. The first
+slice is a DigitalOcean shadow adapter over one frozen catalog snapshot. It
+compares candidate resources, region order, price, and fuzzy accelerator
+matches without changing the optimizer input. DigitalOcean's legacy empty
+hint and missing-rejection-reason behavior is characterized as absence; the
+shadow cannot claim reason parity that the legacy path does not expose.
+
+The removal gate is per provider. A promoted provider exposes only raw
+inventory and declared modifiers; its exact duplicated generic filter and
+ordering code is deleted. Cache deletion is a separate locator-specific gate
+after the cache inventory exists. Frozen optimizer corpora and bounded
+read-only catalog qualification must show identical or explicitly reviewed
+safer candidates and ordering before authority changes.
+
+#### Shared child-workload actuation for managed jobs and Serve
+
+dstack compiles tasks, services, and development environments into one child
+job contract and reuses submission, observation, cancellation, and termination
+mechanics. SkyPilot currently repeats those mechanics in
+`execution._execute()`, `JobController._run_one_task()`, managed-job recovery,
+and Serve replica launch, status polling, probing, and termination. Managed
+jobs and Serve correctly own different domain state machines, but they should
+not each own raw child-cluster transport and result normalization.
+
+SkyPilot will add `ChildWorkloadSpecV1`, `ChildWorkloadObservationV1`, and a
+versioned `ChildWorkloadActuatorV1` with launch, observe, cancel, and terminate
+operations. Managed jobs and Serve remain the sole owners of admission,
+recovery, autoscaling, rollout, replica health, retry policy, and terminal
+domain state. Their adapters compile domain intent into the shared child
+contract and reduce typed observations back into their own state machines.
+
+The design does not copy dstack's universal `RunModel`, one shared resource
+status enum, or a single giant submitted-job worker. The first slice is
+read-only: route managed-job and Serve child status polling through
+`ChildWorkloadObservationV1` and prove caller-visible parity. Launch and
+teardown migrate only after the M3 action kernel is stable and can durably own
+their external effects.
+
+The removal gate requires repository proof that migrated Jobs and Serve
+controllers make no direct `backend.get_job_status`, `sdk.launch`,
+`backend.cancel_jobs`, cancellation facade, or `core.down` call outside the
+adapter, plus passing recovery, cancellation, same-name recreation, rollout,
+mixed-version, and cleanup qualification.
+
+The implementation order is Skylet capability negotiation first, raw-offer
+normalization as an independent provider pilot, and child-workload actuation
+after the durable action kernel is qualified. This ordering avoids using a new
+shared facade to conceal the same duplicated lifecycle ownership underneath.
 
 ### Patterns explicitly not ported
 
@@ -4397,10 +4517,13 @@ epoch, a monotonically increasing authority generation, and nullable selected
 writer and reconciler implementation digests.
 
 Before a later compatibility release changes `DARK` to `LEGACY_OPEN`, every
-API, controller, executor, or worker process eligible to run a volume handler
-must advertise its supported lifecycle version, exact image digest, role, and
-binding and reconciler support through a database-clock heartbeat in a
-separately reviewed process-capability table. `LEGACY_OPEN` requires every
+`all`, `api`, `controller`, or `executor` supervisor eligible to host or
+deliver a volume handler must advertise its supported lifecycle version,
+exact image digest, role, and binding and reconciler support through a
+database-clock heartbeat in a separately reviewed process-capability table.
+An executor supervisor's advertisement covers only child handlers from the
+same exact image, and active attempts record both identities. `LEGACY_OPEN`
+requires every
 legacy mutation admission to register an exact legacy intent and validate the
 scope epoch and writer-authority seal. Activation later enters `DRAINING`,
 rejects new apply and delete admission, waits for every earlier volume request
@@ -4825,6 +4948,130 @@ enforcement, ordinal effect tombstones, retention indexes, and restricted
 borrowed-transaction facade. No raw provider callback may receive a connection
 on which it can commit, close, or begin a nested transaction.
 
+#### M3-S3 architecture review decision
+
+The review selects permanent narrow action and effect rows. It rejects separate
+identity-anchor, live-row, and tombstone tables. `lifecycle_actions` permanently
+owns one complete canonical business key. `lifecycle_action_effects`
+permanently owns every `(action_id, effect_ordinal)`. Neither row is ever
+deleted. A later compactor may clear bulky payload and verbose evidence only
+after terminal and cleanup gates, but identity, binding digest, locator,
+provider operation identity, observed UID, final certainty, cleanup proof, and
+completion time remain.
+
+This gives one ordinary unique domain for a business key and one permanent
+primary-key domain for an effect ordinal. Separate live and tombstone tables
+would require deferred cross-table triggers to prevent a gap, duplicate, or
+partial ordinal summary while retaining the same number of permanent identity
+records. The roadmap terms `identity anchor` and `identity tombstone` therefore
+refer to the permanent row before and after compaction, not extra tables.
+
+Revision `002` remains an empty, expand-only schema and does not authorize
+compaction. Its action and effect storage shape is closed to `FULL`. A later
+reviewed revision may add `COMPACTED`, its irreversible row-local transition,
+retention indexes, and the compactor only after terminal actions and exact
+cleanup proof exist. Revision `002` adds no retention worker, tombstone table,
+compaction trigger, producer, claim API, heartbeat writer, provider call,
+router, reconciler, or public mutation facade.
+
+The selected revision-`002` graph contains these twelve empty tables:
+
+1. `lifecycle_actuation_bindings`;
+2. `lifecycle_binding_compatibility_adapters`;
+3. `lifecycle_process_capabilities`;
+4. `lifecycle_process_binding_capabilities`;
+5. `volume_lifecycle_resources`;
+6. `legacy_volume_intents`;
+7. `lifecycle_actions`;
+8. `lifecycle_action_request_correlations`;
+9. `lifecycle_action_attempts`;
+10. `lifecycle_action_effects`;
+11. `lifecycle_action_evidence`; and
+12. `lifecycle_effect_evidence`.
+
+Action evidence and effect evidence are separate, never polymorphic. Action
+evidence is closed to `ADMISSION_PREFLIGHT_V1`, `ADMISSION_FENCE_V1`,
+`QUARANTINE_REACTIVATION_V1`, and `TERMINAL_REDUCTION_V1`.
+`ADMISSION_PREFLIGHT_V1` is the one provider-produced observation retained at
+action scope because admission persists it before an effect row exists. Every
+post-admission provider observation belongs only to an exact effect ordinal
+and is closed to `PRE_CALL_FENCE_V1`, `SUBMISSION_V1`, `READBACK_V1`,
+`ABSENCE_HORIZON_V1`, `CLEANUP_DECISION_V1`, and
+`COMPATIBILITY_RESOLUTION_V1`. Both evidence tables are append-only while the
+action is nonterminal. Attempts own claim interval and outcome, not provider
+evidence.
+
+Canonical bytes use one extracted leaf implementation of the existing strict
+canonical JSON V1 rules: UTF-8, sorted object keys, compact separators, signed
+64-bit integers, no floats, and no non-NFC string, surrogate, control
+character, duplicate decoded key, unknown schema field, cycle, or unbounded
+container. Action and effect payloads and adapter proof manifests are limited
+to 65,536 bytes. Binding, locator, preflight, capability, and individual
+evidence envelopes are limited to 16,384 bytes. Each stored envelope has an
+explicit encoding token and schema version plus a lowercase SHA-256 digest.
+PostgreSQL checks format and byte bounds without adding `pgcrypto`; every
+trusted writer and reader recomputes the digest. Activation scans and rejects
+any row whose bytes and digest disagree.
+
+The process-role vocabulary reuses the deployed central-server contract
+exactly: `all`, `api`, `executor`, and `controller`. The capability manifest
+uses the closed tokens `LEGACY_ADMISSION_V1`, `ACTION_ADMISSION_V1`,
+`ACTION_RECONCILE_V1`, `ACTION_EXECUTE_V1`, and `PROVIDER_CALL_V1`. A separate
+many-to-many process-binding row is `NATIVE` with no adapter digest or
+`COMPATIBILITY_ADAPTER` with an exact adapter implementation digest. Child
+execution identity belongs to an attempt; revision `002` does not invent a
+second generic worker role. For the volume pilot, an executor supervisor
+advertises the capability and exact image for its child handlers. Each attempt
+stores both that supervisor process identity and its child execution identity.
+Activation fences new executor delivery, drains every earlier child attempt,
+and requires no live attempt owned by an incompatible or missing supervisor
+before changing the scope. Future independently deployed workers require a
+separate schema review and an explicit new role rather than masquerading as an
+executor.
+
+The volume pilot is closed to action kinds `VOLUME_CREATE_V1` and
+`VOLUME_DELETE_V1` and effect kinds `KUBERNETES_PVC_CREATE_V1` and
+`KUBERNETES_PVC_DELETE_V1`. A sidecar exists only for the action writer, so its
+writer mode is `ACTION_V1`; absence of a sidecar remains the legacy marker.
+Visibility is `VISIBLE` or `DETACHED`. Domain state is closed to `RESERVED`,
+`CREATE_PENDING`, `LIVE`, `DELETE_PENDING`,
+`DETACHED_CLEANUP_PENDING`, `TOMBSTONED`, `QUARANTINED`, or `FAILED_SAFE`.
+`attempt_count` counts allocated claims and `retry_count` counts committed
+transitions from a finished attempt back to `WAITING`; both are monotonic and
+`retry_count <= attempt_count`.
+
+One compatibility-adapter approval is identified by source binding digest,
+adapter implementation digest, proof-manifest digest, and monotonically
+increasing approval revision. Its proof payload is immutable. It stores the
+exact ownership scope, source contract version, canonical proof manifest and
+digest, approving-subject digest, approval epoch, and database approval time.
+A one-way, epoch-fenced revocation records revocation time, subject digest, and
+reason digest on that approval; a stronger proof creates a new approval
+revision rather than changing the old payload. Process capability and every
+use record pin the exact approval identity, and a revoked approval cannot
+authorize a new use. Use of an active row appends
+`COMPATIBILITY_RESOLUTION_V1` to the original effect with the adapter identity
+and original-versus-mapped payload and locator digests. It never rewrites the
+effect binding.
+
+The credential-free base locator, provider operation identity, exact target or
+owned UID, terminal-observed replacement or foreign UID, and permanent typed
+cleanup-proof digest remain on the permanent effect. Target and
+terminal-observed identity are distinct nullable columns with an exact
+certainty-dependent shape; `REPLACED` and `FOREIGN_CONFLICT` cannot overwrite
+the old owned identity. The volume sidecar also retains the authoritative
+current-incarnation copy while live or cleanup-relevant. That duplication is
+deliberate: same-name recreation may advance the sidecar, while the old effect
+remains the historical identity and cleanup proof.
+
+This architecture decision is not the literal DDL approval. Before revision
+`002` is implemented, one follow-up subsection must enumerate exact column
+order, PostgreSQL types, nullability, named checks, foreign keys, partial
+indexes, immutable-row guards, lock order, empty-only downgrade, runtime
+metadata parity, and every negative row-shape test for all twelve tables. The
+implementation may begin only after that exact subsection receives a
+`PURSUE` verdict.
+
 ## Cleanup Contract
 
 - Intent and cleanup obligation are durable before provider mutation.
@@ -5061,6 +5308,10 @@ M2 implementation is split into reviewed slices:
   placement-offer handoff, shadow comparison, actual-placement evidence, and
   dormant persistence/fence qualification. Authoritative promotion is gated on
   the M4 descriptor and actuation contract.
+- A later independent raw-offer slice starts with a DigitalOcean shadow over
+  one frozen catalog snapshot. It does not change M2's selected-offer handoff
+  and cannot remove provider feasibility code until its per-provider gate
+  closes.
 
 Deployment proves candidate safety, optimizer winner, selected placement,
 pre-mutation revalidation, actual provisioning result, handle compatibility,
@@ -5081,9 +5332,10 @@ rollback, and cleanup on the exact image digest.
   worker, process-capability row, domain table, or routing change;
 - in M3-S3, after its own exact-DDL adversarial review, add the sidecar,
   process-capability, binding, legacy-intent, action, request-correlation,
-  attempt, effect, evidence, compatibility-adapter, identity-anchor, and
-  identity-tombstone graph with no domain rows and every producer and worker
-  disabled;
+  attempt, permanent effect, separate action and effect evidence, and
+  compatibility-adapter graph with no domain rows and every producer and
+  worker disabled; permanent action and effect rows are the logical identity
+  anchors and later compacted tombstones rather than separate tables;
 - in separately reviewed later slices, add the disabled action kernel and
   volume reducer, then the Release N compatibility reader, reconciler, and
   legacy-intent producer, then shadow admission, then implement and qualify
@@ -5106,6 +5358,8 @@ ambiguous provider response, readback, and cleanup.
 
 ### M4: Cluster provisioning and teardown
 
+- introduce `SkyletCapabilitiesV1` and centralize read-only `GetJobStatus`
+  transport selection before migrating any mutating Skylet method;
 - update this file with the exact node-actuation facet, operation evidence,
   provider descriptor, shared cluster planner, reconciler transaction,
   activation, and rollback contracts and pass a dedicated adversarial review
@@ -5142,6 +5396,8 @@ ambiguous provider response, readback, and cleanup.
 
 ### M5: Serve and pools
 
+- shadow `ChildWorkloadObservationV1` against current replica job-status
+  polling before shared child launch or teardown is reachable;
 - extract pure planners and reducers for the central PostgreSQL deployment;
 - persist central replica launch and down attempts;
 - keep lifecycle epoch, immutable versions, and incarnation inventory;
@@ -5151,6 +5407,8 @@ ambiguous provider response, readback, and cleanup.
 
 ### M6: Managed jobs
 
+- shadow the same `ChildWorkloadObservationV1` against managed-job child
+  status polling while managed jobs retain recovery and terminal-state policy;
 - migrate central PostgreSQL recovery and cleanup actions last;
 - retain controller generation and admission fencing;
 - remove central process-local retry ownership only after recovery equivalence
@@ -5172,6 +5430,64 @@ ambiguous provider response, readback, and cleanup.
 ## Removal Ledger
 
 Removal is part of completion, not optional follow-up.
+
+The Markdown table below remains authoritative for this design-only review.
+The mandatory next slice, before another compatibility artifact is
+implemented, adds the canonical executable manifest
+`docs/designs/provider-lifecycle-actuation-removals.yaml`, the checker
+`tools/check_lifecycle_removals.py`, focused checker tests, and a CI invocation.
+That slice must transcribe every current row into exact artifacts rather than
+claiming that the files already exist. Once merged, the manifest becomes
+authoritative and this table becomes its generated or manually verified human
+summary. Every manifest row has a stable `PLA-(BASE|M[0-7])-NNN` ID and
+records:
+
+- milestone, introducing commit, obligation, disposition, and exact domain,
+  store, provider, and operation scope;
+- one or more semantic locators consisting of a path plus a Python symbol,
+  attribute, call-within-symbol, enum member, physical file, SQL object, or
+  exact test node;
+- the replacement owner and dependencies;
+- exact source, test, telemetry, release-window, and schema gates;
+- the only retained-reference allowlist, recorded evidence, any external
+  blocker, and the final removal commit and deployment proof.
+
+Line numbers are evidence, never identity. Broad scopes such as `migrated` or
+`all promoted providers` are invalid until expanded into exact rows. Semantic
+AST and PostgreSQL catalog checks are authoritative; `rg` is supplementary.
+Released Alembic files are `retain_history` artifacts and remain byte-identical.
+Their live tables, columns, checks, indexes, runtime metadata, and imports are
+separate `must_contract` artifacts removed only by a new forward migration.
+
+Statuses are `planned`, `present`, `gating`, `ready_to_remove`,
+`removal_in_progress`, `removed`, `blocked`, and `retained_verified`.
+`removed` is the only completion status for `must_remove` and `must_contract`.
+`retained_verified` is legal only for `retain_history` and
+`retain_characterization`. A blocker can stop progress, but it never completes
+an obligation and never permits this migration to be reported complete.
+
+The manifest enums are closed. Obligations are `must_remove`,
+`must_contract`, `retain_history`, or `retain_characterization`. Dispositions
+are `delete_file`, `delete_symbol`, `delete_branch`, `delete_enum_member`,
+`replace_content`, `contract_live_schema`, `retain_history`, or
+`retain_characterization`. Locator kinds are `python_symbol`,
+`python_attribute`, `python_call_within`, `python_enum_member`,
+`python_ast_pattern`, `path`, `packaged_path`, `sql_object`,
+`runtime_metadata`, `runtime_import`, or `test_node`.
+
+The checker rejects a line-only locator, a wildcard provider or store, an
+unresolved `present` locator, an invalid status transition, and `blocked` as a
+terminal state. The normal progression is `planned` to `present` to `gating`
+to `ready_to_remove` to `removal_in_progress` to `removed`. An incomplete row
+may enter `blocked` only with `blocked_from_status`, owner, issue, and evidence,
+and may resume only to that recorded status. `removed` requires removal SHA,
+exact-head CI, every source and schema gate, and deployment evidence for a
+runtime-affecting artifact. `retain_history` requires a SHA-256 checksum and
+linked live-schema contraction rows.
+
+Every retained local or controller SQLite compatibility row is
+`must_remove`. Product deprecation may satisfy its gate, but the artifact is
+still incomplete until the code is deleted and the row reaches `removed`.
 
 | Legacy code | Remove after | Objective gate |
 | --- | --- | --- |
@@ -5209,15 +5525,24 @@ Removal is part of completion, not optional follow-up.
 | parallel canonical-name and alias inventories across Cloud and provisioner registration | all migrated registrations flow through `ProviderRegistrationV1`, descriptor dispatch is authoritative, and both legacy views are derived | one compatibility release records zero unexplained audit mismatch, expected partial providers remain explicit, plugin replacement and alias conformance pass, and no independent mutable inventory remains |
 | import-time or hand-maintained provider-wide capability matrices for migrated facets | the immutable provider descriptor generates positive capability views and resource-dependent predicates | every declared capability has executable conformance and repository search finds no migrated parallel list |
 | generic retry, cache update, and failure classification in `RetryingVmProvisioner` | typed attempts and domain retry policy are authoritative | old and new failover traces agree on the characterization corpus |
-| central-PostgreSQL volume mutation `FileLock`, synchronous provider calls, and refresh daemon ownership in `sky/volumes/server/core.py` | M3 action worker owns central volume lifecycle | HA stale-worker, readback, and cleanup tests pass and the server gate is promoted |
+| generic feasibility and ordering bodies in `DigitalOcean._get_feasible_launchable_resources()`, `DigitalOcean.regions_with_offering()`, and `DigitalOcean.zones_provision_loop()` | the DigitalOcean `RawOfferSnapshotV1` source plus shared pure offer policy is authoritative | the frozen and bounded live DigitalOcean corpus preserves or explicitly improves candidates, price, region order, fuzzy matching, and the characterized absence of rejection hints; semantic search finds no second DigitalOcean generic filter or ordering owner |
+| gRPC exception fallback and direct SSH status transport in `CloudVmRayBackend.get_job_status()` | `SkyletCapabilitiesV1` and the bounded, incarnation-and-channel-keyed `GetJobStatus` router are authoritative | mixed old and new Skylet tests pass, handshakes are single-flight and boundedly refreshed, qualified deployments record zero unexplained fallback for one compatibility release, and this method contains no fallback catch or direct SSH transport outside the router |
+| central-PostgreSQL `FileLock` and synchronous provider-call ownership in `sky.volumes.server.core.volume_apply()` and `volume_delete()` | M3 action worker owns central volume create and delete | HA stale-worker, readback, UID replacement, and cleanup tests pass, the server gate is promoted, and both exact functions have no central-PostgreSQL provider-call branch |
+| `sky.server.daemons.refresh_volume_status_event`, its daemon registration, and its direct call into `sky.volumes.server.core.volume_refresh()` | the action reconciler and domain reducer own central-PostgreSQL volume observation | refresh parity and missed-wakeup recovery pass, no central-PostgreSQL daemon registration or direct call remains, and the separately supported SQLite refresh path retains an exact ledger row |
 | local or controller SQLite volume mutation path and `FileLock` | the product separately deprecates that officially supported path | deprecation window and local compatibility inventory are complete |
 | volume `--purge` row deletion after provider error | durable cleanup incident is deployed | ambiguous-delete test retains provider identity and eventually proves absence |
+| future `legacy_volume_intents` live table, runtime metadata, repository, and indexes | every central-PostgreSQL volume scope is permanently `ACTION_OPEN`, the pre-action rollback window is closed, and no unresolved legacy intent remains | a new forward migration drops the live objects, runtime metadata and imports are absent, upgrade and fresh-chain PostgreSQL catalogs prove absence, and the historical creation migration remains checksum-identical |
+| future Release N volume compatibility reader, legacy-intent producer, reconciler, and mixed router | the selected scope and every later volume scope have completed action-authority promotion and their rollback windows are closed | exact locator rows are added before implementation; one compatibility release records zero legacy admission or reconciliation, mixed-version rollback qualification passes, and semantic search finds no compatibility dispatch owner |
+| future executable lifecycle binding compatibility adapters | no nonterminal or quarantined effect references the exact adapter approval and every supported rollback image resolves all remaining bindings natively | exact executable locators and adapter approval IDs have zero eligible use for one compatibility release; executable code is deleted while permanent approval, revocation, and use evidence remains audit history |
+| future `LEGACY_OPEN` and `DRAINING` routing branches plus `LEGACY_ADMISSION_V1` capability handling | every lifecycle ownership scope is permanently `ACTION_OPEN` and pre-action rollback is prohibited or retired | transition and mixed-version corpora pass, no scope or process advertises a legacy capability for one compatibility release, and a forward schema contraction removes only the legacy states and token while retaining action capability heartbeats |
 | central-PostgreSQL cluster process-local provisioning and teardown retry loops | M4 action runtime owns them | crash-at-every-phase tests and test-cluster cleanup pass |
 | local or controller SQLite cluster provisioning and teardown retry loops | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and repository inventory finds no supported SQLite caller |
 | central-PostgreSQL Serve in-memory replica request retry ownership and duplicate scheduling loops | M5 action runtime owns mechanics | lifecycle-epoch, same-name recreation, rollout, scale, and failed-cleanup tests pass |
 | local or controller SQLite Serve retry and scheduling ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite Serve qualification is retired |
 | central-PostgreSQL managed-job process-local recovery and cleanup retry ownership | M6 action runtime owns mechanics | controller handoff, preemption, cancellation, and cleanup conformance passes |
 | controller-local SQLite managed-job recovery and cleanup ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite jobs qualification is retired |
+| direct child status transport in `sky.jobs.utils.get_job_status()` | `ChildWorkloadObservationV1` owns the read-only child-status call while managed jobs retain recovery and terminal-state policy | the exact managed-job status and transient-error corpus passes, and the function contains no direct `backend.get_job_status` call outside the adapter |
+| direct child status transport in `SkyPilotReplicaManager._fetch_job_status()` | `ChildWorkloadObservationV1` owns the read-only child-status call while Serve retains replica health and rollout policy | the exact replica status, preemption, pool, timeout, and lock-free polling corpus passes, and the method contains no direct `backend.get_job_status` call outside the adapter |
 | duplicate managed-image worker lease, heartbeat, retry, and provider-call mechanics | the shared kernel executes already-admitted image actions while image domain admission retains shard fairness and reservations | shard `max_in_flight`, two-level due rotation, fresh-versus-recovery accounting, publication reservations, `COPY`/`VERIFY`/`EVICT`/`READBACK` crash recovery, fencing, quarantine, exact absence, and canary qualification pass with zero dual due or lease owner |
 | `api_controller_action_reservations` and `_reserve_controller_action()` / `_mark_controller_action_state()` | generalized action ledger preserves controller-generation fencing and active reservations are backfilled | compatibility reconciler observes zero unmigrated active reservations and rollback qualification passes |
 
@@ -5565,8 +5890,9 @@ identity evidence.
   no current handler consult the scope or writer-authority seal.
 - Release N later ships a compatibility reader, reconciler, and legacy-intent
   producer against the already-expanded M3-S3 schema while the selected scope
-  is still `DARK`. Every API, controller, executor, or worker role capable of
-  executing that scope must run N or later and pass mixed-version
+  is still `DARK`. Every `all`, `api`, `controller`, or `executor` supervisor
+  capable of hosting or delivering that scope must run N or later, advertise
+  the exact child-handler image when applicable, and pass mixed-version
   qualification. One guarded transition must first acquire the external grant
   for the next authority generation, then bind the writer-authority seal,
   increment the authority generation and epoch, and move only that scope to
@@ -5622,8 +5948,14 @@ This migration is complete only when:
 - every migrated central-PostgreSQL domain path uses the shared mechanics
   without losing its domain fences, while retained SQLite paths remain named
   legacy ledger rows rather than being counted as migrated;
-- every removal-ledger row is deleted or has an explicit externally owned
-  blocker and is not falsely reported complete;
+- every `must_remove` and `must_contract` removal-manifest row is `removed`,
+  and every retained-history or characterization row is `retained_verified`;
+  a row with an external blocker remains incomplete;
+- the removal checker passes in `final` mode on the exact merged SHA, with no
+  `must_remove` or `must_contract` row left in any incomplete status;
+- every live-schema contraction passes PostgreSQL catalog assertions after an
+  upgrade and a fresh full-chain installation, and every retained migration is
+  checksum-identical and unreachable from runtime imports;
 - repository search finds no superseded version branches, silent plugin
   fallback, placement reconstruction, or duplicated retry owner in migrated
   paths;
@@ -6223,3 +6555,43 @@ atomicity.
 Independent source-convention review returned `PASS`, PostgreSQL schema review
 returned `PURSUE`, and deployment and rollback review returned `PASS` on the
 exact digest. No implementation began before those verdicts.
+
+### Review 22
+
+Verdict: `PURSUE` for the additional dstack architecture review at SHA-256
+`5ec3503d55c4c5cc59346ce76f3448f84016636edcbf5f27e52d168d27cda0e4`
+and the M3-S3 architecture decision at SHA-256
+`9d2cd2fe758222927012e7a25e2000f442a508d8482c47a55b72438ae11f952f`.
+This verdict approves a design-only boundary, not revision-`002` literal DDL
+or implementation.
+
+The first M3-S3 challenge returned `RESHAPE` because separate anchor, live,
+and tombstone tables required fragile cross-table uniqueness and completeness
+triggers; preflight evidence ownership was ambiguous; one UID could not prove
+replacement or conflict; adapter approval had no revision or revocation;
+process roles did not explain supervised children; and compaction machinery
+was premature. The corrected contract uses permanent narrow action and effect
+rows, separates admission from post-admission provider evidence, retains
+target and terminal-observed identities, pins epoch-fenced adapter approvals,
+fences supervisor and child execution, and leaves revision `002` full-only and
+empty. Independent adversarial re-review returned `PURSUE` with every listed
+blocker resolved.
+
+The independent dstack source review initially rejected claims that dstack
+advertises method capabilities or imposes stable offer order. It also required
+single-flight and bounded capability revalidation, explicit transient-failure
+semantics, characterization of DigitalOcean's missing rejection hints, and a
+complete child cancellation removal gate. The corrected text distinguishes
+the dstack lesson from SkyPilot's stronger proposed contract and narrows the
+first removal rows to exact read-only pilots. Source re-review returned
+`LGTM`.
+
+The removal-ledger review at SHA-256
+`33368a3615074107c6a0380bb868e50f34bdc5d37613bc4e8655c60c12dbc336`
+keeps Markdown authoritative for this design-only slice and makes the
+manifest, semantic checker, tests, and CI invocation the mandatory next slice.
+It closes manifest enums and transitions, makes blockers nonterminal, requires
+schema and historical-migration evidence, classifies SQLite compatibility as
+incomplete `must_remove` work, adds transitional M3 obligations, and splits
+volume core mutation from the exact daemon owner. The manifest and checker do
+not yet exist, so no claim of executable enforcement is made by this review.
