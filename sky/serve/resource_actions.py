@@ -1292,6 +1292,110 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
 
 
 @dataclasses.dataclass(frozen=True)
+class ServeReplicaActionSpecV1(_CanonicalContract):
+    """Closed immutable Serve wrapper around one provider action plan."""
+
+    version: int
+    provider_plan: ProviderLifecyclePlanV1
+    invocation: ProviderLifecycleInvocationV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'provider_plan', 'invocation'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Serve replica action spec version')
+        if not isinstance(self.provider_plan, ProviderLifecyclePlanV1):
+            raise TypeError('provider_plan has an invalid type.')
+        if not isinstance(self.invocation, ProviderLifecycleInvocationV1):
+            raise TypeError('invocation has an invalid type.')
+        if self.provider_plan.action_id != self.invocation.action_id:
+            raise ValueError('provider plan and invocation action IDs differ.')
+        self.provider_plan.validate_invocation(self.invocation)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ServeReplicaActionSpecV1':
+        raw = _closed_object(value,
+                             name='Serve replica action spec',
+                             keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   provider_plan=ProviderLifecyclePlanV1.from_value(
+                       raw['provider_plan']),
+                   invocation=ProviderLifecycleInvocationV1.from_value(
+                       raw['invocation']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'provider_plan': self.provider_plan.canonical_value(),
+            'invocation': self.invocation.canonical_value(),
+        }
+
+    @property
+    def action_id(self) -> uuid.UUID:
+        return self.provider_plan.action_id
+
+    def validate_parent_provider_plan(
+            self, provider_plan: ProviderLifecyclePlanV1) -> None:
+        """Require a shadow parent's indexed plan to be the wrapper member."""
+
+        if not isinstance(provider_plan, ProviderLifecyclePlanV1):
+            raise TypeError('parent provider_plan has an invalid type.')
+        if provider_plan.canonical_bytes != self.provider_plan.canonical_bytes:
+            raise ValueError('parent provider plan is not byte-equal to the '
+                             'immutable spec provider plan.')
+
+    def launch_cleanup_down_invocation(self) -> ProviderLifecycleInvocationV1:
+        """Derive the sole non-primary invocation allowed by this wrapper."""
+
+        if self.invocation.action_kind is not kernel_actions.ActionKind.LAUNCH:
+            raise ValueError('cleanup down requires a launch action spec.')
+        launch = self.invocation.launch
+        if launch is None:
+            raise ValueError('cleanup down requires a launch invocation.')
+        target = self.invocation.requested_target
+        return ProviderLifecycleInvocationV1(
+            version=1,
+            profile=self.invocation.profile,
+            redaction_profile=self.invocation.redaction_profile,
+            action_kind=kernel_actions.ActionKind.DOWN,
+            resource_identity=self.invocation.resource_identity,
+            requested_target=target,
+            launch=None,
+            down=ProviderDownInvocationV1(
+                cluster_name=target.sky_cluster_name,
+                expected_cluster_record_uuid=target.sky_cluster_record_uuid,
+                workspace=launch.source.workspace,
+                purge=False,
+                graceful=False,
+                graceful_timeout=None))
+
+    def validate_shadow_child_invocation(
+            self, role: ShadowRequestRole,
+            invocation: ProviderLifecycleInvocationV1) -> None:
+        """Require the exact primary invocation or derived cleanup exception."""
+
+        if not isinstance(role, ShadowRequestRole):
+            raise TypeError('shadow request role has an invalid type.')
+        if not isinstance(invocation, ProviderLifecycleInvocationV1):
+            raise TypeError('child invocation has an invalid type.')
+        if role is ShadowRequestRole.LAUNCH_CLEANUP_DOWN:
+            expected = self.launch_cleanup_down_invocation()
+        else:
+            expected_role = (ShadowRequestRole.PRIMARY_LAUNCH
+                             if self.invocation.action_kind
+                             is kernel_actions.ActionKind.LAUNCH else
+                             ShadowRequestRole.PRIMARY_DOWN)
+            if role is not expected_role:
+                raise ValueError('primary child role does not match the action '
+                                 'spec action kind.')
+            expected = self.invocation
+        if invocation.canonical_bytes != expected.canonical_bytes:
+            raise ValueError('child invocation is not byte-equal to the '
+                             'immutable action spec invocation.')
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderErrorV1(_CanonicalContract):
     """Bounded provider error classification without raw exception data."""
 

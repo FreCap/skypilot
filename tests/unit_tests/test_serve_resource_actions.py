@@ -161,6 +161,40 @@ def _resolved_target() -> dict:
     }
 
 
+def _down_plan() -> dict:
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _down_invocation())
+    return {
+        'version': 1,
+        'profile': 'pod_cluster_v1',
+        'action_kind': 'down',
+        'resource_identity': _identity(2),
+        'placement_decision_sha256': 'e' * 64,
+        'resources_snapshot_sha256': '1' * 64,
+        'workspace_identity_sha256': 'f' * 64,
+        'requested_target': _target(),
+        'prior_resolved_target': _resolved_target(),
+        'request_payload_sha256': invocation.sha256,
+        'redaction_profile': 'provider_lifecycle_redaction_v1',
+    }
+
+
+def _launch_spec() -> dict:
+    return {
+        'version': 1,
+        'provider_plan': _launch_plan(),
+        'invocation': _launch_invocation(),
+    }
+
+
+def _down_spec() -> dict:
+    return {
+        'version': 1,
+        'provider_plan': _down_plan(),
+        'invocation': _down_invocation(),
+    }
+
+
 def _observation() -> dict:
     target = actions.ProviderLocatorV1.from_value(_target())
     return {
@@ -313,6 +347,154 @@ def test_locator_and_plan_literal_golden_bytes_and_hashes() -> None:
         b'ffffffffffffffffffffffffffffffffffffffffffffffff"}')
     assert plan.sha256 == (
         '030916d7936d8d18f6790417afba8b4f13c2687d82e540a5fb29b21ac0f6186f')
+
+
+def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
+    launch = actions.ServeReplicaActionSpecV1.from_value(_launch_spec())
+    expected_launch = (b'{"invocation":' + launch.invocation.canonical_bytes +
+                       b',"provider_plan":' +
+                       launch.provider_plan.canonical_bytes + b',"version":1}')
+    assert launch.canonical_bytes == expected_launch
+    assert launch.sha256 == (
+        'c35900943d14875a0cc177186d7b03afdca8070f87f8484a35edcdcdfbe86ebf')
+    assert launch.action_id == uuid.UUID('a1fa64dd-eea2-59db-b7b6-733d8001a086')
+
+    down = actions.ServeReplicaActionSpecV1.from_value(_down_spec())
+    expected_down = (b'{"invocation":' + down.invocation.canonical_bytes +
+                     b',"provider_plan":' + down.provider_plan.canonical_bytes +
+                     b',"version":1}')
+    assert down.canonical_bytes == expected_down
+    assert down.sha256 == (
+        '64f812f81d47290d8ccb7ab183055fedd8c5999c8494e7c6a38f117bec8a80e7')
+    assert down.action_id == uuid.UUID('324a4cdd-4640-57ae-aea8-b3f65851f735')
+
+
+@pytest.mark.parametrize('mutate,match', [
+    (lambda value: value.update({'unexpected': None}), 'unknown or missing'),
+    (lambda value: value.update({'version': 1.0}), 'forbids floats'),
+    (lambda value: value['provider_plan'].update(
+        {'request_payload_sha256': '0' * 64}), 'payload hash'),
+    (lambda value: value['provider_plan'].update(
+        {'resources_snapshot_sha256': '0' * 64}), 'resource snapshot'),
+    (lambda value: value['invocation']['launch'].update(
+        {'admin_policy_input_sha256': '0' * 64}), 'payload hash'),
+])
+def test_action_spec_rejects_unknown_float_and_unlinked_mutations(
+        mutate, match: str) -> None:
+    value = _launch_spec()
+    mutate(value)
+    with pytest.raises((TypeError, ValueError), match=match):
+        actions.ServeReplicaActionSpecV1.from_value(value)
+
+
+@pytest.mark.parametrize('member', ['provider_plan', 'invocation'])
+def test_action_spec_rejects_identity_mismatch(member: str) -> None:
+    value = _launch_spec()
+    identity = value[member]['resource_identity']
+    replacement = '55555555-5555-4555-8555-555555555555'
+    identity['service_hash'] = replacement
+    identity['service_incarnation'] = replacement
+    if member == 'invocation':
+        value[member]['launch']['source']['service_incarnation'] = replacement
+    with pytest.raises(ValueError, match='action IDs differ'):
+        actions.ServeReplicaActionSpecV1.from_value(value)
+
+
+def test_action_spec_requires_typed_members_and_exact_parent_plan_copy(
+) -> None:
+    value = _launch_spec()
+    plan = actions.ProviderLifecyclePlanV1.from_value(value['provider_plan'])
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        value['invocation'])
+    with pytest.raises(TypeError, match='provider_plan'):
+        actions.ServeReplicaActionSpecV1(1, value['provider_plan'], invocation)
+    with pytest.raises(TypeError, match='invocation'):
+        actions.ServeReplicaActionSpecV1(1, plan, value['invocation'])
+
+    spec = actions.ServeReplicaActionSpecV1(1, plan, invocation)
+    spec.validate_parent_provider_plan(plan)
+    changed_plan_value = copy.deepcopy(value['provider_plan'])
+    changed_plan_value['placement_decision_sha256'] = '2' * 64
+    changed_plan = actions.ProviderLifecyclePlanV1.from_value(
+        changed_plan_value)
+    with pytest.raises(ValueError, match='not byte-equal'):
+        spec.validate_parent_provider_plan(changed_plan)
+    with pytest.raises(TypeError, match='invalid type'):
+        spec.validate_parent_provider_plan(changed_plan_value)
+
+
+def test_action_spec_primary_invocation_is_an_exact_byte_copy() -> None:
+    spec = actions.ServeReplicaActionSpecV1.from_value(_launch_spec())
+    spec.validate_shadow_child_invocation(
+        actions.ShadowRequestRole.PRIMARY_LAUNCH, spec.invocation)
+
+    changed_value = _launch_invocation()
+    changed_value['launch']['admin_policy_input_sha256'] = '0' * 64
+    changed = actions.ProviderLifecycleInvocationV1.from_value(changed_value)
+    with pytest.raises(ValueError, match='not byte-equal'):
+        spec.validate_shadow_child_invocation(
+            actions.ShadowRequestRole.PRIMARY_LAUNCH, changed)
+    with pytest.raises(ValueError, match='role does not match'):
+        spec.validate_shadow_child_invocation(
+            actions.ShadowRequestRole.PRIMARY_DOWN, spec.invocation)
+    with pytest.raises(TypeError, match='invalid type'):
+        spec.validate_shadow_child_invocation(
+            actions.ShadowRequestRole.PRIMARY_LAUNCH, changed_value)
+
+
+def test_action_spec_cleanup_down_is_the_only_child_invocation_exception(
+) -> None:
+    spec = actions.ServeReplicaActionSpecV1.from_value(_launch_spec())
+    cleanup = spec.launch_cleanup_down_invocation()
+    assert cleanup.action_kind.value == 'down'
+    assert cleanup.resource_identity == spec.invocation.resource_identity
+    assert cleanup.requested_target == spec.invocation.requested_target
+    assert cleanup.down is not None
+    assert cleanup.down.workspace == 'boltz-test'
+    assert cleanup.sha256 == (
+        'bacb34fa8db0ffaab3f3339cb5b91efb1f0c6cf735f363eb6c57c60fa85c9415')
+    spec.validate_shadow_child_invocation(
+        actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, cleanup)
+
+    changed_value = cleanup.canonical_value()
+    changed_value['down']['workspace'] = 'another-workspace'
+    changed = actions.ProviderLifecycleInvocationV1.from_value(changed_value)
+    with pytest.raises(ValueError, match='not byte-equal'):
+        spec.validate_shadow_child_invocation(
+            actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, changed)
+
+    changed_identity_value = cleanup.canonical_value()
+    changed_identity_value['resource_identity']['desired_generation'] = 2
+    changed_identity = actions.ProviderLifecycleInvocationV1.from_value(
+        changed_identity_value)
+    with pytest.raises(ValueError, match='not byte-equal'):
+        spec.validate_shadow_child_invocation(
+            actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, changed_identity)
+
+    down_spec = actions.ServeReplicaActionSpecV1.from_value(_down_spec())
+    with pytest.raises(ValueError, match='requires a launch action spec'):
+        down_spec.launch_cleanup_down_invocation()
+    with pytest.raises(ValueError, match='requires a launch action spec'):
+        down_spec.validate_shadow_child_invocation(
+            actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, down_spec.invocation)
+
+
+def test_action_spec_enforces_combined_65536_byte_bound() -> None:
+    value = _launch_spec()
+    value['invocation']['launch']['resources']['labels'] = [{
+        'key': f'{index:03d}' + 'k' * 247,
+        'value': 'v' * 250,
+    } for index in range(120)]
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        value['invocation'])
+    assert invocation.launch is not None
+    value['provider_plan']['resources_snapshot_sha256'] = (
+        invocation.launch.resources.sha256)
+    value['provider_plan']['request_payload_sha256'] = invocation.sha256
+    assert len(invocation.canonical_bytes) < 65_536
+    assert len(actions.canonical_json_bytes(value)) > 65_536
+    with pytest.raises(ValueError, match='exceeds 65536'):
+        actions.ServeReplicaActionSpecV1.from_value(value)
 
 
 @pytest.mark.parametrize('mutate,match', [
