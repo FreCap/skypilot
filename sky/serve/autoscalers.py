@@ -347,8 +347,8 @@ class Autoscaler:
             getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
         self.reserved_fill_weight: float = float(
             getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
-        # Whether this service releases its above-floor entitlement while
-        # it demonstrates no work (see reserved_capacity_broker).
+        # Whether this service releases its whole fill entitlement while it
+        # demonstrates no work (see reserved_capacity_broker).
         self.reserved_fill_utilization_gate: bool = bool(
             getattr(spec, 'reserved_fill_utilization_gate', False))
         # Damped free-slot value the fill target acts on (see
@@ -670,12 +670,13 @@ class Autoscaler:
 
         Read-only projection for the reserved-fill poller thread, which
         calls it once per poll from _broker_cycle. None means "no usable
-        telemetry", and the utilization gate treats that as blind: it
-        freezes rather than releasing, so an autoscaler class without
-        occupancy telemetry is never gated at all.
+        telemetry". For an armed utilization gate, the poller publishes that
+        as fresh NULL need: the broker freezes for its 900s blind grace and
+        then resumes bounded decay if blindness persists.
 
         The base class has no per-replica occupancy signal, so it returns
-        None and every subclass that does not override this stays ungated.
+        None. A service that needs static reservation behavior must explicitly
+        set utilization_gate: false.
         """
         del replica_infos  # Unused: no occupancy telemetry on the base.
         return None
@@ -3961,11 +3962,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         must not mutate decision-owned state: it uses the pure
         _outstanding_work_parts rather than _outstanding_work.
 
-        Returns None (blind, and therefore ungated) whenever the demand
-        report is not fresh. That is the fail-safe direction: without a
-        current report we cannot distinguish idle from unobservable, and
-        releasing on an unobservable fleet is the one outcome this design
-        must never produce.
+        Returns None whenever the demand report is not fresh. The poller
+        publishes this as armed-but-blind (fresh activity_ts, NULL need), so
+        the broker freezes for the blind grace before it resumes bounded
+        decay; it does not mistake telemetry loss for confirmed idle.
         """
         with self._logical_state_lock:
             if not self.has_fresh_demand_report():

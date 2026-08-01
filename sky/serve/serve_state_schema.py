@@ -230,9 +230,9 @@ reserved_fill_claims_table = sqlalchemy.Table(
     # tier is not benched): feeds to un-launchable claimants are wasted for a
     # whole round, so the feed split redistributes them.
     sqlalchemy.Column('launchable', sqlalchemy.Integer, server_default='1'),
-    # Utilization gate signal (NULL on every pre-030 row and on every row a
-    # pre-gate binary writes; the broker reads NULL as ungated, which is the
-    # behavior before the gate existed).
+    # Utilization gate signal. NULL activity_ts marks a static opt-out (and
+    # every pre-030/pre-gate row), while a fresh activity_ts with NULL
+    # demonstrated_need marks a current gated writer whose telemetry is blind.
     #
     # demonstrated_need: replicas this claimant can prove it is using right
     # now, fusing in-flight work, queued work, retained rejections, busy
@@ -246,11 +246,10 @@ reserved_fill_claims_table = sqlalchemy.Table(
     # (pre-ready rows are the FIRST scale-down victims).
     sqlalchemy.Column('boot_hold', sqlalchemy.Integer, server_default=None),
     # activity_ts: when the two columns above were measured. Mandatory
-    # anti-skew witness, always written in the same statement as
-    # heartbeat_ts. An old binary's upsert advances heartbeat_ts while
-    # leaving these frozen, and a frozen demonstrated_need of 0 would walk a
-    # busy service to its floor; the broker rejects the signal unless
-    # heartbeat_ts - activity_ts is within the staleness bound.
+    # anti-skew witness for an armed gate. An old binary's upsert advances
+    # heartbeat_ts while leaving these frozen, and a frozen demonstrated_need
+    # of 0 would walk a busy service to zero; the broker treats the signal as
+    # blind unless heartbeat_ts - activity_ts is within the staleness bound.
     sqlalchemy.Column('activity_ts', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float),
 )

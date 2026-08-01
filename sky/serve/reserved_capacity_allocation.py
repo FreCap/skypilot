@@ -22,12 +22,11 @@ class ClaimInput:
     # joins the burst remainder (work conservation).
     effective_cap: int | None = None
     # Utilization gate release target: the ceiling the claimant has walked
-    # itself down to after demonstrating no work. None = ungated (no
-    # signal, gate disabled, or a claim written by a binary that predates
-    # the gate), which is the exact behavior before this field existed.
-    # Like effective_cap it clamps only the HEADROOM, never the floor: a
-    # claimant always keeps attainable_floor() regardless of how idle it
-    # is, so the decay target is an invariant rather than a check.
+    # itself down to after demonstrating no work. None = ungated (gate
+    # explicitly disabled, or a claim written by a binary that predates the
+    # gate), which is the exact static-reservation behavior. Unlike
+    # effective_cap, this ceiling also clamps the reserved floor: an idle
+    # gated claimant can release its whole fill reservation.
     utilization_cap: int | None = None
 
     def attainable_floor(self) -> int:
@@ -35,6 +34,13 @@ class ClaimInput:
         floor = max(0, self.floor)
         if self.effective_cap is not None:
             floor = min(floor, max(0, self.effective_cap))
+        return floor
+
+    def allocation_floor(self) -> int:
+        """The floor retained in this round after utilization gating."""
+        floor = self.attainable_floor()
+        if self.utilization_cap is not None:
+            floor = min(floor, max(0, self.utilization_cap))
         return floor
 
 
@@ -133,32 +139,27 @@ def compute_entitlements(total: int,
     Sum(entitlements) <= total in all reachable states (floors are scaled
     into total; the water-fill never exceeds its amount).
 
-    Floors are clamped to each claimant's effective_cap first: an
-    unattainable floor (floor > what the service can launch under its
-    demand pressure) must not absorb entitlement it can never
-    materialize; the clamped excess joins the weighted remainder and
-    flows to peers. The water-fill share is capped by the HEADROOM
-    (effective_cap minus the attainable floor, derived here rather than
-    stored) so the whole entitlement never exceeds effective_cap either.
+    Floors are clamped to each claimant's effective_cap and utilization_cap
+    first. An unattainable or activity-unbacked floor must not absorb
+    entitlement; the clamped excess joins the weighted remainder and flows
+    to peers. The water-fill share is capped by each total ceiling minus the
+    retained floor, so the whole entitlement never exceeds either ceiling.
     """
     floors = scale_floors(total, {
-        name: claim.attainable_floor() for name, claim in claims.items()
+        name: claim.allocation_floor() for name, claim in claims.items()
     })
     remainder = max(0, total) - sum(floors.values())
     caps: dict[str, int | None] = {}
     for name, claim in claims.items():
         # Both caps bound the same quantity (the weighted share ABOVE the
-        # attainable floor), so the binding one is their min, with None
-        # meaning unbounded on either side. When every gated headroom is 0
-        # the water-fill's active list is empty and Sum(entitlements)
-        # collapses to Sum(floors), which is the idle steady state.
+        # retained floor), so the binding one is their min, with None meaning
+        # unbounded on either side. A utilization cap of 0 therefore removes
+        # both the floor and headroom for an idle gated claimant.
         bounds = []
         if claim.effective_cap is not None:
-            bounds.append(max(0,
-                              claim.effective_cap - claim.attainable_floor()))
+            bounds.append(max(0, claim.effective_cap - floors[name]))
         if claim.utilization_cap is not None:
-            bounds.append(
-                max(0, claim.utilization_cap - claim.attainable_floor()))
+            bounds.append(max(0, claim.utilization_cap - floors[name]))
         caps[name] = min(bounds) if bounds else None
     shares = water_fill(remainder, {
         name: claim.weight for name, claim in claims.items()
@@ -190,12 +191,12 @@ def advance_release_target(prev: Mapping[str, Any] | None, *, floor: int,
     ordinary autoscaler and effective_cap stay the binding constraints
     below it.
 
-    Rising is instantaneous and one-sided. Releasing is a dwell followed by
-    a bounded step schedule, and every step is gated on the previous one
-    being physically actuated. That asymmetry is the whole safety argument:
-    a burst reclaims its entitlement within one round, while giving it up
-    takes many rounds and can be interrupted at any point by a single
-    non-zero sample.
+    Rising is instantaneous and one-sided. Releasing is a dwell followed by a
+    bounded step schedule, and every step is gated on the previous one being
+    physically actuated. That asymmetry is the whole safety argument: active
+    demand reclaims utilization-proportional entitlement within one round,
+    while giving it up takes many rounds and can be interrupted at any point
+    by a single non-zero sample.
     """
     cap = int(prev['cap']) if prev else max(floor, holdings)
     hot_until = float(prev['hot_until']) if prev else now + dwell

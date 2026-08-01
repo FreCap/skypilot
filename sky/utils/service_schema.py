@@ -377,20 +377,13 @@ def get_service_schema():
                                         # broker's water-fill arithmetic.
                                         'maximum': 1e6,
                                     },
-                                    # Make the entitlement depend on
-                                    # demonstrated work: while this service
-                                    # has none, its share above
-                                    # floor_replicas is released in bounded
-                                    # steps and returns to genuinely free
-                                    # GPUs. weight then only arbitrates
-                                    # between claimants that are actually
-                                    # working. Off by default: enabling it
-                                    # makes floor_replicas the service's
-                                    # entire burst-latency contract, since
-                                    # a burst arriving after a full release
-                                    # is served by the floor alone until
-                                    # readiness_probe.initial_delay_seconds
-                                    # has elapsed.
+                                    # Make the whole fill entitlement depend
+                                    # on demonstrated work. This defaults to
+                                    # true: an idle claimant releases both its
+                                    # weighted share and reserved floor in
+                                    # bounded steps. False is the explicit
+                                    # opt-out for a reservation that must stay
+                                    # static without utilization.
                                     'utilization_gate': {
                                         'type': 'boolean',
                                     },

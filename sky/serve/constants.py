@@ -604,22 +604,26 @@ RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS = 3
 # ratio while staying far from float overflow.
 RESERVED_FILL_MAX_WEIGHT = 1e6
 
-# [boltz fork] Utilization gate (opt-in via
-# reserved_capacity_fill.utilization_gate): a claimant that demonstrates no
-# work walks its entitlement down to floor_replicas in bounded steps, and
-# the released capacity returns to genuinely free GPUs where any service
-# can take it -- including one that declares no reserved_capacity_fill at
-# all and can therefore only reach the pool through ordinary
-# cheapest-first demand placement. Floors are structurally immune: the gate
-# only tightens the water-fill headroom, never scale_floors.
+# [boltz fork] Utilization gate (default for reserved_capacity_fill; explicit
+# utilization_gate:false opts out): a claimant that demonstrates no work
+# walks its whole fill entitlement down to zero in bounded steps, including
+# its declared reserved floor. Positive utilization restores a cap proportional
+# to demonstrated need; a large declared floor cannot inflate that cap.
+# Released capacity returns to genuinely free GPUs
+# where any service can take it -- including one that declares no
+# reserved_capacity_fill at all and can therefore only reach the pool through
+# ordinary cheapest-first demand placement.
 #
 # These are POOL-GLOBAL on purpose. A per-service dwell or step rate would
 # let the slower-decaying claimant win every contested transient purely by
 # decaying slower, which re-creates through timing exactly the static
 # priority this feature removes.
 #
-# Continuously-zero demonstrated need required before the first release
-# step. Equals downscale_delay_seconds on both live services, equals
+# Continuously-zero demonstrated need required before the first release step.
+# A gated writer with no usable utilization telemetry reports armed-but-blind:
+# it freezes for the bounded blind grace before decay resumes. Retaining a
+# static reservation requires the explicit per-service opt-out. Equals
+# downscale_delay_seconds on both live services, equals
 # RESERVED_FILL_CLAIM_TTL_SECONDS, and is 5 poll intervals / 15 LB syncs /
 # 5x the report-staleness threshold.
 RESERVED_FILL_IDLE_DWELL_SECONDS = 300.0

@@ -3940,11 +3940,11 @@ def upsert_reserved_fill_claim(
         'holdings_fill': holdings_fill,
         'effective_cap': effective_cap,
         'launchable': int(launchable),
-        # Written unconditionally, including as an explicit NULL triple when
-        # the caller has no sample. A claimant that goes blind must CLEAR its
-        # previous signal in the same statement that advances heartbeat_ts;
-        # leaving a stale need behind would let the broker keep gating on a
-        # measurement nothing is refreshing.
+        # Written unconditionally. A NULL activity_ts is the durable static
+        # opt-out/pre-gate shape; a fresh activity_ts paired with NULL need is
+        # armed-but-blind. The latter must clear any previous numeric sample
+        # in the same statement that advances heartbeat_ts, or the broker
+        # could keep trusting a measurement nothing is refreshing.
         'demonstrated_need': demonstrated_need,
         'boot_hold': None if boot_hold is None else int(boot_hold),
         'activity_ts': activity_ts,
