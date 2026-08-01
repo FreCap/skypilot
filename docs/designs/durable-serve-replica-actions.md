@@ -3,10 +3,11 @@
 Status: bounded M0 and M1b contract accepted after independent adversarial
 review; M1a inert schema and dark M1b typed store implemented and locally
 verified; the frozen M2 Serve032 foundation, cluster identity, immutable
-provider contracts, and typed shadow store are implemented and locally
-verified; additive Serve033 decision coverage plus the candidate-only
-Kubernetes preparation/admission handshake and execution-config boundary are
-specified but not yet implemented; runtime shadow instrumentation pending
+provider contracts, typed shadow store, additive Serve033 coverage schema and
+promotion audit, and generic API006 progress substrate are implemented and
+locally verified; the candidate-only Kubernetes preparation/admission
+handshake and execution-config boundary are in progress; runtime shadow
+instrumentation pending
 
 Last updated: 2026-07-31
 
@@ -1695,12 +1696,13 @@ M1b verification evidence on 2026-08-01:
 
 M2 foundation verification evidence on 2026-08-01:
 
-- Serve032 currently installs the frozen inert mode,
-  replica-identity/sample-link, logical-sample, and represented-attempt schema
-  while preserving portable inert columns for supported local controller
-  databases. Serve033 decision coverage, coverage-only attempts, actual-effect
-  trace columns, explicit parent FK, and coverage-link columns remain an M2
-  implementation gate before deployment;
+- Serve032 installs the frozen inert mode, replica-identity/sample-link,
+  logical-sample, and represented-attempt schema while preserving portable
+  inert columns for supported local controller databases. Serve033 now adds
+  PostgreSQL-only cohort/reference retention, decision coverage,
+  coverage-only attempts, actual-effect trace columns, the explicit parent FK,
+  and replica coverage links; fresh and 032-upgrade catalog/constraint tests,
+  fail-closed nonempty-032 refusal, and downgrade refusal pass locally;
 - global-user-state revision 028 installs a nullable portable cluster-record
   UUID and partial unique index, leaves historical rows null, and provides the
   PostgreSQL-only exact insert/adopt/reject primitive without changing ordinary
@@ -1711,10 +1713,22 @@ M2 foundation verification evidence on 2026-08-01:
   Kubernetes scope, execution-config boundary, and preparation handshake are
   the next contract slice;
   and
-- the PostgreSQL typed shadow store passes its full 21-test suite, including
-  exact parent/child replay, retry-chain closure, activation-window fencing,
-  action-specific projection proof, retention protection, and lock races. Its
-  exact source received independent contract and concurrency acceptance.
+- the PostgreSQL typed shadow store plus Serve033 coverage/cohort and promotion
+  suites pass locally, including exact parent/child replay, retry-chain
+  closure, reference fencing, coverage-only attempts, bounded canonical
+  promotion inventory, outcome-aware replica coverage/sample-link validation,
+  activation-window/hash fencing, retention protection, and lock races. The
+  pure contract and promotion-audit slices received independent adversarial
+  acceptance.
+
+The typed-store foundation intentionally admits represented decisions without
+a cohort reference only. Passing a prepared cohort reference to either ordinary
+or launch-replica represented admission fails before any service, replica,
+coverage, or parent mutation because the current flattened immutable invocation
+cannot yet commit
+`execution_config.capsule.executor_cohort`. The M2 execution-config closure must
+land before this guard is replaced by full byte-equality validation and atomic
+`PREPARING -> SHADOW_ACTIVE` binding.
 
 Runtime admission/linking, legacy SDK instrumentation, provider identity
 propagation/readback, and live shadow evaluation remain M2 gates; no service is
@@ -1722,8 +1736,11 @@ eligible for authority yet.
 
 ### M3: dark dispatcher and recovery
 
-- Add API-request revision 006's bounded provider-progress snapshot and
-  claim-fenced monotonic write/read methods; keep ordinary attempts null.
+- API-request revision 006 now adds the bounded provider-progress snapshot,
+  retained provider-I/O watermark, claim-fenced monotonic write/read methods,
+  typed domain hooks, retry-seed derivation, and fail-closed migration; ordinary
+  attempts remain null. The generic PostgreSQL substrate and race regressions
+  pass locally; the Serve cursor contract and dispatcher integration remain.
 - Run due discovery/materialization against synthetic/canary actions only.
 - Register the private action handler only in the dedicated
   capability-filtered normal-executor cohort, with `retryable=false` and no
@@ -1990,12 +2007,13 @@ write typed outcomes.
 
 ## Open gates
 
-- Serve033 migration, cohort registry/reference fence, coverage/attempt typed
-  store, pure descriptor/classifier, and legacy launch/down instrumentation
-  verification.
-- API006 monotonic provider-progress snapshot and the private-handler
-  capability filter for the existing request executor, including cross-attempt
-  cursor carry, per-attempt worker re-attestation, and partial-launch cleanup.
+- Runtime atomic admission/linking and legacy launch/down instrumentation on top
+  of the implemented Serve033 migration, cohort/reference fence, typed
+  coverage/attempt store, promotion audit, and retention protocol.
+- The Serve-owned cursor validator/reducer and private-handler capability filter
+  on top of the implemented generic API006 progress journal, including
+  cross-attempt cursor carry, per-attempt worker re-attestation, and
+  partial-launch cleanup.
 - Rendered and live verification of the dedicated versioned authority-worker
   Helm cohort, exact RBAC/admission/NetworkPolicy, purpose token/TLS preflight,
   static-manifest/live-UID qualification, complete-spec submit/observe, worker
@@ -2010,7 +2028,10 @@ write typed outcomes.
   Ray/Skylet and action-keyed job recovery, exact handle/endpoint, dual-LB
   reachability, and the redacted invocation builder pass contract tests. Until
   then the profile is shadow-only and promotion-blocking.
-- Test-cluster SSO and immutable registry-push access for `boltz-test`.
+- Build and push the immutable canary image for `boltz-test`. AWS/ECR auth and
+  read-only cluster access through the dedicated SSM hop are verified; the
+  current rollback baseline is Helm revision 51 with all roles pinned to
+  `sha256:a5afbd26e62ebe2f6990b2f311a59caaf3ef2901f2eab5d6dddd46527320f00a`.
 - Measured shadow sample minimums and the first canary service selection.
 - A separate decision on whether central principal convergence is worth its
   operational cost; it must not silently re-enter M1-M4.
