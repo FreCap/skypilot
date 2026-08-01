@@ -1641,6 +1641,9 @@ class RequestTaskFilter:
         finished_after: if provided, only include requests finished at or after
             this timestamp. Requests still in progress (finished_at IS NULL)
             are always included.
+        retention_safe: internal GC guard that excludes correlated requests
+            until their exact resource-action attempt is settled. PostgreSQL
+            enforces this; SQLite has no central resource-action correlation.
         limit: the number of requests to show. If None, show all requests.
 
     Raises:
@@ -1655,6 +1658,7 @@ class RequestTaskFilter:
     finished_before: float | None = None
     include_missing_finished_at: bool = False
     finished_after: float | None = None
+    retention_safe: bool = False
     limit: int | None = None
     fields: list[str] | None = None
     sort: bool = False
@@ -2041,6 +2045,7 @@ async def clean_finished_requests_with_retention(
                                          finished_before=time.time() -
                                          retention_seconds,
                                          include_missing_finished_at=True,
+                                         retention_safe=True,
                                          limit=batch_size,
                                          fields=['request_id']))
         if len(reqs) == 0:

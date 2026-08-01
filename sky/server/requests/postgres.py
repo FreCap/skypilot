@@ -905,6 +905,45 @@ def _queue_values(request: requests_lib.Request) -> dict[str, Any]:
     }
 
 
+def _insert_request_and_queue(
+    connection: sqlalchemy.engine.Connection,
+    request: requests_lib.Request,
+    *,
+    resource_action_id: uuid.UUID | None = None,
+    resource_action_attempt: int | None = None,
+) -> bool:
+    """Insert one request and its queue row in the caller's transaction."""
+    if ((resource_action_id is None) != (resource_action_attempt is None)):
+        raise ValueError('Resource-action request correlation requires both '
+                         'an action ID and an attempt number.')
+    values = _request_values_for_db(request)
+    values['resource_action_id'] = resource_action_id
+    values['resource_action_attempt'] = resource_action_attempt
+    result = connection.execute(
+        postgresql.insert(REQUESTS).values(**values).on_conflict_do_nothing(
+            index_elements=[REQUESTS.c.request_id]).returning(
+                REQUESTS.c.request_id))
+    inserted = result.scalar_one_or_none() is not None
+    if inserted and request.should_enqueue:
+        connection.execute(
+            postgresql.insert(QUEUE).values(
+                **_queue_values(request)).on_conflict_do_nothing(
+                    index_elements=[QUEUE.c.request_id]))
+    return inserted
+
+
+def _request_is_retention_safe() -> sqlalchemy.ColumnElement[bool]:
+    """Require correlated request evidence to be durably snapshotted."""
+    settled_attempt = sqlalchemy.exists().where(
+        RESOURCE_ACTION_ATTEMPTS.c.action_id == REQUESTS.c.resource_action_id,
+        RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+        REQUESTS.c.resource_action_attempt,
+        RESOURCE_ACTION_ATTEMPTS.c.request_id == REQUESTS.c.request_id,
+        RESOURCE_ACTION_ATTEMPTS.c.mutation_boundary == 'SETTLED')
+    return sqlalchemy.or_(REQUESTS.c.resource_action_id.is_(None),
+                          settled_attempt)
+
+
 def _request_filter_statement(
     req_filter: requests_lib.RequestTaskFilter,) -> sqlalchemy.sql.Select:
     statement = sqlalchemy.select(REQUESTS)
@@ -942,6 +981,8 @@ def _request_filter_statement(
         statement = statement.where(
             sqlalchemy.or_(REQUESTS.c.finished_at >= after,
                            REQUESTS.c.finished_at.is_(None)))
+    if req_filter.retention_safe:
+        statement = statement.where(_request_is_retention_safe())
     if req_filter.sort:
         statement = statement.order_by(REQUESTS.c.created_at.desc())
     if req_filter.limit is not None:
@@ -1318,20 +1359,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
     async def create_if_not_exists_async(self,
                                          request: requests_lib.Request) -> bool:
         engine = await _get_async_engine()
-        values = _request_values_for_db(request)
         async with engine.begin() as connection:
-            result = await connection.execute(
-                postgresql.insert(REQUESTS).values(
-                    **values).on_conflict_do_nothing(
-                        index_elements=[REQUESTS.c.request_id]).returning(
-                            REQUESTS.c.request_id))
-            inserted = result.scalar_one_or_none() is not None
-            if inserted and request.should_enqueue:
-                await connection.execute(
-                    postgresql.insert(QUEUE).values(
-                        **_queue_values(request)).on_conflict_do_nothing(
-                            index_elements=[QUEUE.c.request_id]))
-        return inserted
+            return await connection.run_sync(_insert_request_and_queue, request)
 
     async def create_or_refresh_internal_daemon_async(
             self, request: requests_lib.Request) -> bool:
@@ -1445,7 +1474,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         async with engine.begin() as connection:
             await connection.execute(
                 sqlalchemy.delete(REQUESTS).where(
-                    REQUESTS.c.request_id.in_(request_ids)))
+                    REQUESTS.c.request_id.in_(request_ids),
+                    _request_is_retention_safe()))
 
     async def update_status_async(self, request_id: str,
                                   status: requests_lib.RequestStatus) -> None:

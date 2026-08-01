@@ -6,6 +6,7 @@ import concurrent.futures
 import dataclasses
 import datetime
 import os
+import pathlib
 import shutil
 import sqlite3
 import stat
@@ -592,11 +593,12 @@ def test_resource_action_json_constraints_reject_json_null(request_database):
                             updated_at=sqlalchemy.func.clock_timestamp()))
 
 
-def test_correlated_request_keeps_existing_lease_and_attempt_survives_gc(
-        request_database):
+def test_correlated_request_gc_waits_for_settled_attempt(
+        request_database, monkeypatch, tmp_path):
     engine, backend = request_database
     action_id = uuid.uuid4()
     request_id = str(uuid.uuid4())
+    request = _request(request_id)
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values(
@@ -604,13 +606,11 @@ def test_correlated_request_keeps_existing_lease_and_attempt_survives_gc(
         connection.execute(
             sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
                 **_attempt_values(action_id, 1, request_id)))
-
-    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.update(request_postgres.REQUESTS).where(
-                request_postgres.REQUESTS.c.request_id == request_id).values(
-                    resource_action_id=action_id, resource_action_attempt=1))
+        assert request_postgres._insert_request_and_queue(
+            connection,
+            request,
+            resource_action_id=action_id,
+            resource_action_attempt=1)
 
     item = _claim(backend, request_id)
     assert item.claim_token is not None
@@ -628,6 +628,53 @@ def test_correlated_request_keeps_existing_lease_and_attempt_survives_gc(
         storage.deactivate_execution_claim(context)
     assert backend.get_request(
         request_id).status is requests.RequestStatus.SUCCEEDED
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    finished_at=sqlalchemy.func.clock_timestamp() -
+                    datetime.timedelta(minutes=1)))
+
+    log_dir = tmp_path / 'logs'
+    legacy_log_dir = tmp_path / 'legacy-logs'
+    debug_log_dir = tmp_path / 'debug-logs'
+    monkeypatch.setattr(requests.server_constants, 'REQUEST_LOG_PATH_PREFIX',
+                        str(log_dir))
+    monkeypatch.setattr(requests, 'LEGACY_REQUEST_LOG_PATH_PREFIX',
+                        str(legacy_log_dir))
+    monkeypatch.setattr(requests.sky_logging, 'DEBUG_LOG_DIR',
+                        str(debug_log_dir))
+    monkeypatch.setattr(storage, '_storage_backend', backend)
+    files = [
+        request.log_path,
+        requests._get_legacy_log_path(request_id),
+        (debug_log_dir / request_id).with_suffix('.log'),
+        pathlib.Path(requests.request_lock_path(request_id)),
+    ]
+    for path in files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    asyncio.run(requests.clean_finished_requests_with_retention(0))
+    with engine.connect() as connection:
+        request_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.REQUESTS).where(
+                                 request_postgres.REQUESTS.c.request_id ==
+                                 request_id)).scalar_one()
+    assert request_count == 1
+    assert all(path.exists() for path in files)
+
+    # The final delete repeats the predicate, protecting callers that did not
+    # use the retention-safe candidate filter.
+    asyncio.run(backend.delete_requests([request_id]))
+    with engine.connect() as connection:
+        request_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.REQUESTS).where(
+                                 request_postgres.REQUESTS.c.request_id ==
+                                 request_id)).scalar_one()
+    assert request_count == 1
 
     with engine.begin() as connection:
         connection.execute(
@@ -640,7 +687,7 @@ def test_correlated_request_keeps_existing_lease_and_attempt_survives_gc(
                              request_terminal_state='SUCCEEDED',
                              settled_at=sqlalchemy.func.clock_timestamp(),
                              updated_at=sqlalchemy.func.clock_timestamp()))
-    asyncio.run(backend.delete_requests([request_id]))
+    asyncio.run(requests.clean_finished_requests_with_retention(0))
 
     with engine.connect() as connection:
         assert connection.execute(
@@ -663,6 +710,7 @@ def test_correlated_request_keeps_existing_lease_and_attempt_survives_gc(
     assert attempt['request_terminal_state'] == 'SUCCEEDED'
     assert attempt['typed_outcome'] == {'disposition': 'succeeded'}
     assert action_count == 1
+    assert all(not path.exists() for path in files)
 
 
 def test_api005_downgrade_retains_additive_schema(request_database):
