@@ -14,13 +14,25 @@ autoscaler tick repeats the same point read and warning. A state-store outage
 therefore turns one fallback into work proportional to fleet size and increases
 pressure on the failing dependency.
 
+The tick boundary must not make the latest-version fallback authoritative for
+rolling retirement. If the latest spec has much higher per-replica capacity
+than the unavailable historical spec, reusing that fallback across an entire
+old version can overstate the surviving fleet and retire serving replicas
+before their replacements are ready. The bounded read therefore needs a
+fail-closed drain rule as well as retry liveness.
+
 ## Behavior Contract
 
 - Within one `generate_scaling_decisions()` call, each unavailable historical
   version causes at most one durable spec read per autoscaler instance.
 - All replicas of that version use the existing latest-version fallback for the
-  remainder of the tick. The fallback does not authorize a different scaling
-  policy or change capacity arithmetic.
+  remainder of the tick for sizing and scale-up decisions.
+- An unavailable historical version cannot authorize outdated-replica
+  retirement while the latest fleet is still below its final target. The
+  autoscaler keeps all old replicas for that tick and may still request the
+  latest-version scale-up. Once enough latest-version replicas are ready to
+  satisfy the final target, retirement remains safe without historical
+  capacity data.
 - The unavailable-version memo is discarded when the tick completes, whether
   the tick returns or raises. The next tick retries the durable read so a
   transient miss or database failure can heal.
@@ -41,6 +53,8 @@ pressure on the failing dependency.
 | `sky/serve/autoscalers.py`: concurrency historical knob fallback is read once per unavailable version in a tick | `tests/unit_tests/test_concurrency_autoscaler.py`: the same regression through physical-backend capacity resolution | `pytest -n 0 tests/unit_tests/test_concurrency_autoscaler.py -k "version_fallback"` | `Python Tests - Unit Tests` |
 | Failure recovery: a second tick retries and then adopts the recovered historical spec | Both focused test files, with a failed first read and successful second-tick read | Both focused commands above | `Python Tests - Unit Tests` |
 | Cleanup: exceptional tick exit discards the unavailable-version memo | `tests/unit_tests/test_serve_autoscaler.py`: forced decision exception followed by a successful retry | Request-rate focused command above | `Python Tests - Unit Tests` |
+| Request-rate drain safety: a one-shot historical read failure cannot multiply the latest-version fallback into old-fleet retirement | `tests/unit_tests/test_serve_autoscaler.py`: controller-restart rolling update with 100 low-capacity old replicas, one ready latest replica, and immediate state-store recovery | Request-rate focused command above | `Python Tests - Unit Tests` |
+| Concurrency drain safety: unavailable historical knobs fail closed for physical-backend retirement | `tests/unit_tests/test_concurrency_autoscaler.py`: matching high-latest/low-old rolling-update regression | Concurrency focused command above | `Python Tests - Unit Tests` |
 | Adjacent autoscaling, rollout, liveness, and performance behavior | Full request-rate and concurrency autoscaler unit files; existing version-cache, rolling-update, and decision tests plus new exact call-count assertions | `pytest -n 0 tests/unit_tests/test_serve_autoscaler.py tests/unit_tests/test_concurrency_autoscaler.py` | `Python Tests - Unit Tests` |
 | SkyServe integration surface | Jobs and Serve integration suite | `pytest -n 0 tests/test_jobs_and_serve.py` | `Python Tests - Jobs & API Tests` |
 | Formatting and static contracts | Changed Python files through repository formatter, plus diff validation | `bash format.sh --files sky/serve/autoscalers.py tests/unit_tests/test_serve_autoscaler.py tests/unit_tests/test_concurrency_autoscaler.py`; `git diff --check` | `format`, `mypy`, `Pylint`, `Ruff`, `basedpyright`, `async-lifecycle`, import-contract jobs |
@@ -60,6 +74,10 @@ Unit Tests` and includes `tests/test_jobs_and_serve.py` in `Python Tests - Jobs
    healthy steady state.
 3. Rate-limit warnings only. Rejected because it leaves the database retry
    fanout intact.
+4. Continue capacity-aware old-replica retirement with the latest-version
+   fallback. Rejected because the fallback may be larger than the historical
+   capacity and can therefore retire serving capacity before replacements are
+   ready. A one-tick drain hold is bounded, retryable, and conservative.
 
 ## Implementation and Rollout
 
@@ -68,7 +86,11 @@ Unit Tests` and includes `tests/test_jobs_and_serve.py` in `Python Tests - Jobs
    `finally` cleanup.
 3. Consult the set before historical reads and record both missing specs and
    read failures.
-4. Prove the untouched parent repeats reads once per replica, then prove the
+4. If either capacity-aware rolling drain encounters an unavailable historical
+   version, suppress old-replica retirement for that tick while preserving
+   scale-up decisions and the terminal branch where the latest fleet already
+   satisfies the final target.
+5. Prove the untouched parent repeats reads once per replica, then prove the
    exact head performs one read per unavailable version per tick and retries on
    the next tick.
 
