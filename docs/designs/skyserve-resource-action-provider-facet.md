@@ -187,6 +187,24 @@ name with the requested UUID, adopt/update a row with the same UUID, or reject
 a same-name different-UUID row. It validates canonical UUID text and never
 silently overwrites identity.
 
+Global-user-state revision 028 adds nullable
+`clusters.cluster_record_uuid` using SQLAlchemy's portable UUID type (native
+UUID on PostgreSQL) and enforces uniqueness for every nonnull value. It is an
+independent identity commitment, not an alias for `cluster_hash`, and migration
+028 does not backfill historical rows. The inert nullable column and unique
+index are present on the still-supported local SQLite catalog so current
+metadata remains readable; initialization/adoption remains PostgreSQL-only.
+Only the internal action-aware cluster-row primitive may initialize it: insert
+a missing name with the requested UUID, exactly adopt/update a row with the
+same UUID, and reject a same-name null or different-UUID row. Ordinary cluster
+updates omit this column and therefore cannot initialize, clear, or replace a
+nonnull commitment. An old name-only row stays ineligible until removed;
+launch never mints identity onto an already-live resource.
+
+Migration 028 downgrade may remove the unique index and column only when no
+row has a nonnull `cluster_record_uuid`; otherwise it raises. Application
+rollback keeps revision 028 and never invokes schema down.
+
 For Kubernetes, the cluster-record UUID and Serve replica-incarnation UUID use
 the reserved immutable labels `skypilot.co/cluster-record-uuid` and
 `skypilot.co/serve-replica-incarnation` on the workload and pod template. Both
@@ -515,6 +533,29 @@ ProviderPodResourceSnapshotV1 = {
 }
 ```
 
+The Serve adapter's immutable action spec is the closed object:
+
+```text
+ServeReplicaActionSpecV1 = {
+  version: 1,
+  provider_plan: ProviderLifecyclePlanV1,
+  invocation: ProviderLifecycleInvocationV1
+}
+```
+
+Unknown keys and floats are rejected, and the canonical object is bounded to
+65,536 UTF-8 bytes. `provider_plan.validate_invocation(invocation)` must pass;
+the plan and invocation derive the enclosing action ID, and
+`provider_plan.request_payload_sha256` equals `invocation.sha256`. The shadow
+parent's separately indexed `provider_plan` and hash are an exact byte-equal
+copy of the wrapper member, and a primary child's invocation is an exact
+byte-equal copy of the wrapper invocation. A `LAUNCH_CLEANUP_DOWN` child is the
+sole exception: it uses the closed down invocation derived from the same
+launch identity and frozen target. Typed reads reconstruct this exact wrapper;
+arbitrary mappings are not accepted. Golden canonical-byte/hash fixtures plus
+unknown-key, float, identity-mismatch, and mutated-plan/invocation rejection
+tests freeze this wrapper contract.
+
 Exactly one of `launch` and `down` is nonnull and it must match
 `action_kind`. Objects reject unknown keys. Text is NFC, lists are sorted and
 duplicate-free by their canonical element/key, UUIDs are lowercase hyphenated,
@@ -577,6 +618,9 @@ option mutation is permitted afterward.
 ### P2: live shadow observation
 
 - Capture actual legacy request/result.
+- Add global-user-state revision 028 and propagate the precommitted
+  cluster-record UUID through the prepared launch request, backend, cluster
+  row, and provider labels without repurposing `cluster_hash`.
 - Characterize the current direct `core.down()` compatibility path, then route
   legacy teardown through `sdk.down()` and require real request IDs for the
   promotion window.
@@ -632,11 +676,16 @@ resource, and no false teardown completion.
 
 ## Deployment and rollback
 
-Provider changes ship dark, then shadow, then per-service authoritative. No
-provider profile is enabled globally by schema migration. Application rollback
-keeps action/request rows and deploys a compatible image capable of preserving
-nonterminal actions; it does not run provider compensation or schema down.
-After first authority, rollback to a pre-action-aware image is unsupported.
+Provider changes ship dark, then shadow, then per-service authoritative. The
+blocking migration job must converge all three independent additive
+heads—global-user-state 028, Serve032, and API005—before any action-aware
+process image is activated. Activation is gated on all three verified heads;
+there is no cross-lineage Alembic dependency. No provider profile is enabled
+globally by schema migration. Application rollback retains all three heads and
+uses only a compatible image that preserves nonnull cluster-record UUIDs as
+write-once commitments and preserves nonterminal shadow/action state. It does
+not run provider compensation or schema down. After first authority, rollback
+to a pre-action-aware image is unsupported.
 
 Unknown or drifted provider evidence fails closed to `BLOCKED`. Operators may
 inspect and repair it, but cannot replace the frozen locator or fabricate an

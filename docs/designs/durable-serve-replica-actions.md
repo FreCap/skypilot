@@ -891,8 +891,8 @@ Promotion requires:
 
 - all old controller-capable processes drained;
 - every remaining controller/API/executor running the approved image digest,
-  at API005/Serve032, and exposing the registered action handler through the
-  existing handler inventory;
+  at API005, Serve032, and global-user-state 028, and exposing the registered
+  action handler through the existing handler inventory;
 - exact provider-profile eligibility for every live candidate;
 - no unresolved shadow divergence or unsampled mutation;
 - at least 24 hours and a configured minimum sample count of clean live shadow
@@ -967,6 +967,11 @@ M1b verification evidence on 2026-08-01:
 
 - Add Serve032 mode/replica-identity/link plus logical-sample/per-attempt
   schema. Refuse schema down while retaining the additive state.
+- Add global-user-state revision 028 with a nullable, partial-unique
+  `clusters.cluster_record_uuid`; leave historical rows null, omit it from
+  ordinary cluster updates, and reserve initialization/adoption for the
+  PostgreSQL-only action-aware cluster-row primitive. Refuse downgrade while
+  any nonnull commitment remains.
 - Reuse the existing UUID-valued `services.hash` as both textual hash and
   service incarnation; do not add or backfill a second service identity.
 - Preallocate each new action-aware replica incarnation and SkyPilot cluster
@@ -1023,7 +1028,10 @@ Deployment order is:
 
 1. build and push an immutable image digest;
 2. `helm upgrade --reuse-values` with the blocking additive migration hook;
-3. verify API005 and Serve032 heads/structures;
+3. verify all independent milestone-specific heads: M1a is API005 with
+   unchanged Serve031/global-user-state 027; M2 and later require API005,
+   Serve032, and global-user-state 028, with no cross-lineage Alembic
+   dependency;
 4. deploy shadow-capable processes and prove image/head/handler inventory;
 5. collect parity and crash evidence; and
 6. promote only an explicitly selected canary service.
