@@ -28,10 +28,10 @@ export function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
         return;
       }
 
-      if (source === 'visibilitychange') {
+      const handled = onRefreshRef.current(source);
+      if (source === 'visibilitychange' && handled !== false) {
         lastVisibilityRefreshAtRef.current = now;
       }
-      onRefreshRef.current(source);
     };
 
     const handleVisibilityChange = () => {
