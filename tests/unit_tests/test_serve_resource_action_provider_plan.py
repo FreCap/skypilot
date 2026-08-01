@@ -92,6 +92,19 @@ class _IntegerSubclass(int):
     pass
 
 
+class _SpoofedCanonicalJsonObject(actions.CanonicalJsonObject):
+    """Wrapper whose public value and hash conceal different committed data."""
+
+    def canonical_value(self) -> dict:
+        value = super().canonical_value()
+        value['uncontracted'] = 'hidden'
+        return value
+
+    @property
+    def sha256(self) -> str:
+        return actions.canonical_sha256(super().canonical_value())
+
+
 class _UncontractedLabel(actions.ProviderLabelV1):
 
     def canonical_value(self) -> dict:
@@ -1129,6 +1142,35 @@ def test_object_plan_json_preimages_are_detached_and_directly_typed() -> None:
         dataclasses.replace(parsed, request_body={})
     with pytest.raises(TypeError, match='invalid type'):
         dataclasses.replace(parsed, requested_semantic={})
+
+
+def test_object_plan_accepts_exact_canonical_json_object_embeddings() -> None:
+    parsed = actions.ProviderKubernetesObjectPlanV1.from_value(
+        _object_plan('head_pod'))
+
+    assert type(parsed.request_body) is actions.CanonicalJsonObject
+    assert type(parsed.requested_semantic) is actions.CanonicalJsonObject
+    replaced = dataclasses.replace(parsed,
+                                   request_body=parsed.request_body,
+                                   requested_semantic=parsed.requested_semantic)
+    assert replaced.canonical_bytes == parsed.canonical_bytes
+
+
+@pytest.mark.parametrize(('field', 'message'), [
+    ('request_body', 'object plan request_body has an invalid type.'),
+    ('requested_semantic',
+     'object plan requested_semantic has an invalid type.'),
+])
+def test_object_plan_rejects_canonical_json_object_subclass_embeddings(
+        field: str, message: str) -> None:
+    parsed = actions.ProviderKubernetesObjectPlanV1.from_value(
+        _object_plan('head_pod'))
+    spoofed = _SpoofedCanonicalJsonObject(
+        getattr(parsed, field).canonical_value())
+
+    with pytest.raises(TypeError) as error:
+        dataclasses.replace(parsed, **{field: spoofed})
+    assert str(error.value) == message
 
 
 def test_object_plan_is_closed() -> None:

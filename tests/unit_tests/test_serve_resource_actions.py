@@ -7,10 +7,57 @@ import uuid
 import pytest
 
 from sky.serve import resource_actions as actions
+from sky.server.requests import resource_actions as kernel_actions
 
 _SERVICE_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
 _CLUSTER_UUID = '33333333-3333-4333-8333-333333333333'
+
+
+class _EqualitySpoofingString(str):
+    """Text whose Python equality lies about its canonical value."""
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        return False
+
+    __hash__ = str.__hash__
+
+
+class _HashSpoofingString(str):
+    """Text whose hash differs from its canonical string hash."""
+
+    def __hash__(self) -> int:
+        return super().__hash__() ^ 1
+
+
+class _LengthSpoofingString(str):
+    """Text whose direct length understates its canonical content."""
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _LengthSpoofingBytes(bytes):
+    """Encoded bytes whose length understates their canonical content."""
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _BoundSpoofingString(str):
+    """Text whose encoded bytes try to evade byte-size bounds."""
+
+    def encode(self, encoding: str = 'utf-8', errors: str = 'strict') -> bytes:
+        return _LengthSpoofingBytes(super().encode(encoding, errors))
+
+
+_SPOOFING_STRING_TYPES = (_EqualitySpoofingString, _HashSpoofingString,
+                          _LengthSpoofingString, _BoundSpoofingString)
 
 
 def _identity(generation: int = 1) -> dict:
@@ -195,6 +242,18 @@ def _down_spec() -> dict:
     }
 
 
+def _shadow_projection() -> dict:
+    return {
+        'version': 1,
+        'action_kind': 'launch',
+        'row_disposition': 'retained',
+        'replica_status': 'READY',
+        'capacity_outcome': 'success',
+        'action_disposition': 'succeeded',
+        'resolved_target': _resolved_target(),
+    }
+
+
 def _observation() -> dict:
     target = actions.ProviderLocatorV1.from_value(_target())
     return {
@@ -343,6 +402,68 @@ def test_provider_plan_commits_invocation_resource_and_target() -> None:
     with pytest.raises(ValueError, match='payload hash'):
         actions.ProviderLifecyclePlanV1.from_value(forged).validate_invocation(
             invocation)
+
+
+@pytest.mark.parametrize(('value_factory', 'parser', 'field_name'), [
+    (_launch_invocation, actions.ProviderLifecycleInvocationV1.from_value,
+     'invocation.action_kind'),
+    (_launch_plan, actions.ProviderLifecyclePlanV1.from_value,
+     'plan.action_kind'),
+    (_shadow_projection, actions.ServeShadowProjectionV1.from_value,
+     'projection.action_kind'),
+])
+@pytest.mark.parametrize('spoof_type',
+                         _SPOOFING_STRING_TYPES,
+                         ids=('equality', 'hash', 'length', 'bound'))
+def test_action_kind_wire_rejects_string_subclass_before_normalization(
+        value_factory, parser, field_name: str, spoof_type: type[str]) -> None:
+    value = value_factory()
+    value['action_kind'] = spoof_type('launch')
+
+    with pytest.raises(TypeError) as exc_info:
+        parser(value)
+    assert str(exc_info.value) == f'{field_name} must be text.'
+
+
+@pytest.mark.parametrize(('value_factory', 'parser', 'error_message'), [
+    (_launch_invocation, actions.ProviderLifecycleInvocationV1.from_value,
+     'invocation action kind is unsupported.'),
+    (_launch_plan, actions.ProviderLifecyclePlanV1.from_value,
+     'provider plan action kind is unsupported.'),
+    (_shadow_projection, actions.ServeShadowProjectionV1.from_value,
+     'shadow projection action kind is unsupported.'),
+])
+@pytest.mark.parametrize('spoof_type',
+                         _SPOOFING_STRING_TYPES,
+                         ids=('equality', 'hash', 'length', 'bound'))
+def test_action_kind_direct_constructors_are_exact(
+        value_factory, parser, error_message: str,
+        spoof_type: type[str]) -> None:
+    parsed = parser(value_factory())
+
+    accepted = dataclasses.replace(parsed,
+                                   action_kind=kernel_actions.ActionKind.LAUNCH)
+    assert accepted.action_kind is kernel_actions.ActionKind.LAUNCH
+    assert accepted.canonical_bytes == parsed.canonical_bytes
+
+    with pytest.raises(ValueError) as exc_info:
+        dataclasses.replace(parsed, action_kind=spoof_type('launch'))
+    assert str(exc_info.value) == error_message
+
+
+def test_provider_resource_identity_action_identity_exact_kind_gate() -> None:
+    identity = actions.ProviderResourceIdentityV1.from_value(_identity())
+
+    from_text = identity.action_identity('launch')  # type: ignore[arg-type]
+    from_member = identity.action_identity(kernel_actions.ActionKind.LAUNCH)
+    assert from_text.action_id == from_member.action_id
+
+    spoofed_values = tuple(
+        spoof_type('launch') for spoof_type in _SPOOFING_STRING_TYPES)
+    for invalid in (*spoofed_values, 'restart', object()):
+        with pytest.raises(ValueError) as exc_info:
+            identity.action_identity(invalid)  # type: ignore[arg-type]
+        assert str(exc_info.value) == 'action_kind must be launch or down.'
 
 
 def test_locator_and_plan_literal_golden_bytes_and_hashes() -> None:

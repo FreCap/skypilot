@@ -1,11 +1,89 @@
 """Pure bounded provider-value and Kubernetes resource contract tests."""
 
+# pylint: disable=protected-access
+
+import collections.abc
 import copy
 import dataclasses
+import enum
+import uuid
 
 import pytest
 
 from sky.serve import resource_actions as actions
+from sky.server.requests import resource_actions as kernel_actions
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _IntegerSubclass(int):
+    pass
+
+
+class _TestIntEnum(enum.IntEnum):
+    ONE = 1
+
+
+class _UuidSubclass(uuid.UUID):
+    pass
+
+
+class _ListSubclass(list):
+    pass
+
+
+class _DictSubclass(dict):
+    pass
+
+
+class _ExplodingList(list):
+
+    def __iter__(self) -> collections.abc.Iterator[object]:
+        raise AssertionError('list subclass iterator must not be invoked')
+
+    def __len__(self) -> int:
+        raise AssertionError('list subclass length must not be invoked')
+
+
+class _ExplodingDict(dict):
+
+    def __iter__(self) -> collections.abc.Iterator[object]:
+        raise AssertionError('dict subclass iterator must not be invoked')
+
+    def __len__(self) -> int:
+        raise AssertionError('dict subclass length must not be invoked')
+
+    def items(self) -> collections.abc.ItemsView[object, object]:
+        raise AssertionError('dict subclass items must not be invoked')
+
+
+class _ExplodingMapping(collections.abc.Mapping[str, object]):
+    """Mapping whose overridable methods must remain untouched."""
+
+    @property
+    def __class__(self) -> type:
+        raise AssertionError('Mapping subclass __class__ must not be invoked')
+
+    def __getitem__(self, key: str) -> object:
+        del key
+        raise AssertionError('Mapping subclass lookup must not be invoked')
+
+    def __iter__(self) -> collections.abc.Iterator[str]:
+        raise AssertionError('Mapping subclass iterator must not be invoked')
+
+    def __len__(self) -> int:
+        raise AssertionError('Mapping subclass length must not be invoked')
+
+    def items(self) -> collections.abc.ItemsView[str, object]:
+        raise AssertionError('Mapping subclass items must not be invoked')
+
+
+class _CanonicalJsonValueSubclass(actions.CanonicalJsonValue):
+
+    def canonical_value(self) -> object:
+        raise AssertionError('wrapper subclass must be rejected before use')
 
 
 def _artifact(path: str = 'images/runtime.json') -> dict:
@@ -55,6 +133,101 @@ def _allocation(pointer: str, allocator: str, value: object) -> dict:
         'allocator': allocator,
         'value': value,
     }
+
+
+def test_shared_scalar_helpers_accept_exact_builtin_and_typed_values() -> None:
+    timestamp = '2026-08-01T00:00:00.000000Z'
+    identifier = uuid.UUID('11111111-1111-4111-8111-111111111111')
+    profile = actions.ProviderProfile.POD_CLUSTER_V1
+    action_kind = kernel_actions.ActionKind.LAUNCH
+
+    assert actions._text('text', name='test') == 'text'
+    assert actions._sha256('a' * 64, name='test') == 'a' * 64
+    assert actions._sha256_digest('sha256:' + 'a' * 64,
+                                  name='test') == 'sha256:' + 'a' * 64
+    assert actions._nonnegative_integer(0, name='test') == 0
+    assert actions._positive_integer(1, name='test') == 1
+    assert actions._version_one(1, name='test') == 1
+    assert actions._boolean(True, name='test') is True
+    assert actions._timestamp(timestamp, name='test') == timestamp
+    assert actions._enum_value(actions.ProviderProfile, profile,
+                               name='test') is profile
+    assert actions._enum_value(actions.ProviderProfile,
+                               profile.value,
+                               name='test') is profile
+    assert actions._uuid(identifier, name='test') is identifier
+    assert actions._uuid(str(identifier), name='test') == identifier
+    assert actions._action_kind(action_kind, name='test') is action_kind
+    assert actions._action_kind(action_kind.value, name='test') is action_kind
+
+
+def test_shared_scalar_helpers_reject_subclasses_with_stable_errors() -> None:
+    timestamp = '2026-08-01T00:00:00.000000Z'
+    identifier_text = '11111111-1111-4111-8111-111111111111'
+    cases = (
+        (lambda: actions._text(_StringSubclass('text'), name='test'),
+         lambda: actions._text(1, name='test'), TypeError,
+         'test must be text.'),
+        (lambda: actions._sha256(_StringSubclass('a' * 64), name='test'),
+         lambda: actions._sha256('bad', name='test'), ValueError,
+         'test must be lowercase SHA-256 hex.'),
+        (lambda: actions._sha256_digest(_StringSubclass('sha256:' + 'a' * 64),
+                                        name='test'),
+         lambda: actions._sha256_digest('bad', name='test'), ValueError,
+         'test must be sha256:<64 lowercase hex>.'),
+        (lambda: actions._nonnegative_integer(_IntegerSubclass(0), name='test'),
+         lambda: actions._nonnegative_integer(-1, name='test'), ValueError,
+         'test must be a nonnegative integer no greater than '
+         '9223372036854775807.'),
+        (lambda: actions._positive_integer(_IntegerSubclass(1), name='test'),
+         lambda: actions._positive_integer(0, name='test'), ValueError,
+         'test must be a positive integer no greater than '
+         '9223372036854775807.'),
+        (lambda: actions._version_one(_IntegerSubclass(1), name='test'),
+         lambda: actions._version_one(2, name='test'), ValueError,
+         'test must be integer 1.'),
+        (lambda: actions._timestamp(_StringSubclass(timestamp), name='test'),
+         lambda: actions._timestamp('invalid', name='test'), ValueError,
+         'test must be UTC RFC 3339 with six fractional digits.'),
+        (lambda: actions._enum_value(actions.ProviderProfile,
+                                     _StringSubclass('pod_cluster_v1'),
+                                     name='test'),
+         lambda: actions._enum_value(actions.ProviderProfile, 1, name='test'),
+         TypeError, 'test must be text.'),
+        (lambda: actions._uuid(_UuidSubclass(identifier_text), name='test'),
+         lambda: actions._uuid(object(), name='test'), TypeError,
+         'test must be canonical UUID text.'),
+        (lambda: actions._uuid(_StringSubclass(identifier_text), name='test'),
+         lambda: actions._uuid(object(), name='test'), TypeError,
+         'test must be canonical UUID text.'),
+        (lambda: actions._action_kind(_StringSubclass('launch'), name='test'),
+         lambda: actions._action_kind(object(), name='test'), TypeError,
+         'test must be text.'),
+    )
+    for subclass_call, baseline_call, error_type, message in cases:
+        with pytest.raises(error_type) as subclass_error:
+            subclass_call()
+        with pytest.raises(error_type) as baseline_error:
+            baseline_call()
+        assert str(subclass_error.value) == message
+        assert str(baseline_error.value) == message
+
+
+def test_shared_boolean_helper_rejects_integer_and_int_enum() -> None:
+    for value in (1, _TestIntEnum.ONE):
+        with pytest.raises(TypeError) as error:
+            actions._boolean(value, name='test')
+        assert str(error.value) == 'test must be a Boolean.'
+
+
+def test_shared_enum_and_action_kind_unknown_strings_keep_errors() -> None:
+    with pytest.raises(ValueError) as enum_error:
+        actions._enum_value(actions.ProviderProfile, 'unknown', name='test')
+    assert str(enum_error.value) == 'test is unsupported.'
+
+    with pytest.raises(ValueError) as action_error:
+        actions._action_kind('unknown', name='test')
+    assert str(action_error.value) == 'test is unsupported.'
 
 
 @pytest.mark.parametrize('value', [
@@ -112,6 +285,78 @@ def test_canonical_json_value_roundtrip_order_hash_and_integer_bounds() -> None:
     assert parsed.sha256 == actions.canonical_sha256(value)
     assert actions.CanonicalJsonValue(value).canonical_bytes == (
         parsed.canonical_bytes)
+
+
+@pytest.mark.parametrize('value', [
+    None,
+    False,
+    0,
+    'text',
+    [None, True, 1, 'text'],
+    {
+        'nested': [None, False, 2, 'value']
+    },
+])
+def test_canonical_json_accepts_exact_builtin_types(value: object) -> None:
+    parsed = actions.CanonicalJsonValue(value)
+    assert parsed.canonical_value() == value
+
+
+@pytest.mark.parametrize('value', [
+    _StringSubclass('text'),
+    _IntegerSubclass(1),
+    _ListSubclass([1]),
+    _DictSubclass({'key': 1}),
+    {
+        _StringSubclass('key'): 'value'
+    },
+    {
+        'nested': _StringSubclass('value')
+    },
+    {
+        'nested': _IntegerSubclass(1)
+    },
+    {
+        'nested': _ListSubclass([1])
+    },
+    {
+        'nested': _DictSubclass({'key': 1})
+    },
+])
+def test_canonical_json_rejects_root_and_nested_subclasses(
+        value: object) -> None:
+    with pytest.raises(TypeError):
+        actions.CanonicalJsonValue(value)
+
+
+@pytest.mark.parametrize('value', [
+    _ExplodingList([1]),
+    {
+        'nested': _ExplodingList([1])
+    },
+    _ExplodingDict({'key': 1}),
+    {
+        'nested': _ExplodingDict({'key': 1})
+    },
+])
+def test_canonical_json_rejects_container_subclasses_without_invoking_methods(
+        value: object) -> None:
+    with pytest.raises(TypeError):
+        actions.CanonicalJsonValue(value)
+
+
+def test_canonical_json_rejects_mapping_without_invoking_overrides() -> None:
+    values = (_ExplodingMapping(), {'nested': _ExplodingMapping()})
+    for value in values:
+        with pytest.raises(TypeError):
+            actions.CanonicalJsonValue(value)
+
+
+def test_canonical_json_object_rejects_root_subclasses_without_invoking_methods(
+) -> None:
+    for value in (_ExplodingDict({'key': 1}), _ExplodingMapping()):
+        with pytest.raises(TypeError, match='object root'):
+            actions.CanonicalJsonObject(value)
 
 
 @pytest.mark.parametrize('value', [-(2**63) - 1, 2**63, 0.0, 1.5, b'x', {1}])
@@ -177,6 +422,14 @@ def test_canonical_json_container_member_and_depth_boundaries() -> None:
     with pytest.raises(ValueError, match='at most 256'):
         actions.CanonicalJsonValue(list(range(257)))
 
+    object_at_limit = {f'key-{index:03d}': index for index in range(256)}
+    assert len(
+        actions.CanonicalJsonObject(object_at_limit).canonical_value()) == 256
+    object_over_limit = dict(object_at_limit)
+    object_over_limit['key-256'] = 256
+    with pytest.raises(ValueError, match='at most 256'):
+        actions.CanonicalJsonObject(object_over_limit)
+
     depth_sixteen: object = 1
     for _ in range(16):
         depth_sixteen = [depth_sixteen]
@@ -221,6 +474,33 @@ def test_canonical_json_wrappers_are_immutable_and_return_detached_values(
     assert parsed.canonical_value() == {'nested': ['first']}
     with pytest.raises(dataclasses.FrozenInstanceError):
         parsed._canonical_bytes = b'{}'  # type: ignore[misc]  # pylint: disable=protected-access
+
+
+def test_canonical_json_serializes_only_the_detached_validated_snapshot(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    source = {'nested': ['first']}
+    original_serializer = actions.canonical_json_bytes
+    serialized_values: list[object] = []
+
+    def _mutating_serializer(value: object) -> bytes:
+        serialized_values.append(value)
+        assert value is not source
+        assert isinstance(value, dict)
+        assert value['nested'] is not source['nested']
+        source['nested'].append('mutated-during-serialization')
+        source['late'] = True
+        return original_serializer(value)
+
+    monkeypatch.setattr(actions, 'canonical_json_bytes', _mutating_serializer)
+    parsed = actions.CanonicalJsonObject(source)
+
+    assert len(serialized_values) == 1
+    assert parsed.canonical_bytes == b'{"nested":["first"]}'
+    assert parsed.canonical_value() == {'nested': ['first']}
+    assert source == {
+        'nested': ['first', 'mutated-during-serialization'],
+        'late': True,
+    }
 
 
 @pytest.mark.parametrize('value', [None, True, 1, 'text', ['array']])
@@ -299,6 +579,12 @@ def test_server_allocation_direct_construction_requires_immutable_value(
         allocator='api_server',
         value=actions.CanonicalJsonValue('10.0.0.1'))
     assert parsed.canonical_value()['value'] == '10.0.0.1'
+
+    with pytest.raises(TypeError, match='invalid type'):
+        actions.ProviderKubernetesServerAllocationV1(
+            json_pointer='/spec/clusterIP',
+            allocator='api_server',
+            value=_CanonicalJsonValueSubclass('10.0.0.1'))
 
 
 def test_server_allocation_bounds_value_before_recursive_outer_parser() -> None:

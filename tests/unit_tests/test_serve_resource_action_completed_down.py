@@ -23,6 +23,52 @@ _EXPECTED_SSH_RESOLVED_BYTES = (
     b'"uid":"uid-head-ssh-service"}')
 
 
+class _EqualitySpoofingString(str):
+    """Text whose Python equality lies about its canonical value."""
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        return False
+
+    __hash__ = str.__hash__
+
+
+class _HashSpoofingString(str):
+    """Text whose hash differs from its canonical string hash."""
+
+    def __hash__(self) -> int:
+        return super().__hash__() ^ 1
+
+
+class _LengthSpoofingString(str):
+    """Text whose direct length understates its canonical content."""
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _LengthSpoofingBytes(bytes):
+    """Encoded bytes whose length understates their canonical content."""
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _BoundSpoofingString(str):
+    """Text whose encoded bytes try to evade byte-size bounds."""
+
+    def encode(self, encoding: str = 'utf-8', errors: str = 'strict') -> bytes:
+        return _LengthSpoofingBytes(super().encode(encoding, errors))
+
+
+_SPOOFING_STRING_TYPES = (_EqualitySpoofingString, _HashSpoofingString,
+                          _LengthSpoofingString, _BoundSpoofingString)
+
+
 def _artifact() -> dict:
     return {
         'repo_path': 'contracts/admitted-object-normalization.py',
@@ -461,6 +507,31 @@ def test_handle_provider_config_rejects_wrong_literal_ip_and_names(
         raw['provider_config'])
     with pytest.raises((TypeError, ValueError)):
         actions.ProviderKubernetesHandleV1.from_value(raw)
+
+
+@pytest.mark.parametrize(('field', 'spoofed_value', 'message'), [
+    ('context_mode', 'in_cluster',
+     'handle provider_config context_mode must be in_cluster.'),
+    ('port_mode', 'podip', 'handle provider_config port_mode must be podip.'),
+])
+@pytest.mark.parametrize('spoof_type',
+                         _SPOOFING_STRING_TYPES,
+                         ids=('equality', 'hash', 'length', 'bound'))
+def test_handle_provider_config_literals_reject_spoofing_subclasses(
+        field: str, spoofed_value: str, message: str,
+        spoof_type: type[str]) -> None:
+    spoofed_value = spoof_type(spoofed_value)
+    raw_config = _handle()['provider_config']
+    raw_config[field] = spoofed_value
+    with pytest.raises(ValueError) as wire_error:
+        actions.ProviderKubernetesHandleProviderConfigV1.from_value(raw_config)
+    assert str(wire_error.value) == message
+
+    parsed = actions.ProviderKubernetesHandleProviderConfigV1.from_value(
+        _handle()['provider_config'])
+    with pytest.raises(ValueError) as direct_error:
+        dataclasses.replace(parsed, **{field: spoofed_value})
+    assert str(direct_error.value) == message
 
 
 def test_handle_rejects_provider_config_hash_and_pod_name_mapping() -> None:

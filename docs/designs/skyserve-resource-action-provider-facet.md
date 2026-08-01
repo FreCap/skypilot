@@ -28,8 +28,8 @@ action-bound submit comparison, launch-only server-effective identity
 canonicalization/projector and down-current-identity absence, enclosing capsule
 and execution-config composition, and live preflight remain pending; shared
 leaf-validator, named raw-field, and bounded canonical-JSON exact-type
-hardening is frozen below and code-pending; runtime provider propagation,
-observation, and shadow instrumentation remain pending
+hardening is implemented and independently verified; runtime provider
+propagation, observation, and shadow instrumentation remain pending
 
 Last updated: 2026-08-01
 
@@ -4726,6 +4726,25 @@ serialization. The focused suite passes, and independent adversarial review
 accepted the exact inventory implementation and ownership boundary. This
 evidence does not claim the launch-only endpoint-to-inventory equality, any
 other capsule cross-field binding, provider I/O, or authority.
+
+Further P1 bounded-wire verification evidence on 2026-08-01: the shared scalar
+helpers, three raw/direct action-kind sites, action-ID delegation, two Handle
+literals, three canonical-wrapper embedding seams, and detached bounded JSON
+graph implement the exact-type contract above. Hostile probes reject root and
+nested scalar/container/key subclasses and arbitrary `Mapping` values without
+invoking overridden `__class__`, `len`, iteration, lookup, or `items`; the
+serializer receives only a deeply detached graph even when the caller mutates
+its source at serialization time. Existing cycle, shared-reference, depth,
+member, aggregate, integer, text, and byte-size boundaries remain green. The
+focused files and adjacent 12-file non-PostgreSQL provider DTO suite pass
+together. Repository YAPF/isort, mypy over 825 source files, pylint at
+10.00/10, and dashboard lint/format checks pass. Independent adversarial review
+accepted exact source hash
+`3329427c9506aed6a9f40152d4e8c63e4977659e37be92972237736ca0d419d1`
+and the four focused test hashes. This evidence remains scoped to the helpers,
+raw fields, direct sites, wrapper embeddings, and canonical wrappers named
+above; it does not claim exact raw-subclass rejection in unrelated legacy
+canonicalizing parsers or every direct DTO constructor.
 
 First-deployment cutover evidence on 2026-08-01: read-only `boltz-test`
 inspection found API schema 004, Serve 031, global-user-state 027, and no API or

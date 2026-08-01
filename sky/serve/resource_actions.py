@@ -398,7 +398,9 @@ def _closed_object(value: Any, *, name: str,
 
 
 def _enum_value(enum_type: type[_EnumT], value: Any, *, name: str) -> _EnumT:
-    if not isinstance(value, str):
+    if type(value) is enum_type:
+        return value
+    if type(value) is not str:
         raise TypeError(f'{name} must be text.')
     try:
         parsed = enum_type(value)
@@ -413,7 +415,7 @@ def _text(value: Any,
           *,
           name: str,
           maximum_bytes: int = _MAX_TEXT_BYTES) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError(f'{name} must be text.')
     if '\x00' in value:
         raise ValueError(f'{name} cannot contain U+0000.')
@@ -477,22 +479,21 @@ def _canonical_positive_decimal_text(value: Any, *, name: str) -> str:
 
 
 def _sha256(value: Any, *, name: str) -> str:
-    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f'{name} must be lowercase SHA-256 hex.')
     return value
 
 
 def _sha256_digest(value: Any, *, name: str) -> str:
-    if (not isinstance(value, str) or
-            _SHA256_DIGEST_RE.fullmatch(value) is None):
+    if (type(value) is not str or _SHA256_DIGEST_RE.fullmatch(value) is None):
         raise ValueError(f'{name} must be sha256:<64 lowercase hex>.')
     return value
 
 
 def _uuid(value: Any, *, name: str) -> uuid.UUID:
-    if isinstance(value, uuid.UUID):
+    if type(value) is uuid.UUID:
         return value
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError(f'{name} must be canonical UUID text.')
     try:
         parsed = uuid.UUID(value)
@@ -550,8 +551,7 @@ def _nonnegative_integer(value: Any,
                          *,
                          name: str,
                          maximum: int = _MAX_POSTGRES_BIGINT) -> int:
-    if (not isinstance(value, int) or isinstance(value, bool) or value < 0 or
-            value > maximum):
+    if type(value) is not int or value < 0 or value > maximum:
         raise ValueError(
             f'{name} must be a nonnegative integer no greater than {maximum}.')
     return value
@@ -561,15 +561,14 @@ def _positive_integer(value: Any,
                       *,
                       name: str,
                       maximum: int = _MAX_POSTGRES_BIGINT) -> int:
-    if (not isinstance(value, int) or isinstance(value, bool) or value <= 0 or
-            value > maximum):
+    if type(value) is not int or value <= 0 or value > maximum:
         raise ValueError(
             f'{name} must be a positive integer no greater than {maximum}.')
     return value
 
 
 def _version_one(value: Any, *, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value != 1:
+    if type(value) is not int or value != 1:
         raise ValueError(f'{name} must be integer 1.')
     return value
 
@@ -581,13 +580,13 @@ def _optional_nonnegative_integer(value: Any, *, name: str) -> int | None:
 
 
 def _boolean(value: Any, *, name: str) -> bool:
-    if not isinstance(value, bool):
+    if type(value) is not bool:
         raise TypeError(f'{name} must be a Boolean.')
     return value
 
 
 def _timestamp(value: Any, *, name: str) -> str:
-    if not isinstance(value, str) or _UTC_TIMESTAMP_RE.fullmatch(value) is None:
+    if type(value) is not str or _UTC_TIMESTAMP_RE.fullmatch(value) is None:
         raise ValueError(
             f'{name} must be UTC RFC 3339 with six fractional digits.')
     try:
@@ -600,13 +599,26 @@ def _timestamp(value: Any, *, name: str) -> str:
 
 
 def _action_kind(value: Any, *, name: str) -> kernel_actions.ActionKind:
-    if not isinstance(value, (str, kernel_actions.ActionKind)):
+    if type(value) is kernel_actions.ActionKind:
+        return value
+    if type(value) is not str:
         raise TypeError(f'{name} must be text.')
     try:
-        return (value if isinstance(value, kernel_actions.ActionKind) else
-                kernel_actions.ActionKind(value))
+        return kernel_actions.ActionKind(value)
     except ValueError as e:
         raise ValueError(f'{name} is unsupported.') from e
+
+
+def _closed_action_kind_object(value: Any, *, name: str, keys: frozenset[str],
+                               action_kind_name: str) -> JsonObject:
+    """Validate one raw JSON action-kind leaf before canonical reparsing."""
+
+    shallow = _closed_object_shallow(value, name=name, keys=keys)
+    raw_action_kind = shallow['action_kind']
+    if type(raw_action_kind) is not str:
+        raise TypeError(f'{action_kind_name} must be text.')
+    _action_kind(raw_action_kind, name=action_kind_name)
+    return _closed_object(value, name=name, keys=keys)
 
 
 class _CanonicalContract:
@@ -648,73 +660,108 @@ def _bounded_canonical_json_bytes(value: Any,
                                   require_object: bool = False) -> bytes:
     """Iteratively validate and encode one bounded canonical JSON value."""
 
-    if require_object and not isinstance(value, Mapping):
+    if require_object and type(value) is not dict:
         raise TypeError(f'{name} must have a JSON object root.')
 
-    # Each item is (entering, value, parent container depth).  Active container
-    # IDs are removed by exit markers, which rejects cycles while permitting a
-    # non-cyclic value to be referenced from more than one sibling position.
-    stack: list[tuple[bool, Any, int]] = [(True, value, 0)]
+    # Each item contains the source value plus its destination in a detached
+    # built-in graph. Active source-container IDs are removed by exit markers,
+    # which rejects cycles while permitting a non-cyclic value to be referenced
+    # from more than one sibling position.
+    detached_root: list[Any] = [None]
+    stack: list[tuple[bool, Any, int, Any,
+                      Any]] = [(True, value, 0, detached_root, 0)]
     active_container_ids: set[int] = set()
     aggregate_members = 0
     while stack:
-        entering, item, parent_depth = stack.pop()
+        entering, item, parent_depth, destination, destination_key = stack.pop()
         if not entering:
             active_container_ids.remove(id(item))
             continue
-        if item is None or isinstance(item, bool):
+        item_type = type(item)
+        if item is None or item_type is bool:
+            destination[destination_key] = item
             continue
-        if isinstance(item, int):
+        if item_type is int:
             if item < -_MAX_POSTGRES_BIGINT - 1 or item > _MAX_POSTGRES_BIGINT:
                 raise ValueError(f'{name} integers must fit signed 64-bit.')
+            destination[destination_key] = item
             continue
-        if isinstance(item, float):
+        if item_type is float:
             raise TypeError(f'{name} forbids floating-point values.')
-        if isinstance(item, str):
+        if item_type is str:
             _canonical_json_text(item, name=f'{name} string')
+            destination[destination_key] = item
             continue
-        if isinstance(item, tuple):
+        if item_type is tuple:
             raise TypeError(f'{name} JSON arrays must be lists, not tuples.')
 
-        children: list[Any]
-        if isinstance(item, list):
-            children = list(item)
-        elif isinstance(item, Mapping):
-            entries = list(item.items())
-            normalized_keys: set[str] = set()
-            children = []
-            for key, child in entries:
-                if not isinstance(key, str):
-                    raise TypeError(f'{name} object keys must be text.')
-                normalized_key = unicodedata.normalize('NFC', key)
-                if normalized_key in normalized_keys:
-                    raise ValueError(f'{name} has duplicate-after-NFC keys.')
-                normalized_keys.add(normalized_key)
-                _canonical_json_text(key, name=f'{name} object key')
-                children.append(child)
-        else:
+        if item_type is not list and item_type is not dict:
             raise TypeError(f'{name} contains a value outside the JSON domain.')
 
         container_depth = parent_depth + 1
         if container_depth > _MAX_CANONICAL_JSON_CONTAINER_DEPTH:
             raise ValueError(f'{name} container depth exceeds '
                              f'{_MAX_CANONICAL_JSON_CONTAINER_DEPTH}.')
-        if len(children) > _MAX_LIST_ITEMS:
-            raise ValueError(f'{name} containers may contain at most '
-                             f'{_MAX_LIST_ITEMS} members.')
-        aggregate_members += len(children)
-        if aggregate_members > _MAX_CANONICAL_JSON_AGGREGATE_MEMBERS:
-            raise ValueError(f'{name} aggregate container members exceed '
-                             f'{_MAX_CANONICAL_JSON_AGGREGATE_MEMBERS}.')
         container_id = id(item)
         if container_id in active_container_ids:
             raise ValueError(f'{name} contains a reference cycle.')
-        active_container_ids.add(container_id)
-        stack.append((False, item, parent_depth))
-        stack.extend(
-            (True, child, container_depth) for child in reversed(children))
 
-    encoded = canonical_json_bytes(value)
+        member_count: int
+        child_tasks: list[tuple[Any, Any, Any]]
+        if item_type is list:
+            member_count = len(item)
+            if member_count > _MAX_LIST_ITEMS:
+                raise ValueError(f'{name} containers may contain at most '
+                                 f'{_MAX_LIST_ITEMS} members.')
+            children = item[:_MAX_LIST_ITEMS + 1]
+            member_count = len(children)
+            if member_count > _MAX_LIST_ITEMS:
+                raise ValueError(f'{name} containers may contain at most '
+                                 f'{_MAX_LIST_ITEMS} members.')
+            detached_container: Any = [None] * member_count
+            destination[destination_key] = detached_container
+            child_tasks = [(child, detached_container, index)
+                           for index, child in enumerate(children)]
+        elif item_type is dict:
+            member_count = len(item)
+            if member_count > _MAX_LIST_ITEMS:
+                raise ValueError(f'{name} containers may contain at most '
+                                 f'{_MAX_LIST_ITEMS} members.')
+            entries: list[tuple[Any, Any]] = []
+            try:
+                for key, child in item.items():
+                    if len(entries) == _MAX_LIST_ITEMS:
+                        raise ValueError(
+                            f'{name} containers may contain at most '
+                            f'{_MAX_LIST_ITEMS} members.')
+                    entries.append((key, child))
+            except RuntimeError as e:
+                raise ValueError(f'{name} changed during validation.') from e
+            member_count = len(entries)
+            normalized_keys: set[str] = set()
+            detached_container = {}
+            destination[destination_key] = detached_container
+            child_tasks = []
+            for key, child in entries:
+                if type(key) is not str:
+                    raise TypeError(f'{name} object keys must be text.')
+                normalized_key = unicodedata.normalize('NFC', key)
+                if normalized_key in normalized_keys:
+                    raise ValueError(f'{name} has duplicate-after-NFC keys.')
+                normalized_keys.add(normalized_key)
+                _canonical_json_text(key, name=f'{name} object key')
+                child_tasks.append((child, detached_container, key))
+        aggregate_members += member_count
+        if aggregate_members > _MAX_CANONICAL_JSON_AGGREGATE_MEMBERS:
+            raise ValueError(f'{name} aggregate container members exceed '
+                             f'{_MAX_CANONICAL_JSON_AGGREGATE_MEMBERS}.')
+        active_container_ids.add(container_id)
+        stack.append((False, item, parent_depth, None, None))
+        stack.extend((True, child, container_depth, child_destination,
+                      child_destination_key) for child, child_destination,
+                     child_destination_key in reversed(child_tasks))
+
+    encoded = canonical_json_bytes(detached_root[0])
     if len(encoded) > _MAX_OBJECT_BYTES:
         raise ValueError(f'{name} exceeds {_MAX_OBJECT_BYTES} bytes.')
     return encoded
@@ -754,7 +801,7 @@ class CanonicalJsonObject(CanonicalJsonValue):
     """Immutable bounded canonical JSON value with an object root."""
 
     def __init__(self, value: Any) -> None:
-        if not isinstance(value, Mapping):
+        if type(value) is not dict:
             raise TypeError('canonical JSON object must have a JSON object '
                             'root.')
         super().__init__(value)
@@ -765,7 +812,7 @@ class CanonicalJsonObject(CanonicalJsonValue):
 
     def canonical_value(self) -> JsonObject:
         value = super().canonical_value()
-        if not isinstance(value, dict):
+        if type(value) is not dict:
             raise ValueError('canonical JSON object lost its object root.')
         return value
 
@@ -2005,15 +2052,19 @@ class ProviderResourceIdentityV1(_CanonicalContract):
         }
 
     def action_identity(
-        self, action_kind: kernel_actions.ActionKind
+        self, action_kind: kernel_actions.ActionKind | str
     ) -> kernel_actions.ResourceActionIdentity:
+        try:
+            parsed_action_kind = _action_kind(action_kind, name='action_kind')
+        except (TypeError, ValueError) as e:
+            raise ValueError('action_kind must be launch or down.') from e
         return kernel_actions.ResourceActionIdentity(
             service_hash=self.service_hash,
             service_incarnation=self.service_incarnation,
             replica_id=self.replica_id,
             replica_incarnation=self.replica_incarnation,
             desired_generation=self.desired_generation,
-            action_kind=action_kind)
+            action_kind=parsed_action_kind)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2956,7 +3007,7 @@ class ProviderKubernetesServerAllocationV1(_CanonicalContract):
         pointer = _text(self.json_pointer,
                         name='server_allocation.json_pointer')
         allocator = _text(self.allocator, name='server_allocation.allocator')
-        if not isinstance(self.value, CanonicalJsonValue):
+        if type(self.value) is not CanonicalJsonValue:
             raise TypeError('server allocation value has an invalid type.')
         raw_value = self.value.canonical_value()
         if pointer in self._SERVICE_POINTERS:
@@ -3386,7 +3437,8 @@ class ProviderKubernetesHandleProviderConfigV1(_CanonicalContract):
     })
 
     def __post_init__(self) -> None:
-        if self.context_mode != 'in_cluster':
+        if (type(self.context_mode) is not str or
+                self.context_mode != 'in_cluster'):
             raise ValueError('handle provider_config context_mode must be '
                              'in_cluster.')
         object.__setattr__(
@@ -3398,7 +3450,7 @@ class ProviderKubernetesHandleProviderConfigV1(_CanonicalContract):
             _text(self.namespace,
                   name='handle.provider_config.namespace',
                   maximum_bytes=_MAX_SHORT_TEXT_BYTES))
-        if self.port_mode != 'podip':
+        if type(self.port_mode) is not str or self.port_mode != 'podip':
             raise ValueError('handle provider_config port_mode must be podip.')
         if not _boolean(self.use_internal_ips,
                         name='handle.provider_config.use_internal_ips'):
@@ -5574,9 +5626,9 @@ class ProviderKubernetesObjectPlanV1(_CanonicalContract):
                 'object plan display identity label does not match '
                 'its generated name.')
         object.__setattr__(self, 'required_identity_labels', labels)
-        if not isinstance(self.request_body, CanonicalJsonObject):
+        if type(self.request_body) is not CanonicalJsonObject:
             raise TypeError('object plan request_body has an invalid type.')
-        if not isinstance(self.requested_semantic, CanonicalJsonObject):
+        if type(self.requested_semantic) is not CanonicalJsonObject:
             raise TypeError(
                 'object plan requested_semantic has an invalid type.')
         request_body_sha256 = _sha256(self.request_body_sha256,
@@ -8060,9 +8112,8 @@ class ProviderLifecycleInvocationV1(_CanonicalContract):
         if self.redaction_profile != 'provider_lifecycle_redaction_v1':
             raise ValueError('invocation redaction profile is unsupported.')
         try:
-            action_kind = (self.action_kind if isinstance(
-                self.action_kind, kernel_actions.ActionKind) else
-                           kernel_actions.ActionKind(self.action_kind))
+            action_kind = _action_kind(self.action_kind,
+                                       name='invocation.action_kind')
         except (TypeError, ValueError) as e:
             raise ValueError('invocation action kind is unsupported.') from e
         object.__setattr__(self, 'action_kind', action_kind)
@@ -8109,9 +8160,11 @@ class ProviderLifecycleInvocationV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderLifecycleInvocationV1':
-        raw = _closed_object(value,
-                             name='provider lifecycle invocation',
-                             keys=cls._KEYS)
+        raw = _closed_action_kind_object(
+            value,
+            name='provider lifecycle invocation',
+            keys=cls._KEYS,
+            action_kind_name='invocation.action_kind')
         action_kind = _enum_value(kernel_actions.ActionKind,
                                   raw['action_kind'],
                                   name='invocation.action_kind')
@@ -8277,9 +8330,8 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
                        ProviderProfile, self.profile, name='plan.profile'))
         object.__setattr__(self, 'profile', profile)
         try:
-            action_kind = (self.action_kind if isinstance(
-                self.action_kind, kernel_actions.ActionKind) else
-                           kernel_actions.ActionKind(self.action_kind))
+            action_kind = _action_kind(self.action_kind,
+                                       name='plan.action_kind')
         except (TypeError, ValueError) as e:
             raise ValueError('provider plan action kind is unsupported.') from e
         object.__setattr__(self, 'action_kind', action_kind)
@@ -8314,9 +8366,10 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderLifecyclePlanV1':
-        raw = _closed_object(value,
-                             name='provider lifecycle plan',
-                             keys=cls._KEYS)
+        raw = _closed_action_kind_object(value,
+                                         name='provider lifecycle plan',
+                                         keys=cls._KEYS,
+                                         action_kind_name='plan.action_kind')
         prior = (None if raw['prior_resolved_target'] is None else
                  ResolvedProviderTargetV1.from_value(
                      raw['prior_resolved_target']))
@@ -8953,9 +9006,8 @@ class ServeShadowProjectionV1(_CanonicalContract):
     def __post_init__(self) -> None:
         _version_one(self.version, name='shadow projection version')
         try:
-            action_kind = (self.action_kind if isinstance(
-                self.action_kind, kernel_actions.ActionKind) else
-                           kernel_actions.ActionKind(self.action_kind))
+            action_kind = _action_kind(self.action_kind,
+                                       name='projection.action_kind')
         except (TypeError, ValueError) as e:
             raise ValueError(
                 'shadow projection action kind is unsupported.') from e
@@ -8999,9 +9051,11 @@ class ServeShadowProjectionV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ServeShadowProjectionV1':
-        raw = _closed_object(value,
-                             name='Serve shadow projection',
-                             keys=cls._KEYS)
+        raw = _closed_action_kind_object(
+            value,
+            name='Serve shadow projection',
+            keys=cls._KEYS,
+            action_kind_name='projection.action_kind')
         resolved = (None if raw['resolved_target'] is None else
                     ResolvedProviderTargetV1.from_value(raw['resolved_target']))
         return cls(
