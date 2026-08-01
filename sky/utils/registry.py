@@ -1,9 +1,11 @@
 """Registry for classes to be discovered"""
 
 from collections.abc import Callable
+import contextlib
 import difflib
 import typing
 
+from sky.utils import provider_registration
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
@@ -96,13 +98,26 @@ class _Registry(dict, typing.Generic[T]):
 
         def _register(cls: type[T]) -> type[T]:
             name = cls.__name__.lower()
+            # Preserve rejection-before-construction for an already registered
+            # name. The locked check below remains authoritative for races.
             assert name not in self, f'{name} already registered'
-            self[name] = cls()
-
-            for alias in aliases or []:
-                alias = alias.lower()
-                assert alias not in self._aliases, f'{alias} already registered'
-                self._aliases[alias] = name
+            instance = cls()
+            normalized_aliases = tuple(alias.lower() for alias in aliases or ())
+            mutation_context = (
+                provider_registration.provider_registration_mutation()
+                if self is CLOUD_REGISTRY else contextlib.nullcontext())
+            with mutation_context:
+                assert name not in self, f'{name} already registered'
+                seen_aliases: set[str] = set()
+                for alias in normalized_aliases:
+                    assert alias not in self._aliases, (
+                        f'{alias} already registered')
+                    assert alias not in seen_aliases, (
+                        f'{alias} already registered')
+                    seen_aliases.add(alias)
+                self[name] = instance
+                for alias in normalized_aliases:
+                    self._aliases[alias] = name
             return cls
 
         if cls is not None:
