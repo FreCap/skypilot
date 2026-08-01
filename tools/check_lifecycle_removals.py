@@ -481,9 +481,8 @@ class ManifestChecker:
                 continue
             self._check_keys(label, gap, _COVERAGE_GAP_KEYS, _COVERAGE_GAP_KEYS)
             gap_id = gap.get('id')
-            if not isinstance(
-                    gap_id,
-                    str) or _COVERAGE_GAP_ID_RE.fullmatch(gap_id) is None:
+            if not isinstance(gap_id, str) or _COVERAGE_GAP_ID_RE.fullmatch(
+                    gap_id) is None:
                 self._error(label, 'id must match PLA-GAP-NNN')
                 gap_id = label
             elif gap_id in seen_ids:
@@ -502,9 +501,8 @@ class ManifestChecker:
                             'coverage gap candidate_locators must be nonempty')
             else:
                 for locator_index, locator in enumerate(locators):
-                    if not isinstance(
-                            locator,
-                            dict) or locator.get('kind') != 'python_symbol':
+                    if not isinstance(locator, dict) or locator.get(
+                            'kind') != 'python_symbol':
                         self._error(
                             gap_id,
                             'coverage gap candidate locators must be exact '
@@ -1235,8 +1233,8 @@ class ManifestChecker:
                            expectation: typing.Optional[bool]) -> None:
         object_type = locator.get('object_type')
         name = locator.get('name')
-        if not _is_nonempty_string(
-                object_type) or _NAME_RE.fullmatch(object_type) is None:
+        if not _is_nonempty_string(object_type) or _NAME_RE.fullmatch(
+                object_type) is None:
             self._error(artifact_id,
                         f'{label}.object_type must be an exact identifier')
         if not _is_nonempty_string(name) or _NAME_RE.fullmatch(name) is None:
