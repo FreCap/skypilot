@@ -1723,6 +1723,36 @@ action spec and its canonical bytes produce `request_payload_sha256`.
 
 The closed invocation union is:
 
+The previously implemented flattened object also used `version: 1`, but it was
+a local pre-authority scaffold introduced only on the unmerged feature branch:
+its introducing commits are contained by no tag or remote branch other than
+`origin/feat/serve-resource-actions-m1a`, and it has never been released or
+deployed. The contract below is the first deployable v1 wire shape and replaces
+that scaffold in place. There is no dual reader, backfill, or
+optional-execution-config form.
+
+The one-time first-deployment gate keeps every API, worker, and controller on
+the proven baseline image while the additive migrations reach API006,
+Serve033, and global-user-state 028. In one consistent read-only PostgreSQL
+snapshot it then requires zero Serve replica rows in `api_resource_actions`,
+their attempts and correlated `api_requests`; zero rows in all six Serve033
+sample, represented-attempt, coverage, coverage-attempt, worker-cohort, and
+worker-cohort-reference tables; zero replica action/sample/coverage links; and
+no service mode other than `legacy`. The pinned baseline cannot race this
+snapshot because it has no resource-action writer. The exact query output,
+schema heads, and baseline digest are retained as rollout evidence before API
+rollout begins.
+
+An unexpected/missing revision or table, nonzero row/link, nonlegacy service,
+or mixed writer image aborts rollout before a new v1 reader or writer runs.
+Application code never rewrites, reinterprets, or purges an old row. If one is
+found, v1 remains frozen and the feature requires either v2 or a separately
+reviewed offline canonical migration; new-shape v1 cannot coexist with old-
+shape v1. An encountered flattened row fails the closed parser and blocks
+promotion/recovery. Canonical invocation, plan, and wrapper hashes and their
+golden fixtures change; deterministic launch/down action UUIDs do not, because
+they derive only from logical resource identity and action kind.
+
 ```text
 ProviderLaunchLifecycleInvocationV1 = {
   version: 1,
@@ -1749,6 +1779,38 @@ ProviderDownLifecycleInvocationV1 = {
 ProviderLifecycleInvocationV1 =
   ProviderLaunchLifecycleInvocationV1 |
   ProviderDownLifecycleInvocationV1
+
+The `ParentSpec` symbol in the child-only schema below is exactly `self` in the
+zero-argument method
+`ServeReplicaActionSpecV1.launch_cleanup_down_invocation(self)`. The method
+first requires `ParentSpec.invocation` to be a primary launch and receives no
+replacement target, workspace, basis, config, or other argument.
+
+ServeLegacyLaunchCleanupDownInvocationV1 = {
+  version: 1,
+  contract: "serve_legacy_launch_cleanup_down_v1",
+  request_role: "LAUNCH_CLEANUP_DOWN",
+  effect_kind: "down",
+  profile: "pod_cluster_v1",
+  redaction_profile: "provider_lifecycle_redaction_v1",
+  parent_launch_action_id: UUID,
+  parent_launch_request_payload_sha256: Sha256,
+  resource_identity: ParentSpec.invocation.resource_identity,
+  requested_target: ParentSpec.invocation.requested_target,
+  legacy_down_request: {
+    cluster_name: ParentSpec.invocation.requested_target.sky_cluster_name,
+    expected_cluster_record_uuid:
+        ParentSpec.invocation.requested_target.sky_cluster_record_uuid,
+    workspace: ParentSpec.invocation.require_launch().source.workspace,
+    purge: false,
+    graceful: false,
+    graceful_timeout: null
+  }
+}
+
+ServeShadowAttemptInvocationV1 =
+  ProviderLifecycleInvocationV1 |
+  ServeLegacyLaunchCleanupDownInvocationV1
 
 ProviderLaunchInvocationV1 = {
   source: {
@@ -1875,12 +1937,10 @@ ProviderPolicyModeEvidenceV1 = {
 ProviderPolicyBoundaryProofV1 = {
   version: 1,
   boundary: "serve_controller_prepare" | "api_executor_pre_io",
-  config_projection: ProviderKubernetesConfigProjectionV1,
   config_projection_sha256: Sha256,
   modes: ProviderPolicyModeEvidenceV1,
-  projection_before: ProviderLaunchPolicySubjectV1,
+  policy_subject_sha256: Sha256,
   projection_before_sha256: Sha256,
-  projection_after: ProviderLaunchPolicySubjectV1,
   projection_after_sha256: Sha256,
   projections_equal: true
 }
@@ -2166,6 +2226,7 @@ ProviderKubernetesExecutionCapsuleV1 = {
   implementation_contract: "kubernetes_serve_prebooted_runtime_v1",
   executor_cohort: ProviderAuthorityWorkerCohortV1,
   config_projection: ProviderKubernetesConfigProjectionV1,
+  config_projection_sha256: Sha256,
   scope: ProviderKubernetesScopeV1,
   principals: ProviderKubernetesPrincipalsV1,
   prerequisites: [ProviderKubernetesPrerequisiteV1],
@@ -2226,6 +2287,9 @@ ProviderKubernetesExecutionCapsuleV1 = {
 ProviderKubernetesExecutionConfigV1 = {
   version: 1,
   capsule: ProviderKubernetesExecutionCapsuleV1,
+  execution_capsule_sha256: Sha256,
+  policy_subject: ProviderLaunchPolicySubjectV1,
+  policy_subject_sha256: Sha256,
   policy: {
     controller: ProviderPolicyBoundaryProofV1,
     executor: ProviderPolicyBoundaryProofV1
@@ -2238,7 +2302,7 @@ ProviderLaunchPolicySubjectV1 = {
   requested_target: ProviderLifecycleInvocationV1.requested_target,
   resources: ProviderPodResourceSnapshotV1,
   topology: ProviderPodTopologyV1,
-  execution_capsule: ProviderKubernetesExecutionCapsuleV1,
+  execution_capsule_sha256: Sha256,
   replica_env: {"SKYPILOT_SERVE_REPLICA_ID": DecimalIntegerText},
   security_group_scope: "not_applicable:kubernetes",
   admin_policy_mode: "absent_controller_and_executor",
@@ -2260,6 +2324,7 @@ ProviderKubernetesDownExecutionCapsuleV1 = {
   implementation_contract: "kubernetes_serve_exact_cleanup_v1",
   executor_cohort: ProviderAuthorityWorkerCohortV1,
   config_projection: ProviderKubernetesConfigProjectionV1,
+  config_projection_sha256: Sha256,
   scope: ProviderKubernetesScopeV1,
   principals: ProviderKubernetesPrincipalsV1,
   prerequisites: [ProviderKubernetesPrerequisiteV1],
@@ -2288,7 +2353,7 @@ ProviderDownPolicySubjectV1 = {
   workspace: Text,
   prior_launch_basis_sha256: Sha256,
   cleanup_target_sha256: Sha256,
-  execution_capsule: ProviderKubernetesDownExecutionCapsuleV1,
+  execution_capsule_sha256: Sha256,
   admin_policy_mode: "absent_controller_and_executor",
   managed_secrets_mode: "absent",
   purge: false,
@@ -2299,12 +2364,10 @@ ProviderDownPolicySubjectV1 = {
 ProviderDownPolicyBoundaryProofV1 = {
   version: 1,
   boundary: "serve_controller_prepare" | "api_executor_pre_io",
-  config_projection: ProviderKubernetesConfigProjectionV1,
   config_projection_sha256: Sha256,
   modes: ProviderPolicyModeEvidenceV1,
-  projection_before: ProviderDownPolicySubjectV1,
+  policy_subject_sha256: Sha256,
   projection_before_sha256: Sha256,
-  projection_after: ProviderDownPolicySubjectV1,
   projection_after_sha256: Sha256,
   projections_equal: true
 }
@@ -2312,6 +2375,9 @@ ProviderDownPolicyBoundaryProofV1 = {
 ProviderKubernetesDownExecutionConfigV1 = {
   version: 1,
   capsule: ProviderKubernetesDownExecutionCapsuleV1,
+  execution_capsule_sha256: Sha256,
+  policy_subject: ProviderDownPolicySubjectV1,
+  policy_subject_sha256: Sha256,
   policy: {
     controller: ProviderDownPolicyBoundaryProofV1,
     executor: ProviderDownPolicyBoundaryProofV1
@@ -2339,15 +2405,24 @@ port mode, pod config, mounts, or credentials.
 If the current template cannot be reconstructed under those constraints, the
 decision is not representable and remains shadow-only.
 
-The split is intentionally nonrecursive. A `ProviderLaunchPolicySubjectV1`
-contains the policy-free capsule, never the full execution config. Both policy
-proofs' config projections are byte-equal to `capsule.config_projection`; all
-four before/after subjects contain a capsule byte-equal to the invocation's
-capsule; and `projections_equal=true` is derived from canonical bytes. Raw
-effective config, raw tasks, admin-policy output, and managed-secret responses
-are forbidden. The checked-in config-access inventory is the finite list of
-reads; an unlisted read or a value outside the closed projection makes the
-candidate not representable.
+The split is intentionally nonrecursive and content-addressed within one closed
+envelope. Each execution config embeds its capsule and policy subject exactly
+once and stores both recomputed hashes. The capsule likewise stores its
+config-projection hash. The subject contains `execution_capsule_sha256`, never
+the capsule or full execution config. Each boundary proof stores only the
+recomputed config-projection hash, the same policy-subject hash, and the
+before/after hashes. Admission requires both proof
+config-projection hashes to equal `capsule.config_projection.sha256`; the
+capsule's stored projection hash to equal that same value; the config's stored
+capsule hash and subject capsule hash to equal `capsule.sha256`; both proof
+subject hashes to equal `policy_subject.sha256`; and every before/after hash to
+equal that same subject hash when `projections_equal=true`. Thus every
+nonsecret preimage is co-located exactly once rather than repeating the capsule
+and object bodies four times. A bare hash outside this typed enclosing config
+remains non-authoritative. Raw effective config, raw tasks, admin-policy output, and
+managed-secret responses are forbidden. The checked-in config-access inventory
+is the finite list of reads; an unlisted read or a value outside the closed
+projection makes the candidate not representable.
 
 Down never inherits execution authority from the prior launch. At down
 admission, the same private preflight selects the then-active versioned worker
@@ -2725,8 +2800,7 @@ partial invocation:
 ProviderLaunchNormalizationResultV1 =
   PreparedProviderLaunchV1 {
     sdk_request: process-local immutable PreparedLaunchRequest,
-    invocation: ProviderLaunchLifecycleInvocationV1,
-    policy_subject: ProviderLaunchPolicySubjectV1
+    invocation: ProviderLaunchLifecycleInvocationV1
   }
 | ProviderLaunchNotRepresentableV1 {
     reason: ProviderLaunchNotRepresentableReasonV1
@@ -2764,8 +2838,7 @@ ProviderLifecyclePreflightNotRepresentableReasonV1 =
 ProviderDownNormalizationResultV1 =
   PreparedProviderDownV1 {
     sdk_request: process-local immutable PreparedDownRequest,
-    invocation: ProviderDownLifecycleInvocationV1,
-    policy_subject: ProviderDownPolicySubjectV1
+    invocation: ProviderDownLifecycleInvocationV1
   }
 | ProviderDownNotRepresentableV1 {
     reason: ProviderDownNotRepresentableReasonV1
@@ -2815,11 +2888,36 @@ copy of the wrapper member, and a primary child's invocation is an exact
 byte-equal copy of the wrapper invocation. For primary down, the plan and down
 invocation carry byte-equal `PriorLaunchBasisV1` values and admission validates
 the referenced retained row before accepting either. A
-`LAUNCH_CLEANUP_DOWN` child is the sole exception: it uses the closed down
-invocation derived from the same launch identity and frozen target. Typed reads reconstruct this exact wrapper;
-arbitrary mappings are not accepted. Golden canonical-byte/hash fixtures plus
-unknown-key, float, identity-mismatch, and mutated-plan/invocation rejection
-tests freeze this wrapper contract.
+`LAUNCH_CLEANUP_DOWN` child is the sole exception: it uses
+`ServeLegacyLaunchCleanupDownInvocationV1`, derived byte-for-byte from the
+parent launch spec by `launch_cleanup_down_invocation()`. Its parent action ID,
+parent invocation hash, resource identity, target, workspace, and fixed down
+flags must all match that derivation. In particular,
+`parent_launch_request_payload_sha256 == ParentSpec.invocation.sha256 ==
+ParentSpec.provider_plan.request_payload_sha256`. This child-only value
+deliberately has no `PriorLaunchBasisV1` and no current down execution config:
+it observes the
+existing legacy cleanup between launch retries and grants no replay or provider
+authority. It cannot appear in `ServeReplicaActionSpecV1`, a primary child,
+coverage admission, or either authoritative handler. Expected object/trace
+parity comes only from the parent launch capsule; any extra ambient cleanup
+behavior is divergent and promotion-blocking. Typed reads reconstruct the
+exact applicable union member; arbitrary mappings are not accepted. Golden
+canonical-byte/hash fixtures plus unknown-key, float, identity-mismatch, and
+mutated-plan/invocation rejection tests freeze this wrapper contract.
+
+The cleanup derivation performs no database read, preflight, policy evaluation,
+cohort selection, clock read, or prior-attempt lookup. The special closed shape
+forbids prior-launch basis, execution config, cleanup target, cohort, policy,
+and progress keys even when null. Attempt recovery decodes `request_role`
+before its invocation: primary roles accept only the wrapper's byte-equal
+`ProviderLifecycleInvocationV1`, while cleanup accepts only the exact special
+derivation under a launch parent. Cleanup retries reuse those same bytes;
+logical-attempt and request sequence remain in the attempt envelope. Its
+outcome is classified as a down effect, so success requires authoritative
+absence against the frozen target. Recovery preserves legacy request
+association and retry fencing and never upgrades this evidence fingerprint to
+an independently admitted down action.
 
 Exactly one of `launch` and `down` is nonnull and it must match
 `action_kind`. Objects reject unknown keys. Text is NFC, lists are sorted and
@@ -2832,6 +2930,44 @@ which are 1..253 bytes, and each canonical DER-certificate base64 scalar, which
 is 4..16,384 ASCII bytes and decodes to 1..12,288 bytes; lists contain at most
 256 items; the whole canonical object is at most 65,536 bytes. SHA fields are
 64 lowercase hexadecimal characters.
+
+Collection order is part of the wire contract; parsers reject rather than
+silently reorder a noncanonical input:
+
+- `context_identity` and arrays inside an opaque canonical Kubernetes JSON
+  preimage preserve source semantic order. `access_decisions` are contiguous
+  and ordered by `check_sequence` from zero.
+- topology mutable objects, execution object plans, partial/full/cleanup object
+  slots, server allocations, create/delete effects, and endpoint callers use
+  their exact protocol order: role-map plan order, declared JSON-pointer order,
+  mutation sequence, or `serve_lb_slot_0, serve_lb_slot_1`, respectively.
+  `resources_ports` contains exactly the one application port.
+- runtime artifacts use the exact role order `ray_runtime, skylet_runtime,
+  skylet_job_protocol, skylet_state_schema, startup_probe,
+  serve_canary_entrypoint`; the worker handler allowlist and authenticated
+  identity groups use their literal displayed order. Authority-worker
+  registrations are sorted by unique `worker.pod_uid` and reject duplicate Pod
+  UIDs.
+- CA certificates are a sorted duplicate-free set by encoded scalar. Label,
+  annotation, and selector pairs are sorted by key and reject duplicate keys.
+  Image-pull-secret names, legacy-secret references, API groups, resources,
+  resource names, verbs, rule objects, nonresource-rule objects, and
+  avoid-accelerator label keys are sorted duplicate-free sets; compound rules
+  sort by canonical bytes after their inner sets are canonicalized.
+- prerequisites and endpoint network prerequisites are sorted by
+  `(api_version, kind, namespace-or-empty, name)` and reject duplicate logical
+  keys, including two UIDs for one key. All fields displayed as `[]` in a v1
+  config are empty-only, not unordered extension points.
+
+Before linked represented admission is enabled, checked-in realistic launch and
+down golden fixtures must include the observed 1,036-byte `boltz-test` CA
+scalar, three complete requested/semantic object bodies, the full principal/
+authorization/prerequisite inventory, six runtime artifacts, and both endpoint
+callers. Tests record each full `ServeReplicaActionSpecV1` byte length, require
+it to be at most 60,000 bytes (preserving at least 5,536 bytes of rollout
+headroom), and still enforce the absolute 65,536-byte parser bound. Failure is
+`NOT_REPRESENTABLE`; no truncation, compression, omitted preimage, or external
+hash-only lookup is allowed.
 
 The `source` tuple is a content-addressed reference to an immutable retained
 `version_specs` row; the builder verifies the row's exact UTF-8 YAML bytes
@@ -2934,6 +3070,15 @@ observed on `boltz-test`; independent adversarial re-review accepted the leaf.
 This does not claim live URL or X.509 normalization, preflight, execution-config
 closure, or representability authority.
 
+First-deployment cutover evidence on 2026-08-01: read-only `boltz-test`
+inspection found API schema 004, Serve 031, global-user-state 027, and no API or
+Serve resource-action tables. Helm revision 51 has every role on baseline
+digest
+`sha256:a5afbd26e62ebe2f6990b2f311a59caaf3ef2901f2eab5d6dddd46527320f00a`,
+whose recorded source baseline predates the resource-action DTO module. This
+proves the flattened local scaffold is not present there; the post-migration
+zero-row/link/mode snapshot remains a mandatory rollout artifact.
+
 ### P2: live shadow observation
 
 - Capture the actual serialized CoreV1 and Skylet effect trace through its
@@ -2991,6 +3136,10 @@ closure, or representability authority.
 
 Contract tests must cover:
 
+- pre-release flattened-v1 bytes are rejected, the first-deployment preflight
+  passes only with legacy service modes and absent/empty operational tables,
+  and the cutover changes hashes/goldens without changing deterministic action
+  UUIDs;
 - canonical plan/locator bytes and identity mismatch rejection;
 - literal frozen transport/scope bytes/hash, pure user-hash naming, and the
   actual suffixed head-Pod/two-Service names;
@@ -3042,6 +3191,17 @@ Contract tests must cover:
 - the same `PreparedLaunchRequest` object through one live admission epoch, and
   full stored spec/invocation equality rather than generic request-byte or
   object-identity authority after recovery;
+- the legacy launch-cleanup child is the exact parent-derived special wire
+  member, is accepted only for `LAUNCH_CLEANUP_DOWN`, and is rejected as an
+  action spec, primary child, coverage input, or authoritative-handler input;
+- every content-addressed policy edge recomputes to its one co-located capsule,
+  config projection, and policy-subject preimage; crossed controller/executor,
+  before/after, capsule, or subject hashes are rejected;
+- registration sets require ascending unique worker Pod UIDs and reject both a
+  permuted list and duplicate UID;
+- realistic launch/down golden specs exercise the full inventories and observed
+  CA size, record their canonical byte counts, retain 5,536 bytes of headroom,
+  and reject a one-byte-over-budget variant without dropping a preimage;
 - secret sentinels, raw YAML, arbitrary environment, kubeconfig/config, and
   launch-fence values never appearing in canonical invocation bytes;
 - the first launch/down progress cursor and `INTENT_COMMITTED` commit atomically
