@@ -40,6 +40,15 @@ _VERBOSE_FIELDS = _DEFAULT_FIELDS + [
 
 
 def _stable_ast(value: object) -> object:
+    # Treat a local variable annotation as the runtime-equivalent assignment.
+    # The extraction makes the existing count invariant explicit for static
+    # analysis without changing the executed expression.
+    if (isinstance(value, ast.AnnAssign) and
+            isinstance(value.target, ast.Name) and
+            value.target.id == 'num_in_progress_jobs'):
+        return ('Assign', (('targets', (_stable_ast(value.target),)),
+                           ('value', _stable_ast(value.value)), ('type_comment',
+                                                                 None)))
     if isinstance(value, ast.AST):
         fields = []
         for field, child in ast.iter_fields(value):

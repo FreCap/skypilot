@@ -86,7 +86,7 @@ def _handle_jobs_queue_request(
         managed job table.
     """
     # TODO(SKY-980): remove unnecessary fallbacks on the client side.
-    num_in_progress_jobs = None
+    num_in_progress_jobs: int | None = None
     msg = ''
     status_counts: dict[str, int] | None = None
     pool_status_result = None
