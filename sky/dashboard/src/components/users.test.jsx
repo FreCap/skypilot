@@ -93,6 +93,13 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 
+const setDocumentVisibility = (value) => {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+};
+
 describe('UsersTable refresh lifecycle', () => {
   const user = {
     userId: 'alice-id',
@@ -303,6 +310,120 @@ describe('UsersTable refresh lifecycle', () => {
 
     expect(props.refreshDataRef.current).toBeNull();
     expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+
+  it('pauses hidden refreshes, catches up on visibility restore, and resumes cadence once', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    let userCalls = 0;
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getUsers) {
+        userCalls += 1;
+        return Promise.resolve([user]);
+      }
+      if (fetcher === getClusters) {
+        return Promise.resolve([cluster]);
+      }
+      if (fetcher === getManagedJobs) {
+        return Promise.resolve({ jobs: [job] });
+      }
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    const { unmount } = renderTable({ refreshInterval: 30000 });
+
+    try {
+      await screen.findByText('alice');
+      expect(userCalls).toBe(1);
+
+      setDocumentVisibility('hidden');
+      await act(async () => {
+        jest.advanceTimersByTime(29000);
+        await Promise.resolve();
+      });
+      expect(userCalls).toBe(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        for (let i = 0; i < 5; i += 1) {
+          await Promise.resolve();
+        }
+      });
+      expect(userCalls).toBe(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1000);
+        await Promise.resolve();
+      });
+      expect(userCalls).toBe(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(30000);
+        for (let i = 0; i < 5; i += 1) {
+          await Promise.resolve();
+        }
+      });
+      expect(userCalls).toBe(3);
+    } finally {
+      unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('removes hidden-refresh timers and visibility listeners on unmount', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getUsers) {
+        return Promise.resolve([user]);
+      }
+      if (fetcher === getClusters) {
+        return Promise.resolve([cluster]);
+      }
+      if (fetcher === getManagedJobs) {
+        return Promise.resolve({ jobs: [job] });
+      }
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    const { unmount } = renderTable({ refreshInterval: 30000 });
+    await screen.findByText('alice');
+    dashboardCache.get.mockClear();
+
+    unmount();
+    setDocumentVisibility('visible');
+    await act(async () => {
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      jest.advanceTimersByTime(60000);
+      await Promise.resolve();
+    });
+
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+
+    if (visibilityDescriptor) {
+      Object.defineProperty(
+        window.document,
+        'visibilityState',
+        visibilityDescriptor
+      );
+    } else {
+      delete window.document.visibilityState;
+    }
   });
 
   it('projects GPU and infra filters from one resource snapshot', async () => {

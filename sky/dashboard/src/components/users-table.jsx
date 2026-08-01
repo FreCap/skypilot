@@ -24,6 +24,7 @@ import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 import { sortData } from '@/data/utils';
 import { TimestampWithTooltip } from '@/components/utils';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import {
   PenIcon,
   CheckIcon,
@@ -275,20 +276,23 @@ export function UsersTable({
     };
 
     initializeData();
-
-    const interval = setInterval(() => {
-      if (window.document.visibilityState === 'visible') {
-        fetchDataAndProcess(false); // Don't show loading on background refresh
-      }
-    }, refreshInterval);
     const state = refreshState.current;
     return () => {
       disposed = true;
-      clearInterval(interval);
       state.generation += 1;
       state.active = null;
     };
   }, [fetchDataAndProcess, refreshInterval]);
+
+  const refreshUsersWhenVisible = useCallback(() => {
+    void fetchDataAndProcess(false);
+  }, [fetchDataAndProcess]);
+
+  useVisibleRefreshInterval(
+    hasInitiallyLoaded,
+    refreshInterval,
+    refreshUsersWhenVisible
+  );
 
   const filteredAndSortedUsers = useMemo(() => {
     let filtered = usersWithCounts;
