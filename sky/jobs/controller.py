@@ -1660,6 +1660,19 @@ class JobController:
             return (status is None or
                     status == managed_job_state.ManagedJobStatus.PENDING)
 
+        async def finish_failure_cleanup(
+            *cleanup_coros: typing.Coroutine[typing.Any, typing.Any,
+                                             None]) -> None:
+            """Finish failure cleanup before surfacing the original error."""
+            for cleanup_coro in cleanup_coros:
+                cleanup_task: asyncio.Task[None] = asyncio.create_task(
+                    cleanup_coro)
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    if not cleanup_task.done():
+                        await cleanup_task
+
         # Check if all tasks are already in terminal state
         if all(is_terminal(tid) for tid in range(len(tasks))):
             logger.info('All tasks already in terminal state')
@@ -1720,7 +1733,8 @@ class JobController:
 
         except Exception as e:
             logger.error(f'Failed to launch clusters: {e}')
-            await self._cleanup_job_group_clusters(cluster_names)
+            await finish_failure_cleanup(
+                self._cleanup_job_group_clusters(cluster_names))
             raise
 
         # Phase 2: Barrier sync - collect handles and set RUNNING state
@@ -1938,8 +1952,9 @@ class JobController:
             raise
         except Exception as e:
             logger.error(f'Monitoring failed: {e}')
-            await cancel_remaining_monitors()
-            await self._cleanup_job_group_clusters(cluster_names)
+            await finish_failure_cleanup(
+                cancel_remaining_monitors(),
+                self._cleanup_job_group_clusters(cluster_names))
             raise
 
         # Check results (include terminal tasks)
