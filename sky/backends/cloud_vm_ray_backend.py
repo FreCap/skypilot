@@ -4105,7 +4105,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'retrying in {sleep_seconds:.1f} seconds '
                 f'(attempt {attempt + 1}/'
                 f'{_JOB_ID_SSM_RECONNECT_MAX_ATTEMPTS}).')
-            time.sleep(sleep_seconds)
+            context_utils.sleep_with_cancellation(sleep_seconds)
         raise AssertionError('SSM reconnect attempts must be positive.')
 
     def _add_job(self, handle: CloudVmRayResourceHandle, job_name: str | None,
