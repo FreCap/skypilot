@@ -1,5 +1,7 @@
 """Characterization tests for the managed-jobs queue CLI boundary."""
 
+# pylint: disable=protected-access
+
 import ast
 import hashlib
 import inspect
@@ -10,6 +12,7 @@ from click import testing as click_testing
 import pytest
 
 from sky.client.cli import command
+from sky.client.cli import managed_jobs_queue
 
 _BODY_HASHES = {
     '_handle_jobs_queue_request': '37653e2596bc27c3923ccdbc6fb1daee93734b29ae9c81da88fd6910429c121c',
@@ -77,6 +80,22 @@ def test_jobs_queue_command_hierarchy_and_facade_metadata() -> None:
         value = getattr(command, name)
         assert value.__module__ == command.__name__
         assert value.__qualname__ == name
+
+
+def test_jobs_queue_symbols_are_direct_facade_aliases() -> None:
+    assert command.jobs_queue is managed_jobs_queue.jobs_queue
+    assert (command._handle_jobs_queue_request
+            is managed_jobs_queue._handle_jobs_queue_request)
+    assert command.StatusList is managed_jobs_queue.StatusList
+    assert (command._parse_datetime_to_epoch
+            is managed_jobs_queue._parse_datetime_to_epoch)
+    assert (command._DEFAULT_MANAGED_JOB_FIELDS_TO_GET
+            is managed_jobs_queue._DEFAULT_MANAGED_JOB_FIELDS_TO_GET)
+    assert (command._VERBOSE_MANAGED_JOB_FIELDS_TO_GET
+            is managed_jobs_queue._VERBOSE_MANAGED_JOB_FIELDS_TO_GET)
+    assert command.datetime is managed_jobs_queue.datetime
+    assert command.traceback is managed_jobs_queue.traceback
+    assert command.env_options is managed_jobs_queue.env_options
 
 
 @pytest.mark.parametrize(
