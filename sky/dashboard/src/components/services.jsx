@@ -388,52 +388,51 @@ export function ServicesTable({
         requestVersionRef.current === requestVersion;
 
       setLoading(true);
-      let metadataLoaded = false;
-      try {
-        const metadataResponse = await dashboardCache.get(
-          getServices,
-          SERVICE_METADATA_ARGS
-        );
-        if (!isCurrentRequest()) {
-          return;
-        }
-        metadataLoaded = true;
-        setData((previous) =>
-          mergeMetadataWithPrevious(metadataResponse.services || [], previous)
-        );
-        setControllerStopped(metadataResponse.controllerStopped || false);
-        setIsInitialLoad(false);
-      } catch (error) {
-        if (!isCurrentRequest()) return;
-        console.error('Failed to fetch service metadata:', error);
-      }
+      // Both projections are independent. Start them together and make each
+      // arrival useful: metadata paints the cheapest persisted state, while a
+      // summary that wins the race paints the complete list row immediately.
+      // mergeMetadataWithPrevious() is monotonic, so later metadata refreshes
+      // persisted fields without erasing replica counts or endpoints.
+      const metadataPromise = dashboardCache
+        .get(getServices, SERVICE_METADATA_ARGS)
+        .then((metadataResponse) => {
+          if (!isCurrentRequest()) return;
+          setData((previous) =>
+            mergeMetadataWithPrevious(metadataResponse.services || [], previous)
+          );
+          setControllerStopped(metadataResponse.controllerStopped || false);
+          setIsInitialLoad(false);
+        });
+      const summaryPromise = dashboardCache
+        .get(getServices, SERVICE_SUMMARY_ARGS)
+        .then((servicesResponse) => {
+          if (!isCurrentRequest()) return;
+          setData((previous) =>
+            mergeServiceRows(previous, servicesResponse.services || [])
+          );
+          setControllerStopped(servicesResponse.controllerStopped || false);
+          setIsInitialLoad(false);
+          if (onFetched) {
+            onFetched(new Date());
+          }
+        });
 
-      try {
-        // Replica aggregates and provider endpoints are allowed to land after
-        // the persisted service rows. This keeps names and lifecycle state
-        // usable while the more expensive reads are still running.
-        const servicesResponse = await dashboardCache.get(
-          getServices,
-          SERVICE_SUMMARY_ARGS
+      const [metadataResult, summaryResult] = await Promise.allSettled([
+        metadataPromise,
+        summaryPromise,
+      ]);
+      if (!isCurrentRequest()) return;
+      if (metadataResult.status === 'rejected') {
+        console.error(
+          'Failed to fetch service metadata:',
+          metadataResult.reason
         );
-        if (!isCurrentRequest()) {
-          return;
-        }
-        setData((previous) =>
-          mergeServiceRows(
-            metadataLoaded ? previous : [],
-            servicesResponse.services || []
-          )
+      }
+      if (summaryResult.status === 'rejected') {
+        console.error(
+          'Failed to fetch service summaries:',
+          summaryResult.reason
         );
-        setControllerStopped(servicesResponse.controllerStopped || false);
-        if (onFetched) {
-          onFetched(new Date());
-        }
-      } catch (error) {
-        if (!isCurrentRequest()) {
-          return;
-        }
-        console.error('Failed to fetch service summaries:', error);
         setData((previous) =>
           previous.map((service) =>
             service.metadataOnly
@@ -441,12 +440,9 @@ export function ServicesTable({
               : service
           )
         );
-      } finally {
-        if (isCurrentRequest()) {
-          setLoading(false);
-          setIsInitialLoad(false);
-        }
       }
+      setLoading(false);
+      setIsInitialLoad(false);
     },
     [setLoading, onFetched]
   );
