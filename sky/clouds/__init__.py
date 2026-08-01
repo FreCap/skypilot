@@ -1,5 +1,7 @@
 """Clouds in Sky."""
 
+from types import MappingProxyType
+
 from sky.clouds.cloud import Cloud
 from sky.clouds.cloud import cloud_in_iterable
 from sky.clouds.cloud import CloudCapability
@@ -10,6 +12,7 @@ from sky.clouds.cloud import ProvisionerVersion
 from sky.clouds.cloud import Region
 from sky.clouds.cloud import StatusVersion
 from sky.clouds.cloud import Zone
+from sky.utils import registry as registry_lib
 
 # NOTE: import the above first to avoid circular imports.
 # isort: split
@@ -38,6 +41,16 @@ from sky.clouds.vast import Vast
 from sky.clouds.verda import Verda
 from sky.clouds.vsphere import Vsphere
 from sky.clouds.yotta import Yotta
+
+# Audit-only expectations are sealed before server plugins can replace any
+# Cloud registry entry. Keep the exact singleton and its exact type: text
+# identities are insufficient to distinguish a replacement implementation.
+_BUILTIN_CLOUD_AUDIT_BASELINE = MappingProxyType({
+    canonical_name: (cloud, type(cloud))
+    for canonical_name, cloud in registry_lib.CLOUD_REGISTRY.items()
+})
+_BUILTIN_CLOUD_ALIAS_AUDIT_BASELINE = MappingProxyType(
+    dict(registry_lib.CLOUD_REGISTRY._aliases))  # pylint: disable=protected-access
 
 __all__ = [
     'IBM',

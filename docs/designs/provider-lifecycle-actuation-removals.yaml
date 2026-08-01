@@ -15065,6 +15065,233 @@ artifacts:
   retained_references: []
   evidence: {}
   blocker: null
+- id: PLA-M4-100
+  milestone: M4
+  introduced_by: 62df7e5bca61156407be262160bee67709096169
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: provider_registration
+    store: process_memory
+    provider: provider_registry
+    operation: read_only_registry_audit_projection
+  runtime_affecting: true
+  locators:
+  - kind: path
+    path: sky/provision/provider_registry_audit.py
+  - kind: python_symbol
+    path: sky/clouds/__init__.py
+    symbol: _BUILTIN_CLOUD_AUDIT_BASELINE
+  - kind: python_symbol
+    path: sky/clouds/__init__.py
+    symbol: _BUILTIN_CLOUD_ALIAS_AUDIT_BASELINE
+  - kind: python_symbol
+    path: sky/provision/__init__.py
+    symbol: _BuiltinProvisionerAuditExpectation
+  - kind: python_symbol
+    path: sky/provision/__init__.py
+    symbol: _seal_builtin_provisioner_getter
+  - kind: python_symbol
+    path: sky/provision/__init__.py
+    symbol: _BUILTIN_PROVISIONER_AUDIT_BASELINE
+  - kind: python_symbol
+    path: sky/provision/__init__.py
+    symbol: capture_provider_registry_audit
+  replacement: ProviderRegistrationV1 immutable descriptor snapshot and derived compatibility projections
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_read_only_provider_registry_audit_symbols
+      satisfied: false
+      evidence: []
+    test:
+    - id: callback_safe_provider_registry_audit_characterization
+      satisfied: true
+      evidence:
+      - tests/unit_tests/test_sky/provision/test_provider_registry_audit.py::test_clean_builtin_registry_capture_is_exact_and_deterministic
+      - tests/unit_tests/test_sky/provision/test_provider_registry_audit.py::test_clean_subprocess_captures_exact_builtin_inventory
+      - tests/unit_tests/test_sky/provision/test_provider_registry_audit_builder.py::test_snapshot_is_recursively_frozen_and_detached_from_input_mappings
+      - tests/unit_tests/test_sky/provision/test_provider_registry_audit_builder.py::test_custom_metaclass_attribute_resolution_is_unsafe_and_never_runs
+    - id: provider_registration_v1_derived_projection_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_unexplained_provider_registry_audit_errors_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: provider_registry_audit_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: provider_registry_audit_owns_no_schema
+      satisfied: true
+      evidence:
+      - The audit snapshot and sealed baselines own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  - tests/unit_tests/test_sky/provision/test_provider_registry_audit.py
+  - tests/unit_tests/test_sky/provision/test_provider_registry_audit_builder.py
+  evidence: {}
+  blocker: null
+- id: PLA-M4-101
+  milestone: M4
+  introduced_by: 62df7e5bca61156407be262160bee67709096169
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: provider_registration
+    store: process_memory
+    provider: provider_registry
+    operation: registration_quiescence_barrier
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: ProviderRegistrationReceiptFailureV1
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: ProviderRegistrationReceiptError
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: ProviderRegistrationBarrierV1
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _ProviderRegistrationSessionV1
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _LOAD_MUTEX
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _MUTATION_LOCK
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _coordinator_process_id
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _registration_epoch
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _active_session
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _current_receipt
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _reset_after_fork
+  - kind: python_call_within
+    path: sky/utils/provider_registration.py
+    symbol: <module>
+    call: os.register_at_fork
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _reset_after_fork_locked
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _invalidate_receipt_locked
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: _validate_receipt_locked
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: provider_registration_session
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: provider_registration_mutation
+  - kind: python_symbol
+    path: sky/utils/provider_registration.py
+    symbol: provider_registration_capture
+  - kind: runtime_import
+    path: sky/server/plugins.py
+    module: sky.utils
+    symbol: provider_registration
+  - kind: runtime_metadata
+    path: sky/server/plugins.py
+    name: ProviderRegistrationBarrierV1
+  - kind: python_call_within
+    path: sky/server/plugins.py
+    symbol: load_plugins
+    call: provider_registration.provider_registration_session
+  - kind: python_call_within
+    path: sky/server/plugins.py
+    symbol: load_plugins
+    call: registration_session.complete
+  - kind: runtime_import
+    path: sky/utils/registry.py
+    module: sky.utils
+    symbol: provider_registration
+  - kind: runtime_import
+    path: sky/utils/registry.py
+    module: contextlib
+  - kind: python_call_within
+    path: sky/utils/registry.py
+    symbol: _Registry
+    call: provider_registration.provider_registration_mutation
+  - kind: python_call_within
+    path: sky/utils/registry.py
+    symbol: _Registry
+    call: contextlib.nullcontext
+  - kind: python_ast_pattern
+    path: sky/utils/registry.py
+    symbol: _Registry
+    pattern: self is CLOUD_REGISTRY
+  - kind: runtime_import
+    path: sky/provision/__init__.py
+    module: sky.utils
+    symbol: provider_registration
+  - kind: python_call_within
+    path: sky/provision/__init__.py
+    symbol: register_provisioner
+    call: provider_registration.provider_registration_mutation
+  - kind: python_call_within
+    path: sky/provision/__init__.py
+    symbol: register_provisioner_bundle
+    call: provider_registration.provider_registration_mutation
+  replacement: ProviderRegistrationV1 transaction and immutable snapshot publication
+  dependencies:
+  - PLA-M4-100
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_temporary_registration_barrier_symbols_and_hooks
+      satisfied: false
+      evidence: []
+    test:
+    - id: registration_barrier_atomicity_and_fork_characterization
+      satisfied: true
+      evidence:
+      - tests/unit_tests/test_sky/server/test_provider_registration_barrier.py::test_plugin_import_and_install_registrations_are_in_same_receipt
+      - tests/unit_tests/test_sky/server/test_provider_registration_barrier.py::test_cloud_construction_precedes_atomic_registration_mutation
+      - tests/unit_tests/test_sky/server/test_provider_registration_barrier.py::test_duplicate_cloud_name_is_rejected_before_construction
+      - tests/unit_tests/test_sky/server/test_provider_registration_barrier.py::test_forked_child_does_not_inherit_locked_registration_mutation
+    - id: provider_registration_v1_single_transaction_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_unexplained_provider_registration_barrier_errors_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: provider_registration_barrier_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: provider_registration_barrier_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local registration barrier owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  - tests/unit_tests/test_sky/server/test_provider_registration_barrier.py
+  evidence: {}
+  blocker: null
 - id: PLA-M5-001
   milestone: M5
   introduced_by: 0a3fa136b881602ebff7c63bd09c45dbe881bbdb

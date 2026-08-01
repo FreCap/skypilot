@@ -4,8 +4,11 @@ This module provides a standard low-level interface that all
 providers supported by SkyPilot need to follow.
 """
 import dataclasses
+import dis
 import functools
 import inspect
+import types
+from types import MappingProxyType
 import typing
 from typing import Any, Optional, Protocol
 
@@ -41,11 +44,14 @@ from sky.provision import verda
 from sky.provision import vsphere
 from sky.provision import yotta
 from sky.utils import command_runner
+from sky.utils import provider_registration
+from sky.utils import registry as registry_lib
 from sky.utils import timeline
 
 if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
     from sky import task as task_lib
+    from sky.provision import provider_registry_audit
     from sky.utils import status_lib
 
 logger = sky_logging.init_logger(__name__)
@@ -168,6 +174,68 @@ _BUILTIN_PROVISIONER_MODULE_GETTERS: dict[str, typing.Callable[[], Any]] = {
 }
 
 
+class _BuiltinProvisionerAuditExpectation(typing.NamedTuple):
+    """Sealed direct-global getter shape used only by registry auditing."""
+
+    getter: typing.Callable[[], Any]
+    module: Any
+    function_type: type
+    code: types.CodeType
+    defaults: tuple[Any, ...] | None
+    keyword_defaults: dict[str, Any] | None
+    closure: tuple[types.CellType, ...] | None
+    globals_mapping: dict[str, Any]
+    global_name: str
+
+
+def _seal_builtin_provisioner_getter(
+    getter: typing.Callable[[], Any],) -> _BuiltinProvisionerAuditExpectation:
+    """Seal one trusted zero-argument direct-global getter without calling it."""
+    if type(getter) is not types.FunctionType:
+        raise TypeError(
+            'Built-in provisioner getter must be a Python function.')
+    code = getter.__code__
+    significant_instructions = tuple(
+        instruction for instruction in dis.get_instructions(code)
+        if instruction.opname not in ('CACHE', 'NOP', 'RESUME'))
+    if (code.co_argcount != 0 or code.co_posonlyargcount != 0 or
+            code.co_kwonlyargcount != 0 or getter.__defaults__ is not None or
+            getter.__kwdefaults__ is not None or
+            getter.__closure__ is not None or
+            len(significant_instructions) != 2 or
+            significant_instructions[0].opname != 'LOAD_GLOBAL' or
+            significant_instructions[1].opname != 'RETURN_VALUE' or
+            type(significant_instructions[0].argval) is not str):
+        raise ValueError('Built-in provisioner getter must be a direct-global '
+                         'zero-argument function.')
+    global_name = significant_instructions[0].argval
+    globals_mapping = getter.__globals__
+    module = dict.get(globals_mapping, global_name)
+    if module is None:
+        raise ValueError('Built-in provisioner getter global must be present.')
+    return _BuiltinProvisionerAuditExpectation(
+        getter=getter,
+        module=module,
+        function_type=types.FunctionType,
+        code=code,
+        defaults=getter.__defaults__,
+        keyword_defaults=getter.__kwdefaults__,
+        closure=getter.__closure__,
+        globals_mapping=globals_mapping,
+        global_name=global_name,
+    )
+
+
+# Audit-only expectations are sealed before server plugins can replace a
+# built-in inventory getter. Audit capture may read only these exact
+# allowlisted direct-global bindings and never executes a getter.
+_BUILTIN_PROVISIONER_AUDIT_BASELINE = MappingProxyType({
+    canonical_name: _seal_builtin_provisioner_getter(module_getter)
+    for canonical_name, module_getter in
+    _BUILTIN_PROVISIONER_MODULE_GETTERS.items()
+})
+
+
 def _canonical_provider_name(provider_name: str) -> str:
     """Return the one canonical key used by registration and dispatch."""
     normalized = provider_name.lower()
@@ -276,9 +344,10 @@ def register_provisioner(
     ``'aws'``).
     """
     canonical_name = _canonical_provider_name(cloud_name)
-    _registered_provisioner_bundles.pop(canonical_name, None)
-    _registered_provisioners[canonical_name] = Provisioner(
-        module=module, template_override=template_override)
+    with provider_registration.provider_registration_mutation():
+        _registered_provisioner_bundles.pop(canonical_name, None)
+        _registered_provisioners[canonical_name] = Provisioner(
+            module=module, template_override=template_override)
     logger.debug(
         'Registered Provisioner for %r: module=%s, '
         'template_override=%s', canonical_name,
@@ -323,9 +392,10 @@ def register_provisioner_bundle(
         logger.debug('ProvisionerBundleV1 for %r is already registered.',
                      canonical_name)
         return
-    _registered_provisioners.pop(canonical_name, None)
-    replaced = existing_bundle is not None
-    _registered_provisioner_bundles[canonical_name] = bundle
+    with provider_registration.provider_registration_mutation():
+        _registered_provisioners.pop(canonical_name, None)
+        replaced = existing_bundle is not None
+        _registered_provisioner_bundles[canonical_name] = bundle
     if replaced:
         logger.info('Replaced strict ProvisionerBundleV1 for %r.',
                     canonical_name)
@@ -662,3 +732,93 @@ def get_command_runners(
         node_list=node_list,
         **credentials,
     )
+
+
+def capture_provider_registry_audit(
+    receipt: object,
+) -> 'provider_registry_audit.ProviderRegistryAuditSnapshotV1':
+    """Capture one frozen read-only view of every provider registry axis."""
+    # Imported here because Cloud imports provisioner modules while its own
+    # built-in registry baseline is still being constructed.
+    # pylint: disable=import-outside-toplevel
+    from sky import clouds as clouds_lib
+    from sky.provision import provider_registry_audit as registry_audit
+
+    receipt_reason_map = {
+        provider_registration.ProviderRegistrationReceiptFailureV1.MISSING_RECEIPT:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            MISSING_RECEIPT,
+        provider_registration.ProviderRegistrationReceiptFailureV1.INVALID_RECEIPT:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            INVALID_RECEIPT,
+        provider_registration.ProviderRegistrationReceiptFailureV1.WRONG_PROCESS:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            WRONG_PROCESS,
+        provider_registration.ProviderRegistrationReceiptFailureV1.STALE_EPOCH:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            STALE_EPOCH,
+        provider_registration.ProviderRegistrationReceiptFailureV1.ACTIVE_SESSION:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            ACTIVE_SESSION,
+    }
+    context_map = {
+        'main': registry_audit.ProviderAuditContextV1.MAIN,
+        'uvicorn': registry_audit.ProviderAuditContextV1.UVICORN,
+        'executor': registry_audit.ProviderAuditContextV1.EXECUTOR,
+        'controller': registry_audit.ProviderAuditContextV1.CONTROLLER,
+    }
+
+    def _observe(
+        context: 'provider_registry_audit.ProviderAuditContextV1',
+    ) -> 'provider_registry_audit._ProviderRegistryAuditObservationV1':
+        return registry_audit._observe_provider_registry_audit(  # pylint: disable=protected-access
+            capture_context=context,
+            cloud_entries=registry_lib.CLOUD_REGISTRY,
+            cloud_aliases=registry_lib.CLOUD_REGISTRY._aliases,  # pylint: disable=protected-access
+            strict_entries=_registered_provisioner_bundles,
+            legacy_entries=_registered_provisioners,
+            builtin_getters=_BUILTIN_PROVISIONER_MODULE_GETTERS,
+            builtin_cloud_expectations=(
+                clouds_lib._BUILTIN_CLOUD_AUDIT_BASELINE),  # pylint: disable=protected-access
+            builtin_alias_expectations=(
+                clouds_lib._BUILTIN_CLOUD_ALIAS_AUDIT_BASELINE),  # pylint: disable=protected-access
+            builtin_provisioner_expectations=(
+                _BUILTIN_PROVISIONER_AUDIT_BASELINE),
+            strict_container_type=provider_facets.ProvisionerBundleV1,
+            legacy_container_type=Provisioner,
+        )
+
+    try:
+        with provider_registration.provider_registration_capture(
+                receipt) as raw_context:
+            capture_context = context_map.get(raw_context)
+            if capture_context is None:
+                raise registry_audit.ProviderRegistryAuditCaptureErrorV1(
+                    registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+                    INVALID_RECEIPT)
+            first_observation = _observe(capture_context)
+
+        with provider_registration.provider_registration_capture(receipt):
+            second_observation = _observe(capture_context)
+            first_signature = first_observation.signature
+            second_signature = second_observation.signature
+            if (first_signature != second_signature or
+                    first_observation.snapshot != second_observation.snapshot):
+                first_raw_signature = tuple(
+                    item for item in first_signature if item.startswith('raw|'))
+                second_raw_signature = tuple(item for item in second_signature
+                                             if item.startswith('raw|'))
+                if first_raw_signature != second_raw_signature:
+                    reason = (
+                        registry_audit.ProviderRegistryAuditCaptureErrorReasonV1
+                        .REGISTRY_CHANGED)
+                else:
+                    reason = (
+                        registry_audit.ProviderRegistryAuditCaptureErrorReasonV1
+                        .OBSERVED_MEMBER_CHANGED)
+                raise registry_audit.ProviderRegistryAuditCaptureErrorV1(reason)
+    except provider_registration.ProviderRegistrationReceiptError as error:
+        raise registry_audit.ProviderRegistryAuditCaptureErrorV1(
+            receipt_reason_map[error.reason]) from None
+
+    return first_observation.snapshot

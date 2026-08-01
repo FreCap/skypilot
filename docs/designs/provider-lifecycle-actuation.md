@@ -282,18 +282,29 @@ M4 therefore starts with an immutable read-only
 `ProviderRegistryAuditSnapshotV1`, captured only after a quiescent plugin
 registration barrier. It takes the union rather than the intersection of the
 current registries and records a typed present or absent state for every
-legacy facet. It has no dispatch authority and claims no historical replacement
-generation. The audit snapshot joins:
+audited legacy axis. It has no dispatch authority and claims no historical
+replacement generation.
 
-- canonical name and compatibility aliases;
-- Cloud planning facet;
-- strict provisioner bundle;
-- optional offer source;
-- optional node-actuation, volume, port, diagnostics, and configuration
-  facets;
-- positive provider-wide capabilities;
-- typed resource-dependent support predicates;
-- current plugin implementation identity and registration source.
+The first V1 implementation is deliberately narrower than the final
+descriptor. It joins canonical names and aliases, the Cloud planning object,
+the strict provisioner bundle, the legacy provisioner registration, the
+built-in provisioner inventory, lifecycle version switches, the seven-method
+`InstanceLifecycleV1` contract, and template-override ownership. It records
+only the static implementation identities of exact Cloud methods
+`get_offer_source()` and `_unsupported_features_for_resources()`; it never
+invokes them. Volume, port, command-runner, cleanup, diagnostics,
+runtime-configuration, and positive capability facets remain outside this
+snapshot schema until their exact method sets and facade-default semantics
+receive dedicated design review. Method-presence inference is not allowed to
+invent those contracts.
+
+The current registries do not retain configured plugin provenance. V1 can
+truthfully classify an exact match to the pre-plugin built-in audit baseline,
+an entry observed on the strict registry axis, an entry observed on the legacy
+registry axis, or an external or replaced implementation. It cannot prove
+which API or plugin inserted a raw dictionary entry. Module and qualname
+observations are not causal provenance. Configured plugin class path and stable
+artifact provenance begin only with `ProviderRegistrationV1`.
 
 The service catalog remains an external planning facet in V1. Moving catalog
 registration into the descriptor would combine two migrations and is deferred
@@ -303,6 +314,479 @@ The audit explicitly classifies expected partial providers and proves
 one-to-one identity only where two old registries are both expected to own a
 facet. An unexpected partial entry is a conformance failure, not an import
 failure.
+
+#### Exact `ProviderRegistryAuditSnapshotV1` contract
+
+This contract is pinned to SkyPilot
+`b65d4e0cd233e22750f344eef2e6ae5750250482` and dstack
+`ccef71f46b8e61ce3c139d3c147911b6dd19f8a2`.
+
+dstack's useful boundary is the typed chain from `Configurator.TYPE` through
+`Configurator.BACKEND_CLASS` to `Backend.COMPUTE_CLASS`. Capability mixins can
+be inspected without initializing a credentialed backend. SkyPilot adopts the
+same separation between declaration and request-scoped execution. It does not
+copy dstack's repeated import list, `BackendType` inventory, derived map and
+list, or import-time feature caches. In the pinned dstack revision, dynamic
+configurator registration updates the lookup map but not the separately cached
+available-type and feature lists. The SkyPilot end state is therefore one
+validated descriptor registration with derived compatibility projections, not
+another independently mutable list.
+
+The current SkyPilot state has five raw axes that the audit must preserve
+independently:
+
+1. `CLOUD_REGISTRY` canonical keys and its separate alias map;
+2. strict `ProvisionerBundleV1` registrations;
+3. legacy `Provisioner` registrations;
+4. the late-bound built-in provisioner getter inventory;
+5. the provisioner compatibility normalization
+   `lambda_cloud -> lambda`.
+
+The clean built-in baseline is exactly 25 Cloud entries and 24 built-in
+provisioner entries. `ibm` is the only Cloud-only built-in and is expected
+because it declares `RAY_AUTOSCALER` provisioning and `CLOUD_CLI` status. The
+other 24 overlap and declare SkyPilot provisioning and status. Cloud aliases
+are exactly `digitalocean -> do` and `k8s -> kubernetes`; the provisioner-only
+compatibility alias is exactly `lambda_cloud -> lambda`. These alias surfaces
+remain evidence and do not expand either current dispatcher.
+
+The audit-only built-in expectation table is captured once from exact object
+references immediately after the built-in Cloud import set and built-in
+provisioner getter inventory are complete, before server plugin loading. It
+retains the original Cloud singleton and exact type, the original provisioner
+module held by each getter's direct-global binding, the binding name, the
+getter's exact Python function type, code object, defaults, keyword defaults,
+closure, and globals mapping, and the built-in aliases. Every current built-in
+getter has no parameters, defaults, keyword defaults, or closure. It is a
+read-only conformance oracle, not a dispatch registry, and it is removed with
+the audit migration machinery. Capturing this baseline later from already
+plugin-mutated registries is prohibited.
+
+The published snapshot and later token-free report define only recursively
+frozen values. Every collection is a tuple, and neither value retains a live
+callable, module, Cloud object, bundle, descriptor, or mutable mapping. The
+audit-only pre-plugin expectation table is the sole long-lived internal holder
+of the exact live baseline references named above. One in-progress capture may
+also retain a private strong-reference anchor tuple for identity-bearing
+objects observed in its first phase. The projector never inspects that tuple,
+and it is discarded after final revalidation rather than published. The closed
+supporting enums are:
+
+- `AuditPresenceV1`: `ABSENT`, `PRESENT`;
+- `AuditRuntimeIdentityKindV1`: `MODULE`, `CLASS`, `INSTANCE`,
+  `PYTHON_FUNCTION`, `BUILTIN_FUNCTION`, `BOUND_METHOD`, `CALLABLE_OBJECT`,
+  `DESCRIPTOR`, `VALUE`;
+- `AuditRawNameKindV1`: `VALID_STRING`, `INVALID_STRING`, `NON_STRING`;
+- `RegistrationKindV1`: `CLOUD`, `BUILTIN_PROVISIONER`,
+  `STRICT_PROVISIONER`, `LEGACY_PROVISIONER`;
+- `RegistrationSourceObservationV1`: `BUILTIN_BASELINE_MATCH`,
+  `STRICT_REGISTRY_OBSERVED`, `LEGACY_REGISTRY_OBSERVED`,
+  `EXTERNAL_OR_REPLACED`;
+- `AliasSourceV1`: `CLOUD_REGISTRY`, `PROVISIONER_COMPATIBILITY`;
+- `LifecycleSwitchStateV1`: `ABSENT`, `VALID`, `MALFORMED`;
+- `LifecycleMemberStateV1`: `ABSENT`, `CALLABLE`, `NON_CALLABLE`,
+  `UNSAFE_DESCRIPTOR`;
+- `LifecycleOwnerV1`: `STRICT`, `LEGACY`, `BUILTIN`, `FACADE_DEFAULT`,
+  `ABSENT`, `INDETERMINATE`;
+- `LifecycleCompletenessV1`: `EMPTY`, `PARTIAL`, `COMPLETE`,
+  `INDETERMINATE`;
+- `TemplateOwnerV1`: `STRICT`, `LEGACY`, `BUILTIN`, `ABSENT`,
+  `INDETERMINATE`;
+- `ProviderAuditContextV1`: `MAIN`, `UVICORN`, `EXECUTOR`, `CONTROLLER`;
+- `ProviderRegistryIssueSeverityV1`: `WARNING`, `ERROR`;
+- `ProviderRegistryFacetV1`: `REGISTRY_KEY`, `ALIAS`, `CLOUD`,
+  `LIFECYCLE_SWITCH`, `INSTANCE_LIFECYCLE`, `TEMPLATE_OVERRIDE`,
+  `OFFER_DECLARATION`, `RESOURCE_SUPPORT_PREDICATE`.
+
+`AuditRuntimeIdentityV1` contains one identity kind, module and qualname strings
+only when each is an exact `str` of at most 256 code points, and a keyed
+process-local comparison token. Oversized or non-string metadata is omitted.
+Bound methods are normalized over their function and bound owner so repeated
+attribute access compares equal. The token is valid only inside the producing
+process and is exactly 32 lowercase hexadecimal characters produced by a
+keyed process-local hash. It is never serialized, logged, persisted, or
+emitted to telemetry and is not an implementation digest.
+The key is created lazily and replaced before use whenever the current process
+ID differs from the process that created it, so a forked child cannot reproduce
+its parent's tokens for inherited objects.
+First-phase identity-bearing objects remain strongly anchored until final
+signature comparison. This prevents object-address reuse from giving a
+different second-phase object the same token after direct removal and
+reinsertion.
+
+`AuditRawNameV1` contains a raw-name kind, exact text only when the value is an
+exact `str` of at most 128 code points, normalized lowercase text only for that
+case, and an `AuditRuntimeIdentityV1` for malformed evidence. A valid canonical
+name is nonempty, already lowercase, has no leading or trailing whitespace,
+and is at most 128 code points. `INVALID_STRING` and `NON_STRING` values never
+become provider-entry keys. Invalid raw registration keys remain in the
+snapshot's sorted `UnkeyedRegistrationAuditV1` tuple and emit
+`MALFORMED_PROVIDER_KEY`. Invalid alias names or targets remain as bounded
+`AuditRawNameV1` values in `AliasAuditV1` and emit `MALFORMED_ALIAS`; an invalid
+target contributes no entry key. No `repr()` is retained.
+
+An exact bounded nonempty string that differs from its lowercase trimmed form
+uses `INVALID_STRING` and `UNREACHABLE_PROVIDER_KEY`. An empty, oversized, or
+non-string registration key uses `MALFORMED_PROVIDER_KEY`. Any invalid alias
+name or target uses `MALFORMED_ALIAS`; the more specific collision or dangling
+code is added only when both participating names are valid strings.
+
+`RegistrationAuditV1` contains presence, registration kind, observable source,
+runtime identity, and optional template-hook identity. `AliasAuditV1` contains
+two `AuditRawNameV1` values and an alias source. It never coalesces the Cloud
+and provisioner alias surfaces. `UnkeyedRegistrationAuditV1` contains one raw
+source axis, malformed raw name, and registration runtime identity, with no
+live value. `LifecycleSwitchAuditV1` contains a switch state and one exact enum
+value only when it is a member of the expected `ProvisionerVersion`,
+`StatusVersion`, or `OpenPortsVersion` type.
+
+`LifecycleMethodAuditV1` contains the method name, strict, legacy, and built-in
+member state and identity, whether the facade body is a meaningful default,
+and one effective-owner value. `InstanceLifecycleAuditV1` contains exactly the
+seven methods in the declared `INSTANCE_LIFECYCLE_V1_METHODS` order, the sorted
+candidate-owner tuple, one completeness value for each candidate, and whether
+legacy fallback mixes owners. `TemplateOwnershipAuditV1` contains strict,
+legacy, and built-in hook member state and identity plus the effective owner.
+A non-`None`, non-callable hook remains the projected current owner and emits
+`NONCALLABLE_TEMPLATE_OVERRIDE`.
+
+`ProviderRegistryAuditEntryV1` contains one valid canonical name, its aliases,
+Cloud, strict, legacy, and built-in registration observations, the three
+lifecycle switches, instance lifecycle, template ownership, and static
+implementation identities for exactly `get_offer_source` and
+`_unsupported_features_for_resources`. It also contains one partial
+classification and its sorted issues. `ProviderRegistryAuditSnapshotV1`
+contains schema version 1, one capture context, entries, aliases, unkeyed
+registrations, aggregate issues, and `is_conformant`, which is true only when
+no `ERROR` exists. It contains no wall-clock time, process ID, historical
+generation, dispatch method, or barrier receipt.
+
+Both audited Cloud implementation members must resolve statically as callable.
+An absent, non-callable, unsafe descriptor, or custom-resolution result emits
+`UNSAFE_OFFER_DECLARATION` or `UNSAFE_RESOURCE_SUPPORT_PREDICATE` for its exact
+facet; the optional identity remains bounded evidence rather than proof of
+usability.
+
+`BUILTIN_BASELINE_MATCH` requires exact current object identity and exact type
+identity for a Cloud singleton, or exact current module identity for a
+provisioner, against the pre-plugin built-in expectation table. It never uses
+`isinstance()`, `Cloud.is_same_cloud()`, module text, or qualname text alone.
+An expected built-in Cloud that is absent emits
+`CLOUD_BUILTIN_IDENTITY_MISMATCH`; expectation keys therefore remain in the
+entry union even when the corresponding live Cloud entry was deleted.
+Strict and legacy source values describe only the raw registry axis. They do
+not claim which API or plugin inserted the entry.
+
+Each expected built-in Cloud alias whose current exact raw alias key is absent
+or whose target differs emits exactly one `CLOUD_BUILTIN_ALIAS_MISMATCH`.
+Its `canonical_name` is the expected target. Its subject identity is the
+observed raw target identity when the exact alias key is present, and `None`
+when the alias key is absent. The raw alias observation and any other alias
+issues remain independently represented.
+
+The effective lifecycle projection mirrors current routing without returning
+a callable: strict owns all seven lifecycle methods; otherwise a statically
+observed non-`None` legacy member wins; otherwise the raw built-in member wins;
+otherwise the facade default applies. A non-callable winning legacy member
+remains the projected owner and is an error because current dispatch would
+fail only when invoked. A dynamic member that cannot be inspected without
+executing plugin code is `INDETERMINATE` and an error.
+If a winning strict bundle, legacy wrapper, or required owner field is not the
+exact expected container shape under static inspection, the affected owner is
+`INDETERMINATE`; precedence never fabricates a usable member from malformed
+state.
+Projection-to-resolver characterization is mandatory, but the resolver remains
+the sole dispatch owner. Template projection is separately exact: strict wins
+even when its hook is absent, then a non-`None` legacy hook, then the built-in
+hook, then absence.
+
+Completeness in V1 means static presence and callability only. The audit never
+asks an arbitrary object for `__signature__`. Because the strict registry does
+not retain proof that its public validator was the insertion path, every strict
+raw entry is `STRICT_SIGNATURE_UNVERIFIED` and ineligible for descriptor
+promotion even when its seven members are statically complete. The later
+coordinator supplies verifiable contract evidence. All seven current facade
+bodies raise `NotImplementedError`, so their meaningful-default value is false
+in the pinned baseline.
+
+Static member lookup invokes only the built-in `type.__dict__`, `type.__mro__`,
+and exact instance-`__dict__` descriptors. It walks their detached items and
+accepts only exact `str` keys before string comparison. It never performs a
+hashed lookup or equality comparison against a plugin-controlled dictionary or
+mapping-proxy key; any non-exact-string namespace key makes that lookup unsafe.
+Type and MRO membership comparisons use object identity
+only, and class `__module__` and `__qualname__` metadata come from the same
+static namespace scan. This avoids invoking custom metaclass equality,
+descriptors, or attribute lookup while retaining the actual runtime resolution
+order. Exact `staticmethod` and `classmethod` wrappers are unwrapped through
+`__func__`. Python functions, built-in functions, bound methods, and objects
+whose exact type supplies a callable `__call__` slot are `CALLABLE` without
+invoking them. `property` and every other object with a custom `__get__`
+descriptor are `UNSAFE_DESCRIPTOR`; the audit does not execute them. Module or
+class `__getattr__` fallback is never executed. An owner whose exact type, or
+whose metaclass when the owner is a class, replaces the corresponding default
+`__getattribute__` is also unsafe even when a same-named static member exists,
+because current dispatch can replace that member dynamically. Custom
+resolution on a strict or legacy registration container makes its required
+fields malformed and the owner indeterminate. A data or custom descriptor that
+wins one of those container fields has the same result and is never invoked. A
+missing Cloud lifecycle switch with dynamic `__getattr__` fallback is
+`MALFORMED`. Lifecycle and hook members
+become `UNSAFE_DESCRIPTOR`; any other custom Cloud lifecycle-switch resolution
+also becomes `MALFORMED`. The static `get_offer_source` and
+`_unsupported_features_for_resources` observations likewise become unsafe and
+emit their facet-specific issue when Cloud attribute resolution is custom. The
+only Cloud members inspected are the three version switches,
+`get_offer_source`, and `_unsupported_features_for_resources`.
+
+The entry-key union is the valid canonical strings from the Cloud, strict,
+legacy, and built-in maps, the built-in Cloud expectation keys, plus valid
+Cloud-alias targets. The fixed `lambda_cloud -> lambda` compatibility alias
+contributes its target but never rewrites a raw key. Provider entries sort by
+canonical name. Raw-name evidence sorts by `(kind.value, normalized_text or
+'', text or '', process_token or '')`. Aliases sort by `(source.value,
+alias_raw_name_sort_key, target_raw_name_sort_key)`. Candidate owners use fixed
+order `STRICT`, `LEGACY`, `BUILTIN`, `FACADE_DEFAULT`, filtered to present
+candidates. Methods retain the declared seven-method order. Issues sort by
+`(severity.value, code.value, canonical_name or '', facet.value,
+subject_token or '')`.
+
+Alias anomaly checks are source-specific. A Cloud alias target is resolved
+only against the Cloud canonical axis, and alias-to-alias checks use only Cloud
+alias names. The provisioner compatibility target is resolved only against the
+strict, legacy, and built-in provisioner canonical axes. Neither source can
+make the other source's missing target valid. A Cloud alias name colliding with
+a Cloud canonical key emits `ALIAS_CANONICAL_COLLISION`; an alias name from
+either source colliding with a distinct provisioner canonical key emits
+`ALIAS_PROVISIONER_CANONICAL_CONFLICT`. `EXCLUDED_ALIAS` applies only to a raw
+Cloud alias named `local`.
+
+The closed partial classifications are `NONE`,
+`IBM_LEGACY_RAY_CLOUD_ONLY`, `UNDECLARED_STRICT_PROVISIONER_ONLY`,
+`UNDECLARED_LEGACY_PROVISIONER_ONLY`, `UNEXPECTED_CLOUD_ONLY`, and
+`UNEXPECTED_BUILTIN_PROVISIONER_ONLY`. Only `NONE` and the exact IBM case are
+conformant. A provisioner-only entry remains structurally supported by legacy
+dispatch, but V1 cannot distinguish an intentional plugin from a typo because
+the old registries retain no declaration. It is therefore an error until the
+later `ProviderRegistrationV1` explicitly declares the partial contract.
+
+The issue-code set and severities are exact:
+
+| Code | Severity | Facet |
+|---|---|---|
+| `MALFORMED_PROVIDER_KEY`, `UNREACHABLE_PROVIDER_KEY` | `ERROR` | `REGISTRY_KEY` |
+| `MALFORMED_ALIAS`, `CLOUD_BUILTIN_ALIAS_MISMATCH`, `ALIAS_CANONICAL_COLLISION`, `DANGLING_ALIAS`, `ALIAS_TO_ALIAS`, `EXCLUDED_ALIAS`, `ALIAS_PROVISIONER_CANONICAL_CONFLICT` | `ERROR` | `ALIAS` |
+| `WRONG_CLOUD_FACET_TYPE`, `CLOUD_BUILTIN_IDENTITY_MISMATCH`, `UNEXPECTED_CLOUD_ONLY` | `ERROR` | `CLOUD` |
+| `MALFORMED_LIFECYCLE_SWITCH` | `ERROR` | `LIFECYCLE_SWITCH` |
+| `PROVISIONER_BUILTIN_IDENTITY_MISMATCH`, `UNDECLARED_STRICT_PROVISIONER_ONLY`, `UNDECLARED_LEGACY_PROVISIONER_ONLY`, `UNEXPECTED_BUILTIN_PROVISIONER_ONLY`, `SKYPILOT_CLOUD_WITHOUT_LIFECYCLE` | `ERROR` | `INSTANCE_LIFECYCLE` |
+| `STRICT_AND_LEGACY_PRESENT`, `MALFORMED_STRICT_REGISTRATION`, `MALFORMED_LEGACY_REGISTRATION`, `INCOMPLETE_STRICT_LIFECYCLE`, `INCOMPLETE_BUILTIN_LIFECYCLE`, `STRICT_SIGNATURE_UNVERIFIED`, `NONCALLABLE_LEGACY_MEMBER`, `UNSAFE_DYNAMIC_MEMBER`, `MIXED_INSTANCE_LIFECYCLE_OWNER` | `ERROR` | `INSTANCE_LIFECYCLE` |
+| `REPLACED_BUILTIN_GETTER` | `ERROR` | `INSTANCE_LIFECYCLE` |
+| `NONCALLABLE_TEMPLATE_OVERRIDE`, `TEMPLATE_OWNER_INDETERMINATE` | `ERROR` | `TEMPLATE_OVERRIDE` |
+| `UNSAFE_OFFER_DECLARATION` | `ERROR` | `OFFER_DECLARATION` |
+| `UNSAFE_RESOURCE_SUPPORT_PREDICATE` | `ERROR` | `RESOURCE_SUPPORT_PREDICATE` |
+| `PARALLEL_LIFECYCLE_OWNER` | `WARNING` | `INSTANCE_LIFECYCLE` |
+
+`ProviderRegistryAuditIssueV1` contains only one listed code, its fixed
+severity, canonical name when valid, facet, and an optional subject runtime
+identity. It has no free-form detail or provider exception text. Malformed or
+unexpected entries do not abort unrelated construction. Whole-capture failure
+instead raises `ProviderRegistryAuditCaptureErrorV1` with exactly one of
+`MISSING_RECEIPT`, `INVALID_RECEIPT`, `WRONG_PROCESS`, `STALE_EPOCH`,
+`ACTIVE_SESSION`, `REGISTRY_CHANGED`, or `OBSERVED_MEMBER_CHANGED`. No partial
+snapshot accompanies that exception.
+
+##### Registration barrier and capture algorithm
+
+The existing `plugins_loaded()` boolean is not the barrier. It is a schema
+leniency flag, can remain true across a later failed context load, and does not
+cover import-time decorators. V1 adds a process-local registration-session
+coordinator in a lightweight utility module shared by the plugin loader, Cloud
+registry, and provisioner facade. It does not change the boolean's current
+schema semantics: a successful load still sets it true, and a later failed load
+does not temporarily weaken concurrent schema validation. The independent
+receipt is invalidated even when that legacy boolean remains true.
+
+`load_plugins()` takes a process-local reentrant load mutex and begins a
+registration session before reading or importing configured plugin classes.
+Beginning a session invalidates every older receipt in that process. The
+active-session marker spans module import, context filtering, construction,
+and `install()`, but the registry mutation lock is held only while beginning or
+completing the session and around each individual registration. This lets a
+plugin complete synchronous registration on a child thread without deadlocking
+the loader. Recursive `load_plugins()` in the same process fails explicitly on
+the active-session check. Plugin registration that outlives `install()` is
+unsupported; a later supported mutation invalidates the receipt.
+
+Only successful completion of the entire load pass returns an exact
+`ProviderRegistrationBarrierV1` receipt containing the plugin context,
+process-local load epoch, producing process ID, and opaque process-local nonce.
+An empty plugin configuration still completes a receipt. Any exception aborts
+the session and leaves no current receipt. The nonce is an accidental-staleness
+capability, not a security boundary against code already executing in the same
+Python process. MAIN, UVICORN, EXECUTOR, and CONTROLLER receipts are
+process-local; starting a later context in the same process invalidates the
+earlier receipt.
+
+The supported Cloud decorator path and both provisioner registration APIs use
+the same reentrant mutation lock. A supported registration outside an active
+plugin-load session invalidates the current receipt before mutation. The
+strict-to-legacy and legacy-to-strict `pop` plus assignment become one locked
+mutation for audit consistency while preserving last-registration-wins
+dispatch. This lock has no dispatch role and does not make registry entries
+authoritative.
+
+On platforms with `register_at_fork`, the child hook replaces both inherited
+locks and resets the active session, receipt, epoch, and coordinator process ID
+before child code can acquire either lock. The lazy process-ID check remains a
+secondary reset for process starts that do not inherit the module state. A
+child therefore cannot deadlock on a lock held by a vanished parent thread or
+reuse an inherited receipt.
+
+Inherited direct `dict` mutation, direct writes to the private alias map, and
+in-place module or class member replacement are legacy escape hatches with no
+provenance. They are not reclassified as supported registration. Capture uses
+this two-phase linearization:
+
+1. Under the coordinator mutation lock, validate the exact latest receipt and
+   take detached primitive observations of all five raw axes, aliases,
+   lifecycle switches, exact audited Cloud members, lifecycle members, and
+   template hooks, and construct the recursively frozen candidate snapshot.
+   The captured signature includes raw key/value identities and every static
+   member or enum identity represented by the snapshot, including the Cloud
+   type MRO used for Cloud-facet classification. A private
+   strong-reference anchor tuple keeps every first-phase identity-bearing
+   object alive through step 3. The candidate is not yet published.
+2. Release the lock while retaining only the frozen candidate, its signature,
+   and private anchors. No live provider object is inspected and no duplicate
+   mirror projection schema is introduced in this phase.
+3. Reacquire the lock immediately before return, revalidate receipt type,
+   process, epoch, and inactive-session state, and recompute the complete raw
+   and observed-member signature through the same projector. Compare both
+   signatures and the two recursively frozen projections before releasing the
+   lock. Projection equality is the completeness backstop for bounded metadata
+   or classification changed in place without changing object identity. Any
+   difference raises the exact typed capture error and discards the entire
+   candidate snapshot.
+
+A stable direct replacement is retained as `EXTERNAL_OR_REPLACED`.
+Replace-then-restore cannot produce a torn published result:
+if capture observed the replacement, its captured signature differs from the
+final signature; if both observations equal the restored state, the frozen
+projection contains only that restored state. Callable internals and mutable
+provider instance attributes are outside V1 and receive no stronger claim.
+The later coordinator removes these escape hatches rather than granting them
+provenance.
+
+The pre-plugin expectation table retains the exact original getter function,
+sealed executable shape, direct-global binding name, and module for each
+built-in provisioner. Every pinned getter is an exact zero-argument Python
+function whose significant bytecode is exactly one `LOAD_GLOBAL` followed by
+`RETURN_VALUE`, with no defaults, keyword defaults, or closure. Capture checks
+the function identity, exact function type, code object, defaults, keyword
+defaults, closure, and globals mapping against that seal. Exact function fields
+are read through the built-in function descriptors without invoking plugin
+attribute access. Capture then scans the sealed globals dictionary with exact
+`dict.items()` and accepts only an exact `str` key equal to the sealed binding
+name. It does not use hashed lookup because a plugin can insert a colliding
+non-string key whose equality method executes code. It never invokes a getter.
+The observed binding must be the exact baseline module before any member is
+inspected. A replaced getter or an in-place executable-shape change is recorded
+by getter identity with `REPLACED_BUILTIN_GETTER`; a missing or changed global
+binding emits `PROVISIONER_BUILTIN_IDENTITY_MISMATCH`. Thus neither function
+replacement nor a check-to-call race can run arbitrary plugin, credential,
+catalog, or network code through the audit.
+
+Capture must not call `CLOUD_REGISTRY.from_str()`, `_resolve_provisioner()`,
+`repr()`, `Cloud.canonical_name()`, `Cloud.is_same_cloud()`, credential or
+catalog APIs, capability methods, lifecycle methods, descriptors, arbitrary
+plugin properties, or provider callbacks. It does not mutate any registry,
+alias map, compatibility diagnostic set, or plugin state. All inventory
+observation is static; no getter or provider callback is executed.
+
+##### Characterization, rollout, and removal gates
+
+The first implementation must prove:
+
+- a clean subprocess imports the exact worktree and yields the sorted 25 Cloud,
+  24 built-in provisioner, two Cloud alias, one provisioner alias, and IBM
+  expected-partial baseline;
+- all 24 raw built-in modules have callable static members for the seven exact
+  lifecycle methods, while IBM has the exact legacy switches;
+- canonical and Cloud-alias lookup retain the same current singleton identity,
+  without using lookup during snapshot construction;
+- the snapshot is recursively immutable, detached from later mutation,
+  deterministic for an unchanged registry, never calls any getter, and
+  statically observes the exact sealed global binding once per signature phase;
+- strict-only and legacy-only provisioner registrations receive their exact
+  undeclared-partial classifications and conformance errors;
+- strict overlays, complete legacy overlays, partial legacy mixed ownership,
+  template-only legacy registration, non-callable lifecycle and template
+  members, incomplete built-in lifecycle, simultaneous raw strict and legacy
+  state, and all four replacement directions are represented without changing
+  effective dispatch;
+- canonical-alias collisions, alias-canonical collisions, dangling aliases,
+  alias-to-alias targets, excluded aliases, noncanonical, oversized, and
+  non-string names, wrong Cloud values, and alias-as-provisioner-canonical
+  entries produce exact bounded issues and deterministic unkeyed evidence;
+- deleting an expected built-in Cloud or deleting or retargeting an expected
+  built-in Cloud alias remains visible through its exact baseline mismatch;
+- a replaced Cloud singleton, strict lifecycle, legacy module, template hook,
+  built-in module getter, and individual method produce bounded identity
+  evidence without retaining the object;
+- pre-barrier capture, a failed plugin load, a stale receipt after a second
+  context starts, a wrong-process receipt, and a supported post-barrier
+  registration fail with their exact capture-error reason;
+- import-time Cloud decoration and install-time provisioner registration are in
+  the same successful receipt, and MAIN, UVICORN, EXECUTOR, and CONTROLLER
+  receipts never cross process boundaries;
+- concurrent supported replacement and capture produce a complete old or new
+  observation, never the strict/legacy intermediate state, while concurrent
+  direct member replacement fails whole-capture revalidation;
+- registry identities and representative resolver results before and after
+  capture are identical, and no provider, credential, catalog, or network code
+  runs;
+- hostile metaclass equality, MRO and metadata descriptors, colliding
+  non-string instance, module, class, and getter-global keys, container-level
+  custom resolution, and dynamic lifecycle-switch fallback never execute;
+- in-place Cloud-base mutation changes the signed observation and projection,
+  and a fork child can begin registration while a non-surviving parent thread
+  held either coordinator lock.
+
+This first slice adds no automatic audit logging, database row, API response,
+or dispatch branch. An explicit caller receives only the in-memory snapshot.
+It therefore does not start the compatibility-release clock. Before descriptor
+authority or removal can use release evidence, a later reviewed integration
+must capture the latest receipt in every active process context, publish only
+bounded schema version, release identity, context, issue code, severity, and
+count through the existing Datadog path, and attach a token-free
+`ProviderRegistryAuditReportV1` to the exact-image release qualification
+artifacts. No new statistics store is introduced. Runtime identity tokens,
+module names, qualnames, raw malformed names, and provider exception text never
+enter Datadog or the report.
+
+No descriptor promotion can consume the audit until every `ERROR` is
+eliminated or accepted by a later exact descriptor declaration. The required
+one-compatibility-release gate is measured only after that Datadog and release
+artifact integration is deployed in MAIN, UVICORN, EXECUTOR, and CONTROLLER.
+The release report and bounded Datadog counts must agree on zero unexplained
+errors for the exact image.
+
+All code introduced by this audit slice is temporary migration machinery:
+the built-in expectation tables and getter-shape seals, raw-name and identity
+types, snapshot and capture API, issue and capture-error enums, effective-owner
+projection, process-local token key, load mutex, mutation lock, epoch and receipt state,
+registration-session coordinator, plugin-loader begin, complete, and abort
+hooks, Cloud and provisioner mutation hooks, raw/member signature machinery,
+and compatibility source classifications. None receives dispatch authority.
+After the runtime commit SHA exists, a later commit must add an exact executable
+removal-manifest locator for every one of those symbols or hooks. The later
+`ProviderRegistrationV1` coordinator may replace the synchronization primitive
+in place, but it cannot silently make an audit-only symbol permanent.
+
+Removal requires one measured compatibility release with no unexplained audit
+error, descriptor-derived legacy views, alias conformance, plugin replacement
+tests, and repository proof that no independent mutable provider inventory or
+lifecycle switch remains.
 
 After the inventory is characterized, a transaction-like
 `ProviderRegistrationV1` coordinator becomes the only path for newly migrated
@@ -6951,3 +7435,63 @@ render and config-hash oracles, and an observed
 the full writer oracle still used a synthetic instance type; after replacing
 it with catalog-backed `g-2vcpu-8gb` in valid `nyc1`, re-review returned
 `PURSUE` with no remaining blocker.
+
+### Review 25
+
+Verdict: `PURSUE` for the exact read-only
+`ProviderRegistryAuditSnapshotV1` contract at SHA-256
+`72ea561d0f8a64d5f6292229ff16a8f6699380c99184b4353237c73a4e7bb2c8`.
+
+The first adversarial review returned `RESHAPE` because an arbitrary replaced
+built-in getter could execute provider code, top-level identity signatures did
+not fence in-place member replacement, provisioner-only registrations were
+accepted without a declaration, the barrier overstated same-process security,
+and an opt-in memory-only audit could not measure a compatibility release. The
+corrected contract never invokes inventory getters, signs and revalidates
+every observed static member, treats undeclared provisioner-only entries as
+errors, defines the receipt only as a stale-state correctness token, preserves
+the legacy schema flag semantics, and makes existing Datadog counts plus an
+exact-image token-free release report prerequisites for the release gate.
+
+Independent implementation review then required bounded evidence for arbitrary
+raw keys, exact two-phase publication, closed capture-error reasons, and an
+allowlisted static descriptor grammar. Independent contract review required
+snapshot-only live-reference exclusion, executable sort keys, and exact
+non-callable template and incomplete built-in lifecycle issues. After those
+corrections, implementation review returned `PASS`, contract review returned
+`PASS`, and two exact-diff adversarial re-reviews returned `PURSUE`. This
+verdict approves design and the read-only audit implementation only. It grants
+no descriptor or lifecycle dispatch authority.
+
+A subsequent deletion audit found that the entry union could omit a deleted
+Cloud-only baseline such as IBM and that a deleted or retargeted built-in Cloud
+alias had no correctly faceted issue. The contract now retains built-in Cloud
+expectation keys, treats an absent expected Cloud as
+`CLOUD_BUILTIN_IDENTITY_MISMATCH`, and adds
+`CLOUD_BUILTIN_ALIAS_MISMATCH`. The re-review then required deterministic
+alias-mismatch attribution, which is now exact.
+A runtime-safety review also proved that Python function identity alone does
+not prevent in-place `__code__` replacement and that custom
+`__getattribute__` can diverge from static members. The contract therefore
+seals each getter's executable shape, statically reads its direct-global
+binding instead of calling it, and treats custom attribute resolution as
+unsafe. The same review also required PID-sensitive token re-keying after fork,
+strong-reference anchors against address reuse, and source-specific Cloud
+versus provisioner alias validation. These corrections require a final
+exact-diff adversarial re-review before implementation is committed. The
+capture now constructs its single frozen candidate under the registration lock
+and revalidates its complete signature under that lock before publication,
+avoiding a second mirror projection schema. The final clarification makes any
+non-callable or otherwise unsafe audited Cloud implementation member an exact
+facet error rather than identity-only evidence.
+
+The final implementation-safety pass then proved that generic static lookup,
+hashed lookup into live namespaces, equality-based type membership, and
+inherited post-fork locks could still execute plugin callbacks or deadlock a
+child. It also found container-resolution and dynamic-switch projection gaps,
+plus an in-place Cloud-base change not covered by identity-only signatures.
+The corrected contract uses only built-in namespace and MRO descriptors,
+exact-string item scans, identity comparisons, child lock reinitialization,
+signed Cloud MROs, and frozen-projection equality as the final completeness
+backstop. These corrections require one final exact-diff adversarial re-review
+before the runtime commit.

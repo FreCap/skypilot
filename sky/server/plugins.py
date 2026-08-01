@@ -13,6 +13,7 @@ from sky import sky_logging
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils import config_utils
+from sky.utils import provider_registration
 from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
@@ -533,46 +534,49 @@ def plugins_loaded() -> bool:
     return _plugins_loaded
 
 
-def load_plugins(extension_context: ExtensionContext):
+def load_plugins(
+    extension_context: ExtensionContext,
+) -> provider_registration.ProviderRegistrationBarrierV1:
     """Load and initialize plugins from the config."""
     global _EXTENSION_CONTEXT, _plugins_loaded
-    _EXTENSION_CONTEXT = extension_context
+    with provider_registration.provider_registration_session(
+            extension_context.context.value) as registration_session:
+        _EXTENSION_CONTEXT = extension_context
 
-    config = _load_plugin_config()
-    if not config:
+        config = _load_plugin_config()
+        if config:
+            for plugin_config in config.get('plugins', []):
+                class_path = plugin_config['class']
+                logger.debug(f'Loading plugins: {class_path}')
+                module_path, class_name = class_path.rsplit('.', 1)
+                try:
+                    module = importlib.import_module(module_path)
+                except ImportError as e:
+                    raise ImportError(
+                        f'Failed to import plugin module: {module_path}. '
+                        'Please check if the module is installed in your '
+                        'Python environment.') from e
+                try:
+                    plugin_cls = getattr(module, class_name)
+                except AttributeError as e:
+                    raise AttributeError(
+                        f'Could not find plugin {class_name} class in module '
+                        f'{module_path}. ') from e
+                if not issubclass(plugin_cls, BasePlugin):
+                    raise TypeError(
+                        f'Plugin {class_path} must inherit from BasePlugin.')
+                if not plugin_cls.should_load(extension_context.context):
+                    logger.debug(
+                        f'Skipping plugin {class_path}: not enabled for '
+                        f'context {extension_context.context.value}')
+                    continue
+                parameters = plugin_config.get('parameters') or {}
+                plugin = plugin_cls(**parameters)
+                plugin.install(extension_context)
+                _PLUGINS[class_path] = plugin
+
         _plugins_loaded = True
-        return
-
-    for plugin_config in config.get('plugins', []):
-        class_path = plugin_config['class']
-        logger.debug(f'Loading plugins: {class_path}')
-        module_path, class_name = class_path.rsplit('.', 1)
-        try:
-            module = importlib.import_module(module_path)
-        except ImportError as e:
-            raise ImportError(
-                f'Failed to import plugin module: {module_path}. '
-                'Please check if the module is installed in your Python '
-                'environment.') from e
-        try:
-            plugin_cls = getattr(module, class_name)
-        except AttributeError as e:
-            raise AttributeError(
-                f'Could not find plugin {class_name} class in module '
-                f'{module_path}. ') from e
-        if not issubclass(plugin_cls, BasePlugin):
-            raise TypeError(
-                f'Plugin {class_path} must inherit from BasePlugin.')
-        if not plugin_cls.should_load(extension_context.context):
-            logger.debug(f'Skipping plugin {class_path}: not enabled for '
-                         f'context {extension_context.context.value}')
-            continue
-        parameters = plugin_config.get('parameters') or {}
-        plugin = plugin_cls(**parameters)
-        plugin.install(extension_context)
-        _PLUGINS[class_path] = plugin
-
-    _plugins_loaded = True
+        return registration_session.complete()
 
 
 def get_plugins() -> list[BasePlugin]:
