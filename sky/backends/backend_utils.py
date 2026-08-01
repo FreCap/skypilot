@@ -3884,7 +3884,7 @@ def refresh_cluster_record(
                         f'{cluster_name!r}. Using the cached status.')
                     return record
                 sleep_seconds = min(sleep_seconds, remaining_wait)
-            time.sleep(sleep_seconds)
+            context_utils.sleep_with_cancellation(sleep_seconds)
 
             # Refresh for next loop iteration.
             record = _reload_record_if_refresh_fields_changed(
