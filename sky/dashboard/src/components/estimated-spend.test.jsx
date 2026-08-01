@@ -98,6 +98,13 @@ function deferred() {
   return { promise, resolve };
 }
 
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
 function response(days, estimatedCost) {
   return {
     as_of: 1_700_006_400,
@@ -243,6 +250,72 @@ test('coalesces interval refreshes while the same request is pending', async () 
   expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
   expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
   jest.useRealTimers();
+});
+
+test('pauses hidden refreshes and refreshes once on visibility restore', async () => {
+  const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+    window.document,
+    'visibilityState'
+  );
+  jest.useFakeTimers();
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpend.mockResolvedValue(response(30, 30));
+  setDocumentVisibility('hidden');
+  const { unmount } = render(<EstimatedSpend />);
+  let mounted = true;
+
+  try {
+    await act(async () => {});
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
+    expect(getEstimatedSpend).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(120_000 - 1);
+    });
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
+    expect(getEstimatedSpend).toHaveBeenCalledTimes(1);
+
+    setDocumentVisibility('visible');
+    await act(async () => {
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
+    expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
+    expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(60_000);
+    });
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(3);
+    expect(getEstimatedSpend).toHaveBeenCalledTimes(3);
+
+    unmount();
+    mounted = false;
+    window.document.dispatchEvent(new Event('visibilitychange'));
+    await act(async () => {
+      jest.advanceTimersByTime(60_000);
+    });
+    expect(getCurrentUserRole).toHaveBeenCalledTimes(3);
+    expect(getEstimatedSpend).toHaveBeenCalledTimes(3);
+  } finally {
+    if (mounted) unmount();
+    if (visibilityDescriptor) {
+      Object.defineProperty(
+        window.document,
+        'visibilityState',
+        visibilityDescriptor
+      );
+    } else {
+      delete window.document.visibilityState;
+    }
+    jest.useRealTimers();
+  }
 });
 
 test('defaults to owner hierarchy with purchase-option costs', async () => {

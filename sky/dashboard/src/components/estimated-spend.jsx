@@ -45,6 +45,7 @@ import {
 import { SpendAttributionTable } from '@/components/spend-attribution-table';
 import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
 import { getCurrentUserRole } from '@/data/connectors/client';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
 
@@ -629,14 +630,13 @@ export function EstimatedSpend() {
 
   useEffect(() => {
     fetchData();
-    const timer = setInterval(fetchData, AUTO_REFRESH_MS);
     const state = requestState.current;
     return () => {
-      clearInterval(timer);
       state.generation += 1;
       state.active = null;
     };
   }, [fetchData]);
+  useVisibleRefreshInterval(true, AUTO_REFRESH_MS, fetchData);
 
   const chartData = useMemo(() => {
     const days = data?.days || [];
