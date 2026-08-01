@@ -1,9 +1,18 @@
 """Tests for low-cardinality operator notification state."""
 import concurrent.futures
+import inspect
 
 from sky import global_user_state
 from sky.skylet import constants
 from sky.utils.db import db_utils
+
+
+def _wrapper_depth(func):
+    depth = 0
+    while hasattr(func, '__wrapped__'):
+        depth += 1
+        func = func.__wrapped__
+    return depth
 
 
 def _fresh_db(tmp_path, monkeypatch):
@@ -19,6 +28,62 @@ def _fresh_db(tmp_path, monkeypatch):
             ),
         ),
     )
+
+
+def test_operator_notification_facade_contract(tmp_path, monkeypatch):
+    # Private members below are intentional compatibility seams.
+    # pylint: disable=protected-access
+    assert str(inspect.signature(
+        global_user_state.record_operator_notification)) == (
+            '(category: str, message: str, dedupe_window_seconds: int, '
+            'emitted_at: int | None = None) -> None')
+    assert str(inspect.signature(
+        global_user_state.get_operator_notifications)) == (
+            '(user_id: str, since: int) -> dict[str, typing.Any]')
+    assert str(
+        inspect.signature(
+            global_user_state.mark_operator_notifications_read)) == (
+                '(user_id: str, through_sequence: int, '
+                'updated_at: int | None = None) -> int')
+    for function_name in (
+            'record_operator_notification',
+            'get_operator_notifications',
+            'mark_operator_notifications_read',
+    ):
+        function = getattr(global_user_state, function_name)
+        assert function.__module__ == global_user_state.__name__
+        assert function.__qualname__ == function_name
+    assert _wrapper_depth(global_user_state.record_operator_notification) == 1
+    assert _wrapper_depth(global_user_state.get_operator_notifications) == 1
+    assert _wrapper_depth(
+        global_user_state.mark_operator_notifications_read) == 2
+    assert callable(global_user_state._operator_notification_insert_func)
+    assert callable(global_user_state._next_operator_notification_sequence)
+
+    _fresh_db(tmp_path, monkeypatch)
+    delegate = global_user_state._db_manager
+    delegate.get_engine()
+
+    class CountingDatabaseManager:
+
+        def __init__(self):
+            self.get_engine_calls = 0
+
+        def get_engine(self):
+            self.get_engine_calls += 1
+            return delegate.get_engine()
+
+    counting_manager = CountingDatabaseManager()
+    monkeypatch.setattr(global_user_state, '_db_manager', counting_manager)
+    global_user_state.record_operator_notification('insufficient_quota',
+                                                   'quota',
+                                                   3600,
+                                                   emitted_at=100)
+    result = global_user_state.get_operator_notifications('operator', 0)
+    assert global_user_state.mark_operator_notifications_read(
+        'operator', result['latest_sequence'], updated_at=101) == 1
+    assert counting_manager.get_engine_calls == 3
+    # pylint: enable=protected-access
 
 
 def test_continuous_incident_is_coalesced_until_quiet(tmp_path, monkeypatch):
