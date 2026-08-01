@@ -5,9 +5,11 @@ source composer, and M3-S0 are merged and deployment-qualified. M3-S0 passed
 exact-head CI, exact-parent merge verification, staged revisions 49 through 51,
 and bounded monitoring. The test deployment had no managed volume, so positive
 live per-volume parity remains explicitly unproven and the shadow remains
-diagnostic-only. M3-S1 is the next design-and-characterization slice. The M3
-action runtime, authoritative volume writer, and M4 implementation still
-require their dedicated exact-design adversarial reviews and activation gates.
+diagnostic-only. M3-S1 is the next design-and-characterization slice. M3-S2 is
+limited to the inert store-identity and scoped-ownership foundation. The full
+M3 action graph, action runtime, authoritative volume writer, and M4
+implementation still require their dedicated exact-design adversarial reviews
+and activation gates.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -4093,13 +4095,19 @@ The PostgreSQL expand layout uses a sidecar
 name. It can exist without a legacy `volumes` row and therefore owns absent-name
 reservations, incarnation, desired and tombstone generations, workspace,
 writer mode, ownership epoch, current binding digest, public visibility, and
-domain state. It is not deleted on ordinary volume deletion. The existing
-`volumes` row remains the old-reader public projection and may be absent while
-the sidecar retains a tombstone. A volume row with no sidecar is unambiguously
-legacy. The dark-store slice creates no sidecar rows; later action admission
-creates or locks the sidecar and writes its action and effects in one
-transaction. The sidecar has no foreign key to `volumes`, because the name
-reservation and tombstone must outlive that row.
+domain state. For an action-owned live or tombstoned provider resource it also
+owns the versioned canonical base locator and digest, exact observed provider
+UID, comparison-rules version, canonical requested projection and digest, and
+ownership-annotation version. Those fields cannot be cleared or replaced by
+effect compaction; they change only through an incarnation-fenced domain
+transition and remain until exact cleanup proof is durable. It is not deleted
+on ordinary volume deletion. The existing `volumes` row remains the old-reader
+public projection and may be absent while the sidecar retains a tombstone. A
+volume row with no sidecar is unambiguously legacy. The dark identity slice
+creates no sidecar table or row; later action admission creates or locks the
+sidecar and writes its action and effects in one transaction. The sidecar has
+no foreign key to `volumes`, because the name reservation and tombstone must
+outlive that row.
 
 A new incarnation is random UUIDv4 persisted before any provider I/O, with
 desired generation 1 and tombstone generation 0. Each admitted desired-state
@@ -4112,12 +4120,25 @@ reused generation number, separates old and new effects.
 The control-plane store identity is a UUID in one singleton PostgreSQL row. It
 is created once before any sidecar or action row, is never derived from a pod,
 hostname, context, or image, and is preserved by backup and authoritative
-restore. A database clone remains action-writer-disabled while the source may
-be active. It may receive a new store UUID only through an audited fork
-operation after proving that it has no action-owned volume and no nonterminal,
-quarantined, or cleanup-required action; terminal evidence keeps its original
-store UUID. This prevents two writable control planes from sharing action
-identity or provider ownership after a clone.
+restore. Database state alone cannot distinguish a source from its clone. The
+same row therefore carries a nullable SHA-256 digest of an external 256-bit
+writer-authority seal. The seal itself is not stored in this database or its
+backup. Every later legacy-intent producer, action producer, reconciler, and
+worker must present the seal and match the digest in the same preflight that
+checks its scoped ownership epoch. A dark store has a null digest and cannot
+write lifecycle work.
+
+An authoritative restore may mount the original seal only after an audited
+procedure has fenced the source deployment and proved that no other holder can
+write. A clone without that explicit transfer remains writer-disabled even
+though it copied the store UUID and ownership rows. A fork may receive a new
+store UUID and new seal only after proving that it has no action-owned volume
+and no nonterminal, quarantined, or cleanup-required action; terminal evidence
+keeps its original store UUID. Copying both the database and deployment secret
+outside either procedure is unsupported split-brain, detected by the
+deployment authority audit rather than treated as a valid restore. This keeps
+two writable control planes from sharing action identity or provider ownership
+after an ordinary database clone.
 
 Action UUIDv5 namespace is
 `e4abeb94-a9e7-4722-a9e7-2776d6d9e18b`. Effect UUIDv5 namespace is
@@ -4213,13 +4234,17 @@ time-based expiry. Full terminal action, effect, attempt, and evidence rows are
 retained for at least 90 days, configurable only upward. Compaction then writes
 an immutable identity tombstone in the same transaction, retaining action ID,
 complete business key and payload digests, authenticated-subject digest,
-terminal result, final effect certainty and cleanup proof, original binding
-digest, and completion time before removing bulky attempt or evidence data.
-Identity tombstones and `volume_lifecycle_resources` rows persist for the
-lifetime of the control-plane store and continue to reject reuse of an old
-business key. Executable compatibility implementations may be removed only
-when no nonterminal effect references the binding; terminal tombstones retain
-the digest but do not require executable code.
+terminal result, an ordinal-keyed final-certainty and cleanup-proof entry for
+every effect, original binding digest, and completion time before removing
+bulky attempt or evidence data. A scalar effect summary is not sufficient.
+Compaction cannot remove a locator, UID, requested projection, binding, or
+cleanup fact still needed by a live or tombstoned domain resource; the sidecar
+retains that provider identity independently of effect retention. Identity
+tombstones and `volume_lifecycle_resources` rows persist for the lifetime of
+the control-plane store and continue to reject reuse of an old business key.
+Executable compatibility implementations may be removed only when no
+nonterminal effect references the binding; terminal tombstones retain the
+digest but do not require executable code.
 
 The API request row is not this ledger. Existing volume handlers use the
 ordinary request system and its request-lifetime policy, which can cancel a
@@ -4340,11 +4365,23 @@ backfill proves exact ownership. Mixed-version activation uses the per-volume
 writer marker, so a legacy-created PVC cannot switch delete owners merely
 because the server was upgraded.
 
-That marker is not the mixed-version fence by itself. A singleton activation
-row stores `minimum_volume_lifecycle_version`, routing mode, and monotonically
-increasing ownership epoch. Every API or executor process eligible to run a
-volume handler advertises its supported lifecycle version and exact image
-digest through a database-clock heartbeat. Activation first enters `DRAINING`,
+That marker is not the mixed-version fence by itself. Ownership lives in
+`lifecycle_ownership_scopes`, keyed by `(domain, dependency-closed operation
+subset, store mode)`. The volume pilot key is exactly
+`(VOLUME, KUBERNETES_PVC_OWNED_LIFECYCLE_V1, CENTRAL_POSTGRESQL)`. Routing mode
+is closed to `DARK`, `LEGACY_OPEN`, `DRAINING`, or `ACTION_OPEN`. `DARK` is an
+inert expanded schema that current legacy handlers do not consult and from
+which no lifecycle producer or worker may claim authority. The scoped row also
+stores `minimum_lifecycle_version`, a monotonically increasing ownership
+epoch, and nullable selected writer and reconciler implementation digests.
+
+Before a later compatibility release changes `DARK` to `LEGACY_OPEN`, every
+API, controller, executor, or worker process eligible to run a volume handler
+must advertise its supported lifecycle version, exact image digest, role, and
+binding and reconciler support through a database-clock heartbeat in a
+separately reviewed process-capability table. `LEGACY_OPEN` requires every
+legacy mutation admission to register an exact legacy intent and validate the
+scope epoch and writer-authority seal. Activation later enters `DRAINING`,
 rejects new apply and delete admission, waits for every earlier volume request
 and known provider call to finish, and terminates every older eligible process.
 Lease-lost or otherwise unresolved legacy requests are imported as explicit
@@ -4363,12 +4400,12 @@ Once any action-owned sidecar exists, rollback to a pre-action binary is
 prohibited because that binary ignores the sidecar and epoch. Supported
 rollback is only to an image that still contains the mixed router, original
 binding implementation or approved adapter, and pinned action reconciler. The
-deployment preflight refuses an older image while the activation row or any
-action-owned sidecar remains. Returning to a pre-action binary requires a
-separately reviewed reverse migration that first proves no action-owned volume,
-nonterminal effect, quarantine, or cleanup obligation remains. A forced old
-binary outside that gate is explicitly unsupported and cannot be treated as a
-rollback path.
+deployment preflight refuses an older image while the ownership scope is past
+`DARK` or any action-owned sidecar remains. Returning to a pre-action binary
+requires a separately reviewed reverse migration that first proves no
+action-owned volume, nonterminal effect, quarantine, or cleanup obligation
+remains. A forced old binary outside that gate is explicitly unsupported and
+cannot be treated as a rollback path.
 
 Admission persists a deterministic `name_on_cloud`, exact target binding,
 canonical requested PVC projection, comparison-rules version, and readback
@@ -4495,11 +4532,40 @@ The M3-S1 exit gate is an adversarial `PURSUE` verdict over the exact section
 digest plus a passing characterization corpus with no production behavior
 change. The review must find the action, attempt, effect, transaction,
 provider-binding, request-correlation, activation, compatibility, and rollback
-boundaries complete enough to design storage without guessing. Only the next
-approved slice may add a dark central-PostgreSQL store. Its singleton store and
-activation identity rows may exist, but it contains no sidecar, legacy-intent,
-action, attempt, effect, evidence, or identity-tombstone row. Its producer and
-worker ship disabled.
+boundaries complete enough to design the inert identity foundation without
+guessing. It does not approve the full action graph DDL.
+
+Only the next separately reviewed slice, M3-S2, may add a new PostgreSQL-only
+Alembic lineage sharing the ordinary central engine. That slice is limited to
+exactly two tables: `lifecycle_store_identity` and
+`lifecycle_ownership_scopes`. It seeds exactly one `global` store row with a
+random UUIDv4, schema version 1, null writer-authority digest, and database
+creation time, plus exactly one volume-pilot scope row with the key above,
+`DARK`, minimum version 0, ownership epoch 1, null writer and reconciler
+digests, and database update time. Startup fails closed on a missing,
+non-singleton, malformed, or schema-version-mismatched store identity, and the
+runtime repository exposes no operation that can replace its UUID. Downgrade
+may remove only those exact inert seed rows after locking both tables and
+proving there are no other rows; otherwise it fails closed. The lineage's
+Alembic version table is migration metadata, not a third lifecycle data table.
+
+M3-S2 adds no sidecar, process-capability, binding, legacy-intent, action,
+request-correlation, attempt, effect, evidence, compatibility-adapter,
+identity-anchor, or identity-tombstone table or row. It changes no volume,
+request, provider, routing, reconciliation, or event code and ships no
+producer, queue, fetcher, heartbeater, worker, or deployment seal. Runtime
+roles verify the lineage only; the Helm migration job remains the sole DDL
+owner. Local and controller SQLite never initialize or emulate this lineage.
+
+M3-S3 cannot add the remaining tables until a dedicated exact-DDL review fixes
+their table and column types, closed values and legal row shapes, generic
+versus volume-specific identity model, immutable binding persistence,
+process-capability ownership, request-correlation cardinality, action-level
+versus effect-level evidence ownership, canonical payload byte storage,
+cross-live-and-tombstone business-key exclusion, tombstone-before-compaction
+enforcement, ordinal effect tombstones, retention indexes, and restricted
+borrowed-transaction facade. No raw provider callback may receive a connection
+on which it can commit, close, or begin a nested transaction.
 
 ## Cleanup Contract
 
@@ -4752,14 +4818,21 @@ rollback, and cleanup on the exact image digest.
   desired-generation fencing exists;
 - land M3-S1 as the exact legacy mutation transcript and four-file
   characterization corpus, with no production behavior change;
-- in M3-S2, add only the reviewed dark central-PostgreSQL singleton, sidecar,
-  legacy-intent, action, attempt, effect, evidence, compatibility-adapter, and
-  identity-tombstone schema, with no domain rows and producer and worker
+- in M3-S2, add only the reviewed dark PostgreSQL-only store-identity and
+  scoped-ownership lineage, with its two inert seed rows and no producer,
+  worker, process-capability row, domain table, or routing change;
+- in M3-S3, after its own exact-DDL adversarial review, add the sidecar,
+  process-capability, binding, legacy-intent, action, request-correlation,
+  attempt, effect, evidence, compatibility-adapter, identity-anchor, and
+  identity-tombstone graph with no domain rows and every producer and worker
   disabled;
 - in separately reviewed later slices, add the disabled action kernel and
-  volume reducer, then shadow admission, then enable new action-owned PVC
-  create, then UID-scoped delete, and only then replace force purge with the
-  durable detach and cleanup acknowledgement;
+  volume reducer, then the Release N compatibility reader, reconciler, and
+  legacy-intent producer, then shadow admission, then implement and qualify
+  create plus UID-scoped delete, readback, replacement, and cleanup while both
+  remain disabled, then enable that dependency-closed owned-PVC lifecycle as
+  one scope, and only then replace force purge with the durable detach and
+  cleanup acknowledgement;
 - add volume desired generation, incarnation, tombstone, observation, and
   deletion proof through the sidecar before either mutation is promoted;
 - add the negotiated V2 action-event wire and emit the volume lifecycle
@@ -5224,15 +5297,22 @@ identity evidence.
 - Mutation ownership switches behind a server-side gate and can return to the
   old writer only before the new writer performs an irreversible action.
 - Ownership epochs are independent rows keyed by domain, dependency-closed
-  operation subset, and store mode. M3 can therefore cut over only central
-  PostgreSQL volume operations without changing cluster, Serve, jobs, image,
-  or SQLite ownership. A later milestone repeats the same protocol for its own
-  scope.
-- Release N expands the schema for the selected scope and ships a compatibility
-  reader and reconciler with that scope's gate disabled. Every API, controller,
-  executor, or worker role capable of executing that scope must run N or later
-  and pass mixed-version qualification before release N+1 may enable its
-  writer.
+  operation subset, and store mode, with routing closed to `DARK`,
+  `LEGACY_OPEN`, `DRAINING`, or `ACTION_OPEN`. M3 can therefore cut over only
+  `(VOLUME, KUBERNETES_PVC_OWNED_LIFECYCLE_V1, CENTRAL_POSTGRESQL)` without
+  changing cluster, Serve, jobs, image, or SQLite ownership. A later milestone
+  repeats the same protocol for its own scope.
+- M3-S2 is an earlier pure dark expansion, not Release N. It leaves the pilot
+  scope at `DARK`, has no process-capability or legacy-intent table, and makes
+  no current handler consult the scope or writer-authority seal.
+- Release N later ships a compatibility reader, reconciler, and legacy-intent
+  producer against the already-expanded M3-S3 schema while the selected scope
+  is still `DARK`. Every API, controller, executor, or worker role capable of
+  executing that scope must run N or later and pass mixed-version
+  qualification. One guarded transaction may then bind the external
+  writer-authority seal, increment the epoch, and move only that scope to
+  `LEGACY_OPEN`. Release N+1 cannot enable the action writer before that
+  transition and its qualification window complete.
 - Release N also makes every legacy mutation admission in the selected scope
   lock and check that scope's database ownership epoch and persist an active
   legacy intent before external I/O. The intent contains its resource
@@ -5821,3 +5901,37 @@ proved zero-submission effect returns to `PRE_INTENT`; ambiguous work resumes
 through `READBACK`. Independent source review returned `PASS` against exact
 base `3f4f73b3abeb3943abb0af601df05ff570010122`, and an independent adversarial
 review also returned `PURSUE`.
+
+### Review 20
+
+Verdict: `PURSUE` for the corrected M3-S1 contract at exact
+heading-through-before-Cleanup SHA-256
+`61995e1f7bf3e1cf97f44747c1938adcd9f86e08ac5d6f1df0541e5c445e4a9e`.
+This verdict supersedes Review 19 for implementation scope while preserving it
+as the history of the earlier review.
+
+A pre-merge M3-S2 DDL audit returned `RESHAPE`. It found that the earlier text
+mixed a pure dark expansion with Release N legacy interception, described
+activation as both global and scope-keyed, allowed compactable effect evidence
+to own the only live PVC UID, did not fence an ordinary database clone with
+authority outside the backup, and attempted to assign the full action graph to
+M3-S2 before its exact relational model was reviewed. A separate milestone
+review also rejected enabling create authority before its dependency-closed
+UID-scoped delete and cleanup path was qualified.
+
+The corrected contract retains live provider identity on the durable sidecar,
+uses an external writer-authority seal plus a scope-keyed ownership epoch,
+defines `DARK`, separates M3-S2 from Release N, and narrows M3-S2 to exactly two
+PostgreSQL-only lifecycle data tables and two inert seed rows. The full graph,
+process capabilities, immutable bindings, payload bytes, correlations,
+evidence cardinality, identity anchors, per-effect tombstones, and restricted
+transaction facade move behind M3-S3's dedicated exact-DDL review. Create and
+UID-scoped delete, readback, replacement, and cleanup must be implemented and
+qualified while disabled, then enabled together as one dependency-closed
+owned-PVC lifecycle scope.
+
+Independent review against base
+`26a52a759304d3ff085920d0f6298cd78089e8fc` returned `PASS`. The dstack-boundary
+review and the PostgreSQL schema adversarial review independently returned
+`PURSUE` on the exact corrected digest. The characterization corpus remains
+unchanged and passing.
