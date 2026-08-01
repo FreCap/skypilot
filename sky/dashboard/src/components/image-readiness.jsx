@@ -1,8 +1,9 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Copy, RefreshCw, ShieldCheck } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { StatusBadge } from '@/components/elements/StatusBadge';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import {
   Table,
   TableBody,
@@ -15,6 +16,8 @@ import {
   CanaryProfileDialog,
   QualifyProfileDialog,
 } from '@/components/image-action-dialogs';
+
+const READINESS_CLOCK_REFRESH_MS = 5000;
 
 function duration(seconds) {
   if (seconds === null || seconds === undefined) return 'Unknown';
@@ -99,13 +102,9 @@ export function ImageReadiness({
   const [qualifyOpen, setQualifyOpen] = useState(false);
   const [canaryOpen, setCanaryOpen] = useState(false);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
-  useEffect(() => {
-    const timer = setInterval(
-      () => setNow(Math.floor(Date.now() / 1000)),
-      5000
-    );
-    return () => clearInterval(timer);
-  }, []);
+  useVisibleRefreshInterval(true, READINESS_CLOCK_REFRESH_MS, () => {
+    setNow(Math.floor(Date.now() / 1000));
+  });
   const snapshotAge = readiness?.generated_at
     ? Math.max(0, now - readiness.generated_at)
     : null;

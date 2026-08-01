@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { Profiler } from 'react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 
 import { ImageReadiness } from '@/components/image-readiness';
 
@@ -15,6 +16,13 @@ const capabilities = {
     },
   ],
 };
+
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
 
 const readiness = {
   workspace: 'research',
@@ -538,6 +546,91 @@ describe('Image readiness', () => {
       ).toBeDefined();
     } finally {
       dateNow.mockRestore();
+    }
+  });
+
+  it('pauses hidden clock renders and refreshes once on visibility restore', () => {
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const commits = [];
+    jest.useFakeTimers();
+    jest.setSystemTime(10_000_000);
+    const dateNow = jest.spyOn(Date, 'now');
+    setDocumentVisibility('hidden');
+
+    const view = render(
+      <Profiler
+        id="image-readiness"
+        onRender={(id, phase) => commits.push(phase)}
+      >
+        <ImageReadiness
+          readiness={readiness}
+          capabilities={capabilities}
+          loading={false}
+          error={null}
+          onRefresh={jest.fn()}
+        />
+      </Profiler>
+    );
+
+    try {
+      expect(commits).toEqual(['mount']);
+      const clockReadsAfterMount = dateNow.mock.calls.length;
+      for (let tick = 0; tick < 5; tick += 1) {
+        act(() => jest.advanceTimersByTime(5000));
+      }
+      act(() => jest.advanceTimersByTime(4999));
+      expect(commits).toEqual(['mount']);
+      expect(dateNow).toHaveBeenCalledTimes(clockReadsAfterMount);
+
+      setDocumentVisibility('visible');
+      act(() => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+      });
+      expect(commits).toEqual(['mount', 'update']);
+      expect(
+        screen
+          .getAllByText('34s ago')
+          .find((element) => element.classList.contains('text-amber-700'))
+      ).toBeDefined();
+
+      act(() => jest.advanceTimersByTime(1));
+      expect(commits).toEqual(['mount', 'update']);
+
+      act(() => jest.advanceTimersByTime(5000));
+      expect(commits).toEqual(['mount', 'update', 'update']);
+      expect(
+        screen
+          .getAllByText('40s ago')
+          .find((element) => element.classList.contains('text-amber-700'))
+      ).toBeDefined();
+
+      view.unmount();
+      const clockReadsAfterUnmount = dateNow.mock.calls.length;
+      setDocumentVisibility('hidden');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      setDocumentVisibility('visible');
+      act(() => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        jest.advanceTimersByTime(10_000);
+      });
+      expect(commits).toEqual(['mount', 'update', 'update']);
+      expect(dateNow).toHaveBeenCalledTimes(clockReadsAfterUnmount);
+    } finally {
+      view.unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      dateNow.mockRestore();
+      jest.useRealTimers();
     }
   });
 });
