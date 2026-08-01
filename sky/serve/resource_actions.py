@@ -1801,6 +1801,50 @@ class ServeReplicaActionOutcomeV1(_CanonicalContract):
             'normalized_message': self.normalized_message,
         }
 
+    def validate_for_invocation(
+            self, invocation: ProviderLifecycleInvocationV1) -> None:
+        """Require action-specific evidence before accepting this outcome.
+
+        Provider submission acknowledgement is not proof that a resource
+        reached its requested lifecycle state.  A successful launch therefore
+        requires an authoritative, identity-matched, ready observation; a
+        successful down requires authoritative absence.  Non-success outcomes
+        retain their closed retry/error semantics, but any attached observation
+        must still belong to the invocation's frozen target.
+        """
+
+        if not isinstance(invocation, ProviderLifecycleInvocationV1):
+            raise TypeError('invocation has an invalid type.')
+        if self.observation is not None:
+            self.observation.validate_target(invocation.requested_target)
+        if self.disposition is not ServeActionDisposition.SUCCEEDED:
+            return
+        if self.certainty is not ServeActionCertainty.OBSERVED:
+            raise ValueError('succeeded outcome requires observed certainty; '
+                             'provider acknowledgement is not success proof.')
+        observation = self.observation
+        if observation is None:
+            raise ValueError('succeeded outcome requires an observation.')
+        if invocation.action_kind is kernel_actions.ActionKind.LAUNCH:
+            if observation.state is not ProviderObservationState.PRESENT:
+                raise ValueError('succeeded launch requires a PRESENT '
+                                 'observation.')
+            if (observation.certainty
+                    is not ProviderObservationCertainty.AUTHORITATIVE):
+                raise ValueError('succeeded launch requires an authoritative '
+                                 'observation.')
+            if observation.ready is not True:
+                raise ValueError('succeeded launch requires ready=True.')
+            if observation.resolved_target is None:
+                raise ValueError('succeeded launch requires a resolved target.')
+            return
+        if observation.state is not ProviderObservationState.ABSENT:
+            raise ValueError('succeeded down requires an ABSENT observation.')
+        if (observation.certainty
+                is not ProviderObservationCertainty.AUTHORITATIVE):
+            raise ValueError('succeeded down requires an authoritative '
+                             'observation.')
+
 
 @dataclasses.dataclass(frozen=True)
 class ServeShadowProjectionV1(_CanonicalContract):

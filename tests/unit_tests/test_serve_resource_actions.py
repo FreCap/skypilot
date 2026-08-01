@@ -214,6 +214,41 @@ def _observation() -> dict:
     }
 
 
+def _absent_observation() -> dict:
+    observation = _observation()
+    observation.update({
+        'state': 'absent',
+        'certainty': 'authoritative',
+        'observed_provider_operation_id': None,
+        'observed_provider_resource_id': None,
+        'observed_cluster_record_uuid': None,
+        'observed_workload_uid': None,
+        'observed_replica_incarnation_label': None,
+        'resolved_target': None,
+        'ready': None,
+    })
+    return observation
+
+
+def _outcome(*,
+             disposition: str = 'succeeded',
+             certainty: str = 'observed',
+             observation: dict | None = None) -> dict:
+    retryable = disposition in ('retryable', 'uncertain')
+    return {
+        'disposition': disposition,
+        'certainty': certainty,
+        'provider_operation_id': None,
+        'provider_code': None,
+        'retry_class':
+            ('observation_required' if disposition == 'uncertain' else
+             ('transient' if retryable else None)),
+        'retry_after_seconds': (1 if retryable else None),
+        'observation': observation,
+        'normalized_message': None,
+    }
+
+
 def test_launch_invocation_literal_golden_bytes_hash_and_action_id() -> None:
     invocation = actions.ProviderLifecycleInvocationV1.from_value(
         _launch_invocation())
@@ -740,6 +775,134 @@ def test_outcome_projection_and_retry_contract_combinations() -> None:
             'delay_seconds': 1,
             'logical_attempt': 1,
         })
+
+
+def test_succeeded_launch_outcome_requires_observed_ready_present_proof(
+) -> None:
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _launch_invocation())
+    outcome = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(observation=_observation()))
+
+    outcome.validate_for_invocation(invocation)
+
+
+def test_succeeded_down_and_launch_cleanup_require_observed_absence() -> None:
+    outcome = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(observation=_absent_observation()))
+    primary_down = actions.ProviderLifecycleInvocationV1.from_value(
+        _down_invocation())
+    cleanup_down = actions.ServeReplicaActionSpecV1.from_value(
+        _launch_spec()).launch_cleanup_down_invocation()
+
+    outcome.validate_for_invocation(primary_down)
+    outcome.validate_for_invocation(cleanup_down)
+
+
+def test_succeeded_outcome_rejects_missing_or_acknowledged_proof() -> None:
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _launch_invocation())
+    missing = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(observation=None))
+    acknowledged = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(certainty='provider_acknowledged', observation=None))
+
+    with pytest.raises(ValueError, match='requires an observation'):
+        missing.validate_for_invocation(invocation)
+    with pytest.raises(ValueError,
+                       match='acknowledgement is not success proof'):
+        acknowledged.validate_for_invocation(invocation)
+
+
+def test_non_success_outcomes_accept_only_matching_optional_observation(
+) -> None:
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _launch_invocation())
+    retryable = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(disposition='retryable',
+                 certainty='unknown',
+                 observation=_observation()))
+    terminal = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(disposition='terminal_error',
+                 certainty='unknown',
+                 observation=None))
+
+    retryable.validate_for_invocation(invocation)
+    terminal.validate_for_invocation(invocation)
+
+
+@pytest.mark.parametrize(('observation_update', 'message'), [
+    ({
+        'certainty': 'eventually_consistent'
+    }, 'authoritative'),
+    ({
+        'ready': False
+    }, 'ready=True'),
+    ({
+        'state': 'absent',
+        'ready': None,
+        'resolved_target': None,
+        'observed_provider_operation_id': None,
+        'observed_provider_resource_id': None,
+        'observed_cluster_record_uuid': None,
+        'observed_workload_uid': None,
+        'observed_replica_incarnation_label': None,
+    }, 'PRESENT'),
+])
+def test_succeeded_launch_rejects_incomplete_or_wrong_observation(
+        observation_update: dict, message: str) -> None:
+    observation = _observation()
+    observation.update(observation_update)
+    outcome = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(observation=observation))
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _launch_invocation())
+
+    with pytest.raises(ValueError, match=message):
+        outcome.validate_for_invocation(invocation)
+
+
+@pytest.mark.parametrize(('observation_update', 'message'), [
+    ({
+        'certainty': 'eventually_consistent'
+    }, 'authoritative'),
+    (_observation(), 'ABSENT'),
+])
+def test_succeeded_down_rejects_eventual_or_present_observation(
+        observation_update: dict, message: str) -> None:
+    observation = _absent_observation()
+    observation.update(observation_update)
+    outcome = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(observation=observation))
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _down_invocation())
+
+    with pytest.raises(ValueError, match=message):
+        outcome.validate_for_invocation(invocation)
+
+
+def test_outcome_proof_rejects_wrong_target_and_invocation_type() -> None:
+    wrong_target = _target()
+    wrong_target['sky_cluster_name'] = 'another-cluster'
+    wrong_target['kubernetes']['workload_name'] = 'another-cluster'
+    wrong_target_hash = actions.ProviderLocatorV1.from_value(
+        wrong_target).sha256
+    observation = _observation()
+    observation['target_sha256'] = wrong_target_hash
+    observation['resolved_target'][
+        'requested_target_sha256'] = wrong_target_hash
+    outcome = actions.ServeReplicaActionOutcomeV1.from_value(
+        _outcome(disposition='retryable',
+                 certainty='unknown',
+                 observation=observation))
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _launch_invocation())
+
+    with pytest.raises(ValueError, match='does not match requested target'):
+        outcome.validate_for_invocation(invocation)
+    with pytest.raises(TypeError, match='invocation has an invalid type'):
+        outcome.validate_for_invocation(  # type: ignore[arg-type]
+            _launch_invocation())
 
 
 def test_shadow_state_role_eligibility_parity_and_divergence_vocabularies(
