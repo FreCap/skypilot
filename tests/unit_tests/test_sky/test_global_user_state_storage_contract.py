@@ -1,6 +1,7 @@
 """Characterize the global-user-state storage repository facade."""
 
 import inspect
+import typing
 from unittest import mock
 
 import pytest
@@ -25,9 +26,6 @@ _PUBLIC_SIGNATURES = {
         ('(storage_name: str) -> sky.utils.status_lib.StorageStatus | None'),
     'set_storage_handle':
         ("(storage_name: str, handle: 'Storage.StorageMetadata') -> None"),
-    'get_handle_from_storage_name':
-        ("(storage_name: str | None) -> Optional[ForwardRef('Storage."
-         "StorageMetadata')]"),
     'get_glob_storage_name': '(storage_name: str) -> list[str]',
     'get_storage_names_start_with': '(starts_with: str) -> list[str]',
     'get_storage': '() -> list[dict[str, typing.Any]]',
@@ -78,6 +76,24 @@ def test_public_surface_and_decorator_contract():
         assert function.__module__ == 'sky.global_user_state'
         assert function.__qualname__ == name
         assert _wrapper_depth(function) == 1
+
+    function = global_user_state.get_handle_from_storage_name
+    signature = inspect.signature(function)
+    assert list(signature.parameters) == ['storage_name']
+    assert set(typing.get_args(
+        signature.parameters['storage_name'].annotation)) == {str,
+                                                              type(None)}
+    return_types = typing.get_args(signature.return_annotation)
+    assert type(None) in return_types
+    forward_refs = [
+        annotation for annotation in return_types
+        if isinstance(annotation, typing.ForwardRef)
+    ]
+    assert len(forward_refs) == 1
+    assert forward_refs[0].__forward_arg__ == 'Storage.StorageMetadata'
+    assert function.__module__ == 'sky.global_user_state'
+    assert function.__qualname__ == 'get_handle_from_storage_name'
+    assert _wrapper_depth(function) == 1
 
 
 def test_sqlite_lifecycle_preserves_payloads_projection_and_operation_counts(
