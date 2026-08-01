@@ -6,8 +6,10 @@ typed shadow-store and Serve033 coverage/promotion foundations plus the generic
 API006 progress substrate are implemented and locally verified; the
 candidate-only normalization boundary and atomic durable coverage handshake are
 in progress; the closed Kubernetes transport/scope leaf is implemented and
-independently verified, while execution-config closure, runtime provider
-propagation, observation, and shadow instrumentation remain pending
+independently verified; topology/image/config-policy/principal/authorization
+foundation leaves are implemented and locally verified; full execution-config
+composition, prerequisite/resource/renderer/object-plan leaves, runtime
+provider propagation, observation, and shadow instrumentation remain pending
 
 Last updated: 2026-08-01
 
@@ -592,10 +594,45 @@ head_service:     /spec/clusterIP, /spec/clusterIPs, /spec/ipFamilies,
 head_pod:         /spec/nodeName                           (scheduler)
 ```
 
+The pure allocation leaf dispatches only on its pointer and validates no
+cross-allocation state. The four Service pointers require the `api_server`
+allocator: `clusterIP` is either canonical IPv4/IPv6 text or the literal
+`None`; `clusterIPs` is a one-element array containing one canonical IP or
+`None`; `ipFamilies` is exactly `IPv4` or `IPv6` in a one-element array; and
+`ipFamilyPolicy` is exactly `SingleStack`. Canonical IP text is ASCII without a
+zone identifier and must satisfy
+`str(ipaddress.ip_address(value)) == value` under the checked-in helper; the
+parsed `version` determines `IPv4` versus `IPv6`. `/spec/nodeName` requires the
+`scheduler` allocator and a 1..253-byte canonical Kubernetes DNS-subdomain
+name: split on `.`, require each 1..63-byte segment to match
+`[a-z0-9](?:[a-z0-9-]*[a-z0-9])?`, and require the complete ASCII value to be
+at most 253 bytes. No other pointer, allocator, scalar, empty value, or list
+length is valid.
+
+`ProviderKubernetesResolvedObjectV1`,
+`ProviderKubernetesCleanupObjectV1`, and
+`ProviderKubernetesObjectEvidenceV1`, rather than the allocation leaf, enforce
+the role tuple. Each Service commits all four values atomically in the
+displayed pointer order. `head_ssh_service` requires a non-`None` IP whose
+address family equals its sole `ipFamilies` member and whose singleton
+`clusterIPs` member is byte-equal. `head_service` requires
+`clusterIP="None"`, `clusterIPs=["None"]`, and one server-selected family.
+The first renderer never requests dual stack, so a default other than
+`SingleStack` is not representable. The Pod has either no allocation while it
+is not yet scheduled or exactly the one `nodeName` allocation; a committed
+name never changes. A cleanup object with `committed_uid=null` has no
+allocations. A non-`present` object-evidence read has no allocations; a
+`present` read uses the role-valid form above. A completed-launch cleanup target
+and an exact resolved target require every role's complete allocation form,
+including Pod `nodeName`; partial progress/cleanup may retain an unscheduled
+Pod's empty form. These enclosing validators also enforce immutability and
+prevent a partial Service quartet.
+
 The requested Pod body must omit `spec.nodeName`; an input that sets it is not
 representable. Allocation arrays follow the table exactly. UID and semantic
-hash commitments are write-once, while an allowed allocation may be appended
-once after UID commitment; it can never be removed or changed.
+hash commitments are write-once, while the complete allowed allocation tuple
+may be appended once after UID commitment; it can never be removed, partially
+committed, or changed.
 
 `request_body` is the exact nonsecret CoreV1 body sent by the session and is
 bounded together with the complete action spec to 65,536 canonical UTF-8
@@ -604,6 +641,32 @@ replica ID, any Secret/config-map reference, projected token, credential,
 private key, raw user YAML, or unbounded field. Both body and requested semantic
 preimages are embedded next to their hashes; the implementation does not rely
 on a hash-only private interpretation.
+
+An object-plan leaf independently enforces sequence/role/kind against
+`ProviderKubernetesObjectRoleMapV1`, `api_version="v1"`, Kubernetes DNS-label
+syntax for its generated name, and exactly the three sorted
+`required_identity_labels` keys `skypilot-cluster-name`,
+`skypilot.co/cluster-record-uuid`, and
+`skypilot.co/serve-replica-incarnation`. The two identity values are canonical
+UUIDs. The display-label value is derived from `plan.name` under the exact role
+mapping: `head_ssh_service` requires and removes terminal `-head-ssh`, while
+`head_service` and `head_pod` require and remove terminal `-head`. It recomputes
+both body/preimage hashes and requires `request_body.apiVersion`, `kind`, and
+`metadata.{namespace,name}` to equal the plan. The body `metadata.labels` is a
+canonical object containing at least the three required key/value pairs.
+
+The leaf validates `requested_semantic` as bounded canonical JSON and its hash,
+but cannot claim to execute an artifact by hash. Preflight construction and the
+execution session each resolve and hash/size-check `normalization_profile`, run
+that exact normalizer over `request_body`, and require the resulting canonical
+bytes to equal `requested_semantic.canonical_bytes`; neither operand is
+reconstructed from a hash. The enclosing capsule requires exactly three plans
+in role order, names equal to its workload-name basis/topology, every role's
+complete body label map equal to that topology entry, and every plan's
+`normalization_profile` byte-equal to
+`renderer.admitted_object_normalization`. The Pod body omits `spec.nodeName`;
+the two Service body shapes and headless request are checked by the pinned
+renderer/normalizer contract.
 
 `kubernetes_admitted_object_v1` is implemented by the checked-in, pinned
 `normalization_profile`. It removes only `status`, the enumerated server-owned
@@ -1874,6 +1937,28 @@ DecimalPortText = canonical ASCII decimal text matching
   integer port inside `ProviderKubernetesServerOriginV1` is a separate
   transport-decomposition field and is not silently coerced through this type.
 
+CanonicalPositiveDecimalText = canonical ASCII text matching
+  `(?:[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]{0,2}[1-9])`, whose exact decimal
+  value is greater than zero and at most 9223372036854775807. The integer part
+  is always present; leading integer zeroes, a decimal point without a
+  fraction, trailing fractional zeroes, more than three fractional digits,
+  signs, whitespace, exponent, unit suffix, and every zero spelling are
+  invalid. Thus `1`, `0.5`, `0.001`, and `1.23` are canonical, while `01`,
+  `.5`, `1.0`, `1.230`, and `0.000` are not.
+
+CanonicalJsonValue and CanonicalJsonObject use the existing NFC canonical JSON
+domain but add mandatory pre-serialization bounds. An object variant has a JSON
+object root. Each string/key is 1..1,024 UTF-8 bytes, every integer fits signed
+64-bit, floats and reference cycles are forbidden, and each object/list has at
+most 256 members. Container depth is at most 16 with a root container counted
+as depth one, and the aggregate sum of object members plus list elements is at
+most 4,096. Each standalone canonical value and the enclosing typed object are
+at most 65,536 canonical UTF-8 bytes. Validation is iterative and applies these
+bounds before calling the generic recursive serializer; arrays preserve order
+and objects use the canonical key ordering. Empty strings, mappings with
+nontext/duplicate-after-NFC keys, noncanonical text, tuples masquerading as
+parsed JSON arrays, and any value outside this domain are invalid.
+
 DigestPinnedOCIReference = canonical secret-free OCI reference accepted
   byte-for-byte by `sky.container_images.models.validate_oci_reference`, with
   one terminal `@sha256:` plus 64 lowercase hexadecimal characters. Its parsed
@@ -2140,13 +2225,14 @@ ProviderKubernetesPrerequisiteV1 = {
   name: Text,
   uid: Text,
   resource_version: Text,
+  deletion_timestamp: null,
   spec: ProviderKubernetesPrerequisiteSpecV1,
   spec_sha256: Sha256
 }
 
 ProviderKubernetesPrerequisiteSpecV1 = one of:
   {kind: "Namespace", labels: [{key: Text, value: Text}],
-   annotations: [ProviderAnnotationV1], deletion_timestamp: null}
+   annotations: [ProviderAnnotationV1]}
   {kind: "ServiceAccount",
    projection: ProviderKubernetesServiceAccountProjectionV1}
   {kind: "NetworkPolicy", contract: "serve_action_network_policy_v1",
@@ -2157,6 +2243,17 @@ ProviderKubernetesPrerequisiteSpecV1 = one of:
   {kind: "ValidatingAdmissionPolicyBinding",
    contract: "serve_action_validating_binding_v1",
    manifest: ProviderRepoArtifactRefV1}
+
+ProviderKubernetesPrerequisiteKindMapV1 = {
+  "Namespace": {api_version: "v1", scope: "cluster"},
+  "ServiceAccount": {api_version: "v1", scope: "namespaced"},
+  "NetworkPolicy":
+      {api_version: "networking.k8s.io/v1", scope: "namespaced"},
+  "ValidatingAdmissionPolicy":
+      {api_version: "admissionregistration.k8s.io/v1", scope: "cluster"},
+  "ValidatingAdmissionPolicyBinding":
+      {api_version: "admissionregistration.k8s.io/v1", scope: "cluster"}
+}
 
 ProviderKubernetesResourceContractV1 = {
   source_cpus: CanonicalPositiveDecimalText,
@@ -2486,6 +2583,73 @@ ProviderLifecycleExecutionCapsuleV1 =
 ProviderLifecyclePolicyBoundaryProofV1 =
   ProviderPolicyBoundaryProofV1 | ProviderDownPolicyBoundaryProofV1
 ```
+
+Every prerequisite leaf dispatches through
+`ProviderKubernetesPrerequisiteKindMapV1`: its outer and spec `kind` are equal,
+its API version is the displayed literal, cluster-scoped kinds require
+`namespace=null`, and namespaced kinds require a nonnull namespace. The stored
+`spec_sha256` is recomputed from `canonical_sha256(spec.canonical_value())`.
+All prerequisite kinds carry top-level `deletion_timestamp=null`; a deleting
+live object is not representable before or after effects.
+
+For a ServiceAccount, outer namespace/name/UID/resourceVersion are byte-equal
+to its embedded projection. For Namespace, its live metadata name/UID/
+resourceVersion populate the outer record and its sorted labels/annotations
+populate the spec.
+
+The manifest-backed contract-to-normalizer map is literal:
+`serve_action_network_policy_v1` uses
+`serve_action_network_policy_live_projection_v1`,
+`serve_action_validating_policy_v1` uses
+`serve_action_validating_policy_live_projection_v1`, and
+`serve_action_validating_binding_v1` uses
+`serve_action_validating_binding_live_projection_v1`. These checked-in
+normalizers are separate callable-inventory roles even though they share the
+following v1 transform. Each requires an object root, removes exactly top-level
+`status` and metadata `uid`, `resourceVersion`, `generation`,
+`creationTimestamp`, `deletionTimestamp`, and `managedFields`, and preserves
+every other key and array order. It inserts only a canonical
+`metadata.namespace`: absent or JSON null becomes null for a cluster-scoped
+kind, while a namespaced kind requires and preserves the exact nonnull outer
+namespace. An empty-string namespace is invalid. The expected artifact must
+omit the removed server-owned fields and `status`; every retained API default
+must therefore be explicit in that artifact or comparison fails.
+
+Preflight and the execution session each load and hash/size-check the referenced
+artifact, then exact-read the named live object. Before normalization, both
+require the artifact and live object API version, kind, normalized namespace,
+and name to equal the outer record; the live UID and resourceVersion must be
+byte-equal to the outer values, and live `metadata.deletionTimestamp` must be
+absent or null. They then require the canonical bytes of
+`contract_normalize(artifact)` to equal the canonical bytes of
+`contract_normalize(live_object)`. The pure prerequisite
+leaf validates the spec hash, kind/version/scope dispatch, internal identity,
+null deletion timestamp, and content-addressed reference only; it does not read
+an artifact or claim the live proof.
+
+`ProviderKubernetesRendererV1` validates only its fixed `contract`, five typed
+artifact references, and the shape of its typed launch source; it performs no
+cross-field or artifact-content comparison. The inventory-role map is exact:
+`outer_template -> renderer.outer_template`,
+`node_fragment -> renderer.node_fragment`,
+`binding_schema -> renderer.binding_schema`,
+`config_access_inventory -> renderer.config_access_inventory`, and
+`admitted_object_normalization -> renderer.admitted_object_normalization`.
+The expected cohort manifest and preflight bind each complete reference to the
+corresponding distinct role/path/size/hash in the approved artifact inventory;
+the references are not interchangeable merely because each is structurally
+valid. The execution session resolves and revalidates those same bindings and
+applies the template/schema/config-access/normalization artifact according to
+its named role.
+
+The launch capsule owns only comparisons available inside it:
+`renderer.source == post_provision.job_submission.run_source`, complete
+byte-equality of renderer/config-projection `config_access_inventory`, and
+complete byte-equality of every object-plan `normalization_profile` with
+`renderer.admitted_object_normalization`. Enclosing execution-config/spec
+admission requires both capsule source copies to equal `policy_subject.source`
+and the launch invocation `source`. Preflight and the execution session own the
+inventory binding and artifact execution checks above.
 
 Every null, empty collection, and literal in
 `ProviderKubernetesExecutionConfigV1` is semantic; execution may not replace it
