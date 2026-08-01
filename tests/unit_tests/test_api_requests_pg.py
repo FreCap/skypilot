@@ -14,6 +14,7 @@ import time
 from unittest import mock
 import uuid
 
+from alembic import command as alembic_command
 import pytest
 import sqlalchemy
 from sqlalchemy.ext import asyncio as sqlalchemy_async
@@ -42,27 +43,64 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 from sky.volumes.server import core as volume_core
 
-testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
+_POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
+testcontainers_postgres = None
+if _POSTGRES_URL is None:
+    testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
 pytest.importorskip('psycopg2')
 
 pytestmark = pytest.mark.skipif(
-    shutil.which('docker') is None,
+    _POSTGRES_URL is None and shutil.which('docker') is None,
     reason='docker unavailable; skipping durable request PostgreSQL tests')
 
 
 @pytest.fixture(scope='module')
 def postgres_engine():
-    container = testcontainers_postgres.PostgresContainer('postgres:16')
-    try:
-        container.start()
-    except Exception as e:  # pylint: disable=broad-except
-        pytest.skip(f'could not start postgres container: {e}')
-    engine = sqlalchemy.create_engine(container.get_connection_url())
+    container = None
+    admin_engine = None
+    temporary_database = None
+    if _POSTGRES_URL is None:
+        assert testcontainers_postgres is not None
+        container = testcontainers_postgres.PostgresContainer('postgres:16')
+        try:
+            container.start()
+        except Exception as e:  # pylint: disable=broad-except
+            pytest.skip(f'could not start postgres container: {e}')
+        postgres_url = container.get_connection_url()
+    else:
+        temporary_database = f'skypilot_actions_test_{uuid.uuid4().hex}'
+        admin_engine = sqlalchemy.create_engine(_POSTGRES_URL,
+                                                isolation_level='AUTOCOMMIT')
+        quoted_database = admin_engine.dialect.identifier_preparer.quote(
+            temporary_database)
+        try:
+            with admin_engine.connect() as connection:
+                connection.exec_driver_sql(f'CREATE DATABASE {quoted_database}')
+        except Exception as e:  # pylint: disable=broad-except
+            admin_engine.dispose()
+            pytest.skip(f'could not create temporary postgres database: {e}')
+        postgres_url = sqlalchemy.engine.make_url(_POSTGRES_URL).set(
+            database=temporary_database).render_as_string(hide_password=False)
+    engine = sqlalchemy.create_engine(postgres_url)
     try:
         yield engine
     finally:
         engine.dispose()
-        container.stop()
+        if temporary_database is not None:
+            assert admin_engine is not None
+            quoted_database = admin_engine.dialect.identifier_preparer.quote(
+                temporary_database)
+            with admin_engine.connect() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        'SELECT pg_terminate_backend(pid) '
+                        'FROM pg_stat_activity '
+                        'WHERE datname = :database AND pid <> pg_backend_pid()'
+                    ), {'database': temporary_database})
+                connection.exec_driver_sql(f'DROP DATABASE {quoted_database}')
+            admin_engine.dispose()
+        elif container is not None:
+            container.stop()
 
 
 @pytest.fixture
@@ -71,9 +109,8 @@ def request_database(postgres_engine, monkeypatch):
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
     request_postgres._initialize_schema(postgres_engine)
-    async_url = postgres_engine.url.render_as_string(
-        hide_password=False).replace('postgresql+psycopg2',
-                                     'postgresql+asyncpg')
+    async_url = postgres_engine.url.set(
+        drivername='postgresql+asyncpg').render_as_string(hide_password=False)
     async_engine = sqlalchemy_async.create_async_engine(
         async_url, poolclass=sqlalchemy.NullPool)
     monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine',
@@ -203,21 +240,154 @@ def _claim(backend: request_postgres.PostgresRequestBackend,
     return item
 
 
+def _action_values(action_id: uuid.UUID,
+                   *,
+                   resource_identity: str = 'service:replica:1',
+                   generation: int = 1) -> dict[str, object]:
+    return {
+        'action_id': action_id,
+        'domain': 'serve',
+        'resource_type': 'replica',
+        'resource_identity': resource_identity,
+        'desired_generation': generation,
+        'action_type': 'launch',
+        'immutable_spec': {
+            'version': 1,
+            'resource_identity': resource_identity,
+        },
+        'immutable_spec_sha256': 'a' * 64,
+        'kernel_state': 'READY',
+        'current_attempt': 0,
+        'next_attempt_at': sqlalchemy.func.clock_timestamp(),
+    }
+
+
+def _attempt_values(action_id: uuid.UUID, attempt: int,
+                    request_id: str) -> dict[str, object]:
+    return {
+        'action_id': action_id,
+        'attempt': attempt,
+        'request_id': request_id,
+        'request_input_sha256': 'b' * 64,
+        'mutation_boundary': 'NOT_STARTED',
+    }
+
+
+def _normalized_index_predicate(index: dict[str, object]) -> str:
+    dialect_options = index['dialect_options']
+    assert isinstance(dialect_options, dict)
+    predicate = dialect_options['postgresql_where']
+    return ''.join(str(predicate).replace('::text', '').split()).replace(
+        '(', '').replace(')', '')
+
+
+def test_api005_upgrade_preserves_ordinary_api004_rows(postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '004',
+                                         mode='upgrade')
+
+    request = _request('pre-api005')
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.REQUESTS).values(
+                **request_postgres._request_values_for_db(request)))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.QUEUE).values(
+                **request_postgres._queue_values(request)))
+
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '005',
+                                         mode='upgrade')
+    with postgres_engine.connect() as connection:
+        stored = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id)).mappings().one()
+        queue_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.QUEUE).where(
+                                 request_postgres.QUEUE.c.request_id ==
+                                 request.request_id)).scalar_one()
+    assert stored['status'] == requests.RequestStatus.PENDING.value
+    assert stored['resource_action_id'] is None
+    assert stored['resource_action_attempt'] is None
+    assert queue_count == 1
+
+
+def test_ordinary_request_lifecycle_does_not_create_actions(request_database):
+    engine, backend = request_database
+    request_id = str(uuid.uuid4())
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+
+    with engine.connect() as connection:
+        stored = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+        action_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(request_postgres.RESOURCE_ACTIONS)).scalar_one()
+        attempt_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS)).scalar_one()
+    assert stored['resource_action_id'] is None
+    assert stored['resource_action_attempt'] is None
+    assert action_count == 0
+    assert attempt_count == 0
+
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token)
+    context = storage.activate_execution_claim(claim.request_id,
+                                               claim.execution_generation,
+                                               claim.claim_token)
+    try:
+        backend.set_request_finished(request_id,
+                                     requests.RequestStatus.SUCCEEDED,
+                                     result=[])
+    finally:
+        storage.deactivate_execution_claim(context)
+    asyncio.run(backend.delete_requests([request_id]))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(request_postgres.RESOURCE_ACTIONS)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS)).scalar_one() == 0
+
+
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '004'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '005'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
         'api_request_store_metadata', 'api_controller_leadership',
         'api_controller_action_reservations', 'resource_events',
-        'resource_event_targets'
+        'resource_event_targets', 'api_resource_actions',
+        'api_resource_action_attempts'
     }.issubset(inspector.get_table_names())
     request_columns = {
         column['name'] for column in inspector.get_columns('api_requests')
     }
     assert 'event_context' in request_columns
+    assert {'resource_action_id',
+            'resource_action_attempt'}.issubset(request_columns)
     assert {
         'ix_resource_events_workspace_sequence',
         'ix_resource_events_workspace_actor_sequence',
@@ -242,6 +412,271 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     sqlite_engine = sqlalchemy.create_engine('sqlite://')
     with pytest.raises(RuntimeError, match='requires PostgreSQL'):
         request_postgres._initialize_schema(sqlite_engine)
+
+
+def test_resource_action_schema_is_bounded_and_request_points_to_attempt(
+        request_database):
+    engine, _ = request_database
+    inspector = sqlalchemy.inspect(engine)
+
+    action_tables = {
+        table for table in inspector.get_table_names()
+        if table.startswith('api_resource_action')
+    }
+    assert action_tables == {
+        'api_resource_actions', 'api_resource_action_attempts'
+    }
+    action_columns = {
+        column['name']
+        for column in inspector.get_columns('api_resource_actions')
+    }
+    assert action_columns == {
+        'action_id', 'domain', 'resource_type', 'resource_identity',
+        'desired_generation', 'action_type', 'immutable_spec',
+        'immutable_spec_sha256', 'kernel_state', 'current_attempt',
+        'next_attempt_at', 'last_result', 'last_result_sha256',
+        'terminal_disposition', 'revision', 'created_at', 'updated_at',
+        'terminal_at'
+    }
+    attempt_columns = {
+        column['name']
+        for column in inspector.get_columns('api_resource_action_attempts')
+    }
+    assert attempt_columns == {
+        'action_id', 'attempt', 'request_id', 'request_input_sha256',
+        'provider_operation_id', 'mutation_boundary', 'typed_outcome',
+        'typed_outcome_sha256', 'request_terminal_state', 'admitted_at',
+        'updated_at', 'settled_at'
+    }
+    assert 'TEXT' in str(
+        next(column['type']
+             for column in inspector.get_columns('api_resource_action_attempts')
+             if column['name'] == 'request_id')).upper()
+
+    request_fks = {
+        foreign_key['name']: foreign_key
+        for foreign_key in inspector.get_foreign_keys('api_requests')
+    }
+    correlation_fk = request_fks['fk_api_requests_resource_action_attempt']
+    assert correlation_fk['constrained_columns'] == [
+        'resource_action_id', 'resource_action_attempt', 'request_id'
+    ]
+    assert correlation_fk['referred_table'] == ('api_resource_action_attempts')
+    assert correlation_fk['referred_columns'] == [
+        'action_id', 'attempt', 'request_id'
+    ]
+    attempt_fks = {
+        foreign_key['name']: foreign_key for foreign_key in
+        inspector.get_foreign_keys('api_resource_action_attempts')
+    }
+    action_fk = attempt_fks['fk_api_resource_action_attempts_action']
+    assert action_fk['constrained_columns'] == ['action_id']
+    assert action_fk['referred_table'] == 'api_resource_actions'
+    assert action_fk['referred_columns'] == ['action_id']
+    assert all(foreign_key['referred_table'] != 'api_requests'
+               for foreign_key in attempt_fks.values())
+
+    action_indexes = {
+        index['name']: index
+        for index in inspector.get_indexes('api_resource_actions')
+    }
+    due_index = action_indexes['ix_api_resource_actions_due']
+    assert due_index['column_names'] == ['next_attempt_at', 'action_id']
+    assert _normalized_index_predicate(due_index) == "kernel_state='READY'"
+    queued_index = action_indexes['ix_api_resource_actions_queued']
+    assert queued_index['column_names'] == ['updated_at', 'action_id']
+    assert _normalized_index_predicate(queued_index) == "kernel_state='QUEUED'"
+
+    request_indexes = {
+        index['name']: index for index in inspector.get_indexes('api_requests')
+    }
+    correlation_index = request_indexes[
+        'ix_api_requests_resource_action_attempt']
+    assert correlation_index['column_names'] == [
+        'resource_action_id', 'resource_action_attempt'
+    ]
+    assert _normalized_index_predicate(
+        correlation_index) == 'resource_action_idISNOTNULL'
+
+
+def test_resource_action_identity_and_request_binding_constraints(
+        request_database):
+    engine, backend = request_database
+    action_id = uuid.uuid4()
+    request_id = str(uuid.uuid4())
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values(
+                **_action_values(action_id)))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+                **_attempt_values(action_id, 1, request_id)))
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values(
+                    **_action_values(uuid.uuid4())))
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+                        **_attempt_values(action_id, 2, request_id)))
+
+    request = _request(request_id)
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    resource_action_id=action_id, resource_action_attempt=1))
+
+    ordinary_id = str(uuid.uuid4())
+    assert asyncio.run(backend.create_if_not_exists_async(
+        _request(ordinary_id)))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    ordinary_id).values(resource_action_id=action_id,
+                                        resource_action_attempt=1))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    ordinary_id).values(resource_action_id=action_id))
+
+
+def test_resource_action_json_constraints_reject_json_null(request_database):
+    engine, _ = request_database
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values({
+                    **_action_values(uuid.uuid4(),
+                                     resource_identity='json-null-spec'),
+                    'immutable_spec': sqlalchemy.text("'null'::jsonb"),
+                }))
+
+    action_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                request_postgres.RESOURCE_ACTIONS).values(**_action_values(
+                    action_id, resource_identity='json-null-outcome')))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+                **_attempt_values(action_id, 1, str(uuid.uuid4()))))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.RESOURCE_ACTIONS).where(
+                    request_postgres.RESOURCE_ACTIONS.c.action_id ==
+                    action_id).values(last_result={'disposition': 'retry'}))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                        action_id).values(
+                            mutation_boundary='SETTLED',
+                            typed_outcome=sqlalchemy.text("'null'::jsonb"),
+                            typed_outcome_sha256='c' * 64,
+                            request_terminal_state='SUCCEEDED',
+                            settled_at=sqlalchemy.func.clock_timestamp(),
+                            updated_at=sqlalchemy.func.clock_timestamp()))
+
+
+def test_correlated_request_keeps_existing_lease_and_attempt_survives_gc(
+        request_database):
+    engine, backend = request_database
+    action_id = uuid.uuid4()
+    request_id = str(uuid.uuid4())
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values(
+                **_action_values(action_id)))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+                **_attempt_values(action_id, 1, request_id)))
+
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    resource_action_id=action_id, resource_action_attempt=1))
+
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token)
+    context = storage.activate_execution_claim(claim.request_id,
+                                               claim.execution_generation,
+                                               claim.claim_token)
+    try:
+        assert backend.heartbeat_claim(claim)
+        backend.set_request_finished(request_id,
+                                     requests.RequestStatus.SUCCEEDED,
+                                     result=[])
+    finally:
+        storage.deactivate_execution_claim(context)
+    assert backend.get_request(
+        request_id).status is requests.RequestStatus.SUCCEEDED
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action_id, request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt
+                == 1).values(mutation_boundary='SETTLED',
+                             typed_outcome={'disposition': 'succeeded'},
+                             typed_outcome_sha256='c' * 64,
+                             request_terminal_state='SUCCEEDED',
+                             settled_at=sqlalchemy.func.clock_timestamp(),
+                             updated_at=sqlalchemy.func.clock_timestamp()))
+    asyncio.run(backend.delete_requests([request_id]))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.REQUESTS).where(
+                                 request_postgres.REQUESTS.c.request_id ==
+                                 request_id)).scalar_one() == 0
+        attempt = connection.execute(
+            sqlalchemy.select(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action_id, request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt
+                == 1)).mappings().one()
+        action_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(request_postgres.RESOURCE_ACTIONS).where(
+                request_postgres.RESOURCE_ACTIONS.c.action_id ==
+                action_id)).scalar_one()
+    assert attempt['request_id'] == request_id
+    assert attempt['request_terminal_state'] == 'SUCCEEDED'
+    assert attempt['typed_outcome'] == {'disposition': 'succeeded'}
+    assert action_count == 1
+
+
+def test_api005_downgrade_retains_additive_schema(request_database):
+    engine, _ = request_database
+    config = migration_utils.get_alembic_config(
+        engine, migration_utils.API_REQUESTS_DB_NAME)
+    with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
+        alembic_command.downgrade(config, '004')
+
+    assert migration_utils.get_current_alembic_revision(
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '005'
+    inspector = sqlalchemy.inspect(engine)
+    assert 'api_resource_actions' in inspector.get_table_names()
+    assert 'api_resource_action_attempts' in inspector.get_table_names()
 
 
 def test_server_instance_lease_publishes_ready_and_draining(
