@@ -9,6 +9,7 @@ import { showToast } from '@/data/connectors/toast';
 
 // Configuration
 const DEFAULT_TAIL_LINES = 1000;
+const SSH_LOG_INACTIVITY_TIMEOUT_MS = 300000;
 
 export async function getSSHNodePools() {
   try {
@@ -193,9 +194,19 @@ export async function getSSHNodePoolStatus(poolName) {
   }
 }
 
-export async function streamSSHDeploymentLogs({ requestId, signal, onNewLog }) {
+async function streamSSHLogs({ requestId, signal, onNewLog, streamLabel }) {
+  const requestController = new AbortController();
+  const forwardCallerAbort = () => requestController.abort();
+  if (signal) {
+    if (signal.aborted) {
+      forwardCallerAbort();
+    } else {
+      signal.addEventListener('abort', forwardCallerAbort, { once: true });
+    }
+  }
+
   // Measure timeout from last received data, not from start of request.
-  const inactivityTimeout = 300000; // 5 minutes of no data activity
+  const inactivityTimeout = SSH_LOG_INACTIVITY_TIMEOUT_MS;
   let lastActivity = Date.now();
   let timeoutId;
 
@@ -232,11 +243,16 @@ export async function streamSSHDeploymentLogs({ requestId, signal, onNewLog }) {
           headers: {
             'Content-Type': 'application/json',
           },
-          // Only use the signal if it's provided
-          ...(signal ? { signal } : {}),
+          signal: requestController.signal,
         }
       );
 
+      // A transport may ignore abort while connecting and settle after the
+      // public timeout. Do not consume that stale response body.
+      if (requestController.signal.aborted) {
+        await response.body?.cancel?.();
+        return { timeout: false };
+      }
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -261,7 +277,17 @@ export async function streamSSHDeploymentLogs({ requestId, signal, onNewLog }) {
           if (chunk) onNewLog(chunk);
         }
       } finally {
-        reader.cancel();
+        // Fetch owns cancellation after abort; explicitly release the reader
+        // only on normal completion or a non-abort failure.
+        if (!requestController.signal.aborted) {
+          try {
+            await reader.cancel();
+          } catch (cancelError) {
+            if (cancelError.name !== 'AbortError') {
+              console.warn('Error canceling SSH log reader:', cancelError);
+            }
+          }
+        }
         // Clear the timeout when streaming completes successfully
         if (timeoutId) {
           clearTimeout(timeoutId);
@@ -282,133 +308,51 @@ export async function streamSSHDeploymentLogs({ requestId, signal, onNewLog }) {
     }
   })();
 
-  // Race the fetch against the activity-based timeout
-  const result = await Promise.race([fetchPromise, timeoutPromise]);
-
-  // Clear any remaining timeout
-  if (timeoutId) {
-    clearTimeout(timeoutId);
+  let result;
+  try {
+    result = await Promise.race([fetchPromise, timeoutPromise]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    if (signal) {
+      signal.removeEventListener('abort', forwardCallerAbort);
+    }
   }
 
-  // If we timed out due to inactivity, show a more informative message
   if (result.timeout) {
+    requestController.abort();
+    // A non-compliant or still-connecting transport can settle after the
+    // bounded public timeout. Observe its eventual result without waiting.
+    void fetchPromise.catch((error) => {
+      console.warn('Error finishing timed-out SSH log request:', error);
+    });
     showToast(
-      `SSH deployment log stream timed out after ${inactivityTimeout / 1000}s of inactivity`,
+      `${streamLabel} log stream timed out after ${inactivityTimeout / 1000}s of inactivity`,
       'warning'
     );
-    return;
   }
 }
 
-// Reusable function for streaming SSH operation logs (deploy or down)
+export async function streamSSHDeploymentLogs({ requestId, signal, onNewLog }) {
+  return streamSSHLogs({
+    requestId,
+    signal,
+    onNewLog,
+    streamLabel: 'SSH deployment',
+  });
+}
+
 export async function streamSSHOperationLogs({
   requestId,
   signal,
   onNewLog,
   operationType = 'operation',
 }) {
-  // Measure timeout from last received data, not from start of request.
-  const inactivityTimeout = 300000; // 5 minutes of no data activity
-  let lastActivity = Date.now();
-  let timeoutId;
-
-  // Create an activity-based timeout promise
-  const createTimeoutPromise = () => {
-    return new Promise((resolve) => {
-      const checkActivity = () => {
-        const timeSinceLastActivity = Date.now() - lastActivity;
-
-        if (timeSinceLastActivity >= inactivityTimeout) {
-          resolve({ timeout: true });
-        } else {
-          // Check again after remaining time
-          timeoutId = setTimeout(
-            checkActivity,
-            inactivityTimeout - timeSinceLastActivity
-          );
-        }
-      };
-
-      timeoutId = setTimeout(checkActivity, inactivityTimeout);
-    });
-  };
-
-  const timeoutPromise = createTimeoutPromise();
-
-  // Create the fetch promise
-  const fetchPromise = (async () => {
-    try {
-      const response = await fetch(
-        `${ENDPOINT}/api/stream?request_id=${requestId}&format=plain&tail=${DEFAULT_TAIL_LINES}&follow=true`,
-        {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          // Only use the signal if it's provided
-          ...(signal ? { signal } : {}),
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      // Stream the logs
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            const trailingChunk = decoder.decode();
-            if (trailingChunk) onNewLog(trailingChunk);
-            break;
-          }
-
-          // Update activity timestamp when we receive data
-          lastActivity = Date.now();
-
-          const chunk = decoder.decode(value, { stream: true });
-          if (chunk) onNewLog(chunk);
-        }
-      } finally {
-        reader.cancel();
-        // Clear the timeout when streaming completes successfully
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-      }
-      return { timeout: false };
-    } catch (error) {
-      // Clear timeout on any error
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
-
-      // If this was an abort, just return silently
-      if (error.name === 'AbortError') {
-        return { timeout: false };
-      }
-      throw error;
-    }
-  })();
-
-  // Race the fetch against the activity-based timeout
-  const result = await Promise.race([fetchPromise, timeoutPromise]);
-
-  // Clear any remaining timeout
-  if (timeoutId) {
-    clearTimeout(timeoutId);
-  }
-
-  // If we timed out due to inactivity, show a more informative message
-  if (result.timeout) {
-    showToast(
-      `SSH ${operationType} log stream timed out after ${inactivityTimeout / 1000}s of inactivity`,
-      'warning'
-    );
-    return;
-  }
+  return streamSSHLogs({
+    requestId,
+    signal,
+    onNewLog,
+    streamLabel: `SSH ${operationType}`,
+  });
 }

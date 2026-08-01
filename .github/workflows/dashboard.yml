@@ -57,6 +57,7 @@ jobs:
           src/data/connectors/services.test.jsx \
           src/data/connectors/jobs.test.jsx \
           src/data/connectors/jobs-stream-timeout.test.jsx \
+          src/data/connectors/ssh-node-pools-stream-timeout.test.jsx \
           src/data/connectors/jobs-download-logs.test.jsx \
           src/data/connectors/operator-notifications.test.js \
           src/data/connectors/stream-decoders.test.jsx \
