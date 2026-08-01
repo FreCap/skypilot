@@ -1318,12 +1318,36 @@ def generate_replica_cluster_name(service_name: str,
     return f'{prefix}{suffix}'
 
 
+_COMPLETED_REPLICA_FAILURE_STATUSES = frozenset({
+    serve_state.ReplicaStatus.FAILED_PROVISION,
+})
+
+
+def _service_status_from_replica_infos(
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    target_num_replicas: int | None,
+) -> serve_state.ServiceStatus:
+    replica_statuses = [info.status for info in replica_infos]
+    status = serve_state.ServiceStatus.from_replica_statuses(replica_statuses)
+    if (status == serve_state.ServiceStatus.FAILED and
+            target_num_replicas == 0 and
+            all(replica_status in _COMPLETED_REPLICA_FAILURE_STATUSES
+                for replica_status in replica_statuses)):
+        # Completed provisioning failures are retained for operator-visible
+        # history. Once the autoscaler authoritatively wants no replicas, those
+        # rows no longer describe the current fleet. App/readiness failures and
+        # cleanup-uncertain FAILED_CLEANUP/UNKNOWN rows remain visible.
+        return serve_state.ServiceStatus.NO_REPLICA
+    return status
+
+
 def set_service_status_and_active_versions_from_replica(
     service_name: str,
     replica_infos: list['replica_managers.ReplicaInfo'],
     update_mode: UpdateMode,
     expected_service_hash: str | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    target_num_replicas: int | None = None,
 ) -> None:
     record = serve_state.get_service_controller_owner(service_name,
                                                       require_version=True)
@@ -1364,13 +1388,11 @@ def set_service_status_and_active_versions_from_replica(
         chosen_version = get_latest_version_with_min_replicas(
             service_name, replica_infos)
         active_versions = [chosen_version] if chosen_version is not None else []
-    # Compute the service status from ALL replicas, not just the ready ones:
-    # `from_replica_statuses` needs the full set to ever return FAILED (some
-    # replica failed, none ready) or REPLICA_INIT (replicas exist, none ready
-    # or failed). Fed only ready replicas, it can only return READY or
-    # NO_REPLICA, so a service whose replicas all failed would show the
-    # benign-looking NO_REPLICA. `active_versions` above intentionally stays
-    # on the ready replicas (the versions actually serving traffic).
+    # Compute the service status from ALL replicas, not just the ready ones.
+    # The authoritative autoscaler target lets the helper distinguish an idle
+    # scale-to-zero service from an actively desired fleet whose replicas all
+    # failed. `active_versions` above intentionally stays on ready replicas
+    # (the versions actually serving traffic).
     service_hash = (expected_service_hash
                     if expected_service_hash is not None else record_hash)
     if not isinstance(service_hash, str) or not service_hash:
@@ -1383,8 +1405,7 @@ def set_service_status_and_active_versions_from_replica(
                        is not None else record.get('controller_pid')),
         (expected_controller_owner[1] if expected_controller_owner is not None
          else record.get('controller_ip')),
-        serve_state.ServiceStatus.from_replica_statuses(
-            [info.status for info in replica_infos]),
+        _service_status_from_replica_infos(replica_infos, target_num_replicas),
         active_versions=active_versions,
         expected_status=observed_status)
     if not updated:

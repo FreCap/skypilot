@@ -3731,6 +3731,22 @@ class SkyServeController:
                 # for better decoupling.
                 scaling_options = decision_autoscaler.generate_scaling_decisions(
                     replica_infos, active_versions)
+                target_num_replicas = None
+                if (decision_autoscaler.has_recomputed_with_fresh_data()
+                        is True):
+                    demand_target = (
+                        decision_autoscaler.get_final_target_num_replicas())
+                    fill_target = 0
+                    if (getattr(decision_autoscaler, 'reserved_capacity_fill',
+                                False) is True):
+                        fill_target = getattr(decision_autoscaler,
+                                              '_fill_target', 0)
+                    if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
+                            fill_target < 0):
+                        fill_target = 0
+                    target_num_replicas = max(demand_target, fill_target)
+                self._replica_manager.publish_target_num_replicas(
+                    target_num_replicas, expected_version=decision_version)
                 if not self._persist_cost_rebalance_state(decision_autoscaler):
                     logger.warning(
                         'Suppressing new cost-rebalance replacements because '
