@@ -41,6 +41,22 @@ REPLICA_LAUNCH_FENCE_KEYS = (
     REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
 )
 
+# Server-only allowlist for the first same-VM system-OOM recovery rollout.
+# The value is a versioned JSON document binding an exact service incarnation
+# to a safety-profile digest.  It is read only by the API server and is never
+# forwarded into a user task's environment.
+SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR = (
+    'SKYPILOT_INTERNAL_SERVE_SYSTEM_OOM_RECOVERY_PROFILES')
+# Recovery-capable code generation requires this exact controller-owned
+# contract tuple.  PR 1 validates it but intentionally has no producer; the
+# SkyServe adoption PR persists launch intent before emitting these values.
+SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_controller_contract_version')
+SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION = 1
+SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY = 'sky_serve_system_oom_recovery_profile_id'
+SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_profile_version')
+
 # The consolidation mode lock ensures that if multiple API servers are running
 # at the same time (e.g. during a rolling update), recovery can only happen once
 # the previous API server has exited.

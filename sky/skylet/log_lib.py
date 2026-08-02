@@ -25,6 +25,7 @@ from sky import sky_logging
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.skylet import log_reader
+from sky.skylet import system_oom_recovery
 from sky.utils import context
 from sky.utils import context_utils
 from sky.utils import log_utils
@@ -436,6 +437,57 @@ def run_bash_command_with_log_and_return_pid(
                                             stream_logs,
                                             with_ray,
                                             streaming_prefix=streaming_prefix)
+    return {'return_code': return_code, 'pid': os.getpid()}
+
+
+def run_bash_command_with_log_and_return_pid_with_system_oom_recovery(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        bash_command: str | None,
+        log_path: str,
+        recovery_context: dict[str, object],
+        recovery_plan: system_oom_recovery.RecoveryLaunchPlan,
+        env_vars: dict[str, str] | None = None,
+        stream_logs: bool = False,
+        with_ray: bool = False,
+        streaming_prefix: str | None = None):
+    """Run one internally eligible service task under the OOM supervisor.
+
+    This is intentionally a separate entrypoint rather than a flag on
+    :func:`run_with_log`: ordinary jobs retain their byte-for-byte execution
+    path and only generated recovery-aware Ray tasks serialize this function.
+    """
+    if not isinstance(recovery_plan, system_oom_recovery.RecoveryLaunchPlan):
+        raise TypeError('recovery_plan must be a RecoveryLaunchPlan')
+    inner_command = None
+    if (recovery_plan.profile_version ==
+            system_oom_recovery.PROFILE_VERSION_DIRECT_SHELL):
+        if not isinstance(bash_command, str):
+            raise ValueError('direct-shell recovery requires a command')
+        with tempfile.NamedTemporaryFile('w', prefix='sky_app_1_',
+                                         delete=False) as fp:
+            wrapped_command = make_task_bash_script(bash_command,
+                                                    env_vars=env_vars)
+            fp.write(wrapped_command)
+            fp.flush()
+            script_path = fp.name
+        # Deprecated profile v1 intentionally preserves the ordinary
+        # interactive-shell launch byte for byte. It is deleted by stacked PR
+        # 3 after the canonical migration gates pass.
+        inner_command = f'/bin/bash -i {script_path}'
+    else:
+        if bash_command is not None:
+            raise ValueError('owned-container recovery rejects shell command')
+        recovery_plan = recovery_plan.bind_environment(env_vars)
+
+    recovery_context = system_oom_recovery.bind_supervisor_parent(
+        recovery_context, os.getpid())
+    supervisor_command = system_oom_recovery.build_supervisor_command(
+        inner_command, recovery_context, recovery_plan)
+    return_code = run_with_log(supervisor_command,
+                               log_path,
+                               stream_logs=stream_logs,
+                               with_ray=with_ray,
+                               streaming_prefix=streaming_prefix,
+                               shell=False)
     return {'return_code': return_code, 'pid': os.getpid()}
 
 
