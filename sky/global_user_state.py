@@ -544,6 +544,17 @@ def _read_cluster_record_identity_in_session(
     )
 
 
+@db_retries.retry
+def get_cluster_record_identity_snapshot(
+    cluster_name: str,
+    expected_cluster_record_uuid: uuid.UUID | str,
+) -> ClusterRecordIdentitySnapshot | None:
+    """Read one expected-UUID cluster row through the action-aware fence."""
+    with orm.Session(_db_manager.get_engine()) as session, session.begin():
+        return _read_cluster_record_identity_in_session(
+            session, cluster_name, expected_cluster_record_uuid)
+
+
 @metrics_lib.time_me
 def add_or_update_user(
         user: models.User,

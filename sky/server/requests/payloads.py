@@ -833,10 +833,23 @@ class ExecBody(RequestBody):
 
 
 class StopOrDownBody(RequestBody):
+    """Shared stop/down payload with an optional internal teardown fence."""
+
     cluster_name: str
     purge: bool = False
     graceful: bool = False
     graceful_timeout: int | None = None
+    # Internal only.  The public SDK never populates this; SkyServe shadow and
+    # action paths use it to prevent a stale down request from deleting a
+    # same-name successor cluster record.
+    resource_action_expected_cluster_record_uuid: str | None = pydantic.Field(
+        default=None, exclude_if=lambda value: value is None)
+
+    def to_kwargs(self) -> dict[str, Any]:
+        kwargs = super().to_kwargs()
+        kwargs['_expected_cluster_record_uuid'] = kwargs.pop(
+            'resource_action_expected_cluster_record_uuid', None)
+        return kwargs
 
 
 class StatusBody(RequestBody):

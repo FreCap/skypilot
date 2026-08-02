@@ -8,6 +8,7 @@ import json
 import math
 import os
 import pathlib
+import pickle
 import random
 import re
 import shlex
@@ -4573,7 +4574,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _teardown(self,
                   handle: CloudVmRayResourceHandle,
                   terminate: bool,
-                  purge: bool = False):
+                  purge: bool = False,
+                  *,
+                  expected_cluster_record_uuid: str | None = None):
         """Tear down or stop the cluster.
 
         Args:
@@ -4643,18 +4646,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             try:
                 with lock:
                     with resource_lock:
-                        self.teardown_no_lock(
-                            handle,
-                            terminate,
-                            purge,
+                        teardown_kwargs: dict[str, Any] = {
                             # When --purge is set and we already see an ID
                             # mismatch error, we skip the refresh codepath. This
                             # is because refresh checks current user identity
                             # can throw ClusterOwnerIdentityMismatchError. The
                             # argument/flag `purge` should bypass such ID
                             # mismatch errors.
-                            refresh_cluster_status=(
-                                not is_identity_mismatch_and_purge))
+                            'refresh_cluster_status':
+                                not is_identity_mismatch_and_purge,
+                        }
+                        if expected_cluster_record_uuid is not None:
+                            teardown_kwargs['expected_cluster_record_uuid'] = (
+                                expected_cluster_record_uuid)
+                        self.teardown_no_lock(handle, terminate, purge,
+                                              **teardown_kwargs)
                 if terminate:
                     lock.force_unlock()
                 break
@@ -5370,13 +5376,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                      f'{colorama.Style.RESET_ALL}')
         return {str(job_id): local_log_dir}
 
-    def teardown_no_lock(self,
-                         handle: CloudVmRayResourceHandle,
-                         terminate: bool,
-                         purge: bool = False,
-                         post_teardown_cleanup: bool = True,
-                         refresh_cluster_status: bool = True,
-                         remove_from_db: bool = True) -> None:
+    def teardown_no_lock(
+            self,
+            handle: CloudVmRayResourceHandle,
+            terminate: bool,
+            purge: bool = False,
+            post_teardown_cleanup: bool = True,
+            refresh_cluster_status: bool = True,
+            remove_from_db: bool = True,
+            expected_cluster_record_uuid: str | None = None) -> None:
         """Teardown the cluster without acquiring the cluster status lock.
 
         NOTE: This method should not be called without holding the cluster
@@ -5461,12 +5469,36 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 'Skipped.')
             return
 
+        if expected_cluster_record_uuid is not None:
+            exact_snapshot = (
+                global_user_state.get_cluster_record_identity_snapshot(
+                    handle.cluster_name, expected_cluster_record_uuid))
+            if exact_snapshot is None:
+                logger.warning(
+                    f'Cluster {handle.cluster_name!r} was removed before '
+                    'action-fenced provider teardown. Skipped.')
+                return
+            expected_handle_bytes = pickle.dumps(handle)
+            if exact_snapshot.serialized_handle != expected_handle_bytes:
+                raise global_user_state.ClusterRecordIdentityConflictError(
+                    f'Cluster {handle.cluster_name!r} handle changed before '
+                    'action-fenced provider teardown.')
+            handle = typing.cast(CloudVmRayResourceHandle,
+                                 exact_snapshot.handle)
+
         if handle.cluster_yaml is None:
             logger.warning(f'Cluster {handle.cluster_name!r} has no '
                            f'provision yaml so it '
                            'has not been provisioned. Skipped.')
+            removal_kwargs: dict[str, Any] = {}
+            if expected_cluster_record_uuid is not None:
+                removal_kwargs.update({
+                    'expected_cluster_record_uuid': expected_cluster_record_uuid,
+                    'expected_cluster_handle': handle,
+                })
             global_user_state.remove_cluster(handle.cluster_name,
-                                             terminate=terminate)
+                                             terminate=terminate,
+                                             **removal_kwargs)
             return
         log_path = os.path.join(os.path.expanduser(self.log_dir),
                                 'teardown.log')
@@ -5525,8 +5557,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     raise
 
             if post_teardown_cleanup:
+                cleanup_kwargs: dict[str, Any] = {}
+                if expected_cluster_record_uuid is not None:
+                    cleanup_kwargs['expected_cluster_record_uuid'] = (
+                        expected_cluster_record_uuid)
                 self.post_teardown_cleanup(handle, terminate, purge,
-                                           remove_from_db)
+                                           remove_from_db, **cleanup_kwargs)
             return
 
         if (isinstance(cloud, clouds.IBM) and terminate and
@@ -5619,14 +5655,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # (i.e., prev_status is None), as the cleanup has already been done
         # if the cluster is removed from the status table.
         if post_teardown_cleanup:
-            self.post_teardown_cleanup(handle, terminate, purge)
+            final_cleanup_kwargs: dict[str, Any] = {}
+            if expected_cluster_record_uuid is not None:
+                final_cleanup_kwargs['expected_cluster_record_uuid'] = (
+                    expected_cluster_record_uuid)
+            self.post_teardown_cleanup(handle, terminate, purge,
+                                       **final_cleanup_kwargs)
 
-    def post_teardown_cleanup(self,
-                              handle: CloudVmRayResourceHandle,
-                              terminate: bool,
-                              purge: bool = False,
-                              remove_from_db: bool = True,
-                              failover: bool = False) -> None:
+    def post_teardown_cleanup(
+            self,
+            handle: CloudVmRayResourceHandle,
+            terminate: bool,
+            purge: bool = False,
+            remove_from_db: bool = True,
+            failover: bool = False,
+            expected_cluster_record_uuid: str | None = None) -> None:
         """Cleanup local configs/caches and delete TPUs after teardown.
 
         This method will handle the following cleanup steps:
@@ -5823,8 +5866,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     raise
 
         if not terminate or remove_from_db:
+            removal_kwargs: dict[str, Any] = {}
+            if expected_cluster_record_uuid is not None:
+                removal_kwargs.update({
+                    'expected_cluster_record_uuid': expected_cluster_record_uuid,
+                    'expected_cluster_handle': handle,
+                })
             global_user_state.remove_cluster(handle.cluster_name,
-                                             terminate=terminate)
+                                             terminate=terminate,
+                                             **removal_kwargs)
 
     def remove_cluster_config(self, handle: CloudVmRayResourceHandle) -> None:
         """Remove the YAML config of a cluster."""

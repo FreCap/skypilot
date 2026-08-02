@@ -23,6 +23,7 @@ import sys
 import typing
 from typing import Any, Literal, Optional, TypeVar, Union
 from urllib import parse as urlparse
+import uuid
 
 import click
 import colorama
@@ -1648,6 +1649,8 @@ def down(
     purge: bool = False,
     graceful: bool = False,
     graceful_timeout: int | None = None,
+    *,
+    _expected_cluster_record_uuid: str | None = None,
 ) -> server_common.RequestId[None]:
     """Tears down a cluster.
 
@@ -1686,11 +1689,29 @@ def down(
     if graceful and version is not None and version < 32:
         logger.warning('`--graceful` is ignored because the server does '
                        'not support it yet.')
+    if _expected_cluster_record_uuid is not None:
+        try:
+            parsed_record_uuid = uuid.UUID(_expected_cluster_record_uuid)
+        except (AttributeError, TypeError, ValueError) as e:
+            raise ValueError('Expected cluster-record UUID must be canonical '
+                             'UUID text.') from e
+        if str(parsed_record_uuid) != _expected_cluster_record_uuid:
+            raise ValueError('Expected cluster-record UUID must be canonical '
+                             'UUID text.')
+        minimum_version = (
+            server_constants.
+            MIN_RESOURCE_ACTION_EXPECTED_CLUSTER_UUID_API_VERSION)
+        if version is None or version < minimum_version:
+            raise RuntimeError(
+                'The API server cannot preserve the resource-action '
+                'cluster-record teardown fence.')
     body = payloads.StopOrDownBody(
         cluster_name=cluster_name,
         purge=purge,
         graceful=graceful,
         graceful_timeout=graceful_timeout,
+        resource_action_expected_cluster_record_uuid=(
+            _expected_cluster_record_uuid),
     )
     response = server_common.make_authenticated_request(
         'POST', '/down', json=json.loads(body.model_dump_json()), timeout=5)

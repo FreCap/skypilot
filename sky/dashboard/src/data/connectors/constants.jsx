@@ -55,7 +55,7 @@ export const WS_API_URL = API_URL.replace(/^http/, 'ws');
 // Keep in sync with sky/server/constants.py:API_VERSION when (and only
 // when) this dashboard adds new server-side feature support that older
 // dashboard builds cannot handle.
-export const CLIENT_API_VERSION = '68';
+export const CLIENT_API_VERSION = '69';
 export const SERVE_DASHBOARD_DIRECT_READS_API_VERSION = 66;
 export const SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67;
 // Header names expected by the server's APIVersionMiddleware. Mirrors
