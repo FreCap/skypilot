@@ -72,6 +72,7 @@ jobs:
           src/lib/jobs-cache-manager.test.js \
           src/lib/request-activity.test.js \
           src/lib/request-activity.persistence.test.js \
+          src/hooks/useVisibleRefreshInterval.test.js \
           src/hooks/useLogStreamer.test.js \
           src/hooks/useTour.test.jsx \
           src/plugins/PluginProvider.test.jsx \
