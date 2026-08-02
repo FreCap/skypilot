@@ -153,6 +153,17 @@ describe('useVisibleRefreshInterval', () => {
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(onRefresh).toHaveBeenLastCalledWith('interval');
 
+    act(() => {
+      jest.advanceTimersByTime(999);
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(2);
+    expect(onRefresh).toHaveBeenLastCalledWith('interval');
+
     unmount();
   });
 

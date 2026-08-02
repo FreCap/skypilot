@@ -9,7 +9,6 @@ export function useVisibleRefreshInterval(
   const { initialDelayMs = intervalMs, catchUpOnlyWhenOverdue = false } =
     options;
   const onRefreshRef = useRef(onRefresh);
-  const cadenceAnchorRef = useRef(null);
 
   useEffect(() => {
     onRefreshRef.current = onRefresh;
@@ -21,6 +20,12 @@ export function useVisibleRefreshInterval(
     }
 
     let timeoutId = null;
+    let nextIntervalDueAt = null;
+    const initialDelay = Math.max(
+      0,
+      Number.isFinite(initialDelayMs) ? initialDelayMs : intervalMs
+    );
+    const cadenceAnchor = window.performance.now() + initialDelay;
 
     const clearScheduledRefresh = () => {
       if (timeoutId !== null) {
@@ -30,17 +35,17 @@ export function useVisibleRefreshInterval(
     };
 
     const nextCadenceTickAfter = (referenceTime) => {
-      const anchor = cadenceAnchorRef.current;
-      if (anchor === null || referenceTime < anchor) {
-        return anchor;
+      if (referenceTime < cadenceAnchor) {
+        return cadenceAnchor;
       }
 
-      const elapsed = referenceTime - anchor;
+      const elapsed = referenceTime - cadenceAnchor;
       const completedIntervals = Math.floor(elapsed / intervalMs) + 1;
-      return anchor + completedIntervals * intervalMs;
+      return cadenceAnchor + completedIntervals * intervalMs;
     };
 
     const scheduleNextRefresh = (dueAt) => {
+      nextIntervalDueAt = dueAt;
       clearScheduledRefresh();
       if (window.document.visibilityState !== 'visible') {
         return;
@@ -68,7 +73,7 @@ export function useVisibleRefreshInterval(
       }
 
       const now = window.performance.now();
-      const nextDueAt = nextIntervalDueAtRef.current;
+      const nextDueAt = nextIntervalDueAt;
       if (catchUpOnlyWhenOverdue && nextDueAt !== null && now < nextDueAt) {
         scheduleNextRefresh(nextDueAt);
         return;
@@ -82,19 +87,13 @@ export function useVisibleRefreshInterval(
       scheduleNextRefresh(resumedDueAt);
     };
 
-    const initialDelay = Math.max(
-      0,
-      Number.isFinite(initialDelayMs) ? initialDelayMs : intervalMs
-    );
-    cadenceAnchorRef.current = window.performance.now() + initialDelay;
-    scheduleNextRefresh(cadenceAnchorRef.current);
+    scheduleNextRefresh(cadenceAnchor);
     window.document.addEventListener(
       'visibilitychange',
       handleVisibilityChange
     );
 
     return () => {
-      cadenceAnchorRef.current = null;
       clearScheduledRefresh();
       window.document.removeEventListener(
         'visibilitychange',
