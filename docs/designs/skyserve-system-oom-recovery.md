@@ -123,6 +123,11 @@ backend rejection is resolved by the bounded protocol below.
 
 - the workload is a non-pool SkyServe service launched through the existing
   `CloudVmRayBackend` path on one dedicated Linux VM;
+- the controller and `/launch` endpoint share the same central PostgreSQL Serve
+  database and the existing durable service-owner launch fence is enforced.
+  A non-consolidated controller, `enforce_launch_fence=False`, a controller-
+  local database, unavailable shared state, or any non-PostgreSQL central path
+  cannot create `CANDIDATE`; it omits every recovery key and launches ordinary;
 - the effective provider is AWS and the exact successful provision created one
   fresh EC2 instance. Evidence binds the immutable EC2 instance ID plus AWS
   account, region, and availability zone; a reusable name or partial locator is
@@ -197,6 +202,11 @@ SystemOomRecoveryAuthorizationV3 = {
   execution_envelope_sha256: Sha256,
   resource_envelope: {
     provider: "aws",
+    allowed_aws_account_ids: [12DigitText],
+    allowed_locations: [{
+      region: NonemptyText,
+      availability_zones: [NonemptyText]
+    }],
     allowed_market_types: NonemptySubset["on_demand", "spot"],
     allowed_instance_types: [Text],
     max_host_memory_gib: 16,
@@ -224,10 +234,14 @@ consider generating one runtime-profile-2 plan. GCP cannot be added without a
 new authorization-document version or an exact v3-compatible
 immutable-identity extension reviewed before rollout.
 
-The document cannot name an EC2 instance before provisioning. After the actual
-result exists, the backend verifies immutable EC2 instance ID, AWS account,
-region, availability zone, market, instance type, and resolved catalog memory
-against the authorization. The generated driver separately verifies the
+The document cannot name an EC2 instance before provisioning. Its AWS account
+list, location list, each location's availability-zone list, and instance-type
+list are nonempty, duplicate-free, and canonical-sorted. Region/AZ authorization
+is by an exact pair from one location entry, never an independent cross-product.
+After the actual result exists, the backend verifies immutable EC2 instance ID,
+AWS account, region, availability zone, market, instance type, and resolved
+catalog memory against those exact allowlists and the authorization. The
+generated driver separately verifies the
 cgroup-aware total before it calls the unchanged API-v1 operation that persists
 `ARMED`. Neither dynamic proof is added to `JobSystemRecoveryInfo`, its API-v1
 protobuf, or the closed marker-v2 schema. Backend and driver each emit one
@@ -353,6 +367,20 @@ returned ID must equal the already-bound ID. Bind/return mismatch makes
 recovery unadoptable and selects ordinary legacy teardown; it never triggers
 request discovery.
 
+For only this bound recovery-bearing request, the `/launch` endpoint schedules
+the existing request with executor-level `retryable=False` even when the
+unchanged launch body has `retry_until_up=True`. This specifically disables
+the executor's blind unknown-stage `BrokenProcessPool` replay. The existing
+typed `ExecutionRetryableError` path remains allowed only when provisioning
+proves no service job/future/driver was submitted; it may re-enter the same
+bound request and consume a new attempt's fresh-provision lease before one
+eventual job. The body flag's ordinary pre-job capacity retry semantics are
+otherwise unchanged. If a worker dies at an unknown stage or after starting a
+job, the exact request becomes failed, the candidate stays off-route, and the
+controller schedules/adopts legacy teardown without submitting or discovering
+another job. Ordinary and already-demoted requests keep their current executor
+retryability.
+
 The existing outer launch loop can issue another ordinary request after a
 failed request and confirmed legacy cluster cleanup. It must never overwrite
 the recovery-bearing request association or reuse its context. Before any such
@@ -394,15 +422,32 @@ and then, if retryable, re-driven only as `ORDINARY` as described above.
 
 Launch-result callbacks never acquire the replica-manager lock: current
 teardown may hold that lock while joining the launch thread. Instead, one
-Serve-state primitive locks the exact PostgreSQL replica row, revalidates
-service owner plus replica/generation, patches the recovery subdocument, and
-rewrites both versioned JSON and compatibility pickle from that locked value.
-All generic whole-row replica writers lock and preserve the latest stored
-recovery subdocument/revision rather than overwriting it from a stale in-memory
-snapshot. Controller status/probe reductions use the same explicit patch
-primitive and then refresh their local object. This single-writer subdocument
-protocol prevents both lock inversion and lost request/job/reducer updates;
-it adds no table column or migration.
+Serve-state primitive begins one PostgreSQL transaction, locks and validates
+the service owner row first, then locks the exact replica row, revalidates its
+replica/generation and recovery revision, patches the recovery subdocument,
+increments the revision once, and rewrites both versioned JSON and
+compatibility pickle from that locked value. A caller-computed transition
+carries its expected revision: mismatch returns a typed conflict without a
+write, after which the caller refreshes and reruns the pure reducer against the
+latest state. It never reapplies a stale output. Endpoint nonce binding and
+other self-contained compare-and-sets instead compute their transition inside
+the row-locked transaction from the latest value. Terminal teardown,
+`EXHAUSTED`, and quarantine are absorbing, so no request/job/probe callback can
+revive them. Every overlapping mutation locks an already-required lifecycle-
+fence row first and then takes the service owner row as its exclusive common
+mutex before any replica row. Existing writer-specific locks may retain their
+internal order only after that service lock because recovery callbacks never
+acquire them; transactions that directly lock multiple replica rows use
+ascending replica-ID order. No v13 writer or recovery path may acquire a
+service/lifecycle lock after a replica lock. Generic whole-row replica writers
+take that common order and preserve the latest stored recovery subdocument/
+revision rather than overwriting it from a stale in-memory snapshot. Controller
+status/probe reductions use the same explicit patch primitive and then refresh
+their local object. A PostgreSQL deadlock/serialization abort rolls back the
+whole transition; the next reconciliation refreshes and re-reduces instead of
+retrying individual statements. This protocol prevents both database/manager
+lock inversion and lost request/job/reducer updates; it adds no table column or
+migration.
 
 The Ray job can already be live when job-ID persistence fails. That cannot
 retroactively disarm its bounded driver. The driver may complete one replay,
@@ -749,9 +794,13 @@ created EC2 ID. The record supplies the complete created-ID set, head, provider
 and region/zone result. One request-scoped `DescribeInstances` result for that
 exact created ID supplies `InstanceId`, `InstanceType`,
 `Placement.AvailabilityZone`, and actual lifecycle market (`spot` only when
-`InstanceLifecycle == "spot"`; absence means on-demand). The active request's
-STS caller identity supplies the AWS account, and the resolved handle's exact
-instance type is looked up through the AWS catalog for memory. Requested
+`InstanceLifecycle == "spot"`; absence means on-demand; every other non-null
+value is rejected). The EC2 Describe call and STS caller-identity call use the
+exact same request-scoped botocore session, resolved credential/profile chain,
+workspace, and region context that performed provisioning; resolving a new
+ambient/default session is forbidden. STS supplies the AWS account, which must
+also agree with the provision/handle account context, and the resolved handle's
+exact instance type is looked up through the AWS catalog for memory. Requested
 `use_spot` or a task memory hint is never treated as actual-result proof. The
 evidence binds those facts with the ordinary request, display/provider cluster
 names, cluster hash, node count, and owner-fenced service identity. Creation
@@ -841,6 +890,13 @@ claim, request, provider journal, or absence inference.
 - The API endpoint binds its own ordinary request ID by consuming the exact
   random launch nonce before executor scheduling. A client-supplied unbound
   context cannot reach backend admission.
+- A recovery-bearing launch request is non-replayable at the executor boundary;
+  `retry_until_up` retains only the existing typed, proven-pre-job capacity
+  requeue. Unknown-stage worker death selects exact-request failure plus legacy
+  teardown, never blind whole-entrypoint re-execution or a second job.
+- Every overlapping PostgreSQL mutation locks the service owner before replica
+  rows and locks multiple replica IDs in ascending order. Recovery callbacks
+  never take the replica-manager lock or reverse that database order.
 - Authorization v3 maps explicitly to runtime profile/capability v2. No reducer
   compares those different version domains for equality.
 - `JobSystemRecoveryInfo` API v1 and supervisor marker/capability v2 remain
@@ -867,6 +923,9 @@ claim, request, provider journal, or absence inference.
 - Ambiguous supervisor/container cleanup is failure, not permission to replay.
 - GCP/Kubernetes/Slurm, unsupported providers, and nonmatching AWS jobs remain
   ordinary within the same mixed-provider service.
+- Controllers that do not share the API server's central PostgreSQL Serve state
+  or do not enforce the existing durable launch fence remain ordinary and never
+  send a recovery context.
 - The feature creates no listener and has no dependency on port 4517.
 - There is no API008, recovery-specific API-request column, private operation
   header, external L7 correctness fence, provider action profile, or action
@@ -1018,7 +1077,7 @@ seven-day observation window.
 | --- | --- | --- |
 | Authorization document v1 and direct-shell Docker parser | Merged compatibility; never selected by a new production authorization | #1183 removes after seven gates |
 | Authorization document v2 | Typed `OwnedContainerSpec` but lacks the exact authorization-v3 provider/identity/memory envelope; never selected by production after #1182 | #1183 removes the authorization-v2 reader; runtime profile and marker/capability v2 remain |
-| Marker schema v1 and `subreaper-v1+local-docker-empty-inventory-v1` | Read-only compatibility for already-generated artifacts | #1183 removes after marker/telemetry audit |
+| Marker schema v1 and `subreaper-v1+local-docker-empty-inventory-v1` | Read-only compatibility for already-generated artifacts | #1183 removes after controller-observed capability audit plus the two-pass remote marker audit |
 | Status-only old-runtime recovery decoding | Missing detail can only select ordinary VM behavior/replacement | #1183 removes after image and seven-day gates |
 | All-fields-absent v13 recovery bundle written by a v12 rollback controller | Decodes only as `ORDINARY` after candidate/capable drain; partial state quarantines | #1183 removes when rewritten #1182 is the rollback floor |
 | Old #1182 protected request/header/API migration/protected AWS cleanup | Never shipped; no transition writer or row exists | Deleted while rewriting #1182; no compatibility/migration |
@@ -1079,10 +1138,14 @@ an ad hoc `--reuse-values` mutation outside the owning IaC state.
 Rollback requires no network fence. Remove the server authorization document
 through Terraform/Terragrunt first; no newly generated job can arm afterward.
 Persist/adopt legacy teardown for every active `CAPABLE` or unresolved
-`CANDIDATE` replica and wait until zero such active rows remain. `ORDINARY`
-rows need no recovery teardown. A blocked/ambiguous cleanup blocks controller
-rollback. Then apply the last compatible exact digest through the owning
-infrastructure stack after a clean reviewed plan. If that old writer touches an
+`CANDIDATE` replica and every quarantined or partial-v13 row. A complete
+all-row audit must report zero `CAPABLE`, unresolved `CANDIDATE`, quarantined,
+or partial-v13 rows before any v12 writer starts; successful cleanup must have
+deleted each quarantined row. `ORDINARY` rows with a complete valid v13 bundle
+need no recovery teardown. A blocked/ambiguous cleanup or unreadable row blocks
+controller rollback. Then apply the last compatible exact digest through the
+owning infrastructure stack after a clean reviewed plan. If that old writer
+touches an
 `ORDINARY` row, it may erase the complete v13 recovery bundle while retaining
 the v13 version label; rewritten #1182 recognizes only that all-fields-absent
 rollback shape as ordinary on a later re-upgrade. Partial bundles remain
@@ -1093,8 +1156,8 @@ An already-generated driver remains bounded to one replay after authorization
 removal. Therefore rolling below #1182 before active `CAPABLE` and unresolved
 `CANDIDATE` replicas are gone is unsupported: an old controller cannot enforce
 the fresh-probe fence. The replica-local API-v1 companion table and protobuf
-fields remain unchanged
-across rollback. Central schemas were never changed. No rollback deletes
+fields remain unchanged across rollback. Central schemas were never changed.
+No rollback deletes
 action evidence, because this feature creates none.
 
 ## Verification plan
@@ -1106,8 +1169,12 @@ action evidence, because this feature creates none.
   `max_retries=0`, creates one new ObjectRef, and makes no API/cloud call.
 - Eligibility tests cover actual AWS versus GCP/Kubernetes, <=16 GB versus
   larger shapes, on-demand/Spot authorization binding, fallback, reuse/resume,
-  single/multi-node, owner/generation/task mutations, managed secrets, and
-  lease single consumption/rebind/copy/pickle rejection.
+  account/region/AZ/type mismatches, single/multi-node,
+  owner/generation/task mutations, managed secrets, and
+  lease single consumption/rebind/copy/pickle rejection. They also reject a
+  non-null AWS `InstanceLifecycle` other than `spot`, a Describe/STS call from a
+  different session/profile/workspace/account, and any controller without the
+  shared-central-PostgreSQL launch fence.
 - Fault injection at every `RecoverySession` transition proves at most one
   `.remote()`, stable event/attempt IDs, adopt-or-cancel, deadline behavior,
   and placement-group removal.
@@ -1136,6 +1203,9 @@ action evidence, because this feature creates none.
   v13 rollback shape alone defaults ordinary; partial/malformed recovery data
   is isolated per row, forced off-route, logged without raw payload, and fed to
   the existing teardown owner without aborting the fleet read.
+- Rollback tests prove a partial-v13 or quarantined row blocks v12 startup until
+  legacy cleanup deletes it; only a complete valid `ORDINARY` v13 row may be
+  rewritten into the all-fields-absent compatibility shape.
 - Reducer tables/property tests cover duplicate, stale, skipped, reordered,
   malformed, terminal, teardown, preemption, restart, and fresh-probe events.
 - Launch tests crash before/after intent CAS, API-endpoint nonce consumption,
@@ -1143,7 +1213,12 @@ action evidence, because this feature creates none.
   job start, exact result persistence, and job-ID owner CAS. A lost POST
   response adopts only the ID already bound in the exact replica row. Missing
   request/job evidence never invokes latest-job discovery and schedules/adopts
-  legacy teardown.
+  legacy teardown. A `BrokenProcessPool` after remote job submission marks the
+  bound request failed and never requeues the launch entrypoint; the live but
+  unassociated candidate remains off-route until legacy teardown. A separate
+  typed capacity failure proven to occur before any job/future/driver preserves
+  the existing `ExecutionRetryableError` requeue and produces exactly one final
+  service job.
 - Tests recover job ID only from the exact bound legacy request result and
   reject latest-job, name-only, or mismatched generation results.
 - Admission reducer races prove an early exact-job `ABSENT` remains
@@ -1157,17 +1232,30 @@ action evidence, because this feature creates none.
   bounded release protocol and never enter the CAPABLE startup barrier. A
   low-initial-delay candidate that succeeds before its application deadline
   remains alive but off-route through the bounded admission hold.
-- Deterministic races cover request/job/reducer patches versus teardown in both
-  row-lock orders, prove callbacks never acquire the manager lock even while
-  current teardown joins their thread, prove stale whole-row writes preserve
-  the latest recovery revision, and prove exactly one existing cleanup
-  owner/request is adopted or scheduled.
+- Topology tests prove a non-consolidated/local-state controller and any
+  `enforce_launch_fence=False` controller never persist `CANDIDATE`, never send
+  the closed recovery context, and retain ordinary launch behavior.
+- Deterministic races start request/job/reducer patches versus teardown in both
+  arrival orders, assert every transaction acquires service owner before
+  ascending replica rows, prove callbacks never acquire the manager lock even
+  while current teardown joins their thread, prove stale whole-row writes
+  preserve the latest recovery revision, and prove a stale ready/capable or
+  request/job patch cannot land after terminal teardown, exhaustion,
+  quarantine, or demotion. A revision conflict must refresh and rerun the pure
+  reducer; terminal states remain absorbing. Exactly one existing cleanup
+  owner/request is adopted or scheduled. PostgreSQL deadlock detection is not
+  the normal serialization mechanism; injected deadlock/serialization aborts
+  roll back the whole mutation and the next reconciliation re-reduces from the
+  committed revision. No callback retries a partial transition outside its
+  transaction.
 - Legacy integration tests assert noncandidate/disabled request bodies remain
   byte-compatible. Candidate requests differ only by the enumerated internal
-  context and endpoint precondition; after the first request fails, confirmed
-  cleanup and every later retry are ordinary and cannot overwrite its
-  association. Cluster handles/YAML, provider calls, cancellation, down,
-  failed-cleanup retry, and replacement otherwise retain existing behavior.
+  context, endpoint precondition, and executor-level non-replayability; their
+  unchanged body-level `retry_until_up` still retries provisioning inside that
+  one execution. After the first request fails, confirmed cleanup and every
+  later retry are ordinary and cannot overwrite its association. Cluster
+  handles/YAML, provider calls, cancellation, down, failed-cleanup retry, and
+  replacement otherwise retain existing behavior.
   No request/action table or column beyond versioned `ReplicaInfo` JSON is
   created.
 - Mixed-fleet tests show one service can launch recovery-capable AWS jobs and
@@ -1207,17 +1295,20 @@ GCP/Kubernetes jobs remain ordinary controls.
   and an old server with a v2 authorization document plus a new context all
   fail closed. Executor scheduling cannot begin before the exact endpoint bind
   commits, and the backend rejects an unbound form.
-- Telemetry records authorization-document-v1/v2 selection, runtime-marker-v1
-  and status-only reads, authorization-v3 candidate/ordinary/capable outcomes,
-  API-v1 recovery/exhaustion, evidence-loss fallback, market/provider, and
-  preemption races using bounded nonsecret labels. Structured admission logs
-  are separately bounded and never become metric labels.
+- Telemetry records authorization-document-v1/v2 selection, controller-
+  observed runtime-capability-v1 and status-only results, authorization-v3
+  candidate/ordinary/capable outcomes, API-v1 recovery/exhaustion, evidence-
+  loss fallback, market/provider, and preemption races using bounded nonsecret
+  labels. The central controller derives capability-v1 only from an exact
+  `PRESENT` job detail; it does not claim direct observation of a remote marker
+  read. Structured admission logs are separately bounded and never become
+  metric labels.
 
 PR2 adds one low-cardinality counter,
 `sky_serve_system_oom_recovery_events_total`, to the existing metrics endpoint.
 Its closed `event` label is one of `authorization_v1_selected`,
-`authorization_v2_selected`, `marker_v1_read`, `status_only_read`,
-`authorization_v3_candidate`, `authorization_v3_ordinary`,
+`authorization_v2_selected`, `runtime_capability_v1_observed`,
+`status_only_read`, `authorization_v3_candidate`, `authorization_v3_ordinary`,
 `authorization_v3_capable`, `recovery_started`, `recovery_succeeded`,
 `recovery_exhausted`, `evidence_lost`, or `preemption_observed`; `provider` is
 one of `aws`, `gcp`, `kubernetes`, `other`, or `unknown`, and `market` is one of
@@ -1225,11 +1316,12 @@ one of `aws`, `gcp`, `kubernetes`, `other`, or `unknown`, and `market` is one of
 account, region, instance, or reason value is a metric label. Production
 monitoring must retain this series for at least eight days before the removal
 clock starts. Each of the seven UTC 24-hour gate queries requires both zero
-`increase()` for the three deprecated-read events and gap-free scrape-health
-evidence; counter reset, missing target, or scrape gap resets the clock. The
-timestamped query result and eligible-image inventory are retained with both
-PRs. Exact per-replica associations remain in current `ReplicaInfo`; bounded
-structured logs supply diagnostic correlation but are not lifecycle authority.
+`increase()` for all four deprecated compatibility events and gap-free scrape-
+health evidence; counter reset, missing target, or scrape gap resets the clock.
+The timestamped query result and eligible-image inventory are retained with
+both PRs. Exact per-replica associations remain in current `ReplicaInfo`;
+bounded structured logs supply diagnostic correlation but are not lifecycle
+authority.
 
 ## PR 3 removal gates
 
@@ -1238,9 +1330,10 @@ recorded here and in both stacked PR descriptions:
 
 1. A consistent replica-state audit reports zero active unresolved/capable
    authorization-v1/v2 intents and zero ambiguous/unlinked candidate/capable
-   replicas. Every active authorization-v3 `CAPABLE` replica has its exact
-   ordinary launch request ID, service job ID, runtime profile 2, and matching
-   supervisor-marker/capability v2.
+   replicas, quarantined rows, or partial-v13 bundles. Every active
+   authorization-v3 `CAPABLE` replica has its exact ordinary launch request ID,
+   service job ID, runtime profile 2, and matching supervisor-marker/capability
+   v2.
 2. No authorization document v1 or v2 remains in any rendered deployment,
    secret/config source, or live API/controller environment. Current active
    replica audit plus the retained bounded compatibility-telemetry window—not
@@ -1252,17 +1345,20 @@ recorded here and in both stacked PR descriptions:
    profile/marker capability v2. No status-only eligible runtime remains.
 4. From completion of one full eligible AWS Spot fleet rollout, compatibility
    telemetry reports zero authorization-document-v1/v2 selection,
-   runtime-marker-v1 read, and status-only recovery read for seven continuous
-   24-hour periods. Any hit or eligible image change resets the clock.
+   exact runtime-capability-v1 observation, and status-only recovery read for
+   seven continuous 24-hour periods. Any hit or eligible image change resets
+   the clock. This gate makes no claim about an untransported remote marker
+   read; gate 5 independently inventories the marker filesystem.
 5. A two-pass remote audit reports zero marker-v1 directories on every active
    eligible VM. The audit first snapshots active eligible replica rows and
    their exact immutable EC2 IDs, exact job IDs, and runtime digests, scans only
    that inventory, then repeats after one full controller probe interval.
-   Inventory churn is excluded only with a retained terminal replica-state plus
-   completed legacy-cleanup record; all other missing/unreachable targets fail
-   the gate. Both timestamped inventories, per-target results, and churn
-   dispositions are attached to the PR evidence. Age pruning alone is not
-   evidence.
+   The two inventories must be identical. Any addition, removal, replacement,
+   missing row, or unreachable target invalidates both passes and restarts the
+   audit from a fresh snapshot; deleted replica history or a nonexistent
+   cleanup receipt is never inferred as evidence. Both timestamped inventories
+   and every per-target result are attached to the PR evidence. Age pruning
+   alone is not evidence.
 6. Both real 16-GB authorization-v3/runtime-profile-2/supervisor-v2 smoke
    sequences pass with the Ray threshold unchanged: on-demand first-OOM
    recovery plus second-OOM legacy replacement, and Spot OOM recovery plus the
@@ -1271,9 +1367,9 @@ recorded here and in both stacked PR descriptions:
    controls persist `ORDINARY` without the CAPABLE barrier.
 7. The supported rollback target is rewritten #1182 on the unchanged legacy
    lifecycle. Terraform/Terragrunt-owned rollback/re-upgrade, authorization
-   removal, zero-active-capable/unresolved-candidate audit, legacy teardown
-   adoption, and mixed-provider operation have passed without direct-shell
-   compatibility.
+   removal, zero-active-capable/unresolved-candidate/quarantined/partial-v13
+   all-row audit, legacy teardown adoption, and mixed-provider operation have
+   passed without direct-shell compatibility.
 
 ## Open gates and unresolved decisions
 
@@ -1287,10 +1383,11 @@ recorded here and in both stacked PR descriptions:
   liveness observation plus durable preemption/down evidence used by the
   reducer. A generic process exit must not be labeled interruption or OOM, and
   no SQS/EventBridge/early-notice receiver is part of this gate.
-- Verify `sdk.launch` exposes its ordinary request ID before every relevant
-  controller-restart window and that the exact bound result carries a durable
-  service job ID. Any uncloseable association gap remains ordinary replacement
-  rather than adding a new request protocol or latest-job lookup.
+- Verify the endpoint's pre-scheduling request-ID bind survives API/controller
+  restart and a lost HTTP response, and that only that exact bound request's
+  durable result supplies the service job ID. Any uncloseable association gap
+  remains ordinary replacement rather than adding a new request protocol or
+  latest-job lookup.
 - Measure the `ARMED`-before-ready interval on both markets and confirm the
   fixed 35-second visibility/detection budgets against the live 30-second job
   poll.
