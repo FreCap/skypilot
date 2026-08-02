@@ -20,10 +20,12 @@ from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.skylet import constants
 from sky.skylet import runtime_utils
 
 logger = sky_logging.init_logger(__name__)
+metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
 if typing.TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
@@ -64,6 +66,37 @@ _POSTGRES_LOCK_APPLICATION_NAME = 'skypilot-advisory-lock'
 _POSTGRES_POOL_TIMEOUT_SECONDS = 15
 _ISOLATED_POSTGRES_CONNECT_TIMEOUT_SECONDS = 5
 _ISOLATED_POSTGRES_POOL_TIMEOUT_SECONDS = 1
+
+_API_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
+_POSTGRES_CONNECTION_METRIC_PROCESS_ROLES = frozenset({
+    'all',
+    'api',
+    'executor',
+    'controller',
+    'authority-worker',
+    'managed-job-controller',
+    'serve-controller',
+    'unknown',
+})
+_POSTGRES_CONNECTION_METRIC_BASE_PROCESS_ROLES = frozenset({
+    'all',
+    'api',
+    'executor',
+    'controller',
+    'authority-worker',
+})
+_POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES = frozenset({
+    'shared',
+    'api-requests-control',
+    'advisory-lock',
+    'physical-capacity-evidence',
+    'other',
+})
+_POSTGRES_CONNECTION_METRIC_MODES = frozenset({'sync', 'async'})
+
+_postgres_connection_metrics_process_role_override: str | None = None
+_postgres_connection_metrics_warning_emitted = False
+_postgres_connection_metrics_lock = threading.Lock()
 
 
 def is_sqlite_busy_error(e: BaseException) -> bool:
@@ -603,8 +636,8 @@ class DatabaseManager:
 
 
 _max_connections = 0
-_postgres_engine_cache: dict[tuple[str, bool, str],
-                             sqlalchemy.engine.Engine] = {}
+_postgres_engine_cache: dict[tuple[str, bool, str], sqlalchemy.engine.Engine |
+                             sqlalchemy_async.AsyncEngine] = {}
 # Session-level advisory locks must keep their PostgreSQL connection for the
 # entire lock lifetime.  Reusing the ordinary QueuePool for those connections
 # can therefore deadlock a process: a lock checks out the last pooled
@@ -617,6 +650,108 @@ _postgres_isolated_engine_cache: dict[tuple[str, str, int, int, bool, str],
 _sqlite_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
 
 _db_creation_lock = threading.Lock()
+
+
+def set_postgres_connection_metrics_process_role(process_role: str) -> None:
+    """Set the immutable connection-metric role for this process.
+
+    Specialized child entrypoints call this before plugins or database state
+    initialize. Repeating the same value is harmless, while changing roles in
+    one process would make the counter ambiguous and is rejected.
+    """
+    if process_role not in _POSTGRES_CONNECTION_METRIC_PROCESS_ROLES:
+        raise ValueError(f'Invalid PostgreSQL connection metric process role: '
+                         f'{process_role!r}')
+    global _postgres_connection_metrics_process_role_override
+    with _postgres_connection_metrics_lock:
+        current = _postgres_connection_metrics_process_role_override
+        if current is None:
+            _postgres_connection_metrics_process_role_override = process_role
+        elif current != process_role:
+            raise RuntimeError('PostgreSQL connection metric process role is '
+                               f'already set to {current!r}; cannot change it '
+                               f'to {process_role!r}.')
+
+
+def _postgres_connection_metrics_process_role() -> str:
+    override = _postgres_connection_metrics_process_role_override
+    if override is not None:
+        return override
+    process_role = os.environ.get(_API_SERVER_ROLE_ENV_VAR)
+    if process_role in _POSTGRES_CONNECTION_METRIC_BASE_PROCESS_ROLES:
+        return process_role
+    return 'unknown'
+
+
+def _postgres_connection_metrics_engine_namespace(
+        engine_namespace: str | None) -> str:
+    if not engine_namespace:
+        return 'shared'
+    if engine_namespace in _POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES:
+        return engine_namespace
+    return 'other'
+
+
+def _postgres_connection_metrics_enabled() -> bool:
+    return os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED,
+                          'false').lower() == 'true'
+
+
+def _warn_postgres_connection_metrics_failure(error: Exception) -> None:
+    global _postgres_connection_metrics_warning_emitted
+    with _postgres_connection_metrics_lock:
+        if _postgres_connection_metrics_warning_emitted:
+            return
+        _postgres_connection_metrics_warning_emitted = True
+    try:
+        logger.warning(
+            'Failed to record a PostgreSQL physical-connection metric '
+            f'({type(error).__name__}); database connection will continue.')
+    except Exception:  # pylint: disable=broad-except
+        # Observability must never make a physical database connection fail,
+        # even if a custom logging handler is broken.
+        pass
+
+
+def _record_postgres_connection_opened(
+    _dbapi_connection: Any,
+    _connection_record: Any,
+    *,
+    engine_namespace: str,
+    mode: Literal['sync', 'async'],
+) -> None:
+    try:
+        if not metrics_utils.METRICS_ENABLED:
+            return
+        metrics_utils.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL.labels(
+            process_role=_postgres_connection_metrics_process_role(),
+            engine_namespace=engine_namespace,
+            mode=mode).inc()
+    except Exception as e:  # pylint: disable=broad-except
+        _warn_postgres_connection_metrics_failure(e)
+
+
+def _install_postgres_connection_metrics_listener(
+    engine: sqlalchemy.engine.Engine | sqlalchemy_async.AsyncEngine,
+    *,
+    engine_namespace: str | None,
+    mode: Literal['sync', 'async'],
+) -> None:
+    if not _postgres_connection_metrics_enabled():
+        return
+    if mode not in _POSTGRES_CONNECTION_METRIC_MODES:
+        raise ValueError(f'Invalid PostgreSQL connection metric mode: {mode}')
+    normalized_namespace = _postgres_connection_metrics_engine_namespace(
+        engine_namespace)
+    target = engine.sync_engine if mode == 'async' else engine
+    try:
+        sqlalchemy.event.listen(
+            target, 'connect',
+            functools.partial(_record_postgres_connection_opened,
+                              engine_namespace=normalized_namespace,
+                              mode=mode))
+    except Exception as e:  # pylint: disable=broad-except
+        _warn_postgres_connection_metrics_failure(e)
 
 
 def set_max_connections(max_connections: int):
@@ -659,14 +794,16 @@ def get_postgres_lock_engine(
     connection_url = engine.url.render_as_string(hide_password=False)
     with _db_creation_lock:
         if connection_url not in _postgres_lock_engine_cache:
-            _postgres_lock_engine_cache[connection_url] = (
-                sqlalchemy.create_engine(
-                    engine.url,
-                    poolclass=sqlalchemy.NullPool,
-                    connect_args={
-                        'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS,
-                        'application_name': _POSTGRES_LOCK_APPLICATION_NAME,
-                    }))
+            lock_engine = sqlalchemy.create_engine(
+                engine.url,
+                poolclass=sqlalchemy.NullPool,
+                connect_args={
+                    'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS,
+                    'application_name': _POSTGRES_LOCK_APPLICATION_NAME,
+                })
+            _install_postgres_connection_metrics_listener(
+                lock_engine, engine_namespace='advisory-lock', mode='sync')
+            _postgres_lock_engine_cache[connection_url] = lock_engine
         return _postgres_lock_engine_cache[connection_url]
 
 
@@ -737,6 +874,8 @@ def get_isolated_postgres_engine(
                     'connect_timeout': _ISOLATED_POSTGRES_CONNECT_TIMEOUT_SECONDS,
                     'application_name': application_name,
                 })
+            _install_postgres_connection_metrics_listener(
+                isolated, engine_namespace=namespace, mode='sync')
             _postgres_isolated_engine_cache[key] = isolated
         return isolated
 
@@ -866,6 +1005,8 @@ def get_engine(
                 logger.debug(
                     f'Creating a new postgres {engine_type} engine with '
                     f'maximum {_max_connections} connections')
+                created_engine: (sqlalchemy.engine.Engine |
+                                 sqlalchemy_async.AsyncEngine)
                 if async_engine:
                     # Use NullPool for async engines to avoid event loop binding
                     # issues. asyncpg connection pools bind to the event loop on
@@ -874,27 +1015,34 @@ def get_engine(
                     # context (e.g., a thread). NullPool creates a fresh
                     # connection per operation, avoiding this issue.
                     # Refer to https://docs.sqlalchemy.org/en/21/orm/extensions/asyncio.html#using-multiple-asyncio-event-loops for more details. # pylint: disable=line-too-long
-                    _postgres_engine_cache[cache_key] = (
-                        sqlalchemy_async.create_async_engine(
-                            # The URL is used only for dialect selection;
-                            # all connection params come from async_creator.
-                            'postgresql+asyncpg://',
-                            poolclass=sqlalchemy.NullPool,
-                            async_creator=_make_asyncpg_creator(conn_string)))
+                    created_engine = sqlalchemy_async.create_async_engine(
+                        # The URL is used only for dialect selection;
+                        # all connection params come from async_creator.
+                        'postgresql+asyncpg://',
+                        poolclass=sqlalchemy.NullPool,
+                        async_creator=_make_asyncpg_creator(conn_string))
+                    _install_postgres_connection_metrics_listener(
+                        created_engine,
+                        engine_namespace=engine_namespace,
+                        mode='async')
                 elif _max_connections == 0:
-                    _postgres_engine_cache[cache_key] = (sqlalchemy.create_engine(
+                    created_engine = sqlalchemy.create_engine(
                         conn_string,
                         poolclass=sqlalchemy.NullPool,
                         connect_args={
                             'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS
-                        }))
+                        })
+                    _install_postgres_connection_metrics_listener(
+                        created_engine,
+                        engine_namespace=engine_namespace,
+                        mode='sync')
                 else:
                     # A positive value is a strict process-local limit, not a
                     # target idle size. In particular, do not restore the
                     # historical "at least five" overflow behavior here: the
                     # server distributes PostgreSQL's usable connection
                     # capacity across its processes.
-                    _postgres_engine_cache[cache_key] = (sqlalchemy.create_engine(
+                    created_engine = sqlalchemy.create_engine(
                         conn_string,
                         poolclass=sqlalchemy.pool.QueuePool,
                         pool_size=_max_connections,
@@ -904,7 +1052,12 @@ def get_engine(
                         pool_recycle=1800,
                         connect_args={
                             'connect_timeout': _POSTGRES_CONNECT_TIMEOUT_SECONDS
-                        }))
+                        })
+                    _install_postgres_connection_metrics_listener(
+                        created_engine,
+                        engine_namespace=engine_namespace,
+                        mode='sync')
+                _postgres_engine_cache[cache_key] = created_engine
             engine = _postgres_engine_cache[cache_key]
     else:
         if db_name is None:

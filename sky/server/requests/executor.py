@@ -176,6 +176,10 @@ _queue_factory: queue_base.QueueBackendFactory | None = None
 
 def executor_initializer(proc_group: str,
                          clean_env: dict[str, str] | None = None):
+    server_role = os.environ.get('SKYPILOT_API_SERVER_ROLE', 'all')
+    metrics_process_role = ('authority-worker' if server_role
+                            == 'authority-worker' else 'executor')
+    db_utils.set_postgres_connection_metrics_process_role(metrics_process_role)
     setproctitle.setproctitle(f'SkyPilot:executor:{proc_group}:'
                               f'{multiprocessing.current_process().pid}')
     # This runs in a child process of the API server. If the main process

@@ -113,8 +113,11 @@ class _FakeThread:
 
 
 @pytest.mark.parametrize('has_parent', [True, False])
+@pytest.mark.parametrize(('server_role', 'expected_metrics_role'),
+                         [('all', 'executor'), ('executor', 'executor'),
+                          ('authority-worker', 'authority-worker')])
 def test_executor_initializer_arms_watchdog_only_in_child(
-        monkeypatch, has_parent):
+        monkeypatch, has_parent, server_role, expected_metrics_role):
     """executor_initializer arms the watchdog iff a parent process exists.
 
     Executor pool children (including lazily-spawned burst workers) must die
@@ -132,13 +135,29 @@ def test_executor_initializer_arms_watchdog_only_in_child(
                           if has_parent else None))
     monkeypatch.setattr(watchdog, 'start_parent_death_watchdog',
                         lambda *args, **kwargs: armed.append(True))
+    monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', server_role)
 
     # Stub the initializer's other side effects and record they still run.
+    initialization_order = []
+    metrics_roles = []
+
+    def _set_metrics_role(role):
+        metrics_roles.append(role)
+        initialization_order.append('metrics-role')
+
+    monkeypatch.setattr(executor.db_utils,
+                        'set_postgres_connection_metrics_process_role',
+                        _set_metrics_role)
     proctitles = []
     monkeypatch.setattr(executor.setproctitle, 'setproctitle',
                         proctitles.append)
     plugins_loaded = []
-    monkeypatch.setattr(executor.plugins, 'load_plugins', plugins_loaded.append)
+
+    def _load_plugins(context):
+        plugins_loaded.append(context)
+        initialization_order.append('plugins')
+
+    monkeypatch.setattr(executor.plugins, 'load_plugins', _load_plugins)
     monkeypatch.setattr(executor.metrics_lib,
                         'register_multiproc_cleanup_atexit', lambda: None)
     clean_envs = []
@@ -157,6 +176,8 @@ def test_executor_initializer_arms_watchdog_only_in_child(
 
     assert armed == ([True] if has_parent else [])
     # Existing initializer behavior still runs regardless of the guard.
+    assert metrics_roles == [expected_metrics_role]
+    assert initialization_order == ['metrics-role', 'plugins']
     assert len(proctitles) == 1
     assert len(plugins_loaded) == 1
     assert clean_envs == [{'FOO': 'BAR'}]

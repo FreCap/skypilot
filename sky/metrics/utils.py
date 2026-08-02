@@ -183,6 +183,15 @@ SKY_PERSISTENCE_OPERATIONS_TOTAL = prom.Counter(
     ['component', 'operation', 'phase', 'backend'],
 )
 
+# Successful physical PostgreSQL connections. Labels are normalized through
+# closed allowlists in db_utils before this metric is incremented; never add a
+# database URL, user, process ID, job ID, service name, or request name here.
+SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL = prom.Counter(
+    'sky_postgres_connections_opened_total',
+    'Successful physical PostgreSQL connections opened by SkyPilot',
+    ['process_role', 'engine_namespace', 'mode'],
+)
+
 # Time a request spends waiting in the task queue (from creation to dequeue).
 SKY_APISERVER_QUEUE_WAIT_SECONDS = prom.Histogram(
     'sky_apiserver_queue_wait_seconds',

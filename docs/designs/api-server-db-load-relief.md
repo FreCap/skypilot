@@ -19,6 +19,10 @@ independent of useful work:
 5. Each forwarded HA load-balancer role heartbeat reads controller ownership
    and cutover state five times across the stable API proxy and service
    controller.
+6. Production opens roughly 168 PostgreSQL sessions per second, but the server
+   does not expose which process role and engine policy create those physical
+   sessions. Pooling changes would therefore be guesswork across paths with
+   different event-loop and advisory-lock correctness constraints.
 
 These operations are individually small, but their aggregate rate grows with
 API-server roles, services, and replicas. They also compete with user-facing
@@ -46,6 +50,8 @@ migration. No milestone changes a public API or requires an API version bump.
   rollout within the existing authority-routing rollout gate.
 - Provide an explicit disabled or legacy-equivalent setting for each behavioral
   optimization so production enablement and rollback are configuration-only.
+- Attribute successful physical PostgreSQL connections to a bounded process
+  role, engine namespace, and sync/async mode before changing any pool policy.
 
 ## Non-goals
 
@@ -61,12 +67,19 @@ migration. No milestone changes a public API or requires an API version bump.
   mutations.
 - Adding SQLite compatibility to central/API-server paths.
 - Changing the managed-job controller's 10-second idle polling interval.
+- Changing synchronous or asynchronous pool classes, pool sizes, connection
+  lifetimes, advisory-lock ownership, or prepared-statement behavior as part of
+  the connection-attribution milestone.
+- Adding database URLs, names, users, PIDs, job IDs, service names, request
+  names, or any other unbounded value to PostgreSQL connection metrics.
 
 ## Baseline and version comparison
 
-The implementation base for this design is commit
-`34ac0be6c3d7ca1bdaaf7ec8459a590a07a4df7f`, tagged `v1.1.1043`, on
-`origin/improvements`.
+The initial scheduler-index implementation was based on commit
+`34ac0be6c3d7ca1bdaaf7ec8459a590a07a4df7f`, tagged `v1.1.1043`. The
+connection-attribution milestone is based on commit
+`fbf0c1bef3a3a11e20c54d3074e954b3b7bd8c9f`, after the scheduler index shipped
+in `v1.1.1047`, on `origin/improvements`.
 
 The relevant behavior was compared directly with `v1.1.1015`:
 
@@ -119,6 +132,15 @@ That is at most about 3.8 percent of the measured 168 new sessions per second.
 Milestone 0 removes row visits and sort work but intentionally does not change
 async `NullPool` behavior. Architecture-wide connection reuse remains a
 separate investigation because a cached async engine may cross event loops.
+
+The exact `v1.1.1047` production canary confirmed that boundary. In the
+313.6-second aligned pre-deployment interval, `job_info` accumulated 1,249
+sequential scans and 6.41 million sequential tuple reads. In the 304.6-second
+aligned post-deployment interval, both deltas were zero, and the live candidate
+plan became `Limit -> LockRows -> Index Scan` with no outer sort. New sessions
+still measured about 176 per second and Aurora CPU remained between 98 and 100
+percent. The index removed the targeted scheduler amplification completely,
+but connection attribution is required before changing any pool policy.
 
 For a service with `R` trackable replicas and the default 10-second readiness
 interval, the current probe path upserts about `6R` replica rows per minute even
@@ -200,6 +222,54 @@ be merged. In the controller, the authoritative database validation must occur
 inside the role lock and after Kubernetes pod authority is established. The two
 adjacent database reads at that point can be one snapshot.
 
+### Physical PostgreSQL connection attribution
+
+```text
+PostgreSQL engine creation -> optional bounded connect listener
+                           -> successful physical DBAPI connection
+                           -> counter(process role, engine namespace, mode)
+```
+
+The counter observes SQLAlchemy's physical `connect` event. It does not count
+ORM sessions, pool checkouts, transactions, statements, failed connection
+attempts, or PostgreSQL backend connections hidden behind a future proxy. A
+`NullPool` operation therefore increments for every successful physical
+connection, while repeated checkouts from one live `QueuePool` connection do
+not. For an async engine, the listener attaches to `AsyncEngine.sync_engine`,
+which is SQLAlchemy's supported event target for the adapted DBAPI connection.
+
+Attribution uses closed labels only. The process role is resolved when the
+physical connection opens, not when the engine is created, because cached
+engines can be inherited by child processes. The server's existing
+`SKYPILOT_API_SERVER_ROLE` supplies `all`, `api`, `executor`, `controller`, and
+`authority-worker`. A validated write-once process-local override identifies
+request executor children, consolidated managed-job controllers, and
+consolidated Serve controllers before plugins or database state initialize.
+Authority-worker executor children retain `authority-worker` rather than being
+collapsed into `executor`. An unexpected role maps to `unknown` instead of
+becoming a label.
+
+Engine namespaces are normalized to `shared`, `api-requests-control`,
+`advisory-lock`, `physical-capacity-evidence`, or `other`. Sync and async are
+the only mode values. The complete Cartesian bound is therefore 8 process
+roles times 5 namespaces times 2 modes, or at most 80 labeled combinations.
+The production multiprocess collector exports one `_total` series for each
+combination. A non-multiprocess local registry may also expose Prometheus
+client's `_created` companion series. Database URLs, users, process IDs, job
+IDs, service names, request names, and caller-supplied namespaces never appear
+in labels.
+
+The first production attribution canary is deliberately limited to the current
+monolithic deployment: `apiService.highAvailability.enabled=false`, one API
+pod, and executor and controller children that share the pod's metrics
+environment and `/tmp/metrics` directory. With high availability enabled, the
+chart runs API, controller, executor, and authority-worker roles in separate
+pods, while `apiService.metrics.enabled` currently exposes only the API
+deployment's metrics endpoint. The aggregate must not be treated as complete
+in that topology until every database-owning role has a scraped endpoint or an
+equivalent cross-pod aggregation path. Adding that HA metrics topology is
+outside this observability-only PR.
+
 ## Ranked solution
 
 ### Milestone 0: index the waiting-job scheduler path
@@ -259,6 +329,100 @@ Focused tests:
 - a PostgreSQL plan test with thousands of terminal rows and no waiting rows
   uses `ix_job_info_schedule_priority` and contains no `Seq Scan` or `Sort` on
   `job_info`.
+
+### Observability gate: attribute physical PostgreSQL connections
+
+Add this counter to `sky/metrics/utils.py`:
+
+```text
+sky_postgres_connections_opened_total{
+  process_role,
+  engine_namespace,
+  mode
+}
+```
+
+The metric is present only through the existing API-server metrics surface.
+`sky/utils/db/db_utils.py` installs listeners only when
+`SKY_API_SERVER_METRICS_ENABLED=true`. When disabled, `db_utils` must neither
+resolve its lazy `sky.metrics.utils` import nor attach a listener. This makes a
+code-only rollout behaviorally inert and avoids adding Prometheus allocation
+work to controller processes that do not publish metrics.
+
+Attach exactly one listener immediately after each new PostgreSQL engine is
+created in these cache-miss branches:
+
+- the default sync or async engine in `get_engine()`;
+- the dedicated advisory-lock engine in `get_postgres_lock_engine()`; and
+- the isolated physical-capacity engine in `get_isolated_postgres_engine()`.
+
+Do not attach on cache hits or SQLite engines. Normalize a missing default
+namespace to `shared`, preserve `api-requests-control`, assign
+`advisory-lock` to the lock engine, preserve `physical-capacity-evidence`, and
+map every other namespace to `other`. Attach async events to
+`AsyncEngine.sync_engine` and label them `async`; all other paths are `sync`.
+
+Resolve the process role inside the event callback. Add a validated
+process-local setter in `db_utils` and call it before plugin or database
+initialization in:
+
+- `sky/server/requests/executor.py:executor_initializer()` with
+  `authority-worker` when the inherited server role is `authority-worker`, and
+  `executor` otherwise;
+- `sky/jobs/controller.py:main()` with `managed-job-controller`; and
+- `sky/serve/controller.py:run_controller()` with `serve-controller`.
+
+This explicit override is required because the current consolidated Serve
+controller sets the same `IS_SKYPILOT_JOB_CONTROLLER` compatibility marker as
+the managed-job controller. The base server role remains the fallback for
+ordinary API, executor, controller, and authority-worker processes. Invalid
+base roles map to `unknown`; invalid explicit setter values raise before any
+engine can be opened. Repeating the same explicit value is idempotent, while an
+attempt to change an already-set explicit process role raises. Entrypoint tests
+prove that every specialized child sets that role before plugin or database
+initialization, so it cannot first emit under the inherited server role.
+
+This is an observability-only PR. Do not change `NullPool`, `QueuePool`, pool
+sizes, recycling, timeouts, advisory-lock ownership, or event-loop behavior.
+The counter records a successful physical connection after SQLAlchemy obtains
+it. A failed connection attempt does not increment it. The listener must fail
+open: a listener-registration, import, registry, multiprocess-file, or increment
+exception emits at most one warning per process and never prevents engine use
+or rejects or closes the database connection. Metrics are not part of database
+correctness.
+
+Files:
+
+- `sky/metrics/utils.py`
+- `sky/utils/db/db_utils.py`
+- `sky/server/requests/executor.py`
+- `sky/jobs/controller.py`
+- `sky/serve/controller.py`
+- `tests/unit_tests/test_sky/utils/test_db_utils.py`
+- `tests/unit_tests/test_parent_death_watchdog.py`
+- controller entrypoint tests selected by the final diff
+- `docs/designs/api-server-db-load-relief.md`
+
+Focused tests:
+
+- the label allowlists and normalization fallbacks are closed and bounded;
+- SQLite engines never attach the PostgreSQL listener;
+- metrics-disabled PostgreSQL creation does not resolve the lazy metrics import
+  or register a listener;
+- every PostgreSQL cache-miss branch attaches once and cache hits do not attach
+  again;
+- two successful `NullPool` physical connections increment twice, while two
+  checkouts reusing one `QueuePool` physical connection increment once;
+- an async engine attaches through `sync_engine` and reports `async`;
+- failed physical connection attempts do not increment;
+- callbacks resolve the current process role at connection time;
+- a metric-recording exception warns at most once and does not make connection
+  establishment fail;
+- executor, managed-job controller, and Serve controller entrypoints install
+  their explicit role before plugins or database initialization;
+- authority-worker executor children retain `authority-worker`, repeated
+  same-role initialization is allowed, and cross-role reassignment fails; and
+- Prometheus multiprocess collection exposes the counter without a PID label.
 
 ### Milestone 1: throttle expired-claim reaping independently
 
@@ -627,8 +791,15 @@ response-contract change is accepted.
 
 ## Backward compatibility
 
-- There are no database migrations, columns, indexes, serialized fields, REST
-  routes, headers, response fields, or public configuration changes.
+- Revision 027 adds one backward-compatible managed-jobs index and no column or
+  serialized-state change. The remaining milestones add no database migration.
+  No milestone changes REST routes, headers, response fields, or public API
+  versioning.
+- Connection attribution is installed only when the existing
+  `SKY_API_SERVER_METRICS_ENABLED=true` contract is active. With metrics
+  disabled, there is no listener and `db_utils` does not resolve its metrics
+  import. Enabling it adds one bounded counter to the existing metrics endpoint
+  without changing pool behavior or requiring an API version bump.
 - For handlers understood by both versions, old and new queue consumers can run
   together. Old consumers sweep more often; row locks, lease tokens, execution
   generations, and terminal transitions remain authoritative.
@@ -667,6 +838,44 @@ Each milestone is a separate PR and deployment gate.
 5. Stop if the migration cannot converge or the plan does not use the index.
    The migration is forward-only; a binary rollback remains compatible with
    the additive index, and a later reviewed migration may remove it if needed.
+
+### Observability gate
+
+1. Deploy the attribution code with API-server metrics disabled and verify the
+   API, controllers, session rate, and pool classes remain unchanged.
+2. Confirm the canary is the supported monolithic topology: high availability
+   is disabled and one API pod owns the executor and controller children. If
+   roles are split across pods, stop because the standard metrics flag does not
+   yet make their counters visible through the API endpoint. Then enable
+   `apiService.metrics.enabled=true` on the API-server replica through Helm.
+   Verify that the rendered environment, port 9090, Service port, and scrape
+   annotations appear together. Do not assume the annotations prove a scraper
+   exists; either verify the installed scraper target or use a controlled
+   port-forward scrape.
+3. Query:
+
+   ```promql
+   sum by (process_role, engine_namespace, mode) (
+     rate(sky_postgres_connections_opened_total[5m])
+   )
+   ```
+
+   Compare its aggregate over one aligned interval with the
+   `pg_stat_database.sessions` delta. Investigate any sustained gap before
+   changing a pool. A future PgBouncer deployment would change this counter to
+   SkyPilot-to-PgBouncer connections and would require separate backend-session
+   telemetry. Compare API-process CPU, event-loop lag, request latency, and
+   queue wait with the metrics-disabled interval so the counter's own write
+   cadence is proven negligible.
+4. Inspect Prometheus multiprocess files under `/tmp/metrics` for file count
+   and bytes during the canary. Counter files are process-scoped and can remain
+   after short-lived children exit until pod restart, so storage growth follows
+   unique writer PIDs rather than connection count. Treat any fail-open
+   metric-recording warning as an observability-canary failure even though
+   database work continues.
+5. Roll back by disabling `apiService.metrics.enabled`. Do not change async
+   pooling, add PgBouncer, or tune connection limits until the measured role and
+   namespace distribution identifies the dominant path.
 
 ### Milestone 1
 
@@ -711,6 +920,7 @@ Each milestone is a separate PR and deployment gate.
 | Milestone | Success | Roll back or stop |
 |---|---|---|
 | 0 | Idle `job_info` scans fall by about 238/min and tuple reads fall by about 1.22 million/min; claim order and outcomes are unchanged. | Migration or index shape is invalid, the candidate plan retains an outer sequential scan or sort, lock waiters appear, or managed-job behavior differs. |
+| Attribution gate | The bounded counter's aligned aggregate explains the material share of `pg_stat_database.sessions`, every emitted label is in its allowlist, and pool behavior plus API CPU and latency are unchanged. | Listener or metric appears while disabled, unknown labels grow, metric recording warns, the aggregate materially diverges without explanation, `/tmp/metrics` grows without a safe bound, API CPU or latency materially regresses, or API/controller behavior changes. |
 | 1 | In a PostgreSQL request-backend deployment, empty-queue reads fall from about 40 to about 22 `SELECT`s/s at a 1-second interval; queue latency is unchanged. | An under-cap expiry set recovers later than interval plus normal scheduling tolerance, a capped backlog stops draining immediately, replay outcome changes, or database errors increase. |
 | 2 | Combined with 1, empty-queue reads approach 4 `SELECT`s/s at a 1-second cap. | Short-request queue-wait p99 breaches its service objective or shutdown becomes slower. |
 | 3 | Stable services approach zero replica-row updates while transition counts and outcomes match baseline. | Missed readiness transition, wrong teardown classification, stale LB ready set, or probe-round error increase. |
@@ -724,6 +934,8 @@ fixture environment.
 
 ```bash
 pytest -n 0 tests/unit_tests/test_batch_recovery.py -k 'schema_027 or waiting_job'
+pytest -n 0 tests/unit_tests/test_sky/utils/test_db_utils.py
+pytest -n 0 tests/unit_tests/test_parent_death_watchdog.py
 pytest -n 0 tests/unit_tests/test_api_requests_pg.py -k 'expired or reap or queue'
 pytest -n 0 tests/unit_tests/test_sky/server/requests/test_executor.py
 pytest -n 0 tests/unit_tests/test_serve_replica_managers.py -k 'probe or readiness or preemption'
@@ -740,17 +952,23 @@ Manual verification:
 
 1. Record five-minute `pg_stat_user_tables` deltas for `job_info`, run the exact
    candidate `EXPLAIN`, apply revision 027, and repeat both measurements.
-2. Record a five-minute idle baseline for queue statement count and queue-wait
+2. With metrics disabled, confirm engine pool types and the absence of the new
+   listener remain unchanged. Confirm high availability is disabled and all
+   database-owning child roles share the API pod. Enable metrics on that
+   replica, scrape the new counter, compare its aligned rate with
+   `pg_stat_database.sessions`, and inspect `/tmp/metrics` count and bytes
+   before and after representative executor and controller activity.
+3. Record a five-minute idle baseline for queue statement count and queue-wait
    histograms, enable Milestones 1 and 2 independently, and repeat in a
    PostgreSQL request-backend environment.
-3. Seed one expired read-only claim and one expired mutating claim. Confirm the
+4. Seed one expired read-only claim and one expired mutating claim. Confirm the
    former receives a new generation and token, while the latter becomes an
    ambiguous cancelled request with `should_retry` set.
-4. Run a sustained nonempty queue and prove there is no idle sleep and no
+5. Run a sustained nonempty queue and prove there is no idle sleep and no
    throughput regression.
-5. On a large stable service, record replica upsert rows for ten probe rounds,
+6. On a large stable service, record replica upsert rows for ten probe rounds,
    enable Milestone 3, then force ready-to-unready and recovery transitions.
-6. In HA, record one stable heartbeat, each cutover phase, a controller owner
+7. In HA, record one stable heartbeat, each cutover phase, a controller owner
    transfer during a heartbeat, and the exact database statement count before
    and after Milestone 4.
 
@@ -760,6 +978,9 @@ Manual verification:
 |---|---|---|
 | `sky/jobs/state_schema.py` and spot-jobs revision 027 | ordered waiting-job access path | SQLite and PostgreSQL migration shape, interrupted-build repair, live plan and scan-rate canary |
 | `sky/utils/db/migration_utils.py` | managed-jobs schema target | fresh bootstrap and 026-to-027 upgrade tests |
+| `sky/metrics/utils.py` | bounded successful-physical-connection counter | metrics registry and multiprocess collection tests, closed-label review |
+| `sky/utils/db/db_utils.py` | one listener per PostgreSQL engine and process-role resolution | disabled-path import test, sync/async and pool reuse tests, cache-hit deduplication, namespace and role fallbacks |
+| `sky/server/requests/executor.py`, `sky/jobs/controller.py`, and `sky/serve/controller.py` | exact child-process role override before database initialization | entrypoint ordering tests and existing executor/controller lifecycle suites |
 | `sky/server/requests/postgres.py` | expired-claim cadence while preserving queue fencing | PostgreSQL request tests, mixed-consumer race, statement-count observation |
 | `sky/server/requests/executor.py` | bounded idle polling and interruptible shutdown | request executor tests, deterministic backoff tests, queue-wait canary |
 | `sky/serve/replica_managers.py` | changed-only readiness bookkeeping | probe transition and preemption tests, large-fleet write-count canary |
