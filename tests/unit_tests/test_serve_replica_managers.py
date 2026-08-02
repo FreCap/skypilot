@@ -13,10 +13,12 @@ Covers:
 # pylint: disable=protected-access,import-outside-toplevel,reimported
 # pylint: disable=unused-argument,invalid-name,line-too-long
 # pylint: disable=missing-class-docstring,unnecessary-dunder-call
+import asyncio
 import dataclasses
 import json
 import logging
 import threading
+import time
 import types
 from unittest import mock
 
@@ -31,6 +33,9 @@ from sky.provision import common as provision_common
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import serve_utils
+from sky.serve import system_recovery_route_lease
+from sky.serve import system_recovery_state as recovery_state
+from sky.skylet import job_lib
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import thread_utils
@@ -251,7 +256,7 @@ class TestSkyPilotReplicaManagerInitOrdering:
         # boot), and the manager lock was already held when it returned —
         # so any daemon started afterwards cannot win it.
         assert mgr.lock.locked() is True
-        assert len(started) == 3
+        assert len(started) == 4
         lock_state_at_daemon_start.append(mgr.lock.locked())
         release.set()
         # Recovery finishes and releases the lock.
@@ -262,18 +267,19 @@ class TestSkyPilotReplicaManagerInitOrdering:
             time_mod.sleep(0.05)
         assert mgr.lock.locked() is False
 
-    def test_all_three_daemon_threads_are_started(self):
+    def test_all_daemon_threads_are_started(self):
         started = []
         self._build(lambda self_: None, started)
         assert '_thread_pool_refresher' in started
         assert '_job_status_fetcher' in started
         assert '_replica_prober' in started
+        assert '_system_recovery_route_prober' in started
 
-    def test_all_three_daemon_threads_share_ownership_stop_event(self):
+    def test_all_daemon_threads_share_ownership_stop_event(self):
         calls = []
         mgr = self._build(lambda self_: None, [], supervisor_calls=calls)
 
-        assert len(calls) == 3
+        assert len(calls) == 4
         assert all(
             kwargs['stop_event'] is mgr._ownership_lost for _, kwargs in calls)
 
@@ -733,7 +739,1011 @@ def _fake_replica_info(replica_id, status=None):
     info.status_property.preempted = False
     info.status_property.is_scale_down = False
     info.status_property.purged = False
+    # Recovery fields are also lifecycle inputs.  Bare Mock attributes are
+    # truthy, which would make an ordinary fake look quarantined/capable and
+    # route it into the fail-closed teardown path.
+    info.system_recovery_quarantine = None
+    info.system_recovery_disposition = (
+        recovery_state.SystemRecoveryDisposition.ORDINARY)
+    info.system_recovery_launch_intent = None
+    info.system_recovery = None
     return info
+
+
+def _system_recovery_replica(
+    replica_id,
+    disposition=recovery_state.SystemRecoveryDisposition.ORDINARY,
+):
+    info = replica_managers.ReplicaInfo(replica_id, f'svc-{replica_id}', '8080',
+                                        False, None, 1, None)
+    info.system_recovery_disposition = disposition
+    if disposition == recovery_state.SystemRecoveryDisposition.CAPABLE:
+        info.system_recovery = recovery_state.ReplicaSystemRecovery(
+            state=recovery_state.ControllerRecoveryState.ARMED,
+            job_id=9,
+            capability=recovery_state.SYSTEM_RECOVERY_CAPABILITY,
+            original_attempt_id='11111111-1111-4111-8111-111111111111',
+            replacement_attempt_id=None,
+            node_boot_id='boot-id',
+            remote_phase=recovery_state.RemoteRecoveryPhase.ARMED,
+            occurrence_count=0,
+            armed_at=10.0)
+    return info
+
+
+def test_system_recovery_process_guards_are_pruned_to_live_dispositions():
+    manager = _make_manager()
+    manager._candidate_release_monotonic_deadlines = {
+        1: 101.0,
+        2: 102.0,
+        3: 103.0,
+        99: 199.0,
+    }
+    manager._system_recovery_status_initialized = {1, 2, 3, 99}
+    candidate = _system_recovery_replica(
+        1, recovery_state.SystemRecoveryDisposition.CANDIDATE)
+    capable = _system_recovery_replica(
+        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
+    ordinary = _system_recovery_replica(3)
+
+    manager._prune_system_recovery_process_guards(
+        [candidate, capable, ordinary])
+
+    assert manager._candidate_release_monotonic_deadlines == {1: 101.0}
+    assert manager._system_recovery_status_initialized == {2}
+
+
+def test_candidate_guard_is_dropped_on_concurrent_capable_promotion():
+    manager = _make_manager()
+    manager._candidate_release_monotonic_deadlines = {1: 101.0}
+    candidate = _system_recovery_replica(
+        1, recovery_state.SystemRecoveryDisposition.CANDIDATE)
+    promoted = _system_recovery_replica(
+        1, recovery_state.SystemRecoveryDisposition.CAPABLE)
+    manager._patch_system_recovery_with_latest = mock.Mock(
+        return_value=promoted)
+
+    updated, off_route, teardown = manager._reduce_candidate_probe(
+        candidate,
+        succeeded=True,
+        probe_started_at=100.0,
+        probe_monotonic_started_at=100.0,
+        exact_job_nonterminal=True,
+        exact_detail_absent=True)
+
+    assert updated is promoted
+    assert off_route is True
+    assert teardown is False
+    assert manager._candidate_release_monotonic_deadlines == {}
+
+
+def test_capable_status_guard_is_dropped_on_concurrent_exhaustion():
+    manager = _make_manager()
+    capable = _system_recovery_replica(
+        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
+    exhausted = dataclasses.replace(
+        capable.system_recovery,
+        state=recovery_state.ControllerRecoveryState.EXHAUSTED,
+        completed_at=100.0)
+    capable.system_recovery = exhausted
+    manager._system_recovery_status_initialized = {2}
+    manager._patch_system_recovery_with_latest = mock.Mock(return_value=capable)
+
+    _, reduction = manager._reduce_capable_probe(capable,
+                                                 succeeded=False,
+                                                 probe_started_at=100.0)
+
+    assert reduction is None
+    assert manager._system_recovery_status_initialized == set()
+
+
+def _remote_recovery_detail(
+    phase: job_lib.JobSystemRecoveryPhase = job_lib.JobSystemRecoveryPhase.
+    ARMED,
+) -> job_lib.JobSystemRecoveryInfo:
+    replacement_attempt_id = None
+    event_id = None
+    reason = None
+    occurred_at = None
+    deadline_at = None
+    occurrence_count = 0
+    if phase != job_lib.JobSystemRecoveryPhase.ARMED:
+        replacement_attempt_id = '22222222-2222-4222-8222-222222222222'
+        event_id = '33333333-3333-4333-8333-333333333333'
+        reason = 'RAY_NODE_OOM'
+        occurred_at = 20.0
+        deadline_at = 140.0
+        occurrence_count = 1
+    return job_lib.JobSystemRecoveryInfo(
+        capability=recovery_state.SYSTEM_RECOVERY_CAPABILITY,
+        phase=phase,
+        original_attempt_id='11111111-1111-4111-8111-111111111111',
+        replacement_attempt_id=replacement_attempt_id,
+        task_index=0,
+        node_boot_id='boot-id',
+        occurrence_count=occurrence_count,
+        armed_at=10.0,
+        updated_at=30.0,
+        event_id=event_id,
+        reason=reason,
+        occurred_at=occurred_at,
+        deadline_at=deadline_at)
+
+
+def test_route_issuance_evidence_must_exactly_match_armed_attempt():
+    manager = _make_manager()
+    manager._system_recovery_route_epoch = (
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    info = _system_recovery_replica(
+        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
+    info.service_job_id = 9
+
+    assert manager._system_recovery_route_evidence_matches(
+        info, job_lib.JobStatus.RUNNING, _remote_recovery_detail(),
+        job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+    assert not manager._system_recovery_route_evidence_matches(
+        info, job_lib.JobStatus.RUNNING,
+        _remote_recovery_detail(job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED),
+        job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+    assert not manager._system_recovery_route_evidence_matches(
+        info, job_lib.JobStatus.FAILED, _remote_recovery_detail(),
+        job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+
+
+def test_recovered_route_requires_exact_replacement_attempt_evidence():
+    manager = _make_manager()
+    manager._system_recovery_route_epoch = (
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    info = _system_recovery_replica(
+        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
+    info.service_job_id = 9
+    assert info.system_recovery is not None
+    info.system_recovery = dataclasses.replace(
+        info.system_recovery,
+        state=recovery_state.ControllerRecoveryState.RECOVERED,
+        remote_phase=recovery_state.RemoteRecoveryPhase.RETRY_SUBMITTED,
+        occurrence_count=1,
+        replacement_attempt_id='22222222-2222-4222-8222-222222222222',
+        event_id='33333333-3333-4333-8333-333333333333',
+        reason='RAY_NODE_OOM',
+        started_at=20.0,
+        deadline=140.0,
+        retry_submitted_adopted_at=25.0,
+        completed_at=30.0)
+
+    detail = _remote_recovery_detail(
+        job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED)
+    assert manager._system_recovery_route_evidence_matches(
+        info, job_lib.JobStatus.RUNNING, detail,
+        job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+    mismatched = dataclasses.replace(
+        detail, replacement_attempt_id='44444444-4444-4444-8444-444444444444')
+    assert not manager._system_recovery_route_evidence_matches(
+        info, job_lib.JobStatus.RUNNING, mismatched,
+        job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+
+
+def test_route_registry_prunes_recreated_numeric_replica_identity():
+    manager = _make_manager()
+    manager._system_recovery_route_epoch = (
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    manager._system_recovery_route_registry = (
+        system_recovery_route_lease.ManagerRouteLeaseRegistry(
+            clock=lambda: 1.0))
+    old = _system_recovery_replica(
+        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
+    generation = manager._system_recovery_route_generation(old)
+    assert generation is not None
+    assert manager._route_lease_registry().issue(2, generation,
+                                                 'http://replica:8080',
+                                                 '/ready', None, None, 0.0)
+    replacement = _system_recovery_replica(
+        2, recovery_state.SystemRecoveryDisposition.CAPABLE)
+    assert replacement.replica_record_id != old.replica_record_id
+    manager._route_lease_registry().prune({2: replacement.replica_record_id})
+    assert manager._route_lease_registry().marker(2, generation,
+                                                  'http://replica:8080') is None
+
+
+def test_route_prober_connector_does_not_queue_targets_above_aiohttp_default(
+        monkeypatch):
+    manager = _make_manager()
+    manager._ownership_lost = threading.Event()
+    target_count = 101
+    targets = [
+        types.SimpleNamespace(method='GET',
+                              probe_url=f'http://replica-{index}:8080/ready',
+                              headers=None,
+                              post_data=None) for index in range(target_count)
+    ]
+    results = []
+
+    class _Registry:
+
+        def probe_targets(self):
+            return targets
+
+        def record_probe_result(self, target, *, request_started_at, succeeded):
+            results.append((target, request_started_at, succeeded))
+            if len(results) == target_count:
+                manager._ownership_lost.set()
+
+    registry = _Registry()
+    manager._route_lease_registry = lambda: registry
+    concurrency = {'current': 0, 'peak': 0}
+
+    class _Response:
+
+        status = 200
+
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            await self._session.semaphore.acquire()
+            concurrency['current'] += 1
+            concurrency['peak'] = max(concurrency['peak'],
+                                      concurrency['current'])
+            if concurrency['current'] == target_count:
+                self._session.all_started.set()
+            await asyncio.wait_for(self._session.all_started.wait(), timeout=1)
+            return self
+
+        async def __aexit__(self, *_args):
+            concurrency['current'] -= 1
+            self._session.semaphore.release()
+
+    class _Session:
+
+        def __init__(self, *, connector):
+            assert connector.limit == (replica_managers.serve_constants.
+                                       SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS)
+            self._connector = connector
+            self.semaphore = asyncio.Semaphore(connector.limit)
+            self.all_started = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            await self._connector.close()
+
+        def request(self, *_args, **_kwargs):
+            return _Response(self)
+
+    monkeypatch.setattr(replica_managers.aiohttp, 'ClientSession', _Session)
+
+    asyncio.run(manager._system_recovery_route_probe_loop())
+
+    assert concurrency['peak'] == target_count
+    assert len(results) == target_count
+    assert all(succeeded for _, _, succeeded in results)
+
+
+class TestOrderedRouteIssuanceWorker:
+
+    _ROUTE_URL = 'http://10.0.0.2:8080'
+
+    @staticmethod
+    def _ready_info(replica_id, *, capable):
+        disposition = (recovery_state.SystemRecoveryDisposition.CAPABLE
+                       if capable else
+                       recovery_state.SystemRecoveryDisposition.ORDINARY)
+        info = _system_recovery_replica(replica_id, disposition)
+        info.service_job_id = 9
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        info.status_property.first_ready_time = 1.0
+        return info
+
+    @staticmethod
+    def _routable_reduction(info):
+        return recovery_state.RecoveryReduction(
+            state=info.system_recovery,
+            changed=False,
+            force_off_route=False,
+            clear_probe_failure_window=False,
+            mark_ready=True,
+            schedule_legacy_teardown=False)
+
+    def _manager(self, capable):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager._uptime = 1.0
+        manager._system_recovery_route_epoch = (
+            'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+        manager._system_recovery_status_initialized = {capable.replica_id}
+        manager._system_recovery_route_registry = (
+            system_recovery_route_lease.ManagerRouteLeaseRegistry(
+                clock=lambda: 150.0))
+        manager._get_readiness_path = mock.Mock(return_value='/health')
+        manager._get_post_data = mock.Mock(return_value=None)
+        manager._get_readiness_timeout_seconds = mock.Mock(return_value=15)
+        manager._get_readiness_headers = mock.Mock(return_value=None)
+        manager._is_interruptible_replica = mock.Mock(return_value=False)
+        manager._consecutive_failure_threshold_timeout = mock.Mock(
+            return_value=1000)
+        manager._reduce_capable_probe = mock.Mock(
+            side_effect=lambda info, **_kwargs:
+            (info, self._routable_reduction(info)))
+        manager._reconcile_system_recovery_status = mock.Mock(
+            return_value=False)
+        manager._persist_replicas = mock.Mock()
+        return manager
+
+    def _run(self, manager, infos, capable, status_result):
+        handle = object()
+        capable.handle = mock.Mock(return_value=handle)
+        manager._resolve_probe_urls = mock.Mock(
+            return_value={info.replica_id: self._ROUTE_URL for info in infos})
+        spec = mock.Mock(readiness_path='/health',
+                         post_data=None,
+                         readiness_headers=None)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=infos), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_specs',
+                               return_value={1: spec}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_clusters_from_names',
+                 return_value={capable.cluster_name: {'handle': handle}}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=capable), \
+             mock.patch.object(
+                 replica_managers.backends.CloudVmRayBackend,
+                 'get_job_status_with_system_recovery',
+                 side_effect=status_result) as status_fetch, \
+             mock.patch.object(replica_managers,
+                               'time',
+                               mock.Mock(wraps=time)) as manager_time:
+            manager_time.monotonic.return_value = 1.0
+            result = manager._probe_all_replicas()
+        return result, status_fetch
+
+    def test_later_fast_worker_issues_before_earlier_future_drains(self):
+        ordinary = self._ready_info(1, capable=False)
+        capable = self._ready_info(2, capable=True)
+        manager = self._manager(capable)
+        issued = threading.Event()
+        ordering = []
+        ordinary_observation = {'issued_before_return': False}
+        registry = manager._route_lease_registry()
+        original_issue = registry.issue
+
+        def _issue(*args, **kwargs):
+            ordering.append('issue')
+            result = original_issue(*args, **kwargs)
+            issued.set()
+            return result
+
+        registry.issue = mock.Mock(side_effect=_issue)
+
+        def _ordinary_probe(*_args, request_started_callback=None, **_kwargs):
+            assert request_started_callback is not None
+            request_started_callback(2.0)
+            ordinary_observation['issued_before_return'] = issued.wait(1)
+            return ordinary, False, 200.0
+
+        def _capable_probe(*_args, request_started_callback=None, **_kwargs):
+            assert request_started_callback is not None
+            request_started_callback(100.0)
+            ordering.append('readiness_response')
+            return capable, True, 200.0
+
+        ordinary.probe = mock.Mock(side_effect=_ordinary_probe)
+        capable.probe = mock.Mock(side_effect=_capable_probe)
+
+        def _status(*_args, **_kwargs):
+            ordering.append('status')
+            return ({
+                9: job_lib.JobStatus.RUNNING
+            }, {
+                9: _remote_recovery_detail()
+            }, {
+                9: job_lib.JobSystemRecoveryDetailStatus.PRESENT
+            })
+
+        self._run(manager, [ordinary, capable], capable, _status)
+
+        assert ordinary_observation['issued_before_return']
+        assert ordering == ['readiness_response', 'status', 'issue']
+        targets = registry.probe_targets()
+        assert len(targets) == 1
+        assert targets[0].replica_id == capable.replica_id
+        # Registry time is 150. Submission time is 1; only the callback's
+        # exact HTTP start (100 + the 60s lease) can still be admitted.
+        assert capable.status_property.service_ready_now
+
+    def test_adopted_replacement_issues_before_earlier_future_drains(self):
+        ordinary = self._ready_info(1, capable=False)
+        capable = self._ready_info(2, capable=True)
+        assert capable.system_recovery is not None
+        capable.system_recovery = dataclasses.replace(
+            capable.system_recovery,
+            state=recovery_state.ControllerRecoveryState.RETRY_SUBMITTED,
+            remote_phase=recovery_state.RemoteRecoveryPhase.RETRY_SUBMITTED,
+            replacement_attempt_id='22222222-2222-4222-8222-222222222222',
+            event_id='33333333-3333-4333-8333-333333333333',
+            reason='RAY_NODE_OOM',
+            occurrence_count=1,
+            started_at=20.0,
+            deadline=240.0,
+            retry_submitted_adopted_at=100.0)
+        manager = self._manager(capable)
+        issued = threading.Event()
+        ordering = []
+        ordinary_observation = {'issued_before_return': False}
+        registry = manager._route_lease_registry()
+        original_issue = registry.issue
+
+        def _issue(*args, **kwargs):
+            ordering.append('issue')
+            result = original_issue(*args, **kwargs)
+            issued.set()
+            return result
+
+        registry.issue = mock.Mock(side_effect=_issue)
+
+        def _ordinary_probe(*_args, request_started_callback=None, **_kwargs):
+            assert request_started_callback is not None
+            request_started_callback(2.0)
+            ordinary_observation['issued_before_return'] = issued.wait(1)
+            return ordinary, False, 200.0
+
+        def _replacement_probe(*_args,
+                               request_started_callback=None,
+                               **_kwargs):
+            assert request_started_callback is not None
+            request_started_callback(100.0)
+            ordering.append('readiness_response')
+            return capable, True, 200.0
+
+        ordinary.probe = mock.Mock(side_effect=_ordinary_probe)
+        capable.probe = mock.Mock(side_effect=_replacement_probe)
+
+        def _status(*_args, **_kwargs):
+            ordering.append('status')
+            detail = _remote_recovery_detail(
+                job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED)
+            return ({
+                9: job_lib.JobStatus.RUNNING
+            }, {
+                9: detail
+            }, {
+                9: job_lib.JobSystemRecoveryDetailStatus.PRESENT
+            })
+
+        def _adopt(_info, *_evidence):
+            assert capable.system_recovery is not None
+            capable.system_recovery = dataclasses.replace(
+                capable.system_recovery,
+                state=recovery_state.ControllerRecoveryState.RECOVERED,
+                completed_at=201.0)
+            return False
+
+        manager._reconcile_system_recovery_status = mock.Mock(
+            side_effect=_adopt)
+        self._run(manager, [ordinary, capable], capable, _status)
+
+        assert ordinary_observation['issued_before_return']
+        assert ordering == ['readiness_response', 'status', 'issue']
+        targets = registry.probe_targets()
+        assert len(targets) == 1
+        assert targets[0].generation.recovery_state == 'RECOVERED'
+        assert capable.status_property.service_ready_now
+
+    @pytest.mark.parametrize('invoke_start_callback', [False, True])
+    def test_missing_start_or_malformed_status_cannot_issue(
+            self, invoke_start_callback):
+        capable = self._ready_info(2, capable=True)
+        manager = self._manager(capable)
+
+        def _probe(*_args, request_started_callback=None, **_kwargs):
+            if invoke_start_callback:
+                assert request_started_callback is not None
+                request_started_callback(100.0)
+            return capable, True, 200.0
+
+        capable.probe = mock.Mock(side_effect=_probe)
+        self._run(manager, [capable], capable, lambda *_args, **_kwargs: None)
+
+        assert manager._route_lease_registry().probe_targets() == []
+        assert not capable.status_property.service_ready_now
+
+    @pytest.mark.parametrize(('adopted_at', 'expected_issued'), [(200.0, False),
+                                                                 (100.0, True)])
+    def test_retry_submitted_requires_probe_strictly_after_durable_adoption(
+            self, adopted_at, expected_issued):
+        capable = self._ready_info(2, capable=True)
+        assert capable.system_recovery is not None
+        capable.system_recovery = dataclasses.replace(
+            capable.system_recovery,
+            state=recovery_state.ControllerRecoveryState.RETRY_SUBMITTED,
+            remote_phase=recovery_state.RemoteRecoveryPhase.RETRY_SUBMITTED,
+            replacement_attempt_id='22222222-2222-4222-8222-222222222222',
+            event_id='33333333-3333-4333-8333-333333333333',
+            reason='RAY_NODE_OOM',
+            occurrence_count=1,
+            started_at=20.0,
+            deadline=140.0,
+            retry_submitted_adopted_at=adopted_at)
+        manager = self._manager(capable)
+
+        def _probe(*_args, request_started_callback=None, **_kwargs):
+            assert request_started_callback is not None
+            request_started_callback(100.0)
+            return capable, True, 200.0
+
+        capable.probe = mock.Mock(side_effect=_probe)
+
+        def _adopt(_info, *_evidence):
+            assert capable.system_recovery is not None
+            capable.system_recovery = dataclasses.replace(
+                capable.system_recovery,
+                state=recovery_state.ControllerRecoveryState.RECOVERED,
+                completed_at=201.0,
+                retry_submitted_adopted_at=adopted_at)
+            return False
+
+        manager._reconcile_system_recovery_status = mock.Mock(
+            side_effect=_adopt)
+        detail = _remote_recovery_detail(
+            job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED)
+        self._run(
+            manager, [capable], capable, lambda *_args, **_kwargs: ({
+                9: job_lib.JobStatus.RUNNING
+            }, {
+                9: detail
+            }, {
+                9: job_lib.JobSystemRecoveryDetailStatus.PRESENT
+            }))
+
+        assert bool(manager._route_lease_registry().probe_targets()) is (
+            expected_issued)
+        assert capable.status_property.service_ready_now is expected_issued
+
+
+class TestProbeRouteSuspensionTransaction:
+
+    _ROUTE_URL = 'http://10.0.0.1:8080'
+    _SERVICE_HASH = 'incarnation-a'
+    _CONTROLLER_OWNER = (123, '10.0.0.10')
+
+    @staticmethod
+    def _recovered_info(replica_id):
+        info = _system_recovery_replica(
+            replica_id, recovery_state.SystemRecoveryDisposition.CAPABLE)
+        assert info.system_recovery is not None
+        info.system_recovery = dataclasses.replace(
+            info.system_recovery,
+            state=recovery_state.ControllerRecoveryState.RECOVERED,
+            remote_phase=recovery_state.RemoteRecoveryPhase.RETRY_SUBMITTED,
+            replacement_attempt_id=(
+                f'22222222-2222-4222-8222-{replica_id:012d}'),
+            occurrence_count=1,
+            event_id=f'33333333-3333-4333-8333-{replica_id:012d}',
+            reason='RAY_NODE_OOM',
+            started_at=20.0,
+            deadline=140.0,
+            retry_submitted_adopted_at=25.0,
+            completed_at=30.0)
+        info.service_job_id = 9
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        info.status_property.first_ready_time = 1.0
+        info.status_property.service_ready_now = True
+        info.probe = mock.Mock(return_value=(info, False, 100.0))
+        return info
+
+    @staticmethod
+    def _off_route_reduction(info):
+        return recovery_state.RecoveryReduction(
+            state=info.system_recovery,
+            changed=False,
+            force_off_route=True,
+            clear_probe_failure_window=False,
+            mark_ready=False,
+            schedule_legacy_teardown=False)
+
+    def _manager(self, infos):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager._uptime = 1.0
+        manager._service_hash = self._SERVICE_HASH
+        manager._controller_owner = self._CONTROLLER_OWNER
+        manager._system_recovery_route_epoch = (
+            'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+        manager._system_recovery_status_initialized = {
+            info.replica_id for info in infos
+        }
+        manager._system_recovery_route_registry = (
+            system_recovery_route_lease.ManagerRouteLeaseRegistry(
+                clock=lambda: 10.0))
+        manager._resolve_probe_urls = mock.Mock(
+            return_value={info.replica_id: self._ROUTE_URL for info in infos})
+        manager._get_readiness_path = mock.Mock(return_value='/health')
+        manager._get_post_data = mock.Mock(return_value=None)
+        manager._get_readiness_timeout_seconds = mock.Mock(return_value=15)
+        manager._get_readiness_headers = mock.Mock(return_value=None)
+        manager._is_interruptible_replica = mock.Mock(return_value=False)
+        manager._consecutive_failure_threshold_timeout = mock.Mock(
+            return_value=1000)
+        manager._reduce_capable_probe = mock.Mock(
+            side_effect=lambda info, **_kwargs:
+            (info, self._off_route_reduction(info)))
+        return manager
+
+    def _owner_record(self):
+        return {
+            'hash': self._SERVICE_HASH,
+            'controller_pid': self._CONTROLLER_OWNER[0],
+            'controller_ip': self._CONTROLLER_OWNER[1],
+            'lifecycle_epoch': 1,
+            'status': replica_managers.serve_state.ServiceStatus.READY,
+        }
+
+    def _durable_copy(self, info):
+        copied = self._recovered_info(info.replica_id)
+        copied.replica_record_id = info.replica_record_id
+        copied.system_recovery_revision = info.system_recovery_revision
+        return copied
+
+    def _off_route_copy(self, info):
+        off_route = self._durable_copy(info)
+        off_route.status_property.service_ready_now = False
+        return off_route
+
+    def _activate_route(self, manager, info):
+        registry = manager._route_lease_registry()
+        generation = manager._system_recovery_route_generation(info)
+        assert generation is not None
+        assert registry.issue(info.replica_id, generation, self._ROUTE_URL,
+                              '/health', None, None, 10.0)
+        target = next(target for target in registry.probe_targets()
+                      if target.replica_id == info.replica_id)
+        registry.record_probe_result(target,
+                                     request_started_at=10.0,
+                                     succeeded=True)
+        assert registry.marker(info.replica_id, generation,
+                               self._ROUTE_URL) is not None
+        assert registry.heartbeat_payload()['entries']
+        return registry, generation
+
+    def _run_probe(self, manager, infos, persist, readback_infos=None):
+        if readback_infos is None:
+            readback_infos = {}
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=infos), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_specs',
+                               return_value={1: mock.Mock()}), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_clusters_from_names',
+                               return_value={}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=self._owner_record()), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value=readback_infos), \
+             mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replicas',
+                               side_effect=persist):
+            return manager._probe_all_replicas()
+
+    def test_exception_before_batch_commit_restores_exact_route(self):
+        info = self._recovered_info(1)
+        durable = self._durable_copy(info)
+        manager = self._manager([info])
+        registry, generation = self._activate_route(manager, info)
+        marker_before = registry.marker(1, generation, self._ROUTE_URL)
+        assert marker_before is not None
+
+        def _persist(_service_name, updates, **_kwargs):
+            assert updates == [(1, info)]
+            assert registry.marker(1, generation, self._ROUTE_URL) is None
+            assert registry.heartbeat_payload()['entries'] == []
+            assert registry.probe_targets() == []
+            raise RuntimeError('database unavailable')
+
+        with mock.patch.object(registry,
+                               'suspend_record',
+                               wraps=registry.suspend_record) as suspend, \
+             pytest.raises(RuntimeError):
+            self._run_probe(manager, [info], _persist, {1: durable})
+
+        suspend.assert_called_once_with(1, info.replica_record_id)
+        assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
+        assert len(registry.heartbeat_payload()['entries']) == 1
+        assert len(registry.probe_targets()) == 1
+        assert not registry.is_retired(1, generation)
+
+    def test_false_batch_result_permanently_retires_route(self):
+        info = self._recovered_info(1)
+        manager = self._manager([info])
+        registry, generation = self._activate_route(manager, info)
+
+        def _persist(_service_name, _updates, **_kwargs):
+            assert registry.marker(1, generation, self._ROUTE_URL) is None
+            return False
+
+        with pytest.raises(RuntimeError, match='ownership changed'):
+            self._run_probe(manager, [info], _persist,
+                            {1: self._durable_copy(info)})
+
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.is_retired(1, generation)
+
+    def test_commit_then_raise_batch_permanently_retires_route(self):
+        info = self._recovered_info(1)
+        manager = self._manager([info])
+        registry, generation = self._activate_route(manager, info)
+
+        def _persist(_service_name, _updates, **_kwargs):
+            assert registry.marker(1, generation, self._ROUTE_URL) is None
+            raise RuntimeError('connection lost after commit')
+
+        with pytest.raises(RuntimeError, match='connection lost after commit'):
+            # The probe mutates this object before the DB call, modeling the
+            # committed row returned by the ambiguity readback.
+            self._run_probe(manager, [info], _persist, {1: info})
+
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.is_retired(1, generation)
+
+    def test_exception_before_single_commit_restores_proven_route(self):
+        durable = self._recovered_info(1)
+        update = self._off_route_copy(durable)
+        manager = self._manager([durable])
+        registry, generation = self._activate_route(manager, durable)
+        marker_before = registry.marker(1, generation, self._ROUTE_URL)
+
+        def _persist(*_args, **_kwargs):
+            assert registry.marker(1, generation, self._ROUTE_URL) is None
+            raise RuntimeError('write did not commit')
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replica',
+                               side_effect=_persist), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=self._owner_record()), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: durable}), \
+             pytest.raises(RuntimeError, match='write did not commit'):
+            manager._persist_replica(1, update)
+
+        assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
+        assert not registry.is_retired(1, generation)
+
+    @pytest.mark.parametrize('readback_case', [
+        'missing',
+        'changed_record',
+        'off_route',
+        'teardown',
+        'malformed',
+        'read_error',
+        'owner_changed',
+    ])
+    def test_single_commit_ambiguity_retires_unproven_route(
+            self, readback_case):
+        durable = self._recovered_info(1)
+        update = self._off_route_copy(durable)
+        manager = self._manager([durable])
+        registry, generation = self._activate_route(manager, durable)
+        owner = self._owner_record()
+        readback = {1: durable}
+        readback_side_effect = None
+        if readback_case == 'missing':
+            readback = {}
+        elif readback_case == 'changed_record':
+            changed = self._durable_copy(durable)
+            changed.replica_record_id = ('44444444-4444-4444-8444-444444444444')
+            readback = {1: changed}
+        elif readback_case == 'off_route':
+            readback = {1: update}
+        elif readback_case == 'teardown':
+            teardown = self._durable_copy(durable)
+            teardown.status_property.is_scale_down = True
+            readback = {1: teardown}
+        elif readback_case == 'malformed':
+            readback = None
+        elif readback_case == 'read_error':
+            readback_side_effect = RuntimeError('readback failed')
+        else:
+            owner = {**owner, 'controller_pid': 999}
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replica',
+                               side_effect=RuntimeError(
+                                   'connection lost after possible commit')), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value=readback,
+                               side_effect=readback_side_effect), \
+             pytest.raises(RuntimeError,
+                           match='connection lost after possible commit'):
+            manager._persist_replica(1, update)
+
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.is_retired(1, generation)
+
+    def test_cancelled_ambiguity_owner_read_retires_route_and_reraises(self):
+        durable = self._recovered_info(1)
+        update = self._off_route_copy(durable)
+        manager = self._manager([durable])
+        registry, generation = self._activate_route(manager, durable)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'add_or_update_replica',
+                side_effect=RuntimeError('connection lost after write')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_service_controller_owner',
+                 side_effect=asyncio.CancelledError), \
+             pytest.raises(asyncio.CancelledError):
+            manager._persist_replica(1, update)
+
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.is_retired(1, generation)
+
+    def test_cancelled_ambiguity_row_check_retires_route_and_reraises(self):
+        durable = self._recovered_info(1)
+        update = self._off_route_copy(durable)
+        manager = self._manager([durable])
+        registry, generation = self._activate_route(manager, durable)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'add_or_update_replica',
+                side_effect=RuntimeError('connection lost after write')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_service_controller_owner',
+                 return_value=self._owner_record()), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos_from_ids',
+                 return_value={1: durable}), \
+             mock.patch.object(
+                 manager,
+                 '_system_recovery_route_generation',
+                 side_effect=asyncio.CancelledError), \
+             pytest.raises(asyncio.CancelledError):
+            manager._persist_replica(1, update)
+
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.is_retired(1, generation)
+
+    def test_commit_then_raise_recovery_patch_retires_route(self):
+        durable = self._recovered_info(1)
+        update = self._durable_copy(durable)
+        manager = self._manager([durable])
+        registry, generation = self._activate_route(manager, durable)
+
+        def _transition(info):
+            info.status_property.service_ready_now = False
+            return True
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=update), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=self._owner_record()), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: update}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'patch_replica_system_recovery',
+                               side_effect=RuntimeError(
+                                   'connection lost after patch commit')), \
+             pytest.raises(RuntimeError, match='after patch commit'):
+            manager._patch_system_recovery_with_latest(1, _transition)
+
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.is_retired(1, generation)
+
+    def test_commit_then_raise_delete_retires_route(self):
+        durable = self._recovered_info(1)
+        manager = self._manager([durable])
+        registry, generation = self._activate_route(manager, durable)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'remove_replica',
+                               side_effect=RuntimeError(
+                                   'connection lost after delete commit')), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=self._owner_record()), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={}), \
+             pytest.raises(RuntimeError, match='after delete commit'):
+            manager._remove_replica(1, durable.replica_record_id)
+
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.is_retired(1, generation)
+
+    def test_batch_delete_exception_before_commit_restores_proven_routes(self):
+        durable = self._recovered_info(1)
+        manager = self._manager([durable])
+        registry, generation = self._activate_route(manager, durable)
+        marker_before = registry.marker(1, generation, self._ROUTE_URL)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'remove_replicas',
+                               side_effect=RuntimeError(
+                                   'batch delete did not commit')), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=self._owner_record()), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: durable}), \
+             pytest.raises(RuntimeError, match='did not commit'):
+            manager._remove_replicas([durable])
+
+        assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
+        assert not registry.is_retired(1, generation)
+
+    def test_successful_batch_permanently_retires_route(self):
+        info = self._recovered_info(1)
+        manager = self._manager([info])
+        registry, generation = self._activate_route(manager, info)
+
+        def _persist(_service_name, updates, **_kwargs):
+            assert updates == [(1, info)]
+            assert registry.marker(1, generation, self._ROUTE_URL) is None
+            assert registry.heartbeat_payload()['entries'] == []
+            assert registry.probe_targets() == []
+            return True
+
+        with mock.patch.object(registry,
+                               'suspend_record',
+                               wraps=registry.suspend_record) as suspend:
+            self._run_probe(manager, [info], _persist)
+
+        suspend.assert_called_once_with(1, info.replica_record_id)
+        assert registry.marker(1, generation, self._ROUTE_URL) is None
+        assert registry.heartbeat_payload()['entries'] == []
+        assert registry.probe_targets() == []
+        assert registry.is_retired(1, generation)
+
+    def test_exception_before_batch_restores_prior_suspension(self):
+        first = self._recovered_info(1)
+        second = self._recovered_info(2)
+        manager = self._manager([first, second])
+        registry, generation = self._activate_route(manager, first)
+        marker_before = registry.marker(1, generation, self._ROUTE_URL)
+        assert marker_before is not None
+        manager._reduce_capable_probe.side_effect = [
+            (first, self._off_route_reduction(first)),
+            RuntimeError('second reduction failed'),
+        ]
+        persist = mock.Mock(return_value=True)
+
+        with mock.patch.object(registry,
+                               'suspend_record',
+                               wraps=registry.suspend_record) as suspend, \
+             pytest.raises(RuntimeError, match='second reduction failed'):
+            self._run_probe(manager, [first, second], persist)
+
+        persist.assert_not_called()
+        suspend.assert_called_once_with(1, first.replica_record_id)
+        assert registry.marker(1, generation, self._ROUTE_URL) == marker_before
+        assert len(registry.heartbeat_payload()['entries']) == 1
+        assert len(registry.probe_targets()) == 1
+        assert not registry.is_retired(1, generation)
 
 
 class TestLaunchCancellationWait:
@@ -880,7 +1890,7 @@ def test_confirm_logical_bridge_capacity_is_durable_and_monotonic():
         confirmed = mgr.confirm_logical_bridge_capacities({1: 8})
 
     assert confirmed == {1: 8}
-    assert info.to_storage_dict()['replica_info_version'] == 12
+    assert info.to_storage_dict()['replica_info_version'] == 13
     assert info.planned_capacity == 8
     assert info.logical_bridge_capacity_verified is True
     assert persisted == [(1, info)]
@@ -1084,6 +2094,7 @@ class TestLaunchClusterRetry:
         Returns (mock_sdk, mock_terminate, raised RuntimeError or None).
         """
         observed_workspaces = kwargs.pop('observed_workspaces', None)
+        launch_side_effect = kwargs.pop('launch_side_effect', None)
         raised = None
         task = mock.MagicMock()
         resource = mock.MagicMock()
@@ -1100,7 +2111,9 @@ class TestLaunchClusterRetry:
                        ) as mock_backoff:
             mock_backoff.return_value.current_backoff.return_value = (
                 backoff_seconds)
-            if observed_workspaces is None:
+            if launch_side_effect is not None:
+                mock_sdk.launch.side_effect = launch_side_effect
+            elif observed_workspaces is None:
                 mock_sdk.launch.return_value = 'request-id'
             else:
 
@@ -1408,6 +2421,114 @@ run: echo hi
         assert 'ownership loss' in str(raised)
         mock_sdk.api_cancel.assert_called_once_with('request-id')
 
+    @staticmethod
+    def _recovery_handle(cluster_name='svc-1'):
+        handle = mock.Mock(
+            spec=replica_managers.backends.CloudVmRayResourceHandle)
+        handle.cluster_name = cluster_name
+        return handle
+
+    def test_recovery_request_captures_exact_returned_job(self, tmp_path):
+        get_bound = mock.Mock(return_value='request-id')
+        persist_job = mock.Mock(return_value=True)
+        demote = mock.Mock(return_value=True)
+        recovery_context = {'closed': 'context'}
+        handle = self._recovery_handle()
+
+        mock_sdk, _, raised = self._run_launch_cluster(
+            tmp_path, [(7, handle)],
+            system_recovery_launch_context=recovery_context,
+            get_bound_system_recovery_request_id=get_bound,
+            persist_system_recovery_job_id=persist_job,
+            demote_system_recovery_candidate=demote)
+
+        assert raised is None
+        assert mock_sdk.launch.call_count == 1
+        assert (mock_sdk.launch.call_args.kwargs['_extra_launch_context'] ==
+                recovery_context)
+        get_bound.assert_called_once_with()
+        persist_job.assert_called_once_with('request-id', 7)
+        demote.assert_not_called()
+
+    def test_lost_launch_response_adopts_only_bound_request(self, tmp_path):
+        get_bound = mock.Mock(return_value='bound-request')
+        persist_job = mock.Mock(return_value=True)
+        demote = mock.Mock(return_value=True)
+        handle = self._recovery_handle()
+
+        mock_sdk, _, raised = self._run_launch_cluster(
+            tmp_path, [(11, handle)],
+            launch_side_effect=RuntimeError('response lost'),
+            system_recovery_launch_context={'closed': 'context'},
+            get_bound_system_recovery_request_id=get_bound,
+            persist_system_recovery_job_id=persist_job,
+            demote_system_recovery_candidate=demote)
+
+        assert raised is None
+        mock_sdk.stream_and_get.assert_called_once_with('bound-request')
+        persist_job.assert_called_once_with('bound-request', 11)
+        demote.assert_not_called()
+
+    def test_request_mismatch_demotes_before_one_ordinary_retry(self, tmp_path):
+        get_bound = mock.Mock(return_value='different-request')
+        persist_job = mock.Mock(return_value=True)
+        demote = mock.Mock(return_value=True)
+
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [None],
+            launch_side_effect=['request-id', 'ordinary-request'],
+            system_recovery_launch_context={'closed': 'context'},
+            get_bound_system_recovery_request_id=get_bound,
+            persist_system_recovery_job_id=persist_job,
+            demote_system_recovery_candidate=demote)
+
+        assert raised is None
+        assert mock_sdk.launch.call_count == 2
+        first_call, second_call = mock_sdk.launch.call_args_list
+        assert '_extra_launch_context' in first_call.kwargs
+        assert '_extra_launch_context' not in second_call.kwargs
+        demote.assert_called_once_with()
+        persist_job.assert_not_called()
+        mock_terminate.assert_called_once()
+
+    def test_demotion_failure_refuses_second_launch_request(self, tmp_path):
+        demote = mock.Mock(return_value=False)
+
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [None],
+            system_recovery_launch_context={'closed': 'context'},
+            get_bound_system_recovery_request_id=mock.Mock(
+                return_value='different-request'),
+            persist_system_recovery_job_id=mock.Mock(return_value=True),
+            demote_system_recovery_candidate=demote)
+
+        assert isinstance(raised,
+                          replica_managers._SystemRecoveryLaunchCaptureError)
+        assert mock_sdk.launch.call_count == 1
+        demote.assert_called_once_with()
+        mock_terminate.assert_not_called()
+
+    @pytest.mark.parametrize('malformed_result',
+                             [None, (True, object()), (1, object())])
+    def test_malformed_recovery_result_demotes_before_retry(
+            self, tmp_path, malformed_result):
+        get_bound = mock.Mock(return_value='request-id')
+        persist_job = mock.Mock(return_value=True)
+        demote = mock.Mock(return_value=True)
+
+        mock_sdk, _, raised = self._run_launch_cluster(
+            tmp_path, [malformed_result, None],
+            launch_side_effect=['request-id', 'ordinary-request'],
+            system_recovery_launch_context={'closed': 'context'},
+            get_bound_system_recovery_request_id=get_bound,
+            persist_system_recovery_job_id=persist_job,
+            demote_system_recovery_candidate=demote)
+
+        assert raised is None
+        assert mock_sdk.launch.call_count == 2
+        demote.assert_called_once_with()
+        persist_job.assert_not_called()
+
 
 class TestLaunchReplicaAvailabilityMaxRetry:
     """`_launch_replica` must cap availability failures at one attempt only
@@ -1448,9 +2569,11 @@ class TestLaunchReplicaAvailabilityMaxRetry:
                  return_value='/tmp/launch.log'), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.ReplicaInfo'), \
+             mock.patch('sky.serve.replica_managers.ReplicaInfo') as replica_info, \
              mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'
                        ) as mock_thread:
+            replica_info.return_value.replica_record_id = (
+                '00000000-0000-4000-8000-000000000001')
             manager._launch_replica(replica_id=1)
         return mock_thread.call_args
 
@@ -1601,6 +2724,35 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         assert info2.version == 3
         assert info3.version == 2
         assert terminal.version == 1
+
+    def test_capable_replica_is_not_relabelled_to_new_readiness_contract(self):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        mgr._update_mode = None
+        mgr._persist_replica = mock.Mock()
+        info = mock.Mock(replica_id=1, version=1, is_terminal=False)
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.CAPABLE)
+        yaml_content = ('resources: {}\n'
+                        'file_mounts: {}\n'
+                        'service: {readiness_probe: /new-health}\n')
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_yaml_content',
+                               return_value=yaml_content), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_yaml_contents',
+                               return_value={1: yaml_content}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]):
+            mgr.update_version(2,
+                               mock.Mock(spot_placer=None),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert info.version == 1
+        mgr._persist_replica.assert_not_called()
 
     def test_missing_old_version_yaml_fails_before_persisting(self):
         mgr = _make_manager()
@@ -2293,8 +3445,10 @@ class TestLaunchOwnershipFence:
     """A stale manager must never start work that was only queued locally."""
 
     @staticmethod
-    def _pending_info():
+    def _pending_info(replica_id=1):
         info = mock.Mock()
+        info.replica_id = replica_id
+        info.replica_record_id = (f'00000000-0000-4000-8000-{replica_id:012d}')
         info.status = replica_managers.serve_state.ReplicaStatus.PENDING
         info.status_property = mock.Mock()
         info.created_at = 100.0
@@ -2326,7 +3480,7 @@ class TestLaunchOwnershipFence:
             mgr._launch_thread_pool[replica_id] = thread
             mgr._replica_to_request_id[replica_id] = f'req-{replica_id}'
             mgr._replica_to_launch_cancelled[replica_id] = False
-            infos[replica_id] = cls._pending_info()
+            infos[replica_id] = cls._pending_info(replica_id)
         return mgr, infos
 
     def test_recovering_exact_owner_may_launch_from_controller_failed(self):
@@ -2857,8 +4011,9 @@ class TestLaunchOwnershipFence:
         placer.is_launch_admissible.assert_has_calls(
             [mock.call(location, selected_at=100.0)] * 3)
         assert remove.call_args_list == [
-            mock.call(1), mock.call(2),
-            mock.call(3)
+            mock.call(1, infos[1].replica_record_id),
+            mock.call(2, infos[2].replica_record_id),
+            mock.call(3, infos[3].replica_record_id)
         ]
         for launch_thread in launch_threads:
             launch_thread.start.assert_not_called()
@@ -2905,7 +4060,7 @@ class TestLaunchOwnershipFence:
         placer.set_active.assert_not_called()
         placer.set_preemptive.assert_called_once_with(location,
                                                       reason='capacity')
-        remove.assert_called_once_with(3)
+        remove.assert_called_once_with(3, infos[3].replica_record_id)
         launch_threads[2].start.assert_not_called()
         assert len(mgr._launch_thread_pool) == 0
 
@@ -6623,7 +7778,11 @@ class TestLogicalCapacityPlanning:
             'svc',
             list(range(1, 16)),
             'incarnation-a',
-            expected_controller_owner=(101, '10.0.0.1'))
+            expected_controller_owner=(101, '10.0.0.1'),
+            expected_replica_record_ids={
+                victim.replica_id: victim.replica_record_id
+                for victim in victims
+            })
         mgr._terminate_replica.assert_not_called()
         point_read.assert_not_called()
         cluster_exists.assert_not_called()
@@ -6682,7 +7841,8 @@ class TestLogicalCapacityPlanning:
         remove_batch.assert_called_once_with(
             'svc', [1],
             'incarnation-a',
-            expected_controller_owner=(101, '10.0.0.1'))
+            expected_controller_owner=(101, '10.0.0.1'),
+            expected_replica_record_ids={1: victims[0].replica_record_id})
         assert [call.args[0] for call in mgr._terminate_replica.call_args_list
                ] == [2, 3, 4]
         assert 1 not in mgr._launch_thread_pool
@@ -6789,7 +7949,8 @@ class TestLogicalCapacityPlanning:
         remove_batch.assert_called_once_with(
             'svc', [1],
             'incarnation-a',
-            expected_controller_owner=(101, '10.0.0.1'))
+            expected_controller_owner=(101, '10.0.0.1'),
+            expected_replica_record_ids={1: never_served.replica_record_id})
         # The served victim takes the graceful drain path, never a hard delete.
         assert [call.args[0] for call in defer.call_args_list] == [2]
         mgr._terminate_replica.assert_not_called()
@@ -7771,6 +8932,8 @@ class TestLaunchReplicaSnapshotAccumulation:
         def _fake_replica_info_ctor(replica_id, *_args, **_kwargs):
             info = mock.Mock()
             info.replica_id = replica_id
+            info.replica_record_id = (
+                f'00000000-0000-4000-8000-{replica_id:012d}')
             info.is_spot = True
             return info
 
@@ -7844,6 +9007,8 @@ class TestLaunchReplicaSnapshotAccumulation:
             'use_spot': True,
         }
         persisted = []
+        prior_record_id = '11111111-1111-4111-8111-111111111111'
+        prior_created_at = 123.5
 
         with mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=True), \
@@ -7862,6 +9027,8 @@ class TestLaunchReplicaSnapshotAccumulation:
                                     resources_override=resources_override,
                                     existing_replica_infos=[],
                                     recovering_existing_replica=True,
+                                    prior_replica_record_id=prior_record_id,
+                                    prior_created_at=prior_created_at,
                                     prior_version=1,
                                     prior_yaml_content='resources: {}')
 
@@ -7872,6 +9039,8 @@ class TestLaunchReplicaSnapshotAccumulation:
         assert persisted[0].get_spot_location() == (
             replica_managers.spot_placer.Location.from_resources_override(
                 resources_override))
+        assert persisted[0].replica_record_id == prior_record_id
+        assert persisted[0].created_at == prior_created_at
 
     def test_logical_recovery_preserves_persisted_capacity(self):
         placer = mock.Mock()
@@ -8103,7 +9272,7 @@ class TestFailedCleanupReconciliation:
              mock.patch.object(manager, '_remove_replica') as remove:
             manager._handle_sky_down_finish(info, format_exc=None)
 
-        remove.assert_called_once_with(1)
+        remove.assert_called_once_with(1, info.replica_record_id)
         persist.assert_not_called()
         assert not manager._failed_cleanup_retry_attempts
         assert not manager._failed_cleanup_retry_at
@@ -8506,7 +9675,7 @@ class TestPaidLocationLaunchBudget:
         manager._demand_should_skip_saturated_zero_cost = mock.Mock(
             return_value=False)
         persisted = []
-        manager._persist_replica = mock.Mock(
+        manager._persist_new_replica = mock.Mock(
             side_effect=lambda _replica_id, info: persisted.append(info))
 
         with mock.patch.object(replica_managers.serve_state,
@@ -8785,7 +9954,7 @@ class TestPaidLocationLaunchBudget:
                        replica_managers.serve_state.ReplicaStatus.PROVISIONING),
         ]
         manager._next_replica_id = 3
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
         manager._demand_should_skip_saturated_zero_cost = mock.Mock(
             return_value=False)
@@ -8808,7 +9977,7 @@ class TestPaidLocationLaunchBudget:
         assert not launched
         assert len(unresolved) == 2
         assert manager._next_replica_id == 3
-        manager._persist_replica.assert_not_called()
+        manager._persist_new_replica.assert_not_called()
         safe_thread.assert_not_called()
 
     def test_globally_saturated_pool_spills_to_next_paid_pool(self):
@@ -8916,7 +10085,9 @@ class TestPaidLocationLaunchBudget:
                                              budget) is None
         assert manager._next_replica_id == 1
         assert not manager._launch_thread_pool
-        launch_thread.assert_called_once()
+        # Launch workers are now materialized only after admission and the
+        # optional durable recovery-candidate transition both succeed.
+        launch_thread.assert_not_called()
 
     def test_service_envelope_stops_large_physical_wave(self):
         cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -9001,7 +10172,7 @@ class TestPaidLocationLaunchBudget:
         manager._controller_owner = (1, '10.0.0.1')
         manager._next_replica_id = 1
         manager._pending_version = None
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         manager._uses_shared_zero_cost_demand_budget = mock.Mock(
             return_value=False)
         manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
@@ -9034,8 +10205,8 @@ class TestPaidLocationLaunchBudget:
             manager._scale_up_batch_locked([resources_override])
 
         claim.assert_not_called()
-        manager._persist_replica.assert_called_once()
-        persisted = manager._persist_replica.call_args.args[1]
+        manager._persist_new_replica.assert_called_once()
+        persisted = manager._persist_new_replica.call_args.args[1]
         assert persisted.reserved_fill is reserved_fill
         assert persisted.is_zero_cost is True
         persisted_location = persisted.get_spot_location()
@@ -9143,7 +10314,7 @@ class TestPaidLocationLaunchBudget:
         manager._controller_owner = (1, '10.0.0.1')
         manager._next_replica_id = 1
         manager._pending_version = None
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         manager._uses_shared_zero_cost_demand_budget = mock.Mock(
             return_value=False)
         manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
@@ -9178,7 +10349,7 @@ class TestPaidLocationLaunchBudget:
             manager._scale_up_batch_locked([{'use_spot': True}] * 2)
 
         claim.assert_not_called()
-        assert manager._persist_replica.call_count == 2
+        assert manager._persist_new_replica.call_count == 2
         assert manager._next_replica_id == 3
         assert len(manager._launch_thread_pool) == 2
 
@@ -9195,7 +10366,7 @@ class TestPaidLocationLaunchBudget:
         manager._controller_owner = (1, '10.0.0.1')
         manager._next_replica_id = 1
         manager._pending_version = None
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         manager._uses_shared_zero_cost_demand_budget = mock.Mock(
             return_value=False)
         manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
@@ -9245,8 +10416,8 @@ class TestPaidLocationLaunchBudget:
 
         if exempt_kind == 'reserved_fill':
             claim.assert_not_called()
-            manager._persist_replica.assert_called_once()
-            persisted = manager._persist_replica.call_args.args[1]
+            manager._persist_new_replica.assert_called_once()
+            persisted = manager._persist_new_replica.call_args.args[1]
             assert persisted.reserved_fill
             assert persisted.is_zero_cost
             assert replica_managers.spot_placer.locations_match_placement(
@@ -9257,7 +10428,7 @@ class TestPaidLocationLaunchBudget:
             # A fresh cost replacement is location-pinned but not yet
             # admitted. It must not bypass a full paid service envelope.
             claim.assert_not_called()
-            manager._persist_replica.assert_not_called()
+            manager._persist_new_replica.assert_not_called()
             assert manager._next_replica_id == 1
             assert not manager._launch_thread_pool
 
@@ -9278,7 +10449,7 @@ class TestPaidLocationLaunchBudget:
         manager._controller_owner = (1, '10.0.0.1')
         manager._next_replica_id = 1
         manager._pending_version = None
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         manager._uses_shared_zero_cost_demand_budget = mock.Mock(
             return_value=False)
         manager._demand_should_skip_zero_cost = mock.Mock(return_value=True)
@@ -9318,8 +10489,8 @@ class TestPaidLocationLaunchBudget:
             manager._scale_up_batch_locked([{'use_spot': True}, fill])
 
         claim.assert_called_once()
-        manager._persist_replica.assert_called_once()
-        persisted = manager._persist_replica.call_args.args[1]
+        manager._persist_new_replica.assert_called_once()
+        persisted = manager._persist_new_replica.call_args.args[1]
         assert persisted.reserved_fill
         assert persisted.is_zero_cost
         assert replica_managers.spot_placer.locations_match_placement(
@@ -9341,7 +10512,7 @@ class TestPaidLocationLaunchBudget:
         manager._controller_owner = (1, '10.0.0.1')
         manager._next_replica_id = 1
         manager._pending_version = None
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         manager._uses_shared_zero_cost_demand_budget = mock.Mock(
             return_value=False)
         manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
@@ -9387,7 +10558,7 @@ class TestPaidLocationLaunchBudget:
         # each require admission. The marker pins location; only a durable
         # recovery row with an existing claim bypasses new admission.
         assert claim.call_count == 2
-        manager._persist_replica.assert_not_called()
+        manager._persist_new_replica.assert_not_called()
         assert budget.feedback_deferred_frontiers == {('l4',)}
         assert manager._next_replica_id == 1
         assert not manager._launch_thread_pool
@@ -9399,7 +10570,7 @@ class TestPaidLocationLaunchBudget:
         manager._service_hash = 'hash'
         manager._next_replica_id = 1
         manager._pending_version = None
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
         manager._demand_should_skip_saturated_zero_cost = mock.Mock(
             return_value=False)
@@ -9437,7 +10608,7 @@ class TestPaidLocationLaunchBudget:
         assert paid_capacity.select_location(manager._spot_placer,
                                              budget) is None
         exhaust.assert_not_called()
-        manager._persist_replica.assert_not_called()
+        manager._persist_new_replica.assert_not_called()
 
     def test_priority_deferred_large_wave_claims_same_pool_once(self):
         cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -9957,7 +11128,8 @@ class TestRecoveryRetryAndIsolation:
                                         info,
                                         expected_service_hash='incarnation-a',
                                         expected_controller_owner=(123,
-                                                                   '10.0.0.1'))
+                                                                   '10.0.0.1'),
+                                        expected_replica_exists=True)
 
     def test_one_bad_launch_does_not_strand_the_rest(self):
         mgr = _make_manager(next_replica_id=1)
@@ -10017,6 +11189,48 @@ class TestRecoveryRetryAndIsolation:
 
         assert launched == [1]
 
+    def test_bound_candidate_adopter_uses_joinable_launch_worker(self):
+        """A restarted exact-request waiter must notify the refresher."""
+        mgr = _make_manager()
+        candidate = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        candidate.cluster_name = 'svc-1'
+        candidate.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.CANDIDATE)
+        candidate.system_recovery_launch_intent = mock.sentinel.intent
+        candidate.launch_request_id = 'request-1'
+        candidate.service_job_id = None
+        worker = mock.Mock(spec=replica_managers._ReplicaLaunchThread)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[candidate]), \
+             mock.patch.object(
+                 mgr,
+                 '_initialize_system_recovery_process_guards',
+                 side_effect=lambda infos: infos), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'generate_replica_launch_log_file_name',
+                 return_value='/tmp/launch.log'), \
+             mock.patch.object(
+                 replica_managers,
+                 '_ReplicaLaunchThread',
+                 return_value=worker) as launch_thread:
+            mgr._recover_replica_operations()
+
+        runtime = mgr._legacy_mutation_runtime_state()
+        launch_thread.assert_called_once_with(
+            target=replica_managers.adopt_system_recovery_launch,
+            replica_id=1,
+            completion_queue=runtime.launch_completion_queue,
+            completion_event=runtime.launch_completion_event,
+            args=(1, 'svc-1', '/tmp/launch.log', 'request-1', mock.ANY))
+        assert runtime.launch_thread_pool[1] is worker
+        assert runtime.replica_to_request_id[1] == 'request-1'
+        worker.start.assert_called_once_with()
+
     def test_redrive_preserves_reserved_fill_attribution(self):
         # A fill replica surviving a controller respawn is re-driven with
         # its persisted (sentinel-stripped) override; the replacement row
@@ -10038,6 +11252,10 @@ class TestRecoveryRetryAndIsolation:
         demand_row.reserved_fill = False
         demand_row.paid_capacity_pool_key = 'exact-paid-pool'
         persisted: dict = {}
+
+        def _persist(_service_name, replica_id, info, **_kwargs):
+            persisted[replica_id] = info
+
         with mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=False), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
@@ -10052,8 +11270,7 @@ class TestRecoveryRetryAndIsolation:
              mock.patch(
                  'sky.serve.replica_managers.serve_state.'
                  'add_or_update_replica',
-                 side_effect=lambda _svc, rid, info: persisted.__setitem__(
-                     rid, info)), \
+                 side_effect=_persist), \
              mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             mgr._recover_replica_operations()
         assert persisted[1].reserved_fill is True
@@ -10079,6 +11296,9 @@ class TestRecoveryRetryAndIsolation:
         interrupted.cost_rebalance_for_replica_id = None
         persisted: dict[int, replica_managers.ReplicaInfo] = {}
 
+        def _persist(_service_name, replica_id, info, **_kwargs):
+            persisted[replica_id] = info
+
         with mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=False), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
@@ -10093,8 +11313,7 @@ class TestRecoveryRetryAndIsolation:
              mock.patch(
                  'sky.serve.replica_managers.serve_state.'
                  'add_or_update_replica',
-                 side_effect=lambda _svc, rid, info: persisted.__setitem__(
-                     rid, info)), \
+                 side_effect=_persist), \
              mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             mgr._recover_replica_operations()
 

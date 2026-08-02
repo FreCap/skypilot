@@ -8,6 +8,7 @@ context to :mod:`sky.skylet.subprocess_supervisor`.
 from collections.abc import Callable
 import contextlib
 import dataclasses
+import enum
 import functools
 import inspect
 import json
@@ -27,6 +28,7 @@ import typing
 from typing import Any
 import uuid
 
+from sky import sky_logging
 from sky.skylet import constants
 from sky.skylet import job_lib
 
@@ -35,6 +37,8 @@ if typing.TYPE_CHECKING:
 else:
     from sky.adaptors import common as adaptors_common
     psutil = adaptors_common.LazyImport('psutil')
+
+logger = sky_logging.init_logger(__name__)
 
 PROFILE_VERSION_DIRECT_SHELL = 1
 PROFILE_VERSION_OWNED_CONTAINER = 2
@@ -62,11 +66,71 @@ DOCKER_EMPTY_SAMPLES = 3
 DOCKER_EMPTY_SAMPLE_INTERVAL_SECONDS = 1
 RECOVERY_TIMEOUT_SECONDS = 120
 FIRST_EVENT_VISIBILITY_SECONDS = 35
+SYSTEM_RECOVERY_ARM_WINDOW_SECONDS = 35
+SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS = 83
+MAX_RECOVERY_HOST_MEMORY_GIB = 16
+MAX_RECOVERY_HOST_MEMORY_BYTES = MAX_RECOVERY_HOST_MEMORY_GIB * 1024**3
 MEMORY_SAFE_SAMPLES = 3
 MEMORY_SAFE_SAMPLE_INTERVAL_SECONDS = 1
 DEFAULT_RAY_MEMORY_USAGE_THRESHOLD = 0.95
 MAX_REPLAY_MEMORY_USAGE_FRACTION = 0.90
 RAY_MEMORY_HYSTERESIS = 0.05
+
+_DRIVER_ADMISSION_STAGES = frozenset({'arm', 'replay_memory', 'replay_runtime'})
+_DRIVER_ADMISSION_DECISIONS = frozenset({'accepted', 'rejected'})
+_DRIVER_ADMISSION_REASONS = frozenset({
+    'accepted',
+    'arm_window_expired',
+    'boot_changed',
+    'capability_unavailable_at_oom',
+    'cgroup_above_16_gib',
+    'cgroup_invalid',
+    'cgroup_unavailable',
+    'marker_malformed',
+    'marker_rejected',
+    'memory_safe',
+    'memory_watermark_timeout',
+    'placement_group_not_created',
+    'placement_group_unavailable',
+    'ray_session_changed',
+    'ray_session_unavailable',
+    'recovery_state_mismatch',
+    'recovery_state_unavailable',
+    'task_completed_before_arm',
+    'task_failed_before_arm',
+})
+_DRIVER_ADMISSION_CGROUP_STATES = frozenset({
+    'at_most_16_gib', 'above_16_gib', 'invalid', 'not_checked', 'unavailable',
+    'unknown'
+})
+_DRIVER_ADMISSION_RAY_SESSION_STATES = frozenset(
+    {'captured', 'changed', 'not_checked', 'unavailable', 'unchanged'})
+
+
+def _log_driver_admission(*, stage: str, decision: str, reason: str,
+                          cgroup_state: str, ray_session_state: str,
+                          profile_version: int | None) -> None:
+    """Emit one closed, non-identifying driver admission decision."""
+    if stage not in _DRIVER_ADMISSION_STAGES:
+        stage = 'arm'
+    if decision not in _DRIVER_ADMISSION_DECISIONS:
+        decision = 'rejected'
+    if reason not in _DRIVER_ADMISSION_REASONS:
+        reason = 'recovery_state_unavailable'
+    if cgroup_state not in _DRIVER_ADMISSION_CGROUP_STATES:
+        cgroup_state = 'unknown'
+    if ray_session_state not in _DRIVER_ADMISSION_RAY_SESSION_STATES:
+        ray_session_state = 'unavailable'
+    if (type(profile_version) is not int or  # pylint: disable=unidiomatic-typecheck
+            profile_version not in CAPABILITY_BY_PROFILE_VERSION):
+        profile_version = 0
+    # Deliberately omit service/job/session/account/instance identities.  Every
+    # value below comes from a closed, bounded vocabulary.
+    logger.info('system_oom_recovery_driver_admission '
+                f'stage={stage} decision={decision} reason={reason} '
+                f'profile_version={profile_version} '
+                f'cgroup={cgroup_state} ray_session={ray_session_state}')
+
 
 _SHA256_IMAGE_PATTERN = re.compile(r'^[^\s@]+@sha256:[0-9a-f]{64}$')
 _ENVIRONMENT_NAME_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
@@ -582,6 +646,21 @@ def read_boot_id() -> str:
     except OSError:
         return ''
     return boot_id
+
+
+def capture_ray_session_identity(ray_module: Any) -> str | None:
+    """Capture Ray's exact process-local session name, or fail closed."""
+    try:
+        if ray_module.is_initialized() is not True:
+            return None
+        worker_module = ray_module._private.worker  # pylint: disable=protected-access
+        global_node = worker_module._global_node  # pylint: disable=protected-access
+        session_name = global_node.session_name
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if not isinstance(session_name, str) or not session_name:
+        return None
+    return session_name
 
 
 def _attempt_fields(context: dict[str, Any]) -> dict[str, object]:
@@ -1196,15 +1275,31 @@ def _ray_memory_threshold() -> float:
                max(0.0, threshold - RAY_MEMORY_HYSTERESIS))
 
 
-def wait_for_safe_memory(ray_module: Any,
-                         deadline_monotonic: float) -> tuple[bool, str]:
+def wait_for_safe_memory(
+    ray_module: Any,
+    deadline_monotonic: float,
+    *,
+    profile_version: int | None = None,
+) -> tuple[bool, str]:
     """Wait for Ray's cgroup-aware memory readings below a stable watermark."""
+
+    def _result(accepted: bool, message: str, reason: str,
+                cgroup_state: str) -> tuple[bool, str]:
+        _log_driver_admission(stage='replay_memory',
+                              decision=('accepted' if accepted else 'rejected'),
+                              reason=reason,
+                              cgroup_state=cgroup_state,
+                              ray_session_state='not_checked',
+                              profile_version=profile_version)
+        return accepted, message
+
     try:
         ray_utils = ray_module._private.utils  # pylint: disable=protected-access
         get_used_memory = ray_utils.get_used_memory
         get_system_memory = ray_utils.get_system_memory
     except AttributeError:
-        return False, 'Ray cgroup-aware memory helpers are unavailable'
+        return _result(False, 'Ray cgroup-aware memory helpers are unavailable',
+                       'cgroup_unavailable', 'unavailable')
     threshold = _ray_memory_threshold()
     consecutive = 0
     while time.monotonic() <= deadline_monotonic:
@@ -1212,44 +1307,87 @@ def wait_for_safe_memory(ray_module: Any,
             used = float(get_used_memory())
             total = float(get_system_memory())
         except Exception as e:  # pylint: disable=broad-except
-            return False, f'Ray memory reading failed: {e}'
+            return _result(False, f'Ray memory reading failed: {e}',
+                           'cgroup_unavailable', 'unavailable')
         if (not math.isfinite(used) or not math.isfinite(total) or total <= 0 or
                 used < 0):
-            return False, 'Ray memory reading is invalid'
+            return _result(False, 'Ray memory reading is invalid',
+                           'cgroup_invalid', 'invalid')
+        if total > MAX_RECOVERY_HOST_MEMORY_BYTES:
+            return _result(False, 'cgroup-aware host memory exceeds 16 GiB',
+                           'cgroup_above_16_gib', 'above_16_gib')
         if used / total < threshold:
             consecutive += 1
             if consecutive >= MEMORY_SAFE_SAMPLES:
-                return True, ''
+                return _result(True, '', 'memory_safe', 'at_most_16_gib')
         else:
             consecutive = 0
         remaining = deadline_monotonic - time.monotonic()
         if remaining < MEMORY_SAFE_SAMPLE_INTERVAL_SECONDS:
             break
         time.sleep(MEMORY_SAFE_SAMPLE_INTERVAL_SECONDS)
-    return False, 'memory did not reach the stable recovery watermark'
+    return _result(False, 'memory did not reach the stable recovery watermark',
+                   'memory_watermark_timeout', 'at_most_16_gib')
 
 
-def ray_runtime_is_healthy(ray_module: Any, ray_util_module: Any,
-                           placement_group: Any,
-                           expected_boot_id: str) -> tuple[bool, str]:
-    """Check the same boot, live Ray connection, and CREATED placement group."""
+def ray_runtime_is_healthy(
+    ray_module: Any,
+    ray_util_module: Any,
+    placement_group: Any,
+    expected_boot_id: str,
+    expected_ray_session_identity: str | None,
+    *,
+    profile_version: int | None = None,
+) -> tuple[bool, str]:
+    """Check the same boot/Ray session and CREATED placement group."""
+
+    def _result(accepted: bool, message: str, reason: str,
+                ray_session_state: str) -> tuple[bool, str]:
+        _log_driver_admission(stage='replay_runtime',
+                              decision=('accepted' if accepted else 'rejected'),
+                              reason=reason,
+                              cgroup_state='not_checked',
+                              ray_session_state=ray_session_state,
+                              profile_version=profile_version)
+        return accepted, message
+
     if not expected_boot_id or read_boot_id() != expected_boot_id:
-        return False, 'node boot identity changed'
+        return _result(False, 'node boot identity changed', 'boot_changed',
+                       'not_checked')
+    if (not isinstance(expected_ray_session_identity, str) or
+            not expected_ray_session_identity):
+        return _result(False, 'Ray session identity is unavailable',
+                       'ray_session_unavailable', 'unavailable')
+    current_ray_session_identity = capture_ray_session_identity(ray_module)
+    if current_ray_session_identity is None:
+        return _result(False, 'Ray session identity is unavailable',
+                       'ray_session_unavailable', 'unavailable')
+    if current_ray_session_identity != expected_ray_session_identity:
+        return _result(False, 'Ray session identity changed',
+                       'ray_session_changed', 'changed')
     try:
-        if not ray_module.is_initialized():
-            return False, 'Ray is no longer initialized'
         table = ray_util_module.placement_group_table(placement_group)
     except Exception as e:  # pylint: disable=broad-except
-        return False, f'cannot query placement group: {e}'
+        return _result(False, f'cannot query placement group: {e}',
+                       'placement_group_unavailable', 'unchanged')
     if not isinstance(table, dict) or table.get('state') != 'CREATED':
-        return False, 'placement group is no longer CREATED'
-    return True, ''
+        return _result(False, 'placement group is no longer CREATED',
+                       'placement_group_not_created', 'unchanged')
+    return _result(True, '', 'accepted', 'unchanged')
 
 
 _REQUIRED_RECOVERY_PHASES = frozenset({
     'ARMED', 'WAITING_CLEANUP', 'WAITING_MEMORY', 'RESUBMITTING',
     'RETRY_SUBMITTED', 'EXHAUSTED'
 })
+
+
+class RecoveryArmState(enum.Enum):
+    """One-way local admission latch; deliberately not a remote API field."""
+
+    PENDING = 'PENDING'
+    ARMED = 'ARMED'
+    DISABLED = 'DISABLED'
 
 
 @functools.lru_cache(maxsize=1)
@@ -1279,6 +1417,7 @@ def validate_runtime_capability() -> None:
         raise RecoveryError('job system-recovery info schema does not match v1')
     required_operations = {
         job_lib.arm_job_system_recovery: ('job_id', 'info'),
+        job_lib.arm_job_system_recovery_no_lock: ('job_id', 'info'),
         job_lib.transition_job_system_recovery:
             ('job_id', 'expected_phase', 'info'),
         job_lib.transition_job_system_recovery_no_lock:
@@ -1308,6 +1447,10 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
     original_context: dict[str, Any]
     original_future: Any
     submitter: Callable[[int, dict[str, Any]], Any]
+    arm_started_monotonic: float | None = dataclasses.field(default=None,
+                                                            repr=False)
+    expected_ray_session_identity: str | None = dataclasses.field(default=None,
+                                                                  repr=False)
     wall_clock: Callable[[], float] = dataclasses.field(default=time.time,
                                                         repr=False)
     monotonic_clock: Callable[[],
@@ -1329,11 +1472,21 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
                                                          default=None)
     first_event_visible_monotonic: float | None = dataclasses.field(
         init=False, default=None)
+    cleanup_proof_completed_monotonic: float | None = dataclasses.field(
+        init=False, default=None)
     event_visibility_confirmed: bool = dataclasses.field(init=False,
                                                          default=False)
     replacement_context: dict[str, Any] | None = dataclasses.field(init=False,
                                                                    default=None)
     replacement_future: Any = dataclasses.field(init=False, default=None)
+    arm_state: RecoveryArmState = dataclasses.field(
+        init=False, default=RecoveryArmState.PENDING)
+    arm_deadline_monotonic: float = dataclasses.field(init=False)
+    arm_disabled_reason: str | None = dataclasses.field(init=False,
+                                                        default=None)
+    arm_admission_logged: bool = dataclasses.field(init=False,
+                                                   default=False,
+                                                   repr=False)
 
     def __post_init__(self) -> None:
         validate_runtime_capability()
@@ -1345,6 +1498,19 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
             raise RecoveryError('attempt context does not match launch plan')
         self.current_context = self.original_context
         self.current_future = self.original_future
+        if self.arm_started_monotonic is None:
+            self.arm_started_monotonic = self.monotonic_clock()
+        if (not _is_finite_number(self.arm_started_monotonic) or
+                self.arm_started_monotonic < 0):
+            raise RecoveryError('arm-window monotonic start is invalid')
+        self.arm_started_monotonic = float(self.arm_started_monotonic)
+        self.arm_deadline_monotonic = (self.arm_started_monotonic +
+                                       SYSTEM_RECOVERY_ARM_WINDOW_SECONDS)
+        if (not isinstance(self.expected_ray_session_identity, str) or
+                not self.expected_ray_session_identity):
+            self.disable_arm('Ray session identity is unavailable',
+                             admission_reason='ray_session_unavailable',
+                             ray_session_state='unavailable')
 
     @property
     def is_replacement(self) -> bool:
@@ -1375,13 +1541,79 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
             deadline_at=self.deadline_at,
             summary=summary)
 
-    def try_arm(self, marker: dict[str, object] | None) -> bool:
+    def _log_arm_admission_once(self, *, decision: str, reason: str,
+                                cgroup_state: str,
+                                ray_session_state: str) -> None:
+        if self.arm_admission_logged:
+            return
+        self.arm_admission_logged = True
+        _log_driver_admission(
+            stage='arm',
+            decision=decision,
+            reason=reason,
+            cgroup_state=cgroup_state,
+            ray_session_state=ray_session_state,
+            profile_version=self.recovery_plan.profile_version)
+
+    def disable_arm(self,
+                    reason: str,
+                    *,
+                    admission_reason: str = 'recovery_state_unavailable',
+                    cgroup_state: str = 'unknown',
+                    ray_session_state: str = 'captured') -> None:
+        if self.arm_state in (RecoveryArmState.ARMED,
+                              RecoveryArmState.DISABLED):
+            return
+        self.arm_state = RecoveryArmState.DISABLED
+        self.arm_disabled_reason = reason
+        self._log_arm_admission_once(decision='rejected',
+                                     reason=admission_reason,
+                                     cgroup_state=cgroup_state,
+                                     ray_session_state=ray_session_state)
+
+    def try_arm(self, marker: dict[str, object] | None,
+                ray_module: Any) -> bool:
         if self.armed_info is not None:
+            self.arm_state = RecoveryArmState.ARMED
+            self._log_arm_admission_once(decision='accepted',
+                                         reason='accepted',
+                                         cgroup_state='unknown',
+                                         ray_session_state='captured')
             return True
-        if marker is None or marker.get('armed') is not True:
+        if self.arm_state == RecoveryArmState.DISABLED:
+            return False
+        if self.monotonic_clock() >= self.arm_deadline_monotonic:
+            self.disable_arm('recovery arm window expired',
+                             admission_reason='arm_window_expired')
+            return False
+        if marker is None:
+            return False
+        if marker.get('armed') is not True:
+            self.disable_arm('runtime capability marker rejected arming',
+                             admission_reason='marker_rejected')
             return False
         written_at = marker.get('written_at')
         if not _is_finite_number(written_at):
+            self.disable_arm('runtime capability marker is malformed',
+                             admission_reason='marker_malformed')
+            return False
+        try:
+            ray_utils = ray_module._private.utils  # pylint: disable=protected-access
+            total_memory = float(ray_utils.get_system_memory())
+        except Exception as error:  # pylint: disable=broad-except
+            self.disable_arm(f'cgroup-aware memory reading failed: {error}',
+                             admission_reason='cgroup_unavailable',
+                             cgroup_state='unavailable')
+            return False
+        if not math.isfinite(total_memory) or total_memory <= 0:
+            self.disable_arm('cgroup-aware host memory is invalid',
+                             admission_reason='cgroup_invalid',
+                             cgroup_state='invalid')
+            return False
+        if total_memory > MAX_RECOVERY_HOST_MEMORY_BYTES:
+            self.disable_arm('cgroup-aware host memory exceeds 16 GiB',
+                             admission_reason='cgroup_above_16_gib',
+                             cgroup_state='above_16_gib')
             return False
         info = job_lib.JobSystemRecoveryInfo(
             capability=self.recovery_plan.capability,
@@ -1394,15 +1626,39 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
             armed_at=float(written_at),
             updated_at=max(self.wall_clock(), float(written_at)))
         try:
-            if job_lib.arm_job_system_recovery(self.job_id, info):
-                self.armed_info = info
-                return True
-            existing = job_lib.get_job_system_recovery_info(self.job_id)
-        except Exception:  # pylint: disable=broad-except
+            with job_lib.job_status_lock(self.job_id):
+                if self.monotonic_clock() >= self.arm_deadline_monotonic:
+                    self.disable_arm(
+                        'recovery arm window expired while '
+                        'acquiring the job lock',
+                        admission_reason='arm_window_expired',
+                        cgroup_state='at_most_16_gib')
+                    return False
+                if job_lib.arm_job_system_recovery_no_lock(self.job_id, info):
+                    self.armed_info = info
+                    self.arm_state = RecoveryArmState.ARMED
+                    self._log_arm_admission_once(decision='accepted',
+                                                 reason='accepted',
+                                                 cgroup_state='at_most_16_gib',
+                                                 ray_session_state='captured')
+                    return True
+                existing = job_lib.get_job_system_recovery_info(self.job_id)
+        except Exception as error:  # pylint: disable=broad-except
+            self.disable_arm(f'cannot persist recovery ARMED: {error}',
+                             admission_reason='recovery_state_unavailable',
+                             cgroup_state='at_most_16_gib')
             return False
         if existing == info:
             self.armed_info = existing
+            self.arm_state = RecoveryArmState.ARMED
+            self._log_arm_admission_once(decision='accepted',
+                                         reason='accepted',
+                                         cgroup_state='at_most_16_gib',
+                                         ray_session_state='captured')
             return True
+        self.disable_arm('existing recovery state does not match ARMED',
+                         admission_reason='recovery_state_mismatch',
+                         cgroup_state='at_most_16_gib')
         return False
 
     def observe_oom(self) -> None:
@@ -1448,6 +1704,40 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
             return False, ('job is no longer running after first-event '
                            'visibility wait')
         self.event_visibility_confirmed = True
+        return True, ''
+
+    def record_cleanup_proof_completed(self) -> None:
+        """Capture when exact process/container cleanup was proven positive."""
+        if self.cleanup_proof_completed_monotonic is not None:
+            raise RecoveryError('cleanup proof completion was already recorded')
+        completed = self.monotonic_clock()
+        if not _is_finite_number(completed) or completed < 0:
+            raise RecoveryError('cleanup proof monotonic completion is invalid')
+        self.cleanup_proof_completed_monotonic = float(completed)
+
+    def wait_for_replay_quiescence(self) -> tuple[bool, str]:
+        """Wait until cleanup-proof +83s without extending the OOM deadline."""
+        if (self.cleanup_proof_completed_monotonic is None or
+                self.deadline_monotonic is None):
+            return False, 'positive cleanup proof timing is unavailable'
+        replay_not_before = (self.cleanup_proof_completed_monotonic +
+                             SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS)
+        now = self.monotonic_clock()
+        remaining_quiescence = max(0.0, replay_not_before - now)
+        remaining_deadline = max(0.0, self.deadline_monotonic - now)
+        wait_seconds = min(remaining_quiescence, remaining_deadline)
+        try:
+            if wait_seconds > 0:
+                self.wait(wait_seconds)
+        except Exception as e:  # pylint: disable=broad-except
+            return False, f'replay quiescence wait failed: {e}'
+        now = self.monotonic_clock()
+        if now >= self.deadline_monotonic:
+            return False, 'recovery deadline expired during replay quiescence'
+        if now < replay_not_before:
+            return False, ('positive cleanup proof did not remain quiescent '
+                           f'for {SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS} '
+                           'seconds')
         return True, ''
 
     def transition(self, phase: job_lib.JobSystemRecoveryPhase,
@@ -1508,6 +1798,10 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
         )
         if not visibility_ok:
             self.exhaust(visibility_reason)
+            return False
+        quiescence_ok, quiescence_reason = self.wait_for_replay_quiescence()
+        if not quiescence_ok:
+            self.exhaust(quiescence_reason)
             return False
         assert self.deadline_monotonic is not None
         if self.monotonic_clock() >= self.deadline_monotonic:
@@ -1603,15 +1897,6 @@ class RecoverySession:  # pylint: disable=too-many-instance-attributes
         return not adoption_protocol_failed
 
 
-def _read_armed_capability(context: dict[str, Any]) -> dict[str, object] | None:
-    try:
-        marker = read_capability_marker(context)
-    except RecoveryError:
-        return None
-    return marker if marker is not None and marker.get(
-        'armed') is True else None
-
-
 def get_or_fail_with_recovery(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-branches,too-many-statements
     ray_module: Any,
     ray_util_module: Any,
@@ -1621,17 +1906,32 @@ def get_or_fail_with_recovery(  # pylint: disable=too-many-arguments,too-many-po
     initial_context: dict[str, Any],
     job_id: int,
     recovery_plan: RecoveryLaunchPlan,
+    arm_started_monotonic: float | None = None,
+    expected_ray_session_identity: str | None = None,
 ) -> tuple[list[int], list[int | None]]:
     """Wait for one task and manually replay one positively-cleaned Ray OOM."""
     try:
         validate_runtime_capability()
-        session = RecoverySession(job_id, recovery_plan, initial_context,
-                                  future, submitter)
+        session = RecoverySession(
+            job_id,
+            recovery_plan,
+            initial_context,
+            future,
+            submitter,
+            arm_started_monotonic=arm_started_monotonic,
+            expected_ray_session_identity=(expected_ray_session_identity))
         oom_type: type[BaseException] = ray_module.exceptions.OutOfMemoryError
         while True:
-            if session.armed_info is None:
-                session.try_arm(_read_armed_capability(
-                    session.original_context))
+            if (session.armed_info is None and
+                    session.arm_state == RecoveryArmState.PENDING):
+                try:
+                    marker = read_capability_marker(session.original_context)
+                except RecoveryError as error:
+                    session.disable_arm(
+                        f'runtime capability marker is malformed: {error}',
+                        admission_reason='marker_malformed')
+                    marker = None
+                session.try_arm(marker, ray_module)
             ready: list[Any] = []
             try:
                 ready, _ = ray_module.wait([session.current_future], timeout=1)
@@ -1647,13 +1947,24 @@ def get_or_fail_with_recovery(  # pylint: disable=too-many-arguments,too-many-po
                 result = ray_module.get(session.current_future)
             except oom_type:
                 if session.armed_info is None:
-                    session.try_arm(
-                        _read_armed_capability(session.original_context))
+                    try:
+                        marker = read_capability_marker(
+                            session.original_context)
+                    except RecoveryError as error:
+                        session.disable_arm(
+                            f'runtime capability marker is malformed: {error}',
+                            admission_reason='marker_malformed')
+                        marker = None
+                    session.try_arm(marker, ray_module)
                 session.observe_oom()
                 if session.occurrence_count > 1:
                     session.exhaust('second Ray node OOM')
                     return [1], [None]
                 if session.armed_info is None:
+                    if session.arm_state == RecoveryArmState.PENDING:
+                        session.disable_arm(
+                            'capability marker was unavailable at Ray OOM',
+                            admission_reason='capability_unavailable_at_oom')
                     session.exhaust('attempt did not arm recovery')
                     return [1], [None]
                 if not session.transition(
@@ -1667,6 +1978,11 @@ def get_or_fail_with_recovery(  # pylint: disable=too-many-arguments,too-many-po
                 if not cleanup_ok:
                     session.exhaust(cleanup_reason)
                     return [1], [None]
+                try:
+                    session.record_cleanup_proof_completed()
+                except RecoveryError as error:
+                    session.exhaust(str(error))
+                    return [1], [None]
                 if not session.transition(
                         job_lib.JobSystemRecoveryPhase.WAITING_MEMORY,
                         'attempt cleanup was positively verified'):
@@ -1678,13 +1994,24 @@ def get_or_fail_with_recovery(  # pylint: disable=too-many-arguments,too-many-po
                     session.exhaust(visibility_reason)
                     return [1], [None]
                 memory_ok, memory_reason = wait_for_safe_memory(
-                    ray_module, session.deadline_monotonic)
+                    ray_module,
+                    session.deadline_monotonic,
+                    profile_version=recovery_plan.profile_version)
                 if not memory_ok:
                     session.exhaust(memory_reason)
                     return [1], [None]
+                quiescence_ok, quiescence_reason = (
+                    session.wait_for_replay_quiescence())
+                if not quiescence_ok:
+                    session.exhaust(quiescence_reason)
+                    return [1], [None]
                 healthy, health_reason = ray_runtime_is_healthy(
-                    ray_module, ray_util_module, placement_group,
-                    str(session.original_context['node_boot_id']))
+                    ray_module,
+                    ray_util_module,
+                    placement_group,
+                    str(session.original_context['node_boot_id']),
+                    session.expected_ray_session_identity,
+                    profile_version=recovery_plan.profile_version)
                 if not healthy:
                     session.exhaust(health_reason)
                     return [1], [None]
@@ -1693,10 +2020,18 @@ def get_or_fail_with_recovery(  # pylint: disable=too-many-arguments,too-many-po
                 continue
             except Exception as e:  # pylint: disable=broad-except
                 if not session.is_replacement:
+                    if session.arm_state == RecoveryArmState.PENDING:
+                        session.disable_arm(
+                            'original Ray task failed before recovery armed',
+                            admission_reason='task_failed_before_arm')
                     raise
                 session.exhaust(f'replacement Ray task failed: {e}')
                 return [1], [None]
 
+            if session.arm_state == RecoveryArmState.PENDING:
+                session.disable_arm(
+                    'original Ray task completed before recovery armed',
+                    admission_reason='task_completed_before_arm')
             if not isinstance(result, dict):
                 if not session.is_replacement:
                     raise RecoveryError('Ray task returned an invalid result.')

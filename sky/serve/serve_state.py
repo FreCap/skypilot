@@ -1,5 +1,6 @@
 """The database for services information."""
 import collections
+import copy
 import dataclasses
 import enum
 import json
@@ -28,18 +29,23 @@ from sky.utils import common_utils
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
 
+# These modules import Serve state through ReplicaInfo/controller paths. Keep
+# their runtime imports lazy so recovery-only PostgreSQL helpers do not form an
+# import cycle during ``import sky``.
 if typing.TYPE_CHECKING:
     from sqlalchemy.engine import row
 
     from sky.serve import replica_managers
     from sky.serve import resource_action_state
     from sky.serve import service_spec
+else:
+    replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
+    resource_action_state = adaptors_common.LazyImport(
+        'sky.serve.resource_action_state')
 
-replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
-# Importing the typed store eagerly forms a cycle through request payloads while
-# ``sky`` is initializing. Keep the action-only path lazy like ReplicaInfo.
-resource_action_state = adaptors_common.LazyImport(
-    'sky.serve.resource_action_state')
+replica_info_lib = adaptors_common.LazyImport('sky.serve.replica_info')
+system_oom_recovery = adaptors_common.LazyImport(
+    'sky.serve.system_oom_recovery')
 logger = sky_logging.init_logger(__name__)
 
 _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
@@ -144,16 +150,23 @@ def service_lifecycle_epoch_matches(service_name: str, epoch: int) -> bool:
 def _lifecycle_epoch_matches_in_session(session: orm.Session, service_name: str,
                                         epoch: int | None) -> bool:
     """Lock and validate a lifecycle fence row inside a mutation txn."""
-    if epoch is None:
+    is_postgres = (session.bind is not None and session.bind.dialect.name
+                   == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+    if epoch is None and not is_postgres:
         # Compatibility for old direct/unit-test callers. Production lifecycle
         # entrypoints always supply an epoch.
         return True
     stmt = sqlalchemy.select(service_lifecycle_fences_table.c.epoch).where(
         service_lifecycle_fences_table.c.name == service_name)
-    if session.bind is not None and session.bind.dialect.name == (
-            db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+    if is_postgres:
         stmt = stmt.with_for_update()
     row = session.execute(stmt).fetchone()
+    if epoch is None:
+        # PostgreSQL whole-row writers still take the durable lifecycle mutex
+        # even for legacy callers that do not carry an epoch.  Absence keeps
+        # their historical compatibility behavior but cannot authorize a
+        # recovery mutation, whose stricter primitive rejects a missing row.
+        return True
     return row is not None and int(row[0]) == epoch
 
 
@@ -1759,8 +1772,9 @@ def get_service_versions(service_name: str) -> list[int]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(
-            sqlalchemy.select(version_specs_table.c.version.distinct()).where(
-                version_specs_table.c.service_name == service_name)).fetchall()
+            sqlalchemy.select(version_specs_table.c.version).where(
+                version_specs_table.c.service_name ==
+                service_name).distinct()).fetchall()
     return [row[0] for row in rows]
 
 
@@ -1849,11 +1863,309 @@ _PAID_CAPACITY_UNRESOLVED_STATUSES = (
     ReplicaStatus.PROVISIONING.value,
 )
 
+_SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK = (
+    'system_recovery_launch_intent',
+    'system_recovery_disposition',
+    'launch_request_id',
+    'service_job_id',
+    'candidate_ready_observed_at',
+    'ordinary_release_not_before',
+    'system_recovery_revision',
+    'system_recovery',
+    'system_recovery_quarantine',
+)
+_V13_ADDITIVE_STORAGE_FIELDS_FALLBACK = (
+    'replica_record_id',
+    *_SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK,
+)
+
+
+class ReplicaSystemRecoveryStateError(RuntimeError):
+    """Base class for a rejected durable recovery-state mutation."""
+
+
+class ReplicaSystemRecoveryRevisionConflict(ReplicaSystemRecoveryStateError):
+    """A caller reduced an older recovery revision than the locked row."""
+
+    def __init__(self, expected_revision: int, current_revision: int) -> None:
+        super().__init__('Replica system-recovery revision changed: expected '
+                         f'{expected_revision}, found {current_revision}.')
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+
+
+class ReplicaSystemRecoveryMutationRejected(ReplicaSystemRecoveryStateError):
+    """The locked owner, identity, or absorbing state rejected a mutation."""
+
+
+def system_recovery_persistence_available() -> bool:
+    """Whether this controller can use central recovery-state persistence.
+
+    Recovery admission is deliberately PostgreSQL-only.  A local/SQLite Serve
+    controller must remain ordinary; it cannot participate in the endpoint's
+    cross-process nonce bind.
+    """
+    try:
+        engine = _db_manager.get_engine()
+    except Exception:  # pylint: disable=broad-except
+        return False
+    return (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+
+
+def _require_system_recovery_postgres() -> sqlalchemy.engine.Engine:
+    engine = _db_manager.get_engine()
+    if (engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica system recovery requires central PostgreSQL state.')
+    return engine
+
+
+def _system_recovery_storage_fields() -> tuple[str, ...]:
+    fields = getattr(replica_info_lib, 'SYSTEM_RECOVERY_STORAGE_FIELDS',
+                     _SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK)
+    if (not isinstance(fields, tuple) or
+            fields != _SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica system-recovery storage fields do not match the '
+            'accepted v13 contract.')
+    return fields
+
+
+def _v13_additive_storage_fields() -> tuple[str, ...]:
+    fields = getattr(replica_info_lib, 'V13_ADDITIVE_STORAGE_FIELDS',
+                     _V13_ADDITIVE_STORAGE_FIELDS_FALLBACK)
+    if (not isinstance(fields, tuple) or
+            fields != _V13_ADDITIVE_STORAGE_FIELDS_FALLBACK):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica v13 additive storage fields do not match the accepted '
+            'contract.')
+    return fields
+
+
+def _copy_system_recovery_fields(source: 'replica_managers.ReplicaInfo',
+                                 destination: 'replica_managers.ReplicaInfo',
+                                 *,
+                                 increment_revision: bool = False) -> None:
+    """Copy a recovery bundle from an authoritative source object.
+
+    Generic writers pass the locked database row as ``source`` and an
+    untrusted, potentially stale whole-row object as ``destination``.  The
+    destination revision therefore cannot participate in deciding which
+    bundle wins: every recovery field must come from the locked row.
+    Recovery transitions use the same primitive only after their expected
+    revision has been checked under lock.
+    """
+    copy_fields = getattr(replica_info_lib, 'copy_system_recovery_fields', None)
+    if copy_fields is None:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica v13 recovery-copy helper is unavailable.')
+    copy_fields(source, destination, increment_revision=increment_revision)
+
+
+def _system_recovery_revision(
+        replica_info: 'replica_managers.ReplicaInfo') -> int:
+    revision = getattr(replica_info, 'system_recovery_revision', None)
+    if (isinstance(revision, bool) or not isinstance(revision, int) or
+            revision < 0):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica has an invalid system-recovery revision.')
+    return revision
+
+
+def _system_recovery_snapshot(
+        replica_info: 'replica_managers.ReplicaInfo') -> tuple[Any, ...]:
+    return tuple(
+        copy.deepcopy(getattr(replica_info, field_name))
+        for field_name in _system_recovery_storage_fields())
+
+
+def _enum_value(value: Any) -> Any:
+    return getattr(value, 'value', value)
+
+
+def _system_recovery_disposition(
+        replica_info: 'replica_managers.ReplicaInfo') -> str:
+    disposition = _enum_value(
+        getattr(replica_info, 'system_recovery_disposition', None))
+    if disposition not in ('ORDINARY', 'CANDIDATE', 'CAPABLE'):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica has an invalid system-recovery disposition.')
+    return typing.cast(str, disposition)
+
+
+def _has_system_recovery_teardown_intent(
+        replica_info: 'replica_managers.ReplicaInfo') -> bool:
+    status = replica_info.status_property
+    return bool(replica_info.is_terminal or
+                status.sky_down_status is not None or status.preempted or
+                status.purged or status.is_scale_down)
+
+
+def _nested_system_recovery_is_exhausted(
+        replica_info: 'replica_managers.ReplicaInfo') -> bool:
+    recovery = getattr(replica_info, 'system_recovery', None)
+    if recovery is None:
+        return False
+    for field_name in ('controller_state', 'state', 'phase'):
+        value = getattr(recovery, field_name, None)
+        if _enum_value(value) == 'EXHAUSTED':
+            return True
+    return False
+
+
+def _validate_system_recovery_transition(
+        current: 'replica_managers.ReplicaInfo',
+        desired: 'replica_managers.ReplicaInfo') -> None:
+    """Validate monotonic recovery fields against the locked latest row."""
+    current_revision = _system_recovery_revision(current)
+    if _system_recovery_revision(desired) != current_revision:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'A recovery patch must carry the locked expected revision.')
+
+    current_snapshot = _system_recovery_snapshot(current)
+    desired_snapshot = _system_recovery_snapshot(desired)
+    if current_snapshot == desired_snapshot:
+        return
+
+    if (_has_system_recovery_teardown_intent(current) or
+            getattr(current, 'system_recovery_quarantine', None) is not None or
+            _nested_system_recovery_is_exhausted(current)):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Terminal teardown, exhaustion, and quarantine are absorbing.')
+
+    current_intent = getattr(current, 'system_recovery_launch_intent', None)
+    desired_intent = getattr(desired, 'system_recovery_launch_intent', None)
+    if current_intent is not None and desired_intent != current_intent:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'A persisted recovery launch intent is immutable.')
+    if current_intent is None and desired_intent is None and (
+            _system_recovery_disposition(desired) != 'ORDINARY'):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Candidate/capable state requires an exact launch intent.')
+
+    current_request_id = getattr(current, 'launch_request_id', None)
+    desired_request_id = getattr(desired, 'launch_request_id', None)
+    if (current_request_id is not None and
+            desired_request_id != current_request_id):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'A bound launch request ID is immutable.')
+    current_job_id = getattr(current, 'service_job_id', None)
+    desired_job_id = getattr(desired, 'service_job_id', None)
+    if current_job_id is not None and desired_job_id != current_job_id:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'A bound service job ID is immutable.')
+
+    current_quarantine = getattr(current, 'system_recovery_quarantine', None)
+    desired_quarantine = getattr(desired, 'system_recovery_quarantine', None)
+    if current_quarantine is not None and desired_quarantine != current_quarantine:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery quarantine is absorbing.')
+    # Entering quarantine is always a legal fail-closed transition.  It does
+    # not authorize any simultaneous capability promotion.
+    if desired_quarantine is not None:
+        if (_system_recovery_disposition(desired)
+                != _system_recovery_disposition(current)):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Quarantine cannot change recovery disposition.')
+        return
+
+    current_disposition = _system_recovery_disposition(current)
+    desired_disposition = _system_recovery_disposition(desired)
+    if current_disposition == 'ORDINARY':
+        if current_intent is not None:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'A demoted ordinary recovery intent is absorbing.')
+        if desired_disposition not in ('ORDINARY', 'CANDIDATE'):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'An ordinary replica cannot become capable directly.')
+    elif current_disposition == 'CANDIDATE':
+        if desired_disposition not in ('CANDIDATE', 'CAPABLE', 'ORDINARY'):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Invalid candidate recovery transition.')
+    elif desired_disposition != 'CAPABLE':
+        raise ReplicaSystemRecoveryMutationRejected(
+            'A capable recovery disposition cannot be demoted or reset.')
+
+
+def _lock_service_row_if_present_for_replica_write(session: orm.Session,
+                                                   service_name: str) -> None:
+    """Take lifecycle/service mutexes before any PostgreSQL replica row."""
+    if (session.bind is None or session.bind.dialect.name
+            != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        return
+    _lifecycle_epoch_matches_in_session(session, service_name, None)
+    session.execute(
+        sqlalchemy.select(services_table.c.name).where(
+            services_table.c.name ==
+            service_name).with_for_update()).fetchone()
+
+
+def _lock_and_merge_existing_replica_rows_in_session(
+    session: orm.Session,
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
+) -> list[tuple[int, 'replica_managers.ReplicaInfo']] | None:
+    """Lock expected records and merge recovery fields, or reject the batch.
+
+    The service/lifecycle mutex is acquired before the replica rows.  Callers
+    must hold a SQLite immediate transaction before entering this helper.
+    Returning ``None`` is an all-or-nothing existence/record-ID conflict: no
+    bookkeeping row in the batch may be written. The identity comparison
+    precedes recovery-field copying so a stale same-key object cannot adopt a
+    newly recreated row's fence.
+    """
+    if not replica_infos:
+        return replica_infos
+    is_postgres = (
+        engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+    if is_postgres:
+        _lock_service_row_if_present_for_replica_write(session, service_name)
+    replica_ids = sorted({replica_id for replica_id, _ in replica_infos})
+    stmt = sqlalchemy.select(
+        replicas_table.c.replica_id, replicas_table.c.replica_state_version,
+        replicas_table.c.replica_state).where(
+            replicas_table.c.service_name == service_name,
+            replicas_table.c.replica_id.in_(replica_ids)).order_by(
+                replicas_table.c.replica_id)
+    if is_postgres:
+        stmt = stmt.with_for_update()
+    rows = session.execute(stmt).fetchall()
+    if {int(row.replica_id) for row in rows} != set(replica_ids):
+        return None
+    latest_by_id = {
+        int(row.replica_id): _replica_from_state(
+            row.replica_state_version, row.replica_state) for row in rows
+    }
+    if any(
+            getattr(incoming, 'replica_record_id', None) != getattr(
+                latest_by_id[replica_id], 'replica_record_id', None)
+            for replica_id, incoming in replica_infos):
+        return None
+    merged = []
+    for replica_id, incoming in replica_infos:
+        refreshed = copy.deepcopy(incoming)
+        _copy_system_recovery_fields(latest_by_id[replica_id], refreshed)
+        merged.append((replica_id, refreshed))
+    return merged
+
+
+def _validate_replica_row_identity(
+        replica_id: int, replica_info: 'replica_managers.ReplicaInfo') -> None:
+    """Require the physical key and versioned payload to name one replica."""
+    payload_replica_id = getattr(replica_info, 'replica_id', None)
+    if (isinstance(replica_id, bool) or not isinstance(replica_id, int) or
+            isinstance(payload_replica_id, bool) or
+            not isinstance(payload_replica_id, int) or
+            payload_replica_id != replica_id):
+        raise ValueError('Replica row key must match ReplicaInfo.replica_id.')
+
 
 def _replica_row_values(
         service_name: str, replica_id: int,
         replica_info: 'replica_managers.ReplicaInfo') -> dict[str, Any]:
     """Build the legacy rollback blob and the authoritative query state."""
+    _validate_replica_row_identity(replica_id, replica_info)
     replica_state = replica_info.to_storage_dict()
     sky_down_status = replica_info.status_property.sky_down_status
     values = {
@@ -1879,27 +2191,65 @@ def _replica_row_values(
     return values
 
 
-def _replica_conflict_update_values(insert_stmt: Any) -> dict[str, Any]:
-    """Build the generic replica conflict update without action-owned state."""
-    assert _ACTION_OWNED_REPLICA_COLUMNS.isdisjoint(_LEGACY_REPLICA_ROW_COLUMNS)
-    return {
-        column_name: getattr(insert_stmt.excluded, column_name)
-        for column_name in _LEGACY_REPLICA_ROW_COLUMNS
-        if column_name not in ('service_name', 'replica_id')
-    }
-
-
 def _upsert_replica_rows_in_session(
     session: orm.Session,
     engine: sqlalchemy.engine.Engine,
     service_name: str,
     replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
-) -> None:
-    """Upsert replica rows in dialect-safe bounded batches."""
+    *,
+    expected_replica_exists: bool = False,
+) -> bool:
+    """Persist replica rows in dialect-safe bounded batches.
+
+    Expected-existing bookkeeping is deliberately UPDATE-only.  The locked
+    precondition rejects the whole batch before its first write if any row is
+    absent, so a stale manager snapshot cannot recreate terminally deleted
+    replicas. Explicit initial-admission callers use an INSERT-only path.
+    """
+    for replica_id, replica_info in replica_infos:
+        _validate_replica_row_identity(replica_id, replica_info)
+    if expected_replica_exists:
+        merged_infos = _lock_and_merge_existing_replica_rows_in_session(
+            session, engine, service_name, replica_infos)
+        if merged_infos is None:
+            return False
+        replica_infos = merged_infos
     chunk_size = (max(
         1, _SQLITE_MAX_BIND_PARAMS // len(_LEGACY_REPLICA_ROW_COLUMNS)) if
                   engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value
                   else _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE)
+    if expected_replica_exists:
+        value_column_names = tuple(
+            column_name for column_name in _LEGACY_REPLICA_ROW_COLUMNS
+            if column_name not in ('service_name', 'replica_id'))
+        update_stmt = sqlalchemy.update(replicas_table).where(
+            replicas_table.c.service_name == sqlalchemy.bindparam(
+                '_expected_service_name'), replicas_table.c.replica_id ==
+            sqlalchemy.bindparam('_expected_replica_id')).values({
+                column_name: sqlalchemy.bindparam(
+                    f'_replica_{column_name}',
+                    type_=replicas_table.c[column_name].type)
+                for column_name in value_column_names
+            })
+        for start in range(0, len(replica_infos), chunk_size):
+            chunk = replica_infos[start:start + chunk_size]
+            parameters = []
+            for replica_id, replica_info in chunk:
+                row_values = _replica_row_values(service_name, replica_id,
+                                                 replica_info)
+                parameter = {
+                    '_expected_service_name': service_name,
+                    '_expected_replica_id': replica_id,
+                }
+                parameter.update({
+                    f'_replica_{column_name}': row_values[column_name]
+                    for column_name in value_column_names
+                })
+                parameters.append(parameter)
+            result = session.execute(update_stmt, parameters)
+            if result.rowcount >= 0 and result.rowcount != len(chunk):
+                return False
+        return True
     insert_func = _upsert_insert_func(engine)
     for start in range(0, len(replica_infos), chunk_size):
         chunk = replica_infos[start:start + chunk_size]
@@ -1907,10 +2257,8 @@ def _upsert_replica_rows_in_session(
             _replica_row_values(service_name, replica_id, replica_info)
             for replica_id, replica_info in chunk
         ])
-        session.execute(
-            insert_stmt.on_conflict_do_update(
-                index_elements=['service_name', 'replica_id'],
-                set_=_replica_conflict_update_values(insert_stmt)))
+        session.execute(insert_stmt)
+    return True
 
 
 def _replica_from_state(
@@ -1931,6 +2279,7 @@ def _lock_service_owner_in_session(
     require_launch_allowed: bool,
 ) -> bool:
     """Lock and validate one service controller owner."""
+    _lifecycle_epoch_matches_in_session(session, service_name, None)
     owner = session.execute(
         sqlalchemy.select(services_table.c.hash,
                           services_table.c.controller_pid,
@@ -1942,8 +2291,421 @@ def _lock_service_owner_in_session(
         (expected_controller_owner is not None and
          (owner[1], owner[2]) != expected_controller_owner)):
         return False
-    return (not require_launch_allowed or
-            owner[3] not in ServiceStatus.replica_launch_blocking_statuses())
+    return (not require_launch_allowed or owner[3] not in {
+        status.value
+        for status in ServiceStatus.replica_launch_blocking_statuses()
+    })
+
+
+def _lock_system_recovery_service_owner_in_session(
+    session: orm.Session,
+    service_name: str,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int | None,
+    expected_controller_owner: tuple[int | None, str | None],
+    *,
+    require_launch_allowed: bool,
+) -> sqlalchemy.engine.Row:
+    """Lock lifecycle then the exclusive service mutex for one mutation."""
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(expected_service_hash, str) or
+            not expected_service_hash or
+            not isinstance(expected_controller_owner, tuple) or
+            len(expected_controller_owner) != 2):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery owner identity is invalid.')
+    fence = session.execute(
+        sqlalchemy.select(service_lifecycle_fences_table.c.epoch).where(
+            service_lifecycle_fences_table.c.name ==
+            service_name).with_for_update()).fetchone()
+    if fence is None:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery lifecycle fence is absent.')
+    locked_epoch = int(fence.epoch)
+    if locked_epoch < 1:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery lifecycle fence is invalid.')
+    if (expected_lifecycle_epoch is not None and
+        (isinstance(expected_lifecycle_epoch, bool) or
+         not isinstance(expected_lifecycle_epoch, int) or
+         expected_lifecycle_epoch < 1 or
+         expected_lifecycle_epoch != locked_epoch)):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery lifecycle fence changed.')
+
+    owner = session.execute(
+        sqlalchemy.select(
+            services_table.c.name,
+            services_table.c.hash,
+            services_table.c.lifecycle_epoch,
+            services_table.c.controller_pid,
+            services_table.c.controller_ip,
+            services_table.c.status,
+            services_table.c.pool,
+            services_table.c.resource_action_mode,
+            services_table.c.workspace,
+        ).where(services_table.c.name ==
+                service_name).with_for_update()).fetchone()
+    if (owner is None or owner.hash != expected_service_hash or
+            owner.lifecycle_epoch != locked_epoch or
+        (owner.controller_pid, owner.controller_ip) != expected_controller_owner
+            or bool(owner.pool) or owner.resource_action_mode != 'legacy'):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery service owner no longer matches.')
+    launch_blocking_statuses = {
+        status.value
+        for status in ServiceStatus.replica_launch_blocking_statuses()
+    }
+    if require_launch_allowed and owner.status in launch_blocking_statuses:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Service teardown blocks system-recovery mutation.')
+    return owner
+
+
+def _lock_replica_info_for_system_recovery(
+    session: orm.Session,
+    service_name: str,
+    replica_id: int,
+) -> 'replica_managers.ReplicaInfo':
+    if (isinstance(replica_id, bool) or not isinstance(replica_id, int) or
+            replica_id <= 0):
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery replica ID must be positive.')
+    row = session.execute(
+        sqlalchemy.select(replicas_table.c.replica_state_version,
+                          replicas_table.c.replica_state).where(
+                              replicas_table.c.service_name == service_name,
+                              replicas_table.c.replica_id ==
+                              replica_id).with_for_update()).fetchone()
+    if row is None:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery replica row is absent.')
+    try:
+        replica_info = _replica_from_state(row.replica_state_version,
+                                           row.replica_state)
+    except Exception as error:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery replica row is unreadable.') from error
+    if replica_info.replica_id != replica_id:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery replica identity changed.')
+    return replica_info
+
+
+def _write_locked_replica_info_in_session(
+        session: orm.Session, service_name: str, replica_id: int,
+        replica_info: 'replica_managers.ReplicaInfo') -> None:
+    try:
+        values = _replica_row_values(service_name, replica_id, replica_info)
+        pickled = pickle.loads(values['replica_info'])
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica recovery state could not be serialized.') from error
+    if pickled.to_storage_dict() != values['replica_state']:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'Replica JSON/pickle recovery state diverged.')
+    result = session.execute(
+        sqlalchemy.update(replicas_table).where(
+            replicas_table.c.service_name == service_name,
+            replicas_table.c.replica_id == replica_id).values({
+                key: value
+                for key, value in values.items()
+                if key not in ('service_name', 'replica_id')
+            }))
+    if result.rowcount != 1:
+        raise ReplicaSystemRecoveryMutationRejected(
+            'System-recovery update lost its replica row.')
+
+
+def _mutate_replica_system_recovery(
+    service_name: str,
+    replica_id: int,
+    transition: typing.Callable[['replica_managers.ReplicaInfo'],
+                                'replica_managers.ReplicaInfo'],
+    *,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_revision: int,
+) -> 'replica_managers.ReplicaInfo':
+    engine = _require_system_recovery_postgres()
+    if (isinstance(expected_revision, bool) or
+            not isinstance(expected_revision, int) or expected_revision < 0):
+        raise ValueError('expected_revision must be a nonnegative integer.')
+    with orm.Session(engine) as session, session.begin():
+        owner = _lock_system_recovery_service_owner_in_session(
+            session,
+            service_name,
+            expected_service_hash,
+            expected_lifecycle_epoch,
+            expected_controller_owner,
+            require_launch_allowed=True)
+        current = _lock_replica_info_for_system_recovery(
+            session, service_name, replica_id)
+        current_revision = _system_recovery_revision(current)
+        if current_revision != expected_revision:
+            raise ReplicaSystemRecoveryRevisionConflict(expected_revision,
+                                                        current_revision)
+        desired = transition(copy.deepcopy(current))
+        if (not isinstance(desired, replica_managers.ReplicaInfo) or
+                desired.replica_id != replica_id):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Recovery transition returned a different replica.')
+        desired_intent = getattr(desired, 'system_recovery_launch_intent', None)
+        if (desired_intent is not None and
+            (getattr(desired_intent, 'service_hash',
+                     None) != expected_service_hash or
+             getattr(desired_intent, 'replica_id', None) != replica_id or
+             getattr(desired_intent, 'launch_generation', None) != replica_id or
+             getattr(desired_intent, 'workspace', None) != owner.workspace)):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Recovery intent does not match its locked service generation.')
+        _validate_system_recovery_transition(current, desired)
+        if _system_recovery_snapshot(current) == _system_recovery_snapshot(
+                desired):
+            return current
+        try:
+            _copy_system_recovery_fields(desired,
+                                         current,
+                                         increment_revision=True)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Recovery transition produced an invalid v13 bundle.'
+            ) from error
+        if _system_recovery_revision(current) != current_revision + 1:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Recovery transition did not increment its revision once.')
+        _write_locked_replica_info_in_session(session, service_name, replica_id,
+                                              current)
+        return current
+
+
+def patch_replica_system_recovery(
+    service_name: str,
+    replica_id: int,
+    desired_info: 'replica_managers.ReplicaInfo',
+    *,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_revision: int,
+) -> 'replica_managers.ReplicaInfo':
+    """Apply a caller-reduced recovery patch to the locked latest replica.
+
+    The nine mutable recovery fields are copied only after the immutable
+    record identity is proven equal; the identity itself is never copied.
+    Every other field comes from the locked row, so a stale callback cannot
+    overwrite concurrent readiness/teardown state. Revision conflict is
+    explicit: callers refresh and rerun their pure reducer rather than
+    replaying a stale output.
+    """
+    if (not isinstance(desired_info, replica_managers.ReplicaInfo) or
+            desired_info.replica_id != replica_id):
+        raise ValueError('desired_info must match replica_id.')
+    return _mutate_replica_system_recovery(
+        service_name,
+        replica_id,
+        lambda _: desired_info,
+        expected_service_hash=expected_service_hash,
+        expected_lifecycle_epoch=expected_lifecycle_epoch,
+        expected_controller_owner=expected_controller_owner,
+        expected_revision=expected_revision)
+
+
+def create_replica_system_recovery_candidate(
+    service_name: str,
+    replica_id: int,
+    desired_info: 'replica_managers.ReplicaInfo',
+    *,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_revision: int,
+) -> 'replica_managers.ReplicaInfo':
+    """Persist the first owner-fenced CANDIDATE transition."""
+    if (_system_recovery_disposition(desired_info) != 'CANDIDATE' or getattr(
+            desired_info, 'system_recovery_launch_intent', None) is None):
+        raise ValueError('Candidate persistence requires an exact intent.')
+    return patch_replica_system_recovery(
+        service_name,
+        replica_id,
+        desired_info,
+        expected_service_hash=expected_service_hash,
+        expected_lifecycle_epoch=expected_lifecycle_epoch,
+        expected_controller_owner=expected_controller_owner,
+        expected_revision=expected_revision)
+
+
+def demote_replica_system_recovery_to_ordinary(
+    service_name: str,
+    replica_id: int,
+    desired_info: 'replica_managers.ReplicaInfo',
+    *,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_revision: int,
+) -> 'replica_managers.ReplicaInfo':
+    """Persist one irreversible CANDIDATE-to-ORDINARY reduction."""
+    if _system_recovery_disposition(desired_info) != 'ORDINARY':
+        raise ValueError('Demotion target must be ORDINARY.')
+    return patch_replica_system_recovery(
+        service_name,
+        replica_id,
+        desired_info,
+        expected_service_hash=expected_service_hash,
+        expected_lifecycle_epoch=expected_lifecycle_epoch,
+        expected_controller_owner=expected_controller_owner,
+        expected_revision=expected_revision)
+
+
+def bind_replica_system_recovery_launch_request(
+    unbound_context: dict[str, Any],
+    request_id: str,
+) -> 'replica_managers.ReplicaInfo':
+    """Consume one launch nonce and bind the API server's request ID."""
+    context = system_oom_recovery.validate_unbound_launch_context(
+        unbound_context)
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('request_id must be a nonempty string.')
+    service_name = context[constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]
+    service_hash = context[constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY]
+    controller_owner = (
+        context[constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY],
+        context[constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY],
+    )
+    replica_id = context[constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY]
+    workspace = context[constants.SYSTEM_OOM_RECOVERY_WORKSPACE_KEY]
+    engine = _require_system_recovery_postgres()
+    with orm.Session(engine) as session, session.begin():
+        owner = _lock_system_recovery_service_owner_in_session(
+            session,
+            service_name,
+            service_hash,
+            None,
+            controller_owner,
+            require_launch_allowed=True)
+        if owner.workspace != workspace:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'System-recovery workspace changed before request bind.')
+        current = _lock_replica_info_for_system_recovery(
+            session, service_name, replica_id)
+        if (_has_system_recovery_teardown_intent(current) or getattr(
+                current, 'system_recovery_quarantine', None) is not None or
+                _nested_system_recovery_is_exhausted(current) or
+                _system_recovery_disposition(current) != 'CANDIDATE'):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Only a live CANDIDATE may bind a launch request.')
+        if getattr(current, 'launch_request_id', None) is not None:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Recovery launch nonce was already consumed.')
+        intent = getattr(current, 'system_recovery_launch_intent', None)
+        if intent is None:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Recovery candidate has no launch intent.')
+        expected_context = system_oom_recovery.create_unbound_launch_context(
+            intent,
+            service_name=service_name,
+            service_version=current.version,
+            controller_pid=owner.controller_pid,
+            controller_ip=owner.controller_ip)
+        if context != expected_context:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Recovery launch context does not match the locked intent.')
+        current.launch_request_id = request_id
+        current.system_recovery_revision = _system_recovery_revision(
+            current) + 1
+        _write_locked_replica_info_in_session(session, service_name, replica_id,
+                                              current)
+        return current
+
+
+def set_replica_system_recovery_job_id(
+    service_name: str,
+    replica_id: int,
+    service_job_id: int,
+    *,
+    expected_launch_request_id: str,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_revision: int,
+) -> 'replica_managers.ReplicaInfo':
+    """Bind the exact ordinary request result's service job ID once."""
+    if (isinstance(service_job_id, bool) or
+            not isinstance(service_job_id, int) or service_job_id <= 0 or
+            not isinstance(expected_launch_request_id, str) or
+            not expected_launch_request_id):
+        raise ValueError('Job/request IDs are invalid.')
+
+    def _set_job_id(
+        current: 'replica_managers.ReplicaInfo',
+    ) -> 'replica_managers.ReplicaInfo':
+        if current.launch_request_id != expected_launch_request_id:
+            raise ReplicaSystemRecoveryMutationRejected(
+                'Launch request association changed before job bind.')
+        if current.service_job_id not in (None, service_job_id):
+            raise ReplicaSystemRecoveryMutationRejected(
+                'A different service job ID is already bound.')
+        current.service_job_id = service_job_id
+        return current
+
+    return _mutate_replica_system_recovery(
+        service_name,
+        replica_id,
+        _set_job_id,
+        expected_service_hash=expected_service_hash,
+        expected_lifecycle_epoch=expected_lifecycle_epoch,
+        expected_controller_owner=expected_controller_owner,
+        expected_revision=expected_revision)
+
+
+def rewrite_rollback_replica_system_recovery_state(
+    service_name: str,
+    *,
+    expected_service_hash: str,
+    expected_lifecycle_epoch: int,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> int:
+    """Rewrite every exact all-fields-absent v13 rollback shape in-place."""
+    engine = _require_system_recovery_postgres()
+    fields = _v13_additive_storage_fields()
+    rewritten = 0
+    with orm.Session(engine) as session, session.begin():
+        _lock_system_recovery_service_owner_in_session(
+            session,
+            service_name,
+            expected_service_hash,
+            expected_lifecycle_epoch,
+            expected_controller_owner,
+            require_launch_allowed=False)
+        rows = session.execute(
+            sqlalchemy.select(replicas_table.c.replica_id,
+                              replicas_table.c.replica_state_version,
+                              replicas_table.c.replica_state).
+            where(replicas_table.c.service_name == service_name).order_by(
+                replicas_table.c.replica_id).with_for_update()).fetchall()
+        for row in rows:
+            state = row.replica_state
+            if (not isinstance(state, dict) or
+                    state.get('replica_info_version') != 13 or
+                    any(field_name in state for field_name in fields)):
+                continue
+            try:
+                info = _replica_from_state(row.replica_state_version, state)
+            except Exception as error:
+                raise ReplicaSystemRecoveryMutationRejected(
+                    'Rollback-shaped v13 replica could not be rewritten.'
+                ) from error
+            complete = info.to_storage_dict()
+            if any(field_name not in complete for field_name in fields):
+                raise ReplicaSystemRecoveryMutationRejected(
+                    'Replica v13 writer did not emit a complete recovery '
+                    'bundle.')
+            _write_locked_replica_info_in_session(session, service_name,
+                                                  int(row.replica_id), info)
+            rewritten += 1
+    return rewritten
 
 
 def get_service_placement_policy_states(
@@ -2381,6 +3143,7 @@ def try_add_replica_with_paid_capacity_claim(
     frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
 ) -> str:
     """Atomically persist one replica and its global paid-capacity claim."""
+    _validate_replica_row_identity(replica_id, replica_info)
     engine = _db_manager.get_engine()
     reconcile_waiters = False
     with orm.Session(engine) as session:
@@ -2557,10 +3320,7 @@ def try_add_replica_with_paid_capacity_claim(
         replica_info.paid_capacity_pool_key = pool_key
         replica_insert = _upsert_insert_func(engine)(replicas_table).values(
             **_replica_row_values(service_name, replica_id, replica_info))
-        session.execute(
-            replica_insert.on_conflict_do_update(
-                index_elements=['service_name', 'replica_id'],
-                set_=_replica_conflict_update_values(replica_insert)))
+        session.execute(replica_insert)
         claim_insert = _upsert_insert_func(engine)(
             paid_capacity_claims_table).values(service_name=service_name,
                                                service_hash=service_hash,
@@ -2626,8 +3386,11 @@ def adopt_paid_capacity_claims(
     """Attach pre-migration unresolved rows to shared pool claims."""
     if not claims:
         return True
+    for replica_id, _, _, replica_info in claims:
+        _validate_replica_row_identity(replica_id, replica_info)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, True)
         if not _lock_service_owner_in_session(session,
                                               service_name,
                                               service_hash,
@@ -2639,7 +3402,19 @@ def adopt_paid_capacity_claims(
             _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
                                                   base_limit, now)
             _paid_capacity_pool_row_for_update(session, pool_key)
-        for replica_id, pool_key, priority, replica_info in claims:
+        claims_by_replica_id = {
+            replica_id: (pool_key, priority)
+            for replica_id, pool_key, priority, _ in claims
+        }
+        merged_infos = _lock_and_merge_existing_replica_rows_in_session(
+            session, engine, service_name,
+            [(replica_id, replica_info)
+             for replica_id, _, _, replica_info in claims])
+        if merged_infos is None:
+            session.rollback()
+            return False
+        for replica_id, replica_info in merged_infos:
+            pool_key, priority = claims_by_replica_id[replica_id]
             row = session.execute(
                 sqlalchemy.select(replicas_table.c.status).where(
                     replicas_table.c.service_name == service_name,
@@ -2691,8 +3466,13 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
     applied_outcome_pool_keys: set[str] | None = None,
 ) -> bool:
     """Persist a completed launch wave and release claims atomically."""
+    replica_ids = {replica_id for replica_id, _ in replica_infos}
+    if set(outcomes) - replica_ids:
+        raise ValueError('Paid-capacity outcomes must identify updated '
+                         'replica rows.')
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, True)
         if not _lock_service_owner_in_session(session,
                                               service_name,
                                               service_hash,
@@ -2700,8 +3480,13 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
                                               require_launch_allowed=False):
             session.rollback()
             return False
-        _upsert_replica_rows_in_session(session, engine, service_name,
-                                        replica_infos)
+        if not _upsert_replica_rows_in_session(session,
+                                               engine,
+                                               service_name,
+                                               replica_infos,
+                                               expected_replica_exists=True):
+            session.rollback()
+            return False
         if not outcomes:
             session.commit()
             return True
@@ -2812,20 +3597,29 @@ def add_or_update_replica(
     replica_info: 'replica_managers.ReplicaInfo',
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    *,
+    expected_replica_exists: bool = False,
 ) -> bool:
-    """Adds a replica to the database."""
+    """Persist one replica, optionally requiring its row to already exist.
+
+    ``expected_replica_exists`` is the update-only bookkeeping path.  A
+    missing row rejects the mutation instead of falling through to an insert.
+    Callers admitting a new replica must leave it false explicitly; that path
+    is INSERT-only and surfaces a primary-key conflict.
+    """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         _begin_immediate_if_sqlite(
             session, engine, expected_service_hash is not None or
             expected_lifecycle_epoch is not None or
-            expected_controller_owner is not None)
+            expected_controller_owner is not None or expected_replica_exists)
         if not _lifecycle_epoch_matches_in_session(session, service_name,
                                                    expected_lifecycle_epoch):
             session.rollback()
             return False
-        if expected_service_hash is not None:
+        if (expected_service_hash is not None or
+                expected_controller_owner is not None):
             owner = session.execute(
                 sqlalchemy.select(
                     services_table.c.hash, services_table.c.lifecycle_epoch,
@@ -2833,29 +3627,21 @@ def add_or_update_replica(
                     services_table.c.controller_ip).where(
                         services_table.c.name ==
                         service_name).with_for_update()).fetchone()
-            if (owner is None or owner[0] != expected_service_hash or
+            if (owner is None or (expected_service_hash is not None and
+                                  owner[0] != expected_service_hash) or
                 (expected_lifecycle_epoch is not None and
                  owner[1] != expected_lifecycle_epoch) or
                 (expected_controller_owner is not None and
                  (owner[2], owner[3]) != expected_controller_owner)):
                 session.rollback()
                 return False
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
-        insert_stmt = insert_func(replicas_table).values(
-            **_replica_row_values(service_name, replica_id, replica_info))
-
-        insert_stmt = insert_stmt.on_conflict_do_update(
-            index_elements=['service_name', 'replica_id'],
-            set_=_replica_conflict_update_values(insert_stmt))
-
-        session.execute(insert_stmt)
+        if not _upsert_replica_rows_in_session(
+                session,
+                engine,
+                service_name, [(replica_id, replica_info)],
+                expected_replica_exists=expected_replica_exists):
+            session.rollback()
+            return False
         session.commit()
     return True
 
@@ -2873,7 +3659,7 @@ def add_or_update_replica_with_launch_shadow(
 
     This PostgreSQL-only primitive is deliberately separate from generic
     replica persistence: only it may initialize action-owned identity/link
-    columns, while later status upserts continue to preserve those columns.
+    columns, while later status updates continue to preserve those columns.
     """
     engine = _db_manager.get_engine()
     store = resource_action_state.PostgresServeResourceActionStateStore(engine)
@@ -2890,15 +3676,19 @@ def add_or_update_replicas(
     replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    *,
+    expected_replica_exists: bool = False,
 ) -> bool:
-    """Upserts a batch of replicas in one statement/transaction.
+    """Persist a batch of replicas in one transaction.
 
     The probe round persists per-replica bookkeeping for every probed
-    replica; issuing those as individual upserts serializes one DB
+    replica; issuing those as individual updates serializes one DB
     round-trip per replica under the replica-manager lock (at ~1k replicas
-    on Postgres that alone exceeds the probe period). Multi-row
-    ON CONFLICT upsert keeps the round O(1) in round-trips.
+    on Postgres that alone exceeds the probe period). The expected-existing
+    path locks every requested row before its first write, aborts the whole
+    batch if one is absent or has a different record identity, and executes
+    UPDATE only. Explicit initial admission is INSERT-only.
     """
     if not replica_infos:
         return True
@@ -2907,12 +3697,13 @@ def add_or_update_replicas(
         _begin_immediate_if_sqlite(
             session, engine, expected_service_hash is not None or
             expected_lifecycle_epoch is not None or
-            expected_controller_owner is not None)
+            expected_controller_owner is not None or expected_replica_exists)
         if not _lifecycle_epoch_matches_in_session(session, service_name,
                                                    expected_lifecycle_epoch):
             session.rollback()
             return False
-        if expected_service_hash is not None:
+        if (expected_service_hash is not None or
+                expected_controller_owner is not None):
             owner = session.execute(
                 sqlalchemy.select(
                     services_table.c.hash, services_table.c.lifecycle_epoch,
@@ -2920,7 +3711,8 @@ def add_or_update_replicas(
                     services_table.c.controller_ip).where(
                         services_table.c.name ==
                         service_name).with_for_update()).fetchone()
-            if (owner is None or owner[0] != expected_service_hash or
+            if (owner is None or (expected_service_hash is not None and
+                                  owner[0] != expected_service_hash) or
                 (expected_lifecycle_epoch is not None and
                  owner[1] != expected_lifecycle_epoch) or
                 (expected_controller_owner is not None and
@@ -2930,10 +3722,67 @@ def add_or_update_replicas(
         # Older SQLite builds cap SQLITE_MAX_VARIABLE_NUMBER at 999, while
         # PostgreSQL can preserve the prior 300-row batches. The helper derives
         # SQLite's safe chunk from the live table width.
-        _upsert_replica_rows_in_session(session, engine, service_name,
-                                        replica_infos)
+        if not _upsert_replica_rows_in_session(
+                session,
+                engine,
+                service_name,
+                replica_infos,
+                expected_replica_exists=expected_replica_exists):
+            session.rollback()
+            return False
         session.commit()
     return True
+
+
+def _lock_replica_record_ids_in_session(
+    session: orm.Session,
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    replica_ids: list[int],
+) -> dict[int, str] | None:
+    """Lock sorted replica rows and decode their immutable record identities."""
+    record_ids: dict[int, str] = {}
+    is_postgres = (
+        engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+    for start in range(0, len(replica_ids), _REPLICA_DELETE_CHUNK_SIZE):
+        chunk = replica_ids[start:start + _REPLICA_DELETE_CHUNK_SIZE]
+        stmt = sqlalchemy.select(
+            replicas_table.c.replica_id,
+            replicas_table.c.replica_state_version,
+            replicas_table.c.replica_state,
+        ).where(replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id.in_(chunk)).order_by(
+                    replicas_table.c.replica_id)
+        if is_postgres:
+            stmt = stmt.with_for_update()
+        rows = session.execute(stmt).fetchall()
+        try:
+            for row in rows:
+                replica_id = int(row.replica_id)
+                info = _replica_from_state(row.replica_state_version,
+                                           row.replica_state)
+                record_id = getattr(info, 'replica_record_id', None)
+                if (info.replica_id != replica_id or
+                        not isinstance(record_id, str)):
+                    return None
+                record_ids[replica_id] = record_id
+        except Exception:  # pylint: disable=broad-except
+            # A terminal delete cannot guess through unreadable identity state.
+            return None
+    return record_ids
+
+
+def _validate_expected_replica_record_id(record_id: Any) -> None:
+    """Reject malformed delete-fence identities before opening a transaction."""
+    if not isinstance(record_id, str):
+        raise ValueError('Expected replica record IDs must be strings.')
+    try:
+        parsed = uuid.UUID(record_id)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(
+            'Expected replica record IDs must be canonical UUIDs.') from exc
+    if str(parsed) != record_id:
+        raise ValueError('Expected replica record IDs must be canonical UUIDs.')
 
 
 def remove_replica(
@@ -2941,24 +3790,30 @@ def remove_replica(
     replica_id: int,
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    *,
+    expected_replica_record_id: str,
 ) -> bool:
-    """Remove a replica, optionally fenced to one lifecycle/incarnation."""
+    """Remove one replica under service and immutable-record fences."""
+    _validate_expected_replica_record_id(expected_replica_record_id)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         _begin_immediate_if_sqlite(
             session, engine, expected_service_hash is not None or
             expected_lifecycle_epoch is not None or
-            expected_controller_owner is not None)
+            expected_controller_owner is not None or
+            expected_replica_record_id is not None)
         if not _lifecycle_epoch_matches_in_session(session, service_name,
                                                    expected_lifecycle_epoch):
             session.rollback()
             return False
+        _lock_service_row_if_present_for_replica_write(session, service_name)
         predicates = [
             replicas_table.c.service_name == service_name,
             replicas_table.c.replica_id == replica_id,
         ]
-        if expected_service_hash is not None:
+        if (expected_service_hash is not None or
+                expected_controller_owner is not None):
             owner = session.execute(
                 sqlalchemy.select(
                     services_table.c.hash, services_table.c.lifecycle_epoch,
@@ -2966,23 +3821,38 @@ def remove_replica(
                     services_table.c.controller_ip).where(
                         services_table.c.name ==
                         service_name).with_for_update()).fetchone()
-            if (owner is None or owner[0] != expected_service_hash or
+            if (owner is None or (expected_service_hash is not None and
+                                  owner[0] != expected_service_hash) or
                 (expected_lifecycle_epoch is not None and
                  owner[1] != expected_lifecycle_epoch) or
                 (expected_controller_owner is not None and
                  (owner[2], owner[3]) != expected_controller_owner)):
                 session.rollback()
                 return False
+        locked_record_ids = _lock_replica_record_ids_in_session(
+            session, engine, service_name, [replica_id])
+        if locked_record_ids is None:
+            session.rollback()
+            return False
+        current_record_id = locked_record_ids.get(replica_id)
+        if (current_record_id is not None and
+                current_record_id != expected_replica_record_id):
+            session.rollback()
+            return False
         session.execute(
             sqlalchemy.delete(paid_capacity_claims_table).where(
                 paid_capacity_claims_table.c.service_name == service_name,
                 paid_capacity_claims_table.c.replica_id == replica_id))
-        result = session.execute(
-            sqlalchemy.delete(replicas_table).where(*predicates))
+        if current_record_id is not None:
+            result = session.execute(
+                sqlalchemy.delete(replicas_table).where(*predicates))
+            if result.rowcount != 1:
+                session.rollback()
+                return False
         session.commit()
     # Once exact ownership is proven, an already-absent child is the desired
     # idempotent cleanup state, not evidence of ownership loss.
-    return expected_service_hash is not None or result.rowcount > 0
+    return True
 
 
 def remove_replicas(
@@ -2991,6 +3861,8 @@ def remove_replicas(
     expected_service_hash: str,
     expected_lifecycle_epoch: int | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None,
+    *,
+    expected_replica_record_ids: dict[int, str],
 ) -> bool:
     """Atomically remove replicas fenced to one service incarnation.
 
@@ -3005,7 +3877,14 @@ def remove_replicas(
     """
     if not expected_service_hash:
         return False
-    replica_ids = list(dict.fromkeys(replica_ids))
+    if len(set(replica_ids)) != len(replica_ids):
+        raise ValueError('replica_ids must not contain duplicates.')
+    replica_ids = sorted(replica_ids)
+    if set(expected_replica_record_ids) != set(replica_ids):
+        raise ValueError(
+            'expected_replica_record_ids must cover every replica.')
+    for record_id in expected_replica_record_ids.values():
+        _validate_expected_replica_record_id(record_id)
     if not replica_ids:
         return True
     engine = _db_manager.get_engine()
@@ -3029,16 +3908,36 @@ def remove_replicas(
              (owner[2], owner[3]) != expected_controller_owner)):
             session.rollback()
             return False
+        locked_record_ids = _lock_replica_record_ids_in_session(
+            session, engine, service_name, replica_ids)
+        if locked_record_ids is None:
+            session.rollback()
+            return False
+        if any(expected_replica_record_ids[replica_id] != record_id
+               for replica_id, record_id in locked_record_ids.items()):
+            session.rollback()
+            return False
+        # Rows already absent are idempotently complete. Do not include them in
+        # the DELETE, so even an out-of-protocol concurrent insertion cannot be
+        # consumed by this stale terminal callback.
+        present_replica_ids = sorted(locked_record_ids)
         for start in range(0, len(replica_ids), _REPLICA_DELETE_CHUNK_SIZE):
             chunk = replica_ids[start:start + _REPLICA_DELETE_CHUNK_SIZE]
             session.execute(
                 sqlalchemy.delete(paid_capacity_claims_table).where(
                     paid_capacity_claims_table.c.service_name == service_name,
                     paid_capacity_claims_table.c.replica_id.in_(chunk)))
-            session.execute(
+        for start in range(0, len(present_replica_ids),
+                           _REPLICA_DELETE_CHUNK_SIZE):
+            chunk = present_replica_ids[start:start +
+                                        _REPLICA_DELETE_CHUNK_SIZE]
+            result = session.execute(
                 sqlalchemy.delete(replicas_table).where(
                     replicas_table.c.service_name == service_name,
                     replicas_table.c.replica_id.in_(chunk)))
+            if result.rowcount != len(chunk):
+                session.rollback()
+                return False
         session.commit()
     return True
 
@@ -4558,7 +5457,7 @@ def add_replica_if_round_epoch(
 ) -> bool:
     """Persists a fill replica row iff the launch's allocation is current.
 
-    Three predicates, all evaluated atomically with the row upsert:
+    Three predicates, all evaluated atomically with the row insert:
 
     - Round epoch: the launch path's cheap epoch pre-check is TOCTOU (a
       broker round can publish a new epoch between that check and the row
@@ -4582,12 +5481,12 @@ def add_replica_if_round_epoch(
     The atomicity needs a dialect split:
 
     - PostgreSQL: the round and claim rows are read FOR SHARE in the
-      upsert's transaction, blocking concurrent round/claim UPDATEs until
+      insert's transaction, blocking concurrent round/claim UPDATEs until
       commit, so neither predicate can move between the read and the
-      upsert.
+      insert.
     - sqlite: FOR SHARE is a no-op AND the legacy sqlite3 transaction mode
       does not even open a transaction for the SELECT, so the two-statement
-      shape keeps the exact read/publish/upsert interleaving it was meant
+      shape keeps the exact read/publish/insert interleaving it was meant
       to close (or, under WAL snapshot upgrades, aborts with a BUSY error
       instead of fencing). Chosen shape: ONE conditional statement --
       INSERT ... SELECT literals WHERE NOT EXISTS(round with a DIFFERENT
@@ -4612,16 +5511,16 @@ def add_replica_if_round_epoch(
     launch exactly like a fenced pre-check.
     """
     engine = _db_manager.get_engine()
-    row_values = _replica_row_values(service_name, replica_id, replica_info)
     if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
         with orm.Session(engine) as session:
+            _lifecycle_epoch_matches_in_session(session, service_name, None)
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
             if expected_service_hash is not None:
-                owner = session.execute(
-                    sqlalchemy.select(services_table.c.hash,
-                                      services_table.c.controller_pid,
-                                      services_table.c.controller_ip).where(
-                                          services_table.c.name == service_name
-                                      ).with_for_update(read=True)).fetchone()
                 if (owner is None or owner[0] != expected_service_hash or
                     (expected_controller_owner is not None and
                      (owner[1], owner[2]) != expected_controller_owner)):
@@ -4645,16 +5544,16 @@ def add_replica_if_round_epoch(
             if claim is None:
                 session.rollback()
                 return False
+            row_values = _replica_row_values(service_name, replica_id,
+                                             replica_info)
             insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
                 **row_values)
-            insert_stmt = insert_stmt.on_conflict_do_update(
-                index_elements=['service_name', 'replica_id'],
-                set_=_replica_conflict_update_values(insert_stmt))
             session.execute(insert_stmt)
             session.commit()
         return True
     # sqlite: every fence predicate is the WHERE clause of the insert
     # itself.
+    row_values = _replica_row_values(service_name, replica_id, replica_info)
     stale_round = sqlalchemy.select(
         reserved_fill_rounds_table.c.pool_key).where(
             reserved_fill_rounds_table.c.pool_key == pool_key,
@@ -4686,9 +5585,6 @@ def add_replica_if_round_epoch(
     ]).where(sqlalchemy.not_(stale_round), live_claim, current_incarnation)
     insert_stmt = sqlite.insert(replicas_table).from_select(
         [column.name for column in columns], select_stmt)
-    insert_stmt = insert_stmt.on_conflict_do_update(
-        index_elements=['service_name', 'replica_id'],
-        set_=_replica_conflict_update_values(insert_stmt))
     for attempt in range(_SQLITE_FENCE_BUSY_RETRIES):
         try:
             with orm.Session(engine) as session:

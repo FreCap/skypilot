@@ -183,6 +183,14 @@ def test_system_oom_recovery_codegen_is_single_attempt_authority():
     assert 'max_retries=0' in result
     assert result.count('def submit_task_attempt_0(') == 1
     assert 'task_future = submit_task_attempt_0(0, task_attempt_context)' in result
+    assert 'if attempt_number == 0:' in result
+    assert result.index('arm_started_monotonics.append(time.monotonic())') < (
+        result.index('future = remote_task.remote('))
+    assert 'arm_started_monotonics[0]' in result
+    session_capture = ('system_oom_recovery.capture_ray_session_identity(ray)')
+    assert result.index('future = remote_task.remote(') < result.index(
+        session_capture) < result.index('get_or_fail_with_recovery(')
+    assert 'ray_session_identities[0]' in result
     assert 'get_or_fail_with_recovery(' in result
     assert ('run_bash_command_with_log_and_return_pid_with_system_oom_recovery'
             in result)

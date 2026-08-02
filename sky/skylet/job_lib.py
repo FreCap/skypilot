@@ -985,26 +985,32 @@ def _validate_job_system_recovery_transition(
 
 
 @init_db
-def arm_job_system_recovery(job_id: int, info: JobSystemRecoveryInfo) -> bool:
-    """Persist an eligible recovery capability for a running job."""
+def arm_job_system_recovery_no_lock(job_id: int,
+                                    info: JobSystemRecoveryInfo) -> bool:
+    """Persist ARMED while the caller holds ``job_status_lock``."""
     assert _DB is not None
     _validate_armed_job_system_recovery_info(info)
+    if get_status_no_lock(job_id) != JobStatus.RUNNING:
+        return False
+    current = _get_job_system_recovery_info_no_lock(job_id)
+    if current is not None:
+        return current == info
+    try:
+        _DB.cursor.execute(
+            'INSERT INTO job_system_recovery(job_id, info_json) VALUES (?, ?)',
+            (job_id, _serialize_job_system_recovery_info(info)))
+        _DB.conn.commit()
+    except Exception:
+        _DB.conn.rollback()
+        raise
+    return True
+
+
+@init_db
+def arm_job_system_recovery(job_id: int, info: JobSystemRecoveryInfo) -> bool:
+    """Persist an eligible recovery capability for a running job."""
     with job_status_lock(job_id):
-        if get_status_no_lock(job_id) != JobStatus.RUNNING:
-            return False
-        current = _get_job_system_recovery_info_no_lock(job_id)
-        if current is not None:
-            return current == info
-        try:
-            _DB.cursor.execute(
-                'INSERT INTO job_system_recovery(job_id, info_json) '
-                'VALUES (?, ?)',
-                (job_id, _serialize_job_system_recovery_info(info)))
-            _DB.conn.commit()
-        except Exception:
-            _DB.conn.rollback()
-            raise
-        return True
+        return arm_job_system_recovery_no_lock(job_id, info)
 
 
 @init_db

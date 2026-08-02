@@ -373,21 +373,26 @@ def _cleanup(service_name: str,
             info.replica_id,
             info,
             expected_service_hash=service_hash,
-            expected_lifecycle_epoch=lifecycle_epoch)
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_controller_owner=expected_owner,
+            expected_replica_exists=True)
         if persisted is False:
             raise ServiceOwnershipLostError(
-                f'Lost lifecycle epoch while updating replica '
-                f'{info.replica_id}.')
+                f'Lost lifecycle epoch or replica {info.replica_id} was '
+                'removed while updating cleanup bookkeeping.')
 
-    def _remove_replica(replica_id: int) -> None:
+    def _remove_replica(info: replica_managers.ReplicaInfo) -> None:
         removed = serve_state.remove_replica(
             service_name,
-            replica_id,
+            info.replica_id,
             expected_service_hash=service_hash,
-            expected_lifecycle_epoch=lifecycle_epoch)
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_controller_owner=expected_owner,
+            expected_replica_record_id=info.replica_record_id)
         if removed is False:
             raise ServiceOwnershipLostError(
-                f'Lost lifecycle epoch while removing replica {replica_id}.')
+                'Lost lifecycle epoch or record identity while removing '
+                f'replica {info.replica_id}.')
 
     _assert_owner('before replica cleanup')
     # Log who we are and what DB state we're cleaning up, so post-mortems
@@ -434,7 +439,11 @@ def _cleanup(service_name: str,
             service_name, [info.replica_id for info in absent_replica_infos],
             expected_service_hash=service_hash,
             expected_lifecycle_epoch=lifecycle_epoch,
-            expected_controller_owner=expected_owner)
+            expected_controller_owner=expected_owner,
+            expected_replica_record_ids={
+                info.replica_id: info.replica_record_id
+                for info in absent_replica_infos
+            })
         if not removed:
             raise ServiceOwnershipLostError(
                 'Lost lifecycle ownership while bulk-removing absent '
@@ -505,7 +514,7 @@ def _cleanup(service_name: str,
                 t.join()
                 del info2thr[info]
                 if t.format_exc is None:
-                    _remove_replica(info.replica_id)
+                    _remove_replica(info)
                     logger.info(
                         f'Replica {info.replica_id} terminated successfully.')
                 else:

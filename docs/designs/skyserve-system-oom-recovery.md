@@ -1,13 +1,14 @@
 # SkyServe System OOM Recovery
 
-_Status: per-job capability architecture accepted after exact adversarial
-review; the inert runtime foundation is merged; #1182 and draft #1183 are being
-rewritten; production activation is blocked_
+_Status: rewritten #1182 implementation and canonical design are complete;
+the corrected route-lease/runtime design passed exact adversarial re-review;
+the stacked draft #1183 steady-state removal is authored and remains blocked
+on all seven removal gates; production activation is blocked_
 
 _Last updated: 2026-08-02_
 
 _Design baseline: `origin/improvements` at
-`7d4b4413e4da31e42c352c9438904982e1ddfe3a`_
+`2a1ce0cd0ba2ab514cd727b7ea3ae2079e3571cd`_
 
 ## Context and decision
 
@@ -48,16 +49,20 @@ The bounded decision is therefore orthogonal to lifecycle authority:
   only inside the exact service job produced by one fresh, dedicated,
   single-node AWS provision result with at most 16 GB of RAM.
 - The Ray driver owns the only replay. It performs no API request, setup,
-  provisioning, provider mutation, or second SkyPilot job.
+  provisioning, provider mutation, or second SkyPilot job. Before replay it
+  also observes a fixed local quiescence interval longer than the external
+  load balancer's recovery-route lease.
 - #1182 adds only durable launch intent, ordinary request/job association,
   admission disposition, and controller reduction. On exhaustion, preemption,
   evidence loss, or teardown, it schedules or adopts the existing legacy
   replica cleanup/replacement path.
 
-There is **no API008 migration**, no OOM-specific API-request column, no
-`X-SkyPilot-System-Recovery-Operation-ID` header, and no external L7
-private-header fence. The unshipped protected-request implementation is
-deleted rather than carried as compatibility.
+There is **no API008 migration**, no OOM-specific API-request column, and no
+`X-SkyPilot-System-Recovery-Operation-ID` header. The unshipped
+protected-request implementation is deleted rather than carried as
+compatibility. #1182 does add one internal, authenticated, low-cardinality LB
+route-lease heartbeat: it is a data-plane freshness fence, not a per-request
+header, application contract, cloud authority, or public API.
 
 ## Goals
 
@@ -123,6 +128,12 @@ backend rejection is resolved by the bounded protocol below.
 
 - the workload is a non-pool SkyServe service launched through the existing
   `CloudVmRayBackend` path on one dedicated Linux VM;
+- that service version's ordinary readiness-probe interval is a finite positive
+  value at most 10 seconds and its timeout is at most 15 seconds. A larger or
+  malformed value cannot create `CANDIDATE`. Recovery-capable routes also use
+  the separate fixed-cadence lease prober below; the caps keep the ordinary
+  reducer's detection/re-entry contract bounded rather than changing user
+  configuration;
 - the controller and `/launch` endpoint share the same central PostgreSQL Serve
   database and the existing durable service-owner launch fence is enforced.
   A non-consolidated controller, `enforce_launch_fence=False`, a controller-
@@ -188,9 +199,9 @@ SystemOomRecoveryAuthorizationDocumentV3 = {
 
 SystemOomRecoveryAuthorizationV3 = {
   authorization_version: 3,
-  profile_id: Text,
+  profile_id: NonemptyText,
   workspace: Text,
-  service_name: Text,
+  service_name: NonemptyText,
   service_hash: NonemptyText,
   task_sha256: Sha256,
   runtime_image_digest: "sha256:" + 64LowerHex,
@@ -245,10 +256,11 @@ generated driver separately verifies the
 cgroup-aware total before it calls the unchanged API-v1 operation that persists
 `ARMED`. Neither dynamic proof is added to `JobSystemRecoveryInfo`, its API-v1
 protobuf, or the closed marker-v2 schema. Backend and driver each emit one
-bounded internal structured admission log keyed by service hash, replica ID,
-launch generation, profile ID, and exact job ID when available. Logs include
-the decision/reason and the evidence observed at that boundary, but raw account
-and instance values never become metric labels or user-visible output.
+bounded internal structured admission log with only closed decision, reason,
+provider, market, and profile-version values. Service/job/request/session,
+account, instance, location, and free-form evidence values remain in their
+existing owner-fenced state or provider records; they are not copied into this
+new log, metric labels, or user-visible output.
 
 The task digest is the SHA-256 of canonical sorted-key compact JSON produced
 from the effective task's redacted YAML form after removing only `name`,
@@ -282,7 +294,7 @@ SystemRecoveryLaunchIntentV1 = {
   version: 1,
   controller_contract_version: 2,
   recovery_authorization_version: 3,
-  recovery_authorization_profile_id: Text,
+  recovery_authorization_profile_id: NonemptyText,
   recovery_authorization_sha256: Sha256,
   runtime_profile_version: 2,
   expected_runtime_capability:
@@ -307,7 +319,7 @@ endpoint `SystemRecoveryLaunchContextV2Unbound` contains exactly:
 {
   controller_contract_version: 2,
   recovery_authorization_version: 3,
-  recovery_authorization_profile_id: Text,
+  recovery_authorization_profile_id: NonemptyText,
   recovery_authorization_sha256: Sha256,
   runtime_profile_version: 2,
   expected_runtime_capability:
@@ -356,8 +368,11 @@ contract. In the existing `/launch` handler, before executor scheduling, the
 API server uses its already-created ordinary request ID plus the closed launch
 context to consume the exact nonce and owner/generation-fenced bind that ID as
 optional `ReplicaInfo.launch_request_id`. It then overwrites the in-memory
-context's bound-request field with that server-known value. The backend requires
-the current request ID, server-bound context ID, persisted association, and
+context's bound-request field with that server-known value. That server-created
+bound context is the backend's durable-bind witness: it is constructed only
+after the row-locked association commits, and the endpoint never accepts a
+caller-supplied bound form. The backend deliberately does not import or query
+Serve state; it requires the current request ID, server-bound witness ID, and
 fresh-provision evidence request ID to agree. A caller cannot mint a bound
 context, and the legitimate backend cannot run before association is durable.
 This uses the existing request ID and `extra_launch_context` envelope; it adds
@@ -443,11 +458,27 @@ service/lifecycle lock after a replica lock. Generic whole-row replica writers
 take that common order and preserve the latest stored recovery subdocument/
 revision rather than overwriting it from a stale in-memory snapshot. Controller
 status/probe reductions use the same explicit patch primitive and then refresh
-their local object. A PostgreSQL deadlock/serialization abort rolls back the
-whole transition; the next reconciliation refreshes and re-reduces instead of
-retrying individual statements. This protocol prevents both database/manager
-lock inversion and lost request/job/reducer updates; it adds no table column or
-migration.
+their local object. Bookkeeping writes for an already-persisted replica are
+update-only: each v13 row carries an immutable random `replica_record_id`, and
+the writer carries that expected row identity. The transaction aborts the whole
+batch if any locked row is absent or has a different identity. A v12/rollback-
+shaped row deterministically derives its transition identity from its immutable
+replica ID, cluster name, and creation timestamp, and the first v13 rewrite
+persists it; a newly created row always receives a new random identity. Only the
+explicit initial-create and reserved-capacity claim/fill paths may insert, and
+those are insert-only rather than conflict-upserts. Consequently a stale
+callback or manager snapshot serialized after terminal row deletion cannot
+recreate the replica or overwrite a later same-ID row, even while the service
+owner incarnation is still valid. Replica-lifecycle single and batch deletes
+likewise carry the expected `replica_record_id`, lock rows in the common order,
+and abort or leave a mismatched recreated row untouched; service-incarnation
+teardown remains independently fenced by the service hash/owner protocol. A
+PostgreSQL deadlock/
+serialization abort rolls back the whole transition; the next reconciliation
+refreshes and re-reduces instead of retrying individual statements. This
+protocol prevents database/manager lock inversion, lost request/job/reducer
+updates, post-delete resurrection, and stale same-key aliasing; the identity
+lives in versioned JSON/pickle and adds no table column or migration.
 
 The Ray job can already be live when job-ID persistence fails. That cannot
 retroactively disarm its bounded driver. The driver may complete one replay,
@@ -493,11 +524,22 @@ a second SkyPilot job.
 
 Before replay, the session verifies that Ray remains connected, the original
 placement group exists, and instance boot/Ray-session identities are unchanged.
-A fresh `.remote()` produces a new ObjectRef in the same placement-group
-bundle; the failed ObjectRef is never reused. Placement-group removal occurs
-exactly once in an outer `finally`. Every replacement ref is either durably
-adopted after `RETRY_SUBMITTED` or best-effort cancelled and fenced by that
-removal.
+It also waits until at least
+`SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS = 83` monotonic seconds have elapsed
+since the exact positive process/container cleanup proof completed. Memory
+admission may proceed during that interval, but `.remote()` cannot run early.
+Every successful readiness probe against the old process necessarily started
+before that proof. The 83-second minimum exceeds its 60-second recovery-route
+lease plus the marked route's fixed 10-second HTTP connection-pool acquisition
+timeout, fixed 10-second backend-connect timeout, and one 2-second heartbeat
+period, with one second of strict margin. Every correctly upgraded external LB
+has expired the old route, and every request that passed a final pre-transport
+lease check has exhausted both its pool wait and possible connect attempt,
+before a same-IP/same-port replacement can bind. A fresh `.remote()` then
+produces a new ObjectRef in the same placement-group bundle; the failed
+ObjectRef is never reused. Placement-group removal occurs exactly once in an
+outer `finally`. Every replacement ref is either durably adopted after
+`RETRY_SUBMITTED` or best-effort cancelled and fenced by that removal.
 
 A second Ray OOM, nonzero retry result, failed proof/transition, identity
 change, or deadline atomically marks the existing job `FAILED` with recovery
@@ -592,7 +634,8 @@ trip. It never parses logs or polls an application queue.
 
 ### Durable Serve state and pure controller reduction
 
-`ReplicaInfo` version 13 stores the historical launch intent, launch
+`ReplicaInfo` version 13 stores an immutable `replica_record_id`, the historical
+launch intent, launch
 disposition (`CANDIDATE`, `ORDINARY`, or `CAPABLE`), optional ordinary
 `launch_request_id`, exact service job ID, one-shot candidate-ready/
 arm-release anchors, one monotonically increasing recovery-subdocument
@@ -695,6 +738,243 @@ down/purge/preemption/scale-down intent exists. A 200 from the old attempt is
 stale. A second OOM, terminal job, mismatch, malformed detail, deadline, or
 teardown reduces to `EXHAUSTED` and emits `SCHEDULE_OR_ADOPT_LEGACY_TEARDOWN`.
 
+### Recovery-capable external-LB route lease
+
+The controller's ordinary 20-second routing sync is intentionally
+availability-biased: after a failed or slow sync an external LB retains its
+last ready URL. That is safe for ordinary replicas, but is insufficient for a
+recovery-capable process because its replacement can bind the same IP and port.
+The data plane therefore adds one narrow freshness fence only for `CAPABLE`
+routes; ordinary routes keep the existing controller-outage behavior.
+
+For each `READY` `CAPABLE` replica that a normal readiness reduction allows to
+route, the manager registers one process-local route target containing the
+decimal replica ID, immutable `replica_record_id`, exact normalized route and
+probe URLs, closed readiness request, and a new opaque random route token. A
+route generation binds the controller-process epoch, record identity, exact
+remote OOM event identity, and the exact routable attempt identity: the
+original attempt for `ARMED`, or the adopted replacement attempt for
+`RECOVERED`. A token may be issued only once for that exact route generation,
+and only by the normal owner-fenced reduction after a qualifying readiness
+success **and** a fresh exact remote job-status/detail read whose request starts
+after that readiness response completes. Persisted/cached controller state is
+never issuance evidence. The post-probe read must prove the exact job remains
+nonterminal, detail is `PRESENT`, and its event/original/replacement attempt
+identity and phase exactly match the generation that would route. If it instead
+observes `WAITING_*`, `RESUBMITTING`, `RETRY_SUBMITTED`, `EXHAUSTED`, absence,
+malformation, or any mismatch, that observation is reduced first and the probe
+cannot issue the old generation. In particular, a pre-first-readiness OOM whose
+controller status loop stalls cannot let a later readiness success from the
+replacement mint an original-`ARMED` token: the ordered read must adopt
+`RETRY_SUBMITTED` before any replacement probe can qualify, and the existing
+post-adoption probe-start fence then requires another probe. A controller
+replacement creates a new process epoch, but its startup status barrier must
+first re-prove the exact durable generation. Exact `RETRY_SUBMITTED` adoption
+plus a later successful probe creates the replacement generation. Row
+replacement creates a new record identity. A URL change, off-route/re-entry,
+or lease retirement within the same generation never rotates or reissues a
+token; it queues conservative exhaustion and legacy replacement. The token is
+never derived from or accepted by the application. The controller's
+heavyweight routing snapshot includes
+`system_recovery_route_lease=v1`, the decimal replica ID, and that exact token;
+if its resolved URL does not exact-match the manager target, it emits no usable
+marked route. Every resolved URL is transport-canonicalized before comparison:
+scheme and DNS case are lowercase, IP literals use their canonical compressed
+form, IPv6 remains bracketed, default HTTP/HTTPS ports are omitted, and
+credentials, paths, queries, fragments, malformed authorities, or invalid
+ports are rejected. Ordinary and capable rows use the same rule; an invalid
+ordinary spelling is withheld rather than allowed to bypass a capable marker.
+If multiple READY rows resolve to the same canonical transport URL, or a
+capable row has no exact marker, the snapshot emits an explicit fail-closed
+route fence rather than an ordinary route; row order, trailing slashes, DNS
+case, default ports, and equivalent IP spellings therefore cannot downgrade a
+capable route to unmarked behavior. The logical READY count remains unchanged.
+The emitted sentinel is the mutually exclusive closed object
+`{system_recovery_route_fence: v1}` for that URL. Any presence of the fence
+field, malformed value, or mixed fence/marker fields is immediately
+unselectable, removes the associated client/lease, and can never be interpreted
+as ordinary. A collision permanently retires every capable source generation,
+so removing the duplicate later cannot rehabilitate the same token. Fence
+parsing and collision retirement are part of the new-LB activation gate. Thus
+a probe against newer URL B can never renew a stale LB marker for URL A even
+when heavyweight sync is stalled.
+If endpoint resolution for a READY capable row instead becomes absent or
+invalid, the controller cannot safely name a fence transport key, so it
+immediately retires that exact row generation. The resulting heartbeat
+omission revokes any URL retained by the LB's transient-empty snapshot path;
+the malformed or missing endpoint is never projected as ordinary.
+
+The normal readiness worker captures the exact monotonic start immediately
+before its HTTP request. When first issuance may be needed, that same worker
+starts the exact remote status/detail request only after its own readiness
+response has completed. An exact matching result registers the still-inactive
+token under the owner-held manager round before the worker returns; unrelated
+queued or slow fleet probes therefore cannot age issuance evidence or create a
+fleet-wide first-readiness barrier. This registration is process-local and
+does not make stale durable state routable: heavyweight sync must still read
+the exact READY row/generation, and heartbeat publication still requires the
+dedicated prober's later success. A mismatching observation is returned to the
+normal reducer and cannot register a token. For a durable `RETRY_SUBMITTED`
+snapshot, the worker may validate and register only the captured predicted
+`RECOVERED` generation, and only when its readiness probe's wall-clock start is
+strictly after the already-persisted adoption fence. The parent still must
+reduce and persist `RECOVERED -> READY` before heavyweight sync can expose the
+inactive target. A probe at or before adoption cannot register it and requires
+a later round. This keeps replacement issuance independent of unrelated slow
+fleet futures without weakening the post-adoption fence.
+
+A live capable row is never relabeled in place to another service version,
+even for an otherwise config-only update. Its route target permanently binds
+the old version's closed readiness path, body, headers, and timeout; comparing
+only the URL or attempting to infer semantic equivalence would let that old
+request renew after the update. The row therefore remains on its prior version
+and exact prior request only while the existing rolling-update lifecycle still
+admits that version, then follows the existing legacy teardown/replacement
+path; the new-version row and attempt bind the new request. It is never
+projected as the new version under the old token. Ordinary rows retain the
+existing in-place update optimization.
+
+Issuance also fixes an initial absolute retirement deadline equal to the
+qualifying normal readiness request's monotonic start plus 60 seconds. It is
+not anchored to target registration, result processing, first dedicated probe,
+or first heartbeat. The token remains unavailable to heartbeat snapshots until
+one dedicated probe succeeds, but this issuance deadline runs even while the
+token is inactive. A normal probe result processed after a controller stall
+therefore creates an already-retired token rather than extending old evidence.
+
+A dedicated supervised route-lease prober runs independently of the ordinary
+fleet probe/manager lock. It starts a nonoverlapping async round on a fixed
+five-second monotonic cadence, probes every current marked target concurrently,
+and gives each request a hard total timeout of
+`SYSTEM_RECOVERY_ROUTE_PROBE_TIMEOUT_SECONDS = 15`, matching the maximum
+readiness timeout admitted by recovery eligibility. A qualifying success is
+published immediately when that target's coroutine completes; it never waits
+for another replica, candidate job-status work, persistence, or the ordinary
+probe round. Its deadline is exactly its monotonic request start plus
+`SYSTEM_RECOVERY_ROUTE_LEASE_SECONDS = 60`, never result-processing time. The
+prober's persistent aiohttp connector has an explicit 1,000-connection total
+limit matching the service and registry ceiling. The library's default
+100-connection queue must not consume a request's 15-second total timeout or
+make later insertion-ordered targets accumulate false failures. This bounded
+concurrency is controller startup capacity, not a service-configurable knob.
+The first qualifying success may activate the token and replace the still-live
+issuance deadline with its request-start-based deadline; later successes may
+likewise extend only a still-live token. The first failure stops renewal; two
+consecutive failures latch that exact token revoked, and a later success cannot
+clear the latch. Independently, once any issued token's current deadline is
+reached, whether or not it was ever activated, that token and exact route
+generation are permanently retired before any later probe result can publish;
+expiry is not a renewable idle state. A probe completion takes the dedicated
+lock, retires an already-expired prior deadline first, then may activate or
+extend only a still-live token. Consequently a controller/prober pause cannot
+resume after replay, probe the replacement at the same URL, and first-activate
+or resurrect the old marker.
+Retirement is immediately omitted from heartbeat snapshots and is queued as a
+retired-generation observation for normal manager reconciliation; the
+independent prober never takes the manager lock or writes the replica row. The
+manager immediately suspends the exact record/generation's process-local route
+before a capable row is made off-route, terminal, or deleted. Suspension omits
+the marker and heartbeat and ignores in-flight probe completions without yet
+tombstoning the generation. A successful fenced database mutation commits
+permanent retirement. A pre-write local abort may restore only that exact
+unchanged token if its prior deadline is still live. Once a database call was
+attempted, a raised connection or transaction exception is outcome-ambiguous:
+PostgreSQL may have committed before the client lost the result. The manager
+therefore performs an owner/record/generation-fenced readback before
+restoration. Only the exact same durable row, still READY and route-eligible,
+without teardown, preemption, or scale-down intent, and still owned by this
+controller may restore the suspended token. An absent, changed, off-route,
+owner-mismatched, or unreadable result permanently retires it. Explicit
+owner/row `False` results also retire; a revision conflict refreshes and
+re-reduces after the same exact readback rule. A suspension advances a
+per-target probe epoch, so a dedicated result captured before suspension stays
+ignored even after a proved rollback restores the prior deadline. Explicit
+teardown intent retires immediately because rollback to a routable row is no
+longer an allowed outcome. Successful insertion of a recreated numeric replica
+ID retires any target belonging to the prior record identity. This closes
+in-flight probe, ambiguous-commit, heavyweight-sync/delete/recreate races while
+immutable record and generation fencing prevent stale or aborted work from
+revoking the replacement generation. Row-admission observations and complete
+fleet snapshots enter the registry only in their authoritative order under the
+replica-manager lock; random UUID row identities deliberately do not pretend to
+order arbitrary previously unseen observations. The registry additionally
+retains a globally capped set of known-old row identities, rejects their
+delayed replay, and fail-closes only the affected numeric replica ID if that
+bounded history is exhausted. An authoritative snapshot that omits an ID
+releases all process-local history for that deleted row before a later ordered
+admission begins a new history.
+The manager first reduces a fresh exact remote observation. Exact
+`RETRY_SUBMITTED` adoption may advance to the replacement generation, but a row
+that still presents or tries to re-route the retired generation is persisted
+`EXHAUSTED` and sent through legacy replacement. Thus the expected expiry of
+the old route while a proved recovery is off-route does not itself abort that
+recovery, while stale `ARMED` state can never reissue. This keeps a transient
+single miss conservative without allowing a replacement at the same URL to
+rehabilitate the old route. Endpoint/user
+timeout values cannot extend the fixed 15-second request. Target, failure,
+deadline, generation-tombstone, and pending-exhaustion maps use a dedicated
+lock, are bounded by the 1,000-replica service ceiling, and prune terminal,
+deleted, replaced, and non-capable rows. An off-route live generation retains
+its tombstone until it is exhausted or exact attempt evidence advances it.
+
+Every external LB independently POSTs an authenticated internal lease heartbeat
+on a fixed-start two-second monotonic cadence with at most one request in flight
+and a ten-second total timeout, independent of HA slot mode and heavyweight
+routing sync. Its bounded in-memory control path performs no endpoint
+resolution, provider/cloud call, or fleet database scan: the controller owner
+snapshots the manager map and returns a closed v1 object whose entries contain
+decimal replica ID, exact opaque route token, and positive remaining seconds.
+The existing LB sync credential and service-owner dependency protect the
+controller child and stable API proxy routes. The response contains no URL,
+service job, request, account, instance, region, or application data.
+
+The LB validates the version, canonical decimal ID, closed token, finite
+non-boolean remaining duration, and `0 < remaining <= 60`. It anchors each
+accepted deadline at the heartbeat request's monotonic **start** plus the
+returned remaining duration, so network latency consumes rather than extends
+the lease. A response applies only to the current heavy-sync `(URL, replica ID,
+route token)` marker, and only if its request-start/sequence is newer than the
+last applied response for that marker. A reordered old positive therefore
+cannot reinstall a lease after a newer omission, revocation, token rotation, or
+URL change. A well-formed v1 omission revokes immediately; malformed responses,
+authentication failures, timeouts, controller replacement, and the first
+heartbeat after LB startup cannot refresh a lease. Maps are intersected with
+the current marked routing snapshot.
+
+All external-LB replica-bound data-plane selection, including occupancy probes,
+excludes a marked URL unless its exact marker has an unexpired local lease.
+Every retry also rechecks the established admission-eligible HA roles (`ARMED`
+or `ACTIVE`) and non-draining state. `ARMED` remains eligible to close the
+selector-patch/role-heartbeat window during warm-standby promotion; `STANDBY`,
+`DRAINING`, and process-local drain remain ineligible. Thus a handler admitted
+before an LB begins draining cannot select another replica afterward.
+Selection is not the final fence: after any await that can buffer a client body
+or delay scheduling, one `_client_pool_lock` critical section revalidates role,
+drain, ready membership, URL, replica ID, route token, deadline, and exact client
+generation; increments that exact client's reference; and returns the checked
+client object to the transport. No second URL lookup occurs. Marked routes use
+at most 10 seconds to acquire that client's pooled connection and at most 10
+additional seconds to open a backend connection; ordinary routes retain their
+existing pool-waiting behavior.
+
+A newly synced marked URL is unavailable until its first valid heartbeat. A
+coherent sync that removes or changes its marker removes the associated lease;
+ordinary unmarked URLs retain existing controller-outage semantics. With a
+stalled heavy sync and no traffic, at most 60 seconds after the last successful
+old-process lease-probe start every LB stops selection, and at most 20 seconds
+later every pool wait/connect admitted by a final atomic checkout has completed
+or failed against the old process. The driver's 83-second minimum after exact
+cleanup proof leaves a further three-second strict margin before a replacement
+can bind the same URL.
+
+This is an internal per-route freshness lease, not application authority, a
+cloud lifecycle lease, public header, or per-request token. It cannot authorize
+replay, adoption, readiness, teardown, or provisioning; it can only remove a
+marked route from LB selection. Recovery authorization remains disabled until
+every live LB process capable of a replica-bound selection—including DRAINING/
+terminating processes and already-admitted retry loops—is proven to enforce the
+v1 marker, heartbeat, per-attempt drain/role fence, and atomic checkout.
+
 `sky/serve/system_recovery_state.py` owns validated observations, the nested
 tagged states (`ARMED`, `RECOVERING`, `RETRY_SUBMITTED`, `RECOVERED`, or
 `EXHAUSTED`), and pure `reduce_remote_observation()` /
@@ -768,7 +1048,8 @@ pure SkyServe controller reducer
   | ready + arm-window expiry + exact ABSENT: candidate -> ORDINARY
   | any valid capability-v2 phase: candidate -> CAPABLE/reduced phase
   | MALFORMED/UNSPECIFIED/deadline: legacy teardown
-  | recovered: fresh probe -> READY
+  | CAPABLE ready probe -> bounded external-LB route lease
+  | recovered: post-adoption fresh probe -> READY + route-lease renewal
   | exhausted/preempted/evidence loss
   v
 existing legacy replica teardown/replacement path
@@ -783,8 +1064,10 @@ The responsibility boundary is intentionally small:
 - the Ray driver owns the local cgroup cap and task replay on the same machine;
 - the supervisor owns only process/container cleanup evidence;
 - the local job table owns remote event/attempt state; and
-- SkyServe owns durable routing/reduction and the decision to call its existing
-  teardown scheduler.
+- SkyServe owns durable routing/reduction, the bounded process-local route
+  lease, and the decision to call its existing teardown scheduler; and
+- each external LB owns only its independently expiring local copy of that
+  route permission.
 
 ### One-shot fresh-provision evidence
 
@@ -857,11 +1140,12 @@ mixed candidate -> backend generates ordinary job -> first ready stays off-route
 
 first Ray host OOM (machine/driver still live)
   -> WAITING_CLEANUP (controller keeps replica off-route)
-  -> graceful descendant/container cleanup + memory watermark
+  -> old external-LB route lease expires
+  -> graceful descendant/container cleanup proof + >=83s quiet + memory watermark
   -> same driver submits one new ObjectRef
   -> RETRY_SUBMITTED
   -> fresh post-adoption probe
-  -> RECOVERED -> READY on the same VM/job/driver
+  -> RECOVERED -> READY -> fresh route lease on the same VM/job/driver
 
 second OOM / failed proof / memory mismatch / teardown / Spot interruption
   -> EXHAUSTED or preemption fence
@@ -897,6 +1181,10 @@ claim, request, provider journal, or absence inference.
 - Every overlapping PostgreSQL mutation locks the service owner before replica
   rows and locks multiple replica IDs in ascending order. Recovery callbacks
   never take the replica-manager lock or reverse that database order.
+- Whole-row bookkeeping for an existing replica is update-only. Once terminal
+  teardown deletes its row, no stale manager snapshot or callback can insert it
+  again or match a later row that reuses the numeric ID; immutable record
+  identity must also match.
 - Authorization v3 maps explicitly to runtime profile/capability v2. No reducer
   compares those different version domains for equality.
 - `JobSystemRecoveryInfo` API v1 and supervisor marker/capability v2 remain
@@ -920,6 +1208,14 @@ claim, request, provider journal, or absence inference.
   Ray OOM can replay, and observed/durable legacy preemption always wins.
 - Readiness routes a recovered replica only after a probe begun after exact
   `RETRY_SUBMITTED` adoption.
+- A marked recovery-capable URL is selectable only under an exact local route
+  token and lease of at most 60 seconds from the qualifying dedicated-probe
+  start, plus an atomic final checkout before its bounded 10-second pool wait
+  and bounded 10-second backend connect. The driver cannot submit its
+  replacement before 83 monotonic seconds from exact positive cleanup proof.
+  Because every old-process success started before that proof, no same-IP/same-
+  port replacement exists while any conforming old-route lease or lease-
+  admitted transport attempt can remain live.
 - Ambiguous supervisor/container cleanup is failure, not permission to replay.
 - GCP/Kubernetes/Slurm, unsupported providers, and nonmatching AWS jobs remain
   ordinary within the same mixed-provider service.
@@ -928,8 +1224,9 @@ claim, request, provider journal, or absence inference.
   send a recovery context.
 - The feature creates no listener and has no dependency on port 4517.
 - There is no API008, recovery-specific API-request column, private operation
-  header, external L7 correctness fence, provider action profile, or action
-  worker.
+  header, public/per-request routing token, provider action profile, or action
+  worker. The bounded authenticated recovery-route lease is the only added L7
+  correctness fence.
 - SQS/Temporal completion events cannot arm, recover, exhaust, clean up, or
   delete a system replica.
 
@@ -1112,10 +1409,17 @@ an ad hoc `--reuse-values` mutation outside the owning IaC state.
    still `resource_action_mode=legacy`. Verify the Terraform/Terragrunt plan
    contains no unrelated Helm-value or infrastructure drift and no local/
    central recovery-schema change.
-2. Verify all API/controllers and candidate replica images expose the required
-   supervisor-marker-v2, controller-contract-v2, and job-detail-v1 capability.
-   Existing replicas remain ordinary; the authorization affects only newly
-   launched jobs.
+2. Inventory every live external-LB process that can make a replica-bound
+   choice, including ACTIVE, STANDBY, DRAINING, terminating, and processes with
+   already-admitted retry handlers. Prove each runs the v1 route-token/lease
+   reader, per-attempt role/drain fence, and atomic client checkout, and that the
+   authenticated lease heartbeat is healthy through the stable API proxy. With
+   authorization absent, inject a synthetic marked route in the test fleet and
+   prove no process selects it without a fresh exact token lease. Terminate and
+   drain every old or uninventoryable process before proceeding. Only then
+   verify all API/controllers and candidate images expose supervisor-marker-v2,
+   controller-contract-v2, and job-detail-v1. Existing replicas remain ordinary;
+   authorization affects only newly launched jobs.
 3. Install an exact authorization-v3 entry for a dedicated fresh AWS on-demand
    16-GB canary through the owning deployment configuration.
    Replace only that canary replica and run first-OOM same-machine recovery,
@@ -1137,16 +1441,22 @@ an ad hoc `--reuse-values` mutation outside the owning IaC state.
    digest and the last authorization-document-v1/v2, runtime-marker-v1, and
    status-only reader is drained. #1183 stays draft.
 
-Rollback requires no network fence. Remove the server authorization document
-through Terraform/Terragrunt first; no newly generated job can arm afterward.
+Rollback requires no public endpoint or security-group change, but the v1 LB
+lease reader and controller heartbeat must remain deployed until recovery state
+is drained. Remove the server authorization document through Terraform/
+Terragrunt first; no newly generated job can arm afterward.
 Persist/adopt legacy teardown for every active `CAPABLE` or unresolved
 `CANDIDATE` replica and every quarantined or partial-v13 row. A complete
 all-row audit must report zero `CAPABLE`, unresolved `CANDIDATE`, quarantined,
 or partial-v13 rows before any v12 writer starts; successful cleanup must have
 deleted each quarantined row. `ORDINARY` rows with a complete valid v13 bundle
 need no recovery teardown. A blocked/ambiguous cleanup or unreadable row blocks
-controller rollback. Then apply the last compatible exact digest through the
-owning infrastructure stack after a clean reviewed plan. If that old writer
+controller rollback. Wait at least 83 seconds after the last capable route lease
+renewal, verify every live LB process and admitted retry loop excludes all
+marked URLs, and completely drain any process that cannot prove the v1 fences.
+Then apply the last
+compatible exact digest through the owning infrastructure stack after a clean
+reviewed plan. If that old writer
 touches an
 `ORDINARY` row, it may erase the complete v13 recovery bundle while retaining
 the v13 version label; rewritten #1182 recognizes only that all-fields-absent
@@ -1177,12 +1487,16 @@ action evidence, because this feature creates none.
   account/region/AZ/type mismatches, single/multi-node,
   owner/generation/task mutations, managed secrets, and
   lease single consumption/rebind/copy/pickle rejection. They also reject a
+  readiness interval above 10 seconds or timeout above 15 seconds, a
   non-null AWS `InstanceLifecycle` other than `spot`, a Describe/STS call from a
   different session/profile/workspace/account, and any controller without the
   shared-central-PostgreSQL launch fence.
 - Fault injection at every `RecoverySession` transition proves at most one
   `.remote()`, stable event/attempt IDs, adopt-or-cancel, deadline behavior,
   and placement-group removal.
+- Monotonic-clock tests prove `.remote()` cannot run before 83 seconds from the
+  exact positive cleanup proof even when memory admission finishes immediately,
+  while the unchanged local recovery deadline still bounds the attempt.
 - Supervisor tests cover subreaper/PDEATHSIG, one-way latch, adopted descendants,
   graceful/forced cleanup, Docker/boot/process identity, empty inventory,
   post-create/pre-start fence, exact-ID removal, atomic markers, pruning, and
@@ -1246,7 +1560,13 @@ action evidence, because this feature creates none.
   arrival orders, assert every transaction acquires service owner before
   ascending replica rows, prove callbacks never acquire the manager lock even
   while current teardown joins their thread, prove stale whole-row writes
-  preserve the latest recovery revision, and prove a stale ready/capable or
+  preserve the latest recovery revision, prove delete-first then stale single/
+  batch/paid-capacity completion writes cannot resurrect an absent row, and
+  prove write-first then delete leaves no row. Delete, recreate the same numeric
+  replica ID with a new record identity, then prove every stale old-identity
+  writer and replica-lifecycle deleter aborts without touching the new JSON or
+  pickle. Insert-only fresh/reserved writers fail rather than overwrite a
+  conflict. A stale ready/capable or
   request/job patch cannot land after terminal teardown, exhaustion,
   quarantine, or demotion. A revision conflict must refresh and rerun the pure
   reducer; terminal states remain absorbing. Exactly one existing cleanup
@@ -1267,6 +1587,49 @@ action evidence, because this feature creates none.
   created.
 - Mixed-fleet tests show one service can launch recovery-capable AWS jobs and
   ordinary GCP/Kubernetes jobs while remaining resource-action legacy.
+- Route-lease tests cover the fixed five-second independent-probe cadence,
+  fixed 15-second hard timeout, immediate per-target publication, two-failure
+  token latch, irreversible 60-second expiry, controller/prober pause through
+  replay both before and after first activation, normal-result processing
+  delayed past its request-start deadline, same-generation token
+  non-reissuance, pre-first-readiness OOM with stalled status reconciliation,
+  ordered post-probe exact-detail issuance evidence, and exact-attempt
+  generation advance. Deterministic composite-worker races block an earlier
+  submitted ordinary future while a later `ARMED` or already-adopted
+  `RETRY_SUBMITTED` worker completes readiness, exact status, and inactive
+  issuance; they prove the actual HTTP callback start rather than submission
+  time anchors the deadline. Missing callbacks, malformed/throwing status,
+  and probes at or before adoption issue nothing. They cover the closed
+  marker/heartbeat schemas,
+  authentication/owner fencing, exact record/URL/token matching, token
+  issuance, finite/capped
+  remaining durations, request-start anchoring, fixed-start heartbeat timeout,
+  startup without a heartbeat, expiry, malformed/omitted/timeout/reordered
+  responses, controller/LB replacement, bounded pruning, ordinary unmarked
+  availability, and occupancy/data-plane filtering. URL A -> B with stalled
+  heavyweight sync expires A because only B's token can renew. Same-URL client
+  remove/re-add races prove final validation and exact client-generation
+  checkout are atomic. `ARMED` remains admission-eligible, while
+  `ARMED`/`ACTIVE` -> `DRAINING` during a retry forbids another replica
+  selection.
+- Route-registry transaction tests cover suspension epochs and late
+  pre-suspension completions after rollback; PostgreSQL commit-then-raise
+  readback for single/batch writes, patches, and deletes; explicit false
+  results; exact proven pre-write restoration; row recreation, known-old UUID
+  replay, bounded repeated tombstones, and per-ID overflow isolation. URL
+  validation covers scheme/DNS case, default ports, canonical IPv4/IPv6, and
+  rejection of credentials, paths, queries, fragments, invalid ports, and
+  malformed or ambiguous authorities.
+- The adversarial replay regression retains an old ready route, stalls the
+  heavyweight controller sync beyond the replay window with no traffic, expires
+  its 60-second lease, drains a lease-admitted 10-second pool wait plus
+  10-second connect attempt, then binds a replacement on the same URL after the
+  83-second driver fence. Every request remains unselectable until exact
+  `RETRY_SUBMITTED` adoption creates a new exact attempt generation, a fresh
+  later normal readiness reduction issues that generation's one token, the
+  independent prober succeeds, and the matching heartbeat lands. A paused old
+  generation that resumes after replacement remains retired and instead
+  schedules legacy teardown.
 
 ### Spot and real 16-GB smoke
 
@@ -1292,7 +1655,8 @@ GCP/Kubernetes jobs remain ordinary controls.
 ### Negative architecture tests
 
 - Repository guards fail if #1182 adds an API008 migration, OOM-specific
-  API-request field, private operation header, L7 dependency, protected
+  API-request field, private operation header, another/unbounded L7 dependency,
+  protected
   handle/YAML/receipt/proof, resource-action profile/row/worker, direct cloud
   cleanup, another request/queue/lease, a `JobSystemRecoveryInfo` API-v1/
   protobuf field, or a marker-v2 field.
@@ -1329,6 +1693,37 @@ The timestamped query result and eligible-image inventory are retained with
 both PRs. Exact per-replica associations remain in current `ReplicaInfo`;
 bounded structured logs supply diagnostic correlation but are not lifecycle
 authority.
+
+### Local verification evidence (2026-08-02)
+
+- The complete 24-module changed-test sweep passes under Python 3.14. Nine
+  PostgreSQL persistence cases are collected but skipped because this host has
+  no Docker daemon; they remain a required CI/merge gate rather than inferred
+  evidence.
+- Focused architecture, route-lease, route-registry, controller, proxy,
+  load-balancer, manager-transaction, backend, driver, AWS-admission, and
+  authorization tests pass. They include the composite-worker ordering races,
+  commit-then-raise PostgreSQL readback model, probe-epoch suspension fence,
+  bounded identity tombstones, strict URL canonicalization, first/second OOM
+  production-v2 simulation, and authenticated heartbeat path.
+- Mypy reports no issues in the repository's current 868-file configured
+  target and pinned Pylint 4.0.4 rates all 20 changed source modules 10.00/10.
+  The repository `format.sh` gate passes with YAPF 0.43.0, isort 5.12.0,
+  dashboard lint/format, Python compilation, and `git diff --check`. Ruff
+  0.15.21, every additional scoped Ruff CI invariant, and the flake8-async
+  lifecycle baseline also pass. Cancellation during ambiguous route readback
+  retires every suspended route before re-raising and has focused regression
+  coverage.
+- Two exact adversarial audits accepted the corrected route-lease and runtime
+  semantics after the submission-order, stale-route, ambiguous-commit,
+  suspension, and identity-history fixes. The negative architecture guard
+  confirms the production recovery surface contains no port 4517, SQS,
+  EventBridge, Temporal, or application completion-marker authority.
+- No production deployment, authorization activation, real AWS OOM injection,
+  or provider-termination race has been performed. The real PostgreSQL suite,
+  both 16-GB cloud smoke sequences, deployment inventory, rollback exercise,
+  and seven continuous UTC days of compatibility telemetry remain blocking
+  evidence below.
 
 ## PR 3 removal gates
 
@@ -1411,6 +1806,7 @@ recorded here and in both stacked PR descriptions:
 - Keep the separate durable resource-action designs synchronized with the
   explicit non-dependency: this initiative creates no AWS action profile, M4A
   milestone, action row, or action-authoritative service transition.
-- No rollout step may add API008, accept the old private header, require an L7
-  fence, raise RAM above 16 GB, change Ray's threshold, or make an application
-  completion message system authority. Any such need reopens this design.
+- No rollout step may add API008, accept the old private header, add a second or
+  unbounded L7 fence beyond the v1 recovery-route lease, raise RAM above 16 GB,
+  change Ray's threshold, or make an application completion message system
+  authority. Any such need reopens this design.

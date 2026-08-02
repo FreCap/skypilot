@@ -210,3 +210,32 @@ def test_probe_contains_input_and_transport_failures():
     client.get.assert_called_once_with('https://replica.example/health',
                                        headers={'X-User': 'value'},
                                        timeout=7)
+
+
+def test_probe_reports_exact_start_immediately_before_transport_call():
+    replica = _replica()
+    events = []
+    response = mock.Mock(status_code=200)
+
+    def _get(*_args, **_kwargs):
+        events.append(('request', None))
+        return response
+
+    client = mock.Mock()
+    client.get.side_effect = _get
+
+    with mock.patch.object(replica_managers.replica_tls,
+                           'probe_client',
+                           return_value=client):
+        _, ready, _ = replica.probe(
+            readiness_path='/health',
+            post_data=None,
+            timeout=7,
+            headers=None,
+            resolved_url='https://replica.example',
+            request_started_callback=lambda started_at: events.append(
+                ('start', started_at)))
+
+    assert ready
+    assert [event for event, _ in events] == ['start', 'request']
+    assert isinstance(events[0][1], float)
