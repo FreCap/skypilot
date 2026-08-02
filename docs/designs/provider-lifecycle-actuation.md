@@ -1030,6 +1030,50 @@ controllers make no direct `backend.get_job_status`, `sdk.launch`,
 adapter, plus passing recovery, cancellation, same-name recreation, rollout,
 mixed-version, and cleanup qualification.
 
+Before child-workload actuation can replace Serve mutation, the existing
+process-local mutation path needs one explicit deletion boundary. A
+behavior-preserving preparatory slice therefore moves its launch-completion
+queue and event, launch and down thread pools, request, cancellation, and
+logical-fence maps, and failed-cleanup retry maps into
+`_LegacyReplicaMutationRuntime`. `SkyPilotReplicaManager` keeps temporary proxy
+properties that adopt pre-refactor instance fields exactly once under a
+dedicated publication lock. Identity-matched instance aliases make
+instance-level `unittest.mock.patch.object()` restoration local and do not
+retain replaced worker pools; property deletion recreates the historical
+per-field default. Meanwhile,
+`_recover_replica_operations()` and `_refresh_thread_pool()` retain their
+existing lock and caller contracts and route into explicitly named legacy
+bodies. The scale-reconciliation event remains manager-owned because it is
+controller feedback for already-committed provider observations, not legacy
+worker bookkeeping.
+
+This isolation changes no authority selection, persistence, retry timing,
+transport, provider effect, or caller-visible lifecycle behavior. It is a
+mergeable removal seam, but it is not evidence that any M5 legacy path is
+removed. Keeping the fields spread across the manager until final deletion was
+considered and rejected because later migration could not prove that all
+process-local launch and down ownership had been retired as one unit.
+
+The exact removal order is executable. `PLA-M5-017` first removes the inherited
+legacy launch-completion call sites, and `PLA-M5-018` then deletes
+`_ReplicaLaunchThread`, `_launch_completion_state()`, and
+`_join_notified_launch_workers()`. `PLA-M5-019` next removes every initializer,
+publication, proxy, recovery, refresh, and direct runtime-state route across
+`SkyPilotReplicaManager`; only then may `PLA-M5-020` delete
+`_LegacyReplicaMutationRuntime`, its publication lock, field map, publication
+helpers, nine proxy properties, `_legacy_mutation_runtime_state()`,
+`_recover_legacy_replica_operations()`, and
+`_refresh_legacy_mutation_runtime()`. `PLA-M5-021` finally deletes the
+temporary characterization file after final durable-runtime recovery,
+cancellation, completion, retry, mixed-version, and same-name recreation
+coverage replaces it. No owner symbol may disappear while a recorded route
+still names it.
+
+These rows remain present until all supported Serve stores either use the
+qualified durable action and child-workload owners or are explicitly retired.
+They make the future deletion complete, but do not claim that any M5 legacy
+path is removed in this preparatory slice.
+
 The implementation order is Skylet capability negotiation first, raw-offer
 normalization as an independent provider pilot, and child-workload actuation
 after the durable action kernel is qualified. This ordering avoids using a new
