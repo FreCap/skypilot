@@ -2,10 +2,13 @@
 
 Status: bounded M0 and M1b contract accepted after independent adversarial
 review; M1a inert schema and dark M1b typed store implemented and locally
-verified; the frozen M2 Serve032 foundation, cluster identity, immutable
-provider contracts, typed shadow store, additive Serve033 coverage schema and
-promotion audit, and generic API006 progress substrate are implemented and
-locally verified; the Serve033 preparation-capability commitment schema/typed
+verified; upstream's shipped Serve032 request-classification migration and the
+unshipped resource-action migration lineage have been reconciled as one
+guarded Serve033 catalog, implemented and reverified against both the upstream
+lineage and adversarial partial/corrupt catalogs; the cluster identity,
+immutable provider contracts, typed shadow
+store, promotion audit, and generic API006 progress substrate are implemented
+and locally verified; the Serve033 preparation-capability commitment schema/typed
 store, closed launch-identity wire contracts, shared effective-identity
 resolver, capability-fenced no-enqueue endpoint, and bounded authenticated
 client are implemented and locally verified, while manager-side CSPRNG
@@ -2327,14 +2330,18 @@ M1b verification evidence on 2026-08-01:
 
 M2 foundation verification evidence on 2026-08-01:
 
-- Serve032 installs the frozen inert mode, replica-identity/sample-link,
-  logical-sample, and represented-attempt schema while preserving portable
-  inert columns for supported local controller databases. The implemented
-  Serve033 foundation adds PostgreSQL-only cohort/reference retention, decision coverage,
-  coverage-only attempts, actual-effect trace columns, the explicit parent FK,
-  and replica coverage links; fresh and 032-upgrade catalog/constraint tests,
-  fail-closed nonempty-032 refusal, and downgrade refusal pass locally;
-  the still-dark revision now includes the nonnull, no-default lowercase
+- The earlier feature-only Serve032/033 migration tests are superseded after
+  upstream shipped a different revision 032. Read-only `boltz-test` audit
+  proves the target is at upstream request-classification Serve032, has no
+  resource-action tables, and was never stamped with either feature-only
+  shape. The single guarded Serve033 migration is implemented and its 23-case
+  serial PostgreSQL/SQLite matrix passes: unique 031 -> upstream 032 -> 033
+  lineage, preservation of upstream classification state, exact reflected
+  catalog, rejection before mutation of nonempty evidence or activated action
+  state, convergence from every proven-empty partial graph by replacement,
+  rejection of malformed defaults/types/checks and feature-only collisions,
+  lost-ack replay, and downgrade refusal.
+- The still-dark final catalog includes the nonnull, no-default lowercase
   preparation-capability SHA-256 commitment. Typed reference decoding,
   persistence, exact adoption, binding, launch/down fixture coverage, invalid-
   row rejection, and lost-migration-acknowledgement catalog convergence pass
