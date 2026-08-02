@@ -1318,6 +1318,95 @@
                 }
             }
         },
+        "resourceActions": {
+            "type": "object",
+            "properties": {
+                "authorityWorker": {
+                    "type": "object",
+                    "properties": {
+                        "activeCohort": {
+                            "type": "string"
+                        },
+                        "auth": {
+                            "type": "object",
+                            "properties": {
+                                "existingSecret": {
+                                    "type": "string"
+                                },
+                                "key": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "cohorts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": [
+                                    "id",
+                                    "replicas",
+                                    "image",
+                                    "imagePullPolicy"
+                                ],
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 63
+                                    },
+                                    "image": {
+                                        "type": "string",
+                                        "minLength": 1
+                                    },
+                                    "imagePullPolicy": {
+                                        "type": "string"
+                                    },
+                                    "replicas": {
+                                        "type": "integer"
+                                    }
+                                }
+                            }
+                        },
+                        "enabled": {
+                            "type": "boolean"
+                        },
+                        "healthPort": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 65535
+                        },
+                        "preflightPort": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 65535
+                        },
+                        "retirementTombstones": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "tls": {
+                            "type": "object",
+                            "properties": {
+                                "caKey": {
+                                    "type": "string"
+                                },
+                                "certKey": {
+                                    "type": "string"
+                                },
+                                "existingSecret": {
+                                    "type": "string"
+                                },
+                                "privateKeyKey": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "requestStore": {
             "type": "object",
             "required": [

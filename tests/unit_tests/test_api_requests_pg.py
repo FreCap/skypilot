@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import datetime
+import json
 import os
 import pathlib
 import shutil
@@ -30,6 +31,7 @@ from sky.server.events import cursors as event_cursors
 from sky.server.events import emission as event_emission
 from sky.server.events import schema as event_schema
 from sky.server.events import store as event_store
+from sky.server.requests import authority_worker
 from sky.server.requests import cutover
 from sky.server.requests import executor
 from sky.server.requests import payloads
@@ -37,6 +39,7 @@ from sky.server.requests import postgres as request_postgres
 from sky.server.requests import preconditions
 from sky.server.requests import registry
 from sky.server.requests import requests
+from sky.server.requests import resource_actions
 from sky.server.requests import storage
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
@@ -366,6 +369,262 @@ def test_api006_upgrade_requires_empty_action_attempts(postgres_engine):
             mode='upgrade')
     assert migration_utils.get_current_alembic_revision(
         postgres_engine, migration_utils.API_REQUESTS_DB_NAME) == '005'
+
+
+def test_api007_upgrade_preserves_instances_and_widens_only_role_check(
+        postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '006',
+                                         mode='upgrade')
+    ordinary_id = uuid.uuid4()
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=ordinary_id,
+                role='executor',
+                version='pre-api007',
+                ready=False,
+                health_detail={},
+                supported_handlers=[],
+                supported_payload_versions={}))
+
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '007',
+                                         mode='upgrade')
+    authority_id = uuid.uuid4()
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=authority_id,
+                role='authority-worker',
+                version='api007',
+                ready=False,
+                health_detail={},
+                supported_handlers=[],
+                supported_payload_versions={}))
+        roles = connection.execute(
+            sqlalchemy.select(request_postgres.SERVER_INSTANCES.c.role).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id.in_(
+                    (ordinary_id, authority_id))).
+            order_by(request_postgres.SERVER_INSTANCES.c.role)).scalars().all()
+    assert roles == ['authority-worker', 'executor']
+
+    checks = {
+        check['name']: ''.join(check['sqltext'].split()).replace('::text', '')
+        for check in sqlalchemy.inspect(postgres_engine).get_check_constraints(
+            'api_server_instances')
+    }
+    role_check = checks['ck_api_server_instances_role']
+    for role in ('all', 'api', 'executor', 'controller', 'authority-worker'):
+        assert f"'{role}'" in role_check
+    assert role_check.count("'") == 10
+
+
+def test_authority_claim_query_requires_current_queued_action_cohort_and_reference(
+        request_database, monkeypatch):
+    engine, _ = request_database
+    action_id = uuid.uuid4()
+    request_id = str(uuid.uuid4())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cohort_identity = {
+        'version': 1,
+        'manifest': {
+            'cohort_id': 'authority-v1',
+        },
+        'manifest_sha256': 'a' * 64,
+        'deployment_uid': 'deployment-uid-v1',
+        'service_account_uid': 'service-account-uid-v1',
+    }
+    claim_config = authority_worker.AuthorityWorkerClaimConfig(
+        routing=authority_worker.AuthorityWorkerRoutingConfig(
+            cohort_id='authority-v1',
+            namespace='skypilot-system',
+            deployment_name='skypilot-authority-v1',
+            service_account_name='skypilot-authority-v1',
+            image='registry.example/authority@sha256:' + '1' * 64),
+        active_cohort_id='authority-v1',
+        cohort_identity_bytes=resource_actions.canonical_json_bytes(
+            cohort_identity),
+        cohort_identity_sha256=resource_actions.canonical_sha256(
+            cohort_identity),
+        deployment_uid='deployment-uid-v1',
+        lifecycle_state='ACCEPTING')
+    immutable_spec = {
+        'invocation': {
+            'launch': {
+                'execution_config': {
+                    'capsule': {
+                        'executor_cohort': cohort_identity,
+                    },
+                },
+            },
+            'down': None,
+        },
+    }
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'CREATE TABLE serve_resource_action_worker_cohorts ('
+            'cohort_id TEXT PRIMARY KEY, deployment_uid TEXT NOT NULL, '
+            'cohort_identity JSONB NOT NULL, '
+            'cohort_identity_sha256 TEXT NOT NULL, '
+            'lifecycle_state TEXT NOT NULL)')
+        connection.exec_driver_sql(
+            'CREATE TABLE serve_resource_action_worker_cohort_refs ('
+            'decision_id UUID PRIMARY KEY, cohort_id TEXT NOT NULL, '
+            'action_type TEXT NOT NULL, reference_state TEXT NOT NULL)')
+        connection.exec_driver_sql(
+            'CREATE TABLE serve_resource_action_shadow_coverage ('
+            'decision_id UUID PRIMARY KEY, action_type TEXT NOT NULL, '
+            'worker_cohort_ref_id UUID)')
+        connection.execute(
+            sqlalchemy.text(
+                'INSERT INTO serve_resource_action_worker_cohorts '
+                '(cohort_id, deployment_uid, cohort_identity, '
+                'cohort_identity_sha256, lifecycle_state) VALUES '
+                '(:cohort_id, :deployment_uid, CAST(:identity AS JSONB), '
+                ':identity_sha256, :lifecycle_state)'), {
+                    'cohort_id': 'authority-v1',
+                    'deployment_uid': 'deployment-uid-v1',
+                    'identity': json.dumps(cohort_identity),
+                    'identity_sha256': claim_config.cohort_identity_sha256,
+                    'lifecycle_state': 'ACCEPTING',
+                })
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTIONS).values(
+                action_id=action_id,
+                domain='serve',
+                resource_type='replica',
+                resource_identity='replica-7',
+                desired_generation=1,
+                action_type='launch',
+                immutable_spec=immutable_spec,
+                immutable_spec_sha256='b' * 64,
+                kernel_state='QUEUED',
+                current_attempt=1,
+                revision=1,
+                created_at=now,
+                updated_at=now))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+                action_id=action_id,
+                attempt=1,
+                request_id=request_id,
+                request_input_sha256='c' * 64,
+                mutation_boundary='NOT_STARTED',
+                admitted_at=now,
+                updated_at=now))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.REQUESTS).values(
+                request_id=request_id,
+                name='serve.resource_action.launch',
+                handler_name='serve_resource_action_launch',
+                payload_type='internal',
+                payload_format='json',
+                payload_version=1,
+                producer_version='test',
+                payload_json={},
+                execution_class='normal',
+                status='PENDING',
+                created_at=now,
+                schedule_type='short',
+                user_id='system',
+                should_retry=True,
+                ignore_return_value=False,
+                retryable=False,
+                execution_generation=0,
+                resource_action_id=action_id,
+                resource_action_attempt=1,
+                updated_at=now))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.QUEUE).values(
+                request_id=request_id,
+                schedule_type='short',
+                priority=0,
+                available_at=now,
+                enqueued_at=now,
+                ignore_return_value=False,
+                retryable=False,
+                precondition_attempts=0,
+                delivery_state='queued',
+                updated_at=now))
+        connection.execute(
+            sqlalchemy.text(
+                'INSERT INTO serve_resource_action_worker_cohort_refs '
+                '(decision_id, cohort_id, action_type, reference_state) VALUES '
+                '(:decision_id, :cohort_id, :action_type, :reference_state)'), {
+                    'decision_id': action_id,
+                    'cohort_id': 'authority-v1',
+                    'action_type': 'launch',
+                    'reference_state': 'ACTION_ACTIVE',
+                })
+
+    monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'authority-worker')
+    queue = request_postgres.PostgresQueueBackend(
+        'short',
+        execution_classes=frozenset({'normal'}),
+        authority_claim_config=claim_config)
+    claimed = queue.get()
+    assert claimed is not None
+    assert claimed.request_id == request_id
+
+    # A queued request for a retained prior attempt must not race the action's
+    # current attempt, even when every frozen cohort/reference field matches.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    status='WAITING',
+                    claim_token=None,
+                    worker_instance_id=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None))
+        connection.execute(
+            sqlalchemy.update(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == request_id).values(
+                    delivery_state='queued', claim_generation=None))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
+                action_id=action_id,
+                attempt=2,
+                request_id=str(uuid.uuid4()),
+                request_input_sha256='d' * 64,
+                mutation_boundary='NOT_STARTED',
+                admitted_at=now,
+                updated_at=now))
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTIONS).where(
+                request_postgres.RESOURCE_ACTIONS.c.action_id ==
+                action_id).values(current_attempt=2))
+    assert queue.qsize() == 0
+    assert queue.get() is None
+
+    # Matching the current attempt is still insufficient once the action has
+    # left the kernel's only claimable state.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTIONS).where(
+                request_postgres.RESOURCE_ACTIONS.c.action_id ==
+                action_id).values(current_attempt=1, kernel_state='BLOCKED'))
+    assert queue.qsize() == 0
+    assert queue.get() is None
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTIONS).where(
+                request_postgres.RESOURCE_ACTIONS.c.action_id ==
+                action_id).values(kernel_state='QUEUED'))
+        connection.execute(
+            sqlalchemy.text(
+                "UPDATE serve_resource_action_worker_cohort_refs "
+                "SET reference_state = 'RELEASED' WHERE decision_id = :id"), {
+                    'id': action_id,
+                })
+    assert queue.get() is None
 
 
 def test_api006_upgrade_serializes_with_uncommitted_api005_insert(

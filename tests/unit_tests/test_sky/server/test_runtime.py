@@ -113,6 +113,63 @@ def test_executor_role_starts_workers_without_public_server(monkeypatch):
     assert background.stopped
 
 
+def test_authority_role_resolves_closed_claim_config_before_workers(
+        monkeypatch):
+    background = _BackgroundLoop()
+    lease = mock.Mock()
+    config = mock.Mock()
+    queue_server = mock.Mock()
+    worker = mock.Mock()
+    state = runtime.RuntimeState('authority-worker', config, lease, False)
+    health_server = mock.Mock()
+    claim_config = SimpleNamespace(
+        routing=SimpleNamespace(cohort_id='authority-v1'),
+        active_cohort_id='authority-v1',
+        lifecycle_state='ACCEPTING')
+    connection = mock.MagicMock()
+    connection.__enter__.return_value = connection
+    engine = mock.Mock()
+    engine.connect.return_value = connection
+    inventory = mock.Mock()
+    resolve = mock.Mock(return_value=claim_config)
+    start_workers = mock.Mock(return_value=(queue_server, [worker]))
+    run_in_parallel = mock.Mock()
+    monkeypatch.setattr(runtime, '_start_background_loop',
+                        lambda *args: background)
+    monkeypatch.setattr(runtime.authority_worker,
+                        'require_private_handler_inventory', inventory)
+    monkeypatch.setattr(runtime.authority_worker, 'resolve_claim_config',
+                        resolve)
+    monkeypatch.setattr(runtime.request_postgres, 'initialize_and_get_db',
+                        lambda: engine)
+    monkeypatch.setattr(runtime.executor, 'start', start_workers)
+    monkeypatch.setattr(runtime, '_wait_for_executor_shutdown', lambda: None)
+    monkeypatch.setattr(runtime, '_RoleHealthServer',
+                        lambda *args: health_server)
+    monkeypatch.setattr(runtime.subprocess_utils, 'run_in_parallel',
+                        run_in_parallel)
+    monkeypatch.setattr(runtime.plugins, 'get_plugins', lambda: [])
+
+    runtime.run_role(state, _args())
+
+    inventory.assert_called_once_with()
+    resolve.assert_called_once_with(connection)
+    start_workers.assert_called_once_with(
+        config,
+        execution_classes=frozenset({request_registry.ExecutionClass.NORMAL}),
+        authority_claim_config=claim_config)
+    lease.set_ready.assert_called_once()
+    detail = lease.set_ready.call_args.kwargs['health_detail']
+    assert detail['cohort_id'] == 'authority-v1'
+    assert detail['claim_contract'] == 'frozen_action_cohort_join_v1'
+    health_server.start.assert_called_once_with()
+    health_server.stop.assert_called_once_with()
+    run_in_parallel.assert_called_once()
+    queue_server.kill.assert_called_once_with()
+    queue_server.join.assert_called_once_with()
+    assert background.stopped
+
+
 def test_stop_queue_server_is_idempotent_after_child_cleanup():
     queue_server = mock.Mock()
     queue_server.is_alive.return_value = False

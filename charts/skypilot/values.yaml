@@ -354,6 +354,44 @@ controllerService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: kubernetes.io/hostname
 
+# Dedicated normal-executor cohorts for private Serve resource actions.  This
+# surface is dark by default; enabling it requires registered Serve033 cohort
+# identities that exactly match the immutable routing inputs rendered here.
+resourceActions:
+  authorityWorker:
+    # @schema type: [boolean]
+    enabled: false
+    # Cohort selected for new preparation references.  Existing DRAINING
+    # cohorts remain listed until all of their frozen work is released.
+    # @schema type: string
+    activeCohort: ""
+    # @schema type: array; itemProperties: {"id": {"type": "string", "minLength": 1, "maxLength": 63}, "replicas": {"type": "integer"}, "image": {"type": "string", "minLength": 1}, "imagePullPolicy": {"type": "string"}}
+    cohorts: []
+    # Cohort IDs whose removed Deployment/ServiceAccount names remain visible
+    # to the surviving retirement verifier.
+    # @schema type: array; item: string
+    retirementTombstones: []
+    # @schema type: [integer]; minimum: 1; maximum: 65535
+    healthPort: 46581
+    # The future authenticated preflight endpoint.  The routing slice exposes
+    # no mutation service and does not treat this Service as activation proof.
+    # @schema type: [integer]; minimum: 1; maximum: 65535
+    preflightPort: 46583
+    auth:
+      # @schema type: string
+      existingSecret: ""
+      # @schema type: string
+      key: tokens
+    tls:
+      # @schema type: string
+      existingSecret: ""
+      # @schema type: string
+      certKey: tls.crt
+      # @schema type: string
+      privateKeyKey: tls.key
+      # @schema type: string
+      caKey: ca.crt
+
 # Environment and files required by every central PostgreSQL client. Use these
 # for private CA bundles, client certificates, or shared libpq settings instead
 # of apiService.extra* so the migration Job and managed image workers receive
