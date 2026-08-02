@@ -46,6 +46,7 @@ from sky.usage import usage_lib
 from sky.utils import annotations
 from sky.utils import common as common_lib
 from sky.utils import common_utils
+from sky.utils import context_utils
 from sky.utils import controller_utils
 from sky.utils import debug_dump_helpers
 from sky.utils import message_utils
@@ -148,6 +149,11 @@ _JOBS_GRACEFUL_CANCEL_SIGNAL = 'graceful'
 
 
 # ====== internal functions ======
+def _sleep_log_follow_wait(seconds: float) -> None:
+    """Sleep between log-follow polls while honoring request cancellation."""
+    context_utils.sleep_with_cancellation(seconds)
+
+
 def terminate_cluster(
     cluster_name: str,
     max_retry: int = 6,
@@ -1403,7 +1409,7 @@ def _wait_for_next_task(
         if (snapshot.task_id != current_task_id or
                 not _should_keep_logging(snapshot.status)):
             return snapshot
-        time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
+        _sleep_log_follow_wait(JOB_STATUS_CHECK_GAP_SECONDS)
 
 
 def _wait_for_initial_log_stream_snapshot(
@@ -1414,7 +1420,7 @@ def _wait_for_initial_log_stream_snapshot(
         snapshot = get_snapshot()
         if snapshot.status is not None:
             return snapshot
-        time.sleep(1)
+        _sleep_log_follow_wait(1)
 
 
 def stream_logs_by_id(job_id: int,
@@ -1783,7 +1789,7 @@ def stream_logs_by_id(job_id: int,
                         prev_msg = msg
                     if waited >= JOB_STATUS_CHECK_GAP_SECONDS:
                         break
-                    time.sleep(_PROVISION_LOG_POLL_GAP_SECONDS)
+                    _sleep_log_follow_wait(_PROVISION_LOG_POLL_GAP_SECONDS)
                     waited += _PROVISION_LOG_POLL_GAP_SECONDS
                 snapshot = get_stream_target_snapshot()
                 continue
@@ -1874,7 +1880,7 @@ def stream_logs_by_id(job_id: int,
                         while not is_managed_job_status_updated(
                                 managed_job_status :=
                                 managed_job_state.get_status(job_id)):
-                            time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
+                            _sleep_log_follow_wait(JOB_STATUS_CHECK_GAP_SECONDS)
                         assert managed_job_status is not None, (
                             job_id, managed_job_status)
                         continue
@@ -1931,7 +1937,7 @@ def stream_logs_by_id(job_id: int,
             # controller, and check the managed job queue again.
             # Wait a bit longer than the controller, so as to make sure the
             # managed job state is updated.
-            time.sleep(3 * JOB_STATUS_CHECK_GAP_SECONDS)
+            _sleep_log_follow_wait(3 * JOB_STATUS_CHECK_GAP_SECONDS)
             managed_job_status = managed_job_state.get_status(job_id)
             assert managed_job_status is not None, (job_id, managed_job_status)
 
@@ -1948,7 +1954,7 @@ def stream_logs_by_id(job_id: int,
         assert managed_job_status is not None, job_id
         while (_should_keep_logging(managed_job_status) and follow and
                wait_seconds < _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS):
-            time.sleep(1)
+            _sleep_log_follow_wait(1)
             wait_seconds += 1
             managed_job_status = managed_job_state.get_status(job_id)
             assert managed_job_status is not None, job_id
