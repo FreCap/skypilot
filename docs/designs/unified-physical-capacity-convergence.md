@@ -1494,9 +1494,9 @@ queue design, CLI command routing, the new queue module, and its contract test.
 Neither intervening PR touched a capacity cleanup path.
 
 On 2026-08-02 the open cleanup PR was replayed cleanly onto current
-`improvements` base `9a4a38ce4`. The refreshed stack is retirement design
-`4673fa520`, scanner removal `57cd3dc97`, verification updates `8c6e609d3` and
-`b3209e774`, and fail-closed retired-mode enforcement `54c10f958`. The last
+`improvements` base `9d4841b3e`. The refreshed stack is retirement design
+`d6707ef4f`, scanner removal `6c16145e2`, verification updates `f604c57a5` and
+`c34dfddc6`, and fail-closed retired-mode enforcement `53723374a`. The last
 change deliberately keeps `shadow` in the closed parser enum for a precise
 diagnostic while rejecting it at runtime; only `disabled` can start after the
 projector is removed.
