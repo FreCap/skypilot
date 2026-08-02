@@ -1043,6 +1043,7 @@ def test_worker_commands_are_scoped_to_coordinator_token():
     assert token_header in notify_code
     assert token_header in shutdown_code
     assert '"attempt_id": 4' in notify_code
+    assert '/health' in shutdown_code
     assert '--connect-timeout 2' in shutdown_code
     assert '--max-time 5' in shutdown_code
 
@@ -1090,7 +1091,8 @@ def test_worker_shutdown_cancels_only_owned_job(monkeypatch):
     monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock())
     cancel = mock.Mock(return_value='cancel')
     monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
-    monkeypatch.setattr(coordinator.time, 'sleep', mock.Mock())
+    sleep = mock.Mock()
+    monkeypatch.setattr(coordinator.time, 'sleep', sleep)
     remove = mock.Mock(return_value=True)
     monkeypatch.setattr(coordinator.managed_job_state,
                         'remove_batch_worker_record', remove)
@@ -1102,6 +1104,142 @@ def test_worker_shutdown_cancels_only_owned_job(monkeypatch):
                                    batch_coordinator._worker_token,
                                    'worker-a',
                                    worker_job_id=17)
+    sleep.assert_not_called()
+
+
+def test_worker_shutdown_code_waits_for_health_to_disappear(
+        tmp_path, monkeypatch):
+    fake_bin = tmp_path / 'fake-bin'
+    fake_bin.mkdir()
+    health_calls = tmp_path / 'health-calls'
+    fake_curl = fake_bin / 'curl'
+    fake_curl.write_text(f"""#!/bin/bash
+set -e
+case "$*" in
+  *"/shutdown"*)
+    exit 0
+    ;;
+  *"/health"*)
+    count=0
+    if [ -f "{health_calls}" ]; then
+      count=$(cat "{health_calls}")
+    fi
+    count=$((count + 1))
+    printf '%s' "$count" > "{health_calls}"
+    if [ "$count" -lt 3 ]; then
+      printf '200'
+    else
+      printf '000'
+    fi
+    exit 0
+    ;;
+esac
+echo "unexpected curl invocation: $*" >&2
+exit 1
+""",
+                         encoding='utf-8')
+    fake_curl.chmod(0o755)
+    fake_sleep = fake_bin / 'sleep'
+    fake_sleep.write_text('#!/bin/bash\nexit 0\n', encoding='utf-8')
+    fake_sleep.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fake_bin}:{os.environ["PATH"]}')
+    batch_coordinator = _make_coordinator()
+
+    proc = subprocess.run(
+        ['/bin/bash', '-c',
+         batch_coordinator._generate_shutdown_code()],
+        check=False,
+        capture_output=True,
+        text=True)
+
+    assert proc.returncode == 0
+    assert health_calls.read_text(encoding='utf-8') == '3'
+
+
+def test_worker_shutdown_code_has_bounded_health_wait(tmp_path, monkeypatch):
+    fake_bin = tmp_path / 'fake-bin'
+    fake_bin.mkdir()
+    health_calls = tmp_path / 'health-calls'
+    fake_curl = fake_bin / 'curl'
+    fake_curl.write_text(f"""#!/bin/bash
+set -e
+case "$*" in
+  *"/shutdown"*)
+    exit 0
+    ;;
+  *"/health"*)
+    count=0
+    if [ -f "{health_calls}" ]; then
+      count=$(cat "{health_calls}")
+    fi
+    count=$((count + 1))
+    printf '%s' "$count" > "{health_calls}"
+    printf '200'
+    exit 0
+    ;;
+esac
+echo "unexpected curl invocation: $*" >&2
+exit 1
+""",
+                         encoding='utf-8')
+    fake_curl.chmod(0o755)
+    fake_sleep = fake_bin / 'sleep'
+    fake_sleep.write_text('#!/bin/bash\nexit 0\n', encoding='utf-8')
+    fake_sleep.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fake_bin}:{os.environ["PATH"]}')
+    batch_coordinator = _make_coordinator()
+
+    proc = subprocess.run(
+        ['/bin/bash', '-c',
+         batch_coordinator._generate_shutdown_code()],
+        check=False,
+        capture_output=True,
+        text=True)
+
+    expected_polls = int(
+        coordinator.constants.WORKER_SHUTDOWN_HEALTH_WAIT_SECONDS /
+        coordinator.constants.WORKER_SHUTDOWN_POLL_INTERVAL_SECONDS)
+    assert proc.returncode == 0
+    assert int(health_calls.read_text(encoding='utf-8')) == expected_polls
+
+
+def test_worker_shutdown_code_skips_health_wait_when_worker_already_gone(
+        tmp_path, monkeypatch):
+    fake_bin = tmp_path / 'fake-bin'
+    fake_bin.mkdir()
+    health_calls = tmp_path / 'health-calls'
+    fake_curl = fake_bin / 'curl'
+    fake_curl.write_text(f"""#!/bin/bash
+set -e
+case "$*" in
+  *"/shutdown"*)
+    exit 7
+    ;;
+  *"/health"*)
+    printf 'unexpected' > "{health_calls}"
+    exit 1
+    ;;
+esac
+echo "unexpected curl invocation: $*" >&2
+exit 1
+""",
+                         encoding='utf-8')
+    fake_curl.chmod(0o755)
+    fake_sleep = fake_bin / 'sleep'
+    fake_sleep.write_text('#!/bin/bash\nexit 0\n', encoding='utf-8')
+    fake_sleep.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fake_bin}:{os.environ["PATH"]}')
+    batch_coordinator = _make_coordinator()
+
+    proc = subprocess.run(
+        ['/bin/bash', '-c',
+         batch_coordinator._generate_shutdown_code()],
+        check=False,
+        capture_output=True,
+        text=True)
+
+    assert proc.returncode == 0
+    assert not health_calls.exists()
 
 
 def test_cancel_claims_worker_cleanup_once(monkeypatch):

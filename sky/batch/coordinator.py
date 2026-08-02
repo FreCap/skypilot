@@ -1054,10 +1054,30 @@ class BatchCoordinator:
     def _generate_shutdown_code(self) -> str:
         """Generate a script that shuts down the worker service."""
         port = constants.WORKER_SERVICE_PORT
+        wait_seconds = constants.WORKER_SHUTDOWN_HEALTH_WAIT_SECONDS
+        poll_interval = constants.WORKER_SHUTDOWN_POLL_INTERVAL_SECONDS
+        poll_attempts = max(1, int(wait_seconds / poll_interval))
         return textwrap.dedent(f"""\
+            shutdown_status=0
             curl -sf --connect-timeout 2 --max-time 5 -X POST \\
                 http://127.0.0.1:{port}/shutdown \\
-                -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' || true
+                -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' \\
+                >/dev/null || shutdown_status=$?
+            if [ "$shutdown_status" -ne 0 ]; then
+                exit 0
+            fi
+            for _ in $(seq 1 {poll_attempts}); do
+                http_code=$(curl -s -o /dev/null -w '%{{http_code}}' \\
+                    --connect-timeout 1 --max-time 1 \\
+                    http://127.0.0.1:{port}/health \\
+                    -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' \\
+                    || true)
+                if [ "$http_code" = "000" ]; then
+                    exit 0
+                fi
+                sleep {poll_interval}
+            done
+            exit 0
             """)
 
     # ------------------------------------------------------------------
@@ -1344,7 +1364,6 @@ class BatchCoordinator:
             logger.warning('Failed to send shutdown to %s: %s', cluster_name, e)
 
         if worker_job_id is not None:
-            time.sleep(5)
             try:
                 self._cancel_worker_job_by_id(cluster_name, worker_job_id,
                                               self._worker_token)
