@@ -1660,19 +1660,6 @@ class JobController:
             return (status is None or
                     status == managed_job_state.ManagedJobStatus.PENDING)
 
-        async def finish_failure_cleanup(
-            *cleanup_coros: typing.Coroutine[typing.Any, typing.Any,
-                                             None]) -> None:
-            """Finish failure cleanup before surfacing the original error."""
-            for cleanup_coro in cleanup_coros:
-                cleanup_task: asyncio.Task[None] = asyncio.create_task(
-                    cleanup_coro)
-                try:
-                    await asyncio.shield(cleanup_task)
-                except asyncio.CancelledError:
-                    if not cleanup_task.done():
-                        await cleanup_task
-
         # Check if all tasks are already in terminal state
         if all(is_terminal(tid) for tid in range(len(tasks))):
             logger.info('All tasks already in terminal state')
@@ -1689,6 +1676,7 @@ class JobController:
         tasks_to_launch = [
             tid for tid in range(len(tasks)) if needs_launch(tid)
         ]
+        launch_failure: Exception | None = None
 
         try:
             # Prepare all tasks (create executors and set STARTING state)
@@ -1731,11 +1719,17 @@ class JobController:
                 logger.info('Phase 1: Skipping launch - resuming from '
                             'previous execution')
 
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f'Failed to launch clusters: {e}')
-            await finish_failure_cleanup(
-                self._cleanup_job_group_clusters(cluster_names))
-            raise
+            launch_failure = e
+
+        if launch_failure is not None:
+            try:
+                await self._finish_failure_cleanup(
+                    self._cleanup_job_group_clusters(cluster_names))
+            except asyncio.CancelledError:  # noqa: ASYNC103
+                pass
+            raise launch_failure.with_traceback(launch_failure.__traceback__)
 
         # Phase 2: Barrier sync - collect handles and set RUNNING state
         logger.info('Phase 2: Waiting for all clusters to be ready...')
@@ -1855,6 +1849,7 @@ class JobController:
         async_task_to_id: dict[asyncio.Task, int] = {
             at: tid for tid, at in monitor_async_tasks.items()
         }
+        monitor_failure: Exception | None = None
 
         async def cancel_remaining_monitors() -> None:
             """Cancel and join monitors without interrupting their cleanup."""
@@ -1950,12 +1945,18 @@ class JobController:
             # a child can keep polling or recover while cleanup is in progress.
             await cancel_remaining_monitors()
             raise
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f'Monitoring failed: {e}')
-            await finish_failure_cleanup(
-                cancel_remaining_monitors(),
-                self._cleanup_job_group_clusters(cluster_names))
-            raise
+            monitor_failure = e
+
+        if monitor_failure is not None:
+            try:
+                await self._finish_failure_cleanup(
+                    cancel_remaining_monitors(),
+                    self._cleanup_job_group_clusters(cluster_names))
+            except asyncio.CancelledError:  # noqa: ASYNC103
+                pass
+            raise monitor_failure.with_traceback(monitor_failure.__traceback__)
 
         # Check results (include terminal tasks)
         all_succeeded = True
@@ -2070,6 +2071,26 @@ class JobController:
         await asyncio.gather(*(cleanup_cluster(cluster_name)
                                for cluster_name in cluster_names
                                if cluster_name is not None))
+
+    async def _finish_failure_cleanup(
+            self, *cleanup_coros: typing.Coroutine[typing.Any, typing.Any,
+                                                   None]) -> None:
+        """Finish failure cleanup before surfacing the original error."""
+        cancelled = False
+        for cleanup_coro in cleanup_coros:
+            cleanup_task: asyncio.Task[None] = asyncio.create_task(cleanup_coro)
+            try:
+                await asyncio.shield(cleanup_task)
+                continue
+            except asyncio.CancelledError:  # noqa: ASYNC103
+                cancelled = True
+            while not cleanup_task.done():
+                try:
+                    await cleanup_task
+                except asyncio.CancelledError:  # noqa: ASYNC103
+                    cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def run(self):
         """Run controller logic and handle exceptions."""
