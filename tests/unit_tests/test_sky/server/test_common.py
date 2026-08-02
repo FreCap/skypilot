@@ -38,7 +38,7 @@ def test_resolve_effective_request_identity_preserves_no_auth_pair() -> None:
 
 def test_resolve_effective_request_identity_requires_authenticated_name(
 ) -> None:
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match='Authenticated user name is required'):
         common.resolve_effective_request_identity(
             models.User(id='authenticated-hash', name=None), 'submitted-name',
             'submitted-hash')

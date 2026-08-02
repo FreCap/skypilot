@@ -1109,7 +1109,8 @@ def resolve_effective_request_identity(
     exactly the same identity rule.
     """
     if auth_user is not None:
-        assert auth_user.name is not None
+        if auth_user.name is None:
+            raise ValueError('Authenticated user name is required.')
         return auth_user.name, auth_user.id
     return submitted_original_user, submitted_user_hash
 

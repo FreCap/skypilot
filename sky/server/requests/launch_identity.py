@@ -106,7 +106,7 @@ async def canonicalize_launch_identity(
                 context_sha256=typed_request.context_sha256,
                 proof=proof,
                 proof_sha256=proof.sha256))
-    except (AssertionError, TypeError, ValueError):
+    except (TypeError, ValueError):
         raise _error(400, 'Effective request identity is invalid.') from None
     return fastapi.Response(content=response.canonical_bytes,
                             media_type='application/json')
