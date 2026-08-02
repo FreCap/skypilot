@@ -62,8 +62,6 @@ _POSTGRES_LOCK_APPLICATION_NAME = 'skypilot-advisory-lock'
 # or unexpectedly long transaction must not leave a worker waiting forever for
 # another connection from its process-local budget.
 _POSTGRES_POOL_TIMEOUT_SECONDS = 15
-_ISOLATED_POSTGRES_CONNECT_TIMEOUT_SECONDS = 5
-_ISOLATED_POSTGRES_POOL_TIMEOUT_SECONDS = 1
 
 
 def is_sqlite_busy_error(e: BaseException) -> bool:
@@ -612,8 +610,6 @@ _postgres_engine_cache: dict[tuple[str, bool, str],
 # that same pool.  A cached NullPool engine keeps lock sessions on a separate
 # connection path and physically closes them when the lock is released.
 _postgres_lock_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
-_postgres_isolated_engine_cache: dict[tuple[str, str, int, int, bool, str],
-                                      sqlalchemy.engine.Engine] = {}
 _sqlite_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
 
 _db_creation_lock = threading.Lock()
@@ -674,108 +670,6 @@ def get_postgres_lock_connection(
     engine: sqlalchemy.engine.Engine,) -> sqlalchemy.pool.PoolProxiedConnection:
     """Open a dedicated, non-reused connection for a session advisory lock."""
     return get_postgres_lock_engine(engine).raw_connection()
-
-
-def _isolated_postgres_engine_key(
-    engine: sqlalchemy.engine.Engine,
-    *,
-    namespace: str,
-    pool_size: int,
-    max_overflow: int,
-    pool_pre_ping: bool,
-    application_name: str,
-) -> tuple[str, str, int, int, bool, str]:
-    """Return a credential-preserving cache key for an isolated PG pool."""
-    if engine.dialect.name != SQLAlchemyDialect.POSTGRESQL.value:
-        raise ValueError('Isolated PostgreSQL engines require PostgreSQL. '
-                         f'Current dialect: {engine.dialect.name}')
-    if not namespace or not application_name:
-        raise ValueError('namespace and application_name must be non-empty.')
-    if pool_size <= 0:
-        raise ValueError('pool_size must be positive.')
-    if max_overflow < 0:
-        raise ValueError('max_overflow must be non-negative.')
-    connection_url = engine.url.render_as_string(hide_password=False)
-    return (connection_url, namespace, pool_size, max_overflow, pool_pre_ping,
-            application_name)
-
-
-def get_isolated_postgres_engine(
-    engine: sqlalchemy.engine.Engine,
-    *,
-    namespace: str,
-    pool_size: int,
-    max_overflow: int = 0,
-    pool_pre_ping: bool = False,
-    application_name: str,
-) -> sqlalchemy.engine.Engine:
-    """Return a cached PostgreSQL engine with an explicit pool policy.
-
-    This deliberately does not use :func:`get_engine`: isolated operational
-    components must not inherit the process-global ``_max_connections`` value
-    or share the ordinary central-database pool.  The full credential-bearing
-    URL and every pool-policy input participate in the private cache key.
-    """
-    key = _isolated_postgres_engine_key(engine,
-                                        namespace=namespace,
-                                        pool_size=pool_size,
-                                        max_overflow=max_overflow,
-                                        pool_pre_ping=pool_pre_ping,
-                                        application_name=application_name)
-    with _db_creation_lock:
-        isolated = _postgres_isolated_engine_cache.get(key)
-        if isolated is None:
-            isolated = sqlalchemy.create_engine(
-                engine.url,
-                poolclass=sqlalchemy.pool.QueuePool,
-                pool_size=pool_size,
-                max_overflow=max_overflow,
-                pool_timeout=_ISOLATED_POSTGRES_POOL_TIMEOUT_SECONDS,
-                pool_pre_ping=pool_pre_ping,
-                pool_recycle=1800,
-                connect_args={
-                    'connect_timeout': _ISOLATED_POSTGRES_CONNECT_TIMEOUT_SECONDS,
-                    'application_name': application_name,
-                })
-            _postgres_isolated_engine_cache[key] = isolated
-        return isolated
-
-
-def isolated_postgres_engine_checked_out(
-    engine: sqlalchemy.engine.Engine,) -> int:
-    """Return the number of live checkouts for an explicit isolated pool."""
-    pool = engine.pool
-    if not isinstance(pool, sqlalchemy.pool.QueuePool):
-        raise ValueError('Expected an isolated QueuePool engine.')
-    return pool.checkedout()
-
-
-def dispose_isolated_postgres_engine(
-    engine: sqlalchemy.engine.Engine,
-    *,
-    namespace: str,
-    pool_size: int,
-    max_overflow: int = 0,
-    pool_pre_ping: bool = False,
-    application_name: str,
-) -> None:
-    """Dispose and forget one isolated engine after proving no checkout."""
-    key = _isolated_postgres_engine_key(engine,
-                                        namespace=namespace,
-                                        pool_size=pool_size,
-                                        max_overflow=max_overflow,
-                                        pool_pre_ping=pool_pre_ping,
-                                        application_name=application_name)
-    with _db_creation_lock:
-        isolated = _postgres_isolated_engine_cache.get(key)
-        if isolated is None:
-            return
-        checked_out = isolated_postgres_engine_checked_out(isolated)
-        if checked_out:
-            raise RuntimeError('Cannot dispose an isolated PostgreSQL engine '
-                               f'with {checked_out} checked-out connection(s).')
-        _postgres_isolated_engine_cache.pop(key)
-        isolated.dispose()
 
 
 def _make_asyncpg_creator(dsn: str) -> Callable[[], Any]:
