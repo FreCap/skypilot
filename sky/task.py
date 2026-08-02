@@ -239,8 +239,8 @@ def get_plaintext_secrets(secrets: dict[str, SecretStr]) -> dict[str, str]:
     return {k: v.get_secret_value() for k, v in secrets.items()}
 
 
-_fill_in_env_vars = task_yaml_lib._fill_in_env_vars
-_parse_secret_name = task_yaml_lib._parse_secret_name
+_fill_in_env_vars = task_yaml_lib._fill_in_env_vars  # pylint: disable=protected-access
+_parse_secret_name = task_yaml_lib._parse_secret_name  # pylint: disable=protected-access
 
 
 @dataclasses.dataclass
