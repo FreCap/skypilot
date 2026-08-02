@@ -65,12 +65,12 @@ schema, tables, migration hook, state access, and closed row contracts remain
 unchanged. No shared inventory, observation cache, action journal, occupancy
 ledger, or identity-transport product is authorized by this retirement.
 
-C1 also retains `CapacityMode.SHADOW` and
-`validate_runtime_capability()`. After projector removal that accepted mode is
-intentionally inert rather than fail-closed. Therefore deployment preflight
-must prove mode is absent or exactly `disabled` before any cleanup pod starts;
-a stale `shadow` value is a rollout blocker even though the cleanup binary
-would accept it.
+C1 retains the closed `CapacityMode.SHADOW` enum so old configuration parses,
+but `validate_runtime_capability()` rejects every mode except `disabled` after
+projector removal. Deployment preflight must still prove mode is absent or
+exactly `disabled` before any cleanup Pod starts; a stale `shadow` value is an
+explicit startup and rollout blocker rather than silently accepted inert
+configuration.
 
 ## Why convergence could pay off
 

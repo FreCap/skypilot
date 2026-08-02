@@ -201,7 +201,7 @@ def validate_runtime_capability(config: CapacityConfig,
     if revision != '001':
         raise ValueError(
             f'Unsupported physical-capacity schema revision {revision!r}.')
-    if config.mode not in (CapacityMode.DISABLED, CapacityMode.SHADOW):
+    if config.mode is not CapacityMode.DISABLED:
         raise RuntimeError(
             f'Physical-capacity mode {config.mode.value!r} is unavailable '
             f'with schema revision {revision}.')

@@ -292,16 +292,13 @@ def test_load_config_rejects_unknown_mode(
         config.load_config()
 
 
+def test_revision_001_runtime_capability_accepts_only_disabled() -> None:
+    config.validate_runtime_capability(
+        config.CapacityConfig(mode=config.CapacityMode.DISABLED))
+
+
 @pytest.mark.parametrize('mode', [
-    config.CapacityMode.DISABLED,
     config.CapacityMode.SHADOW,
-])
-def test_revision_001_runtime_capability_accepts_only_inert_modes(
-        mode: config.CapacityMode) -> None:
-    config.validate_runtime_capability(config.CapacityConfig(mode=mode))
-
-
-@pytest.mark.parametrize('mode', [
     config.CapacityMode.OBSERVE,
     config.CapacityMode.TEARDOWN,
     config.CapacityMode.SERVE,
