@@ -117,6 +117,45 @@ describe('useVisibleRefreshInterval', () => {
     unmount();
   });
 
+  it('preserves the original due boundary when early visibility catch-up is disabled', () => {
+    const onRefresh = jest.fn();
+    const { unmount } = renderHook(() =>
+      useVisibleRefreshInterval(true, 1000, onRefresh, {
+        catchUpOnlyWhenOverdue: true,
+      })
+    );
+
+    expect(jest.getTimerCount()).toBe(1);
+
+    act(() => {
+      jest.advanceTimersByTime(600);
+      setDocumentVisibility('hidden');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(jest.getTimerCount()).toBe(0);
+
+    act(() => {
+      jest.advanceTimersByTime(300);
+      setDocumentVisibility('visible');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(1);
+
+    act(() => {
+      jest.advanceTimersByTime(99);
+    });
+    expect(onRefresh).not.toHaveBeenCalled();
+
+    act(() => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(onRefresh).toHaveBeenLastCalledWith('interval');
+
+    unmount();
+  });
+
   it('supports an aligned first tick without losing the cadence boundary', () => {
     const onRefresh = jest.fn();
     const { unmount } = renderHook(() =>

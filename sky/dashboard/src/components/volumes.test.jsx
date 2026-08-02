@@ -148,7 +148,7 @@ describe('Volumes request ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
-  it('refreshes immediately on visibility restore and skips the adjacent timer boundary', async () => {
+  it('preserves the due boundary when visibility returns before the next refresh', async () => {
     const visibilityDescriptor = Object.getOwnPropertyDescriptor(
       window.document,
       'visibilityState'
@@ -173,7 +173,7 @@ describe('Volumes request ownership', () => {
         window.document.dispatchEvent(new Event('visibilitychange'));
         await Promise.resolve();
       });
-      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
 
       await act(async () => {
         jest.advanceTimersByTime(1);
