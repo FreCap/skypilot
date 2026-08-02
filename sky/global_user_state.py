@@ -27,6 +27,7 @@ from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import asyncio as sql_async
 
 from sky import global_user_state_cloud_checks
+from sky import global_user_state_cluster_events
 from sky import global_user_state_cluster_yaml
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
@@ -1102,143 +1103,38 @@ def add_cluster_event(cluster_name: str,
         existing_cluster_hash: If provided, add the event only when the current
             row has this cluster-generation hash.
     """
-    engine = _db_manager.get_engine()
-    if transitioned_at is None:
-        transitioned_at = int(time.time())
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            session.rollback()
-            raise ValueError('Unsupported database dialect')
-
-        # Read hash and status in a single query so they come from the same
-        # row snapshot (a separate hash pre-fetch could pair a stale hash
-        # with a newer status under concurrent removal/re-creation).
-        query = session.query(
-            cluster_table.c.cluster_hash,
-            cluster_table.c.status).filter_by(name=cluster_name)
-        if existing_cluster_hash is not None:
-            query = query.filter_by(cluster_hash=existing_cluster_hash)
-        cluster_row = query.first()
-        if cluster_row is None or cluster_row.cluster_hash is None:
-            logger.debug(f'Hash for cluster {cluster_name} not found. '
-                         'Skipping event.')
-            return
-        cluster_hash = cluster_row.cluster_hash
-        last_status = cluster_row.status
-        if nop_if_duplicate:
-            # Reuse this session: add_cluster_event already holds a pooled
-            # connection here, and a nested checkout self-deadlocks a
-            # single-connection sync pool.
-            last_event = get_last_cluster_event(cluster_hash,
-                                                event_type=event_type,
-                                                session=session)
-            if duplicate_regex is not None and last_event is not None:
-                if re.search(duplicate_regex, last_event):
-                    return
-            elif last_event == reason:
-                return
-        try:
-            request_id = common_utils.get_current_request_id()
-            session.execute(
-                insert_func(cluster_event_table).values(
-                    cluster_hash=cluster_hash,
-                    name=cluster_name,
-                    starting_status=last_status,
-                    ending_status=new_status.value if new_status else None,
-                    reason=reason,
-                    transitioned_at=transitioned_at,
-                    type=event_type.value,
-                    request_id=request_id,
-                ))
-            session.commit()
-        except sqlalchemy.exc.IntegrityError as e:
-            for msg in _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS:
-                if msg in str(e):
-                    # This can happen if the cluster event is added twice.
-                    # We can ignore this error unless the caller requests
-                    # to expose the error.
-                    if expose_duplicate_error:
-                        raise db_utils.UniqueConstraintViolationError(
-                            value=reason, message=str(e))
-                    else:
-                        return
-            raise e
+    global_user_state_cluster_events.add_cluster_event(
+        _db_manager.get_engine, orm.Session, sqlite, postgresql, cluster_table,
+        cluster_event_table, get_last_cluster_event, logger,
+        common_utils.get_current_request_id, time.time,
+        _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS, cluster_name, new_status, reason,
+        event_type, nop_if_duplicate, duplicate_regex, expose_duplicate_error,
+        transitioned_at, existing_cluster_hash)
 
 
 def get_last_cluster_event(cluster_hash: str,
                            event_type: ClusterEventType,
                            session: 'orm.Session | None' = None) -> str | None:
-    with _session_scope(session) as active_session:
-        row = active_session.query(cluster_event_table).filter_by(
-            cluster_hash=cluster_hash, type=event_type.value).order_by(
-                cluster_event_table.c.transitioned_at.desc()).first()
-    if row is None:
-        return None
-    return row.reason
+    return global_user_state_cluster_events.get_last_cluster_event(
+        _session_scope(session), cluster_event_table, cluster_hash, event_type)
 
 
 def get_terminal_or_last_status_change_event(cluster_hash: str) -> str | None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        # Order by type (TERMINAL first, STATUS_CHANGE after),
-        # then by transitioned_at desc.
-        # Use a CASE expression for ordering type.
-        type_priority = sqlalchemy.case(
-            (cluster_event_table.c.type == ClusterEventType.TERMINAL.value, 0),
-            else_=1)
-        row = session.query(cluster_event_table).filter(
-            cluster_event_table.c.cluster_hash == cluster_hash,
-            cluster_event_table.c.type.in_([
-                ClusterEventType.TERMINAL.value,
-                ClusterEventType.STATUS_CHANGE.value
-            ])).order_by(type_priority,
-                         cluster_event_table.c.transitioned_at.desc()).first()
-    if row is None:
-        return None
-    return row.reason
+    return (global_user_state_cluster_events.
+            get_terminal_or_last_status_change_event(_db_manager.get_engine(),
+                                                     orm.Session,
+                                                     cluster_event_table,
+                                                     ClusterEventType,
+                                                     cluster_hash))
 
 
 def _get_last_or_terminal_cluster_event_multiple(
         cluster_hashes: set[str]) -> dict[str, str]:
     """Returns the last or terminal cluster event for each cluster."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        # Create a priority expression: TERMINAL (0) before STATUS_CHANGE (1)
-        type_priority = sqlalchemy.case(
-            (cluster_event_table.c.type == ClusterEventType.TERMINAL.value, 0),
-            else_=1)
-
-        # Use ROW_NUMBER to rank events within each cluster_hash,
-        # ordered by type priority (TERMINAL first) then by transitioned_at
-        # (latest first)
-        row_number = sqlalchemy.func.row_number().over(
-            partition_by=cluster_event_table.c.cluster_hash,
-            order_by=[
-                type_priority,
-                cluster_event_table.c.transitioned_at.desc()
-            ]).label('rn')
-
-        # Subquery to get all events with their rank
-        ranked_events = session.query(
-            cluster_event_table.c.cluster_hash, cluster_event_table.c.reason,
-            row_number).filter(
-                cluster_event_table.c.cluster_hash.in_(cluster_hashes),
-                cluster_event_table.c.type.notin_([
-                    ClusterEventType.DEBUG.value,
-                    ClusterEventType.LAUNCH_PROGRESS.value,
-                ])).subquery()
-
-        # Select only the top-ranked event for each cluster
-        rows = session.query(
-            ranked_events.c.cluster_hash,
-            ranked_events.c.reason).filter(ranked_events.c.rn == 1).all()
-
-    return {row.cluster_hash: row.reason for row in rows}
+    return (global_user_state_cluster_events.
+            get_last_or_terminal_cluster_event_multiple(
+                _db_manager.get_engine(), orm.Session, cluster_event_table,
+                ClusterEventType, cluster_hashes))
 
 
 def get_last_cluster_event_of_type_multiple(
@@ -1249,29 +1145,11 @@ def get_last_cluster_event_of_type_multiple(
     Mirrors _get_last_or_terminal_cluster_event_multiple but filters to a
     single event type (no TERMINAL-priority ordering).
     """
-    if not cluster_hashes:
-        return {}
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row_number = sqlalchemy.func.row_number().over(
-            partition_by=cluster_event_table.c.cluster_hash,
-            order_by=cluster_event_table.c.transitioned_at.desc()).label('rn')
-
-        ranked = session.query(
-            cluster_event_table.c.cluster_hash,
-            cluster_event_table.c.reason,
-            row_number,
-        ).filter(
-            cluster_event_table.c.cluster_hash.in_(cluster_hashes),
-            cluster_event_table.c.type == event_type.value,
-        ).subquery()
-
-        rows = session.query(
-            ranked.c.cluster_hash,
-            ranked.c.reason,
-        ).filter(ranked.c.rn == 1).all()
-
-    return {row.cluster_hash: row.reason for row in rows}
+    return (global_user_state_cluster_events.
+            get_last_cluster_event_of_type_multiple(_db_manager.get_engine,
+                                                    orm.Session,
+                                                    cluster_event_table,
+                                                    cluster_hashes, event_type))
 
 
 def get_last_status_change_times(
@@ -1287,38 +1165,10 @@ def get_last_status_change_times(
     ``_CLUSTER_IN_QUERY_CHUNK_SIZE`` to stay under SQLite's 999-parameter
     cap (PostgreSQL has no such cap but the chunking is harmless there).
     """
-    if not cluster_hashes:
-        return {}
-    engine = _db_manager.get_engine()
-    hashes_list = list(cluster_hashes)
-    result: dict[str, int] = {}
-    with orm.Session(engine) as session:
-        for offset in range(0, len(hashes_list), _CLUSTER_IN_QUERY_CHUNK_SIZE):
-            batch = hashes_list[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
-            row_number = sqlalchemy.func.row_number().over(
-                partition_by=cluster_event_table.c.cluster_hash,
-                order_by=cluster_event_table.c.transitioned_at.desc()).label(
-                    'rn')
-
-            ranked = session.query(
-                cluster_event_table.c.cluster_hash,
-                cluster_event_table.c.transitioned_at,
-                row_number,
-            ).filter(
-                cluster_event_table.c.cluster_hash.in_(batch),
-                cluster_event_table.c.type ==
-                ClusterEventType.STATUS_CHANGE.value,
-                cluster_event_table.c.ending_status == ending_status.value,
-            ).subquery()
-
-            rows = session.query(
-                ranked.c.cluster_hash,
-                ranked.c.transitioned_at,
-            ).filter(ranked.c.rn == 1).all()
-
-            for row in rows:
-                result[row.cluster_hash] = int(row.transitioned_at)
-    return result
+    return global_user_state_cluster_events.get_last_status_change_times(
+        _db_manager.get_engine, orm.Session, cluster_event_table,
+        _CLUSTER_IN_QUERY_CHUNK_SIZE, ClusterEventType.STATUS_CHANGE.value,
+        cluster_hashes, ending_status)
 
 
 def get_first_status_change_time_since(cluster_hash: str,
@@ -1335,31 +1185,17 @@ def get_first_status_change_time_since(cluster_hash: str,
     status can be re-entered by a transient probe failure: the repeated entry
     writes a fresh row, and the latest one would keep sliding forward.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(
-            sqlalchemy.func.min(cluster_event_table.c.transitioned_at)).filter(
-                cluster_event_table.c.cluster_hash == cluster_hash,
-                cluster_event_table.c.type ==
-                ClusterEventType.STATUS_CHANGE.value,
-                cluster_event_table.c.ending_status == ending_status.value,
-                cluster_event_table.c.transitioned_at >= since,
-            ).scalar()
-    return None if row is None else int(row)
+    return global_user_state_cluster_events.get_first_status_change_time_since(
+        _db_manager.get_engine(), orm.Session, cluster_event_table,
+        ClusterEventType.STATUS_CHANGE.value, cluster_hash, ending_status,
+        since)
 
 
 def cleanup_cluster_events_with_retention(retention_hours: float,
                                           event_type: ClusterEventType) -> None:
-    engine = _db_manager.get_engine()
-    # Once for events with type STATUS_CHANGE.
-    with orm.Session(engine) as session:
-        query = session.query(cluster_event_table).filter(
-            cluster_event_table.c.transitioned_at
-            < time.time() - retention_hours * 3600,
-            cluster_event_table.c.type == event_type.value)
-        logger.debug(f'Deleting {query.count()} cluster events.')
-        query.delete()
-        session.commit()
+    global_user_state_cluster_events.cleanup_cluster_events_with_retention(
+        _db_manager.get_engine(), orm.Session, cluster_event_table, logger,
+        time.time, retention_hours, event_type)
 
 
 async def cluster_event_retention_daemon():
@@ -1476,36 +1312,9 @@ def get_cluster_events(
     cluster_hash = _resolve_cluster_hash(cluster_hash, cluster_name)
     if cluster_hash is None:
         raise ValueError(f'Hash for cluster {cluster_name} not found.')
-
-    event_types = ([event_type]
-                   if isinstance(event_type, ClusterEventType) else event_type)
-    type_filter = cluster_event_table.c.type.in_(
-        [et.value for et in event_types])
-
-    with orm.Session(engine) as session:
-        if limit is not None:
-            # To get the most recent N events in ASC order, we use a subquery:
-            # 1. Get most recent N events (ORDER BY DESC LIMIT N)
-            # 2. Re-order them by ASC
-            subquery = session.query(cluster_event_table).filter(
-                cluster_event_table.c.cluster_hash == cluster_hash,
-                type_filter).order_by(
-                    cluster_event_table.c.transitioned_at.desc()).limit(
-                        limit).subquery()
-            rows = session.query(subquery).order_by(
-                subquery.c.transitioned_at.asc()).all()
-        else:
-            rows = session.query(cluster_event_table).filter(
-                cluster_event_table.c.cluster_hash == cluster_hash,
-                type_filter).order_by(
-                    cluster_event_table.c.transitioned_at.asc()).all()
-
-    if include_timestamps:
-        return [{
-            'reason': row.reason,
-            'transitioned_at': row.transitioned_at
-        } for row in rows]
-    return [row.reason for row in rows]
+    return global_user_state_cluster_events.get_cluster_events(
+        engine, orm.Session, cluster_event_table, cluster_hash,
+        ClusterEventType, event_type, include_timestamps, limit)
 
 
 _CLUSTER_EVENT_NAMES_CHUNK = 500
@@ -1535,35 +1344,9 @@ def get_cluster_events_by_names(
         List of dicts with 'reason' and 'transitioned_at' (unix timestamp)
         fields, ordered from newest to oldest.
     """
-    cluster_names = list(dict.fromkeys(cluster_names))
-    if not cluster_names or not event_types or limit == 0:
-        return []
-    engine = _db_manager.get_engine()
-    type_values = [event_type.value for event_type in event_types]
-    rows = []
-    with orm.Session(engine) as session:
-        for start in range(0, len(cluster_names), _CLUSTER_EVENT_NAMES_CHUNK):
-            names = cluster_names[start:start + _CLUSTER_EVENT_NAMES_CHUNK]
-            query = session.query(
-                cluster_event_table.c.reason,
-                cluster_event_table.c.transitioned_at,
-            ).filter(cluster_event_table.c.name.in_(names),
-                     cluster_event_table.c.type.in_(type_values)).order_by(
-                         cluster_event_table.c.transitioned_at.desc())
-            if limit is not None:
-                # The global newest L events must be within each chunk's
-                # newest L, so bounding every query preserves the final result
-                # without materializing older rows that cannot survive.
-                query = query.limit(limit)
-            rows.extend(query.all())
-    if len(cluster_names) > _CLUSTER_EVENT_NAMES_CHUNK:
-        rows.sort(key=lambda row: row.transitioned_at, reverse=True)
-        if limit is not None and limit >= 0:
-            rows = rows[:limit]
-    return [{
-        'reason': row.reason,
-        'transitioned_at': row.transitioned_at,
-    } for row in rows]
+    return global_user_state_cluster_events.get_cluster_events_by_names(
+        _db_manager.get_engine, orm.Session, cluster_event_table,
+        _CLUSTER_EVENT_NAMES_CHUNK, cluster_names, event_types, limit)
 
 
 def _get_user_hash_or_current_user(user_hash: str | None) -> str:
