@@ -8238,6 +8238,9 @@ CREATE TABLE keyed_submission_containments (
 
 CREATE UNIQUE INDEX keyed_submission_containments_owner_uuid_uq
   ON keyed_submission_containments(owner_uuid);
+CREATE UNIQUE INDEX keyed_submission_containments_local_owner_uq
+  ON keyed_submission_containments(username, submission_key)
+  WHERE kind = 'LOCAL_CGROUP_V2_DIRECT_V1';
 CREATE INDEX keyed_submission_containments_state_idx
   ON keyed_submission_containments(state, username, submission_key);
 
@@ -8263,10 +8266,12 @@ state, nullability, numeric, primary-key, and uniqueness invariants above; it
 does not guess future digest or UUID versions. Foreign keys are deliberately
 absent because existing v40 connections do not enable SQLite foreign-key
 enforcement. The reducer must validate the parent submission in its same
-`BEGIN IMMEDIATE` transaction.
+`BEGIN IMMEDIATE` transaction. The partial unique local-owner index enforces at
+most one `LOCAL_CGROUP_V2_DIRECT_V1` row per submission; the v41 reducer and
+full-plan digest enforce the required at-least-one row before admission.
 
 The installer runs only after the legacy additive-column commits, requires no
-active transaction, and creates all three tables and four named indexes in one
+active transaction, and creates all three tables and five named indexes in one
 `BEGIN IMMEDIATE`. It validates the code-owned canonical SQL for every object
 before commit. Canonicalization removes the exact `IF NOT EXISTS` clause that
 SQLite omits from `sqlite_master.sql`, removes ASCII whitespace outside
