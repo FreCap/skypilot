@@ -8031,11 +8031,17 @@ Skylet module, main SkyPilot metadata, or second copy of its own import files.
 
 The main release wheel never owns files under `skypilot_worker_runtime`; its
 package discovery is explicitly restricted to `sky` and its documented
-first-party packages, and it declares an exact requirement on the matching
-`skypilot-worker-runtime-v1` version. Release publication uploads both wheels
-as one qualified artifact set. To preserve those bytes after a release-wheel
-installation, the main release wheel also carries that exact standalone wheel
-as an opaque package-data artifact under
+first-party packages. M5-S0b1a0 first makes it carry the exact standalone
+wheel as a dormant opaque artifact without adding an index-resolved
+dependency. M5-S0b1a1 may declare the exact matching
+`skypilot-worker-runtime-v1` requirement and publish both wheels as one
+qualified artifact set only after the project name and publisher authority
+exist on both TestPyPI and PyPI and both indexes already serve the exact
+qualified runtime version and SHA-256. The dependency must not reach an
+integration branch while either index can return a missing project, a missing
+qualified version, or bytes outside the qualified artifact set. To preserve
+the qualified bytes after a release-wheel installation, the main release wheel
+carries the exact standalone wheel as an opaque package-data artifact under
 `sky/skylet/runtime_wheels/v1/`, beside a minimal manifest containing its
 filename, version, size, and SHA-256. Owning this nested wheel file does not
 make the main distribution own any extracted `skypilot_worker_runtime` import
@@ -11557,7 +11563,7 @@ image and newly provisioned or naturally restarted v40 workers retain ordinary
 legacy behavior; it does not force-restart the existing worker fleet and cannot
 count as coordinated-runtime qualification.
 
-M5-S0b is split into ten additional ordered gates. None consumes a new legacy
+M5-S0b is split into eleven additional ordered gates. None consumes a new legacy
 Skylet version. Ordinary workers remain on byte-compatible v40 throughout;
 fresh coordinated workers use the independently versioned runtime protocol.
 
@@ -11567,18 +11573,43 @@ trigger, rollback, and subgate contracts. It changes no runtime and requires no
 deployment. An adversarial review of this exact committed design must return
 `PURSUE` before implementation.
 
-M5-S0b1a keeps Skylet `40` and lands only the packaging foundation. It creates
-the separate `addons/submission-containment/python-runtime/` build root and
-standalone distribution, restricts main-wheel package discovery, adds the
-exact main-wheel dependency, and makes the internal worker builder and
-installer preserve the opaque standalone wheel and produce, transfer, verify,
-and install the two-wheel bundle. No existing primitive or
-facade moves in this gate. Release-wheel, internal-wheel, standalone-wheel,
-source/editable-install, installed-API reconstruction, cache invalidation,
-bundle-transfer, tampered-bundle, offline v40 install, dependency-metadata,
-package-file ownership, and import-isolation matrices must prove one canonical
-source and zero overlapping import-file owners. Deploying the resulting ordinary v40
-image changes no singleton, listener, process, or capability.
+M5-S0b1a0 keeps Skylet `40` and lands only the index-independent packaging
+foundation. It creates the separate
+`addons/submission-containment/python-runtime/` build root and standalone
+distribution, restricts main-wheel package discovery, embeds and verifies the
+opaque standalone wheel in release artifacts, and makes the internal worker
+builder and installer produce, transfer, verify, and install the exact
+two-wheel bundle. It deliberately adds no main-wheel dependency, uploads no
+new public package, and changes no existing release package's dependency
+resolution. Ordinary source and editable installation retains its existing
+one-command path. Standalone-specific qualification installs the local build
+explicitly; worker installation resolves both explicit local wheel paths
+without an index. No existing primitive or facade moves in this gate.
+Release-wheel, internal-wheel, standalone-wheel, source/editable-install,
+installed-API reconstruction, cache invalidation, bundle-transfer,
+tampered-bundle, offline v40 install, package-file ownership, and
+import-isolation matrices must prove one canonical source and zero overlapping
+import-file owners. Deploying the resulting ordinary v40 image changes no
+singleton, listener, process, or capability.
+
+M5-S0b1a1 keeps Skylet `40` and activates only distribution dependency and
+publication. Before its dependency commit or release-workflow activation
+reaches an integration branch, an explicitly authorized bootstrap operator
+reserves `skypilot-worker-runtime-v1` on TestPyPI and PyPI, binds the intended
+trusted publisher or scoped credentials on both, publishes the exact qualified
+`1.0.0` wheel to both, fetches it back from each index, and proves both fetched
+SHA-256 values equal the checked-in qualified bytes. Later runtime-version
+bumps repeat that index-availability prerequisite before their exact main
+dependency reaches integration. Release and nightly workflows then own the
+normal dependency-first publication path: they publish and byte-verify the
+standalone wheel before the main package, reject `skip-existing` unless the
+existing artifact's SHA-256 is identical, add the exact main-wheel dependency,
+and select distribution files by parsed project identity rather than globs.
+TestPyPI validation must fetch and hash the standalone artifact from TestPyPI
+itself instead of satisfying it from the public-index fallback. Existing
+source, editable, wheel, sdist, Docker, worker-floor, and backward-compatibility
+install matrices must pass with the exact dependency before merge. This gate
+adds no runtime entrypoint, process, listener, capability, or provider effect.
 
 M5-S0b1b keeps Skylet `40` and relocates only the already-shipped pure keyed
 schema primitives into the now-qualified standalone dependency root.
@@ -13809,3 +13840,24 @@ This verdict authorizes the design-only M5-S0b0 merge and then only the ordered
 M5-S0b1a packaging foundation. It grants no coordinated worker activation,
 provider lifecycle effect, assignment, artifact removal, physical teardown,
 legacy owner removal, or production rollout authority.
+
+### Review 35
+
+Verdict: `PURSUE` for the index-independent M5-S0b1a0 packaging foundation and
+the separately authorized M5-S0b1a1 dependency-publication gate. The exact
+pre-verdict canonical design SHA-256 was
+`0a77536d79798fb01b21af47a4d8105da845b48997adbab4c975e5e53dd47234`, and
+the unchanged removal-ledger SHA-256 was
+`91e4de097f3d49062bebcdaecdce207fddd212f109068ffa8c7520cdcf4e8342`.
+Independent authority and release-path reviews both accepted those bytes.
+
+The split preserves every ordinary one-command source and editable install,
+keeps the standalone wheel outside all publication upload artifacts, and lets
+ordinary v40 workers qualify the exact two-local-wheel bundle without an index
+lookup for the standalone distribution. The main distribution retains its
+existing dependency metadata throughout M5-S0b1a0. M5-S0b1a1 cannot reach an
+integration branch until an explicitly authorized bootstrap publication has
+made the exact qualified `1.0.0` wheel available on both TestPyPI and PyPI and
+fetch-back SHA-256 checks match the checked-in bytes. This verdict grants no
+public-package mutation, dependency activation, coordinated entrypoint,
+provider effect, or legacy-owner removal authority.
