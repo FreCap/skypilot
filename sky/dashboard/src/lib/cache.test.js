@@ -42,6 +42,15 @@ function createSlowBackgroundFetch(thirdData = 'duplicate') {
   return { background, fetch };
 }
 
+function createSameSourceFetcher(value) {
+  const fetch = async (...args) => {
+    fetch.calls.push(args);
+    return { value };
+  };
+  fetch.calls = [];
+  return fetch;
+}
+
 describe('DashboardCache', () => {
   let cache;
 
@@ -153,6 +162,55 @@ describe('DashboardCache', () => {
   });
 
   describe('invalidateFunction', () => {
+    test('distinguishes same-source closures with different captured values', async () => {
+      const fetchA = createSameSourceFetcher('A');
+      const fetchB = createSameSourceFetcher('B');
+
+      expect(fetchA.toString()).toBe(fetchB.toString());
+
+      await expect(cache.get(fetchA, ['x'])).resolves.toEqual({ value: 'A' });
+      await expect(cache.get(fetchB, ['x'])).resolves.toEqual({ value: 'B' });
+
+      expect(cache.getCached(fetchA, ['x'])).toEqual({ value: 'A' });
+      expect(cache.getCached(fetchB, ['x'])).toEqual({ value: 'B' });
+      expect(fetchA.calls).toHaveLength(1);
+      expect(fetchB.calls).toHaveLength(1);
+    });
+
+    test('invalidateFunction only clears the exact fetch function', async () => {
+      const fetchA = createSameSourceFetcher('A');
+      const fetchB = createSameSourceFetcher('B');
+
+      await cache.get(fetchA, ['x']);
+      await cache.get(fetchB, ['x']);
+
+      cache.invalidateFunction(fetchA);
+
+      expect(cache.getCached(fetchA, ['x'])).toBeNull();
+      expect(cache.getCached(fetchB, ['x'])).toEqual({ value: 'B' });
+
+      await expect(cache.get(fetchA, ['x'])).resolves.toEqual({ value: 'A' });
+      expect(fetchA.calls).toHaveLength(2);
+      expect(fetchB.calls).toHaveLength(1);
+    });
+
+    test('memoizes function identity key generation', async () => {
+      let toStringCalls = 0;
+      const fetch = async () => ({ data: 'seeded' });
+      fetch.toString = () => {
+        toStringCalls += 1;
+        return 'expensive';
+      };
+
+      await cache.get(fetch, ['x']);
+      cache.getCached(fetch, ['x']);
+      cache.getCached(fetch, ['x']);
+      cache.invalidateFunction(fetch);
+      await cache.get(fetch, ['x']);
+
+      expect(toStringCalls).toBe(0);
+    });
+
     test('drops in-flight pending requests, not just cached entries', async () => {
       const mockFetch = createMockFetch({ data: 'v1' }, 100);
 

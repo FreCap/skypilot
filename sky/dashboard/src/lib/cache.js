@@ -7,15 +7,6 @@ import { CACHE_CONFIG } from './config';
 // Default value configured in config.js but can be overridden per function or globally
 const DEFAULT_CACHE_TTL = CACHE_CONFIG.DEFAULT_TTL;
 
-// Simple string hash function (djb2)
-function simpleHash(str) {
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) + hash + str.charCodeAt(i);
-  }
-  return hash >>> 0;
-}
-
 function invokeAsPromise(fetchFunction, args) {
   try {
     return Promise.resolve(fetchFunction(...args));
@@ -29,6 +20,8 @@ class DashboardCache {
     this.cache = new Map();
     this.backgroundJobs = new Map(); // Track ongoing background refresh jobs
     this.pendingRequests = new Map(); // Track in-flight requests to deduplicate concurrent calls
+    this.functionIds = new WeakMap();
+    this.nextFunctionId = 0;
     this.debugMode = false; // Added for debug mode
     this.preloader = null; // Reference to cache preloader for coordination
   }
@@ -193,8 +186,10 @@ class DashboardCache {
    * @param {Function} fetchFunction - The function to invalidate all entries for
    */
   invalidateFunction(fetchFunction) {
-    const functionString = fetchFunction.toString();
-    const functionHash = simpleHash(functionString);
+    const functionId = this.functionIds.get(fetchFunction);
+    if (functionId === undefined) {
+      return;
+    }
     const keysToDelete = new Set();
 
     // Find all keys that start with the function hash. Sweep the
@@ -204,7 +199,7 @@ class DashboardCache {
     // request instead of refetching.
     for (const map of [this.cache, this.pendingRequests, this.backgroundJobs]) {
       for (const key of map.keys()) {
-        if (key.startsWith(`${functionHash}_`)) {
+        if (key.startsWith(`${functionId}_`)) {
           keysToDelete.add(key);
         }
       }
@@ -346,13 +341,22 @@ class DashboardCache {
    * @private
    */
   _generateKey(fetchFunction, args) {
-    // The `fetchFunction.name` would be like `a`, `s`, `n`, etc. after exporting,
-    // which is very likely to be conflict between different functions.
-    // So we use the function string to generate the hash.
-    const functionString = fetchFunction.toString();
-    const functionHash = simpleHash(functionString);
+    const functionHash = this._getFunctionHash(fetchFunction);
     const argsHash = args.length > 0 ? JSON.stringify(args) : '';
     return `${functionHash}_${argsHash}`;
+  }
+
+  _getFunctionHash(fetchFunction) {
+    let functionHash = this.functionIds.get(fetchFunction);
+    if (functionHash === undefined) {
+      // Stable per-function ids avoid cross-cache collisions for distinct
+      // closures that share identical source text and remove repeated
+      // stringification from the hot path.
+      this.nextFunctionId += 1;
+      functionHash = this.nextFunctionId;
+      this.functionIds.set(fetchFunction, functionHash);
+    }
+    return functionHash;
   }
 }
 
