@@ -9,15 +9,13 @@ export function useVisibleRefreshInterval(
   const { initialDelayMs = intervalMs } = options;
   const onRefreshRef = useRef(onRefresh);
   const cadenceAnchorRef = useRef(null);
-  const nextIntervalDueAtRef = useRef(null);
 
   useEffect(() => {
     onRefreshRef.current = onRefresh;
   }, [onRefresh]);
 
   useEffect(() => {
-    if (!enabled || !intervalMs) {
-      nextIntervalDueAtRef.current = null;
+    if (!enabled || !Number.isFinite(intervalMs) || intervalMs <= 0) {
       return undefined;
     }
 
@@ -42,7 +40,6 @@ export function useVisibleRefreshInterval(
     };
 
     const scheduleNextRefresh = (dueAt) => {
-      nextIntervalDueAtRef.current = dueAt;
       clearScheduledRefresh();
       if (window.document.visibilityState !== 'visible') {
         return;
@@ -91,7 +88,6 @@ export function useVisibleRefreshInterval(
 
     return () => {
       cadenceAnchorRef.current = null;
-      nextIntervalDueAtRef.current = null;
       clearScheduledRefresh();
       window.document.removeEventListener(
         'visibilitychange',
