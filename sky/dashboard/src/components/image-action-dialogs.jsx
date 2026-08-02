@@ -1,4 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -23,6 +29,7 @@ import {
   retryImageLocation,
   retryImagePublication,
 } from '@/data/connectors/images';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 export const IMAGE_REMEDIATIONS = {
   ARTIFACT_NOT_READY: 'Wait for canonical verification, then retry prepare.',
@@ -75,6 +82,10 @@ function OperationProgress({ mutation, workspace, onTerminal }) {
   const [pollError, setPollError] = useState(null);
   const generation = useRef(0);
   const terminalNotification = useRef(null);
+  const pollControllerRef = useRef(null);
+  const pollOwnerRef = useRef(null);
+  const catchUpPollRef = useRef(false);
+  const nextPollDueAtRef = useRef(null);
   const operationId = operation?.id;
   const operationTerminal =
     operation && ['SUCCEEDED', 'FAILED'].includes(operation.state);
@@ -88,49 +99,101 @@ function OperationProgress({ mutation, workspace, onTerminal }) {
     onTerminal?.(operation);
   }, [operation, onTerminal]);
 
+  const startPoll = useCallback(
+    (refreshSource = 'poll') => {
+      if (!operationId || operationTerminal) {
+        return false;
+      }
+      if (
+        refreshSource === 'visibilitychange' &&
+        nextPollDueAtRef.current !== null &&
+        performance.now() < nextPollDueAtRef.current
+      ) {
+        return false;
+      }
+      if (pollOwnerRef.current !== null) {
+        catchUpPollRef.current = true;
+        return false;
+      }
+
+      const currentGeneration = generation.current;
+      nextPollDueAtRef.current = performance.now() + OPERATION_POLL_INTERVAL_MS;
+      const controller = pollControllerRef.current;
+      if (controller === null) {
+        return false;
+      }
+      let terminal = false;
+      const pollPromise = (async () => {
+        try {
+          const next = await getImageOperation(
+            operationId,
+            workspace,
+            controller.signal
+          );
+          if (generation.current !== currentGeneration) return;
+          setOperation(next);
+          setPollError(null);
+          terminal = ['SUCCEEDED', 'FAILED'].includes(next.state);
+        } catch (error) {
+          if (
+            generation.current === currentGeneration &&
+            error.name !== 'AbortError'
+          ) {
+            setPollError(error.code || error.message);
+          }
+        }
+      })().finally(() => {
+        if (pollOwnerRef.current?.promise === pollPromise) {
+          pollOwnerRef.current = null;
+        }
+        if (generation.current !== currentGeneration || terminal) {
+          return;
+        }
+        if (
+          catchUpPollRef.current &&
+          window.document.visibilityState === 'visible'
+        ) {
+          catchUpPollRef.current = false;
+          void startPoll();
+        }
+      });
+      pollOwnerRef.current = {
+        promise: pollPromise,
+      };
+      return true;
+    },
+    [operationId, operationTerminal, workspace]
+  );
+
   useEffect(() => {
+    generation.current += 1;
+    catchUpPollRef.current = false;
+    nextPollDueAtRef.current = null;
+    pollControllerRef.current?.abort();
+    pollControllerRef.current = new AbortController();
+    pollOwnerRef.current = null;
+
     if (!operationId || operationTerminal) {
       return undefined;
     }
-    const currentGeneration = ++generation.current;
-    const controller = new AbortController();
-    let timer = null;
-    const poll = async () => {
-      const startedAt = performance.now();
-      let terminal = false;
-      try {
-        const next = await getImageOperation(
-          operationId,
-          workspace,
-          controller.signal
-        );
-        if (generation.current !== currentGeneration) return;
-        setOperation(next);
-        setPollError(null);
-        terminal = ['SUCCEEDED', 'FAILED'].includes(next.state);
-      } catch (error) {
-        if (
-          generation.current === currentGeneration &&
-          error.name !== 'AbortError'
-        ) {
-          setPollError(error.code || error.message);
-        }
-      } finally {
-        if (generation.current !== currentGeneration || terminal) return;
-        const elapsed = performance.now() - startedAt;
-        timer = setTimeout(
-          poll,
-          Math.max(0, OPERATION_POLL_INTERVAL_MS - elapsed)
-        );
-      }
-    };
-    poll();
+    nextPollDueAtRef.current = performance.now() + OPERATION_POLL_INTERVAL_MS;
+    void startPoll('initial');
+
     return () => {
       generation.current += 1;
-      controller.abort();
-      clearTimeout(timer);
+      catchUpPollRef.current = false;
+      nextPollDueAtRef.current = null;
+      pollControllerRef.current?.abort();
+      pollControllerRef.current = null;
+      pollOwnerRef.current = null;
     };
-  }, [operationId, operationTerminal, workspace]);
+  }, [operationId, operationTerminal, workspace, startPoll]);
+
+  useVisibleRefreshInterval(
+    Boolean(operationId && !operationTerminal),
+    OPERATION_POLL_INTERVAL_MS,
+    startPoll
+  );
 
   return (
     <div className="space-y-3 rounded-md border border-gray-200 bg-gray-50 p-4">
