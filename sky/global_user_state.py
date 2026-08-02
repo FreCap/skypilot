@@ -33,6 +33,7 @@ from sky import global_user_state_schema
 from sky import global_user_state_service_account_tokens
 from sky import global_user_state_storage
 from sky import global_user_state_system_config
+from sky import global_user_state_users
 from sky import global_user_state_volumes
 from sky import models
 from sky import sky_logging
@@ -566,252 +567,48 @@ def add_or_update_user(
         If return_user=False: bool (whether the user is newly added)
         If return_user=True: Tuple[bool, models.User]
     """
-    if user.name is None:
-        return (False, user) if return_user else False
-    engine = _db_manager.get_engine()
-    # Set created_at if not already set
-    created_at = user.created_at
-    if created_at is None:
-        created_at = int(time.time())
-    with orm.Session(engine) as session:
-        # Check for duplicate names if not allowed (within the same transaction)
-        if not allow_duplicate_name:
-            existing_user = session.query(user_table).filter(
-                user_table.c.name == user.name).first()
-            if existing_user is not None:
-                return (False, user) if return_user else False
-
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            # For SQLite, use INSERT OR IGNORE followed by UPDATE to detect new
-            # vs existing
-            insert_func = sqlite.insert
-
-            # First try INSERT OR IGNORE - this won't fail if user exists
-            insert_stmnt = insert_func(user_table).prefix_with(
-                'OR IGNORE').values(
-                    id=user.id,
-                    name=user.name,
-                    password=user.password,
-                    created_at=created_at,
-                    type=user.user_type,
-                )
-            use_returning = return_user and _sqlite_supports_returning()
-            if use_returning:
-                insert_stmnt = insert_stmnt.returning(
-                    user_table.c.id,
-                    user_table.c.name,
-                    user_table.c.password,
-                    user_table.c.created_at,
-                    user_table.c.type,
-                    user_table.c.preferred_workspace,
-                )
-            result = session.execute(insert_stmnt)
-
-            row = None
-            if use_returning:
-                # With RETURNING, check if we got a row back.
-                row = result.fetchone()
-                was_inserted = row is not None
-            else:
-                # Without RETURNING, use rowcount.
-                was_inserted = result.rowcount > 0
-
-            if not was_inserted:
-                # User existed, so update it (but don't update created_at)
-                update_values = {user_table.c.name: user.name}
-                if user.password:
-                    update_values[user_table.c.password] = user.password
-                if user.user_type:
-                    update_values[user_table.c.type] = user.user_type
-
-                update_stmnt = sqlalchemy.update(user_table).where(
-                    user_table.c.id == user.id).values(update_values)
-                if use_returning:
-                    update_stmnt = update_stmnt.returning(
-                        user_table.c.id,
-                        user_table.c.name,
-                        user_table.c.password,
-                        user_table.c.created_at,
-                        user_table.c.type,
-                        user_table.c.preferred_workspace,
-                    )
-
-                result = session.execute(update_stmnt)
-                if use_returning:
-                    row = result.fetchone()
-
-            session.commit()
-
-            if return_user:
-                if row is None:
-                    # row=None means the sqlite used has no RETURNING support,
-                    # so we need to do a separate query
-                    row = session.query(user_table).filter_by(
-                        id=user.id).first()
-                updated_user = models.User(
-                    id=row.id,
-                    name=row.name,
-                    password=row.password,
-                    created_at=row.created_at,
-                    user_type=row.type,
-                    preferred_workspace=row.preferred_workspace,
-                )
-                return was_inserted, updated_user
-            else:
-                return was_inserted
-
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            # For PostgreSQL, use INSERT ... ON CONFLICT with RETURNING to
-            # detect insert vs update
-            insert_func = postgresql.insert
-
-            insert_stmnt = insert_func(user_table).values(
-                id=user.id,
-                name=user.name,
-                password=user.password,
-                created_at=created_at,
-                type=user.user_type,
-            )
-
-            # Use a sentinel in the RETURNING clause to detect insert vs update
-            if user.password:
-                set_ = {
-                    user_table.c.name: user.name,
-                    user_table.c.password: user.password
-                }
-            else:
-                set_ = {user_table.c.name: user.name}
-            if user.user_type:
-                set_[user_table.c.type] = user.user_type
-            upsert_stmnt = insert_stmnt.on_conflict_do_update(
-                index_elements=[user_table.c.id], set_=set_).returning(
-                    user_table.c.id,
-                    user_table.c.name,
-                    user_table.c.password,
-                    user_table.c.created_at,
-                    user_table.c.type,
-                    user_table.c.preferred_workspace,
-                    # This will be True for INSERT, False for UPDATE
-                    sqlalchemy.literal_column('(xmax = 0)').label('was_inserted'
-                                                                 ))
-
-            result = session.execute(upsert_stmnt)
-            row = result.fetchone()
-
-            was_inserted = bool(row.was_inserted) if row else False
-            session.commit()
-
-            if return_user:
-                updated_user = models.User(
-                    id=row.id,
-                    name=row.name,
-                    password=row.password,
-                    created_at=row.created_at,
-                    user_type=row.type,
-                    preferred_workspace=row.preferred_workspace,
-                )
-                return was_inserted, updated_user
-            else:
-                return was_inserted
-        else:
-            raise ValueError('Unsupported database dialect')
+    return global_user_state_users.add_or_update_user(
+        _db_manager.get_engine, orm.Session, sqlite, postgresql, user_table,
+        _sqlite_supports_returning, time.time, user, allow_duplicate_name,
+        return_user)
 
 
 @metrics_lib.time_me
 def get_user(user_id: str,
              session: 'orm.Session | None' = None) -> models.User | None:
-    with _session_scope(session) as active_session:
-        row = active_session.query(user_table).filter_by(id=user_id).first()
-    if row is None:
-        return None
-    return models.User(
-        id=row.id,
-        name=row.name,
-        password=row.password,
-        created_at=row.created_at,
-        user_type=row.type,
-        preferred_workspace=row.preferred_workspace,
-    )
+    return global_user_state_users.get_user(_session_scope(session), user_table,
+                                            user_id)
 
 
 @metrics_lib.time_me
 def get_users(user_ids: set[str]) -> dict[str, models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).filter(
-            user_table.c.id.in_(user_ids)).all()
-    return {
-        row.id: models.User(
-            id=row.id,
-            name=row.name,
-            password=row.password,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    }
+    return global_user_state_users.get_users(_db_manager.get_engine(),
+                                             orm.Session, user_table, user_ids)
 
 
 @metrics_lib.time_me
 def get_user_by_name(username: str) -> list[models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).filter_by(name=username).all()
-    if len(rows) == 0:
-        return []
-    return [
-        models.User(
-            id=row.id,
-            name=row.name,
-            password=row.password,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    ]
+    return global_user_state_users.get_user_by_name(_db_manager.get_engine(),
+                                                    orm.Session, user_table,
+                                                    username)
 
 
 @metrics_lib.time_me
 def get_user_by_name_match(username_match: str) -> list[models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).filter(
-            user_table.c.name.like(f'%{username_match}%')).all()
-    return [
-        models.User(
-            id=row.id,
-            name=row.name,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    ]
+    return global_user_state_users.get_user_by_name_match(
+        _db_manager.get_engine(), orm.Session, user_table, username_match)
 
 
 @metrics_lib.time_me
 def delete_user(user_id: str) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(user_table).filter_by(id=user_id).delete()
-        session.commit()
+    global_user_state_users.delete_user(_db_manager.get_engine(), orm.Session,
+                                        user_table, user_id)
 
 
 @metrics_lib.time_me
 def get_all_users() -> list[models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).all()
-    return [
-        models.User(
-            id=row.id,
-            name=row.name,
-            password=row.password,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    ]
+    return global_user_state_users.get_all_users(_db_manager.get_engine(),
+                                                 orm.Session, user_table)
 
 
 @db_retries.retry
@@ -824,14 +621,8 @@ def set_user_preferred_workspace(user_id: str, workspace: str | None) -> bool:
     invoking this. Returns True if a row was updated, False if the user_id
     does not exist.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        result = session.execute(
-            sqlalchemy.update(user_table).where(
-                user_table.c.id == user_id).values(
-                    preferred_workspace=workspace))
-        session.commit()
-        return result.rowcount > 0
+    return global_user_state_users.set_user_preferred_workspace(
+        _db_manager.get_engine(), orm.Session, user_table, user_id, workspace)
 
 
 @metrics_lib.time_me
