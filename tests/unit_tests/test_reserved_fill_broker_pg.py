@@ -5246,7 +5246,9 @@ class TestUtilizationGateSkewPG:
             for row in serve_state.get_reserved_fill_claims(pool_key)
         }['svc']
         with _armed_gate():
-            assert broker._activity_input(fresh).blind is False
+            fresh_signal = broker._activity_input(fresh)
+        assert fresh_signal.armed is True
+        assert fresh_signal.blind is False
 
         # A pre-gate binary heartbeats the SAME row 61s later, omitting the
         # gate columns. Their ON CONFLICT set_ leaves them frozen.
@@ -5262,9 +5264,12 @@ class TestUtilizationGateSkewPG:
         assert row['activity_ts'] == 1000.0  # FROZEN, not refreshed to 1061
         assert row['demonstrated_need'] == 0  # FROZEN
         with _armed_gate():
-            # lag 61 > RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS (60) -> blind, so
-            # a frozen demonstrated_need of 0 does NOT decay a busy service.
-            assert broker._activity_input(row).blind is True
+            # lag 61 > RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS (60) ->
+            # armed-but-blind, so a frozen zero first gets blind grace rather
+            # than being trusted as confirmed idle.
+            stale_signal = broker._activity_input(row)
+        assert stale_signal.armed is True
+        assert stale_signal.blind is True
 
 
 class TestMigration030PopulatedClaimsPG:
@@ -5312,6 +5317,8 @@ class TestMigration030PopulatedClaimsPG:
             assert got['boot_hold'] is None
             assert got['activity_ts'] is None
             with _armed_gate():
-                assert broker._activity_input(dict(got)).blind is True
+                legacy_signal = broker._activity_input(dict(got))
+            assert legacy_signal.armed is False
+            assert legacy_signal.blind is True
         finally:
             engine.dispose()

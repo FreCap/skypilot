@@ -188,6 +188,7 @@ class SkyServiceSpec:
         # object is the same opt-in as a plain `true`).
         reserved_fill_enabled = (isinstance(reserved_capacity_fill, dict) or
                                  bool(reserved_capacity_fill))
+        normalized_reserved_fill: bool | dict[str, Any] | None
         if isinstance(reserved_capacity_fill, dict):
             # The YAML path is schema-validated; enforce ranges here too so
             # programmatic construction cannot feed bad knobs to the
@@ -221,6 +222,13 @@ class SkyServiceSpec:
                         'reserved_capacity_fill.weight must not exceed '
                         f'{constants.RESERVED_FILL_MAX_WEIGHT:g}. '
                         f'Got: {fill_weight}')
+            utilization_gate = reserved_capacity_fill.get(
+                'utilization_gate', True)
+            if not isinstance(utilization_gate, bool):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'reserved_capacity_fill.utilization_gate must be a '
+                        f'boolean. Got: {utilization_gate!r}')
             # A floor above max_replicas can never be materialized: the fill
             # target is clamped to max_replicas, so the excess would sit as
             # a permanent phantom claim on the broker (absorbing entitlement
@@ -700,8 +708,20 @@ class SkyServiceSpec:
         # Opt-in: allow scaling up onto free reserved (zero-cost) capacity.
         # Absent/False means no behavior change. Bool form or object form
         # ({floor_replicas, weight}); object form implies enabled.
+        # Normalize the utilization policy into the persisted representation.
+        # Newly constructed/parsed enabled specs default to activity-backed
+        # fill. __setstate__ separately maps old representations that lack the
+        # key to explicit False, so a controller restart does not silently
+        # change an existing service before an intentional update.
+        if isinstance(reserved_capacity_fill, dict):
+            normalized_reserved_fill = dict(reserved_capacity_fill)
+            normalized_reserved_fill.setdefault('utilization_gate', True)
+        elif reserved_fill_enabled:
+            normalized_reserved_fill = {'utilization_gate': True}
+        else:
+            normalized_reserved_fill = reserved_capacity_fill
         self._reserved_capacity_fill: bool | dict[
-            str, Any] | None = reserved_capacity_fill
+            str, Any] | None = normalized_reserved_fill
         # Absent/None is the default policy: enabled when a placer supplies a
         # candidate catalog. False is the durable opt-out for both newly
         # parsed and pre-existing persisted service specs.
@@ -762,8 +782,22 @@ class SkyServiceSpec:
         # Missing means this service version still counts physical backends
         # until an explicit update creates a newly marked version.
         state.setdefault('_uses_logical_replicas', False)
-        # Added with reserved-capacity fill; old DB rows predate it.
-        state.setdefault('_reserved_capacity_fill', None)
+        # Added with reserved-capacity fill; old DB rows predate it. M5 made
+        # utilization gating the default for newly parsed enabled specs, but
+        # old persisted bool/object forms did not make that choice. Normalize
+        # those missing-key forms to the explicit legacy opt-out so restart is
+        # behavior-preserving; an intentional service update reparses omitted
+        # utilization_gate as True.
+        if '_reserved_capacity_fill' not in state:
+            state['_reserved_capacity_fill'] = None
+        else:
+            reserved_fill = state['_reserved_capacity_fill']
+            if isinstance(reserved_fill, dict):
+                reserved_fill = dict(reserved_fill)
+                reserved_fill.setdefault('utilization_gate', False)
+                state['_reserved_capacity_fill'] = reserved_fill
+            elif reserved_fill:
+                state['_reserved_capacity_fill'] = {'utilization_gate': False}
         state.setdefault('_cost_rebalance', None)
         # Added with the in-flight-aware graceful drain; old DB rows
         # predate it (None -> default drain semantics).
@@ -1230,9 +1264,9 @@ class SkyServiceSpec:
                       'scale_up_rate_period_seconds', 'adaptive_scale_up',
                       'max_scale_down_rate_percentage'):
             add_if_not_none('replica_policy', field, getattr(self, f'_{field}'))
-        # no_empty: omit both None and False so older controllers never see
-        # the field unless the user opted in. Canonicalize: an object form
-        # carrying only default knobs collapses to the plain bool form.
+        # no_empty omits the disabled None/False forms. Enabled fill always
+        # serializes as an object so its utilization policy is unambiguous
+        # across server versions.
         reserved_fill_config: bool | dict[str, Any] | None = (
             self._reserved_capacity_fill)
         if isinstance(self._reserved_capacity_fill, dict):
@@ -1241,9 +1275,12 @@ class SkyServiceSpec:
                 fill_obj['floor_replicas'] = self.reserved_fill_floor_replicas
             if self.reserved_fill_weight != 1.0:
                 fill_obj['weight'] = self.reserved_fill_weight
-            if self.reserved_fill_utilization_gate:
-                fill_obj['utilization_gate'] = True
-            reserved_fill_config = fill_obj if fill_obj else True
+            # Always serialize the policy explicitly. A new client may send
+            # this YAML to a pre-M5 server, whose default is False, so omitting
+            # True would silently change a gated service back to static fill.
+            # Keeping False explicit is equally important for new servers.
+            fill_obj['utilization_gate'] = self.reserved_fill_utilization_gate
+            reserved_fill_config = fill_obj
         add_if_not_none('replica_policy',
                         'reserved_capacity_fill',
                         reserved_fill_config,
@@ -1530,15 +1567,16 @@ class SkyServiceSpec:
 
     @property
     def reserved_fill_utilization_gate(self) -> bool:
-        # Whether this service's entitlement above floor_replicas is
-        # released while it demonstrates no work. Off unless the object
-        # form opts in: enabling it makes floor_replicas the whole
-        # burst-latency contract, which is a deliberate operator choice
-        # rather than something a default should make for them.
+        # Reserved fill is activity-backed by default: an idle claimant
+        # eventually releases its whole fill entitlement. The object form
+        # provides a durable explicit opt-out for services whose reservation
+        # must remain static even without observable utilization.
+        if not self.reserved_capacity_fill:
+            return False
         if isinstance(self._reserved_capacity_fill, dict):
             return bool(
                 self._reserved_capacity_fill.get('utilization_gate', False))
-        return False
+        return True
 
     @property
     def cost_rebalance(self) -> bool:

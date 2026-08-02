@@ -32,7 +32,7 @@ def upgrade() -> None:
     ON CONFLICT DO UPDATE set_ comprehension iterates that dict, so an old
     binary heartbeating a migrated row advances heartbeat_ts while leaving
     demonstrated_need frozen. A frozen 0 would read as "permanently idle"
-    and walk a busy service down to its floor. Pairing every write with
+    and walk a busy service down to zero. Pairing every write with
     activity_ts lets the broker reject the claim when
     heartbeat_ts - activity_ts exceeds the staleness bound.
 

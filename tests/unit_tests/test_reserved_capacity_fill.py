@@ -2015,8 +2015,13 @@ class TestPlacerSkipZeroCostPreference(unittest.TestCase):
 class TestBrokerPollerCycle(unittest.TestCase):
     """The broker cycle claims, reads the round, and feeds grant + epoch."""
 
-    def _run_cycle(self, allocation, zero_cost=None, replica_infos=()):
+    def _run_cycle(self,
+                   allocation,
+                   zero_cost=None,
+                   replica_infos=(),
+                   utilization_gate=False):
         autoscaler = _make_autoscaler(min_replicas=1)
+        autoscaler.reserved_fill_utilization_gate = utilization_gate
         if zero_cost is None:
             zero_cost = [spot_placer.Location.from_pickleable(_K8S_KEY)]
         placer = mock.Mock()
@@ -2036,6 +2041,29 @@ class TestBrokerPollerCycle(unittest.TestCase):
             reserved_capacity._broker_cycle(autoscaler, placer, 'svc',
                                             zero_cost, keys)
         return autoscaler, upsert_mock, remove_mock, round_mock
+
+    def test_gated_writer_without_telemetry_publishes_armed_blind_signal(self):
+        allocation = reserved_capacity_broker.Allocation(grant=0,
+                                                         feed=0,
+                                                         round_id=1,
+                                                         epoch=1,
+                                                         snapshot_time=1.0)
+        _, upsert_mock, _, _ = self._run_cycle(allocation,
+                                               utilization_gate=True)
+        self.assertEqual(upsert_mock.call_args.kwargs['activity'], {
+            'demonstrated_need': None,
+            'boot_hold': False,
+        })
+
+    def test_explicitly_ungated_writer_omits_utilization(self):
+        allocation = reserved_capacity_broker.Allocation(grant=None,
+                                                         feed=0,
+                                                         round_id=1,
+                                                         epoch=1,
+                                                         snapshot_time=1.0)
+        _, upsert_mock, _, _ = self._run_cycle(allocation,
+                                               utilization_gate=False)
+        self.assertIsNone(upsert_mock.call_args.kwargs['activity'])
 
     def test_unseeded_autoscaler_still_heartbeats_holdings(self):
         # Respawn path whose best-effort boot seed failed: the cycle must
@@ -2160,7 +2188,7 @@ if __name__ == '__main__':
 
 
 class TestFillDemandSample(unittest.TestCase):
-    """The gate's signal: per-replica, and blind unless the report is fresh."""
+    """The gate's detailed signal is available only with fresh telemetry."""
 
     def _autoscaler(self):
         spec = service_spec.SkyServiceSpec(
@@ -2182,13 +2210,14 @@ class TestFillDemandSample(unittest.TestCase):
         info.reserved_fill = True
         return info
 
-    def test_blind_without_a_fresh_report(self):
-        # Releasing on an unobservable fleet is the one outcome this
-        # feature must never produce, so no report means no gating.
+    def test_no_sample_without_a_fresh_report(self):
+        # The poller converts this lack of utilization proof to fresh NULL
+        # need (armed-but-blind) for a gated service; the autoscaler projection
+        # itself stays explicit about having no detailed sample.
         autoscaler = self._autoscaler()
         self.assertIsNone(autoscaler.fill_demand_sample([]))
 
-    def test_base_autoscaler_class_is_never_gated(self):
+    def test_base_autoscaler_class_has_no_detailed_sample(self):
         spec = service_spec.SkyServiceSpec(readiness_path='/health',
                                            initial_delay_seconds=60,
                                            readiness_timeout_seconds=30,

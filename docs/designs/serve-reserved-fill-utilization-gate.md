@@ -1,16 +1,22 @@
 # Utilization-gated reserved capacity
 
-- **Status:** implementing (M1 to M3 landing in this PR; M0 and M4 are operator steps)
-- **Last updated:** 2026-07-25
-- **Milestones:** M0 config (operator), M1 persistence, M2 signal (log only), M3 gate
-  (default off), M4 staged enable (operator)
+- **Status:** implemented; M5 default-on contract correction pending deploy
+- **Last updated:** 2026-08-01
+- **Milestones:** M0 config (operator), M1 persistence, M2 signal (log only), M3
+  gate, M4 staged validation (operator), M5 default-on/full-release semantics
 
 Reserved-fill capacity is arbitrated by static declared floors and weights. Nothing in the
 allocation math knows whether a claimant is doing any work, so an idle service keeps everything
-its weight entitles it to, indefinitely. This design adds a utilization gate: a claimant that
-demonstrates no work walks its entitlement down to `floor_replicas` in bounded steps, and the
+its floor and weight entitle it to, indefinitely. This design adds a utilization gate: by default,
+a claimant must demonstrate utilization to retain any fill reservation. A claimant that
+demonstrates no work walks its whole fill entitlement, including `floor_replicas`, down to zero in
+bounded steps. Positive utilization makes
+`ceil(demonstrated_need * 1.25)` the utilization-backed target; a rise to that
+target is immediate, while a lower target follows the bounded release path. A
+large declared floor cannot inflate it. The
 released capacity returns to genuinely free GPUs where any service can take it, including one
-that does not declare `reserved_capacity_fill` at all.
+that does not declare `reserved_capacity_fill` at all. `utilization_gate: false` is the explicit
+opt-out that preserves a static reservation without utilization.
 
 All line references are at prod SHA `a0028d62c7be576a97937d8fe7471bfa7c019849` (SkyPilot 1.1.807),
 which is an ancestor of the branch this lands on. Read them with
@@ -32,15 +38,35 @@ repeatedly reverted: any wave lasting more than about an hour is expected to
 span at least one roll. The trajectory in "Release path and end-to-end latency
 budget" below assumes no roll and is therefore a best case, not a typical one.
 
-The gate is still correct to ship (it is default off, and the mechanism is
-independent), but do not enable it on `protenixv2-hybrid-v1` before Milestones
-1 and 2 of `serve-drain-proof-across-lb-restarts.md` are deployed. Enabling it
-earlier will produce churn without release.
+The gate mechanism is independent, but do not leave it active on
+`protenixv2-hybrid-v1` before Milestones 1 and 2 of
+`serve-drain-proof-across-lb-restarts.md` are deployed. With the M5 default
+flip, such a service must carry an explicit `utilization_gate: false` until
+that dependency is deployed; otherwise it will produce churn without release.
 
 ## Operator decisions on record
 
-Taken 2026-07-25, and they override the sizing recommendations in "Configuration for the live
-services" below, which are retained as the analysis that produced them.
+The 2026-08-01 decisions below supersede the 2026-07-25 rollout choices and
+the sizing recommendations retained later as historical analysis.
+
+1. **Activity backing is the default.** Plain `reserved_capacity_fill: true`
+   and object form without `utilization_gate` are gated.
+2. **An idle gated claim releases its full reservation to zero.** A large
+   declared floor cannot be used to hoard idle GPUs; in particular,
+   `opendde-10c200s-v4`'s observed `floor_replicas: 70` and `weight: 1000000`
+   no longer protect idle fill capacity.
+3. **`boltz-l4-fleet` is the deliberate exception.** Its platform spec must
+   set `utilization_gate: false` using the M5 server, so it retains its
+   always-warm 1-2+ replica availability contract without utilization. Do not
+   apply this update through a pre-M5 serializer, which may omit explicit
+   false from the canonical object form.
+4. **No utilization proof is armed-but-blind, not confirmed idle.** A current
+   gated writer pairs a fresh `activity_ts` with NULL `demonstrated_need` when
+   the detailed sample is unavailable. That freezes an existing cap for the
+   900s blind grace and then resumes decay. Explicit false writes all activity
+   fields NULL and immediately clears prior gate state.
+
+Historical decisions taken 2026-07-25:
 
 1. **`boltz-l4-fleet` keeps `floor_replicas: 10`.** Not raised to 12.
 2. **`protenixv2-hybrid-v1` keeps `floor_replicas: 0`** (the field is absent today). The decay
@@ -50,14 +76,16 @@ services" below, which are retained as the analysis that produced them.
 3. **Rebalancing is done by the gate, not by a static reallocation.** The design's "available
    today, no code change" lever (a) is therefore not the plan of record; it remains documented as
    the interim fallback.
-4. **Idle means no in-flight requests and no queued work**, sustained. This is requirement 4 in
+4. **Idle means no in-flight requests and no queued work**, sustained. This is requirement 1 in
    the behavior contract.
 
-Consequence to keep in view: with `protenix floor 0`, a burst after a full release is served by
-nothing warm and waits the full `readiness_probe.initial_delay_seconds` of 1800s for its first
-useful replica. Risk 1 below is the analysis; the decision stands. Open question 1 (protenix's
-real `effective_request_duration_seconds`) is still the gate on M4 for that service, because it
-determines whether zero is a defensible floor or merely a cheap one.
+Consequence to keep in view: under M5 every gated service has an idle fill floor
+of zero, regardless of its declared `floor_replicas`. A burst restores the
+utilization-proportional cap immediately, but if released GPUs were taken by
+another tenant the service still waits through provisioning and
+`readiness_probe.initial_delay_seconds`. Services that require warm idle
+capacity must explicitly set `utilization_gate: false`; the declared floor then
+retains its static meaning.
 
 ## Problem
 
@@ -87,24 +115,70 @@ Grep for `idle`, `last_request`, `activity`, `utilization` over `autoscalers.py`
 
 Two knobs, both existing, both redefined. Nothing new is user-facing except an enable flag.
 
-**`floor_replicas` is the guaranteed warm base.** It is the number of fill replicas the service keeps when it is doing nothing at all. It is never gated by utilization, it is refilled by `feed` even while the service is idle, and it is the level an idle service decays *to*. Structurally it is untouched: the gate tightens only the water-fill headroom (`reserved_capacity_allocation.py:140-145`), never `scale_floors` (49-63) and never `attainable_floor()` (25-30). Operationally its role changes completely: under the old model it was a fairness minimum that rarely bound, because idle hoarding kept everyone warm by accident. Under the new model it is the **only** capacity that survives a quiet period, so it is the entire burst-latency contract. A burst arriving after a decay is served by `floor_replicas` alone for the first `readiness_probe.initial_delay_seconds` (1800s for protenix, 1200s for boltz-l4-fleet). If you get one number right in the spec, get this one right.
+**`floor_replicas` is conditional under the default gate.** For a gated
+claimant, `ClaimInput.allocation_floor()` clamps the declared attainable floor
+by the utilization cap before `scale_floors` runs. A need of 1 produces a cap
+target of 2, so after bounded down-convergence even `floor_replicas: 70`
+contributes only 2 priority floor slots; sustained zero walks it to zero. For
+an explicitly ungated claimant
+(`utilization_gate: false`), `floor_replicas` remains the static warm base and
+is refilled while idle.
 
-**`weight` is the contention tiebreaker among services that have simultaneously demonstrated work.** It divides the remainder above the floors, and only among claimants whose utilization cap has not already bound them below their weighted share. It has no effect on an idle service, because an idle service's headroom is 0 before the weighted split runs. Two corollaries. First, extreme weights are now actively wrong: `1e6` no longer means "protenix wins when it is working" (utilization handles that); it means "a busy boltz-l4-fleet gets nothing above its floor whenever protenix also has a single request in flight", which is a much harsher policy than intended. Use ratios in the 2x to 10x range. Second, weight can no longer buy idle hoarding, so raising it is no longer a way to reserve capacity. Raising `floor_replicas` is.
+**`weight` is the contention tiebreaker among services that have simultaneously demonstrated work.** It divides the remainder above the floors, and only among claimants whose utilization cap has not already bound them below their weighted share. It has no effect on an idle gated service, because that service's floor and headroom are both 0 before the weighted split runs. Two corollaries. First, extreme weights are actively wrong: `1e6` means a minimally active claimant can starve a heavily used peer above its floor. Use ratios in the 2x to 10x range. Second, neither weight nor a declared floor can buy idle hoarding under the default; a static warm reservation requires `utilization_gate: false`.
 
-**Everything above the floor is borrowed.** It is held only while the holder can prove work, it is released in bounded steps when the proof stops, and it returns to genuinely free GPUs (measured by `query_pool_group_observation`, `reserved_capacity.py:161-194`), not to a named peer. Free is the only channel that a service which does not declare `reserved_capacity_fill` can reach, because a non-claimant structurally cannot hold fill rows and never appears in `get_reserved_fill_claims` (`serve_state.py:5075-5084`).
+**Every gated fill slot is borrowed.** It is held only while the holder can
+prove work, is released in bounded steps when the proof stops, and returns to
+genuinely free GPUs (measured by `query_pool_group_observation`,
+`reserved_capacity.py:161-194`), not to a named peer. Free is the only channel
+that a service which does not declare `reserved_capacity_fill` can reach,
+because a non-claimant structurally cannot hold fill rows and never appears in
+`get_reserved_fill_claims` (`serve_state.py:5075-5084`).
 
 ## Behavior contract
 
 1. **Idle is `demonstrated_need == 0`.** `demonstrated_need = max(busy_fill_holdings + pre_ready_fill_holdings, ceil(outstanding_work / work_per_replica))`. It is zero only when: `in_flight_total == 0` (requirement 4), `queue_depth == 0` (requirement 4), no retained rejections in the 360s `LB_REJECT_WINDOW_SECONDS` window, no occupancy-unknown replica, no fill replica reporting in-flight work, and no fill replica in PENDING / PROVISIONING / STARTING.
-2. **No signal means busy.** A claimant with no fresh LB report (`has_fresh_demand_report()` false, `autoscalers.py:4166-4172`, threshold `3 * LB_CONTROLLER_SYNC_INTERVAL_SECONDS` = 60s), an autoscaler class with no occupancy telemetry, a stale activity stamp, or the gate disabled, is *ungated*: it gets exactly today's entitlement. The gate never fails toward release.
+2. **No current utilization proof is distinct from both idle and opt-out.** A
+   default-gated current writer always publishes `activity_ts`. When
+   `fill_demand_sample()` is unavailable, `demonstrated_need` is NULL, which
+   means armed-but-blind: freeze for `RESERVED_FILL_BLIND_GRACE_SECONDS`, then
+   resume bounded decay if blindness persists. An all-NULL activity tuple is
+   the explicit/static opt-out (and legacy row shape) and removes prior gate
+   state immediately. A stale non-NULL `activity_ts` remains armed-but-blind,
+   preserving the version-skew guard.
 3. **Idleness must persist for 300s before anything is released** (`RESERVED_FILL_IDLE_DWELL_SECONDS`), measured in wall clock, and no release step is taken while any fill replica the service already authorized is still booting.
-4. **A gated claimant's entitlement walks down to `floor_replicas` in bounded steps**, at most `max(2, ceil(0.25 * (cap - floor)))` replicas per `RESERVED_FILL_RELEASE_STEP_SECONDS` = 300s, and only after the previous step has been physically actuated (`holdings_fill <= cap`). The target is `floor_replicas`, never zero, and the floor is structurally unreachable from below because the gate caps at `max(floor, ...)` and the floor is applied by `scale_floors` before the gated headroom is computed.
-5. **Recovery is one round, release is many.** Any round in which `ceil(need * 1.25) > cap` sets `cap = ceil(need * 1.25)` immediately, with no dwell and no step schedule. Measured asymmetry on this pool: full entitlement restored in <= 120s (one poller cycle plus `damp_grants`' two-round up-move), versus ~72 minutes to walk 77 down to 16.
+4. **A gated claimant's entitlement walks down to zero in bounded steps**, at
+   most `max(2, ceil(0.25 * cap))` replicas per
+   `RESERVED_FILL_RELEASE_STEP_SECONDS` = 300s, and only after the previous
+   step has been physically actuated (`holdings_fill <= cap`). The utilization
+   cap clamps both the floor passed to `scale_floors` and weighted headroom.
+   Any positive need raises the cap immediately to
+   `ceil(need * (1 + headroom))`; the cap may remain below the declared floor.
+5. **Recovery is one round, release is many.** Whenever
+   `ceil(need * 1.25) > cap`, the raw cap rises to that target immediately,
+   with no dwell or step schedule. A lower utilization target never forces an
+   immediate down-move; it follows the ordinary dwell-and-step release path.
+   Measured asymmetry on this pool: utilization-backed entitlement is
+   restored in <= 120s (one poller cycle plus grant damping), versus roughly
+   75 minutes to walk 77 down to zero.
 6. **Lowering a grant never deletes a pod.** It removes scale-down shelter (`autoscalers.py:1129-1141`, `1147-1190`) and the ordinary drain-aware scale-down does the work, gated on `not _replica_is_busy(info)` (`autoscalers.py:4217-4239`, applied at 6632-6635 physical and 6759-6763 logical) and, for a logical replica that has served, on the LB reporting exactly zero in-flight and not-unknown (`replica_managers.py:~6228-6231`). A replica whose occupancy the LB cannot vouch for is never force-evicted; its retirement aborts and it rejoins service (`replica_managers.py:5962-5965`).
-7. **Conservation is preserved and becomes strict.** `Sum(entitlements) <= total` holds verbatim: the change is a pure tightening of the `caps` mapping, and `water_fill`'s bound `sum(result) <= amount` is cap-independent (`allocation.py:97-114`: `remaining` is non-increasing, the cap clamp at 102-106 only lowers `give`). When every claimant's gated headroom is 0, `water_fill`'s `active` list (77-81) is empty, the loop never runs, and `Sum(entitlements) = Sum(floors) < total`. The difference is the capacity that drains back to free.
-8. **A non-claimant service can expect exactly this:** the pool's steady-state free level rises from 0 to `total - Sum(floors) - (active surplus)`. With the recommended floors and both services idle that is 87 - 28 = 59 A100s genuinely free, takeable by any ordinary cheapest-first optimizer placement, by a SkyServe service that never declares `reserved_capacity_fill`, and by the research namespace. It is *not* a reservation: a busy claimant can re-take a freed slot within one 60s round via `compute_feeds`, and on this cluster the research tenant will usually take it first.
+7. **Conservation is preserved and becomes strict.**
+   `Sum(entitlements) <= total` still holds: the utilization cap can only lower
+   each claimant's retained floor and weighted headroom. When every claimant
+   is gated and idle, every allocation floor and headroom cap is zero, so
+   `Sum(entitlements) = 0`; explicitly ungated floors are the only fill
+   reservations left in the idle steady state.
+8. **A non-claimant service can expect exactly this:** the pool's steady-state
+   free level rises toward `total - Sum(explicitly_ungated_floors) - (active
+   gated entitlement)`. The released slots are genuinely free and takeable by
+   ordinary cheapest-first placement, another SkyServe service, or the
+   research namespace. It is not a direct handoff or durable reservation for a
+   named peer.
 9. **The demand path is never gated by a decayed grant.** `_demand_should_skip_zero_cost` (`replica_managers.py:3633-3675`) reads `max(damped_grant, raw_grant)`, not the ceiling. A bursting claimant's ordinary demand scale-up onto the zero-cost tier is its fastest reacquisition path (immediate, no round, no feed, demand rows exempt from the ceiling) and it stays open.
-10. **The gate is off by default and has a process-wide kill switch.** `reserved_capacity_fill.utilization_gate` defaults false; `SKYPILOT_SERVE_RESERVED_FILL_UTILIZATION_GATE=0` disables it for every service in the process without a spec redeploy.
+10. **The gate is on by default and has two opt-outs.**
+    `reserved_capacity_fill.utilization_gate` defaults true; explicit false is
+    the durable per-service static-reservation contract.
+    `SKYPILOT_SERVE_RESERVED_FILL_UTILIZATION_GATE=0` remains the emergency
+    process-wide kill switch and ungates every service without a spec redeploy.
 
 ## Mechanism
 
@@ -130,7 +204,15 @@ class FillDemandSample:
     work_per_replica: float
 ```
 
-`Autoscaler.fill_demand_sample(replica_infos) -> FillDemandSample | None` returns `None` on the base class. `None` means no telemetry, which the gate treats as blind, so `RequestRateAutoscaler` (2024), `InstanceAwareRequestRateAutoscaler` (2675), `QueueLengthAutoscaler` (7354) and `FallbackRequestRateAutoscaler` (7186) are never gated. `ConcurrencyAutoscaler` overrides it, returning `None` when `not self.has_fresh_demand_report()` and otherwise, under `self._logical_state_lock` (`autoscalers.py:3965`):
+`Autoscaler.fill_demand_sample(replica_infos) -> FillDemandSample | None`
+returns `None` on the base class. `ConcurrencyAutoscaler` overrides it,
+returning `None` when `not self.has_fresh_demand_report()` and otherwise,
+under `self._logical_state_lock` (`autoscalers.py:3965`). For a default-gated
+claimant, `_broker_cycle` maps `None` to a fresh `activity_ts` with NULL need.
+Request-rate, instance-aware request-rate, queue-length, fallback, and
+temporarily unobservable concurrency services are therefore armed-but-blind:
+they freeze for the bounded blind grace and then decay unless their spec
+explicitly sets `utilization_gate: false`:
 
 - `outstanding_work`: from `_outstanding_work()` (`autoscalers.py:5230-5286`). This is the correct quantity and not a new one: it already fuses in-flight, `_queue_work()` (4651-4677), `_rejected_work()` (4921-4933, which retains rejections over `LB_REJECT_WINDOW_SECONDS` = 360, `constants.py:390`) and the unknown-occupancy floor, and it is what the autoscaler itself trusts for its own target. Using raw `queue_depth` instead would be self-destructing: `LB_REQUEST_QUEUE_TIMEOUT_SECONDS` = 120 (`constants.py:338`) converts every queued request into a rejection two minutes after a burst hits a saturated fleet, so a naive queue-depth signal would collapse to zero long before a 1800s cold start could deliver anything. **Required refactor:** `_outstanding_work` writes `self._weighted_queue_work` and `self._rejected_concurrency` at 5281-5282 (read only by `info()` at 6933 and 6940). Extract the body into a pure `_outstanding_work_parts(replica_infos) -> tuple[float, float, float]`; `_outstanding_work` keeps the two assignments, `fill_demand_sample` calls the pure variant so a poller-thread read cannot clobber an observability field the decision tick owns.
 - `busy_fill_holdings`: count of this service's nonterminal FILL rows for which `_replica_is_busy(info)` is True (`autoscalers.py:4217-4239`). Fill/demand classification reuses the single existing definition (`count_zero_cost_holdings`, `autoscalers.py:695-718`, via `_fill_row_occupies_free_slot` 766-804 and `_replica_on_zero_cost_location` 806-815). This term is **per replica, not per service**, which is the critical repair: with `graceful_drain_async_occupancy: true` on protenix, an unknown-occupancy replica is busy individually (`4233-4234`), it does not pin the whole 77-replica fleet as busy. Three unknown replicas out of 77 produce `need = 3`, not "the service is busy".
@@ -157,7 +239,21 @@ sqlalchemy.Column('boot_hold', sqlalchemy.Integer, server_default=None)
 sqlalchemy.Column('activity_ts', sqlalchemy.Float, server_default=None)
 ```
 
-`activity_ts` is the mandatory anti-skew witness. `upsert_reserved_fill_claim` (`serve_state.py:4946-4999`) builds its `values` dict from the columns *that binary* knows (4962-4972) and the `ON CONFLICT DO UPDATE` `set_` comprehension iterates `values` (4990-4996), so an old binary heartbeating a migrated row advances `heartbeat_ts` while leaving the three new columns frozen indefinitely. If the frozen value were `demonstrated_need = 0`, that service would be judged permanently idle and walked to its floor while actually busy. `_claim_input` therefore treats a claim as **blind** unless `0 <= heartbeat_ts - activity_ts <= RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS` (60.0, `= 3 * LB_CONTROLLER_SYNC_INTERVAL_SECONDS`, matching `_staleness_threshold_seconds` at `autoscalers.py:4156-4164`). A new binary writes `activity_ts` unconditionally from the single `now` computed at `broker.py:268`, in the same INSERT, so the pairing is exact-float and epsilon-free. An old binary fails the lag check within one poll interval and its claim is ungated, which is today's behavior. This invariant must be pinned by a real-Postgres test, because it silently degrades to "trusts stale data" if `heartbeat_ts` ever stops advancing.
+`activity_ts` is the mandatory anti-skew witness. `upsert_reserved_fill_claim`
+(`serve_state.py:4946-4999`) builds its `values` dict from the columns *that
+binary* knows (4962-4972) and the `ON CONFLICT DO UPDATE` `set_` comprehension
+iterates `values` (4990-4996), so an old binary heartbeating a migrated row
+advances `heartbeat_ts` while leaving the three new columns frozen
+indefinitely. If the frozen value were `demonstrated_need = 0`, that service
+would be judged permanently idle and walked to zero while actually busy.
+`_claim_input` therefore treats a claim as **blind** unless
+`0 <= heartbeat_ts - activity_ts <= RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS`.
+A current gated writer writes `activity_ts` on every heartbeat, including when
+its detailed sample is unavailable; an explicit false writer omits the three
+activity fields. A previously armed row heartbeated by an old binary fails the
+lag check within one poll interval and becomes armed-but-blind, so frozen zero
+is not trusted during the 900s grace. A pre-gate all-NULL row remains ungated.
+These invariants must be pinned by a real-Postgres test.
 
 `upsert_claim` (`broker.py:253-301`) gains `activity: dict[str, Any] | None = None` after `effective_cap` (`:262`), defaulted so every existing caller and all 133 existing broker tests stay valid, and expands it into the three columns.
 
@@ -214,7 +310,11 @@ Five properties are load-bearing.
 
 *The step is gated on actuation.* `holdings > cap` means the previous step has not drained yet, so no new step is proposed. This keeps the cap at most one step ahead of physical reality (the "cap runs ahead of pods" problem), and it converts a stuck drain (an occupancy-unknown replica that keeps aborting its retirement at `replica_managers.py:5962-5965`) into a visibly stalled cap rather than a cap sitting at the floor with 77 pods still running. Effective step period in practice is 300s plus the actuation lag, i.e. 350-450s.
 
-*Rounding is `max(floor, anchor - step)` with `min_step = 2`.* A pure geometric decay never terminates in integers. The minimum step guarantees monotone progress and kills the long 1-replica tail.
+For utilization-gated claims the broker passes `floor=0`; the resulting cap
+also clamps the declared floor during allocation. *Rounding is
+`max(floor, anchor - step)` with `min_step = 2`.* A pure geometric decay never
+terminates in integers. The minimum step guarantees monotone progress and
+kills the long 1-replica tail.
 
 *The rise carries a 25% headroom* (`RESERVED_FILL_UTILIZATION_HEADROOM = 0.25`), so the gate is never the binding constraint on a service that is actively growing. The ordinary autoscaler target and `effective_cap` stay the binding constraints on the way up, exactly as today.
 
@@ -242,34 +342,55 @@ These are pool-global on purpose. A per-service half-life or dwell would let the
 One optional field on `ClaimInput` (`reserved_capacity_allocation.py:9-30`), defaulted so every existing construction, pickle and `dataclasses.replace` stays valid:
 
 ```python
-utilization_cap: int | None = None   # None = ungated, today's exact behavior
+utilization_cap: int | None = None   # None = explicit/static ungated behavior
 ```
 
-One replacement of the cap construction in `compute_entitlements`, replacing lines 140-145:
+`ClaimInput.allocation_floor()` returns
+`min(attainable_floor(), max(0, utilization_cap))` when a utilization cap is
+present, and `attainable_floor()` otherwise. `compute_entitlements` passes
+those activity-adjusted floors through `scale_floors`, then constructs
+headroom caps from each total ceiling:
 
 ```python
+floors = scale_floors(total, {
+    name: claim.allocation_floor() for name, claim in claims.items()
+})
 caps: dict[str, int | None] = {}
 for name, claim in claims.items():
     bounds = []
     if claim.effective_cap is not None:
-        bounds.append(max(0, claim.effective_cap - claim.attainable_floor()))
+        bounds.append(max(0, claim.effective_cap - floors[name]))
     if claim.utilization_cap is not None:
-        bounds.append(max(0, claim.utilization_cap - claim.attainable_floor()))
+        bounds.append(max(0, claim.utilization_cap - floors[name]))
     caps[name] = min(bounds) if bounds else None
 ```
 
-Lines 136-139 (`scale_floors`, `remainder`) and 146-149 (`water_fill`, `floors[name] + shares[name]`) are untouched. `attainable_floor()` (25-30) is untouched, so the floor is structurally immune to the gate and requirement 5's decay target is an invariant, not a check. `water_fill`'s existing cap-redistribution loop (100-112) delivers symmetric borrowing for free: a gated claimant's unused share is redistributed to the ungated ones with no new code.
+`attainable_floor()` remains the declared/effective-cap-clamped reservation,
+but the allocation floor may fall below it all the way to zero. `water_fill`'s
+existing cap-redistribution loop delivers symmetric borrowing: a gated
+claimant's unused floor and share are redistributed to active or explicitly
+ungated peers with no separate transfer path.
 
 Conservation proof, unchanged from today's argument because the gate is a pure tightening of a mapping the invariant never depended on:
 
-1. `scale_floors(total, attainable_floors)` gives `sum(floors) <= max(0, total)`. Identity branch (59-60) when `floor_sum <= total`; otherwise `_largest_remainder_round(scaled, total)` (62-63) sums to exactly `total` by construction (33-46).
+1. `scale_floors(total, allocation_floors)` gives
+   `sum(floors) <= max(0, total)`. Each allocation floor is already no larger
+   than both the attainable declared floor and the utilization cap. The
+   identity branch applies when `floor_sum <= total`; otherwise
+   `_largest_remainder_round(scaled, total)` sums to exactly `total`.
 2. `remainder = max(0, total) - sum(floors) >= 0` (139).
 3. `water_fill(remainder, weights, caps)` satisfies `sum(result) <= remainder` for *every* caps mapping: `remaining` initializes to `max(0, amount)` (98), each iteration's `rounded` sums to exactly `remaining`, `give <= rounded[name]` because the cap clamp at 102-106 only lowers it and `give = max(0, room)` is never negative, and `remaining -= give` (108-109) so `remaining` is non-increasing and never negative.
 4. Therefore `sum(entitlements) <= sum(floors) + remainder = max(0, total) <= total`, given `total = entitlement_free + conserved_holdings >= 0` (`broker.py:892-907`).
-5. The gate makes the inequality strict in the idle case. `water_fill`'s `active` construction at 77-81 is `weights[name] > 0 and (caps.get(name) is None or (caps[name] or 0) > 0)`; when every gated headroom is 0 the active list is empty, the `while` loop never runs, all shares are 0, and `sum(entitlements) = sum(floors)`.
-6. Lower bound preserved: `sum(entitlements) >= sum(floors)` always.
+5. The gate makes the inequality strict in the idle case. When every gated
+   utilization cap is 0, their allocation floors and headroom caps are 0; only
+   explicitly ungated floors remain.
+6. Lower bound preserved relative to the activity-adjusted allocation floors:
+   `sum(entitlements) >= sum(floors)` always.
 
-`compute_feeds` (197-290) needs **no change**, and it is worth stating why, because it looks like a hole. An idle claimant's feed need is `max(0, min(damped, raw, effective_cap) - holdings_fill)` (237-243), and its grant is capped at its release target, so an idle claimant can only ever be fed up to its own floor deficit. It cannot re-absorb what it released, and it cannot outbid a busy peer for capacity above its floor no matter what its weight is. Floor refill *does* win over a peer's above-floor growth, which is deliberate: that is what "guaranteed" means.
+`compute_feeds` needs **no change**. An idle gated claimant's grant and raw
+grant are capped at the release target, ultimately zero, so its feed need is
+zero and it cannot re-absorb what it released. An explicitly ungated
+claimant's static floor continues to refill under the existing grant math.
 
 ### Round assembly
 
@@ -277,7 +398,12 @@ Conservation proof, unchanged from today's argument because the gate is a pure t
 
 In `_run_round_locked`, the advance goes **inside the `if query_ok:` branch** (`broker.py:892-957`), after the live-holdings `dataclasses.replace` at 862-868 (so `holdings` is the row-scan-corrected value, not the possibly-stale claim value) and immediately before `compute_entitlements` at 908. Placing it before the `query_ok` split, as an earlier draft did, would let the governor advance on measurement-blackout rounds where grants are never recomputed: N consecutive blackout rounds would silently walk the cap down and then apply the whole drop in one step when the query recovered, possibly with `holdings_shrank` confirmed (927-941) so the immediate-down bypass (`allocation.py:184-185`) skipped the damping entirely.
 
-The blackout branch (`broker.py:958-992`) needs two changes. Its floor at `claim.holdings_fill` exists so a blackout never strips a live replica's shelter, but as written it also *un-decays* a claimant mid-release, republishing its grant at its holdings and making `Sum(grants) > total` for that round. Change it to floor at `min(claim.holdings_fill, carried_cap)`, and carry `utilization_state` forward with `stepped_at = now` and `hot_until = max(hot_until, now + dwell)` for every claimant so a long blackout cannot produce a double step on recovery.
+The blackout branch floors shelter at
+`min(claim.holdings_fill, carried_cap)` and carries armed utilization state
+with its clocks paused, so a blackout neither un-decays a claimant nor banks a
+double step. Before the branch, previous state is filtered to claimants whose
+current activity input is still `armed`; therefore explicit false/all-NULL
+activity clears a prior cap immediately even during a measurement blackout.
 
 The single-claimant fast path (`broker.py:817-841`) **must** be gated. Left alone it publishes `grants = {service: None}`, `collect_reserved_capacity` stores that as `_fill_grant = None`, and `autoscalers.py:1129-1133` applies no ceiling at all, so the gate is computed and discarded. That configuration (one fill claimant plus several non-claimants) is precisely the one requirement 3 describes, and it also arrives by accident whenever a peer's claim TTLs out. Changes:
 
@@ -314,11 +440,13 @@ protenix, logical replica unit, `graceful_drain_async_occupancy: true`, `gracefu
 
 **First freed A100: ~11 minutes worst case, ~8 minutes typical.**
 
-Full trajectory, cap 77 with floor 16, `step_fraction` 0.25, `min_step` 2, steps at ~400s effective (300s schedule plus actuation): 77, 61, 49, 40, 34, 29, 25, 22, 20, 18, 16. Ten steps.
+Full M5 trajectory, cap 77 with idle release floor 0,
+`step_fraction` 0.25 and `min_step` 2, at roughly 400s per effective step:
+77, 57, 42, 31, 23, 17, 12, 9, 6, 4, 2, 0. Eleven steps.
 
-- 50% of the 61-replica surplus released by ~25 minutes.
+- 50% released by ~25 minutes.
 - 80% by ~45 minutes.
-- Floor reached by ~72 minutes.
+- Zero reached by roughly 75-80 minutes.
 
 These are grant trajectories and therefore upper bounds on the pod trajectory: `max_scale_down_rate_percentage` (`autoscalers.py:3888-3889`), `_consume_downscale_pressure_veto` (5207-5228) and the actuation gate can each make the physical release slower, never faster.
 
@@ -345,10 +473,21 @@ replica_policy:
   reserved_capacity_fill:
     floor_replicas: 16
     weight: 4
-    utilization_gate: true     # NEW, default false
+    # utilization_gate: true is the default. Set false only for a static
+    # reservation that must remain warm without demonstrated utilization.
 ```
 
-Plumbed through `service_spec.py` validation (187-251), the `reserved_fill_utilization_gate` property (near 1498-1519, default False), `to_yaml_config` round-trip (1230-1240), `__setstate__` default (766) and `override` passthrough (1710-1711); snapshotted on the autoscaler at `autoscalers.py:377-385` and refreshed in `update_version` (553-560).
+Plumbed through `service_spec.py` validation, the
+`reserved_fill_utilization_gate` property (default True for enabled fill),
+`to_yaml_config` round-trip (both true and false serialize explicitly so a
+new client preserves policy against a pre-M5 server), and `override`
+passthrough; snapshotted on the autoscaler and refreshed in `update_version`.
+Newly parsed enabled specs normalize an omitted gate to explicit true in their
+persisted in-memory representation. `__setstate__` normalizes old bool/object
+representations that lack the key to explicit false, so a controller restart
+is behavior-preserving. The default changes only on an intentional service
+update that reparses current YAML. Explicit false remains the recommended
+durable contract for static holders and round-trips unchanged.
 
 Migration: new `sky/schemas/db/serve_state/030_reserved_fill_utilization_gate.py`, `down_revision = '029'`, four `db_utils.add_column_to_table_alembic` calls (three on `reserved_fill_claims`, one on `reserved_fill_rounds`) inside `with op.get_context().autocommit_block():`, all `server_default=None`, no-op `downgrade`. Style from `029_restart_safe_placement_policy.py`; single-column-on-a-reserved-fill-table shape from `005_reserved_fill_phantom_streak.py`. Explicitly **not** the `004_reserved_fill_broker.py` precedent (columns folded into a create), because these land on a live table. Bump `SERVE_VERSION` from `'029'` to `'030'` at `sky/utils/db/migration_utils.py:54`.
 
@@ -356,33 +495,105 @@ The serve DB resolves to PostgreSQL in the prod api-server pod (`db_utils.get_en
 
 ## Rejected alternatives
 
-**Claim-side idle decay (`activity_cap`): the claimant publishes an already-decayed self-cap, allocation math untouched.** The seam is genuinely elegant, and this design borrows it: folding a claimant-derived cap into `effective_cap` does bite `attainable_floor()`, the headroom and the feed need, which are exactly the three places it must. It lost on durability and on measurement scope. The decay state lived in controller memory, and its own fail-closed rule defeated its rehydration: `has_fresh_demand_report()` is false on the first tick after any restart, which disarms the tracker and republishes a NULL cap in the same tick. Since all controllers restart together inside one api-server pod, every routine deploy would simultaneously reset every claimant's decay, restore full weighted entitlements within 120s, and (if any free existed) feed 40 new 1800s-readiness replicas that would be released again 30 minutes later. Its busy predicate was also service-level and all-or-nothing over `unknown_replicas > 0`, so one flapping replica out of 77 would pin protenix busy forever, making the feature silently inert on the one service it was written for. This design keeps the cap-tightening seam, moves the state to the round row in Postgres, and replaces the service-level boolean with a per-replica count.
+**Claim-side idle decay (`activity_cap`): the claimant publishes an
+already-decayed self-cap, allocation math untouched.** It lost on durability
+and measurement scope: controller restarts reset in-memory decay and
+service-level unknown occupancy could pin a whole fleet. This design keeps a
+separate durable utilization cap on the round row, applies it explicitly to
+both `allocation_floor()` and weighted headroom, and uses per-replica
+occupancy. It does not overload `effective_cap`, whose meaning remains
+materializable capacity under demand pressure.
 
-**Two-tier lease: guaranteed floors plus activity-renewed borrowed slots.** The reframing of `floor_replicas` as the cold-start knob is the best restatement of the three and is adopted here almost verbatim. The mechanism lost on two structural defects. First, the leased tier was served from the remainder *before* the active water-fill, and a single request renewed the lease in full, so a claimant receiving one request every 890s would permanently outrank a peer with `queue_depth` 61 while holding everything above its floor. That reproduces the 05:22 incident exactly, and the design advertised it as its main anti-thrash property. Second, the busy stamp was placed inside `_collect_request_information_locked`, which does not run when the LB is dead, when `in_flight` is None (`autoscalers.py:4278-4284`), or when the controller is not demand-authoritative (`controller.py:1046-1050`), so its own fail-closed terms were dead code and an LB outage would age a busy service into "idle" and dump its fleet. The binary lease also cannot express partial release, which is the common case here. This design keeps the semantics, discards the lease structure, and measures in `_broker_cycle`, which runs unconditionally.
+**Two-tier lease: guaranteed floors plus activity-renewed borrowed slots.** M5
+rejects the guaranteed tier: positive activity restores only the
+utilization-proportional cap, which may remain below the declared floor. It
+also rejects a separate leased tier served ahead of water-fill, because that
+lets sparse traffic renew the entire weighted surplus ahead of a heavily
+loaded peer. The utilization cap instead bounds one ordinary water-fill
+claimant and can express partial release. Measurement remains in
+`_broker_cycle`, which runs unconditionally.
 
 The exponential-envelope form of the broker-side gate (continuous per-round decay) was also rejected in favor of step-and-settle: a grant that moves every round bumps the per-pool fencing epoch every round (`broker.py:995-1031`), which is the exact pathology the in-code comment at 993-1000 warns about, and it lets the cap run arbitrarily far ahead of physical pod count when drains lag.
 
 ## Risks and mitigations
 
-**1. Cold start is the real cost and only `floor_replicas` addresses it.** After a full release, a burst is served by the floor alone for 1200s (boltz-l4-fleet) to 1800s (protenix). The user chose this knowingly. The consequence is that `floor_replicas` moves from a rarely-binding fairness minimum to the number that determines burst SLA. Sizing rule: `floor = ceil(B * D / T_ramp)`, where `B` is the burst that must not wait, `D` the mean request duration, `T_ramp` the readiness delay. Derivation: the warm base clears `B` jobs in `B*D/floor` seconds and the elastic fleet becomes useful at `T_ramp`; equating them is the point where the marginal warm replica stops buying latency, because below it the burst waits on the floor and above it you are paying to keep capacity the ramp would have delivered by the same moment. **Recalibrate `D` before enabling on protenix**: read `effective_request_duration_seconds` from `Autoscaler.info()` (surfaced at `autoscalers.py:6923-6929`, estimator state 7001-7005) or from `serve_autoscaler_history` (serve migration 019). If `D` is really ~1800s rather than ~600s, the formula gives `floor ~= 52` and the honest conclusion is that protenix should barely decay at all. This is a gate on Milestone 4, not a caveat.
+**1. Cold start is the real cost, and a declared floor alone no longer keeps
+capacity warm.** After a full gated release, a burst restores only its
+utilization-proportional cap immediately; the physical GPUs may also have been
+taken and still require the full provisioning/readiness ramp. A service with a hard warm-availability SLA
+must explicitly set `utilization_gate: false` and size `floor_replicas` from
+that SLA. Boltz L4 is the recorded example; gated batch services deliberately
+accept the cold start in exchange for not hoarding idle GPUs.
 
-**2. Release may be one-way on this cluster (highest severity).** SkyPilot's inference pods run in `rescluster-k8s-prod-east1-preemptible-inference` below the research tenant in scheduling priority, and `hyperpod-ns-research` holds 241 of 328 GPUs with standing demand. A released A100 is likely bound to a pending research pod within seconds, well inside the 60s `query_pool_group_observation` interval, so `observed_free` never rises and every `feed` stays 0, which is already today's steady state. A raised grant then authorizes nothing. Three consequences that must be accepted explicitly: (a) `floor_replicas` is a hard capacity contract, not a soft warm base, and should be rounded up, not down; (b) `scale_floors` (`allocation.py:49-63`) scales the floors themselves down proportionally if the pool total falls below `Sum(floors)`, so "guaranteed" is guaranteed relative to what SkyPilot still physically holds, not absolutely; (c) the fastest reacquisition path is the ordinary demand scale-up onto the zero-cost tier, which is why the `max(damped, raw)` demand-gate split is mandatory and not an optimization. Mitigation before Milestone 4: measure reacquisition empirically on `boltz-l4-fleet-test` (floor 0, no production traffic) by releasing and observing whether the freed GPUs are still available to SkyPilot one poll interval later. If they are not, this design should ship with much larger floors and a smaller `step_fraction`, and open question 2 below needs a user decision.
+**2. Release may be one-way on this cluster (highest severity).** SkyPilot's
+inference pods run below the research tenant in scheduling priority, so a
+released GPU may be rebound before the next capacity poll. A raised gated
+grant then authorizes no physical launch. The fastest reacquisition path is
+ordinary demand placement onto the zero-cost tier, which is why the
+`max(damped, raw)` demand-gate split remains mandatory. The operational choice
+is now explicit: accept this for activity-backed batch services, or set
+`utilization_gate: false` for the small online warm floor that cannot be
+donated.
 
 **3. The 7200s `graceful_drain_seconds` on protenix is a cap, not a delay, but it is also the failure mode.** For a genuinely idle replica the drain tracker proves drained in one to two LB syncs (`replica_managers.py:5839-5995`, tracker at 700-795) and `_wait_for_drain` short-circuits (621-656). But with `graceful_drain_async_occupancy: true`, a replica whose occupancy the LB never validity-filters (`controller.py:749-795`) is UNKNOWN, and a current-version logical victim that cannot prove it drained has its retirement **aborted** and rejoins service (5962-5965). Under this design that surfaces as a stalled cap (the actuation gate stops stepping) rather than a runaway release, which is the correct fail-closed behavior but is silent. Mitigation, must ship with the feature: alert when `holdings_fill > cap` persists for more than three consecutive rounds, and when `unknown_replicas > 0` in the Concurrency report for more than an hour.
 
-**4. Version skew.** An old binary heartbeating a migrated claim row freezes the three new columns while advancing `heartbeat_ts`; defeated by the `heartbeat_ts - activity_ts <= 60s` lag check, which fails open within one poll. An old binary driving a round leaves `utilization_state` untouched (its publish `values` dict omits it) and computes ungated grants for one round; self-healing. A new binary against a pre-030 DB raises `ProgrammingError` from `get_reserved_fill_claims` (`serve_state.py:5079` emits an explicit column list from Python metadata), which escapes `_run_round_locked`, passes `run_round_if_stale` (catches only `locks.LockTimeout`, `broker.py:661`) and is swallowed by the poller's broad handler (`reserved_capacity.py:593-595`); `collect_reserved_capacity` is then never called, so `_fill_grant` freezes (it is never staleness-decayed) while `_fill_free_slots` decays to 0 after three intervals. Closed by the pre-deploy migration job ordering, but the handler at 593-595 should also log the exception type and traceback, because today a schema error is indistinguishable from a transient one.
+**4. Version skew.** An old binary heartbeating a previously armed migrated
+claim freezes the activity columns while advancing `heartbeat_ts`; the lag
+check turns that row armed-but-blind within one poll, freezing before any
+blind-grace decay rather than trusting frozen zero. A truly pre-gate all-NULL
+row stays ungated. An old binary driving a round omits `utilization_state`, so
+the state survives its mixed-version publish and a new writer resumes it.
+Schema ordering remains closed by the pre-deploy migration job.
 
 **5. The no-allocation path removes the ceiling entirely.** `collect_reserved_capacity(0, keys, time.time())` at `reserved_capacity.py:496` and `:502` leaves `grant` at its `None` default, and `autoscalers.py:691` assigns it unconditionally, so a round-lock timeout or a rejected claim un-caps the fill fleet for that cycle. It cannot launch anything (feed is 0 and `_fresh_fill_free_slots` decays, `autoscalers.py:750-758`) and the next successful round re-applies the cap within 60s, so this stays as-is: it is the existing fail-open to pre-broker behavior and changing it is out of scope. Worth knowing when reading logs during a decay.
 
-**6. Cross-service handoff is slow and burns readiness time.** A full transfer costs the dwell plus the step schedule plus the release chain plus the acquirer's 1200-1800s readiness, roughly 45 to 90 minutes end to end, during which the transferred GPUs serve nothing on either side. This design is a decongestant, not a fast load balancer between services. If the two services alternate on a sub-two-hour cadence, a large fraction of the transferred GPU-hours is spent booting, and the correct answer is larger floors on both, not a faster gate.
+**6. Cross-service handoff is slow and burns readiness time.** A full transfer
+costs the dwell plus the step schedule plus the release chain plus the
+acquirer's readiness, roughly 45 to 90 minutes end to end. This design is a
+decongestant, not a fast load balancer. A latency-critical online service uses
+an explicit ungated small floor; gated batch services accept the ramp.
 
-**7. Visible utilization drop that will be reported as a regression.** With both services idle and the recommended floors, SkyPilot occupancy on this pool falls from 87 to 28 of 328 GPUs. That is the intended outcome, but a dashboard tracking SkyPilot GPU-hours will show a step change. Pre-brief: GPU-hours-held stops being the metric; served-work-per-GPU-hour becomes it.
+**7. Visible utilization drop that will be reported as a regression.** With
+all gated services idle, SkyPilot fill occupancy falls to only the explicitly
+ungated reservations. That is the intended outcome; GPU-hours-held stops being
+the metric and served-work-per-GPU-hour becomes it.
 
 **8. Constants tuned against one day of traffic.** `step_fraction`, `min_step` and the 25% headroom were chosen against a single 52-request protenix burst at 08:06 and one boltz queue episode at 05:22. They are defensible, not validated. Mitigation: replay `serve_history.serve_request_activity_history_table` (`serve_history.py:107-140`, minute-bucket per-service arrival history, already in the same Postgres DB) through `advance_release_target` offline before enabling on protenix. Blast radius of a bad constant is one env-var flip.
 
 ## Configuration for the live services
 
-### Available today, no code change
+### M5 rollout configuration
+
+Rollout order is deliberate:
+
+1. Deploy the M5 SkyPilot image. Existing persisted missing-key service specs
+   normalize to legacy false in `__setstate__`, so this restart alone activates
+   no gate.
+2. Through the M5 server, update `boltz-l4-fleet` to the explicit false config
+   below. The new serializer preserves the opt-out durably.
+3. Update `opendde-10c200s-v4` (and other batch claimants) with the gate omitted
+   or true. Intentional reparse adopts the new default and starts release.
+
+```yaml
+# boltz-l4-fleet: online availability exception
+replica_policy:
+  reserved_capacity_fill:
+    floor_replicas: 2  # or the operator-selected online warm floor
+    weight: 1
+    utilization_gate: false
+```
+
+Batch/research claimants such as `opendde-10c200s-v4` must omit the knob (or
+write `utilization_gate: true`). Their declared floors become
+activity-backed: zero demonstrated utilization eventually yields zero fill
+entitlement even when `floor_replicas` is 70.
+
+### Historical M4 analysis (superseded by M5)
+
+The following tables preserve the analysis used for the original
+floor-retaining, opt-in gate. They are not the current rollout contract.
+
+#### Available at the time, no code change
 
 Two levers exist right now. They are genuinely different and should not be conflated.
 
@@ -397,7 +608,7 @@ With floors 16/12/0 and weights 4/1/0.1 on an 87-slot pool: floors 28, remainder
 
 **(b) Lower `max_replicas` on the fill claimants.** This is the only existing lever that can create genuinely free capacity, because `effective_cap = max(0, max_replicas - demand_target)` (`reserved_capacity.py:474-475`) becomes the binding headroom cap. To leave N GPUs free you need `Sum(max_replicas - demand_target) < 87`. It is **traffic-blind and permanent**: it caps the burst response by exactly the same amount it releases, at all times, whether or not anyone needs the capacity. Use it only as a bridge, and prefer (a) alone if you can wait for the code. That `max_replicas` is the only existing lever, and that it cannot distinguish "idle" from "small", is the argument for building the gate.
 
-### Post-change values
+#### Original post-change values
 
 | Service | Knob | Current | Recommended | Reasoning |
 | --- | --- | --- | --- | --- |
@@ -407,14 +618,14 @@ With floors 16/12/0 and weights 4/1/0.1 on an 87-slot pool: floors 28, remainder
 | | `graceful_drain_seconds` | 7200 | **7200** (unchanged) | It is a cap, not a wait, and it is the guard that stops the ceiling from ever evicting a replica the LB cannot vouch for. |
 | `boltz-l4-fleet` | `floor_replicas` | 10 | **12** | Same rule with `T_ramp` = 1200, `B` = 72 (queue 61 + in-flight 11 at 05:22), `D` ~= 180s: `72*180/1200` = 10.8. Validates the existing 10 and raises it modestly, justified because 10 replicas measurably produced a 61-deep queue. |
 | | `weight` | 100 | **1** | The baseline the others are expressed against. Against protenix's 4 this is the intended 4:1. |
-| | `utilization_gate` | n/a | **true** (enable second) | Smaller blast radius than protenix, physical replica unit, strict drain branch (`replica_managers.py:5975-5995`) so it releases more reliably. |
+| | `utilization_gate` | n/a | **true** (historical; now **false**) | M5 records Boltz L4 as the explicit always-warm online exception. |
 | `boltz-l4-fleet-test` | `floor_replicas` | 0 | **0** (unchanged) | A test service should hold nothing at rest, and under the new model it genuinely does instead of holding whatever it last drifted into. |
 | | `weight` | 0.1 | **0.1** (unchanged) | Already encodes "loses every contention", which stays correct. Its practical path is now the free-slack path, not the grant path. |
 | | `utilization_gate` | n/a | **true** (enable first) | No production traffic; the correct place to validate the full 13-step release chain and, critically, whether a released A100 is reacquirable at all on this cluster. |
 
 Pool-level constants stay at their defaults. Do not set them per service.
 
-### Resulting allocation, 87 fill-arbitrable GPUs
+#### Original resulting allocation, 87 fill-arbitrable GPUs
 
 | Scenario | protenix | boltz-l4-fleet | test | Free | Today |
 | --- | --- | --- | --- | --- | --- |
@@ -435,11 +646,27 @@ Each is independently shippable and independently valuable.
 
 **M2. Signal, log only (1.5 days).** `_outstanding_work_parts` extraction, `FillDemandSample`, `Autoscaler.fill_demand_sample`, the `ConcurrencyAutoscaler` override, the `_broker_cycle` measurement, the claim writes, the `activity_ts` lag check in `_claim_input`, and the extended round and per-service log lines. The gate is not wired to `compute_entitlements`. **Bake for one week** and confirm that measured idle and busy transitions match the known traffic history in `serve_request_activity_history`, and that protenix's `demonstrated_need` actually reaches 0 (if `unknown_replicas` keeps it pinned, the feature would be inert and M3 should not ship as designed).
 
-**M3. The gate (1.5 days).** `advance_release_target`, `ClaimInput.utilization_cap`, the `compute_entitlements` cap tightening, the `utilization_state` round column wiring, the single-claimant fast-path gating (grants, raw_grants, feeds unchanged), the blackout-branch floor and carry, the `demand_gate_grant` split, the schema and spec knob, the env kill switch. Default off. Ships dark.
+**M3. The gate (complete).** `advance_release_target`,
+`ClaimInput.utilization_cap`, entitlement cap tightening, durable state,
+single-claimant behavior, blackout carry, demand-gate split, schema/spec knob,
+and the env kill switch. This originally shipped default off.
 
-**M4. Enable, staged (0.5 day plus bake).** Recalibrate `D` for protenix first. Then `boltz-l4-fleet-test` (validate the full release chain and reacquisition), then `boltz-l4-fleet`, then `protenixv2-hybrid-v1`, with at least one full traffic cycle between each.
+**M4. Staged validation (operator).** Historical opt-in rollout and live drain
+validation.
 
-Total engineering effort ~4.5 days, plus roughly two weeks of staged bake.
+**M5. Default-on/full-release correction.** Make gating the default for every
+enabled fill policy; serialize explicit false durably; publish a paired zero
+only for confirmed zero utilization, while a missing detailed sample publishes
+fresh NULL need as armed-but-blind; let the utilization cap clamp the declared
+allocation floor; and use idle release floor 0 with proportional recovery.
+Legacy persisted missing-key specs normalize to false on unpickle; intentional
+updates adopt the new default. Deploy SkyPilot first, then apply the
+boltz-platform explicit-false update through the new server, then intentionally
+update OpenDDE to activate the default gate.
+
+The original M0-M4 estimate was ~4.5 days plus staged bake. M5 is a localized
+contract correction with a required server-first, Boltz-opt-out-second,
+OpenDDE-activation-third rollout.
 
 ## Test plan
 
@@ -447,24 +674,38 @@ Repo philosophy: the minimum tests that establish logic correctness, never asser
 
 ### `tests/unit_tests/test_reserved_fill_broker.py` (2134 lines, 77 tests today) - pure math
 
-- `advance_release_target`: rise is instantaneous and ignores dwell and step schedule; dwell blocks the first step for exactly `dwell` seconds measured in wall clock (a delayed or skipped round does not shorten it); `boot_hold` blocks a step and extends `hot_until`; `holdings > cap` blocks a step (actuation gate); the step is `max(min_step, ceil(fraction * (anchor - floor)))` against hand-computed values for the 77 -> 16 trajectory; the cap converges to exactly `floor` in finite steps and never below it; blind freezes without raising and without lowering, and pauses the step clock; blind past `blind_grace` resumes the decay.
-- `compute_entitlements`: `Sum(entitlements) <= total` under every combination of `effective_cap` present/absent and `utilization_cap` present/absent, including the all-capped case where the strict inequality must hold and `Sum(entitlements) == Sum(floors)`; floors are never gated (property test over random floors, caps and needs asserting `entitlement >= attainable_floor()`); a gated claimant's freed remainder is redistributed to an ungated peer by the existing `water_fill` cap loop.
-- `compute_feeds` interaction: a gated claimant at its cap has need exactly 0 (it cannot re-absorb what it released); a gated claimant below its floor is still fed up to its floor.
+- `advance_release_target`: rise is instantaneous and proportional to need;
+  idle release converges to `floor=0` in finite bounded steps; dwell, boot
+  hold, actuation, blind freeze, and blind grace behavior remain pinned.
+- `compute_entitlements`: `Sum(entitlements) <= total` under every combination
+  of `effective_cap` and `utilization_cap`; a zero utilization cap clamps a
+  non-zero declared floor to zero; a positive cap restores it; the lower-bound
+  assertion uses `allocation_floor()`, not `attainable_floor()`.
+- `compute_feeds` interaction: a fully released gated claimant has zero feed
+  need; an explicitly ungated claimant still refills its static floor.
 - `damp_grants` interaction with a monotone stepwise descent: the published grant lags the raw by exactly one round, and the lag disappears once `holdings_shrank` is confirmed.
-- `_claim_input`: an unpaired or out-of-lag `activity_ts` yields an ungated `ClaimInput`; the gate combines with `effective_cap` by `min` with None-as-unbounded on both sides; `dataclasses.replace(claim, holdings_fill=...)` at `broker.py:862-868` preserves `utilization_cap`.
+- `_activity_input`: all-NULL activity is unarmed/ungated; fresh NULL need and
+  stale non-NULL `activity_ts` are armed-but-blind; paired fresh integer need
+  is trusted. Explicit disarm clears prior state even during blackout.
 - Single-claimant fast path: an armed gate publishes an integer grant and a non-empty `raw_grants`; `feeds` equals raw measured free; `utilization_gate: false` restores the `None` grant and the empty `raw_grants` exactly.
 - Blackout branch: a carried grant is floored at `min(holdings_fill, carried_cap)`, so a decay in progress is not undone and `Sum(grants) <= total` still holds; `stepped_at` is pushed forward so recovery cannot double-step.
 
 ### `tests/unit_tests/test_reserved_fill_broker_pg.py` (4170 lines, 56 tests today) - real Postgres
 
 - Migration `030` applies to a populated pre-030 `reserved_fill_claims` table; existing rows read as ungated.
-- **Skew invariant (mandatory):** write a paired claim with the new writer, then simulate an old writer's upsert (a `values` dict omitting the three columns) and assert the round classifies the claim as blind within one poll interval and computes ungated grants.
+- **Skew invariant (mandatory):** write a paired claim with the new writer,
+  then simulate an old writer's upsert omitting the activity columns and assert
+  it becomes armed-but-blind within one poll. A populated pre-030 all-NULL row
+  remains unarmed/ungated.
 - `utilization_state` survives writer rotation, is not clobbered by an old-shaped `publish_reserved_fill_round`, and is dropped for claimants whose claims expired.
 - A three-claimant round where one claimant is gated and the others' grants rise, asserting `Sum(entitlements) <= total`.
 
 ### `tests/unit_tests/test_reserved_capacity_fill.py` (2159 lines, 114 tests today) - autoscaler side
 
-- `fill_demand_sample` returns `None` when `has_fresh_demand_report()` is false, and on every non-`ConcurrencyAutoscaler` class.
+- `fill_demand_sample` returns `None` when detailed telemetry is unavailable;
+  `_broker_cycle` converts that to fresh NULL need for an armed-but-blind
+  writer and leaves all activity fields NULL only for explicit
+  `utilization_gate: false`.
 - `demonstrated_need` is 0 only under the full six-term idle condition; each of the six independently forces a non-zero need (in-flight, queue depth, retained rejections, unknown occupancy, a busy fill replica, a booting fill replica).
 - An occupancy-unknown replica contributes to `need` **per replica**, not by pinning the service: 3 unknown of 77 gives `need = 3`.
 - `_outstanding_work_parts` extraction is behavior-preserving: `_outstanding_work` returns the same value and still assigns `_weighted_queue_work` and `_rejected_concurrency`, while the pure variant assigns nothing.
@@ -473,7 +714,11 @@ Repo philosophy: the minimum tests that establish logic correctness, never asser
 
 ### `tests/unit_tests/test_reserved_capacity_spec.py` (314 lines, 19 tests today)
 
-- `utilization_gate` schema acceptance and rejection of unknown keys under `additionalProperties: False`; `to_yaml_config` round-trip; `__setstate__` default False for specs unpickled from pre-030 rows; `update_version` refresh.
+- `utilization_gate` defaults true for bool/object fill forms; explicit false
+  round-trips without canonicalizing away; non-booleans are rejected; old
+  plain-true and missing-key object pickles preserve legacy false; newly
+  created true/false specs survive pickle and YAML round-trips;
+  `update_version` refreshes the setting.
 
 ### `tests/unit_tests/test_concurrency_autoscaler.py`
 
@@ -487,11 +732,43 @@ Repo philosophy: the minimum tests that establish logic correctness, never asser
 4. **After M4 step 2 (`boltz-l4-fleet`):** confirm the cap walks 22 -> 12 and that a synthetic burst restores full entitlement within 120s and reopens the demand gate (verifiable by observing that new demand replicas land on the zero-cost tier, not on paid capacity).
 5. **After M4 step 3 (`protenixv2-hybrid-v1`):** watch the first idle-to-burst transition end to end. Alert at T+30min on `queue_depth > 0` or `rejected_in_recent_window > 0`. If the floor is undersized, raise it before touching any pool-level constant.
 6. **Standing alerts, shipped with M3:** `holdings_fill > cap` for more than three consecutive rounds (stalled release, usually unknown occupancy); a claim blind for more than one hour while `serve_request_activity_history` shows zero arrivals for the same service over the same period (wedged LB, feature silently inert); a claim whose `cap` has not stepped down across several dwell windows while `demonstrated_need` reads 0 on every non-blind round over the same span (intermittent-blindness stall, feature silently inert -- distinct from the contiguous-blind alert because no single blind streak is long, the blind rounds are merely frequent); `Sum(grants) > total` in any round (conservation violation, should be impossible).
+7. **M5 rollout gate:** deploy the SkyPilot image and verify legacy persisted
+   services remain ungated. Then update `boltz-l4-fleet` through the new server
+   with rendered boltz-platform YAML containing `utilization_gate: false`;
+   confirm its claim has NULL activity fields, no utilization state, and
+   retains its configured static floor with zero traffic. Only then update
+   OpenDDE to adopt default true.
+8. **M5 full-release acceptance:** with `opendde-10c200s-v4` idle, verify fresh
+   paired `demonstrated_need=0`, then observe its cap and physical fill holdings
+   walk from the current level through its declared floor of 70 to zero. Verify
+   the released slots appear as free or as holdings/grants for another
+   claimant, and that Boltz's replicas/grant do not fall below its explicit
+   static floor.
+9. **M5 recovery acceptance:** send one OpenDDE batch after release and verify
+   the raw cap becomes `ceil(demonstrated_need * 1.25)` in one broker round
+   (not 70 merely because the declared floor is 70), the demand gate reads
+   `max(damped, raw)`, and capacity reacquisition is bounded only by physical
+   availability/provisioning rather than the decay schedule.
 
 ## Open questions
 
 1. **What is protenix's actual `effective_request_duration_seconds`?** If it is ~600s the recommended floor of 16 stands. If it is ~1800s (which `graceful_drain_seconds: 7200` hints at), `ceil(B*D/T_ramp)` gives ~52 and protenix should barely decay at all, which changes whether M4 should enable the gate there and changes the entire value proposition for the largest holder on the pool. Resolvable from `Autoscaler.info()` or `serve_autoscaler_history` before M3 ships.
-2. **Is a released A100 reacquirable on this cluster?** If `hyperpod-ns-research` absorbs every freed slot permanently, release is a one-way donation, `floor_replicas` becomes a hard permanent contract rather than a warm base, and `step_fraction` should be much smaller. Measured directly in live validation step 3. This is the question most likely to change the design.
-3. **Given the answer to 2, does the user still want release when no peer needs the capacity?** Requirement 5 says yes and was chosen knowingly, but it was chosen before the one-way-release interaction was quantified. The alternative (release only against a peer's demonstrated need) satisfies requirements 1 and 2 but not requirement 3, because a non-claimant can never demonstrate need to the broker. This is a genuine fork in the design and needs an explicit re-confirmation with the reacquisition data in hand.
-4. **Should `utilization_gate` default to true after the bake?** Shipping it opt-in is correct for this rollout, but leaving it opt-in forever means every new fill service starts with the wrong semantics. Proposal: flip the default in the release after M4 completes, with the flip called out in the changelog.
-5. **Does `queue_depth` charged at one slot per unit need a concurrency divisor?** `_queue_work()` (`autoscalers.py:4651-4677`) already weights by priority timeout, and both live services run `target_concurrency_per_replica: 1`, so the current form is exact today. A future claimant with concurrency 8 and a queue of 80 would claim 80 slots instead of 10, over-estimating in the retain direction (never dumping a busy fleet). Carrying `target_concurrency_per_replica` on the claim is the v2 fix; it does not change anything for the three live services.
+2. **Is a released A100 reacquirable on this cluster?** If the research tenant
+   absorbs every freed slot, release is a one-way donation and a gated
+   `floor_replicas` cannot provide a warm guarantee because it is itself
+   utilization-capped. The service must explicitly opt out for the portion
+   that is truly a hard availability contract. Measure this directly during
+   live validation.
+3. **Resolved 2026-08-01: release does not wait for a named peer.** The user
+   confirmed that maximizing utilization is the goal. A gated claimant releases
+   on sustained zero utilization even if the broker cannot identify who will
+   take the slot; online warm capacity is expressed by explicit false.
+4. **Resolved 2026-08-01: `utilization_gate` defaults true and releases the
+   whole fill reservation.** Static online reservations use explicit false;
+   Boltz L4 is the first recorded exception.
+5. **Does OpenDDE's drain complete through the old declared floor?** M5 makes
+   the broker cap mathematically cross 70 to zero, but physical release still
+   depends on drain-proof retirement. A cap below 70 with
+   `holdings_fill > cap` for more than three rounds is a rollout failure, not a
+   reason to restore floor immunity.
+6. **Does `queue_depth` charged at one slot per unit need a concurrency divisor?** `_queue_work()` (`autoscalers.py:4651-4677`) already weights by priority timeout, and both live services run `target_concurrency_per_replica: 1`, so the current form is exact today. A future claimant with concurrency 8 and a queue of 80 would claim 80 slots instead of 10, over-estimating in the retain direction (never dumping a busy fleet). Carrying `target_concurrency_per_replica` on the claim is the v2 fix; it does not change anything for the three live services.
