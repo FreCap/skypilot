@@ -37,6 +37,18 @@ coverage, and cohort tables empty. This is binary/schema/mixed-version rollback
 evidence only. It does not prove shadow parity, provider I/O, crash recovery of
 an action, M4 authority, or the operational payoff.
 
+The follow-up API007 activation correction and frozen renderer-contract merge
+commit `4f024b60f2fc71852fa8fb9747390f4d3917b03f` was deployed as immutable
+image tag `resource-actions-4f024b60f` and digest
+`sha256:06c9e71c5744ea970c41402fb9c4934e6722a7b53271f6715231b4b275525d25`.
+Helm revisions 71--73 deployed that exact digest API -> ordinary executor ->
+controller with the authority worker explicitly disabled. The final dark
+checkpoint retained API007, Serve033, global-user-state 028, and capacity001;
+all eight action-family tables and all Serve service/replica/cluster tables
+had zero rows. This verifies the corrected activation and renderer contract
+can be shipped dark; renderer execution, provider I/O, and authority remain
+unimplemented and unproved.
+
 Last updated: 2026-08-02
 
 Canonical owner: this file. The provider-side companion is
@@ -2703,6 +2715,12 @@ commit `a836825ef9c219563bb2abc740707c825c26edc5`, and digest
 exact merge commit `93aec0c8a4f2e1a80ed35640c9d424bea3f9e580`, and digest
 `sha256:8bc1295d5cb873861576aaf0806665e89b2d325194da8dd61fa5752f0593d174`
 (`merged`) were built from a clean checkout and deployed separately.
+After PR #1202 merged, immutable tag `resource-actions-4f024b60f`, exact merge
+commit `4f024b60f2fc71852fa8fb9747390f4d3917b03f`, and digest
+`sha256:06c9e71c5744ea970c41402fb9c4934e6722a7b53271f6715231b4b275525d25`
+(`renderer-contract`) were deployed separately. In the rows below, `prior`
+means the compatible digest running that ordinary role immediately before its
+staged replacement.
 
 | Helm revision | Started (UTC) | Purpose | API / executor / controller | Migration job (UTC) | Heads after checkpoint |
 |---|---|---|---|---|---|
@@ -2717,16 +2735,20 @@ exact merge commit `93aec0c8a4f2e1a80ed35640c9d424bea3f9e580`, and digest
 | 65 | 13:26:30 | Exact-merge stage 1: API | merged / new / new | 13:26:40–13:27:49, succeeded | retained 028 / Serve033 / API007 |
 | 66 | 13:34:59 | Exact-merge stage 2: ordinary executor | merged / merged / new | 13:35:09–13:35:21, succeeded | retained 028 / Serve033 / API007 |
 | 67 | 13:40:08 | Exact-merge stage 3: controller; final | merged / merged / merged | 13:40:18–13:40:28, succeeded | retained 028 / Serve033 / API007 |
+| 71 | 16:14:34 | Renderer-contract stage 1: API and migrations | renderer-contract / prior / prior | 16:14:43–16:15:51, succeeded | retained 028 / Serve033 / API007 / capacity001 |
+| 72 | 16:23:19 | Renderer-contract stage 2: ordinary executor | renderer-contract / renderer-contract / prior | 16:23:29–16:23:40, succeeded | retained 028 / Serve033 / API007 / capacity001 |
+| 73 | 16:27:59 | Renderer-contract stage 3: controller; final | renderer-contract / renderer-contract / renderer-contract | 16:28:09–16:28:57, succeeded | retained 028 / Serve033 / API007 / capacity001 |
 
-Each checkpoint was held until every changed role converged to exactly 2/2
-ready replicas at the intended digest with zero container restarts. The final
-revision had two ready API endpoints, zero services, replicas, and clusters,
-zero ungranted PostgreSQL locks, and no schema, migration, private-handler, or
-resource-action error in the role-log scan. The 18 pre-existing API requests
-were preserved; normal executor processing reduced nonterminal requests from
-9 to 6 during the exercise.
+Each revision 57--67 checkpoint was held until every changed role converged to
+exactly 2/2 ready replicas at the intended digest with zero container restarts.
+The final revision had two ready API endpoints, zero services, replicas, and
+clusters, zero ungranted PostgreSQL locks, and no schema, migration,
+private-handler, or resource-action error in the role-log scan. The 18
+pre-existing API requests were preserved; normal executor processing reduced
+nonterminal requests from 9 to 6 during the exercise.
 
-At every checkpoint, all eight action-family tables remained empty:
+At every revision 57--67 checkpoint, all eight action-family tables remained
+empty:
 `api_resource_actions`, `api_resource_action_attempts`,
 `serve_resource_action_shadow_samples`,
 `serve_resource_action_shadow_attempts`,
@@ -2756,8 +2778,21 @@ to 2/2 with zero restarts. This remains ordinary Deployment recovery evidence,
 not action crash-canary, shadow-parity, or M4 soak evidence. No M4 candidate
 window starts from this dark rollout.
 
-The rollout encountered ordinary Kubernetes infrastructure churn. Across the
-10:05–10:49 UTC event window the selected role/migration objects accumulated
+At the revision-73 stable checkpoint, all six active ordinary-role Pods
+reported the exact `renderer-contract` image ID, were ready, and had zero
+container restarts. The post-rollout role-log scan from the revision-71 start
+found zero traceback,
+exception, critical, fatal, unhandled, or error matches. PostgreSQL reported
+API007, Serve033, global-user-state 028, and capacity001; all eight
+action-family tables, services, replicas, and clusters had zero rows.
+`resourceActions.authorityWorker.enabled=false`, and no authority-worker
+workload resource existed. Karpenter churn occurred during the three stages,
+but no mixed-version Pod remained at the checkpoint. This is
+dark binary/schema/contract evidence only and starts no M4 candidate window.
+
+The original revisions 58--64 rollout encountered ordinary Kubernetes
+infrastructure churn. Across the 10:05–10:49 UTC event window the selected
+role/migration objects accumulated
 134 `FailedScheduling` events while Karpenter supplied capacity, 10
 `Underutilized` evictions, two transient AWS-CNI `FailedCreatePodSandBox`
 events, and 167 startup/readiness `Unhealthy` events. Every affected Deployment

@@ -29,6 +29,16 @@ Authority-worker resources remained disabled and absent; no provider session,
 private-handler dispatch, shadow sample, action row, provider I/O, or M4
 authority was exercised.
 
+The later API007 activation correction and frozen renderer-contract merge
+commit `4f024b60f2fc71852fa8fb9747390f4d3917b03f` was deployed dark as immutable
+digest
+`sha256:06c9e71c5744ea970c41402fb9c4934e6722a7b53271f6715231b4b275525d25`.
+Helm revisions 71--73 converged all six ordinary-role Pods to that digest with
+zero current restarts while authority remained disabled and every action and
+Serve graph table had zero rows at the final checkpoint. This is deployability
+evidence for the contract correction, not renderer or provider-runtime
+evidence.
+
 Last updated: 2026-08-02
 
 Canonical owner: this file governs only the provider-mutation and observation
@@ -6136,6 +6146,12 @@ The new artifact used immutable tag `resource-actions-a836825ef`, source commit
 (`old`). Deployment evidence remains scoped to that source commit if the PR is
 subsequently rebased.
 
+The later contract artifact used immutable tag `resource-actions-4f024b60f`,
+exact merge commit `4f024b60f2fc71852fa8fb9747390f4d3917b03f`, and digest
+`sha256:06c9e71c5744ea970c41402fb9c4934e6722a7b53271f6715231b4b275525d25`
+(`renderer-contract`). In the rows below, `prior` means the compatible digest
+running that ordinary role immediately before its staged replacement.
+
 | Revision | Purpose | API / executor / controller | Migration result | Heads after checkpoint |
 |---|---|---|---|---|
 | 57 | Observed baseline | old / old / old | prior rollout | 027 / Serve032 / API004 |
@@ -6146,14 +6162,18 @@ subsequently rebased.
 | 62 | Re-upgrade API stage | new / old / old | succeeded, 10:36:15–10:36:26 UTC | retained 028 / Serve033 / API007 |
 | 63 | Re-upgrade ordinary-executor stage | new / new / old | succeeded, 10:42:48–10:43:00 UTC | retained 028 / Serve033 / API007 |
 | 64 | Re-upgrade controller/final stage | new / new / new | succeeded, 10:46:32–10:47:04 UTC | retained 028 / Serve033 / API007 |
+| 71 | Renderer-contract API/migration stage | renderer-contract / prior / prior | succeeded, 16:14:43–16:15:51 UTC | retained 028 / Serve033 / API007 / capacity001 |
+| 72 | Renderer-contract ordinary-executor stage | renderer-contract / renderer-contract / prior | succeeded, 16:23:29–16:23:40 UTC | retained 028 / Serve033 / API007 / capacity001 |
+| 73 | Renderer-contract controller/final stage | renderer-contract / renderer-contract / renderer-contract | succeeded, 16:28:09–16:28:57 UTC | retained 028 / Serve033 / API007 / capacity001 |
 
-Every checkpoint converged the changed role to 2/2 at the intended digest with
-zero restarts. All eight action/shadow/coverage/cohort tables remained empty;
-services, replicas, and clusters remained zero; all 18 pre-existing requests
-were preserved while normal processing reduced nonterminal requests from 9 to
-6; final ungranted locks were zero; and no authority-worker resource existed.
-The final state had two ready API endpoints and no matching schema, migration,
-private-handler, or resource-action error in role logs.
+Every revision 57--64 checkpoint converged the changed role to 2/2 at the
+intended digest with zero restarts. All eight action/shadow/coverage/cohort
+tables remained empty; services, replicas, and clusters remained zero; all 18
+pre-existing requests were preserved while normal processing reduced
+nonterminal requests from 9 to 6; final ungranted locks were zero; and no
+authority-worker resource existed. The final state had two ready API endpoints
+and no matching schema, migration, private-handler, or resource-action error in
+role logs.
 
 Karpenter/capacity churn generated 134 aggregated `FailedScheduling` events,
 10 `Underutilized` evictions, two transient AWS-CNI
@@ -6162,6 +6182,18 @@ for the selected rollout objects between 10:05 and 10:49 UTC. Every affected
 ordinary Deployment recovered to 2/2 with zero restarts. With zero actions and
 provider I/O disabled, this is ordinary Deployment recovery evidence, not an
 action crash-canary or provider-authority result.
+
+At revision 73, all six active API, ordinary-executor, and controller Pods
+reported the exact `renderer-contract` digest, were ready, and had zero
+restarts. A role-log scan from the revision-71 start found zero traceback,
+exception, critical, fatal, unhandled,
+or error matches. PostgreSQL retained API007, Serve033, global-user-state 028,
+and capacity001; the eight action-family tables and the service, replica, and
+cluster tables all had zero rows. The authority-worker value remained
+explicitly false and no matching workload resource existed. Karpenter churn
+occurred during the rollout, but no mixed-version Pod remained at the final
+checkpoint. This checkpoint starts no shadow, provider-I/O,
+crash-canary, or M4 evidence window.
 
 On `boltz-test`, every authority-worker Deployment, versioned ServiceAccount,
 selector Service, purpose Secret projection, static-manifest projection, and
