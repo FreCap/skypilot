@@ -1367,7 +1367,9 @@ class PostgresResourceActionStore:
         terminal_request = request_postgres._request_from_mapping(  # pylint: disable=protected-access
             request_row)
         reduction_context = actions.ReductionContext(
-            terminal_request=terminal_request, database_now=database_now)
+            terminal_request=terminal_request,
+            database_now=database_now,
+            predecessor_attempt=predecessor)
         reduction = reducer(connection, action, attempt_record,
                             reduction_context).normalized()
         typed_outcome = dict(reduction.typed_outcome)

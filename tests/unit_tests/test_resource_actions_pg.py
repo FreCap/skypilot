@@ -757,6 +757,7 @@ def test_claim_journal_and_retry_reduction_replay_keep_deadline(
 
     def reducer(connection, action_record, attempt_record, context):
         del connection
+        assert context.predecessor_attempt is None
         callbacks.append((action_record.revision, attempt_record.attempt,
                           context.terminal_request.status))
         return actions.ActionReduction(
@@ -1152,8 +1153,10 @@ def test_reducer_locks_predecessor_before_current_attempt(
     request_input = actions.ActionRequestInput.from_request(
         action.action_id, 2, request_two)
 
-    def reducer(*unused_args):
-        del unused_args
+    def reducer(unused_connection, unused_action, unused_attempt, context):
+        del unused_connection, unused_action, unused_attempt
+        assert context.predecessor_attempt is not None
+        assert context.predecessor_attempt.attempt == 1
         return actions.ActionReduction(kernel_state=actions.KernelState.READY,
                                        typed_outcome={
                                            'version': 1,

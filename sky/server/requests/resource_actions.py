@@ -583,10 +583,11 @@ class ActionReduction:
 
 @dataclasses.dataclass(frozen=True)
 class ReductionContext:
-    """Locked request evidence and database time for one first reduction."""
+    """Locked lineage, request evidence, and DB time for first reduction."""
 
     terminal_request: requests_lib.Request
     database_now: datetime.datetime
+    predecessor_attempt: AttemptRecord | None = None
 
 
 class ProviderProgressContract(Protocol):
