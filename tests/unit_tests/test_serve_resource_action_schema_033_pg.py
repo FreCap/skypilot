@@ -1,12 +1,14 @@
-"""Schema-contract tests for additive SkyServe revision 033."""
+"""Migration contracts for the combined SkyServe revision 033."""
 # pylint: disable=not-callable,redefined-outer-name
 
 import datetime
 import os
+from pathlib import Path
 import shutil
 import uuid
 
 from alembic import command as alembic_command
+from alembic import script as alembic_script
 import pytest
 import sqlalchemy
 
@@ -15,9 +17,61 @@ from sky.utils.db import migration_utils
 
 _POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
 _UTC = datetime.timezone.utc
+_BUCKET = datetime.datetime(2026, 8, 1, 1, 2, tzinfo=_UTC)
+_DAY = datetime.datetime(2026, 8, 1, tzinfo=_UTC)
 _SERVICE_UUID = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _REPLICA_UUID = uuid.UUID('22222222-2222-4222-8222-222222222222')
-_CLUSTER_UUID = uuid.UUID('33333333-3333-4333-8333-333333333333')
+
+_VERSION_TABLE = 'alembic_version_serve_state_db'
+_RAW_ACTIVITY = 'serve_request_activity_history'
+_DAILY_ACTIVITY = 'serve_request_activity_daily'
+_RAW_PAIR_CONSTRAINT = 'serve_request_activity_history_classified_pair'
+_DAILY_PAIR_CONSTRAINT = 'serve_request_activity_daily_classified_pair'
+
+_SERVICE_ACTION_COLUMNS = (
+    'resource_action_mode',
+    'resource_action_mode_changed_at',
+)
+_REPLICA_ACTION_COLUMNS = (
+    'replica_incarnation',
+    'sky_cluster_record_uuid',
+    'launch_action_id',
+    'down_action_id',
+    'launch_shadow_sample_id',
+    'down_shadow_sample_id',
+    'launch_shadow_coverage_id',
+    'down_shadow_coverage_id',
+    'desired_generation',
+)
+_EVIDENCE_TABLES = (
+    'serve_resource_action_shadow_samples',
+    'serve_resource_action_shadow_attempts',
+    'serve_resource_action_worker_cohorts',
+    'serve_resource_action_worker_cohort_refs',
+    'serve_resource_action_shadow_coverage',
+    'serve_resource_action_shadow_coverage_attempts',
+)
+_SERVICE_CHECKS = {
+    'ck_services_resource_action_mode',
+    'ck_services_resource_action_mode_timestamp',
+}
+_REPLICA_CHECKS = {
+    'ck_replicas_resource_action_identity',
+    'ck_replicas_resource_action_links',
+    'ck_replicas_resource_action_launch_exclusive',
+    'ck_replicas_resource_action_down_exclusive',
+    'ck_replicas_resource_action_shadow_links',
+}
+_REPLICA_INDEXES = {
+    'uq_replicas_ra_replica_incarnation': 'replica_incarnation',
+    'uq_replicas_ra_sky_cluster_record_uuid': 'sky_cluster_record_uuid',
+    'uq_replicas_ra_launch_action_id': 'launch_action_id',
+    'uq_replicas_ra_down_action_id': 'down_action_id',
+    'uq_replicas_ra_launch_shadow_sample': 'launch_shadow_sample_id',
+    'uq_replicas_ra_down_shadow_sample': 'down_shadow_sample_id',
+    'uq_replicas_ra_launch_shadow_coverage': 'launch_shadow_coverage_id',
+    'uq_replicas_ra_down_shadow_coverage': 'down_shadow_coverage_id',
+}
 
 
 @pytest.fixture(scope='module')
@@ -81,23 +135,103 @@ def _reset_to_revision_031(engine: sqlalchemy.engine.Engine) -> None:
     services = sqlalchemy.Table(
         'services', metadata,
         sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
-        sqlalchemy.Column('status', sqlalchemy.Text))
+        sqlalchemy.Column('status', sqlalchemy.Text, nullable=False))
     replicas = sqlalchemy.Table(
         'replicas', metadata,
         sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
         sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
-        sqlalchemy.Column('status', sqlalchemy.Text))
+        sqlalchemy.Column('status', sqlalchemy.Text, nullable=False))
     version = sqlalchemy.Table(
-        'alembic_version_serve_state_db', metadata,
+        _VERSION_TABLE, metadata,
         sqlalchemy.Column('version_num',
                           sqlalchemy.String(32),
                           primary_key=True))
+
+    raw_activity = None
+    daily_activity = None
+    if engine.dialect.name == 'postgresql':
+        raw_activity = sqlalchemy.Table(
+            _RAW_ACTIVITY, metadata,
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('service_hash', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('reporter_session_id',
+                              sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('bucket_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              primary_key=True),
+            sqlalchemy.Column('observed_at',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.Column('request_count',
+                              sqlalchemy.Integer,
+                              nullable=False),
+            sqlalchemy.Column('rejected_count',
+                              sqlalchemy.Integer,
+                              nullable=False,
+                              server_default='0'),
+            sqlalchemy.Column('rejection_count_available',
+                              sqlalchemy.Boolean,
+                              nullable=False,
+                              server_default=sqlalchemy.false()),
+            sqlalchemy.CheckConstraint(
+                'request_count >= 0',
+                name='serve_request_activity_history_nonnegative'),
+            sqlalchemy.CheckConstraint(
+                'rejected_count >= 0',
+                name='serve_request_activity_history_rejected_nonnegative'))
+        daily_activity = sqlalchemy.Table(
+            _DAILY_ACTIVITY, metadata,
+            sqlalchemy.Column('day_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              primary_key=True),
+            sqlalchemy.Column('service_name', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('service_hash', sqlalchemy.Text,
+                              primary_key=True),
+            sqlalchemy.Column('first_bucket_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.Column('last_bucket_start',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.Column('request_count',
+                              sqlalchemy.BigInteger,
+                              nullable=False),
+            sqlalchemy.Column('observed_at',
+                              sqlalchemy.DateTime(timezone=True),
+                              nullable=False),
+            sqlalchemy.CheckConstraint(
+                'request_count >= 0',
+                name='serve_request_activity_daily_nonnegative'))
+
     metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(services.insert().values(name='svc', status='READY'))
         connection.execute(replicas.insert().values(service_name='svc',
                                                     replica_id=7,
                                                     status='PENDING'))
+        if raw_activity is not None:
+            connection.execute(raw_activity.insert().values(
+                service_name='svc',
+                service_hash=str(_SERVICE_UUID),
+                reporter_session_id='reporter-v1',
+                bucket_start=_BUCKET,
+                observed_at=_BUCKET + datetime.timedelta(seconds=30),
+                request_count=9,
+                rejected_count=2,
+                rejection_count_available=True))
+        if daily_activity is not None:
+            connection.execute(daily_activity.insert().values(
+                day_start=_DAY,
+                service_name='svc',
+                service_hash=str(_SERVICE_UUID),
+                first_bucket_start=_BUCKET,
+                last_bucket_start=_BUCKET,
+                request_count=9,
+                observed_at=_BUCKET + datetime.timedelta(minutes=1)))
         connection.execute(version.insert().values(version_num='031'))
 
 
@@ -113,400 +247,769 @@ def _revision(engine: sqlalchemy.engine.Engine) -> str:
     return revision
 
 
-def _foreign_keys(inspector: sqlalchemy.Inspector,
-                  table: str) -> dict[str, tuple[str, tuple[str, ...], str]]:
+def _stamp(engine: sqlalchemy.engine.Engine, revision: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text(f'UPDATE {_VERSION_TABLE} '
+                            'SET version_num = :revision'),
+            {'revision': revision})
+
+
+def _column_map(inspector: sqlalchemy.Inspector,
+                table: str) -> dict[str, dict[str, object]]:
     return {
-        foreign_key['name']: (
-            foreign_key['referred_table'],
+        str(column['name']): column for column in inspector.get_columns(table)
+    }
+
+
+def _check_names(inspector: sqlalchemy.Inspector, table: str) -> set[str]:
+    return {
+        str(constraint['name'])
+        for constraint in inspector.get_check_constraints(table)
+        if constraint['name'] is not None
+    }
+
+
+def _foreign_keys(
+    inspector: sqlalchemy.Inspector, table: str
+) -> dict[str, tuple[str, tuple[str, ...], tuple[str, ...], str | None]]:
+    return {
+        str(foreign_key['name']): (
+            str(foreign_key['referred_table']),
             tuple(foreign_key['constrained_columns']),
+            tuple(foreign_key['referred_columns']),
             foreign_key['options'].get('ondelete')
         ) for foreign_key in inspector.get_foreign_keys(table)
     }
 
 
-def _pending_shadow_sample(action_id: uuid.UUID) -> dict[str, object]:
-    return {
-        'would_be_action_id': action_id,
-        'service_name': 'svc',
-        'service_hash': str(_SERVICE_UUID),
-        'service_incarnation': _SERVICE_UUID,
-        'replica_id': 7,
-        'replica_incarnation': _REPLICA_UUID,
-        'desired_generation': 1,
-        'action_type': 'launch',
-        'resource_identity': 'serve-action:test',
-        'immutable_spec': {},
-        'immutable_spec_sha256': 'a' * 64,
-        'provider_plan': {},
-        'provider_plan_sha256': 'b' * 64,
-        'profile_eligibility': 'UNSUPPORTED',
-        'phase': 'PENDING',
-        'parity_class': 'PENDING',
+def _normalized(value: object) -> str:
+    return (''.join(str(value).lower().split()).replace('(', '').replace(
+        ')', '').replace('::text', ''))
+
+
+def _catalog_signature(engine: sqlalchemy.engine.Engine) -> tuple:
+    inspector = sqlalchemy.inspect(engine)
+    tables = []
+    for table in sorted(inspector.get_table_names()):
+        columns = tuple((str(column['name']), str(column['type']),
+                         bool(column['nullable']), str(column['default']))
+                        for column in inspector.get_columns(table))
+        checks = tuple(
+            sorted((str(constraint['name']), _normalized(constraint['sqltext']))
+                   for constraint in inspector.get_check_constraints(table)))
+        foreign_keys = tuple(
+            sorted(
+                (str(foreign_key['name']), str(foreign_key['referred_table']),
+                 tuple(foreign_key['constrained_columns']),
+                 tuple(foreign_key['referred_columns']),
+                 foreign_key['options'].get('ondelete'))
+                for foreign_key in inspector.get_foreign_keys(table)))
+        indexes = tuple(
+            sorted((str(index['name']), bool(index['unique']),
+                    tuple(index['column_names']),
+                    _normalized((index.get('dialect_options') or {}
+                                ).get('postgresql_where')))
+                   for index in inspector.get_indexes(table)))
+        tables.append((table, columns, checks, foreign_keys, indexes))
+    return tuple(tables)
+
+
+def _ordinary_rows(engine: sqlalchemy.engine.Engine) -> tuple:
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.text('SELECT name, status FROM services')).one()
+        replica = connection.execute(
+            sqlalchemy.text('SELECT service_name, replica_id, status '
+                            'FROM replicas')).one()
+    return tuple(service), tuple(replica)
+
+
+def _classification_rows(engine: sqlalchemy.engine.Engine) -> tuple:
+    with engine.connect() as connection:
+        raw = connection.execute(
+            sqlalchemy.text(
+                'SELECT service_name, service_hash, reporter_session_id, '
+                'bucket_start, observed_at, request_count, rejected_count, '
+                'rejection_count_available, classified_request_count, '
+                f'counted_rejected_count FROM {_RAW_ACTIVITY}')).one()
+        daily = connection.execute(
+            sqlalchemy.text(
+                'SELECT day_start, service_name, service_hash, '
+                'first_bucket_start, last_bucket_start, request_count, '
+                'classified_request_count, counted_rejected_count, '
+                'classified_first_bucket_start, '
+                'classified_last_bucket_start, classification_incomplete, '
+                f'observed_at FROM {_DAILY_ACTIVITY}')).one()
+    return tuple(raw), tuple(daily)
+
+
+def _assert_classification_catalog(engine: sqlalchemy.engine.Engine) -> None:
+    inspector = sqlalchemy.inspect(engine)
+    raw = _column_map(inspector, _RAW_ACTIVITY)
+    daily = _column_map(inspector, _DAILY_ACTIVITY)
+    assert set(raw) >= {
+        'classified_request_count',
+        'counted_rejected_count',
     }
+    assert isinstance(raw['classified_request_count']['type'],
+                      sqlalchemy.Integer)
+    assert isinstance(raw['counted_rejected_count']['type'], sqlalchemy.Integer)
+    assert raw['classified_request_count']['nullable']
+    assert raw['counted_rejected_count']['nullable']
+    assert raw['classified_request_count']['default'] is None
+    assert raw['counted_rejected_count']['default'] is None
+    assert _RAW_PAIR_CONSTRAINT in _check_names(inspector, _RAW_ACTIVITY)
+
+    assert set(daily) >= {
+        'classified_request_count',
+        'counted_rejected_count',
+        'classified_first_bucket_start',
+        'classified_last_bucket_start',
+        'classification_incomplete',
+    }
+    assert isinstance(daily['classified_request_count']['type'],
+                      sqlalchemy.BigInteger)
+    assert isinstance(daily['counted_rejected_count']['type'],
+                      sqlalchemy.BigInteger)
+    for name in ('classified_first_bucket_start',
+                 'classified_last_bucket_start'):
+        assert isinstance(daily[name]['type'], sqlalchemy.DateTime)
+        assert daily[name]['type'].timezone
+        assert daily[name]['nullable']
+        assert daily[name]['default'] is None
+    assert isinstance(daily['classification_incomplete']['type'],
+                      sqlalchemy.Boolean)
+    assert not daily['classification_incomplete']['nullable']
+    assert _normalized(daily['classification_incomplete']['default']).replace(
+        '::boolean', '') == 'false'
+    assert _DAILY_PAIR_CONSTRAINT in _check_names(inspector, _DAILY_ACTIVITY)
 
 
-def test_revision_032_catalog_remains_frozen_and_head_catalog_is_complete():
-    assert set(action_schema.REVISION_032_METADATA.tables) == {
+def _set_exact_classification_rows(engine: sqlalchemy.engine.Engine) -> None:
+    last_bucket = _BUCKET + datetime.timedelta(minutes=1)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text(f'UPDATE {_RAW_ACTIVITY} SET '
+                            'classified_request_count = 8, '
+                            'counted_rejected_count = 2'))
+        connection.execute(
+            sqlalchemy.text(f'UPDATE {_DAILY_ACTIVITY} SET '
+                            'classified_request_count = 8, '
+                            'counted_rejected_count = 2, '
+                            'classified_first_bucket_start = :first_bucket, '
+                            'classified_last_bucket_start = :last_bucket, '
+                            'classification_incomplete = false'), {
+                                'first_bucket': _BUCKET,
+                                'last_bucket': last_bucket,
+                            })
+
+
+def _assert_head_table_catalog(inspector: sqlalchemy.Inspector,
+                               expected: sqlalchemy.Table) -> None:
+    table = expected.name
+    actual_columns = _column_map(inspector, table)
+    assert tuple(actual_columns) == tuple(expected.c.keys())
+    dialect = inspector.bind.dialect
+    for expected_column in expected.columns:
+        actual = actual_columns[expected_column.name]
+        assert (str(actual['type'].compile(dialect=dialect)).upper() == str(
+            expected_column.type.compile(dialect=dialect)).upper())
+        assert bool(actual['nullable']) == bool(expected_column.nullable)
+        assert ((actual['default'] is None) == (expected_column.server_default
+                                                is None))
+
+    expected_primary_key = next(
+        constraint for constraint in expected.constraints
+        if isinstance(constraint, sqlalchemy.PrimaryKeyConstraint))
+    actual_primary_key = inspector.get_pk_constraint(table)
+    assert actual_primary_key['name'] == expected_primary_key.name
+    assert tuple(actual_primary_key['constrained_columns']) == tuple(
+        column.name for column in expected_primary_key.columns)
+
+    expected_checks = {
+        str(constraint.name)
+        for constraint in expected.constraints
+        if isinstance(constraint, sqlalchemy.CheckConstraint)
+    }
+    assert _check_names(inspector, table) == expected_checks
+
+    expected_uniques = {
+        str(constraint.name):
+            tuple(column.name for column in constraint.columns)
+        for constraint in expected.constraints
+        if isinstance(constraint, sqlalchemy.UniqueConstraint)
+    }
+    actual_uniques = {
+        str(constraint['name']): tuple(constraint['column_names'])
+        for constraint in inspector.get_unique_constraints(table)
+    }
+    assert actual_uniques == expected_uniques
+
+    expected_foreign_keys = {
+        str(constraint.name):
+            (next(iter(constraint.elements)).column.table.name,
+             tuple(element.parent.name
+                   for element in constraint.elements),
+             tuple(element.column.name
+                   for element in constraint.elements), constraint.ondelete)
+        for constraint in expected.constraints
+        if isinstance(constraint, sqlalchemy.ForeignKeyConstraint)
+    }
+    assert _foreign_keys(inspector, table) == expected_foreign_keys
+
+    actual_indexes = {
+        str(index['name']): index for index in inspector.get_indexes(table)
+    }
+    for expected_index in expected.indexes:
+        actual = actual_indexes[str(expected_index.name)]
+        assert bool(actual['unique']) == bool(expected_index.unique)
+        assert tuple(actual['column_names']) == tuple(
+            column.name for column in expected_index.columns)
+        expected_where = expected_index.dialect_options['postgresql']['where']
+        actual_where = (actual.get('dialect_options') or
+                        {}).get('postgresql_where')
+        if expected_where is None:
+            assert actual_where is None
+        else:
+            # PostgreSQL reflects ``IN (...)`` as ``= ANY (ARRAY[...])`` and
+            # injects text casts. The exact named index, key columns, unique
+            # bit, and existence of its partial predicate are stable.
+            assert actual_where is not None
+
+
+def _assert_final_postgres_catalog(engine: sqlalchemy.engine.Engine) -> None:
+    inspector = sqlalchemy.inspect(engine)
+    assert {
+        table for table in inspector.get_table_names()
+        if table.startswith('serve_resource_action_')
+    } == set(_EVIDENCE_TABLES)
+    assert set(_column_map(
+        inspector, 'services')) == {'name', 'status', *_SERVICE_ACTION_COLUMNS}
+    assert set(_column_map(inspector, 'replicas')) == {
+        'service_name', 'replica_id', 'status', *_REPLICA_ACTION_COLUMNS
+    }
+    assert _check_names(inspector, 'services') == _SERVICE_CHECKS
+    assert _check_names(inspector, 'replicas') == _REPLICA_CHECKS
+
+    for table, expected_columns in (
+        ('services', action_schema.service_columns()),
+        ('replicas', action_schema.replica_columns() +
+         action_schema.replica_coverage_columns()),
+    ):
+        actual_columns = _column_map(inspector, table)
+        for expected in expected_columns:
+            actual = actual_columns[expected.name]
+            dialect = inspector.bind.dialect
+            assert (str(actual['type'].compile(dialect=dialect)).upper() == str(
+                expected.type.compile(dialect=dialect)).upper())
+            assert bool(actual['nullable']) == bool(expected.nullable)
+            assert ((actual['default'] is None) == (expected.server_default
+                                                    is None))
+    assert _normalized(
+        _column_map(
+            inspector,
+            'services')['resource_action_mode']['default']) == "'legacy'"
+
+    replica_indexes = {
+        str(index['name']): index for index in inspector.get_indexes('replicas')
+    }
+    for name, column in _REPLICA_INDEXES.items():
+        index = replica_indexes[name]
+        assert index['unique']
+        assert index['column_names'] == [column]
+        assert _normalized((index.get('dialect_options') or
+                            {}).get('postgresql_where')) == f'{column}isnotnull'
+
+    for table in (
+            action_schema.WORKER_COHORTS,
+            action_schema.WORKER_COHORT_REFS,
+            action_schema.SHADOW_COVERAGE,
+            action_schema.SHADOW_SAMPLES,
+            action_schema.SHADOW_ATTEMPTS,
+            action_schema.SHADOW_COVERAGE_ATTEMPTS,
+    ):
+        _assert_head_table_catalog(inspector, table)
+
+    capability = _column_map(
+        inspector,
+        action_schema.WORKER_COHORT_REFS.name)['preparation_capability_sha256']
+    assert not capability['nullable']
+    assert capability['default'] is None
+
+
+def _install_old_feature_draft(engine: sqlalchemy.engine.Engine) -> None:
+    """Install the empty, unshipped feature-032 catalog on PostgreSQL."""
+    old_replica_columns = {
+        'replica_incarnation': 'UUID',
+        'desired_generation': 'BIGINT',
+        'sky_cluster_record_uuid': 'UUID',
+        'launch_action_id': 'UUID',
+        'down_action_id': 'UUID',
+        'launch_shadow_sample_id': 'UUID',
+        'down_shadow_sample_id': 'UUID',
+    }
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "ALTER TABLE services ADD COLUMN resource_action_mode TEXT "
+            "NOT NULL DEFAULT 'legacy'")
+        connection.exec_driver_sql(
+            'ALTER TABLE services ADD COLUMN '
+            'resource_action_mode_changed_at TIMESTAMPTZ')
+        for name, sql_type in old_replica_columns.items():
+            connection.exec_driver_sql(
+                f'ALTER TABLE replicas ADD COLUMN {name} {sql_type}')
+        connection.exec_driver_sql(
+            "ALTER TABLE services ADD CONSTRAINT "
+            "ck_services_resource_action_mode CHECK "
+            "(resource_action_mode IN ('legacy', 'shadow', 'authoritative'))")
+        connection.exec_driver_sql(
+            'ALTER TABLE services ADD CONSTRAINT '
+            'ck_services_resource_action_mode_timestamp CHECK '
+            "(resource_action_mode = 'legacy' OR "
+            'resource_action_mode_changed_at IS NOT NULL)')
+        connection.exec_driver_sql(
+            'ALTER TABLE replicas ADD CONSTRAINT '
+            'ck_replicas_resource_action_identity CHECK '
+            '((replica_incarnation IS NULL AND desired_generation IS NULL '
+            'AND sky_cluster_record_uuid IS NULL) OR '
+            '(replica_incarnation IS NOT NULL AND '
+            'desired_generation IS NOT NULL AND desired_generation > 0 '
+            'AND sky_cluster_record_uuid IS NOT NULL))')
+        connection.exec_driver_sql(
+            'ALTER TABLE replicas ADD CONSTRAINT '
+            'ck_replicas_resource_action_links CHECK '
+            '(replica_incarnation IS NOT NULL OR '
+            '(launch_action_id IS NULL AND down_action_id IS NULL AND '
+            'launch_shadow_sample_id IS NULL AND '
+            'down_shadow_sample_id IS NULL))')
+        connection.exec_driver_sql(
+            'ALTER TABLE replicas ADD CONSTRAINT '
+            'ck_replicas_resource_action_launch_exclusive CHECK '
+            '(launch_action_id IS NULL OR launch_shadow_sample_id IS NULL)')
+        connection.exec_driver_sql(
+            'ALTER TABLE replicas ADD CONSTRAINT '
+            'ck_replicas_resource_action_down_exclusive CHECK '
+            '(down_action_id IS NULL OR down_shadow_sample_id IS NULL)')
+        for name, column in tuple(_REPLICA_INDEXES.items())[:6]:
+            connection.exec_driver_sql(
+                f'CREATE UNIQUE INDEX {name} ON replicas ({column}) '
+                f'WHERE {column} IS NOT NULL')
+        action_schema.STAGED_SERVE033_METADATA.create_all(connection,
+                                                          checkfirst=True)
+
+
+def test_serve_alembic_lineage_has_one_upstream_032_and_combined_033() -> None:
+    engine = sqlalchemy.create_engine('sqlite://')
+    config = migration_utils.get_alembic_config(engine,
+                                                migration_utils.SERVE_DB_NAME)
+    scripts = alembic_script.ScriptDirectory.from_config(config)
+    revisions = list(scripts.walk_revisions())
+    revision_ids = [revision.revision for revision in revisions]
+    assert len(revision_ids) == len(set(revision_ids))
+    assert scripts.get_heads() == ['033']
+    revision_032 = scripts.get_revision('032')
+    revision_033 = scripts.get_revision('033')
+    assert Path(revision_032.path).name == (
+        '032_serve_request_rejection_classification.py')
+    assert revision_032.down_revision == '031'
+    assert Path(
+        revision_033.path).name == ('033_serve_resource_action_coverage.py')
+    assert revision_033.down_revision == '032'
+    assert migration_utils.SERVE_VERSION == '033'
+
+
+def test_staged_and_head_schema_aliases_are_disjoint_and_complete() -> None:
+    assert set(action_schema.STAGED_SERVE033_METADATA.tables) == {
         'serve_resource_action_shadow_samples',
         'serve_resource_action_shadow_attempts',
     }
-    assert 'legacy_effect_trace' not in action_schema.SHADOW_ATTEMPTS_032.c
-    assert set(action_schema.RESOURCE_ACTION_STATE_METADATA.tables) == {
-        'serve_resource_action_shadow_samples',
-        'serve_resource_action_shadow_attempts',
-        'serve_resource_action_worker_cohorts',
-        'serve_resource_action_worker_cohort_refs',
-        'serve_resource_action_shadow_coverage',
-        'serve_resource_action_shadow_coverage_attempts',
-    }
+    assert (action_schema.STAGED_SHADOW_SAMPLES
+            is action_schema.shadow_samples_table)
+    assert (action_schema.STAGED_SHADOW_ATTEMPTS
+            is action_schema.shadow_attempts_table)
+    assert set(action_schema.RESOURCE_ACTION_STATE_METADATA.tables) == set(
+        _EVIDENCE_TABLES)
+    assert action_schema.SHADOW_SAMPLES is not action_schema.STAGED_SHADOW_SAMPLES
+    assert action_schema.SHADOW_ATTEMPTS is not action_schema.STAGED_SHADOW_ATTEMPTS
+    assert 'legacy_effect_trace' not in action_schema.STAGED_SHADOW_ATTEMPTS.c
     assert {'legacy_effect_trace', 'legacy_effect_trace_sha256'
            } <= set(action_schema.SHADOW_ATTEMPTS.c.keys())
-    parent_foreign_keys = {
-        foreign_key.name: foreign_key
-        for foreign_key in action_schema.SHADOW_SAMPLES.foreign_key_constraints
+    foreign_keys = {
+        constraint.name: constraint
+        for constraint in action_schema.SHADOW_SAMPLES.foreign_key_constraints
     }
-    coverage_foreign_key = parent_foreign_keys[
-        'fk_serve_ra_shadow_samples_coverage']
-    assert coverage_foreign_key.ondelete == 'RESTRICT'
-    assert next(iter(coverage_foreign_key.elements)).target_fullname == (
+    coverage = foreign_keys['fk_serve_ra_shadow_samples_coverage']
+    assert coverage.ondelete == 'RESTRICT'
+    assert next(iter(coverage.elements)).target_fullname == (
         'serve_resource_action_shadow_coverage.decision_id')
 
 
-def test_revision_033_sqlite_adds_only_portable_inert_links(tmp_path):
+def test_sqlite_031_to_032_to_033_adds_only_portable_columns(tmp_path) -> None:
     engine = sqlalchemy.create_engine(
         f'sqlite:///{tmp_path / "serve-033.sqlite"}')
     _reset_to_revision_031(engine)
-    _upgrade(engine, '032')
-    inspector = sqlalchemy.inspect(engine)
-    columns_032 = {
-        column['name'] for column in inspector.get_columns('replicas')
-    }
-    assert 'launch_shadow_coverage_id' not in columns_032
-    assert 'down_shadow_coverage_id' not in columns_032
+    ordinary_rows = _ordinary_rows(engine)
 
-    _upgrade(engine, '033')
-    inspector = sqlalchemy.inspect(engine)
-    columns_033 = {
-        column['name'] for column in inspector.get_columns('replicas')
-    }
-    assert {'launch_shadow_coverage_id',
-            'down_shadow_coverage_id'} <= columns_033
-    assert not ({
-        'serve_resource_action_worker_cohorts',
-        'serve_resource_action_worker_cohort_refs',
-        'serve_resource_action_shadow_coverage',
-        'serve_resource_action_shadow_coverage_attempts',
-        'serve_resource_action_shadow_samples',
-        'serve_resource_action_shadow_attempts',
-    } & set(inspector.get_table_names()))
-    with engine.connect() as connection:
-        row = connection.execute(
-            sqlalchemy.text(
-                'SELECT status, launch_shadow_coverage_id, '
-                'down_shadow_coverage_id FROM replicas')).mappings().one()
-    assert row == {
-        'status': 'PENDING',
-        'launch_shadow_coverage_id': None,
-        'down_shadow_coverage_id': None,
-    }
-    assert _revision(engine) == '033'
-
-    config = migration_utils.get_alembic_config(engine,
-                                                migration_utils.SERVE_DB_NAME)
-    with pytest.raises(RuntimeError, match='cannot be downgraded'):
-        alembic_command.downgrade(config, '032')
-    assert _revision(engine) == '033'
-
-
-def test_revision_033_postgres_upgrade_catalog_and_constraints(
-        postgres_engine) -> None:
-    engine = postgres_engine
-    _reset_to_revision_031(engine)
     _upgrade(engine, '032')
     inspector = sqlalchemy.inspect(engine)
     assert _revision(engine) == '032'
-    assert 'legacy_effect_trace' not in {
-        column['name'] for column in inspector.get_columns(
-            'serve_resource_action_shadow_attempts')
-    }
-    assert 'serve_resource_action_shadow_coverage' not in (
-        inspector.get_table_names())
+    assert set(_column_map(inspector, 'services')) == {'name', 'status'}
+    assert set(_column_map(
+        inspector, 'replicas')) == {'service_name', 'replica_id', 'status'}
+    assert not set(_EVIDENCE_TABLES).intersection(inspector.get_table_names())
+    assert _ordinary_rows(engine) == ordinary_rows
 
     _upgrade(engine, '033')
     inspector = sqlalchemy.inspect(engine)
     assert _revision(engine) == '033'
-    assert {
-        'serve_resource_action_worker_cohorts',
-        'serve_resource_action_worker_cohort_refs',
-        'serve_resource_action_shadow_coverage',
-        'serve_resource_action_shadow_coverage_attempts',
-    } <= set(inspector.get_table_names())
-    assert {'launch_shadow_coverage_id', 'down_shadow_coverage_id'} <= {
-        column['name'] for column in inspector.get_columns('replicas')
+    assert set(_column_map(
+        inspector, 'services')) == {'name', 'status', *_SERVICE_ACTION_COLUMNS}
+    assert set(_column_map(inspector, 'replicas')) == {
+        'service_name', 'replica_id', 'status', *_REPLICA_ACTION_COLUMNS
     }
-    assert {'legacy_effect_trace', 'legacy_effect_trace_sha256'} <= {
-        column['name'] for column in inspector.get_columns(
-            'serve_resource_action_shadow_attempts')
-    }
-    cohort_reference_columns = {
-        column['name']: column for column in inspector.get_columns(
-            'serve_resource_action_worker_cohort_refs')
-    }
-    assert not cohort_reference_columns['preparation_capability_sha256'][
-        'nullable']
-    assert cohort_reference_columns['preparation_capability_sha256'][
-        'default'] is None
-    cohort_reference_checks = {
-        constraint['name'] for constraint in inspector.get_check_constraints(
-            'serve_resource_action_worker_cohort_refs')
-    }
-    assert 'ck_serve_ra_worker_cohort_refs_capability' in (
-        cohort_reference_checks)
-    assert _foreign_keys(inspector, 'serve_resource_action_shadow_samples'
-                        )['fk_serve_ra_shadow_samples_coverage'] == (
-                            'serve_resource_action_shadow_coverage',
-                            ('would_be_action_id',), 'RESTRICT')
-    assert _foreign_keys(inspector,
-                         'serve_resource_action_worker_cohort_refs') == {
-                             'fk_serve_ra_worker_cohort_refs_cohort':
-                                 ('serve_resource_action_worker_cohorts',
-                                  ('cohort_id',), 'RESTRICT')
-                         }
-    assert _foreign_keys(inspector,
-                         'serve_resource_action_shadow_coverage_attempts') == {
-                             'fk_serve_ra_shadow_coverage_attempts_coverage':
-                                 ('serve_resource_action_shadow_coverage',
-                                  ('decision_id',), 'CASCADE')
-                         }
-    replica_indexes = {
-        index['name']: index for index in inspector.get_indexes('replicas')
-    }
-    for name, column in {
-            'uq_replicas_ra_launch_shadow_coverage': 'launch_shadow_coverage_id',
-            'uq_replicas_ra_down_shadow_coverage': 'down_shadow_coverage_id',
-    }.items():
-        assert replica_indexes[name]['unique']
-        assert replica_indexes[name]['column_names'] == [column]
-    replica_checks = {
-        constraint['name']
-        for constraint in inspector.get_check_constraints('replicas')
-    }
-    assert {
-        'ck_replicas_resource_action_links',
-        'ck_replicas_resource_action_launch_exclusive',
-        'ck_replicas_resource_action_down_exclusive',
-        'ck_replicas_resource_action_shadow_links',
-    } <= replica_checks
+    assert not set(_EVIDENCE_TABLES).intersection(inspector.get_table_names())
+    assert _ordinary_rows(engine) == ordinary_rows
     with engine.connect() as connection:
-        row = connection.execute(
-            sqlalchemy.text(
-                'SELECT status, launch_shadow_coverage_id, '
-                'down_shadow_coverage_id FROM replicas')).mappings().one()
-    assert row == {
-        'status': 'PENDING',
-        'launch_shadow_coverage_id': None,
-        'down_shadow_coverage_id': None,
+        service = connection.execute(
+            sqlalchemy.text('SELECT resource_action_mode, '
+                            'resource_action_mode_changed_at FROM services')
+        ).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.text('SELECT ' + ', '.join(_REPLICA_ACTION_COLUMNS) +
+                            ' FROM replicas')).mappings().one()
+    assert service == {
+        'resource_action_mode': 'legacy',
+        'resource_action_mode_changed_at': None,
     }
+    assert set(replica.values()) == {None}
 
 
-def test_revision_033_postgres_checks_restrict_and_cascade(
+def test_postgres_fresh_031_through_upstream_032_and_033(
         postgres_engine) -> None:
     engine = postgres_engine
     _reset_to_revision_031(engine)
+    ordinary_rows = _ordinary_rows(engine)
+
     _upgrade(engine, '033')
-    decision_id = uuid.uuid4()
-    now = datetime.datetime.now(_UTC)
-    with engine.begin() as connection:
-        connection.execute(action_schema.WORKER_COHORTS.insert().values(
-            cohort_id='cohort-v1',
-            deployment_uid='deployment-uid-v1',
-            cohort_identity={},
-            cohort_identity_sha256='a' * 64,
-            registration_attestations={},
-            registration_attestations_sha256='b' * 64,
-            lifecycle_state='REGISTERING'))
-        connection.execute(action_schema.WORKER_COHORT_REFS.insert().values(
-            decision_id=decision_id,
-            cohort_id='cohort-v1',
-            service_hash=str(_SERVICE_UUID),
-            replica_incarnation=_REPLICA_UUID,
-            desired_generation=1,
-            action_type='launch',
-            controller_owner_fence='123:10.0.0.1',
-            lifecycle_epoch=1,
-            preparation_capability_sha256='d' * 64,
-            reference_state='PREPARING'))
-        connection.execute(action_schema.SHADOW_COVERAGE.insert().values(
-            decision_id=decision_id,
-            service_name='svc',
-            service_hash=str(_SERVICE_UUID),
-            service_incarnation=_SERVICE_UUID,
-            replica_id=7,
-            replica_incarnation=_REPLICA_UUID,
-            desired_generation=1,
-            action_type='launch',
-            normalizer_contract_version=1,
-            normalization_outcome='REPRESENTABLE',
-            worker_cohort_ref_id=decision_id,
-            admitted_at=now))
-        connection.execute(action_schema.SHADOW_SAMPLES.insert().values(
-            **_pending_shadow_sample(decision_id)))
-        connection.execute(action_schema.SHADOW_ATTEMPTS.insert().values(
-            would_be_action_id=decision_id,
-            request_sequence=1,
-            logical_attempt=1,
-            request_role='PRIMARY_LAUNCH',
-            planned_execution_kind='api_request',
-            phase='PRE_SUBMIT',
-            invocation={},
-            invocation_sha256='c' * 64))
 
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(action_schema.SHADOW_ATTEMPTS.update().where(
-                action_schema.SHADOW_ATTEMPTS.c.would_be_action_id ==
-                decision_id).values(legacy_effect_trace={}))
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(action_schema.SHADOW_COVERAGE.delete().where(
-                action_schema.SHADOW_COVERAGE.c.decision_id == decision_id))
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(action_schema.WORKER_COHORTS.delete().where(
-                action_schema.WORKER_COHORTS.c.cohort_id == 'cohort-v1'))
-
-    invalid_reason_id = uuid.uuid4()
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(action_schema.SHADOW_COVERAGE.insert().values(
-                decision_id=invalid_reason_id,
-                service_name='svc',
-                service_hash=str(_SERVICE_UUID),
-                service_incarnation=_SERVICE_UUID,
-                replica_id=8,
-                replica_incarnation=uuid.uuid4(),
-                desired_generation=2,
-                action_type='down',
-                normalizer_contract_version=1,
-                normalization_outcome='NOT_REPRESENTABLE',
-                not_representable_reason='multi_node'))
-
-    coverage_only_id = uuid.uuid4()
-    with engine.begin() as connection:
-        connection.execute(action_schema.SHADOW_COVERAGE.insert().values(
-            decision_id=coverage_only_id,
-            service_name='svc',
-            service_hash=str(_SERVICE_UUID),
-            service_incarnation=_SERVICE_UUID,
-            replica_id=8,
-            replica_incarnation=uuid.uuid4(),
-            desired_generation=2,
-            action_type='down',
-            normalizer_contract_version=1,
-            normalization_outcome='NOT_REPRESENTABLE',
-            not_representable_reason='prior_launch_basis'))
-        connection.execute(
-            action_schema.SHADOW_COVERAGE_ATTEMPTS.insert().values(
-                decision_id=coverage_only_id,
-                request_sequence=1,
-                logical_attempt=1,
-                request_role='PRIMARY_DOWN',
-                phase='PRE_SUBMIT'))
-        connection.execute(action_schema.SHADOW_COVERAGE.delete().where(
-            action_schema.SHADOW_COVERAGE.c.decision_id == coverage_only_id))
-        remaining = connection.execute(
-            sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                action_schema.SHADOW_COVERAGE_ATTEMPTS).where(
-                    action_schema.SHADOW_COVERAGE_ATTEMPTS.c.decision_id ==
-                    coverage_only_id)).scalar_one()
-    assert remaining == 0
+    assert _revision(engine) == '033'
+    _assert_classification_catalog(engine)
+    raw, daily = _classification_rows(engine)
+    assert raw[5:10] == (9, 2, True, None, None)
+    assert daily[5:11] == (9, None, None, None, None, True)
+    assert _ordinary_rows(engine) == ordinary_rows
+    _assert_final_postgres_catalog(engine)
 
 
-@pytest.mark.parametrize('capability_sha256', [None, 'D' * 64, 'd' * 63])
-def test_revision_033_postgres_requires_exact_capability_commitment(
-        postgres_engine, capability_sha256: str | None) -> None:
-    engine = postgres_engine
-    _reset_to_revision_031(engine)
-    _upgrade(engine, '033')
-    with engine.begin() as connection:
-        connection.execute(action_schema.WORKER_COHORTS.insert().values(
-            cohort_id='cohort-v1',
-            deployment_uid='deployment-uid-v1',
-            cohort_identity={},
-            cohort_identity_sha256='a' * 64,
-            registration_attestations={},
-            registration_attestations_sha256='b' * 64,
-            lifecycle_state='REGISTERING'))
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(action_schema.WORKER_COHORT_REFS.insert().values(
-                decision_id=uuid.uuid4(),
-                cohort_id='cohort-v1',
-                service_hash=str(_SERVICE_UUID),
-                replica_incarnation=_REPLICA_UUID,
-                desired_generation=1,
-                action_type='down',
-                controller_owner_fence='123:10.0.0.1',
-                lifecycle_epoch=1,
-                preparation_capability_sha256=capability_sha256,
-                reference_state='PREPARING'))
-
-
-def test_revision_033_postgres_does_not_synthesize_capability_commitment(
-        postgres_engine) -> None:
-    engine = postgres_engine
-    _reset_to_revision_031(engine)
-    _upgrade(engine, '033')
-    with engine.begin() as connection:
-        connection.execute(action_schema.WORKER_COHORTS.insert().values(
-            cohort_id='cohort-v1',
-            deployment_uid='deployment-uid-v1',
-            cohort_identity={},
-            cohort_identity_sha256='a' * 64,
-            registration_attestations={},
-            registration_attestations_sha256='b' * 64,
-            lifecycle_state='REGISTERING'))
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(action_schema.WORKER_COHORT_REFS.insert().values(
-                decision_id=uuid.uuid4(),
-                cohort_id='cohort-v1',
-                service_hash=str(_SERVICE_UUID),
-                replica_incarnation=_REPLICA_UUID,
-                desired_generation=1,
-                action_type='launch',
-                controller_owner_fence='123:10.0.0.1',
-                lifecycle_epoch=1,
-                reference_state='PREPARING'))
-
-
-def test_revision_033_postgres_nonempty_shadow_fails_before_catalog_change(
+def test_postgres_already_upstream_032_preserves_exact_classification(
         postgres_engine) -> None:
     engine = postgres_engine
     _reset_to_revision_031(engine)
     _upgrade(engine, '032')
-    action_id = uuid.uuid4()
-    with engine.begin() as connection:
-        connection.execute(action_schema.SHADOW_SAMPLES_032.insert().values(
-            **_pending_shadow_sample(action_id)))
+    assert _revision(engine) == '032'
+    _assert_classification_catalog(engine)
+    assert not set(_SERVICE_ACTION_COLUMNS).intersection(
+        _column_map(sqlalchemy.inspect(engine), 'services'))
+    assert not set(_REPLICA_ACTION_COLUMNS).intersection(
+        _column_map(sqlalchemy.inspect(engine), 'replicas'))
+    _set_exact_classification_rows(engine)
+    classification_rows = _classification_rows(engine)
+    ordinary_rows = _ordinary_rows(engine)
 
-    with pytest.raises(RuntimeError, match='reviewed evidence backfill'):
+    _upgrade(engine, '033')
+
+    assert _classification_rows(engine) == classification_rows
+    assert _ordinary_rows(engine) == ordinary_rows
+    _assert_classification_catalog(engine)
+    _assert_final_postgres_catalog(engine)
+
+
+def test_abandoned_feature_032_stamp_without_classification_fails_before_ddl(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _install_old_feature_draft(engine)
+    _stamp(engine, '032')
+    before = _catalog_signature(engine)
+
+    with pytest.raises(RuntimeError, match='exact shipped request-.*columns'):
         _upgrade(engine, '033')
+
     assert _revision(engine) == '032'
-    inspector = sqlalchemy.inspect(engine)
-    assert 'serve_resource_action_shadow_coverage' not in (
-        inspector.get_table_names())
-    assert 'launch_shadow_coverage_id' not in {
-        column['name'] for column in inspector.get_columns('replicas')
-    }
+    assert _catalog_signature(engine) == before
+    assert 'launch_shadow_coverage_id' not in _column_map(
+        sqlalchemy.inspect(engine), 'replicas')
 
 
-def test_revision_033_postgres_refuses_downgrade(postgres_engine) -> None:
+def test_missing_upstream_classification_constraint_fails_before_ddl(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {_DAILY_ACTIVITY} DROP CONSTRAINT '
+            f'{_DAILY_PAIR_CONSTRAINT}')
+    before = _catalog_signature(engine)
+
+    with pytest.raises(RuntimeError, match=_DAILY_PAIR_CONSTRAINT):
+        _upgrade(engine, '033')
+
+    assert _revision(engine) == '032'
+    assert _catalog_signature(engine) == before
+    assert not set(_SERVICE_ACTION_COLUMNS).intersection(
+        _column_map(sqlalchemy.inspect(engine), 'services'))
+
+
+def test_corrupt_upstream_classification_default_fails_without_mutation(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {_DAILY_ACTIVITY} ALTER COLUMN '
+            'classification_incomplete SET DEFAULT true')
+    before_catalog = _catalog_signature(engine)
+    before_classification = _classification_rows(engine)
+    before_ordinary = _ordinary_rows(engine)
+
+    with pytest.raises(RuntimeError, match='classification_incomplete'):
+        _upgrade(engine, '033')
+
+    assert _revision(engine) == '032'
+    assert _catalog_signature(engine) == before_catalog
+    assert _classification_rows(engine) == before_classification
+    assert _ordinary_rows(engine) == before_ordinary
+
+
+def test_weakened_same_name_upstream_check_fails_without_mutation(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {_RAW_ACTIVITY} DROP CONSTRAINT '
+            f'{_RAW_PAIR_CONSTRAINT}')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {_RAW_ACTIVITY} ADD CONSTRAINT '
+            f'{_RAW_PAIR_CONSTRAINT} CHECK '
+            '(classified_request_count IS NULL OR '
+            'classified_request_count >= 0)')
+    before_catalog = _catalog_signature(engine)
+    before_classification = _classification_rows(engine)
+    before_ordinary = _ordinary_rows(engine)
+
+    with pytest.raises(RuntimeError, match=_RAW_PAIR_CONSTRAINT):
+        _upgrade(engine, '033')
+
+    assert _revision(engine) == '032'
+    assert _catalog_signature(engine) == before_catalog
+    assert _classification_rows(engine) == before_classification
+    assert _ordinary_rows(engine) == before_ordinary
+
+
+def test_every_nonempty_evidence_table_is_rejected_before_ddl(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    for table in _EVIDENCE_TABLES:
+        _reset_to_revision_031(engine)
+        _upgrade(engine, '032')
+        quoted = engine.dialect.identifier_preparer.quote(table)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'CREATE TABLE {quoted} (marker INTEGER NOT NULL)')
+            connection.exec_driver_sql(
+                f'INSERT INTO {quoted} (marker) VALUES (1)')
+        before = _catalog_signature(engine)
+
+        with pytest.raises(RuntimeError) as error:
+            _upgrade(engine, '033')
+
+        assert 'nonempty resource-action evidence' in str(error.value)
+        assert table in str(error.value)
+        assert _revision(engine) == '032'
+        assert _catalog_signature(engine) == before
+
+
+def test_nonlegacy_service_state_is_rejected_before_ddl(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "ALTER TABLE services ADD COLUMN resource_action_mode TEXT "
+            "NOT NULL DEFAULT 'legacy'")
+        connection.exec_driver_sql(
+            'ALTER TABLE services ADD COLUMN '
+            'resource_action_mode_changed_at TIMESTAMPTZ')
+        connection.execute(
+            sqlalchemy.text('UPDATE services SET resource_action_mode = '
+                            "'shadow', resource_action_mode_changed_at = "
+                            'clock_timestamp()'))
+    before = _catalog_signature(engine)
+
+    with pytest.raises(RuntimeError, match='activated service'):
+        _upgrade(engine, '033')
+
+    assert _revision(engine) == '032'
+    assert _catalog_signature(engine) == before
+
+
+def test_every_nonnull_replica_action_column_is_rejected_before_ddl(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    for column in _REPLICA_ACTION_COLUMNS:
+        _reset_to_revision_031(engine)
+        _upgrade(engine, '032')
+        sql_type = 'BIGINT' if column == 'desired_generation' else 'UUID'
+        value = 1 if column == 'desired_generation' else _REPLICA_UUID
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE replicas ADD COLUMN {column} {sql_type}')
+            connection.execute(
+                sqlalchemy.text(f'UPDATE replicas SET {column} = :value'),
+                {'value': value})
+        before = _catalog_signature(engine)
+
+        with pytest.raises(RuntimeError, match='linked replica'):
+            _upgrade(engine, '033')
+
+        assert _revision(engine) == '032'
+        assert _catalog_signature(engine) == before
+
+
+def test_empty_old_two_table_hybrid_converges_to_final_catalog(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    classification_rows = _classification_rows(engine)
+    ordinary_rows = _ordinary_rows(engine)
+    _install_old_feature_draft(engine)
+    assert set(_EVIDENCE_TABLES).intersection(
+        sqlalchemy.inspect(engine).get_table_names()) == {
+            action_schema.STAGED_SHADOW_SAMPLES.name,
+            action_schema.STAGED_SHADOW_ATTEMPTS.name,
+        }
+
+    _upgrade(engine, '033')
+
+    assert _revision(engine) == '033'
+    assert _classification_rows(engine) == classification_rows
+    assert _ordinary_rows(engine) == ordinary_rows
+    _assert_final_postgres_catalog(engine)
+
+
+def test_malformed_empty_worker_cohort_refs_is_recreated_exactly(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    classification_rows = _classification_rows(engine)
+    ordinary_rows = _ordinary_rows(engine)
+    with engine.begin() as connection:
+        action_schema.RESOURCE_ACTION_STATE_METADATA.create_all(connection,
+                                                                checkfirst=True)
+        connection.exec_driver_sql(
+            'ALTER TABLE serve_resource_action_worker_cohort_refs '
+            'ALTER COLUMN preparation_capability_sha256 DROP NOT NULL')
+    malformed = _column_map(
+        sqlalchemy.inspect(engine),
+        action_schema.WORKER_COHORT_REFS.name)['preparation_capability_sha256']
+    assert malformed['nullable']
+
+    _upgrade(engine, '033')
+
+    assert _revision(engine) == '033'
+    assert _classification_rows(engine) == classification_rows
+    assert _ordinary_rows(engine) == ordinary_rows
+    _assert_final_postgres_catalog(engine)
+    repaired = _column_map(
+        sqlalchemy.inspect(engine),
+        action_schema.WORKER_COHORT_REFS.name)['preparation_capability_sha256']
+    assert not repaired['nullable']
+    assert repaired['default'] is None
+
+
+def test_partial_worker_cohort_refs_without_primary_key_converges(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    classification_rows = _classification_rows(engine)
+    ordinary_rows = _ordinary_rows(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'CREATE TABLE serve_resource_action_worker_cohort_refs '
+            '(decision_id UUID NOT NULL, cohort_id TEXT, '
+            'preparation_capability_sha256 TEXT)')
+    malformed_primary_key = sqlalchemy.inspect(engine).get_pk_constraint(
+        action_schema.WORKER_COHORT_REFS.name)
+    assert not malformed_primary_key['constrained_columns']
+
+    _upgrade(engine, '033')
+
+    assert _revision(engine) == '033'
+    assert _classification_rows(engine) == classification_rows
+    assert _ordinary_rows(engine) == ordinary_rows
+    _assert_final_postgres_catalog(engine)
+
+
+@pytest.mark.parametrize('partial_table', _EVIDENCE_TABLES)
+def test_each_empty_partial_action_table_subset_converges(
+        postgres_engine, partial_table: str) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '032')
+    classification_rows = _classification_rows(engine)
+    ordinary_rows = _ordinary_rows(engine)
+    quoted = engine.dialect.identifier_preparer.quote(partial_table)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'CREATE TABLE {quoted} (partial_marker INTEGER)')
+
+    _upgrade(engine, '033')
+
+    assert _revision(engine) == '033'
+    assert _classification_rows(engine) == classification_rows
+    assert _ordinary_rows(engine) == ordinary_rows
+    _assert_final_postgres_catalog(engine)
+
+
+def test_complete_lost_ack_catalog_converges_idempotently(
+        postgres_engine) -> None:
     engine = postgres_engine
     _reset_to_revision_031(engine)
     _upgrade(engine, '033')
+    before_catalog = _catalog_signature(engine)
+    before_classification = _classification_rows(engine)
+    before_ordinary = _ordinary_rows(engine)
+    _stamp(engine, '032')
+
+    _upgrade(engine, '033')
+
+    assert _revision(engine) == '033'
+    assert _catalog_signature(engine) == before_catalog
+    assert _classification_rows(engine) == before_classification
+    assert _ordinary_rows(engine) == before_ordinary
+    _assert_final_postgres_catalog(engine)
+
+
+def test_revision_033_refuses_downgrade_and_preserves_catalog(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '033')
+    before = _catalog_signature(engine)
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
+
     with pytest.raises(RuntimeError, match='cannot be downgraded'):
         alembic_command.downgrade(config, '032')
+
     assert _revision(engine) == '033'
+    assert _catalog_signature(engine) == before

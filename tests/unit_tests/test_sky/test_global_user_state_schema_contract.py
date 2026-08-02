@@ -21,7 +21,7 @@ _EXPECTED_TABLE_COLUMNS = {
     'cluster_table': (
         'clusters',
         ('name', 'launched_at', 'handle', 'last_use', 'status', 'autostop',
-         'to_down', 'metadata', 'owner', 'cluster_hash',
+         'to_down', 'metadata', 'owner', 'cluster_hash', 'cluster_record_uuid',
          'storage_mounts_metadata', 'cluster_ever_up', 'status_updated_at',
          'config_hash', 'user_hash', 'workspace', 'last_creation_yaml',
          'last_creation_command', 'is_managed', 'container_image_binding_known',

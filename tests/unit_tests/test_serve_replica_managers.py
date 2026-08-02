@@ -3345,6 +3345,7 @@ class TestScaleUpBatch:
         initial = [_fake_replica_info(40), _fake_replica_info(41)]
         stale_local = [_fake_replica_info(99)]
         snapshots = []
+        reservation_lock = mock.MagicMock()
 
         def _launch(replica_id,
                     _resources_override,
@@ -3366,6 +3367,9 @@ class TestScaleUpBatch:
                  'sky.serve.replica_managers.serve_state.'
                  'get_replica_infos_grouped',
                  return_value={'svc': list(initial)}) as grouped_scan, \
+             mock.patch.object(replica_managers.locks,
+                               'get_lock',
+                               return_value=reservation_lock), \
              mock.patch.object(mgr,
                                '_build_zero_cost_demand_budget',
                                return_value=None), \
@@ -4385,6 +4389,7 @@ class TestLogicalCapacityPlanning:
         mgr._logical_target = (1, 9, 8)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         launches = []
+        reservation_lock = mock.MagicMock()
         stale_replacement = self._ready_backend(2, 8)
         stale_replacement.unknown_capacity_replacement = True
 
@@ -4416,6 +4421,9 @@ class TestLogicalCapacityPlanning:
                                'get_replica_infos_grouped',
                                return_value={'svc': [original]
                                             }) as grouped_scan, \
+             mock.patch.object(replica_managers.locks,
+                               'get_lock',
+                               return_value=reservation_lock), \
              mock.patch.object(mgr,
                                '_build_zero_cost_demand_budget',
                                return_value=None), \

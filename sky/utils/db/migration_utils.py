@@ -52,7 +52,7 @@ SPOT_JOBS_VERSION = '026'  # durable managed-job controller ownership
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '033'  # decision coverage and authority-cohort retention
+SERVE_VERSION = '033'  # request classification and action decision coverage
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'

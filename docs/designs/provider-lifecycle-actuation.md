@@ -24,6 +24,15 @@ Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
 here.
 
+The central-PostgreSQL SkyServe replica launch/down slice is intentionally
+split into `docs/designs/durable-serve-replica-actions.md` and
+`docs/designs/skyserve-resource-action-provider-facet.md`. Those files are
+authoritative for that slice and reuse the existing API-request queue and
+execution lease. References below to migrating Serve onto the proposed generic
+M3 action lease are superseded for central SkyServe launch/down; the broader
+provider ownership, placement, volume, cluster, jobs, image, and SQLite
+compatibility program remains owned here.
+
 ## Summary
 
 SkyPilot will move to a three-owner architecture:
@@ -7098,8 +7107,12 @@ widening legacy authority.
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
   polling before shared child launch or teardown is reachable;
-- extract pure planners and reducers for the central PostgreSQL deployment;
-- persist central replica launch and down attempts;
+- implement central PostgreSQL replica launch/down through the bounded
+  companion designs, using their action/attempt journal above the existing
+  API-request queue and execution lease rather than the proposed M3 action
+  lease;
+- extract the companion's pure planners and reducers and persist central
+  replica launch/down attempts;
 - keep lifecycle epoch, immutable versions, and incarnation inventory;
 - make the jobs and Serve pool handoff an explicit fenced contract;
 - retain the officially supported SQLite Serve path until a separate
@@ -12317,7 +12330,7 @@ still incomplete until the code is deleted and the row reaches `removed`.
 | future `LEGACY_OPEN` and `DRAINING` routing branches plus `LEGACY_ADMISSION_V1` capability handling | every lifecycle ownership scope is permanently `ACTION_OPEN` and pre-action rollback is prohibited or retired | transition and mixed-version corpora pass, no scope or process advertises a legacy capability for one compatibility release, and a forward schema contraction removes only the legacy states and token while retaining action capability heartbeats |
 | central-PostgreSQL cluster process-local provisioning and teardown retry loops | M4 action runtime owns them | crash-at-every-phase tests and test-cluster cleanup pass |
 | local or controller SQLite cluster provisioning and teardown retry loops | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and repository inventory finds no supported SQLite caller |
-| central-PostgreSQL Serve in-memory replica request retry ownership and duplicate scheduling loops | M5 action runtime owns mechanics | lifecycle-epoch, same-name recreation, rollout, scale, and failed-cleanup tests pass |
+| central-PostgreSQL Serve in-memory replica request retry ownership and duplicate scheduling loops | the bounded Serve action journal owns logical identity/retry/reduction while the existing API-request lease owns execution | lifecycle-epoch, same-name recreation, rollout, scale, failed-cleanup, request-correlation, and controller-handoff tests pass with no second queue or action lease |
 | local or controller SQLite Serve retry and scheduling ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite Serve qualification is retired |
 | central-PostgreSQL pool assignment inside `get_next_cluster_name()` under a service `FileLock` | `PoolWorkerCoordinator` owns exact worker reservation and selected-resource binding while SQLite has an explicitly named compatibility implementation | assignment, retirement, capacity, identity, crash recovery, writer-fence, and exact-effect tests pass, one release records no legacy PostgreSQL entry, and PLA-M5-015 reaches `removed` |
 | direct central-PostgreSQL pool teardown admission through `_terminate_replica()` callers and failed-service purge | every graceful and forced source closes the exact worker through `PoolWorkerCoordinator` before scheduling or producing a destructive effect | every inventoried source passes pre-effect close-token and stale-incarnation tests, one release records no unfenced admission, and PLA-M5-016 reaches `removed` |

@@ -52,8 +52,8 @@ cluster_table = sqlalchemy.Table(
     sqlalchemy.Column('owner', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('cluster_hash', sqlalchemy.Text, server_default=None),
     # Write-once provider identity for action-aware launches. Ordinary cluster
-    # persistence omits this column so it cannot initialize, clear, or replace
-    # an existing commitment.
+    # persistence deliberately omits this column so it cannot initialize,
+    # clear, or replace an existing commitment.
     sqlalchemy.Column('cluster_record_uuid',
                       sqlalchemy.Uuid,
                       nullable=True,

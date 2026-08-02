@@ -742,7 +742,7 @@ def test_ordinary_request_lifecycle_does_not_create_actions(request_database):
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '006'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '007'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
@@ -1090,7 +1090,7 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api006_downgrade_retains_additive_schema(request_database):
+def test_api006_downgrade_guard_retains_api007_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
@@ -1098,7 +1098,7 @@ def test_api006_downgrade_retains_additive_schema(request_database):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '006'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '007'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
@@ -2011,7 +2011,7 @@ def test_local_sqlite_request_claim_arguments_are_ignored(
         assert stored.status is requests.RequestStatus.RUNNING
         assert stored.pid == 1234
     finally:
-        requests._DB = None
+        asyncio.run(requests.close_db_async())
 
 
 def test_sqlite_cutover_is_atomic_verified_and_idempotent(
@@ -2222,8 +2222,9 @@ def test_strict_return_encoder_failure_terminalizes_failed_in_postgres(
             'unknown or missing' in error['message'])
     with engine.connect() as connection:
         queue_count = connection.execute(
-            sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                request_postgres.QUEUE)).scalar_one()
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(request_postgres.QUEUE)).scalar_one()
     assert queue_count == 0
 
 

@@ -136,8 +136,8 @@ def _coverage_values(sample: dict) -> dict:
     }
 
 
-def _drop_serve032_common_columns(engine) -> None:
-    """Make a revision-031 catalog look like an actually historical one."""
+def _drop_pre_033_resource_action_columns(engine) -> None:
+    """Materialize the shipped revision-032 pre-resource-action catalog."""
     replica_columns = (
         'down_shadow_coverage_id',
         'launch_shadow_coverage_id',
@@ -159,6 +159,74 @@ def _drop_serve032_common_columns(engine) -> None:
             'ALTER TABLE services DROP COLUMN resource_action_mode')
 
 
+def _assert_upstream_request_classification_catalog(engine) -> None:
+    """Verify revision-032 request classification survives unchanged."""
+    inspector = sqlalchemy.inspect(engine)
+    raw_columns = {
+        column['name']: column
+        for column in inspector.get_columns('serve_request_activity_history')
+    }
+    for name in ('classified_request_count', 'counted_rejected_count'):
+        column = raw_columns[name]
+        assert isinstance(column['type'], sqlalchemy.Integer)
+        assert column['nullable'] is True
+        assert column['default'] is None
+
+    daily_columns = {
+        column['name']: column
+        for column in inspector.get_columns('serve_request_activity_daily')
+    }
+    for name in ('classified_request_count', 'counted_rejected_count'):
+        column = daily_columns[name]
+        assert isinstance(column['type'], sqlalchemy.BigInteger)
+        assert column['nullable'] is True
+        assert column['default'] is None
+    for name in ('classified_first_bucket_start',
+                 'classified_last_bucket_start'):
+        column = daily_columns[name]
+        assert isinstance(column['type'], sqlalchemy.DateTime)
+        assert column['type'].timezone is True
+        assert column['nullable'] is True
+        assert column['default'] is None
+    incomplete = daily_columns['classification_incomplete']
+    assert isinstance(incomplete['type'], sqlalchemy.Boolean)
+    assert incomplete['nullable'] is False
+    assert 'false' in str(incomplete['default']).lower()
+
+    raw_checks = {
+        constraint['name']: ''.join(str(constraint['sqltext']).lower().split())
+        for constraint in inspector.get_check_constraints(
+            'serve_request_activity_history')
+    }
+    assert ('counted_rejected_count<=classified_request_count'
+            in raw_checks['serve_request_activity_history_classified_pair'])
+    daily_checks = {
+        constraint['name']: ''.join(str(constraint['sqltext']).lower().split())
+        for constraint in inspector.get_check_constraints(
+            'serve_request_activity_daily')
+    }
+    assert ('classified_first_bucket_start<=classified_last_bucket_start'
+            in daily_checks['serve_request_activity_daily_classified_pair'])
+
+
+def _assert_classification_rows_retained(engine) -> None:
+    with engine.connect() as connection:
+        raw = connection.execute(
+            sqlalchemy.text(
+                'SELECT classified_request_count, counted_rejected_count '
+                'FROM serve_request_activity_history WHERE '
+                "service_name = 'legacy' AND reporter_session_id = 'session'")
+        ).one()
+        daily = connection.execute(
+            sqlalchemy.text(
+                'SELECT classified_request_count, counted_rejected_count, '
+                'classification_incomplete '
+                'FROM serve_request_activity_daily WHERE '
+                "service_name = 'legacy'")).one()
+    assert raw == (7, 2)
+    assert daily == (7, 2, False)
+
+
 def _replica(replica_id: int, version: int = 1) -> replica_managers.ReplicaInfo:
     return replica_managers.ReplicaInfo(replica_id=replica_id,
                                         cluster_name=f'svc-{replica_id}',
@@ -169,11 +237,12 @@ def _replica(replica_id: int, version: int = 1) -> replica_managers.ReplicaInfo:
                                         resources_override=None)
 
 
-def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
+def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     engine = empty_postgres
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
-                                         '031')
-    _drop_serve032_common_columns(engine)
+                                         '032')
+    _drop_pre_033_resource_action_columns(engine)
+    _assert_upstream_request_classification_catalog(engine)
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.text(
@@ -181,10 +250,36 @@ def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
         connection.execute(
             sqlalchemy.text("INSERT INTO replicas (service_name, replica_id) "
                             "VALUES ('legacy', 1)"))
+        connection.execute(
+            sqlalchemy.text(
+                'INSERT INTO serve_request_activity_history '
+                '(service_name, service_hash, reporter_session_id, '
+                'bucket_start, observed_at, request_count, rejected_count, '
+                'rejection_count_available, classified_request_count, '
+                'counted_rejected_count) VALUES '
+                "('legacy', 'hash', 'session', "
+                "TIMESTAMPTZ '2026-08-01 00:00:00+00', "
+                "TIMESTAMPTZ '2026-08-01 00:01:00+00', 7, 2, true, 7, 2)"))
+        connection.execute(
+            sqlalchemy.text(
+                'INSERT INTO serve_request_activity_daily '
+                '(day_start, service_name, service_hash, first_bucket_start, '
+                'last_bucket_start, request_count, classified_request_count, '
+                'counted_rejected_count, classified_first_bucket_start, '
+                'classified_last_bucket_start, classification_incomplete, '
+                'observed_at) VALUES '
+                "(TIMESTAMPTZ '2026-08-01 00:00:00+00', 'legacy', 'hash', "
+                "TIMESTAMPTZ '2026-08-01 00:00:00+00', "
+                "TIMESTAMPTZ '2026-08-01 00:00:00+00', 7, 7, 2, "
+                "TIMESTAMPTZ '2026-08-01 00:00:00+00', "
+                "TIMESTAMPTZ '2026-08-01 00:00:00+00', false, "
+                "TIMESTAMPTZ '2026-08-01 00:01:00+00')"))
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
-    # Simulate a lost migration acknowledgement: retain all DDL/data, move
-    # only Alembic's marker back, and prove revisions 032/033 converge exactly.
+    _assert_upstream_request_classification_catalog(engine)
+    _assert_classification_rows_retained(engine)
+    # Simulate lost acknowledgements for both additive revisions: retain all
+    # DDL/data, move only Alembic's marker back, and prove 032/033 converge.
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
     alembic_command.stamp(config, '031')
@@ -192,6 +287,8 @@ def test_pg_upgrade_from_031_and_catalog_are_exact(empty_postgres):
                                          migration_utils.SERVE_VERSION)
     assert migration_utils.get_current_alembic_revision(
         engine, migration_utils.SERVE_DB_NAME) == '033'
+    _assert_upstream_request_classification_catalog(engine)
+    _assert_classification_rows_retained(engine)
 
     inspector = sqlalchemy.inspect(engine)
     assert {

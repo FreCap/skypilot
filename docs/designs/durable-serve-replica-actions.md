@@ -1,31 +1,27 @@
 # Durable SkyServe Replica Actions
 
-Status: bounded M0 and M1b contract accepted after independent adversarial
-review; M1a inert schema and dark M1b typed store implemented and locally
-verified; upstream's shipped Serve032 request-classification migration and the
-unshipped resource-action migration lineage have been reconciled as one
-guarded Serve033 catalog, implemented and reverified against both the upstream
-lineage and adversarial partial/corrupt catalogs; the cluster identity,
-immutable provider contracts, typed shadow
-store, promotion audit, and generic API006 progress substrate are implemented
-and locally verified; the Serve033 preparation-capability commitment schema/typed
-store, closed launch-identity wire contracts, shared effective-identity
-resolver, capability-fenced no-enqueue endpoint, and bounded authenticated
-client are implemented and locally verified, while manager-side CSPRNG
-generation/reference creation, client wiring, and raw-capability discard remain
-pending; the immutable effect-origin,
-closed handler-return,
-pre-I/O representability, and reducer-owned quiescence contract is frozen in
-design while its Serve validator/reducer, dedicated return codec, and shadow-
-outcome parser alignment remain pending; the candidate-only Kubernetes
-preparation/admission
-handshake and execution-config boundary are in progress; runtime shadow
-instrumentation pending
+Status: bounded M0 and M1b contracts accepted after independent adversarial
+review. The additive API005-007, global-user-state 028, and guarded Serve033
+schemas; dark generic action store; typed Serve shadow/coverage/cohort stores;
+and cluster-identity fence are implemented and locally PostgreSQL-verified.
+The generic API006 kernel now has lineage-safe retry materialization and
+claim-fenced progress/reduction validation. The Serve-owned pure progress
+validator/reducer, exact launch/down execution configurations, completed and
+partial-launch down bases, strict private return codecs, and fail-closed
+request-result persistence are implemented and focused pure/PostgreSQL-tested.
+The four private handlers remain deliberately fail closed before provider I/O.
+Provider rendering and normalization, manager/runtime admission, dispatcher
+wiring, live provider I/O, atomic Serve projection, and runtime shadow
+instrumentation remain open. Authority is disabled, no service has been
+promoted, and the named legacy thread/map/retry-clock owners remain in place;
+the restructuring has not yet earned its claimed operational payoff.
 
 Last updated: 2026-08-02
 
 Canonical owner: this file. The provider-side companion is
-`docs/designs/provider-lifecycle-actuation.md`.
+`docs/designs/skyserve-resource-action-provider-facet.md`. The broader
+`docs/designs/provider-lifecycle-actuation.md` remains authoritative for its
+separate provider ownership and placement program.
 
 ## Decision
 
@@ -207,12 +203,18 @@ ResourceActionIdentityV1 = {
 }
 ```
 
-The normalized JSON object has fixed key order, UTF-8 encoding, no floats, and
-bounded strings. `action_id` is UUIDv5 of the fixed SkyPilot resource-action
-namespace and those canonical bytes. The human-readable equivalent is close to
+Every text field is NFC-normalized before validation. Canonical JSON is emitted
+with Python `json.dumps(value, sort_keys=True, separators=(',', ':'),
+ensure_ascii=False, allow_nan=False)` and encoded as UTF-8; UUIDs use lowercase
+hyphenated text and integers use JSON integers. The fixed resource-action UUID
+namespace is `ffa24895-49b7-5f76-9a32-ff22809e4dff`, itself UUIDv5 of
+`https://skypilot.co/resource-actions/v1` in `uuid.NAMESPACE_URL`. `action_id`
+is `uuid.uuid5(RESOURCE_ACTION_NAMESPACE, canonical_identity_bytes.decode(
+'utf-8'))`. The human-readable equivalent is close to
 `service_hash:replica_id:desired_generation:launch`, but the UUID derivation
 also includes both incarnations so deleted/recreated services or replica IDs
-cannot alias prior actions.
+cannot alias prior actions. These bytes and namespace are a versioned storage
+contract and require a new identity version, not an in-place change.
 
 The database enforces both primary-key uniqueness on `action_id` and uniqueness
 on the complete natural identity. Re-admission is idempotent only when the
@@ -238,10 +240,10 @@ identity columns rather than being duplicated inside `resource_identity`.
 SkyServe already creates `services.hash` with `uuid.uuid4()` before starting
 any external child operation. For action-aware rows that one persisted value is
 the service incarnation: `service_hash` is its canonical lowercase UUID text
-and `service_incarnation` is the same value decoded as a UUID. Serve032 does
-not add a second service-incarnation column. A null, non-UUID, or noncanonical
-legacy `services.hash` is ineligible rather than backfilled with a fictitious
-identity.
+and `service_incarnation` is the same value decoded as a UUID. The action
+schema does not add a second service-incarnation column. A null, non-UUID, or
+noncanonical legacy `services.hash` is ineligible rather than backfilled with a
+fictitious identity.
 
 `replica_incarnation` is minted when a new action-aware replica row is first
 admitted and is never copied when a replica ID is reused. `desired_generation`
@@ -442,8 +444,14 @@ generic action/attempt GC; a future GC must first add a typed persisted reverse-
 reference relation and migration. The handler executes only the complete
 cleanup target in its own immutable capsule. This is verified retained-source
 deduplication, not provenance truncation or an unverified hash-only provider
-lookup. Authority remains disabled until full realistic and candidate-maximal
-specs measure at most 60,000 bytes.
+lookup. The size gate requires full realistic and candidate-maximal specs to
+measure at most 60,000 bytes. The corrected implementation now freezes the
+completed-launch case and all 20 legal partial-launch cases with exact
+realistic/candidate-maximal byte/hash goldens and enforces that limit in tests.
+This closes only the immutable down-spec graph measurement; it does not supply
+the still-missing runtime renderer/normalizer or the complete live progress,
+outcome, worker-attestation, and preflight-envelope representability pass, so
+authority remains disabled.
 
 Provider progress is attempt-local storage for one action-wide monotonic
 provider cursor. Materializing attempt `n+1` locks the action and settled
@@ -553,9 +561,8 @@ shape/size, and terminal-shape rules. Foreign keys and transactional store
 methods enforce request existence and terminal-state relationships; a CHECK
 constraint cannot inspect another table.
 
-`current_attempt` starts at zero. Attempt `n` uses UUIDv5 of
-`(action_id,"attempt",n)` as `request_id`. Attempt numbers are contiguous and
-never reused. PostgreSQL owns all timestamps and revision increments.
+`current_attempt` starts at zero. Attempt numbers are contiguous and never
+reused. PostgreSQL owns all timestamps and revision increments.
 
 Python derives UUIDv5 identities and canonical SHA-256 values. PostgreSQL
 enforces lowercase SHA-256 shape and conservative JSON byte/type limits; typed
@@ -1402,8 +1409,14 @@ projection safe.
 
 ## Serve integration
 
-Serve migrations 032 and 033 are additive. The already-frozen revision 032
-adds:
+Upstream revision 032 is the shipped request-rejection-classification
+migration. It adds no resource-action state. An earlier feature-only draft also
+used revision ID 032 for the first half of the resource-action catalog; that
+lineage was never shipped or stamped on `boltz-test`, but retaining both files
+would give Alembic two different revisions named 032. The resource-action
+lineage therefore has one additive revision 033 with `down_revision='032'`.
+
+Revision 033 adds all of the resource-action state in one transaction:
 
 - `services.resource_action_mode` with permanent `legacy` default and
   `resource_action_mode_changed_at` for the promotion window;
@@ -1411,23 +1424,44 @@ adds:
   `sky_cluster_record_uuid`, current launch/down action IDs, and current
   launch/down represented-sample IDs on replicas; and
 - bounded logical-sample and represented per-legacy-request-attempt shadow
-  tables.
+  tables; and
+- the two nullable replica coverage-link columns.
 
-Revision 033 has `down_revision='032'`. It adds the two nullable replica
-coverage-link columns on both supported Serve dialects. On PostgreSQL only, it
-creates the worker-cohort registry/reference (including the nonnull preparation-
-capability SHA-256 commitment), decision-coverage, and coverage-only submission
-tables, their checks and indexes, explicitly adds
+On PostgreSQL only, the same revision creates the worker-cohort
+registry/reference (including the nonnull preparation-capability SHA-256
+commitment), decision-coverage, and coverage-only submission tables, their
+checks and indexes, explicitly adds
 `shadow_samples.would_be_action_id -> shadow_coverage.decision_id ON DELETE
 RESTRICT`, adds nullable pair-checked `legacy_effect_trace`/hash columns to the
 represented-attempt table, and updates the replica checks and partial unique
-indexes. It does
-not depend on `metadata.create_all(checkfirst=True)` to alter an existing
-table. Because no runtime shadow writer has ever been activated on revision
-032, the 033 transaction first asserts that both existing shadow tables are
-empty. A nonempty installation fails closed for a separately reviewed
-backfill; migration never synthesizes coverage for prior samples. Revision 032
-is not rewritten and neither revision supports schema down.
+indexes. It does not depend on `metadata.create_all(checkfirst=True)` to alter
+an existing table.
+
+The PostgreSQL revision performs one read-only audit before its first catalog
+mutation. It requires the exact upstream-032 request-classification columns and
+constraints; an installation stamped by the abandoned feature-only 032 shape
+therefore fails instead of silently advancing while missing upstream state. It
+then inspects every possible resource-action evidence table: logical samples,
+represented attempts, worker cohorts, cohort references, decision coverage,
+and coverage-only attempts. Tables may be absent, which is the expected shipped
+032 shape, or present and empty, which permits interrupted/hybrid catalog
+convergence. Any row fails closed for a separately reviewed backfill. If the
+old resource-action columns already exist, every service must still have
+`resource_action_mode='legacy'` with a null change timestamp, and every replica
+identity/action/sample/coverage link must be null. Any action-owned row state
+also fails closed. Migration never synthesizes evidence or intent.
+
+After that audit, revision 033 validates every already-present portable action
+column against its exact type, nullability, and default. Because all six action
+tables are proven empty, it drops any present subset in dependency-safe order
+and creates the complete six-table head graph from one metadata catalog. This
+avoids retaining a weak same-name column/constraint and avoids creating a
+dependent foreign key before an adopted parent has its key. A reflected
+postcondition verifies the complete columns, keys, checks, foreign keys, and
+indexes before Alembic may stamp the revision. On non-PostgreSQL Serve
+controller databases it adds only the portable service and replica columns at
+revision 033. Upstream revision 032 is not rewritten, and resource revision 033
+does not support schema down.
 
 Revision 033 remains unshipped while this schema is being authored, so its
 fresh-table definition is updated in place. Deployment preflight must prove
@@ -1560,10 +1594,10 @@ inventory, and milestone gates; table defaults or a bare SQL update do not
 activate behavior.
 
 The common services/replicas metadata remains usable by local SQLite Serve
-databases, whose rows stay `legacy`: revisions 032 and 033 add only their inert
+databases, whose rows stay `legacy`: revision 033 adds only its inert
 existing-table columns on both supported Serve dialects so current metadata
-remains queryable, but create no shadow table on SQLite. The shadow tables and every
-action-aware helper are PostgreSQL-only and fail closed on another dialect. A
+remains queryable, but creates no shadow table on SQLite. The shadow tables and
+every action-aware helper are PostgreSQL-only and fail closed on another dialect. A
 separate SQLAlchemy metadata owns those tables so revision 001/current-Base
 bootstrap cannot accidentally create them in a fresh SQLite database. Existing
 rows retain null replica identity/link columns: migration must not mint an identity
@@ -1582,10 +1616,10 @@ at runtime before authority.
 
 The new identity, generation, provider-target, and action/shadow-link columns
 are action-owned. Existing generic replica upserts currently replace every
-non-primary-key column from `EXCLUDED`; Serve032 and Serve033 change all ordinary, batch,
-paid-capacity, and reserved-fill conflict updates to exclude the action-owned
-set. Legacy inserts may still create null action fields, but routine status
-persistence can never erase or replace an existing identity/link. Only typed,
+non-primary-key column from `EXCLUDED`; the Serve033 integration changes all
+ordinary, batch, paid-capacity, and reserved-fill conflict updates to exclude
+the action-owned set. Legacy inserts may still create null action fields, but
+routine status persistence can never erase or replace an existing identity/link. Only typed,
 owner-fenced transition/admission methods may initialize an identity, advance
 a generation, or change its current link.
 
@@ -2314,9 +2348,19 @@ M1a verification evidence on 2026-07-31:
 
 - Add typed store methods for idempotent action admission, due discovery,
   deterministic attempt materialization, and terminal reduction.
+- Extract a connection-borrowing request/queue insert helper from the existing
+  PostgreSQL request creator. Correlated materialization and adoption use that
+  helper inside the action transaction; ordinary request creation keeps its
+  existing behavior.
+- Implement the literal namespace, canonical preimages, pristine-request
+  validation, and mismatch-to-`BLOCKED` behavior above.
 - Before creating any runtime correlation, make request retention skip a
-  correlated terminal request until its attempt is `SETTLED`; test both the
+  correlated terminal request until its attempt is `SETTLED` in both candidate
+  selection (before log unlink) and the final delete predicate; test both the
   skip and deletion after the terminal snapshot.
+- Keep generic request terminalization action-unaware. Snapshot terminal
+  evidence only in the separate reducer transaction and add inverse-concurrency
+  tests for the declared lock order.
 - Do not import Serve modules into the generic store.
 - Keep dispatcher and Serve activation disabled.
 
@@ -2337,14 +2381,18 @@ M1b verification evidence on 2026-08-01:
 
 ### M2: Serve shadow journal
 
-- Keep frozen Serve032 mode/replica-identity/sample-link, logical-sample, and
-  represented-attempt schema unchanged. Add Serve033 coverage links,
-  decision-coverage, and coverage-only attempt schema; assert the dark 032
-  tables are empty before adding the explicit parent FK. Refuse schema down
-  while retaining the additive state.
-- Verify fresh 031 -> 032 -> 033 and already-at-032 -> 033 PostgreSQL upgrades,
-  ordinary-row preservation, fail-closed nonempty-shadow detection, explicit
-  FK/catalog convergence, and SQLite columns-only behavior.
+- Preserve upstream's shipped request-classification Serve032. Install all
+  unshipped resource-action service/replica columns, logical evidence,
+  cohort/reference retention, decision coverage, and coverage-only attempts in
+  one guarded Serve033 transaction. Refuse schema down while retaining the
+  additive state.
+- Verify unique Alembic lineage; fresh 031 -> upstream 032 -> combined 033 and
+  already-at-upstream-032 -> 033 PostgreSQL upgrades; upstream telemetry and
+  ordinary-row preservation; rejection of the abandoned feature-032 stamp,
+  nonempty evidence, or nonlegacy/nonnull action state before mutation; empty
+  hybrid/lost-ack convergence by transactional replacement of the proven-empty
+  action graph; malformed portable-column rejection; exact reflected
+  postconditions; SQLite columns only at 033; and downgrade refusal.
 - Add global-user-state revision 028 with a nullable, partial-unique
   `clusters.cluster_record_uuid`; leave historical rows null, omit it from
   ordinary cluster updates, and reserve initialization/adoption for the
@@ -2379,7 +2427,7 @@ M1b verification evidence on 2026-08-01:
   divergent.
 - Preserve legacy autoscaling and provider mutation authority.
 
-M2 foundation verification evidence on 2026-08-01:
+M2 foundation verification evidence through 2026-08-02:
 
 - The earlier feature-only Serve032/033 migration tests are superseded after
   upstream shipped a different revision 032. Read-only `boltz-test` audit
@@ -2408,12 +2456,14 @@ M2 foundation verification evidence on 2026-08-01:
   UUID and partial unique index, leaves historical rows null, and provides the
   PostgreSQL-only exact insert/adopt/reject primitive without changing ordinary
   cluster updates;
-- the initial closed, bounded provider locator, invocation, observation,
-  outcome, shadow projection, and retry contracts have canonical byte/hash
-  fixtures and action-specific success proof; the companion's stricter frozen
-  Kubernetes scope, execution-config boundary, and preparation handshake are
-  the next contract slice;
-  and
+- the closed, bounded provider locator, invocation, observation, outcome,
+  shadow projection, and retry contracts have canonical byte/hash fixtures and
+  action-specific success proof. The stricter frozen Kubernetes scope, exact
+  launch and down execution configurations, completed-launch basis, all 20
+  legal partial-launch cleanup shapes, and their full-spec byte/hash goldens
+  are now implemented and locally verified. These are immutable contract and
+  persistence foundations; no provider renderer, normalizer, or runtime
+  mutation path consumes them yet; and
 - the PostgreSQL typed shadow store plus Serve033 coverage/cohort and promotion
   suites pass locally, including exact parent/child replay, retry-chain
   closure, reference fencing, coverage-only attempts, bounded canonical
@@ -2422,41 +2472,91 @@ M2 foundation verification evidence on 2026-08-01:
   pure contract and promotion-audit slices received independent adversarial
   acceptance.
 
-The typed-store foundation intentionally admits represented decisions without
-a cohort reference only. Passing a prepared cohort reference to either ordinary
-or launch-replica represented admission fails before any service, replica,
-coverage, or parent mutation because the current flattened immutable invocation
-cannot yet commit
-`execution_config.capsule.executor_cohort`. The M2 execution-config closure must
-land before this guard is replaced by full byte-equality validation and atomic
-`PREPARING -> SHADOW_ACTIVE` binding.
+The typed store now validates a prepared cohort reference against the exact
+immutable execution configuration and performs store-level
+`PREPARING -> SHADOW_ACTIVE` binding with the represented coverage/parent graph
+in one transaction. Exact replay adopts the complete pre-submit graph;
+partial, crossed, stale-owner, or byte-unequal graphs fail closed. Focused
+PostgreSQL state-store tests cover those transitions. This is not runtime
+admission: no manager currently creates and discards the preparation
+capability, calls the canonicalization/preflight client, or routes a real
+legacy or action request through this primitive.
 
-Runtime admission/linking, legacy SDK instrumentation, provider identity
-propagation/readback, and live shadow evaluation remain M2 gates; no service is
-eligible for authority yet.
+Manager/runtime admission, legacy SDK instrumentation, provider rendering and
+normalization, provider identity propagation/readback, atomic action-to-Serve
+projection, and live shadow evaluation remain M2 gates. No service is eligible
+for authority.
 
 ### M3: dark dispatcher and recovery
 
-- API-request revision 006 now adds the bounded provider-progress snapshot,
+- API-request revision 006 adds the bounded provider-progress snapshot,
   retained provider-I/O watermark, claim-fenced monotonic write/read methods,
   typed domain hooks, retry-seed derivation, and fail-closed migration; ordinary
-  attempts remain null. The generic PostgreSQL substrate and race regressions
-  pass locally; the Serve cursor contract and dispatcher integration remain.
-- Run due discovery/materialization against synthetic/canary actions only.
-- Register the private action handler only in the dedicated
-  capability-filtered normal-executor cohort, with `retryable=false` and no
-  precondition; ordinary normal executors exclude it. Normalize retry/pause
-  exceptions inside the handler so the generic executor cannot requeue the
-  same request attempt.
-- Exercise request correlation, controller eviction, lost admission response,
-  retry deadlines, and reducer idempotency.
-- Run provider readback on shadow samples without submitting a second mutation.
+  attempts remain null.
+- The generic store materializes a retry only after locking and validating the
+  exact immediate predecessor and current attempt in ascending order. It
+  byte-validates the complete inherited seed, rejects settled-lineage or
+  lost-ack tampering, retains the null-progress fresh-cursor branch, and never
+  adds an action lease or second queue.
+- The Serve-owned pure API006 progress contract and reducer implement exact
+  launch/down cursor validation, monotonic transitions, cross-attempt origin
+  retention, request-terminal fallback, retry scheduling, supersession
+  quiescence, and maximum-attempt blocking. The exact launch/down execution
+  configurations and completed/partial down bases are frozen inputs to that
+  contract.
+- The two authoritative private handler names have dedicated strict return
+  encoders and decoders. A successful request with a null, malformed, unknown-
+  key, or default-encoded return is terminalized as `FAILED` with a persisted
+  error instead of `SUCCEEDED` with an unusable value. The strict rule applies
+  to those exact private names in both persistence backends; ordinary request
+  names retain their existing codecs and behavior.
+- The four private handlers and their capability-filtered registrations exist,
+  but their implementations intentionally raise before reading provider
+  credentials or crossing a provider-I/O boundary. This is a safety fence, not
+  a working provider path.
+- Dispatcher invocation, provider rendering/normalization, pre-I/O admission,
+  provider checkpoint writes, request-to-reducer wiring, and atomic Serve
+  projection remain dark. No synthetic or canary action has executed provider
+  I/O through M3.
+
+M3 foundation verification evidence on 2026-08-02:
+
+- `tests/unit_tests/test_resource_actions_pg.py` passes against real PostgreSQL
+  and covers lineage-safe retry materialization, exact lost-ack adoption,
+  attempt-two tamper rejection,
+  predecessor-before-current lock order, null-progress retry, operation-ID
+  binding, claim expiry, and both terminalization/progress race directions;
+- `tests/unit_tests/test_serve_resource_action_progress.py` passes and covers
+  the closed cursor phase tables, effect origins, inherited retry seeds,
+  request-terminal `P0/O/S/X` fallback,
+  handler `S/R/U/B/Q` reduction, supersession quiescence, maximum-attempt
+  blocking, and malformed/crossed/hash-invalid evidence;
+- `tests/unit_tests/test_serve_resource_action_launch_execution_config.py` and
+  `tests/unit_tests/test_serve_resource_action_down_execution_config.py` pass
+  and freeze exact prepared-reference/cohort binding, completed-launch down,
+  all 20 legal partial-launch cleanup shapes,
+  40 full-spec byte/hash goldens, and the declared size bounds. Focused
+  cases in `tests/unit_tests/test_serve_resource_action_state_pg.py` pass
+  against PostgreSQL and cover linked admission and exact replay;
+- `tests/unit_tests/test_serve_resource_action_return_codec.py` plus the
+  focused generic request PostgreSQL/SQLite cases pass and prove strict round
+  trip, exact request-name binding, and fail-closed persistence for null or
+  malformed private returns; and
+- these results verify pure contracts and dark persistence only. They provide
+  no renderer/normalizer, live preflight, provider mutation/readback, runtime
+  dispatcher, atomic Serve projection, shadow-parity, or crash-canary evidence.
+  The reducer's maximum-attempt disposition is implemented, but emission of
+  the named `attempt_domain_exhausted` operational event remains open.
 
 ### M4: per-service authority
 
 - Promote only the isolated eligible cohort after the activation gates.
 - Materialize real launch/down requests through PR #1070.
 - Keep noneligible services on legacy/shadow without a global flag flip.
+
+M4 has not started. Authority remains disabled in code and deployment; no
+service may be described as action-authoritative on the basis of the M1-M3
+foundation tests.
 
 ### M5: legacy ownership removal
 
@@ -2470,6 +2570,11 @@ For the eligible authoritative path, delete:
 
 Compatibility readers may project action state into old status fields, but no
 fallback branch may submit or retry an eligible authoritative mutation.
+
+M5 has not started. The named fields and call sites carry deprecation markers,
+but launch/down SafeThreads, `_replica_to_request_id`, cleanup retry maps and
+clocks, and restart-time legacy inference still own live behavior. A dormant
+journal beside those owners is not a completed restructuring.
 
 ### M6: reuse decision, not automatic generalization
 
@@ -2659,9 +2764,13 @@ Tests must prove:
   bytes before the run-token transaction; `START_COMMITTED` never satisfies
   `JOB_RUNNING` or launch success;
 - exactly one queue delivery and one request claim lease per attempt;
+- retry/pause exceptions produce one terminal typed outcome and never requeue
+  or repeat provider mutation within the same request/attempt;
 - no action lease/heartbeat table or domain due scanner;
 - database-clock retry continuity across restart;
 - stale owner/request/reducer writes reject;
+- both evidence-versus-terminalization race directions linearize according to
+  the action-attempt-request lock order;
 - observed launch adoption and ambiguous launch blocking;
 - a never-started launch cancels through each of `unmaterialized`, terminal-
   request-unsettled, retained-settled/request-present, and retained-settled/
@@ -2738,6 +2847,13 @@ material code removal and reuse of the same state/lock/request semantics. One
 Serve adapter alone justifies a durable Serve action layer, not an open-ended
 workflow framework.
 
+As of 2026-08-02 these payoff conditions are not met. The implementation has
+proved a bounded kernel and frozen/tested Serve contracts, but live ownership
+still belongs to the legacy threads, maps, and clocks. The payoff remains a
+hypothesis until an eligible service runs through the durable path, the shadow
+and crash gates pass, and M5 removes those owners without introducing a second
+scheduler or fallback mutation path.
+
 ## Security and operational boundary
 
 This design uses the repository's current PostgreSQL migration and runtime
@@ -2755,18 +2871,20 @@ write typed outcomes.
 
 ## Open gates
 
-- Runtime atomic admission/linking and legacy launch/down instrumentation on top
-  of the implemented Serve033 migration, cohort/reference fence, typed
-  coverage/attempt store, promotion audit, and retention protocol.
-- The Serve-owned cursor validator/reducer and private-handler capability filter
-  on top of the implemented generic API006 progress journal, including
-  immutable cross-attempt effect origins, per-attempt worker re-attestation,
-  the dedicated closed return encoder/decoder, candidate-maximal 65,536-byte
-  progress/outcome fixtures, at-most-60,000-byte completed and every-legal-
-  partial down full-spec goldens plus capped preflight envelopes,
-  reducer-owned quiescence, and
-  partial-launch cleanup. Authority remains disabled until realistic and
-  candidate-maximal fixture measurements both pass.
+- Manager-side preparation-capability generation/discard, canonicalization and
+  preflight client wiring, runtime use of the store-level atomic admission
+  primitive, legacy launch/down instrumentation, and the owner-fenced atomic
+  action/replica/capacity/event projection on top of the implemented Serve033
+  stores and promotion/retention protocol.
+- The candidate provider renderer and normalizer, exact live preflight,
+  real private-handler submit/observe/readback/checkpoint implementation,
+  dispatcher and reducer invocation, partial-launch cleanup execution, and
+  `attempt_domain_exhausted` event emission. The pure cursor/reducer,
+  lineage-safe generic store, strict codecs, execution configurations,
+  quiescence construction, and realistic/candidate-maximal full-spec goldens
+  are implemented; capped live rendered bodies and preflight envelopes still
+  require measurement. Authority remains disabled until the runtime and live
+  gates pass.
 - Rendered and live verification of the dedicated versioned authority-worker
   Helm cohort, exact RBAC/admission/NetworkPolicy, purpose token/TLS preflight,
   static-manifest/live-UID qualification, complete-spec submit/observe, worker
@@ -2792,6 +2910,10 @@ write typed outcomes.
   revision, image, heads, and workload inventory immediately before rollout;
   revision 56 is no longer the current rollback point.
 - Measured shadow sample minimums and the first canary service selection.
+- Authoritative canary evidence followed by deletion of the launch/down
+  SafeThread owners, `_replica_to_request_id`, cleanup retry maps/clocks, and
+  restart-time legacy inference. Deprecation comments alone do not close this
+  gate or earn the payoff.
 - A separate decision on whether central principal convergence is worth its
   operational cost; it must not silently re-enter M1-M4.
 

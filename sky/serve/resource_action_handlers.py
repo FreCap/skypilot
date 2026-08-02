@@ -28,19 +28,19 @@ def _provider_profile_disabled(**unused_payload: Any) -> NoReturn:
 
 def serve_shadow_candidate_launch(**payload: Any) -> NoReturn:
     """Reject a launch shadow request before provider I/O."""
-    return _provider_profile_disabled(**payload)
+    _provider_profile_disabled(**payload)
 
 
 def serve_shadow_candidate_down(**payload: Any) -> NoReturn:
     """Reject a down shadow request before provider I/O."""
-    return _provider_profile_disabled(**payload)
+    _provider_profile_disabled(**payload)
 
 
 def serve_resource_action_launch(**payload: Any) -> NoReturn:
     """Reject an authoritative launch request before provider I/O."""
-    return _provider_profile_disabled(**payload)
+    _provider_profile_disabled(**payload)
 
 
 def serve_resource_action_down(**payload: Any) -> NoReturn:
     """Reject an authoritative down request before provider I/O."""
-    return _provider_profile_disabled(**payload)
+    _provider_profile_disabled(**payload)

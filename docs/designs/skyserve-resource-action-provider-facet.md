@@ -1,40 +1,17 @@
 # SkyServe Resource-Action Provider Facet
 
-Status: bounded M0 accepted after independent adversarial review; parent M1
-kernel complete; M2 cluster identity, initial immutable provider contracts, and
-typed shadow-store and Serve033 coverage/promotion foundations plus the generic
-API006 progress substrate are implemented and locally verified; the
-committed-effect/origin, closed handler-return, API006 representability, and
-partial-launch quiescence literal contract is frozen in this design while its
-Serve-owned cursor validator/reducer and both
-prior-launch-basis parser/admission paths remain pending; the
-candidate-only normalization boundary and atomic durable coverage handshake are
-in progress; the closed Kubernetes transport/scope leaf is implemented and
-independently verified; topology/image/config-policy/principal/authorization
-foundation leaves are implemented and locally verified; the complete launch
-execution-config composition and exact outer launch invocation are implemented
-and independently verified, while the down composition remains pending;
-bounded resource values and the generic
-prerequisite/object-plan/renderer foundations, exact prerequisite role/kind map
-and role-dispatched prerequisite leaf, and launch-only endpoint
-projection/workload leaves are implemented and independently verified, while
-the enclosing exact 12-record inventory validator is implemented and
-independently verified and named capsule composition and request-body
-renderer/normalizer artifacts remain design-frozen and code-pending;
-foundational runtime/job/endpoint leaves now include the closed Skylet job-spec,
-submit-request, retained-evidence, and policy-boundary-proof leaves and are
-independently verified; the policy-free request-identity, scheduling, storage,
-metadata, security, object-mutation-effect, and exact launch/down mutation
-contract leaves are implemented and independently verified; the launch-only
-server-effective identity wire contracts, shared resolver, no-enqueue endpoint,
-store validation, and bounded client are implemented and independently
-verified, while manager integration, contextual action-bound submit comparison,
-down-current-identity absence, down capsule/config composition, and live
-preflight remain pending; the launch identity-to-source projector and enclosing
-capsule/config composition are implemented and independently verified; shared
-leaf-validator, named raw-field, and bounded canonical-JSON exact-type
-hardening is implemented and independently verified; runtime provider
-propagation, observation, and shadow instrumentation remain pending
+Status: bounded M0 accepted after independent adversarial review; the parent M1
+kernel and the M2 schema, cluster-identity, shadow-store, and immutable provider
+contract foundations are implemented. As of 2026-08-02, the exact three-object
+`ResolvedProviderTargetV1` is the first deployable v1 resolved-target wire; the
+unreleased flattened v1 scaffold is rejected. Immutable launch and down
+invocations/execution configurations, completed and partial down bases, the
+closed API006 progress/lineage/reduction contract, and strict private-handler
+return codecs are implemented and locally verified. The provider renderer,
+admitted-object and live transport normalizers, live preflight, runtime
+admission/session, request-handler dispatcher, provider observation/effect
+capture, and live provider authority are not implemented. Authority remains
+disabled, and this status does not claim M4 or provider-authoritative rollout.
 
 Last updated: 2026-08-02
 
@@ -1475,6 +1452,13 @@ ProviderKubernetesCleanupTargetV1 = {
   observed_at: UtcTimestamp
 }
 ```
+
+The exact three-object `ResolvedProviderTargetV1` above is the first deployable
+v1 resolved-target wire. An earlier unreleased pre-authority scaffold carried
+the scalar target fields but omitted `kubernetes_objects`; it was never
+deployed and is not a compatibility format. The closed parser rejects that
+flattened shape and any incomplete replacement rather than adding a dual reader
+or inferring object identity from provider-resource/workload scalars.
 
 The cleanup target is the complete immutable down-addressing preimage. Its
 three entries follow `ProviderKubernetesObjectRoleMapV1` and embed every exact
@@ -4856,8 +4840,34 @@ subtyped persisted wrappers, nested children, collection leaves, and crossed
 capsule/config graphs. A six-file focused matrix passes all 397 tests against
 PostgreSQL; targeted mypy is clean, pylint is 10.00/10, and independent
 adversarial review reproduced the persisted-wrapper regressions and accepted
-the tranche. This evidence does not claim down execution-config composition,
-provider I/O, preflight, admission, manager integration, or authority.
+the tranche. This launch-only evidence does not claim provider I/O, preflight,
+admission, manager integration, or authority.
+
+Further P1 execution-contract verification evidence on 2026-08-02: immutable
+down composition now includes both completed-launch and partial-launch bases,
+the exact three-object cleanup target, a current down-only execution capsule
+and policy subject, the complete down execution config, and the exact outer
+down invocation. The reviewed launch/down tranche passed 239 pure cases and 41
+PostgreSQL cases, including all 20 legal partial-down shapes and 40 frozen
+launch/down spec goldens; every measured canonical spec remained below the
+65,536-byte bound. The resolved-target tests require all three canonical roles
+and reject the pre-release flattened wire.
+
+Further P1 progress and return-envelope verification evidence on 2026-08-02:
+the pure Serve-owned API006 contract parses and validates launch/down cursors,
+checks monotonic transitions and attempt/execution attestations, derives only a
+lineage-valid retry seed, constructs supersession quiescence, and validates the
+exact handler and fallback reductions. Its focused suite passed 72 cases, and
+the generic PostgreSQL retry/materialization suite passed 40 real-database
+cases, including predecessor locking and cross-generation attestation checks.
+Strict encoders/decoders are registered only for
+`sky.serve_resource_action_launch` and
+`sky.serve_resource_action_down`; focused codec/name, PostgreSQL, and SQLite
+runs verify that null, malformed, or hash-invalid returns terminalize failed
+instead of persisting a successful null/untyped result. This evidence is for
+immutable values and persistence behavior only: it does not implement or prove
+the renderer, normalizer, preflight, runtime admission/session, dispatcher,
+provider I/O, shadow parity, or live authority.
 
 First-deployment cutover evidence refreshed on 2026-08-02: read-only
 `boltz-test` inspection found API schema 004, upstream request-classification
@@ -4929,10 +4939,11 @@ artifact.
 
 Contract tests must cover:
 
-- pre-release flattened-v1 bytes are rejected, the first-deployment preflight
-  passes only with legacy service modes and absent/empty operational tables,
-  and the cutover changes hashes/goldens without changing deterministic action
-  UUIDs;
+- pre-release flattened resolved-target and invocation v1 bytes are rejected,
+  the deployable resolved target contains exactly the three canonical object
+  roles, the first-deployment preflight passes only with legacy service modes
+  and absent/empty operational tables, and the cutover changes hashes/goldens
+  without changing deterministic action UUIDs;
 - canonical plan/locator bytes and identity mismatch rejection;
 - exact built-in acceptance and subclass rejection at the shared text, hash,
   integer, timestamp, enum, UUID, and action-kind helpers; exact-Boolean
@@ -5207,6 +5218,12 @@ write-once commitments and preserves nonterminal shadow/action state. It does
 not run provider compensation or schema down. After first authority, rollback
 to a pre-action-aware image is unsupported.
 
+As of 2026-08-02 this section remains a rollout contract, not deployment
+evidence. `resourceActions.authorityWorker.enabled` must remain `false`: no
+live provider dispatcher or admitted provider session exists, no profile has
+passed the authority gates, and no M4/provider-authoritative service is
+claimed.
+
 The companion inherits the parent's exact role rollout: build one immutable
 digest, upgrade the API role first until all required heads converge, upgrade
 the new authority-worker cohort second and attest it, then upgrade controllers
@@ -5391,6 +5408,10 @@ absence result through a public API.
 
 ## Open gates
 
+- M4/provider authority is not reached. Keep the authority worker and every
+  provider-authoritative route disabled until the remaining gates below are
+  implemented and verified; immutable specs, progress, and codecs alone do not
+  authorize provider I/O.
 - Exact inventory of existing providers that can propagate a stable
   cluster-record UUID/incarnation before launch; multi-node/compound launch is
   ineligible until all effects have one exact observable target contract.
@@ -5404,42 +5425,33 @@ absence result through a public API.
   network preflight plus both launch LB Deployment-to-ServiceAccount projections
   on the selected Boltz canary path, and verify the down preflight performs zero
   LB Deployment GETs.
-- Implementation and contract verification of the down execution config, its
-  nonrecursive policy-subject projector, and contextual consumption of both
-  launch and down policy subjects; the launch execution config, policy-subject
-  projector, and access inventory are complete. Complete preflight seeds and
-  the controller/executor dual policy-absence proof sequence,
-  preparation/counted-slot gate,
-  normalized spec/partial UID-qualified adoption/deletion, redacted invocation
-  builder, private handler claim filter, and request-handler pre-I/O/
-  operation-ID callbacks without duplicating provider policy. The exact
-  cluster-row UUID primitive and generic API006 progress journal are complete;
-  the Serve-owned cursor validator/reducer remains open.
+- Implement the provider renderer and admitted-object normalizer, then bind the
+  already-implemented launch/down invocation and execution-config contracts to
+  complete preflight seeds, the controller/executor dual policy-absence proof
+  sequence, the preparation/counted-slot gate, and exact partial
+  UID-qualified adoption/deletion. Neither execution config currently has a
+  runtime consumer capable of provider mutation.
 - Before the live Kubernetes normalizer is implemented, freeze exact server-URL
   decomposition and rejection rules, including host, default-port, path, IPv6,
   IDNA, and percent-encoding handling. The pure transport DTO intentionally
   does not invent those source-normalization rules.
-- Implementation and verification of cross-attempt cursor carry, effect-fenced
-  worker attestation, quiesced superseded partial-launch cleanup, current
-  down-only execution authority, the closed effect-body trace, qualified
+- Implement the live preflight endpoint/client and same-client runtime
+  admission/session, including current-scope drift checks, artifact loading,
+  principal/authorization proofs, and the exact request-handler dispatcher.
+  The dispatcher must checkpoint the implemented API006 progress contract and
+  operation IDs before/after each real effect; strict return codecs are a
+  persistence fence, not a dispatcher.
+- Integrate the implemented cursor validator, lineage-safe retry seed, exact
+  reducer/fallback, and quiescence builder with the live handler and the
+  owner-fenced retained-source admission transaction. Completed and partial
+  basis parsers exist, but no provider-runtime path yet performs partial-launch
+  cleanup admission, effect readback, or Serve projection.
+- Implement and verify the closed effect-body trace, qualified
   manifest/config/CRI runtime identity, and the Skylet fsynced outbox/run-token/
   post-exec-handshake recovery state machine, including full retained-request
-  reconstruction and equal-hash/unequal-byte conflict handling.
-- Design-complete/code-pending: this canonical file now freezes the literal
-  five-effect and every-phase prefix tables, immutable full effect claims,
-  committed-effect hash preimages and created/adopted dispositions, CoreV1 422
-  observation matrix, cluster-row disposition matrix, Skylet rejection matrix,
-  lexicographic attempt/generation origin ordering, closed handler terminal
-  result, candidate-maximal size representability fixtures/preflight, and
-  quiescence ownership.
-  Implement and adversarially verify the Serve-owned API006 progress
-  validator/reducer and owner-fenced quiescence builder before partial cleanup
-  admission; provider authority remains disabled until both realistic and
-  candidate-maximal size goldens are measured below the bound. No deployable
-  `PriorLaunchBasisV1` parser or admission path may be
-  exposed until it accepts and fully validates both `completed_launch` and
-  `partial_launch_cleanup`; the generic opaque API006 JSONB substrate requires
-  no second queue or database migration for this provider-specific validator.
+  reconstruction and equal-hash/unequal-byte conflict handling. Measure
+  realistic and candidate-maximal renderer/preflight/runtime goldens below the
+  bound before enabling any authority.
 - Rendered and live verification of the dedicated authority-worker Helm
   versioned-cohort contract, `REGISTERING`/two-ready-Pod activation,
   release-namespace worker/Service/RBAC/projections, two distinct frozen LB

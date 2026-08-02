@@ -514,6 +514,10 @@ def test_all_generic_replica_upserts_preserve_action_owned_columns(
     for replica_id in range(1, 5):
         assert serve_state.add_or_update_replica('svc', replica_id,
                                                  _replica(replica_id))
+        launch_shadow_coverage_id = (None if replica_id %
+                                     2 else uuid.UUID(int=replica_id * 100 + 5))
+        down_shadow_coverage_id = (None if replica_id %
+                                   2 else uuid.UUID(int=replica_id * 100 + 6))
         action_values = {
             'replica_incarnation': uuid.UUID(int=replica_id * 100 + 1),
             'desired_generation': replica_id,
@@ -524,12 +528,10 @@ def test_all_generic_replica_upserts_preserve_action_owned_columns(
             'down_action_id':
                 (uuid.UUID(int=replica_id * 100 + 4) if replica_id % 2 else None
                 ),
-            'launch_shadow_sample_id':
-                (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 5)
-                ),
-            'down_shadow_sample_id':
-                (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 6)
-                ),
+            'launch_shadow_coverage_id': launch_shadow_coverage_id,
+            'down_shadow_coverage_id': down_shadow_coverage_id,
+            'launch_shadow_sample_id': launch_shadow_coverage_id,
+            'down_shadow_sample_id': down_shadow_coverage_id,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(_mock_serve_db) as session:

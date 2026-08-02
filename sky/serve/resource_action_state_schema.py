@@ -1,10 +1,10 @@
 """PostgreSQL schema catalogs for SkyServe resource-action evidence.
 
-The revision-032 metadata is deliberately frozen and separate from
-``serve_state_schema.Base``.  Historical migration 032 imports ``metadata`` at
-runtime, so revision-033 additions live in a second head metadata graph.  This
-both preserves the 032 catalog and prevents a fresh SQLite bootstrap from
-trying to create PostgreSQL-only JSONB evidence tables.
+The staged tables are separate from ``serve_state_schema.Base`` so a fresh
+SQLite bootstrap never tries to create PostgreSQL-only JSONB evidence tables.
+Serve revision 033 may encounter the staged sample/attempt pair from an
+unshipped, empty migration draft, then converges that pair into the complete
+head graph in the same guarded transaction.
 """
 
 import sqlalchemy
@@ -424,9 +424,9 @@ def shadow_attempt_effect_trace_columns() -> tuple[sqlalchemy.Column, ...]:
     )
 
 
-# Migration 032 imports ``metadata`` and the lowercase tables above.  Clone
-# them into the current-head graph before extending their physical catalog so a
-# 031 -> 032 upgrade still installs the exact frozen 032 schema.
+# Clone the abandoned feature draft's staged tables into the revision-033 head
+# graph before extending their physical catalog. The guarded migration may
+# encounter that empty pair, but upstream revision 032 never imports it.
 head_metadata = sqlalchemy.MetaData()
 shadow_samples_head_table = shadow_samples_table.to_metadata(head_metadata)
 shadow_attempts_head_table = shadow_attempts_table.to_metadata(head_metadata)
@@ -762,12 +762,12 @@ shadow_samples_head_table.append_constraint(
         ondelete='RESTRICT',
         name='fk_serve_ra_shadow_samples_coverage'))
 
-# Uppercase aliases match the central request-store schema catalog style and
-# expose the current head.  Lowercase objects and ``metadata`` remain the exact
-# revision-032 catalog consumed by migration 032.
-REVISION_032_METADATA = metadata
-SHADOW_SAMPLES_032 = shadow_samples_table
-SHADOW_ATTEMPTS_032 = shadow_attempts_table
+# Uppercase aliases match the central request-store schema catalog style.  The
+# staged graph lets migration 033 adopt an empty feature-draft sample/attempt
+# pair before it installs the complete head graph.
+STAGED_SERVE033_METADATA = metadata
+STAGED_SHADOW_SAMPLES = shadow_samples_table
+STAGED_SHADOW_ATTEMPTS = shadow_attempts_table
 SHADOW_SAMPLES = shadow_samples_head_table
 SHADOW_ATTEMPTS = shadow_attempts_head_table
 WORKER_COHORTS = worker_cohorts_table
@@ -778,7 +778,7 @@ RESOURCE_ACTION_STATE_METADATA = head_metadata
 
 
 def service_columns() -> tuple[sqlalchemy.Column, ...]:
-    """Return fresh revision-032 columns for the existing services table."""
+    """Return fresh revision-033 columns for the existing services table."""
     return (
         sqlalchemy.Column('resource_action_mode',
                           sqlalchemy.Text,

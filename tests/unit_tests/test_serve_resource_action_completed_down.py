@@ -779,7 +779,7 @@ def test_new_contracts_are_closed_and_immutable() -> None:
             setattr(parsed, '_immutability_probe', None)
 
 
-def test_existing_flattened_resolved_target_wire_is_unchanged() -> None:
+def test_pre_release_flattened_resolved_target_wire_is_rejected() -> None:
     raw = {
         'version': 1,
         'requested_target_sha256': 'a' * 64,
@@ -788,20 +788,13 @@ def test_existing_flattened_resolved_target_wire_is_unchanged() -> None:
         'provider_operation_id': None,
         'resolved_at': _OBSERVED_AT,
     }
-    expected = (b'{"provider_operation_id":null,"provider_resource_id":'
-                b'"pod/svc-replica-head","requested_target_sha256":"' +
-                b'a' * 64 + b'","resolved_at":"2026-08-01T05:06:07.123456Z",'
-                b'"version":1,"workload_uid":"uid-head-pod"}')
-
-    parsed = actions.ResolvedProviderTargetV1.from_value(raw)
-
-    assert parsed.canonical_bytes == expected
-    assert parsed.canonical_value() == raw
-    assert parsed.sha256 == actions.canonical_sha256(raw)
-    new_shape = copy.deepcopy(raw)
-    new_shape['kubernetes_objects'] = []
     with pytest.raises(ValueError, match='unknown or missing'):
-        actions.ResolvedProviderTargetV1.from_value(new_shape)
+        actions.ResolvedProviderTargetV1.from_value(raw)
+
+    incomplete_current_shape = copy.deepcopy(raw)
+    incomplete_current_shape['kubernetes_objects'] = []
+    with pytest.raises(ValueError, match='exactly three'):
+        actions.ResolvedProviderTargetV1.from_value(incomplete_current_shape)
 
 
 def test_canonical_locator_wire_embeds_complete_addressing_preimages() -> None:
