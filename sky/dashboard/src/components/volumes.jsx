@@ -544,7 +544,9 @@ export function VolumesTable({
     };
   }, [fetchData, preloadingComplete]);
 
-  useVisibleRefreshInterval(preloadingComplete, refreshInterval, fetchData);
+  useVisibleRefreshInterval(preloadingComplete, refreshInterval, fetchData, {
+    catchUpOnlyWhenOverdue: true,
+  });
 
   // Reset to first page when data changes
   useEffect(() => {

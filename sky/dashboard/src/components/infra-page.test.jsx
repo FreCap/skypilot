@@ -235,7 +235,7 @@ describe('Infra page refresh lifecycle', () => {
     jest.useRealTimers();
   });
 
-  it('refreshes immediately on visibility restore without an adjacent duplicate', async () => {
+  it('preserves the due boundary when visibility returns before the next refresh', async () => {
     jest.useFakeTimers();
 
     const { unmount } = render(<GPUs />);
@@ -263,7 +263,7 @@ describe('Infra page refresh lifecycle', () => {
       window.document.dispatchEvent(new Event('visibilitychange'));
       await Promise.resolve();
     });
-    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(2);
+    expect(cacheCallsFor(getWorkspaceContexts)).toHaveLength(1);
 
     await act(async () => {
       jest.advanceTimersByTime(1);

@@ -6,7 +6,8 @@ export function useVisibleRefreshInterval(
   onRefresh,
   options = {}
 ) {
-  const { initialDelayMs = intervalMs } = options;
+  const { initialDelayMs = intervalMs, catchUpOnlyWhenOverdue = false } =
+    options;
   const onRefreshRef = useRef(onRefresh);
   const cadenceAnchorRef = useRef(null);
 
@@ -66,13 +67,19 @@ export function useVisibleRefreshInterval(
         return;
       }
 
-      const handled = onRefreshRef.current('visibilitychange');
       const now = window.performance.now();
-      const nextDueAt =
+      const nextDueAt = nextIntervalDueAtRef.current;
+      if (catchUpOnlyWhenOverdue && nextDueAt !== null && now < nextDueAt) {
+        scheduleNextRefresh(nextDueAt);
+        return;
+      }
+
+      const handled = onRefreshRef.current('visibilitychange');
+      const resumedDueAt =
         handled === false
           ? nextCadenceTickAfter(now)
           : nextCadenceTickAfter(now + intervalMs - 1);
-      scheduleNextRefresh(nextDueAt);
+      scheduleNextRefresh(resumedDueAt);
     };
 
     const initialDelay = Math.max(
@@ -94,5 +101,5 @@ export function useVisibleRefreshInterval(
         handleVisibilityChange
       );
     };
-  }, [enabled, initialDelayMs, intervalMs]);
+  }, [catchUpOnlyWhenOverdue, enabled, initialDelayMs, intervalMs]);
 }

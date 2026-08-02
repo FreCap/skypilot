@@ -763,9 +763,16 @@ export function GPUs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useVisibleRefreshInterval(!isInitialLoad, REFRESH_INTERVAL, () => {
-    startRefresh({ showLoadingIndicators: false });
-  });
+  useVisibleRefreshInterval(
+    !isInitialLoad,
+    REFRESH_INTERVAL,
+    () => {
+      startRefresh({ showLoadingIndicators: false });
+    },
+    {
+      catchUpOnlyWhenOverdue: true,
+    }
+  );
 
   // Reset states when component unmounts
   useEffect(() => {
