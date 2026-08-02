@@ -1290,6 +1290,8 @@ def test_worker_finalization_claims_cleanup_before_late_cancel(monkeypatch):
 
     shutdown.assert_called_once_with('worker-a', worker_job_id=17)
     assert not batch_coordinator._active_workers
+    assert not batch_coordinator._launching_workers
+    assert not batch_coordinator._cleaning_workers
 
 
 def test_worker_launched_after_cancel_cleans_itself(monkeypatch):
@@ -1319,7 +1321,160 @@ def test_worker_launched_after_cancel_cleans_itself(monkeypatch):
 
     assert not dispatch.is_alive()
     shutdown.assert_called_once_with('worker-a', worker_job_id=17)
+    assert not batch_coordinator._cleaning_workers
     assert not batch_coordinator._active_workers
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_waits_for_late_launched_worker(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    entered = threading.Event()
+    release_launch = threading.Event()
+    shutdown_entered = threading.Event()
+    release_shutdown = threading.Event()
+
+    def _launch_worker_service(cluster_name):
+        assert cluster_name == 'worker-a'
+        entered.set()
+        release_launch.wait(timeout=5)
+        return 17
+
+    def _shutdown_worker(cluster_name, worker_job_id=None):
+        assert cluster_name == 'worker-a'
+        assert worker_job_id == 17
+        shutdown_entered.set()
+        release_shutdown.wait(timeout=5)
+
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        _launch_worker_service)
+    monkeypatch.setattr(batch_coordinator, '_pop_ready_batch',
+                        mock.Mock(return_value=(None, None)))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records', mock.Mock(return_value=[]))
+    shutdown = mock.Mock(side_effect=_shutdown_worker)
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', shutdown)
+
+    dispatch = threading.Thread(target=batch_coordinator._worker_dispatch_loop,
+                                args=('worker-a',))
+    dispatch.start()
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        cleanup = asyncio.create_task(
+            batch_coordinator.handle_superseded(timeout=1))
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()
+
+        release_launch.set()
+        assert await asyncio.to_thread(shutdown_entered.wait, 1)
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()
+
+        release_time = time.monotonic()
+        release_shutdown.set()
+        await asyncio.wait_for(cleanup, timeout=1)
+        assert time.monotonic() - release_time < 0.15
+    finally:
+        release_launch.set()
+        release_shutdown.set()
+        dispatch.join(timeout=5)
+
+    assert not dispatch.is_alive()
+    shutdown.assert_called_once_with('worker-a', worker_job_id=17)
+    assert not batch_coordinator._active_workers
+    assert not batch_coordinator._launching_workers
+    assert not batch_coordinator._cleaning_workers
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_waits_for_started_worker_finalizer(
+        monkeypatch):
+    batch_coordinator = _make_coordinator()
+    shutdown_entered = threading.Event()
+    release_shutdown = threading.Event()
+
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        mock.Mock(return_value=17))
+    monkeypatch.setattr(batch_coordinator, '_pop_ready_batch',
+                        mock.Mock(return_value=(None, None)))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records', mock.Mock(return_value=[]))
+
+    def _shutdown_worker(cluster_name, worker_job_id=None):
+        assert cluster_name == 'worker-a'
+        assert worker_job_id == 17
+        shutdown_entered.set()
+        release_shutdown.wait(timeout=5)
+
+    shutdown = mock.Mock(side_effect=_shutdown_worker)
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', shutdown)
+    dispatch = threading.Thread(target=batch_coordinator._worker_dispatch_loop,
+                                args=('worker-a',))
+    dispatch.start()
+    try:
+        assert await asyncio.to_thread(shutdown_entered.wait, 1)
+        cleanup = asyncio.create_task(
+            batch_coordinator.handle_superseded(timeout=1))
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()
+
+        release_shutdown.set()
+        await asyncio.wait_for(cleanup, timeout=1)
+    finally:
+        release_shutdown.set()
+        dispatch.join(timeout=5)
+
+    assert not dispatch.is_alive()
+    shutdown.assert_called_once_with('worker-a', worker_job_id=17)
+    assert not batch_coordinator._cleaning_workers
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_waits_for_failed_late_launch(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    entered = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def _launch_worker_service(cluster_name):
+        assert cluster_name == 'worker-a'
+        entered.set()
+        release.wait(timeout=5)
+        raise RuntimeError('launch failed')
+
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        _launch_worker_service)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records', mock.Mock(return_value=[]))
+    shutdown = mock.Mock()
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', shutdown)
+
+    def _dispatch():
+        try:
+            batch_coordinator._worker_dispatch_loop('worker-a')
+        except Exception as e:  # pylint: disable=broad-except
+            errors.append(e)
+
+    dispatch = threading.Thread(target=_dispatch)
+    dispatch.start()
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        cleanup = asyncio.create_task(
+            batch_coordinator.handle_superseded(timeout=1))
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()
+        release.set()
+        await asyncio.wait_for(cleanup, timeout=1)
+    finally:
+        release.set()
+        dispatch.join(timeout=5)
+
+    assert not dispatch.is_alive()
+    assert len(errors) == 1
+    assert str(errors[0]) == 'launch failed'
+    shutdown.assert_not_called()
+    assert not batch_coordinator._active_workers
+    assert not batch_coordinator._launching_workers
+    assert not batch_coordinator._cleaning_workers
 
 
 def test_superseded_cleanup_claim_blocks_worker_finalizer(monkeypatch):
@@ -2340,7 +2495,7 @@ async def test_superseded_cleanup_has_one_global_deadline(monkeypatch):
     finally:
         release.set()
 
-    assert entered.is_set()
+    assert await asyncio.to_thread(entered.wait, 1)
     assert time.monotonic() - started < 0.5
     # The timed-out exec may finish, but no subsequent get/cancel is started.
     get.assert_not_called()

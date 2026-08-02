@@ -99,7 +99,10 @@ class BatchCoordinator:
 
         # Worker tracking: cluster_name → worker_job_id
         self._active_workers: dict[str, int] = {}
+        self._launching_workers: set[str] = set()
+        self._cleaning_workers: set[tuple[str, int]] = set()
         self._active_workers_lock = threading.Lock()
+        self._worker_state_changed = threading.Event()
 
         # Cancellation flag for inline (controller) mode.
         self._cancelled = False
@@ -214,16 +217,31 @@ class BatchCoordinator:
                 # Normal cancellation owns these workers synchronously.  A
                 # worker finalizer can only clean a later registration.
                 self._active_workers.clear()
+            self._worker_state_changed.set()
         return workers_snapshot
 
-    def _claim_worker_cleanup(self, cluster_name: str,
-                              worker_job_id: int) -> bool:
+    def _claim_worker_cleanup(self,
+                              cluster_name: str,
+                              worker_job_id: int,
+                              allow_superseded_cleanup: bool = False) -> bool:
         """Claim one worker and return whether local shutdown is allowed."""
         with self._active_workers_lock:
             if self._active_workers.get(cluster_name) != worker_job_id:
                 return False
             self._active_workers.pop(cluster_name)
-            return not self._superseded_cleanup_started
+            cleanup_allowed = (allow_superseded_cleanup or
+                               not self._superseded_cleanup_started)
+            if cleanup_allowed:
+                self._cleaning_workers.add((cluster_name, worker_job_id))
+            self._worker_state_changed.set()
+            return cleanup_allowed
+
+    def _finish_worker_cleanup(self, cluster_name: str,
+                               worker_job_id: int) -> None:
+        """Mark an externally owned worker shutdown as settled."""
+        with self._active_workers_lock:
+            self._cleaning_workers.discard((cluster_name, worker_job_id))
+            self._worker_state_changed.set()
 
     def _retire_active_worker(self, cluster_name: str,
                               worker_job_id: int) -> bool:
@@ -232,7 +250,39 @@ class BatchCoordinator:
             if self._active_workers.get(cluster_name) != worker_job_id:
                 return False
             self._active_workers.pop(cluster_name)
+            self._worker_state_changed.set()
             return True
+
+    def _mark_worker_launch_started(self, cluster_name: str) -> None:
+        """Track a worker launch that has not published its job ID yet."""
+        with self._active_workers_lock:
+            self._launching_workers.add(cluster_name)
+            self._worker_state_changed.set()
+
+    def _mark_worker_launch_failed(self, cluster_name: str) -> None:
+        """Forget a launch that failed before a worker job ID existed."""
+        with self._active_workers_lock:
+            self._launching_workers.discard(cluster_name)
+            self._worker_state_changed.set()
+
+    def _register_active_worker(self, cluster_name: str,
+                                worker_job_id: int) -> bool:
+        """Publish a launched worker and return whether supersession is live."""
+        with self._active_workers_lock:
+            self._launching_workers.discard(cluster_name)
+            self._active_workers[cluster_name] = worker_job_id
+            late_superseded_launch = self._superseded_cleanup_started
+            self._worker_state_changed.set()
+            return late_superseded_launch
+
+    def _pending_worker_cleanup_snapshot(
+            self) -> tuple[list[str], list[str], list[str]]:
+        """Return sorted pending worker states for diagnostics."""
+        with self._active_workers_lock:
+            return (sorted(self._active_workers),
+                    sorted(self._launching_workers),
+                    sorted(f'{name}:{job_id}'
+                           for name, job_id in self._cleaning_workers))
 
     async def handle_superseded(self, timeout: float = 60) -> None:
         """Bound cleanup of only this superseded incarnation's workers.
@@ -432,13 +482,20 @@ class BatchCoordinator:
 
         while loop.time() < deadline:
             with self._active_workers_lock:
-                if not self._active_workers:
+                if (not self._active_workers and not self._launching_workers and
+                        not self._cleaning_workers):
                     return
-            await asyncio.sleep(min(0.2, max(0, deadline - loop.time())))
-        with self._active_workers_lock:
-            remaining_workers = sorted(self._active_workers)
-        logger.warning('Timed out waiting for superseded Batch workers: %s',
-                       remaining_workers)
+                self._worker_state_changed.clear()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.to_thread(self._worker_state_changed.wait, remaining)
+        remaining_workers, launching_workers, cleaning_workers = (
+            self._pending_worker_cleanup_snapshot())
+        logger.warning(
+            'Timed out waiting for superseded Batch workers: active=%s, '
+            'launching=%s, cleaning=%s', remaining_workers, launching_workers,
+            cleaning_workers)
 
     def mark_succeeded(self, end_time: float) -> None:
         """Durably succeed only if this coordinator still owns the job."""
@@ -1310,9 +1367,16 @@ class BatchCoordinator:
         """
         job_id = str(self._managed_job_id)
 
-        worker_job_id = self._launch_worker_service(cluster_name)
-        with self._active_workers_lock:
-            self._active_workers[cluster_name] = worker_job_id
+        self._mark_worker_launch_started(cluster_name)
+        worker_job_id = None
+        late_superseded_launch = False
+        try:
+            worker_job_id = self._launch_worker_service(cluster_name)
+            late_superseded_launch = self._register_active_worker(
+                cluster_name, worker_job_id)
+        except Exception:
+            self._mark_worker_launch_failed(cluster_name)
+            raise
 
         try:
             while not self._cancelled:
@@ -1441,8 +1505,15 @@ class BatchCoordinator:
         finally:
             # Cleanup ownership is claimed under the same lock used by cancel
             # and supersession.  Exactly one path may issue external shutdown.
-            if self._claim_worker_cleanup(cluster_name, worker_job_id):
-                self._shutdown_worker(cluster_name, worker_job_id=worker_job_id)
+            if worker_job_id is not None and self._claim_worker_cleanup(
+                    cluster_name,
+                    worker_job_id,
+                    allow_superseded_cleanup=late_superseded_launch):
+                try:
+                    self._shutdown_worker(cluster_name,
+                                          worker_job_id=worker_job_id)
+                finally:
+                    self._finish_worker_cleanup(cluster_name, worker_job_id)
 
     # ------------------------------------------------------------------
     # Dispatch orchestration
