@@ -166,4 +166,24 @@ describe('useVisibleRefreshInterval', () => {
 
     unmount();
   });
+
+  it.each([
+    ['negative', -1],
+    ['infinite', Number.POSITIVE_INFINITY],
+  ])('disables %s refresh intervals', (_label, intervalMs) => {
+    const onRefresh = jest.fn();
+    const { unmount } = renderHook(() =>
+      useVisibleRefreshInterval(true, intervalMs, onRefresh)
+    );
+
+    expect(jest.getTimerCount()).toBe(0);
+
+    act(() => {
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
+
+    unmount();
+  });
 });
