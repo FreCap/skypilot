@@ -7,7 +7,7 @@ implemented and verified, with merge and deployment pending; no payoff gate
 was satisfied, and every materialized or authoritative capacity product remains
 unauthorized
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 Canonical owner: this file. Rejected materialized/active-control drafts remain
 recoverable from branch history and the review record; they are not a second
@@ -1487,11 +1487,19 @@ The stack was first rebased over path-disjoint PR #1104, producing base
 `521d1253d`. PR #1104 changed only the cluster-launch cancellation design,
 backend utilities, context utilities, and their tests.
 
-A second path-disjoint rebase over PR #1106 produced the exact current anchors:
+A second path-disjoint rebase over PR #1106 produced these historical anchors:
 `improvements` base `9b4e7c111`, retirement-design commit `80cee0be7`, and
 implementation commit `d416071a5`. PR #1106 changed only the managed-jobs
 queue design, CLI command routing, the new queue module, and its contract test.
 Neither intervening PR touched a capacity cleanup path.
+
+On 2026-08-02 the open cleanup PR was replayed cleanly onto current
+`improvements` base `9a4a38ce4`. The refreshed stack is retirement design
+`4673fa520`, scanner removal `57cd3dc97`, verification updates `8c6e609d3` and
+`b3209e774`, and fail-closed retired-mode enforcement `54c10f958`. The last
+change deliberately keeps `shadow` in the closed parser enum for a precise
+diagnostic while rejecting it at runtime; only `disabled` can start after the
+projector is removed.
 
 The implementation deletes all seven C2-only production modules and all five
 C2-only test modules in the ledger. The six shared implementation files are
@@ -1507,7 +1515,7 @@ mode/allowlist configuration, and retained C1 tests remain present. No schema
 revision, row deletion, or data rewrite is included.
 
 Local verification completed and the code-sensitive checks were repeated after
-each rebase:
+each rebase. The prior rebase's broader local evidence was:
 
 - compile/import checks loaded the retained capacity package and controller
   runtime and found exactly five capacity tables;
@@ -1521,6 +1529,11 @@ each rebase:
   socket, so that exact test remains a CI gate; and
 - YAPF, isort, mypy over 808 source files, pylint at 10.00/10, and dashboard
   lint/Prettier completed successfully on the exact changed files.
+
+On the 2026-08-02 refresh, the retained capacity model/state and migration
+test set passed with `SKYPILOT_CONFIG=/dev/null`; `git diff --check` passed;
+and the repository formatter completed YAPF, mypy, pylint, dashboard lint, and
+Prettier. CI must qualify the refreshed PR head before merge.
 
 This is implementation evidence only. It does not claim that the cleanup image
 has been merged or deployed; the retirement rollout checks above remain open.
