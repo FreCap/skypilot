@@ -2,6 +2,7 @@ import React, { useState, useEffect, createContext, useContext } from 'react';
 import { ArrowUpCircle } from 'lucide-react';
 import { NonCapitalizedTooltip } from '@/components/utils';
 import { apiClient } from '@/data/connectors/client';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 const VersionContext = createContext({
   version: null,
@@ -80,12 +81,11 @@ export function formatReleaseTimestamp(timestamp) {
 
 function useDeploymentAge(timestamp) {
   const [now, setNow] = useState(() => Date.now());
+  const hasValidTimestamp = parseReleaseTimestamp(timestamp) !== null;
 
-  useEffect(() => {
-    if (parseReleaseTimestamp(timestamp) === null) return undefined;
-    const interval = setInterval(() => setNow(Date.now()), 60 * 1000);
-    return () => clearInterval(interval);
-  }, [timestamp]);
+  useVisibleRefreshInterval(hasValidTimestamp, 60 * 1000, () => {
+    setNow(Date.now());
+  });
 
   return formatReleaseAge(timestamp, now);
 }

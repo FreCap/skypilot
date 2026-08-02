@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 
 import {
   DeploymentVersionContent,
@@ -11,6 +11,13 @@ import {
 afterEach(() => {
   jest.restoreAllMocks();
 });
+
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
 
 test('shows compact deployment age', () => {
   jest.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-08-01T17:30:00Z'));
@@ -79,4 +86,70 @@ test('formats deployment ages without inventing malformed timestamps', () => {
   expect(formatReleaseAge('2026-08-01T12:00:00', now)).toBeNull();
   expect(formatReleaseAge('123', now)).toBeNull();
   expect(formatReleaseTimestamp('not-a-time')).toBeNull();
+});
+
+test('pauses hidden deployment-age refreshes and restores one visible cadence', () => {
+  jest.useFakeTimers();
+  jest.setSystemTime(new Date('2026-08-01T17:58:00Z'));
+  const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+    window.document,
+    'visibilityState'
+  );
+  setDocumentVisibility('visible');
+
+  try {
+    render(
+      <DeploymentVersionContent
+        version="1.1.27"
+        latestVersion={null}
+        commit="abcdef123456"
+        commitTimestamp="2026-08-01T15:00:00Z"
+        build="5921"
+        deploymentTimestamp="2026-08-01T17:00:00Z"
+        plugins={[]}
+      />
+    );
+
+    expect(screen.getByText('v1.1.27 · deployed 58m ago')).toBeVisible();
+    expect(jest.getTimerCount()).toBe(1);
+
+    act(() => {
+      setDocumentVisibility('hidden');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(jest.getTimerCount()).toBe(0);
+
+    act(() => {
+      jest.advanceTimersByTime(90 * 1000);
+    });
+    expect(screen.getByText('v1.1.27 · deployed 58m ago')).toBeVisible();
+
+    act(() => {
+      setDocumentVisibility('visible');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(screen.getByText('v1.1.27 · deployed 59m ago')).toBeVisible();
+    expect(jest.getTimerCount()).toBe(1);
+
+    act(() => {
+      jest.advanceTimersByTime(89 * 1000);
+    });
+    expect(screen.getByText('v1.1.27 · deployed 59m ago')).toBeVisible();
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(screen.getByText('v1.1.27 · deployed 1h ago')).toBeVisible();
+  } finally {
+    if (visibilityDescriptor) {
+      Object.defineProperty(
+        window.document,
+        'visibilityState',
+        visibilityDescriptor
+      );
+    } else {
+      delete window.document.visibilityState;
+    }
+    jest.useRealTimers();
+  }
 });
