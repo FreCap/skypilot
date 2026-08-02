@@ -41,6 +41,7 @@ class _TestProviderProgressContract:
         self.transitions = []
         self.snapshot_validations = 0
         self.reject_next_snapshot = False
+        self.retry_seed_calls = []
 
     @staticmethod
     def _attestation(fence: actions.AttemptExecutionFence) -> dict:
@@ -102,8 +103,7 @@ class _TestProviderProgressContract:
                 not isinstance(value['provider_operation_id'], str)):
             raise ValueError('typed outcome operation ID is invalid')
 
-    def retry_seed(self, action, predecessor):
-        del action
+    def _seed_from_predecessor(self, predecessor):
         assert predecessor.typed_outcome is not None
         self._parse_outcome(predecessor.typed_outcome)
         if predecessor.typed_outcome['disposition'] not in {
@@ -120,8 +120,16 @@ class _TestProviderProgressContract:
         seed['worker_attestation'] = None
         return seed
 
+    def retry_seed(self, action, lineage_predecessor, predecessor):
+        del action
+        self.retry_seed_calls.append(
+            (None if lineage_predecessor is None else
+             lineage_predecessor.attempt, predecessor.attempt))
+        return self._seed_from_predecessor(predecessor)
+
     def validate_attempt_snapshot(self, action, predecessor, attempt,
                                   execution_fence):
+        del action
         self.snapshot_validations += 1
         if self.reject_next_snapshot:
             self.reject_next_snapshot = False
@@ -143,7 +151,7 @@ class _TestProviderProgressContract:
                         attempt.provider_progress_revision != 1 or
                         attestation is not None):
                     raise ValueError('invalid inherited retry seed')
-                expected = self.retry_seed(action, predecessor)
+                expected = self._seed_from_predecessor(predecessor)
                 if actions.canonical_json_bytes(progress) != (
                         actions.canonical_json_bytes(expected)):
                     raise ValueError('inherited retry seed differs')
@@ -207,6 +215,60 @@ class _TestProviderProgressContract:
                 phase, _ = self._parse_progress(attempt.provider_progress)
                 if phase == 'SUCCEEDED':
                     raise ValueError('SUCCEEDED progress cannot reduce READY')
+
+
+class _LineageProviderProgressContract(_TestProviderProgressContract):
+    """Synthetic domain contract with a durable immediate-lineage prefix."""
+
+    _LINEAGE_FIELD = 'lineage_predecessor_sha256'
+
+    @staticmethod
+    def lineage_commitment(attempt):
+        return actions.canonical_sha256({
+            'version': 1,
+            'action_id': str(attempt.action_id),
+            'attempt': attempt.attempt,
+            'request_id': attempt.request_id,
+            'request_input_sha256': attempt.request_input_sha256,
+            'provider_progress_sha256': attempt.provider_progress_sha256,
+            'typed_outcome_sha256': attempt.typed_outcome_sha256,
+            'request_terminal_state': attempt.request_terminal_state,
+        })
+
+    @staticmethod
+    def _parse_outcome(value):
+        if not isinstance(value, dict):
+            raise ValueError('typed outcome is not closed')
+        base_value = dict(value)
+        if _LineageProviderProgressContract._LINEAGE_FIELD not in base_value:
+            raise ValueError('typed outcome lacks its lineage commitment')
+        lineage_sha256 = base_value.pop(
+            _LineageProviderProgressContract._LINEAGE_FIELD)
+        _TestProviderProgressContract._parse_outcome(base_value)
+        if (lineage_sha256 is not None and
+            (not isinstance(lineage_sha256, str) or len(lineage_sha256) != 64)):
+            raise ValueError('typed outcome lineage commitment is invalid')
+
+    def retry_seed(self, action, lineage_predecessor, predecessor):
+        expected = (None if predecessor.attempt == 1 else
+                    self.lineage_commitment(lineage_predecessor))
+        assert predecessor.typed_outcome is not None
+        self._parse_outcome(predecessor.typed_outcome)
+        actual = predecessor.typed_outcome[self._LINEAGE_FIELD]
+        if actual != expected:
+            raise ValueError('retry lineage commitment differs from the exact '
+                             'immediate earlier attempt')
+        return super().retry_seed(action, lineage_predecessor, predecessor)
+
+    def validate_reduction(self, action, predecessor, attempt, reduction,
+                           context):
+        super().validate_reduction(action, predecessor, attempt, reduction,
+                                   context)
+        expected = (None if predecessor is None else
+                    self.lineage_commitment(predecessor))
+        if reduction.typed_outcome[self._LINEAGE_FIELD] != expected:
+            raise ValueError('reduction lineage commitment differs from the '
+                             'locked immediate predecessor')
 
 
 def _typed_progress(item, store, phase='CREATE_INTENT'):
@@ -414,6 +476,62 @@ def _settle_first_attempt_for_retry(engine, backend, store):
         storage.deactivate_execution_claim(claim_token)
     reduced = _reduce_retry(engine, store, action, request)
     return action, request, progress, reduced
+
+
+def _settle_lineage_attempt_for_retry(engine, backend, store, materialized,
+                                      request):
+    assert materialized.attempt is not None
+    attempt_record = materialized.attempt
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        current_progress = attempt_record.provider_progress
+        if current_progress is None:
+            proposed_progress = _typed_progress(item, store)
+            expected_progress_revision = 0
+        else:
+            proposed_progress = copy.deepcopy(current_progress)
+            proposed_progress['worker_attestation'] = _typed_progress(
+                item, store)['worker_attestation']
+            expected_progress_revision = 1
+        store.commit_intent_with_progress(request.request_id, proposed_progress,
+                                          expected_progress_revision)
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+
+    request_input = actions.ActionRequestInput.from_request(
+        materialized.action.action_id, attempt_record.attempt, request)
+    contract = store._provider_progress_contract
+
+    def reducer(unused_connection, unused_action, settled_attempt, context):
+        del unused_connection, unused_action
+        lineage_sha256 = (None if context.predecessor_attempt is None else
+                          contract.lineage_commitment(
+                              context.predecessor_attempt))
+        return actions.ActionReduction(
+            kernel_state=actions.KernelState.READY,
+            typed_outcome={
+                'version': 1,
+                'disposition': 'retryable',
+                'provider_operation_id': settled_attempt.provider_operation_id,
+                'lineage_predecessor_sha256': lineage_sha256,
+            },
+            result={
+                'version': 1,
+                'classification': 'transient',
+            },
+            retry_after_seconds=0)
+
+    with engine.begin() as connection:
+        return store.reduce_in_transaction(connection,
+                                           materialized.action.action_id,
+                                           attempt_record.attempt,
+                                           materialized.action.revision,
+                                           request_input, reducer)
 
 
 def test_admission_due_discovery_and_immutable_conflict(action_database):
@@ -1049,6 +1167,124 @@ def test_retry_materialization_requires_typed_inherited_seed(action_database):
         storage.deactivate_execution_claim(claim_token)
 
 
+def test_retry_materialization_and_lost_ack_use_locked_lineage_in_order(
+        action_database, monkeypatch):
+    engine, backend, _ = action_database
+    contract = _LineageProviderProgressContract()
+    store = resource_actions_postgres.PostgresResourceActionStore(
+        engine, provider_progress_contract=contract)
+    action = _admit(engine, store, _new_action())
+
+    request_one = _request(action.action_id, 1)
+    first = store.materialize(action.action_id, action.revision, 1, request_one)
+    assert first is not None and first.created
+    reduced_one = _settle_lineage_attempt_for_retry(engine, backend, store,
+                                                    first, request_one)
+
+    request_two = _request(action.action_id, 2)
+    second = store.materialize(action.action_id, reduced_one.action.revision, 2,
+                               request_two)
+    assert second is not None and second.created
+    second_replay = store.materialize(action.action_id,
+                                      reduced_one.action.revision, 2,
+                                      request_two)
+    assert second_replay is not None and second_replay.adopted
+    assert contract.retry_seed_calls == [(None, 1), (None, 1)]
+    reduced_two = _settle_lineage_attempt_for_retry(engine, backend, store,
+                                                    second, request_two)
+
+    lock_order = []
+    original_action = store._locked_action
+    original_attempt = store._locked_attempt
+
+    def _record_action(*args, **kwargs):
+        lock_order.append(('action', str(args[1])))
+        return original_action(*args, **kwargs)
+
+    def _record_attempt(*args, **kwargs):
+        lock_order.append(('attempt', args[2]))
+        return original_attempt(*args, **kwargs)
+
+    monkeypatch.setattr(store, '_locked_action', _record_action)
+    monkeypatch.setattr(store, '_locked_attempt', _record_attempt)
+    request_three = _request(action.action_id, 3)
+    third = store.materialize(action.action_id, reduced_two.action.revision, 3,
+                              request_three)
+    assert third is not None and third.created
+    assert lock_order[:4] == [('action', str(action.action_id)), ('attempt', 1),
+                              ('attempt', 2), ('attempt', 3)]
+    assert contract.retry_seed_calls[-1] == (1, 2)
+
+    lock_order.clear()
+    third_replay = store.materialize(action.action_id,
+                                     reduced_two.action.revision, 3,
+                                     request_three)
+    assert third_replay is not None and third_replay.adopted
+    assert lock_order[:4] == [('action', str(action.action_id)), ('attempt', 1),
+                              ('attempt', 2), ('attempt', 3)]
+    assert contract.retry_seed_calls[-2:] == [(1, 2), (1, 2)]
+
+
+@pytest.mark.parametrize('lost_ack', [False, True])
+def test_attempt_two_lineage_tampering_cannot_seed_or_adopt_attempt_three(
+        action_database, lost_ack):
+    engine, backend, _ = action_database
+    contract = _LineageProviderProgressContract()
+    store = resource_actions_postgres.PostgresResourceActionStore(
+        engine, provider_progress_contract=contract)
+    action = _admit(engine, store, _new_action())
+
+    request_one = _request(action.action_id, 1)
+    first = store.materialize(action.action_id, action.revision, 1, request_one)
+    assert first is not None and first.created
+    reduced_one = _settle_lineage_attempt_for_retry(engine, backend, store,
+                                                    first, request_one)
+    request_two = _request(action.action_id, 2)
+    second = store.materialize(action.action_id, reduced_one.action.revision, 2,
+                               request_two)
+    assert second is not None and second.created
+    reduced_two = _settle_lineage_attempt_for_retry(engine, backend, store,
+                                                    second, request_two)
+    request_three = _request(action.action_id, 3)
+    if lost_ack:
+        third = store.materialize(action.action_id, reduced_two.action.revision,
+                                  3, request_three)
+        assert third is not None and third.created
+
+    with engine.begin() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                2).with_for_update()).mappings().one()
+        outcome = copy.deepcopy(row['typed_outcome'])
+        outcome['lineage_predecessor_sha256'] = '0' * 64
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                2).values(
+                    typed_outcome=outcome,
+                    typed_outcome_sha256=actions.canonical_sha256(outcome)))
+
+    with pytest.raises(actions.ActionConflict,
+                       match='lineage commitment differs'):
+        store.materialize(action.action_id, reduced_two.action.revision, 3,
+                          request_three)
+    if not lost_ack:
+        with engine.connect() as connection:
+            attempt_three = connection.execute(
+                sqlalchemy.select(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt).where(
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                        action.action_id,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                        3)).scalar_one_or_none()
+        assert attempt_three is None
+
+
 @pytest.mark.parametrize('corruption,match', [
     ('succeeded_cursor', 'SUCCEEDED progress cannot be retried'),
     ('unauthorized_outcome', 'does not authorize retry'),
@@ -1339,6 +1575,7 @@ def test_domain_contract_provider_operation_id_matrix(action_database,
 def test_generic_store_preserves_domain_nested_operation_id(action_database):
 
     class _NestedOperationContract(_TestProviderProgressContract):
+        """Synthetic contract with a nested operation-ID projection."""
 
         @staticmethod
         def _parse_outcome(value):

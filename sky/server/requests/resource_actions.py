@@ -598,9 +598,19 @@ class ProviderProgressContract(Protocol):
     I/O or mutate durable state.
     """
 
-    def retry_seed(self, action: ActionRecord,
-                   predecessor: AttemptRecord) -> Mapping[str, Any] | None:
-        """Derive the only legal attempt-local seed from a predecessor."""
+    def retry_seed(
+        self,
+        action: ActionRecord,
+        lineage_predecessor: AttemptRecord | None,
+        predecessor: AttemptRecord,
+    ) -> Mapping[str, Any] | None:
+        """Derive the only legal seed from a predecessor and its lineage.
+
+        ``lineage_predecessor`` is the attempt immediately before
+        ``predecessor``, or ``None`` exactly when ``predecessor`` is attempt
+        one.  This lets a domain validate predecessor outcome/prefix
+        commitments without making the generic store understand their shape.
+        """
 
     def validate_attempt_snapshot(
         self,

@@ -583,9 +583,22 @@ class PostgresResourceActionStore:
     def _derive_retry_seed(
         self,
         action: actions.ActionRecord,
+        lineage_predecessor: actions.AttemptRecord | None,
         predecessor: actions.AttemptRecord,
     ) -> actions.JsonObject | None:
         """Validate a settled predecessor and derive its sole retry seed."""
+        if (predecessor.action_id != action.action_id or
+            (predecessor.attempt == 1) != (lineage_predecessor is None)):
+            raise actions.InvariantViolation(
+                'Retry predecessor lineage does not match its action/attempt.')
+        if lineage_predecessor is not None:
+            if (lineage_predecessor.action_id != action.action_id or
+                    lineage_predecessor.attempt != predecessor.attempt - 1 or
+                    lineage_predecessor.mutation_boundary
+                    is not actions.MutationBoundary.SETTLED):
+                raise actions.InvariantViolation(
+                    'Retry lineage predecessor is not the exact settled '
+                    'immediate earlier attempt.')
         if predecessor.mutation_boundary is not actions.MutationBoundary.SETTLED:
             raise actions.ActionConflict('Retry predecessor is not settled.')
         if predecessor.typed_outcome is None:
@@ -609,7 +622,7 @@ class PostgresResourceActionStore:
                 'retained bytes.')
         try:
             seed_value = self._provider_progress_contract.retry_seed(
-                action, predecessor)
+                action, lineage_predecessor, predecessor)
             seed = (
                 None if seed_value is None else actions._canonical_object(  # pylint: disable=protected-access
                     seed_value,
@@ -622,6 +635,28 @@ class PostgresResourceActionStore:
             raise actions.ActionConflict(
                 'Typed retry seed presence differs from predecessor progress.')
         return seed
+
+    def _locked_retry_lineage(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        action: actions.ActionRecord,
+        predecessor_attempt: int,
+    ) -> tuple[actions.AttemptRecord | None, actions.AttemptRecord]:
+        """Lock the predecessor's immediate lineage in attempt order."""
+        lineage_predecessor: actions.AttemptRecord | None = None
+        if predecessor_attempt > 1:
+            lineage_row = self._locked_attempt(connection, action.action_id,
+                                               predecessor_attempt - 1)
+            if lineage_row is None:
+                raise actions.InvariantViolation(
+                    'Retry materialization is missing its lineage predecessor.')
+            lineage_predecessor = _attempt_record(lineage_row)
+        predecessor_row = self._locked_attempt(connection, action.action_id,
+                                               predecessor_attempt)
+        if predecessor_row is None:
+            raise actions.InvariantViolation(
+                'Retry materialization is missing its predecessor.')
+        return lineage_predecessor, _attempt_record(predecessor_row)
 
     def _validate_progress_snapshot(
         self,
@@ -746,13 +781,11 @@ class PostgresResourceActionStore:
                 predecessor: actions.AttemptRecord | None = None
                 progress_seed: actions.JsonObject | None = None
                 if expected_attempt > 1:
-                    predecessor_row = self._locked_attempt(
-                        connection, action.action_id, expected_attempt - 1)
-                    if predecessor_row is None:
-                        raise actions.InvariantViolation(
-                            'Retry materialization is missing its predecessor.')
-                    predecessor = _attempt_record(predecessor_row)
-                    progress_seed = self._derive_retry_seed(action, predecessor)
+                    lineage_predecessor, predecessor = (
+                        self._locked_retry_lineage(connection, action,
+                                                   expected_attempt - 1))
+                    progress_seed = self._derive_retry_seed(
+                        action, lineage_predecessor, predecessor)
                 inserted_attempt = connection.execute(
                     postgresql.insert(
                         request_postgres.RESOURCE_ACTION_ATTEMPTS).values(
@@ -907,16 +940,13 @@ class PostgresResourceActionStore:
                         'lost-ack materialization.')
                 predecessor = None
                 if expected_attempt > 1:
-                    predecessor_row = self._locked_attempt(
-                        connection, action.action_id, expected_attempt - 1)
-                    if predecessor_row is None:
-                        raise actions.InvariantViolation(
-                            'Lost-ACK retry adoption is missing its predecessor.'
-                        )
-                    predecessor = _attempt_record(predecessor_row)
+                    lineage_predecessor, predecessor = (
+                        self._locked_retry_lineage(connection, action,
+                                                   expected_attempt - 1))
                     # Re-derivation validates the settled predecessor's typed
                     # outcome/cursor without accepting any caller cursor.
-                    self._derive_retry_seed(action, predecessor)
+                    self._derive_retry_seed(action, lineage_predecessor,
+                                            predecessor)
                 attempt, request_row, queue_row = self._locked_binding(
                     connection, request_input)
                 if attempt is None or request_row is None:
