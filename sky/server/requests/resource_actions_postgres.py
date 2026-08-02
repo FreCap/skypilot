@@ -227,10 +227,6 @@ def _attempt_record(row: Mapping[str, Any]) -> actions.AttemptRecord:
                     terminal_state not in _TERMINAL_REQUEST_STATES or
                     settled_at is None):
                 raise ValueError('settled attempt has incomplete evidence')
-            if typed_outcome.get(
-                    'provider_operation_id') != provider_operation_id:
-                raise ValueError(
-                    'settled provider operation evidence is inconsistent')
         elif (typed_outcome is not None or terminal_state is not None or
               settled_at is not None):
             raise ValueError('unsettled attempt has terminal evidence')
@@ -653,6 +649,7 @@ class PostgresResourceActionStore:
         predecessor: actions.AttemptRecord | None,
         attempt: actions.AttemptRecord,
         reduction: actions.ActionReduction,
+        context: actions.ReductionContext,
     ) -> None:
         if reduction.kernel_state is actions.KernelState.READY:
             if attempt.provider_progress is None:
@@ -674,7 +671,7 @@ class PostgresResourceActionStore:
                         'revision-one seed.')
         try:
             self._provider_progress_contract.validate_reduction(
-                action, predecessor, attempt, reduction)
+                action, predecessor, attempt, reduction, context)
         except (TypeError, ValueError) as e:
             raise actions.ActionConflict(
                 f'Typed action reduction is invalid: {e}') from e
@@ -1369,44 +1366,15 @@ class PostgresResourceActionStore:
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
         terminal_request = request_postgres._request_from_mapping(  # pylint: disable=protected-access
             request_row)
+        reduction_context = actions.ReductionContext(
+            terminal_request=terminal_request, database_now=database_now)
         reduction = reducer(connection, action, attempt_record,
-                            terminal_request).normalized()
+                            reduction_context).normalized()
         typed_outcome = dict(reduction.typed_outcome)
         result_value = dict(reduction.result)
-        if 'provider_operation_id' not in typed_outcome:
-            raise actions.ActionConflict(
-                'Typed outcome is missing provider_operation_id.')
-        typed_provider_operation_id = typed_outcome.get('provider_operation_id')
-        if typed_provider_operation_id is not None:
-            if not isinstance(typed_provider_operation_id, str):
-                raise actions.ActionConflict(
-                    'typed provider_operation_id must be text or null.')
-            typed_provider_operation_id = actions._bounded_text(  # pylint: disable=protected-access
-                typed_provider_operation_id,
-                name='provider_operation_id',
-                maximum_bytes=1024)
-            if attempt_record.provider_operation_id is None:
-                raise actions.ActionConflict(
-                    'Typed outcome cannot create provider operation evidence '
-                    'that is absent from the claim-fenced journal.')
-            if (attempt_record.provider_operation_id
-                    != typed_provider_operation_id):
-                raise actions.ActionConflict(
-                    'Typed outcome conflicts with journaled provider '
-                    'operation ID.')
         provider_operation_id = attempt_record.provider_operation_id
-        typed_outcome['provider_operation_id'] = provider_operation_id
-        typed_outcome = actions._canonical_object(  # pylint: disable=protected-access
-            typed_outcome,
-            name='settled_typed_outcome')
-        reduction = actions.ActionReduction(
-            kernel_state=reduction.kernel_state,
-            typed_outcome=typed_outcome,
-            result=result_value,
-            retry_after_seconds=reduction.retry_after_seconds,
-            terminal_disposition=reduction.terminal_disposition).normalized()
         self._validate_reduction_contract(action, predecessor, attempt_record,
-                                          reduction)
+                                          reduction, reduction_context)
 
         settled = connection.execute(
             sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(

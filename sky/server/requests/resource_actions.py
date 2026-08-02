@@ -581,6 +581,14 @@ class ActionReduction:
                                disposition)
 
 
+@dataclasses.dataclass(frozen=True)
+class ReductionContext:
+    """Locked request evidence and database time for one first reduction."""
+
+    terminal_request: requests_lib.Request
+    database_now: datetime.datetime
+
+
 class ProviderProgressContract(Protocol):
     """Domain-owned closed validation behind the generic API006 journal.
 
@@ -618,6 +626,7 @@ class ProviderProgressContract(Protocol):
         predecessor: AttemptRecord | None,
         attempt: AttemptRecord,
         reduction: ActionReduction,
+        context: ReductionContext,
     ) -> None:
         """Validate a first terminal reduction, including retry authority."""
 
@@ -633,5 +642,5 @@ class ReductionResult:
 
 Reducer = Callable[[
     'sqlalchemy.engine.Connection', ActionRecord, AttemptRecord,
-    'requests_lib.Request'
+    ReductionContext
 ], ActionReduction]

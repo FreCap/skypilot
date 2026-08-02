@@ -3,6 +3,7 @@
 
 import concurrent.futures
 import copy
+import datetime
 import os
 import shutil
 import threading
@@ -184,10 +185,21 @@ class _TestProviderProgressContract:
                 raise ValueError('worker attestation changed')
         self.transitions.append((old_phase, new_phase))
 
-    def validate_reduction(self, action, predecessor, attempt, reduction):
+    def validate_reduction(self, action, predecessor, attempt, reduction,
+                           context):
         self.validate_attempt_snapshot(action, predecessor, attempt, None)
+        if (context.terminal_request.request_id != attempt.request_id or
+                context.terminal_request.status not in {
+                    requests.RequestStatus.SUCCEEDED,
+                    requests.RequestStatus.FAILED,
+                    requests.RequestStatus.CANCELLED,
+                } or not isinstance(context.database_now, datetime.datetime)):
+            raise ValueError('reduction context differs from terminal request')
         outcome = dict(reduction.typed_outcome)
         self._parse_outcome(outcome)
+        if outcome['provider_operation_id'] != attempt.provider_operation_id:
+            raise ValueError('typed outcome conflicts with journaled provider '
+                             'operation ID')
         if reduction.kernel_state is actions.KernelState.READY:
             if outcome['disposition'] not in {'retryable', 'uncertain'}:
                 raise ValueError('typed outcome does not authorize retry')
@@ -363,8 +375,8 @@ def _reduce_retry(engine, store, action, request):
     request_input = actions.ActionRequestInput.from_request(
         action.action_id, 1, request)
 
-    def reducer(connection, action_record, attempt_record, terminal_request):
-        del connection, action_record, attempt_record, terminal_request
+    def reducer(connection, action_record, attempt_record, context):
+        del connection, action_record, attempt_record, context
         return actions.ActionReduction(
             kernel_state=actions.KernelState.READY,
             typed_outcome={
@@ -743,16 +755,16 @@ def test_claim_journal_and_retry_reduction_replay_keep_deadline(
         action.action_id, 1, request)
     callbacks = []
 
-    def reducer(connection, action_record, attempt_record, terminal_request):
+    def reducer(connection, action_record, attempt_record, context):
         del connection
         callbacks.append((action_record.revision, attempt_record.attempt,
-                          terminal_request.status))
+                          context.terminal_request.status))
         return actions.ActionReduction(
             kernel_state=actions.KernelState.READY,
             typed_outcome={
                 'version': 1,
                 'disposition': 'retryable',
-                'provider_operation_id': None,
+                'provider_operation_id': attempt_record.provider_operation_id,
             },
             result={
                 'version': 1,
@@ -1162,16 +1174,16 @@ def test_reducer_locks_predecessor_before_current_attempt(
                               ('attempt', 2)]
 
 
-@pytest.mark.parametrize('journal_id,typed_id,expected_id,error_match', [
+@pytest.mark.parametrize('journal_id,handler_id,expected_id,error_match', [
     (None, None, None, None),
     ('operation-1', None, 'operation-1', None),
     ('operation-1', 'operation-1', 'operation-1', None),
     ('operation-1', 'operation-2', None, 'conflicts with journaled'),
-    (None, 'operation-1', None, 'cannot create provider operation'),
+    (None, 'operation-1', None, 'conflicts with journaled'),
 ])
-def test_settlement_provider_operation_id_matrix(action_database, journal_id,
-                                                 typed_id, expected_id,
-                                                 error_match):
+def test_domain_contract_provider_operation_id_matrix(action_database,
+                                                      journal_id, handler_id,
+                                                      expected_id, error_match):
     engine, backend, store = action_database
     action = _admit(engine, store, _new_action())
     request = _request(action.action_id)
@@ -1192,14 +1204,17 @@ def test_settlement_provider_operation_id_matrix(action_database, journal_id,
     request_input = actions.ActionRequestInput.from_request(
         action.action_id, 1, request)
 
-    def reducer(*unused_args):
-        del unused_args
+    def reducer(unused_connection, unused_action, attempt_record,
+                unused_context):
+        del unused_connection, unused_action, unused_context
+        normalized_operation_id = (attempt_record.provider_operation_id
+                                   if handler_id is None else handler_id)
         return actions.ActionReduction(
             kernel_state=actions.KernelState.TERMINAL,
             typed_outcome={
                 'version': 1,
                 'disposition': 'terminal_error',
-                'provider_operation_id': typed_id,
+                'provider_operation_id': normalized_operation_id,
             },
             result={
                 'version': 1,
@@ -1219,6 +1234,83 @@ def test_settlement_provider_operation_id_matrix(action_database, journal_id,
     assert settled.attempt.provider_operation_id == expected_id
     assert settled.attempt.typed_outcome is not None
     assert settled.attempt.typed_outcome['provider_operation_id'] == expected_id
+
+
+def test_generic_store_preserves_domain_nested_operation_id(action_database):
+
+    class _NestedOperationContract(_TestProviderProgressContract):
+
+        @staticmethod
+        def _parse_outcome(value):
+            if not isinstance(value, dict) or set(value) != {
+                    'version', 'provider_result'
+            }:
+                raise ValueError('nested typed outcome is not closed')
+            provider_result = value['provider_result']
+            if (value['version'] != 1 or
+                    not isinstance(provider_result, dict) or
+                    set(provider_result) != {'provider_operation_id'} or
+                (provider_result['provider_operation_id'] is not None and
+                 not isinstance(provider_result['provider_operation_id'], str))
+               ):
+                raise ValueError('nested provider result is invalid')
+
+        def validate_reduction(self, action, predecessor, attempt, reduction,
+                               context):
+            self.validate_attempt_snapshot(action, predecessor, attempt, None)
+            self._parse_outcome(reduction.typed_outcome)
+            if (reduction.typed_outcome['provider_result']
+                ['provider_operation_id'] != attempt.provider_operation_id):
+                raise ValueError('nested operation ID differs from journal')
+            if context.terminal_request.request_id != attempt.request_id:
+                raise ValueError('terminal request differs from attempt')
+
+    engine, backend, store = action_database
+    store._provider_progress_contract = _NestedOperationContract()
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    store.materialize(action.action_id, 1, 1, request)
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        store.commit_intent_with_progress(request.request_id,
+                                          _typed_progress(item, store), 0)
+        store.record_submission(request.request_id, 'nested-operation')
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    request_input = actions.ActionRequestInput.from_request(
+        action.action_id, 1, request)
+
+    def reducer(unused_connection, unused_action, attempt_record,
+                unused_context):
+        del unused_connection, unused_action, unused_context
+        return actions.ActionReduction(
+            kernel_state=actions.KernelState.TERMINAL,
+            typed_outcome={
+                'version': 1,
+                'provider_result': {
+                    'provider_operation_id':
+                        attempt_record.provider_operation_id,
+                },
+            },
+            result={
+                'version': 1,
+            },
+            terminal_disposition='nested_terminal')
+
+    with engine.begin() as connection:
+        settled = store.reduce_in_transaction(connection, action.action_id, 1,
+                                              2, request_input, reducer)
+    assert settled.attempt.typed_outcome == {
+        'version': 1,
+        'provider_result': {
+            'provider_operation_id': 'nested-operation',
+        },
+    }
 
 
 def test_settled_replay_revalidates_closed_typed_outcome(action_database):
