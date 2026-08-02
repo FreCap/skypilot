@@ -8078,6 +8078,220 @@ borrowing any uncommitted marker, and the row-existence predicate rejects a
 same-transaction second insert. Duplicate legacy or keyed mutation of a mapped
 row is therefore rejected, while ordinary legacy behavior is unchanged.
 
+###### M5-S0a persistence foundation pre-slice
+
+M5-S0 first lands one separately reviewed, merged, deployed, and monitored
+v40-compatible persistence pre-slice before any v41 process is advertised.
+M5-S0a creates no keyed row, registers no RPC, changes no scheduler or status
+path, and keeps `SKYLET_VERSION = 40`. This distinction is required because a
+Skylet version bump force-kills and restarts the existing daemon: using `41`
+for schema-only code would both cause an unnecessary restart and prevent the
+complete v41 implementation from forcing its required later restart. M5-S0a
+does not satisfy any v41 capability, activation, or worker-compatibility gate.
+
+`KEYED_SUBMISSION_SCHEMA_VERSION = 1` is a code-owned constant, not
+`PRAGMA user_version`; the existing database is shared with unversioned legacy
+migrations. The exact v1 side-table layout is:
+
+```sql
+CREATE TABLE keyed_submissions (
+  username TEXT NOT NULL,
+  submission_key TEXT NOT NULL,
+  job_id INTEGER NOT NULL CHECK (job_id > 0),
+  add_digest TEXT NOT NULL,
+  queue_digest TEXT,
+  service_hash TEXT NOT NULL,
+  worker_incarnation TEXT NOT NULL,
+  lifecycle_fence_operation_id TEXT NOT NULL,
+  lifecycle_fence_identity_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN (
+    'UNQUEUED', 'QUEUED', 'LAUNCHING', 'STARTED', 'CANCELLING',
+    'COMPLETING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'QUARANTINED',
+    'INSERTING', 'UPDATING', 'RECEIPTING', 'STATUS_UPDATING', 'DELETING')),
+  driver_token TEXT,
+  containment_plan BLOB NOT NULL,
+  containment_plan_digest TEXT NOT NULL,
+  provisional_root_pid INTEGER CHECK (
+    provisional_root_pid IS NULL OR provisional_root_pid > 0),
+  provisional_process_start_identity BLOB,
+  local_supervisor_operation_id TEXT,
+  local_cgroup_scope_uuid TEXT NOT NULL,
+  supervisor_launch_receipt_digest TEXT,
+  cancel_operation_id TEXT,
+  cancel_digest TEXT,
+  cancel_origin_state TEXT CHECK (
+    cancel_origin_state IS NULL OR
+    cancel_origin_state IN ('QUEUED', 'LAUNCHING', 'STARTED')),
+  cancel_grace_policy_version TEXT CHECK (
+    cancel_grace_policy_version IS NULL OR
+    cancel_grace_policy_version = 'TERM_10S_THEN_HARD_KILL_V1'),
+  cancel_host_boot_id TEXT,
+  cancel_deadline_boottime_ns INTEGER CHECK (
+    cancel_deadline_boottime_ns IS NULL OR
+    cancel_deadline_boottime_ns >= 0),
+  cancel_phase TEXT CHECK (
+    cancel_phase IS NULL OR cancel_phase IN (
+      'INTENT', 'GRACE_ENTERED', 'HARD_KILL_ENTERED', 'OWNERS_RETIRED')),
+  completion_operation_id TEXT,
+  completion_identity_digest TEXT,
+  pending_legacy_status TEXT CHECK (
+    pending_legacy_status IS NULL OR pending_legacy_status IN (
+      'SUCCEEDED', 'FAILED', 'FAILED_SETUP', 'FAILED_DRIVER')),
+  supervisor_outcome_receipt_digest TEXT,
+  completion_phase TEXT CHECK (
+    completion_phase IS NULL OR completion_phase IN (
+      'OUTCOME_RECORDED', 'OWNERS_SEALED', 'OWNERS_RETIRED')),
+  terminal_legacy_status TEXT CHECK (
+    terminal_legacy_status IS NULL OR terminal_legacy_status IN (
+      'SUCCEEDED', 'FAILED', 'FAILED_SETUP', 'FAILED_DRIVER', 'CANCELLED')),
+  PRIMARY KEY (username, submission_key),
+  CHECK ((provisional_root_pid IS NULL) =
+         (provisional_process_start_identity IS NULL)),
+  CHECK (state NOT IN (
+    'UPDATING', 'LAUNCHING', 'STARTED', 'RECEIPTING', 'COMPLETING',
+    'SUCCEEDED', 'FAILED') OR local_supervisor_operation_id IS NOT NULL),
+  CHECK (state NOT IN (
+    'UPDATING', 'LAUNCHING', 'STARTED', 'RECEIPTING', 'COMPLETING',
+    'SUCCEEDED', 'FAILED') OR driver_token IS NOT NULL),
+  CHECK (cancel_origin_state IS NULL OR cancel_origin_state = 'QUEUED' OR
+         (local_supervisor_operation_id IS NOT NULL AND
+          driver_token IS NOT NULL)),
+  CHECK (
+    (cancel_operation_id IS NULL AND cancel_digest IS NULL AND
+     cancel_origin_state IS NULL AND cancel_grace_policy_version IS NULL AND
+     cancel_host_boot_id IS NULL AND
+     cancel_deadline_boottime_ns IS NULL AND cancel_phase IS NULL) OR
+    (cancel_operation_id IS NOT NULL AND cancel_digest IS NOT NULL AND
+     cancel_origin_state IS NOT NULL AND
+     cancel_grace_policy_version IS NOT NULL AND
+     cancel_host_boot_id IS NOT NULL AND
+     cancel_deadline_boottime_ns IS NOT NULL AND cancel_phase IS NOT NULL)),
+  CHECK (state != 'CANCELLING' OR cancel_operation_id IS NOT NULL),
+  CHECK (
+    (completion_operation_id IS NULL AND
+     completion_identity_digest IS NULL AND pending_legacy_status IS NULL AND
+     supervisor_outcome_receipt_digest IS NULL AND completion_phase IS NULL) OR
+    (completion_operation_id IS NOT NULL AND
+     completion_identity_digest IS NOT NULL AND
+     pending_legacy_status IS NOT NULL AND
+     supervisor_outcome_receipt_digest IS NOT NULL AND
+     completion_phase IS NOT NULL)),
+  CHECK (state NOT IN ('COMPLETING', 'SUCCEEDED', 'FAILED') OR
+         completion_operation_id IS NOT NULL),
+  CHECK (state NOT IN ('COMPLETING', 'SUCCEEDED', 'FAILED') OR
+         cancel_operation_id IS NULL),
+  CHECK (state != 'CANCELLED' OR completion_operation_id IS NULL),
+  CHECK (
+    (state = 'SUCCEEDED' AND terminal_legacy_status IS 'SUCCEEDED') OR
+    (state = 'FAILED' AND terminal_legacy_status IS NOT NULL AND
+     terminal_legacy_status IN ('FAILED', 'FAILED_SETUP', 'FAILED_DRIVER')) OR
+    (state = 'CANCELLED' AND terminal_legacy_status IS 'CANCELLED') OR
+    (state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED') AND
+     terminal_legacy_status IS NULL))
+);
+
+CREATE UNIQUE INDEX keyed_submissions_job_id_uq
+  ON keyed_submissions(job_id);
+CREATE INDEX keyed_submissions_state_idx
+  ON keyed_submissions(state, job_id);
+
+CREATE TABLE keyed_submission_containments (
+  username TEXT NOT NULL,
+  submission_key TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  kind TEXT NOT NULL CHECK (kind = 'LOCAL_CGROUP_V2_DIRECT_V1'),
+  implementation_digest TEXT NOT NULL,
+  owner_uuid TEXT NOT NULL,
+  identity_digest TEXT NOT NULL,
+  provider_native_owner_locator BLOB,
+  state TEXT NOT NULL CHECK (state IN (
+    'PLANNED', 'PREPARED', 'LAUNCHED', 'SEALED', 'EMPTY', 'RETIRED',
+    'QUARANTINED')),
+  prepare_receipt BLOB,
+  prepare_receipt_digest TEXT,
+  launch_receipt BLOB,
+  launch_receipt_digest TEXT,
+  effect_receipt BLOB,
+  effect_receipt_digest TEXT,
+  seal_receipt BLOB,
+  seal_receipt_digest TEXT,
+  empty_receipt BLOB,
+  empty_receipt_digest TEXT,
+  retirement_receipt BLOB,
+  retirement_receipt_digest TEXT,
+  PRIMARY KEY (username, submission_key, ordinal),
+  CHECK ((prepare_receipt IS NULL) = (prepare_receipt_digest IS NULL)),
+  CHECK ((launch_receipt IS NULL) = (launch_receipt_digest IS NULL)),
+  CHECK ((effect_receipt IS NULL) = (effect_receipt_digest IS NULL)),
+  CHECK ((seal_receipt IS NULL) = (seal_receipt_digest IS NULL)),
+  CHECK ((empty_receipt IS NULL) = (empty_receipt_digest IS NULL)),
+  CHECK ((retirement_receipt IS NULL) =
+         (retirement_receipt_digest IS NULL)),
+  CHECK (state != 'PREPARED' OR prepare_receipt IS NOT NULL),
+  CHECK (state != 'LAUNCHED' OR
+         (prepare_receipt IS NOT NULL AND launch_receipt IS NOT NULL)),
+  CHECK (state != 'SEALED' OR seal_receipt IS NOT NULL),
+  CHECK (state != 'EMPTY' OR
+         (seal_receipt IS NOT NULL AND empty_receipt IS NOT NULL)),
+  CHECK (state != 'RETIRED' OR retirement_receipt IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX keyed_submission_containments_owner_uuid_uq
+  ON keyed_submission_containments(owner_uuid);
+CREATE INDEX keyed_submission_containments_state_idx
+  ON keyed_submission_containments(state, username, submission_key);
+
+CREATE TABLE keyed_submission_seals (
+  username TEXT NOT NULL,
+  submission_key TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN ('ADD', 'QUEUE')),
+  expected_add_digest TEXT NOT NULL,
+  job_id INTEGER,
+  queue_digest TEXT,
+  state TEXT NOT NULL CHECK (state = 'SEALED_ABSENT'),
+  created_at REAL NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (username, submission_key, phase),
+  CHECK ((phase = 'ADD' AND job_id IS NULL AND queue_digest IS NULL) OR
+         (phase = 'QUEUE' AND job_id IS NOT NULL AND job_id > 0 AND
+          queue_digest IS NOT NULL))
+);
+```
+
+All identifier, digest, token, and canonical-byte fields are additionally
+validated by the v41 reducer before insertion. SQLite owns only the closed
+state, nullability, numeric, primary-key, and uniqueness invariants above; it
+does not guess future digest or UUID versions. Foreign keys are deliberately
+absent because existing v40 connections do not enable SQLite foreign-key
+enforcement. The reducer must validate the parent submission in its same
+`BEGIN IMMEDIATE` transaction.
+
+The installer runs only after the legacy additive-column commits, requires no
+active transaction, and creates all three tables and four named indexes in one
+`BEGIN IMMEDIATE`. It validates the code-owned canonical SQL for every object
+before commit. Canonicalization removes the exact `IF NOT EXISTS` clause that
+SQLite omits from `sqlite_master.sql`, removes ASCII whitespace outside
+single-quoted literals, strips one trailing semicolon, and otherwise preserves
+every UTF-8 byte. Repeated and concurrent installation is create-or-validate.
+A reserved-name or owned-object shape mismatch rolls back every object created
+by that attempt, reports keyed schema unavailable, and leaves ordinary v40 job
+initialization available; an I/O error, corrupt database, or failure involving
+either legacy table still propagates. The later v41 capability revalidates this
+exact object set and advertises no keyed profile when it is unavailable.
+
+M5-S0a deliberately installs no trigger and no mapped-row producer. The
+persistent negative-authority triggers land in M5-S0b together with the only
+v41 reducer able to satisfy their transient guard protocol. Their literal SQL
+and catalog-validation bytes must be added to this canonical design before S0b
+implementation. The S0b triggers must use `RAISE(ROLLBACK, ...)`, reject
+pending inserts after either applicable seal, preserve immutable pending-row
+identity while advancing `submit` from zero, bind PID publication to the exact
+stored provisional process, enforce exact status transitions and retired-owner
+terminalization, reject mapped job replace, rekey, or delete, and prevent
+replacement or rewriting of side-table identities and already stored receipt
+columns. Landing them with the reducer avoids expanding every v40 write path
+before any keyed owner exists while retaining the final stale-writer barrier
+before the first keyed row can be produced.
+
 A v40 binary can still add and queue ordinary jobs after the schema appears.
 If it later sees an existing keyed pending row, its autonomous `_run_job()`
 fails on the guarded pending update before process spawn, its status heuristic
@@ -9374,8 +9588,17 @@ with a new typed birth and new scope. Otherwise rollback is a forward fix.
 
 ##### Milestones and removal gates
 
-M5-S0 adds only Skylet `41` keyed add, queue, exact cancel, observational
-lookup, atomic absence seal, additive side tables and local mutation triggers,
+M5-S0 is split into two ordered merge, deploy, and monitoring gates. M5-S0a
+installs only the exact v1 side tables and named indexes specified above, keeps
+Skylet `40`, and has no trigger, side-row producer, or capability claim. Its
+upgrade and rollback tests must pass before merge. Deployment proves the API
+image and newly provisioned or naturally restarted v40 workers retain ordinary
+legacy behavior; it does not force-restart the existing worker fleet and cannot
+count as the v41 compatibility gate.
+
+M5-S0b adds only Skylet `41` keyed add, queue, exact cancel, observational
+lookup, atomic absence seal, validation and consumption of the additive side
+tables, and the local mutation and side-identity triggers,
 supervisor prepare, launch, payload-event, completion, and retirement receipts,
 receipt-aware scheduling, the dormant
 `SubmissionContainmentAdapterV1` reducer, root-owned
@@ -9387,8 +9610,9 @@ producer, and no central caller sends a key, launches a containment, or installs
 a fence. Legacy
 mode preserves the existing `StopEvent` and `SetAutostop` implementation and
 provider retry behavior exactly; the new durable teardown protocol is exercised
-only by isolated coordinated-mode tests. S0 merges, deploys, and completes a
-worker compatibility monitoring gate before M5-S1 begins.
+only by isolated coordinated-mode tests. S0b force-restarts the capable worker
+canary, merges, deploys, and completes the actual v41 worker compatibility
+monitoring gate before M5-S1 begins.
 
 M5-S1 adds only API-requests `005`, API version `69`, HMAC-authorized stable
 internal worker launch, exec, exact cancel, and coordinated-down
