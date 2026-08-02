@@ -1749,6 +1749,8 @@ def stream_logs_by_id(job_id: int,
             # the next round of status check.
             if (handle is None or managed_job_status
                     != managed_job_state.ManagedJobStatus.RUNNING):
+                if not follow:
+                    return '', exceptions.JobExitCode.SUCCEEDED
                 status_str = ''
                 if (managed_job_status is not None and managed_job_status
                         != managed_job_state.ManagedJobStatus.RUNNING):
