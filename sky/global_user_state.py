@@ -8,6 +8,7 @@ Concepts:
 """
 import asyncio
 import contextlib
+import dataclasses
 import enum
 import json
 import os
@@ -356,6 +357,204 @@ def _session_scope(session: 'orm.Session | None' = None):
             yield owned_session
 
 
+class ClusterRecordIdentityWriteOutcome(enum.Enum):
+    """Successful outcomes of the action-aware cluster identity primitive."""
+
+    INSERTED = 'inserted'
+    ADOPTED = 'adopted'
+
+
+class ClusterRecordIdentityConflictError(RuntimeError):
+    """A cluster name or record UUID is already committed incompatibly."""
+
+
+class ClusterRecordRemovalOutcome(enum.Enum):
+    """Successful outcomes of expected-identity cluster-row removal."""
+
+    REMOVED_EXACT = 'removed_exact'
+    ALREADY_ABSENT = 'already_absent'
+
+
+@dataclasses.dataclass(frozen=True)
+class ClusterRecordIdentitySnapshot:
+    """One exact action-aware cluster row read under its resource locks."""
+
+    cluster_name: str
+    cluster_record_uuid: uuid.UUID
+    serialized_handle: bytes
+    handle: Any
+
+
+_CLUSTER_RECORD_HANDLE_UNSET = object()
+
+
+def _canonical_cluster_record_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    """Validates one UUID value without accepting alternate text spellings."""
+    if isinstance(value, uuid.UUID):
+        return value
+    if not isinstance(value, str):
+        raise TypeError('cluster_record_uuid must be a UUID or canonical UUID '
+                        'text.')
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as e:
+        raise ValueError(
+            'cluster_record_uuid must be canonical UUID text.') from e
+    if str(parsed) != value:
+        raise ValueError('cluster_record_uuid must be canonical UUID text.')
+    return parsed
+
+
+def _lock_cluster_record_uuid_in_session(session: orm.Session,
+                                         record_uuid: uuid.UUID) -> None:
+    """Serializes claims of one cluster-record UUID across cluster names."""
+    lock_key = json.dumps(
+        ('resource_action_cluster_record_uuid', str(record_uuid)),
+        separators=(',', ':'))
+    session.execute(
+        sqlalchemy.text('SELECT pg_advisory_xact_lock('
+                        'hashtextextended(CAST(:lock_key AS text), 0))'),
+        {'lock_key': lock_key})
+
+
+def _commit_cluster_record_identity_in_session(
+    session: orm.Session,
+    cluster_name: str,
+    cluster_record_uuid: uuid.UUID | str,
+    *,
+    insert_values: typing.Mapping[str, Any] | None = None,
+) -> ClusterRecordIdentityWriteOutcome:
+    """Insert or exactly adopt one identity in a caller-owned transaction.
+
+    A caller inserting a missing row must either pass all ordinary insert
+    values or finish populating it before committing this same transaction.
+    """
+    if not isinstance(cluster_name, str):
+        raise TypeError('cluster_name must be text.')
+    if not cluster_name:
+        raise ValueError('cluster_name must be nonempty.')
+    parsed_uuid = _canonical_cluster_record_uuid(cluster_record_uuid)
+    bind = session.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Action-aware cluster identity requires the central PostgreSQL '
+            'database.')
+
+    # The name lock is shared with ordinary cluster upserts and removal.  The
+    # UUID lock closes the independent same-UUID/different-name race before the
+    # partial unique index becomes the last line of defense.
+    lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+    _lock_cluster_record_uuid_in_session(session, parsed_uuid)
+
+    name_row = session.execute(
+        sqlalchemy.select(
+            cluster_table.c.name, cluster_table.c.cluster_record_uuid).where(
+                cluster_table.c.name ==
+                cluster_name).with_for_update()).mappings().one_or_none()
+    if name_row is not None:
+        committed_uuid = name_row['cluster_record_uuid']
+        if committed_uuid == parsed_uuid:
+            return ClusterRecordIdentityWriteOutcome.ADOPTED
+        observed = ('null' if committed_uuid is None else str(committed_uuid))
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} has incompatible cluster-record UUID '
+            f'{observed}; expected {parsed_uuid}.')
+
+    uuid_row = session.execute(
+        sqlalchemy.select(cluster_table.c.name).where(
+            cluster_table.c.cluster_record_uuid ==
+            parsed_uuid).with_for_update()).mappings().one_or_none()
+    if uuid_row is not None:
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster-record UUID {parsed_uuid} is already committed '
+            f'to cluster {uuid_row["name"]!r}, not {cluster_name!r}.')
+
+    values = dict(insert_values or {})
+    unexpected_identity = {'name', 'cluster_record_uuid'}.intersection(values)
+    if unexpected_identity:
+        raise ValueError('insert_values must omit identity-owned columns: ' +
+                         ', '.join(sorted(unexpected_identity)))
+    insert_statement = postgresql.insert(cluster_table).values(
+        name=cluster_name, cluster_record_uuid=parsed_uuid, **values)
+    inserted = session.execute(
+        insert_statement.on_conflict_do_nothing()).rowcount
+    if inserted != 1:
+        # Every action-aware writer takes both advisory locks above, so a
+        # conflict here means an out-of-contract writer raced the commitment.
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster identity for {cluster_name!r} and '
+            f'{parsed_uuid} changed concurrently.')
+    return ClusterRecordIdentityWriteOutcome.INSERTED
+
+
+def _read_cluster_record_identity_in_session(
+    session: orm.Session,
+    cluster_name: str,
+    expected_cluster_record_uuid: uuid.UUID | str,
+) -> ClusterRecordIdentitySnapshot | None:
+    """Read one exact action-aware cluster row in a caller transaction.
+
+    The absence result is authoritative only for the row in this PostgreSQL
+    transaction.  A present legacy/null or differently identified same-name
+    row is a conflict, never an absence result.
+    """
+    if not isinstance(cluster_name, str):
+        raise TypeError('cluster_name must be text.')
+    if not cluster_name:
+        raise ValueError('cluster_name must be nonempty.')
+    parsed_uuid = _canonical_cluster_record_uuid(expected_cluster_record_uuid)
+    bind = session.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Action-aware cluster identity requires the central PostgreSQL '
+            'database.')
+
+    lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+    _lock_cluster_record_uuid_in_session(session, parsed_uuid)
+    row = session.execute(
+        sqlalchemy.select(
+            cluster_table.c.cluster_record_uuid,
+            cluster_table.c.handle,
+        ).where(cluster_table.c.name ==
+                cluster_name).with_for_update()).mappings().one_or_none()
+    if row is None:
+        return None
+    observed_uuid = row['cluster_record_uuid']
+    if observed_uuid != parsed_uuid:
+        observed = ('null' if observed_uuid is None else str(observed_uuid))
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} has incompatible cluster-record UUID '
+            f'{observed}; expected {parsed_uuid}.')
+    serialized_handle = row['handle']
+    if not isinstance(serialized_handle, bytes) or not serialized_handle:
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} with cluster-record UUID '
+            f'{parsed_uuid} has no exact persisted handle.')
+    try:
+        handle = pickle.loads(serialized_handle)
+    except Exception as e:  # pylint: disable=broad-except
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} with cluster-record UUID '
+            f'{parsed_uuid} has an unreadable persisted handle.') from e
+    return ClusterRecordIdentitySnapshot(
+        cluster_name=cluster_name,
+        cluster_record_uuid=parsed_uuid,
+        serialized_handle=serialized_handle,
+        handle=handle,
+    )
+
+
+@db_retries.retry
+def get_cluster_record_identity_snapshot(
+    cluster_name: str,
+    expected_cluster_record_uuid: uuid.UUID | str,
+) -> ClusterRecordIdentitySnapshot | None:
+    """Read one expected-UUID cluster row through the action-aware fence."""
+    with orm.Session(_db_manager.get_engine()) as session, session.begin():
+        return _read_cluster_record_identity_in_session(
+            session, cluster_name, expected_cluster_record_uuid)
+
+
 @metrics_lib.time_me
 def add_or_update_user(
         user: models.User,
@@ -636,19 +835,21 @@ def set_user_preferred_workspace(user_id: str, workspace: str | None) -> bool:
 
 
 @metrics_lib.time_me
-def add_or_update_cluster(cluster_name: str,
-                          cluster_handle: 'backends.ResourceHandle',
-                          requested_resources: set[Any] | None,
-                          ready: bool,
-                          is_launch: bool = True,
-                          config_hash: str | None = None,
-                          task_config: dict[str, Any] | None = None,
-                          is_managed: bool = False,
-                          provision_log_path: str | None = None,
-                          existing_cluster_hash: str | None = None,
-                          workload_type: str | None = None,
-                          workload_id: str | None = None,
-                          workload_task_id: int | None = None) -> str:
+def add_or_update_cluster(
+        cluster_name: str,
+        cluster_handle: 'backends.ResourceHandle',
+        requested_resources: set[Any] | None,
+        ready: bool,
+        is_launch: bool = True,
+        config_hash: str | None = None,
+        task_config: dict[str, Any] | None = None,
+        is_managed: bool = False,
+        provision_log_path: str | None = None,
+        existing_cluster_hash: str | None = None,
+        workload_type: str | None = None,
+        workload_id: str | None = None,
+        workload_task_id: int | None = None,
+        cluster_record_uuid: uuid.UUID | str | None = None) -> str:
     """Adds or updates cluster_name -> cluster_handle mapping.
 
     Args:
@@ -670,11 +871,23 @@ def add_or_update_cluster(cluster_name: str,
         workload_type: Best-effort cost attribution type.
         workload_id: Best-effort cost attribution identifier.
         workload_task_id: Managed-job task ID, when available.
+        cluster_record_uuid: Internal action-aware write-once cluster identity.
+            Ordinary callers must omit this argument.  When present, the
+            PostgreSQL identity primitive inserts or exactly adopts it in the
+            same transaction as the ordinary cluster row fields.
 
     Returns:
         The stable hash identifying the inserted or updated cluster generation.
     """
     engine = _db_manager.get_engine()
+    parsed_cluster_record_uuid = (
+        None if cluster_record_uuid is None else
+        _canonical_cluster_record_uuid(cluster_record_uuid))
+    if (parsed_cluster_record_uuid is not None and
+            engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        raise RuntimeError(
+            'Action-aware cluster identity requires the central PostgreSQL '
+            'database.')
 
     # Restored or internally constructed handles can bypass current Resources
     # construction. Fence them before pickle allocates any durable bytes.
@@ -796,6 +1009,12 @@ def add_or_update_cluster(cluster_name: str,
 
     with orm.Session(engine) as session:
         lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+        if parsed_cluster_record_uuid is not None:
+            # Every action-aware writer acquires name -> UUID -> row.  Taking
+            # the UUID before the initial row lock prevents an inverse claimant
+            # for another name and the same UUID from deadlocking adoption.
+            _lock_cluster_record_uuid_in_session(session,
+                                                 parsed_cluster_record_uuid)
         # with_for_update() locks the row until commit() or rollback()
         # is called, or until the code escapes the with block.
         cluster_row = session.query(cluster_table).filter_by(
@@ -879,6 +1098,38 @@ def add_or_update_cluster(cluster_name: str,
             session.rollback()
             raise ValueError('Unsupported database dialect')
 
+        row_insert_values = {
+            **conditional_values,
+            'handle': handle,
+            'status': status.value,
+            # set metadata to server default ('{}')
+            # set owner to server default (null)
+            'cluster_hash': cluster_hash,
+            # set storage_mounts_metadata to server default (null)
+            'status_updated_at': status_updated_at,
+            'is_managed': int(is_managed),
+            'cloud': cloud,
+            'region': region,
+            'zone': zone,
+            'node_names': node_names,
+            'container_image_binding_known': int(container_image_binding_known),
+            'container_image_consumer_kind': container_image_consumer_kind,
+            'container_image_consumer_owner': container_image_consumer_owner,
+        }
+        if parsed_cluster_record_uuid is not None:
+            # A generation-fenced update must retain its old missing-row
+            # rejection.  It may adopt only the row already selected above.
+            if existing_cluster_hash is None:
+                _commit_cluster_record_identity_in_session(
+                    session,
+                    cluster_name,
+                    parsed_cluster_record_uuid,
+                    insert_values=row_insert_values,
+                )
+            elif cluster_row is not None:
+                _commit_cluster_record_identity_in_session(
+                    session, cluster_name, parsed_cluster_record_uuid)
+
         if existing_cluster_hash is not None:
             count = session.query(cluster_table).filter_by(
                 name=cluster_name, cluster_hash=existing_cluster_hash
@@ -903,23 +1154,7 @@ def add_or_update_cluster(cluster_name: str,
         else:
             insert_stmnt = insert_func(cluster_table).values(
                 name=cluster_name,
-                **conditional_values,
-                handle=handle,
-                status=status.value,
-                # set metadata to server default ('{}')
-                # set owner to server default (null)
-                cluster_hash=cluster_hash,
-                # set storage_mounts_metadata to server default (null)
-                status_updated_at=status_updated_at,
-                is_managed=int(is_managed),
-                cloud=cloud,
-                region=region,
-                zone=zone,
-                node_names=node_names,
-                container_image_binding_known=int(
-                    container_image_binding_known),
-                container_image_consumer_kind=container_image_consumer_kind,
-                container_image_consumer_owner=container_image_consumer_owner,
+                **row_insert_values,
             )
             insert_or_update_stmt = insert_stmnt.on_conflict_do_update(
                 index_elements=[cluster_table.c.name],
@@ -1619,22 +1854,58 @@ def update_last_use(cluster_name: str):
 
 @db_retries.retry
 @metrics_lib.time_me
-def remove_cluster(cluster_name: str,
-                   terminate: bool,
-                   existing_cluster_hash: str | None = None) -> None:
+def remove_cluster(
+    cluster_name: str,
+    terminate: bool,
+    existing_cluster_hash: str | None = None,
+    *,
+    expected_cluster_record_uuid: uuid.UUID | str | None = None,
+    expected_cluster_handle: Any = _CLUSTER_RECORD_HANDLE_UNSET
+) -> ClusterRecordRemovalOutcome | None:
     """Removes or stops a cluster mapping.
 
     If ``existing_cluster_hash`` is provided, only that cluster generation is
     mutated. A missing or replaced generation is a no-op.
+
+    ``expected_cluster_record_uuid`` is the internal action-aware teardown
+    fence.  It is PostgreSQL-only, requires ``terminate=True`` and an explicit
+    ``expected_cluster_handle`` (``None`` means the admission-time row was
+    absent), and compares a present row's exact persisted handle bytes before
+    deletion.  A missing row is an idempotent ``ALREADY_ABSENT`` result; a
+    legacy/null, differently identified, or byte-different row is a conflict.
     """
     engine = _db_manager.get_engine()
+    parsed_cluster_record_uuid = (
+        None if expected_cluster_record_uuid is None else
+        _canonical_cluster_record_uuid(expected_cluster_record_uuid))
+    if parsed_cluster_record_uuid is not None:
+        if existing_cluster_hash is not None:
+            raise ValueError('Expected cluster-record UUID and legacy cluster '
+                             'hash fences are mutually exclusive.')
+        if not terminate:
+            raise ValueError('Expected cluster-record UUID removal requires '
+                             'terminate=True.')
+        if expected_cluster_handle is _CLUSTER_RECORD_HANDLE_UNSET:
+            raise ValueError('Expected cluster-record UUID removal requires '
+                             'an explicit expected handle or None.')
+        if (engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+            raise RuntimeError(
+                'Action-aware cluster identity requires the central '
+                'PostgreSQL database.')
+    elif expected_cluster_handle is not _CLUSTER_RECORD_HANDLE_UNSET:
+        raise ValueError('An expected cluster handle requires an expected '
+                         'cluster-record UUID.')
     with orm.Session(engine) as session:
         lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+        if parsed_cluster_record_uuid is not None:
+            _lock_cluster_record_uuid_in_session(session,
+                                                 parsed_cluster_record_uuid)
         # Read every clusters-table field this function needs in one snapshot;
         # the stop path below writes the handle back in the same session.
         query = session.query(
             cluster_table.c.cluster_hash, cluster_table.c.provision_log_path,
-            cluster_table.c.handle, cluster_table.c.workspace,
+            cluster_table.c.handle, cluster_table.c.cluster_record_uuid,
+            cluster_table.c.workspace,
             cluster_table.c.container_image_binding_known,
             cluster_table.c.container_image_consumer_kind,
             cluster_table.c.container_image_consumer_owner).filter_by(
@@ -1643,7 +1914,29 @@ def remove_cluster(cluster_name: str,
             query = query.filter_by(cluster_hash=existing_cluster_hash)
         row = query.with_for_update().first()
         if row is None and existing_cluster_hash is not None:
-            return
+            return None
+        if parsed_cluster_record_uuid is not None:
+            if row is None:
+                session.commit()
+                return ClusterRecordRemovalOutcome.ALREADY_ABSENT
+            observed_uuid = row.cluster_record_uuid
+            if observed_uuid != parsed_cluster_record_uuid:
+                observed = ('null'
+                            if observed_uuid is None else str(observed_uuid))
+                raise ClusterRecordIdentityConflictError(
+                    f'Cluster {cluster_name!r} has incompatible '
+                    f'cluster-record UUID {observed}; expected '
+                    f'{parsed_cluster_record_uuid}.')
+            if expected_cluster_handle is None:
+                raise ClusterRecordIdentityConflictError(
+                    f'Cluster {cluster_name!r} unexpectedly has a row for '
+                    f'cluster-record UUID {parsed_cluster_record_uuid}.')
+            expected_handle_bytes = pickle.dumps(expected_cluster_handle)
+            if row.handle != expected_handle_bytes:
+                raise ClusterRecordIdentityConflictError(
+                    f'Cluster {cluster_name!r} has a different persisted '
+                    f'handle for cluster-record UUID '
+                    f'{parsed_cluster_record_uuid}.')
         cluster_hash = row.cluster_hash if row is not None else None
         provision_log_path = (row.provision_log_path
                               if row is not None else None)
@@ -1713,6 +2006,9 @@ def remove_cluster(cluster_name: str,
         if existing_cluster_hash is not None:
             mutation_query = mutation_query.filter_by(
                 cluster_hash=existing_cluster_hash)
+        if parsed_cluster_record_uuid is not None:
+            mutation_query = mutation_query.filter_by(
+                cluster_record_uuid=parsed_cluster_record_uuid)
         if terminate:
             if (terminal_workspace is not None and
                 ((terminal_binding_known and terminal_consumer_kind == 'cluster'
@@ -1742,7 +2038,7 @@ def remove_cluster(cluster_name: str,
             count = mutation_query.delete()
         else:
             if row is None or row.handle is None:
-                return
+                return None
             handle = pickle.loads(row.handle)
             # Must invalidate IP list to avoid directly trying to ssh into a
             # stopped VM, which leads to timeout.
@@ -1757,7 +2053,13 @@ def remove_cluster(cluster_name: str,
                 cluster_table.c.status_updated_at: current_time
             })
         assert count <= 1, count
+        if parsed_cluster_record_uuid is not None and count != 1:
+            raise ClusterRecordIdentityConflictError(
+                f'Cluster {cluster_name!r} changed during exact removal.')
         session.commit()
+        if parsed_cluster_record_uuid is not None:
+            return ClusterRecordRemovalOutcome.REMOVED_EXACT
+        return None
 
 
 @db_retries.retry

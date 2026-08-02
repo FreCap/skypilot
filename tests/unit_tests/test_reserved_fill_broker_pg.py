@@ -2857,7 +2857,7 @@ class TestMigrationChainPG:
         try:
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '031')
             with engine.begin() as connection:
                 connection.execute(
                     sqlalchemy.text(
@@ -2878,7 +2878,7 @@ class TestMigrationChainPG:
             alembic_command.downgrade(config, '028')
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '031')
 
             inspector = sqlalchemy.inspect(engine)
             service_columns = {
@@ -2906,7 +2906,7 @@ class TestMigrationChainPG:
         try:
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '031')
             daily = serve_history.serve_request_activity_daily_table
             day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
             with engine.begin() as connection:
@@ -2960,7 +2960,7 @@ class TestMigrationChainPG:
 
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '032')
             with engine.connect() as connection:
                 row = connection.execute(
                     sqlalchemy.text(
@@ -2997,7 +2997,7 @@ class TestMigrationChainPG:
             alembic_command.downgrade(config, '031')
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '032')
             with engine.connect() as connection:
                 assert connection.execute(
                     sqlalchemy.text(
@@ -3012,7 +3012,7 @@ class TestMigrationChainPG:
         try:
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '031')
             config = migration_utils.get_alembic_config(
                 engine, migration_utils.SERVE_DB_NAME)
             alembic_command.downgrade(config, '026')

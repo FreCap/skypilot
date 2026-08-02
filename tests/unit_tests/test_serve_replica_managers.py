@@ -54,6 +54,105 @@ def test_replica_manager_rejects_legacy_service_without_workspace():
                                         version=1)
 
 
+def test_action_aware_manager_snapshots_the_current_lifecycle_fence():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._service_hash = 'incarnation-a'
+    manager._controller_owner = (123, '10.0.0.1')
+    current_owner = {
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lifecycle_epoch': 17,
+        'status': replica_managers.serve_state.ServiceStatus.READY,
+    }
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_controller_owner',
+                           return_value=current_owner):
+        assert manager._resource_action_fence_kwargs() == {
+            'expected_controller_owner': (123, '10.0.0.1'),
+            'expected_lifecycle_epoch': 17,
+        }
+    assert manager._db_fence_kwargs() == {
+        'expected_service_hash': 'incarnation-a',
+        'expected_controller_owner': (123, '10.0.0.1'),
+    }
+
+
+def test_legacy_replica_writes_omit_an_unknown_lifecycle_epoch():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_hash = None
+    manager._controller_owner = None
+
+    assert manager._resource_action_fence_kwargs() is None
+    assert manager._db_fence_kwargs() == {}
+
+
+@pytest.mark.parametrize('epoch', [None, 0, -1, True, '17'])
+def test_action_fence_rejects_an_invalid_current_epoch(epoch):
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._service_hash = 'incarnation-a'
+    manager._controller_owner = (123, '10.0.0.1')
+    owner = {
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lifecycle_epoch': epoch,
+        'status': replica_managers.serve_state.ServiceStatus.READY,
+    }
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_controller_owner',
+                           return_value=owner):
+        assert manager._resource_action_fence_kwargs() is None
+
+
+def test_action_fence_uses_a_new_epoch_after_a_same_owner_update():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._service_hash = 'incarnation-a'
+    manager._controller_owner = (123, '10.0.0.1')
+
+    def _owner(epoch):
+        return {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'lifecycle_epoch': epoch,
+            'status': replica_managers.serve_state.ServiceStatus.READY,
+        }
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_controller_owner',
+                           side_effect=[_owner(17), _owner(18)]):
+        first = manager._resource_action_fence_kwargs()
+        second = manager._resource_action_fence_kwargs()
+
+    assert first is not None
+    assert second is not None
+    assert first['expected_lifecycle_epoch'] == 17
+    assert second['expected_lifecycle_epoch'] == 18
+
+
+def test_action_fence_defers_when_the_current_owner_is_unavailable():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._service_hash = 'incarnation-a'
+    manager._controller_owner = (123, '10.0.0.1')
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_controller_owner',
+                           side_effect=RuntimeError('database restarting')):
+        assert manager._resource_action_fence_kwargs() is None
+
+
 class TestSkyPilotReplicaManagerInitOrdering:
     """`SkyPilotReplicaManager.__init__` must (1) hand the manager lock to
     the recovery pass BEFORE any daemon thread can grab it — otherwise
@@ -2185,6 +2284,21 @@ class TestLaunchOwnershipFence:
             assert not mgr._service_is_launch_authorized()
         assert mgr._ownership_lost.is_set()
 
+    def test_same_owner_epoch_advance_does_not_cancel_the_manager(self):
+        mgr = self._owned_manager()
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'lifecycle_epoch': 18,
+            'status': replica_managers.serve_state.ServiceStatus.READY,
+        }
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner):
+            assert mgr._service_is_launch_authorized()
+        assert not mgr._ownership_lost.is_set()
+
     def test_nonconsolidated_controller_omits_api_local_fence(self):
         mgr = self._owned_manager()
         mgr._enforce_launch_fence = False
@@ -3231,6 +3345,7 @@ class TestScaleUpBatch:
         initial = [_fake_replica_info(40), _fake_replica_info(41)]
         stale_local = [_fake_replica_info(99)]
         snapshots = []
+        reservation_lock = mock.MagicMock()
 
         def _launch(replica_id,
                     _resources_override,
@@ -3252,6 +3367,9 @@ class TestScaleUpBatch:
                  'sky.serve.replica_managers.serve_state.'
                  'get_replica_infos_grouped',
                  return_value={'svc': list(initial)}) as grouped_scan, \
+             mock.patch.object(replica_managers.locks,
+                               'get_lock',
+                               return_value=reservation_lock), \
              mock.patch.object(mgr,
                                '_build_zero_cost_demand_budget',
                                return_value=None), \
@@ -4271,6 +4389,7 @@ class TestLogicalCapacityPlanning:
         mgr._logical_target = (1, 9, 8)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         launches = []
+        reservation_lock = mock.MagicMock()
         stale_replacement = self._ready_backend(2, 8)
         stale_replacement.unknown_capacity_replacement = True
 
@@ -4302,6 +4421,9 @@ class TestLogicalCapacityPlanning:
                                'get_replica_infos_grouped',
                                return_value={'svc': [original]
                                             }) as grouped_scan, \
+             mock.patch.object(replica_managers.locks,
+                               'get_lock',
+                               return_value=reservation_lock), \
              mock.patch.object(mgr,
                                '_build_zero_cost_demand_budget',
                                return_value=None), \

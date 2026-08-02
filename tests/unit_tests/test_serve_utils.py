@@ -6,6 +6,7 @@ import tempfile
 import threading
 import types
 from unittest import mock
+import uuid
 
 import pytest
 import requests.exceptions as requests_exceptions
@@ -1382,6 +1383,10 @@ def test_child_only_purge_termination_failure_retains_inventory():
              return_value={
                  info.cluster_name: (None, None) for info in replica_infos
              }), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={info.replica_id: None for info in replica_infos}), \
          mock.patch('sky.serve.replica_managers.terminate_cluster',
                     side_effect=_terminate) as terminate, \
          mock.patch.object(serve_state,
@@ -2838,11 +2843,14 @@ class TestTerminateFailedServices:
              exists,
              terminate_side_effect=None,
              lb_side_effect=None,
-             resource_scope=None):
+             resource_scope=None,
+             teardown_identities=None):
         terminated = []
+        self.termination_kwargs = []
 
-        def _terminate(cluster_name, _log_file, **_kwargs):
+        def _terminate(cluster_name, _log_file, **kwargs):
             terminated.append(cluster_name)
+            self.termination_kwargs.append(kwargs)
             if terminate_side_effect is not None:
                 terminate_side_effect(cluster_name)
 
@@ -2869,6 +2877,12 @@ class TestTerminateFailedServices:
                  'sky.serve.serve_utils.global_user_state.'
                  'get_cluster_status_fields',
                  side_effect=_cluster_snapshot), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_replica_resource_action_identities',
+                 side_effect=lambda _service_name, replica_ids:
+                 ({replica_id: None for replica_id in replica_ids}
+                  if teardown_identities is None else teardown_identities)), \
              mock.patch('sky.serve.replica_managers.terminate_cluster',
                         side_effect=_terminate), \
              mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
@@ -2926,6 +2940,27 @@ class TestTerminateFailedServices:
                                                'incarnation-a',
                                                expected_lifecycle_epoch=17)
         assert message is None
+
+    def test_action_owned_cluster_termination_uses_exact_record_uuid(self):
+        info = self._replica(1, 'svc-1')
+        cluster_record_uuid = uuid.UUID('33333333-3333-4333-8333-333333333333')
+        identity = serve_state.ReplicaResourceActionIdentity(
+            replica_id=1,
+            cluster_name='svc-1',
+            replica_incarnation=uuid.UUID(
+                '11111111-1111-4111-8111-111111111111'),
+            desired_generation=2,
+            sky_cluster_record_uuid=cluster_record_uuid)
+
+        _, _, _, message, _, _ = self._run([info],
+                                           exists=lambda _name: True,
+                                           teardown_identities={1: identity})
+
+        assert message is None
+        assert self.termination_kwargs == [{
+            'continue_guard': mock.ANY,
+            'expected_cluster_record_uuid': str(cluster_record_uuid),
+        }]
 
     def test_large_absent_inventory_uses_one_cluster_snapshot(self):
         infos = [

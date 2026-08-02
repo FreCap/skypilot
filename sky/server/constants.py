@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 68  # Exact non-rejected SkyServe request activity
+API_VERSION = 69  # Action-fenced internal cluster teardown
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -127,6 +127,11 @@ MIN_SERVE_DASHBOARD_DIRECT_READS_API_VERSION = (
 
 # Minimum API version with batched summaries and paginated replica reads.
 MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67
+
+# Minimum server version accepting the private expected-cluster-record UUID on
+# controller-originated down requests. Older servers ignore unknown payload
+# fields, which would silently discard the teardown fence.
+MIN_RESOURCE_ACTION_EXPECTED_CLUSTER_UUID_API_VERSION = 69
 
 # Minimum server API version that exposes the admin-only, low-cardinality
 # operator notification inbox used by the dashboard.

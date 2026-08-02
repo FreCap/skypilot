@@ -375,11 +375,16 @@ def request(method, url, **kwargs) -> 'requests.Response':
     return request_without_retry(method, url, **kwargs)
 
 
-def request_without_retry(method, url, **kwargs) -> 'requests.Response':
+def request_without_retry(method,
+                          url,
+                          *,
+                          raise_for_server_unavailable: bool = True,
+                          **kwargs) -> 'requests.Response':
     """Send a request to the API server without retry."""
     timeout = kwargs.pop('timeout', DEFAULT_REQUEST_TIMEOUT)
     response = _session.request(method, url, timeout=timeout, **kwargs)
-    handle_server_unavailable(response)
+    if raise_for_server_unavailable:
+        handle_server_unavailable(response)
     # TODO (kyuds): investigate into whether we can remove this as we
     # explicitly set in `get_api_server_status`.
     remote_api_version = response.headers.get(constants.API_VERSION_HEADER)

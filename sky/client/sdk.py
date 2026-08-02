@@ -11,6 +11,8 @@ Usage example:
 
 """
 from collections.abc import Iterator
+import contextlib
+import dataclasses
 import datetime
 import json
 import logging
@@ -21,6 +23,7 @@ import sys
 import typing
 from typing import Any, Literal, Optional, TypeVar, Union
 from urllib import parse as urlparse
+import uuid
 
 import click
 import colorama
@@ -799,6 +802,117 @@ def launch(
 
     Other exceptions may be raised depending on the backend.
     """
+    with _prepared_launch_request_in_current_context(
+            task=task,
+            cluster_name=cluster_name,
+            retry_until_up=retry_until_up,
+            idle_minutes_to_autostop=idle_minutes_to_autostop,
+            wait_for=wait_for,
+            dryrun=dryrun,
+            down=down,
+            backend=backend,
+            optimize_target=optimize_target,
+            no_setup=no_setup,
+            clone_disk_from=clone_disk_from,
+            fast=fast,
+            _need_confirmation=_need_confirmation,
+            _is_launched_by_jobs_controller=_is_launched_by_jobs_controller,
+            _is_launched_by_sky_serve_controller=(
+                _is_launched_by_sky_serve_controller),
+            _disable_controller_check=_disable_controller_check,
+            _file_mounts_blob_id=_file_mounts_blob_id,
+            _extra_launch_context=_extra_launch_context,
+            _include_credentials=_include_credentials) as prepared_request:
+        return submit_prepared_launch_request(prepared_request)
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparedLaunchRequest:
+    """Internal, replay-stable snapshot of one launch request payload.
+
+    The immutable canonical bytes are the sole authority.  ``body`` returns a
+    fresh ``LaunchBody`` for typed inspection, so mutating that view or the
+    source task cannot alter a later inspection or submission.
+    """
+
+    submitted_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.submitted_bytes, bytes):
+            raise TypeError('Launch request canonical payload must be bytes.')
+        try:
+            submitted_json = self.submitted_bytes.decode('utf-8')
+            submitted_payload = json.loads(submitted_json)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                'Launch request payload must be valid UTF-8 JSON.') from exc
+        if not isinstance(submitted_payload, dict):
+            raise ValueError('Launch request payload must be a JSON object.')
+        canonical_bytes = _canonical_launch_json_bytes(submitted_payload)
+        if canonical_bytes != self.submitted_bytes:
+            raise ValueError('Launch request payload is not canonical JSON.')
+        try:
+            body = payloads.LaunchBody.model_validate_json(self.submitted_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                'Launch request payload is not a LaunchBody.') from exc
+        if _canonical_launch_body_bytes(body) != self.submitted_bytes:
+            raise ValueError('Launch request payload does not exactly match '
+                             'its LaunchBody representation.')
+
+    @property
+    def body(self) -> payloads.LaunchBody:
+        """Returns a fresh typed view of the committed request bytes."""
+        return payloads.LaunchBody.model_validate_json(self.submitted_bytes)
+
+    @property
+    def submitted_json(self) -> str:
+        """Returns the canonical UTF-8 JSON text committed for submission."""
+        return self.submitted_bytes.decode('utf-8')
+
+
+def _canonical_launch_json_bytes(value: Any) -> bytes:
+    return json.dumps(value,
+                      sort_keys=True,
+                      separators=(',', ':'),
+                      ensure_ascii=False,
+                      allow_nan=False).encode('utf-8')
+
+
+def _canonical_launch_body_bytes(body: payloads.LaunchBody) -> bytes:
+    return _canonical_launch_json_bytes(json.loads(body.model_dump_json()))
+
+
+@contextlib.contextmanager
+def _prepared_launch_request_in_current_context(
+    task: Union['sky.Task', 'sky.Dag'],
+    cluster_name: str | None = None,
+    retry_until_up: bool = False,
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor | None = None,
+    dryrun: bool = False,
+    down: bool = False,  # pylint: disable=redefined-outer-name
+    backend: Optional['backends.Backend'] = None,
+    optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
+    no_setup: bool = False,
+    clone_disk_from: str | None = None,
+    fast: bool = False,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _need_confirmation: bool = False,
+    _is_launched_by_jobs_controller: bool = False,
+    _is_launched_by_sky_serve_controller: bool = False,
+    _disable_controller_check: bool = False,
+    _file_mounts_blob_id: str | None = None,
+    _extra_launch_context: dict[str, Any] | None = None,
+    _include_credentials: bool = False,
+) -> Iterator[PreparedLaunchRequest]:
+    """Yields a frozen launch while its preparation context remains active.
+
+    Public launch submission must occur inside this context because the client
+    admin policy may temporarily override transport configuration. A standalone
+    preparer may retain the yielded immutable request after the context exits.
+    """
     if cluster_name is None:
         cluster_name = cluster_utils.generate_cluster_name()
 
@@ -816,8 +930,8 @@ def launch(
 
     dag = dag_utils.convert_entrypoint_to_dag(task)
     # Override the autostop config from command line flags to task YAML.
-    for task in dag.tasks:
-        for resource in task.resources:
+    for dag_task in dag.tasks:
+        for resource in dag_task.resources:
             if remote_api_version is None or remote_api_version < 13:
                 # An older server would not recognize the wait_for field
                 # in the schema, so we need to omit it.
@@ -840,12 +954,15 @@ def launch(
         idle_minutes_to_autostop=idle_minutes_to_autostop,
         down=down,
         dryrun=dryrun)
+    # The context deliberately spans the yield so launch submission observes
+    # the policy's temporary transport configuration.
+    # pylint: disable-next=contextmanager-generator-missing-cleanup
     with admin_policy_utils.apply_and_use_config_in_current_request(
             dag,
             request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
             request_options=request_options,
             at_client_side=True) as dag:
-        return _launch(
+        prepared_request = _freeze_launch_request(
             dag,
             cluster_name,
             request_options,
@@ -866,9 +983,67 @@ def launch(
             _extra_launch_context,
             _include_credentials,
         )
+        yield prepared_request
 
 
-def _launch(
+@usage_lib.entrypoint('sky.client.sdk.launch')
+@server_common.check_server_healthy_or_start
+@annotations.client_api
+@sky_context.contextual
+def prepare_launch_request(
+    task: Union['sky.Task', 'sky.Dag'],
+    cluster_name: str | None = None,
+    retry_until_up: bool = False,
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor | None = None,
+    dryrun: bool = False,
+    down: bool = False,  # pylint: disable=redefined-outer-name
+    backend: Optional['backends.Backend'] = None,
+    optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
+    no_setup: bool = False,
+    clone_disk_from: str | None = None,
+    fast: bool = False,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _need_confirmation: bool = False,
+    _is_launched_by_jobs_controller: bool = False,
+    _is_launched_by_sky_serve_controller: bool = False,
+    _disable_controller_check: bool = False,
+    _file_mounts_blob_id: str | None = None,
+    _extra_launch_context: dict[str, Any] | None = None,
+    _include_credentials: bool = False,
+) -> PreparedLaunchRequest:
+    """Prepares a launch for inspection and later exact submission.
+
+    This is the non-submitting counterpart of ``launch``. It preserves the
+    same client health, usage, and context boundaries while returning the
+    immutable request produced by the shared launch-preparation pipeline.
+    """
+    with _prepared_launch_request_in_current_context(
+            task=task,
+            cluster_name=cluster_name,
+            retry_until_up=retry_until_up,
+            idle_minutes_to_autostop=idle_minutes_to_autostop,
+            wait_for=wait_for,
+            dryrun=dryrun,
+            down=down,
+            backend=backend,
+            optimize_target=optimize_target,
+            no_setup=no_setup,
+            clone_disk_from=clone_disk_from,
+            fast=fast,
+            _need_confirmation=_need_confirmation,
+            _is_launched_by_jobs_controller=_is_launched_by_jobs_controller,
+            _is_launched_by_sky_serve_controller=(
+                _is_launched_by_sky_serve_controller),
+            _disable_controller_check=_disable_controller_check,
+            _file_mounts_blob_id=_file_mounts_blob_id,
+            _extra_launch_context=_extra_launch_context,
+            _include_credentials=_include_credentials) as prepared_request:
+        return prepared_request
+
+
+def _freeze_launch_request(
     dag: 'sky.Dag',
     cluster_name: str,
     request_options: admin_policy.RequestOptions,
@@ -890,9 +1065,8 @@ def _launch(
     _file_mounts_blob_id: str | None = None,
     _extra_launch_context: dict[str, Any] | None = None,
     _include_credentials: bool = False,
-) -> server_common.RequestId[tuple[int | None,
-                                   Optional['backends.ResourceHandle']]]:
-    """Auxiliary function for launch(), refer to launch() for details."""
+) -> PreparedLaunchRequest:
+    """Freezes a launch DAG after high-level policy and option preparation."""
 
     validate(dag, admin_policy_request_options=request_options)
     # The flags have been applied to the task YAML and the backward
@@ -998,8 +1172,26 @@ def _launch(
         extra_launch_context=_extra_launch_context or {},
         include_credentials=include_credentials,
     )
+
+    # Keep the submitted representation detached from both the source Dag and
+    # mutable nested values accepted by LaunchBody.  Sorting keys and removing
+    # insignificant whitespace gives callers stable bytes to journal/hash,
+    # while decoding those bytes below preserves the existing ``json=`` HTTP
+    # request behavior.
+    submitted_bytes = _canonical_launch_body_bytes(body)
+    return PreparedLaunchRequest(submitted_bytes=submitted_bytes)
+
+
+def submit_prepared_launch_request(
+    prepared_request: PreparedLaunchRequest,
+) -> server_common.RequestId[tuple[int | None,
+                                   Optional['backends.ResourceHandle']]]:
+    """Submits exactly one HTTP request from a prepared launch snapshot."""
     response = server_common.make_authenticated_request(
-        'POST', '/launch', json=json.loads(body.model_dump_json()), timeout=5)
+        'POST',
+        '/launch',
+        json=json.loads(prepared_request.submitted_bytes),
+        timeout=5)
     return server_common.get_request_id(response)
 
 
@@ -1457,6 +1649,8 @@ def down(
     purge: bool = False,
     graceful: bool = False,
     graceful_timeout: int | None = None,
+    *,
+    _expected_cluster_record_uuid: str | None = None,
 ) -> server_common.RequestId[None]:
     """Tears down a cluster.
 
@@ -1495,11 +1689,29 @@ def down(
     if graceful and version is not None and version < 32:
         logger.warning('`--graceful` is ignored because the server does '
                        'not support it yet.')
+    if _expected_cluster_record_uuid is not None:
+        try:
+            parsed_record_uuid = uuid.UUID(_expected_cluster_record_uuid)
+        except (AttributeError, TypeError, ValueError) as e:
+            raise ValueError('Expected cluster-record UUID must be canonical '
+                             'UUID text.') from e
+        if str(parsed_record_uuid) != _expected_cluster_record_uuid:
+            raise ValueError('Expected cluster-record UUID must be canonical '
+                             'UUID text.')
+        minimum_version = (
+            server_constants.
+            MIN_RESOURCE_ACTION_EXPECTED_CLUSTER_UUID_API_VERSION)
+        if version is None or version < minimum_version:
+            raise RuntimeError(
+                'The API server cannot preserve the resource-action '
+                'cluster-record teardown fence.')
     body = payloads.StopOrDownBody(
         cluster_name=cluster_name,
         purge=purge,
         graceful=graceful,
         graceful_timeout=graceful_timeout,
+        resource_action_expected_cluster_record_uuid=(
+            _expected_cluster_record_uuid),
     )
     response = server_common.make_authenticated_request(
         'POST', '/down', json=json.loads(body.model_dump_json()), timeout=5)

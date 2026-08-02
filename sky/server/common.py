@@ -348,6 +348,7 @@ def make_authenticated_request(method: str,
                                path: str,
                                server_url: str | None = None,
                                retry: bool = True,
+                               allow_non_get_without_retry: bool = False,
                                **kwargs) -> 'requests.Response':
     """Make an authenticated HTTP request to the API server.
 
@@ -359,6 +360,9 @@ def make_authenticated_request(method: str,
         path: API path (e.g., '/api/v1/status')
         server_url: Server URL, defaults to configured server
         retry: Whether to retry on transient errors
+        allow_non_get_without_retry: Permit a caller-owned bounded retry
+            policy for a non-GET request. The default preserves the guard
+            against accidentally disabling retries for mutating requests.
         **kwargs: Additional arguments to pass to requests
 
     Returns:
@@ -371,7 +375,7 @@ def make_authenticated_request(method: str,
     if retry:
         return rest.request(method, url, **kwargs)
     else:
-        if method != 'GET':
+        if method != 'GET' and not allow_non_get_without_retry:
             raise AssertionError('Only GET requests can be done without retry')
         return rest.request_without_retry(method, url, **kwargs)
 
@@ -1090,6 +1094,25 @@ def api_server_user_logs_dir_prefix(
     if user_hash is None:
         user_hash = common_utils.get_user_hash()
     return API_SERVER_CLIENT_DIR / user_hash / 'sky_logs'
+
+
+def resolve_effective_request_identity(
+    auth_user: 'models.User | None',
+    submitted_original_user: str,
+    submitted_user_hash: str,
+) -> tuple[str, str]:
+    """Return the server-effective ``(original_user, user_hash)`` pair.
+
+    Ordinary authentication is authoritative when present.  The submitted
+    pair remains the legacy fallback for deployments without authentication.
+    This resolver is pure so direct API boundaries and queued requests can use
+    exactly the same identity rule.
+    """
+    if auth_user is not None:
+        if auth_user.name is None:
+            raise ValueError('Authenticated user name is required.')
+        return auth_user.name, auth_user.id
+    return submitted_original_user, submitted_user_hash
 
 
 def get_request_user_id(request: 'fastapi.Request',

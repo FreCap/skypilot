@@ -11,12 +11,37 @@ import requests
 
 import sky
 from sky import exceptions
+from sky import models
 from sky import skypilot_config
 from sky.server import common
 from sky.server import constants as server_constants
 from sky.server.common import ApiServerInfo
 from sky.server.common import ApiServerStatus
 from sky.skylet.constants import ENV_VAR_IS_SKYPILOT_SERVER
+
+
+def test_resolve_effective_request_identity_uses_authenticated_pair() -> None:
+    auth_user = models.User(id='AUTH-HASH',
+                            name='Authenticated Name',
+                            user_type=models.UserType.SSO.value)
+
+    assert common.resolve_effective_request_identity(
+        auth_user, 'spoofed-name',
+        'spoofed-hash') == ('Authenticated Name', 'auth-hash')
+
+
+def test_resolve_effective_request_identity_preserves_no_auth_pair() -> None:
+    assert common.resolve_effective_request_identity(
+        None, 'submitted-name',
+        'submitted-hash') == ('submitted-name', 'submitted-hash')
+
+
+def test_resolve_effective_request_identity_requires_authenticated_name(
+) -> None:
+    with pytest.raises(ValueError, match='Authenticated user name is required'):
+        common.resolve_effective_request_identity(
+            models.User(id='authenticated-hash', name=None), 'submitted-name',
+            'submitted-hash')
 
 
 def _create_test_cookie(name: str = 'test-cookie', value: str = 'test-value'):

@@ -1,0 +1,517 @@
+{{- $resourceActions := .Values.resourceActions | default (dict) -}}
+{{- $authority := get $resourceActions "authorityWorker" | default (dict) -}}
+{{- if (get $authority "enabled") -}}
+{{- $fullName := include "skypilot.fullname" . -}}
+{{- $activeCohort := get $authority "activeCohort" | default "" -}}
+{{- $cohorts := get $authority "cohorts" | default (list) -}}
+{{- $tombstones := get $authority "retirementTombstones" | default (list) -}}
+{{- $healthPort := get $authority "healthPort" | default 46581 -}}
+{{- $preflightPort := get $authority "preflightPort" | default 46583 -}}
+{{- $auth := get $authority "auth" | default (dict) -}}
+{{- $tls := get $authority "tls" | default (dict) -}}
+{{- $authSecret := get $auth "existingSecret" | default "" -}}
+{{- $authKey := get $auth "key" | default "" -}}
+{{- $tlsSecret := get $tls "existingSecret" | default "" -}}
+{{- $tlsCertKey := get $tls "certKey" | default "" -}}
+{{- $tlsPrivateKeyKey := get $tls "privateKeyKey" | default "" -}}
+{{- $tlsCaKey := get $tls "caKey" | default "" -}}
+{{- $executorService := .Values.executorService | default (dict) -}}
+{{- $resources := dig "resources" .Values.apiService.resources $executorService -}}
+{{- $terminationGrace := dig "terminationGracePeriodSeconds" 60 $executorService -}}
+{{- $nodeSelector := get $executorService "nodeSelector" -}}
+{{- $tolerations := get $executorService "tolerations" -}}
+{{- $affinity := get $executorService "affinity" -}}
+{{- $topologyKey := get $executorService "topologySpreadTopologyKey" | default "kubernetes.io/hostname" -}}
+{{- if not .Values.apiService.highAvailability.enabled -}}
+{{- fail "resourceActions.authorityWorker.enabled=true requires apiService.highAvailability.enabled=true" -}}
+{{- end -}}
+{{- if ne .Values.requestStore.backend "postgres" -}}
+{{- fail "resourceActions.authorityWorker.enabled=true requires requestStore.backend=postgres" -}}
+{{- end -}}
+{{- if not .Values.apiService.dbConnectionSecretName -}}
+{{- fail "resourceActions.authorityWorker.enabled=true requires a pre-existing apiService.dbConnectionSecretName" -}}
+{{- end -}}
+{{- if or (not .Values.storage.enabled) (ne .Values.storage.accessMode "ReadWriteMany") -}}
+{{- fail "resourceActions.authorityWorker.enabled=true requires ReadWriteMany storage" -}}
+{{- end -}}
+{{- if eq (int $healthPort) (int $preflightPort) -}}
+{{- fail "resourceActions.authorityWorker healthPort and preflightPort must differ" -}}
+{{- end -}}
+{{- if or (empty $authSecret) (empty $authKey) -}}
+{{- fail "resourceActions.authorityWorker.auth existingSecret and key are required" -}}
+{{- end -}}
+{{- if or (empty $tlsSecret) (empty $tlsCertKey) (empty $tlsPrivateKeyKey) (empty $tlsCaKey) -}}
+{{- fail "resourceActions.authorityWorker.tls existingSecret and all key names are required" -}}
+{{- end -}}
+{{- if eq (len $cohorts) 0 -}}
+{{- fail "resourceActions.authorityWorker.cohorts must contain at least one cohort" -}}
+{{- end -}}
+{{- $ids := dict -}}
+{{- $activeMatches := 0 -}}
+{{- range $cohort := $cohorts -}}
+{{- $id := get $cohort "id" | default "" -}}
+{{- $name := printf "%s-authority-%s" $fullName $id -}}
+{{- if not (regexMatch "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$" $id) -}}
+{{- fail (printf "resourceActions.authorityWorker cohort id %q must be a DNS label" $id) -}}
+{{- end -}}
+{{- if gt (len $name) 63 -}}
+{{- fail (printf "resourceActions.authorityWorker cohort %q produces a resource name longer than 63 characters" $id) -}}
+{{- end -}}
+{{- if hasKey $ids $id -}}
+{{- fail (printf "resourceActions.authorityWorker cohort id %q is duplicated" $id) -}}
+{{- end -}}
+{{- $_ := set $ids $id true -}}
+{{- if ne (int (get $cohort "replicas")) 2 -}}
+{{- fail (printf "resourceActions.authorityWorker cohort %q must have replicas: 2" $id) -}}
+{{- end -}}
+{{- $image := get $cohort "image" | default "" -}}
+{{- if not (regexMatch "^.+@sha256:[0-9a-f]{64}$" $image) -}}
+{{- fail (printf "resourceActions.authorityWorker cohort %q image must be digest-pinned" $id) -}}
+{{- end -}}
+{{- if ne (get $cohort "imagePullPolicy") "Always" -}}
+{{- fail (printf "resourceActions.authorityWorker cohort %q imagePullPolicy must be Always" $id) -}}
+{{- end -}}
+{{- if eq $id $activeCohort -}}
+{{- $activeMatches = add1 $activeMatches -}}
+{{- end -}}
+{{- end -}}
+{{- if ne (int $activeMatches) 1 -}}
+{{- fail "resourceActions.authorityWorker.activeCohort must name exactly one cohort" -}}
+{{- end -}}
+{{- $tombstoneIds := dict -}}
+{{- range $id := $tombstones -}}
+{{- if not (regexMatch "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$" $id) -}}
+{{- fail (printf "resourceActions.authorityWorker retirement tombstone %q must be a DNS label" $id) -}}
+{{- end -}}
+{{- if or (hasKey $ids $id) (hasKey $tombstoneIds $id) -}}
+{{- fail (printf "resourceActions.authorityWorker retirement tombstone %q is duplicated or still active" $id) -}}
+{{- end -}}
+{{- $_ := set $tombstoneIds $id true -}}
+{{- end -}}
+{{- range $cohort := $cohorts }}
+{{- $id := get $cohort "id" -}}
+{{- $name := printf "%s-authority-%s" $fullName $id -}}
+{{- $image := include "common.image" (dict "root" $ "image" (get $cohort "image")) -}}
+{{- $routing := dict "version" 1 "cohort_id" $id "namespace" $.Release.Namespace "deployment_name" $name "service_account_name" $name "container_name" "skypilot-authority-worker" "image" $image "claim_contract" "frozen_action_cohort_join_v1" "handler_allowlist" (list "serve_shadow_candidate_launch" "serve_shadow_candidate_down" "serve_resource_action_launch" "serve_resource_action_down") -}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-routing-v1
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    skypilot.co/role: resource-action-authority
+    skypilot.co/authority-cohort: {{ $id | quote }}
+immutable: true
+data:
+  routing.json: {{ toJson $routing | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    skypilot.co/role: resource-action-authority
+    skypilot.co/authority-cohort: {{ $id | quote }}
+automountServiceAccountToken: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    skypilot.co/role: resource-action-authority
+    skypilot.co/authority-cohort: {{ $id | quote }}
+  annotations:
+    skypilot.co/authority-routing-sha256: {{ sha256sum (toJson $routing) | quote }}
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      skypilot.co/role: resource-action-authority
+      skypilot.co/authority-cohort: {{ $id | quote }}
+  template:
+    metadata:
+      labels:
+        skypilot.co/role: resource-action-authority
+        skypilot.co/authority-cohort: {{ $id | quote }}
+    spec:
+      automountServiceAccountToken: true
+      serviceAccountName: {{ $name }}
+      terminationGracePeriodSeconds: {{ $terminationGrace }}
+      {{- with $.Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      runtimeClassName: {{ $.Values.runtimeClassName }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: skypilot-authority-worker
+        image: {{ $image }}
+        imagePullPolicy: Always
+        {{- with $.Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          {{- toYaml $resources | nindent 10 }}
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - touch /var/run/skypilot/draining && sleep {{ $.Values.apiService.highAvailability.readinessDrainSeconds }}
+        env:
+        {{- with $.Values.databaseConnection.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: SKYPILOT_DEV
+          value: {{ $.Values.apiService.skypilotDev | quote }}
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: postgres
+        - name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
+          value: {{ $.Values.requestStore.cutoverGatePath | quote }}
+        - name: SKYPILOT_API_SERVER_ENDPOINT
+          value: {{ printf "http://%s-api-service.%s.svc" $fullName $.Release.Namespace | quote }}
+        - name: SKYPILOT_API_SERVER_ROLE
+          value: authority-worker
+        - name: SKYPILOT_API_SERVER_INSTANCE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: SKYPILOT_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: SKYPILOT_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SKYPILOT_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SKYPILOT_DB_CONNECTION_URI
+          valueFrom:
+            secretKeyRef:
+              name: {{ $.Values.apiService.dbConnectionSecretName }}
+              key: connection_string
+        - name: SKYPILOT_STATE_DB_MIGRATION_MODE
+          value: verify
+        - name: SKYPILOT_API_SERVER_STORAGE_ENABLED
+          value: "true"
+        - name: SKYPILOT_ROLLING_UPDATE_ENABLED
+          value: "true"
+        - name: SKYPILOT_GRACE_PERIOD_SECONDS
+          value: {{ $terminationGrace | quote }}
+        - name: SKYPILOT_POD_CPU_CORE_LIMIT
+          valueFrom:
+            resourceFieldRef:
+              containerName: skypilot-authority-worker
+              resource: requests.cpu
+        - name: SKYPILOT_POD_MEMORY_BYTES_LIMIT
+          valueFrom:
+            resourceFieldRef:
+              containerName: skypilot-authority-worker
+              resource: requests.memory
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ROUTING_CONFIG
+          value: /etc/skypilot/resource-action-authority/routing.json
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACTIVE_COHORT
+          value: {{ $activeCohort | quote }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_AUTH_TOKENS_FILE
+          value: /etc/skypilot/resource-action-authority/auth/tokens
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_TLS_CERT_FILE
+          value: /etc/skypilot/resource-action-authority/tls/tls.crt
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_TLS_PRIVATE_KEY_FILE
+          value: /etc/skypilot/resource-action-authority/tls/tls.key
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_TLS_CA_FILE
+          value: /etc/skypilot/resource-action-authority/tls/ca.crt
+        command: ["tini", "--"]
+        args:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          mkdir -p /root/.sky
+          if [ ! -s /root/.sky/config.yaml ]; then
+            cp /var/skypilot/config/config.yaml /root/.sky/config.yaml
+          fi
+          exec python -m sky.server.server --deploy --host 0.0.0.0 \
+            --role authority-worker --role-health-port {{ $healthPort }}
+        ports:
+        - name: health
+          containerPort: {{ $healthPort }}
+        - name: preflight
+          containerPort: {{ $preflightPort }}
+        startupProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          failureThreshold: 60
+          periodSeconds: 10
+          timeoutSeconds: 1
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: health
+          periodSeconds: 10
+          timeoutSeconds: 1
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          failureThreshold: 3
+          periodSeconds: 5
+          timeoutSeconds: 1
+        volumeMounts:
+        - name: authority-routing
+          mountPath: /etc/skypilot/resource-action-authority/routing.json
+          subPath: routing.json
+          readOnly: true
+        - name: authority-auth
+          mountPath: /etc/skypilot/resource-action-authority/auth
+          readOnly: true
+        - name: authority-tls
+          mountPath: /etc/skypilot/resource-action-authority/tls
+          readOnly: true
+        - name: skypilot-role-runtime
+          mountPath: /var/run/skypilot
+        - name: state-volume
+          mountPath: /root/.sky
+          subPath: .sky
+        - name: state-volume
+          mountPath: /root/sky_logs
+          subPath: sky_logs
+        - name: skypilot-config
+          mountPath: /var/skypilot/config
+          readOnly: true
+        {{- with $.Values.databaseConnection.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+      - name: authority-routing
+        configMap:
+          name: {{ $name }}-routing-v1
+          items:
+          - key: routing.json
+            path: routing.json
+      - name: authority-auth
+        projected:
+          defaultMode: 0400
+          sources:
+          - secret:
+              name: {{ $authSecret | quote }}
+              items:
+              - key: {{ $authKey | quote }}
+                path: tokens
+      - name: authority-tls
+        projected:
+          defaultMode: 0400
+          sources:
+          - secret:
+              name: {{ $tlsSecret | quote }}
+              items:
+              - key: {{ $tlsCertKey | quote }}
+                path: tls.crt
+              - key: {{ $tlsPrivateKeyKey | quote }}
+                path: tls.key
+              - key: {{ $tlsCaKey | quote }}
+                path: ca.crt
+      - name: skypilot-role-runtime
+        emptyDir: {}
+      - name: state-volume
+        persistentVolumeClaim:
+          claimName: {{ $fullName }}-state
+      - name: skypilot-config
+        configMap:
+          name: {{ $fullName }}-config
+      {{- with $.Values.databaseConnection.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with $nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $topologyKey }}
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: {{ $topologyKey }}
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            skypilot.co/role: resource-action-authority
+            skypilot.co/authority-cohort: {{ $id | quote }}
+      {{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}-authority-preflight
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    skypilot.co/role: resource-action-authority
+    skypilot.co/authority-cohort: {{ $activeCohort | quote }}
+  ports:
+  - name: preflight
+    port: {{ $preflightPort }}
+    targetPort: preflight
+    protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullName }}-authority-preflight
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      skypilot.co/role: resource-action-authority
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          skypilot.co/role: controller
+    ports:
+    - protocol: TCP
+      port: {{ $preflightPort }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullName }}-authority-self-attestation
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames:
+  {{- range $cohort := $cohorts }}
+  - {{ printf "%s-authority-%s" $fullName (get $cohort "id") }}
+  {{- end }}
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  resourceNames:
+  - {{ include "skypilot.serviceAccountName" . }}
+  {{- range $cohort := $cohorts }}
+  - {{ printf "%s-authority-%s" $fullName (get $cohort "id") }}
+  {{- end }}
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullName }}-authority-self-attestation
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullName }}-authority-self-attestation
+subjects:
+{{- range $cohort := $cohorts }}
+- kind: ServiceAccount
+  name: {{ printf "%s-authority-%s" $fullName (get $cohort "id") }}
+  namespace: {{ $.Release.Namespace }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullName }}-authority-introspection
+rules:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  resourceNames: [{{ .Release.Namespace | quote }}]
+  verbs: ["get"]
+- nonResourceURLs: ["/version"]
+  verbs: ["get"]
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["selfsubjectreviews"]
+  verbs: ["create"]
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["selfsubjectaccessreviews", "selfsubjectrulesreviews"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullName }}-authority-introspection
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullName }}-authority-introspection
+subjects:
+{{- range $cohort := $cohorts }}
+- kind: ServiceAccount
+  name: {{ printf "%s-authority-%s" $fullName (get $cohort "id") }}
+  namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- if gt (len $tombstones) 0 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullName }}-authority-retirement-verifier
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames:
+  {{- range $id := $tombstones }}
+  - {{ printf "%s-authority-%s" $fullName $id }}
+  {{- end }}
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  resourceNames:
+  {{- range $id := $tombstones }}
+  - {{ printf "%s-authority-%s" $fullName $id }}
+  {{- end }}
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullName }}-authority-retirement-verifier
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullName }}-authority-retirement-verifier
+subjects:
+- kind: ServiceAccount
+  name: {{ include "skypilot.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

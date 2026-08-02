@@ -152,8 +152,17 @@ class Backend(Generic[_ResourceHandleType]):
     def teardown(self,
                  handle: _ResourceHandleType,
                  terminate: bool,
-                 purge: bool = False) -> None:
-        self._teardown(handle, terminate, purge)
+                 purge: bool = False,
+                 *,
+                 expected_cluster_record_uuid: str | None = None) -> None:
+        if expected_cluster_record_uuid is None:
+            self._teardown(handle, terminate, purge)
+        else:
+            self._teardown(
+                handle,
+                terminate,
+                purge,
+                expected_cluster_record_uuid=expected_cluster_record_uuid)
 
     def register_info(self, **kwargs) -> None:
         """Register backend-specific information."""
@@ -208,5 +217,7 @@ class Backend(Generic[_ResourceHandleType]):
     def _teardown(self,
                   handle: _ResourceHandleType,
                   terminate: bool,
-                  purge: bool = False):
+                  purge: bool = False,
+                  *,
+                  expected_cluster_record_uuid: str | None = None):
         raise NotImplementedError

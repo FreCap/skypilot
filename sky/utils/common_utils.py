@@ -266,12 +266,14 @@ def check_workspace_name_is_valid(workspace_name: str | None) -> None:
                 'lowercase letters, numbers, dashes, and underscores.')
 
 
-def make_cluster_name_on_cloud(
+def make_cluster_name_on_cloud_for_user(
         display_name: str,
         max_length: int | None = 15,
         add_user_hash: bool = True,
-        cluster_name_hash_length: int = CLUSTER_NAME_HASH_LENGTH) -> str:
-    """Generate valid cluster name on cloud that is unique to the user.
+        cluster_name_hash_length: int = CLUSTER_NAME_HASH_LENGTH,
+        *,
+        user_hash: str) -> str:
+    """Purely generate a cloud cluster name for an explicit user.
 
     This is to map the cluster name to a valid length and character set for
     cloud providers,
@@ -291,6 +293,13 @@ def make_cluster_name_on_cloud(
         add_user_hash: Whether to append user hash to the cluster name.
         cluster_name_hash_length: Number of base36 hash characters to retain
             when the display name must be truncated.
+        user_hash: Frozen user identity to append.  This is ignored when
+            ``add_user_hash`` is false.
+
+    Raises:
+        TypeError: If an included user hash is not text.
+        ValueError: If an included user hash is invalid or cannot fit while
+            retaining a display-name hash.
     """
 
     cluster_name_on_cloud = re.sub(r'[._]', '-', display_name).lower()
@@ -298,31 +307,56 @@ def make_cluster_name_on_cloud(
         logger.debug(
             f'The user specified cluster name {display_name} might be invalid '
             f'on the cloud, we convert it to {cluster_name_on_cloud}.')
-    user_hash = ''
+    user_hash_suffix = ''
     if add_user_hash:
-        user_hash = get_user_hash()
-        user_hash = f'-{user_hash}'
-    user_hash_length = len(user_hash)
+        if not isinstance(user_hash, str):
+            raise TypeError('user_hash must be text')
+        # ``is_valid_user_hash()`` intentionally retains its broad legacy
+        # behavior.  This explicit durable input must consume the whole value;
+        # in particular, ``$`` must not accept a trailing newline.
+        if re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9-]*', user_hash) is None:
+            raise ValueError('user_hash is invalid')
+        user_hash_suffix = f'-{user_hash}'
+    user_hash_length = len(user_hash_suffix)
 
     if (max_length is None or
             len(cluster_name_on_cloud) <= max_length - user_hash_length):
-        return f'{cluster_name_on_cloud}{user_hash}'
+        return f'{cluster_name_on_cloud}{user_hash_suffix}'
     # -1 is for the dash between cluster name and cluster name hash.
     if cluster_name_hash_length <= 0:
         raise ValueError('cluster_name_hash_length must be positive')
     truncate_cluster_name_length = (max_length - cluster_name_hash_length - 1 -
                                     user_hash_length)
+    if truncate_cluster_name_length <= 0:
+        raise ValueError('max_length does not leave room for the display '
+                         'name, cluster-name hash, and user_hash')
     truncate_cluster_name = cluster_name_on_cloud[:truncate_cluster_name_length]
     if truncate_cluster_name.endswith('-'):
         truncate_cluster_name = truncate_cluster_name.rstrip('-')
-    assert truncate_cluster_name_length > 0, (cluster_name_on_cloud, max_length)
     # MD5 only derives a short suffix for the cluster name, not a security use.
     display_name_hash = hashlib.md5(display_name.encode(),
                                     usedforsecurity=False).hexdigest()
     # Use base36 to reduce the length of the hash.
     display_name_hash = base36_encode(display_name_hash)
     return (f'{truncate_cluster_name}'
-            f'-{display_name_hash[:cluster_name_hash_length]}{user_hash}')
+            f'-{display_name_hash[:cluster_name_hash_length]}'
+            f'{user_hash_suffix}')
+
+
+def make_cluster_name_on_cloud(
+        display_name: str,
+        max_length: int | None = 15,
+        add_user_hash: bool = True,
+        cluster_name_hash_length: int = CLUSTER_NAME_HASH_LENGTH) -> str:
+    """Compatibility wrapper using the current ambient user identity."""
+
+    user_hash = get_user_hash() if add_user_hash else ''
+    return make_cluster_name_on_cloud_for_user(
+        display_name,
+        max_length=max_length,
+        add_user_hash=add_user_hash,
+        cluster_name_hash_length=cluster_name_hash_length,
+        user_hash=user_hash)
 
 
 def cluster_name_in_hint(cluster_name: str, cluster_name_on_cloud: str) -> str:
@@ -954,6 +988,28 @@ def validate_schema(obj, schema, err_msg_prefix='', skip_none=True):
             raise exceptions.InvalidSkyPilotConfigError(err_msg)
 
 
+_EXPLICIT_USER_LABEL_RE = re.compile(r'^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$')
+
+
+def clean_username_for_explicit_user_v1(username: str) -> str:
+    """Clean one explicit username without consulting ambient identity."""
+    if type(username) is not str:
+        raise TypeError('username must be text.')
+    if not username or len(username.encode('utf-8')) > 1024:
+        raise ValueError('username must be 1..1024 UTF-8 bytes.')
+    if not username.isascii():
+        raise ValueError('username must be ASCII.')
+    username = username.lower()
+    username = re.sub(r'[^a-z0-9-_]', '', username)
+    username = re.sub(r'^[0-9-]+', '', username)
+    username = re.sub(r'-$', '', username)
+    username = username[:63]
+    if _EXPLICIT_USER_LABEL_RE.fullmatch(username) is None:
+        raise ValueError('cleaned username must be a canonical Kubernetes '
+                         'label value.')
+    return username
+
+
 def get_cleaned_username(username: str = '') -> str:
     """Cleans the username. Underscores are allowed, as we will
      handle it when mapping to the cluster_name_on_cloud in
@@ -975,12 +1031,7 @@ def get_cleaned_username(username: str = '') -> str:
       A cleaned username.
     """
     username = username or get_current_user_name()
-    username = username.lower()
-    username = re.sub(r'[^a-z0-9-_]', '', username)
-    username = re.sub(r'^[0-9-]+', '', username)
-    username = re.sub(r'-$', '', username)
-    username = username[:63]
-    return username
+    return clean_username_for_explicit_user_v1(username)
 
 
 def fill_template(template_ref: str, variables: dict[str, Any],

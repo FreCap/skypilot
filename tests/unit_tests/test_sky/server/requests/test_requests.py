@@ -12,6 +12,7 @@ import pytest
 from sky import core
 from sky.server import constants as server_constants
 from sky.server.requests import payloads
+from sky.server.requests import registry
 from sky.server.requests import requests
 from sky.server.requests.requests import RequestStatus
 from sky.server.requests.requests import ScheduleType
@@ -130,6 +131,38 @@ def test_set_request_succeeded_nonexistent_request(isolated_database):
     # already-terminal one) and no row is created.
     requests.set_request_succeeded('nonexistent-request', {'result': 'ok'})
     assert requests.get_request('nonexistent-request') is None
+
+
+@pytest.mark.parametrize('result', [None, {}])
+@pytest.mark.asyncio
+async def test_sqlite_strict_return_encoder_failure_is_durably_failed(
+        isolated_database, result):
+    registration = registry.resolve_handler('serve_resource_action_launch')
+    request = requests.Request(
+        request_id='strict-result-failure',
+        name='sky.serve_resource_action_launch',
+        entrypoint=registration.func,
+        request_body=payloads.RequestBody(),
+        status=RequestStatus.RUNNING,
+        created_at=0.0,
+        user_id='test-user',
+    )
+    try:
+        await requests.create_if_not_exists_async(request)
+
+        requests.set_request_succeeded(request.request_id, result)
+
+        stored = await requests.get_request_async(request.request_id)
+        assert stored is not None
+        assert stored.status is RequestStatus.FAILED
+        assert stored.return_value is None
+        error = stored.get_error()
+        assert error is not None
+        assert error['type'] in ('TypeError', 'ValueError')
+        assert ('JSON object' in error['message'] or
+                'unknown or missing' in error['message'])
+    finally:
+        await requests.close_db_async()
 
 
 @pytest.mark.asyncio
@@ -1892,8 +1925,8 @@ def _dummy_for_encoder_test():
     return None
 
 
-def test_set_return_value_swallows_encoder_failure():
-    """Encoder failure must not propagate; return_value drops to None."""
+def test_set_return_value_propagates_encoder_failure():
+    """Persistence paths must see encoder failures and terminalize FAILED."""
     req = requests.Request(
         request_id='encoder-failure',
         name='test',
@@ -1905,7 +1938,8 @@ def test_set_return_value_swallows_encoder_failure():
     )
     with mock.patch('sky.server.requests.serializers.encoders.get_encoder',
                     return_value=_raising_encoder):
-        req.set_return_value({'some': 'unencodable'})
+        with pytest.raises(RuntimeError, match='encoder boom'):
+            req.set_return_value({'some': 'unencodable'})
     assert req.return_value is None
 
 

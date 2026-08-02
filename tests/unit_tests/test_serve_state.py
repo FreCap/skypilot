@@ -12,6 +12,7 @@ import json
 import pickle
 import sqlite3
 import types
+import uuid
 
 import pytest
 import sqlalchemy
@@ -391,6 +392,205 @@ def test_replica_state_uses_jsonb_on_postgres():
     state_type = serve_state.replicas_table.c.replica_state.type
     assert isinstance(state_type.dialect_impl(postgresql.dialect()),
                       postgresql.JSONB)
+
+
+def test_resource_action_common_columns_default_to_inert(_mock_serve_db):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+
+    with orm.Session(_mock_serve_db) as session:
+        service = session.execute(
+            sqlalchemy.select(serve_state.services_table).where(
+                serve_state.services_table.c.name == 'svc')).mappings().one()
+        replica = session.execute(
+            sqlalchemy.select(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1)).mappings().one()
+
+    assert service['resource_action_mode'] == 'legacy'
+    assert service['resource_action_mode_changed_at'] is None
+    assert all(replica[name] is None
+               for name in serve_state._ACTION_OWNED_REPLICA_COLUMNS)
+
+
+def test_replica_teardown_identity_snapshot_distinguishes_legacy_and_action(
+        _mock_serve_db):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    replica = _replica(1)
+    assert serve_state.add_or_update_replica('svc', 1, replica)
+
+    assert serve_state.get_replica_resource_action_identities('svc',
+                                                              [1, 2]) == {
+                                                                  1: None
+                                                              }
+    snapshot = serve_state.get_replica_info_with_resource_action_identity(
+        'svc', 1)
+    assert snapshot is not None
+    legacy_info, legacy_identity = snapshot
+    assert legacy_info.cluster_name == 'svc-1'
+    assert legacy_identity is None
+
+    replica_incarnation = uuid.uuid4()
+    cluster_record_uuid = uuid.uuid4()
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1).values(
+                    replica_incarnation=replica_incarnation,
+                    desired_generation=3,
+                    sky_cluster_record_uuid=cluster_record_uuid))
+        session.commit()
+
+    action_identity = serve_state.get_replica_resource_action_identity('svc', 1)
+    assert action_identity == serve_state.ReplicaResourceActionIdentity(
+        replica_id=1,
+        cluster_name='svc-1',
+        replica_incarnation=replica_incarnation,
+        desired_generation=3,
+        sky_cluster_record_uuid=cluster_record_uuid)
+    action_snapshot = (
+        serve_state.get_replica_info_with_resource_action_identity('svc', 1))
+    assert action_snapshot is not None
+    assert action_snapshot[0].cluster_name == 'svc-1'
+    assert action_snapshot[1] == action_identity
+
+
+@pytest.mark.parametrize('invalid_values, message', [
+    ({
+        'replica_incarnation': uuid.uuid4()
+    }, 'partial or invalid'),
+    ({
+        'launch_action_id': uuid.uuid4()
+    }, 'legacy replica row has resource-action links'),
+    ({
+        'replica_incarnation': uuid.uuid4(),
+        'desired_generation': 1,
+        'sky_cluster_record_uuid': uuid.uuid4(),
+        'launch_action_id': uuid.uuid4(),
+        'launch_shadow_coverage_id': uuid.uuid4(),
+    }, 'competing launch action owners'),
+])
+def test_replica_teardown_identity_snapshot_rejects_invalid_rows(
+        _mock_serve_db, invalid_values, message):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1).values(
+                    **invalid_values))
+        session.commit()
+
+    with pytest.raises(serve_state.MalformedReplicaResourceActionIdentityError,
+                       match=message):
+        serve_state.get_replica_resource_action_identities('svc', [1])
+
+
+def test_replica_teardown_snapshot_rejects_divergent_physical_column(
+        _mock_serve_db):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1).values(
+                    cluster_name='replacement-cluster'))
+        session.commit()
+
+    with pytest.raises(serve_state.MalformedReplicaResourceActionIdentityError,
+                       match='JSON state differs'):
+        serve_state.get_replica_info_with_resource_action_identity('svc', 1)
+
+
+def test_all_generic_replica_upserts_preserve_action_owned_columns(
+        _mock_serve_db):
+    service_hash = 'incarnation-a'
+    _add_minimal_service('svc', service_hash=service_hash)
+    expected_by_replica = {}
+
+    for replica_id in range(1, 5):
+        assert serve_state.add_or_update_replica('svc', replica_id,
+                                                 _replica(replica_id))
+        launch_shadow_coverage_id = (None if replica_id %
+                                     2 else uuid.UUID(int=replica_id * 100 + 5))
+        down_shadow_coverage_id = (None if replica_id %
+                                   2 else uuid.UUID(int=replica_id * 100 + 6))
+        action_values = {
+            'replica_incarnation': uuid.UUID(int=replica_id * 100 + 1),
+            'desired_generation': replica_id,
+            'sky_cluster_record_uuid': uuid.UUID(int=replica_id * 100 + 2),
+            'launch_action_id':
+                (uuid.UUID(int=replica_id * 100 + 3) if replica_id % 2 else None
+                ),
+            'down_action_id':
+                (uuid.UUID(int=replica_id * 100 + 4) if replica_id % 2 else None
+                ),
+            'launch_shadow_coverage_id': launch_shadow_coverage_id,
+            'down_shadow_coverage_id': down_shadow_coverage_id,
+            'launch_shadow_sample_id': launch_shadow_coverage_id,
+            'down_shadow_sample_id': down_shadow_coverage_id,
+        }
+        expected_by_replica[replica_id] = action_values
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id ==
+                    replica_id).values(**action_values))
+            session.commit()
+
+    # Ordinary and batch persistence use different statement builders.
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1, version=2))
+    assert serve_state.add_or_update_replicas('svc',
+                                              [(2, _replica(2, version=2))])
+
+    # Paid-capacity admission persists the replica and claim atomically.
+    assert serve_state.try_add_replica_with_paid_capacity_claim(
+        'svc',
+        service_hash,
+        3,
+        _replica(3, version=2),
+        pool_key='test-paid-pool',
+        priority=1,
+        base_limit=1,
+        max_limit=2,
+        now=100.0,
+        success_ttl_seconds=60.0,
+        waiter_ttl_seconds=60.0,
+        expected_controller_owner=None) == 'acquired'
+
+    # Reserved-fill admission has separate PostgreSQL and SQLite upsert
+    # statements. This fixture exercises the SQLite INSERT ... SELECT path.
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(serve_state.reserved_fill_claims_table.insert().values(
+            service_name='svc',
+            pool_key='test-fill-pool',
+            weight=1,
+            floor_replicas=1,
+            gpus_per_replica=1,
+            holdings_fill=1,
+            heartbeat_ts=100.0))
+        session.commit()
+    assert serve_state.add_replica_if_round_epoch('svc',
+                                                  4,
+                                                  _replica(4, version=2),
+                                                  pool_key='test-fill-pool',
+                                                  expected_epoch=1)
+
+    with orm.Session(_mock_serve_db) as session:
+        rows = session.execute(
+            sqlalchemy.select(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name ==
+                'svc')).mappings().all()
+    actual_by_replica = {row['replica_id']: row for row in rows}
+    for replica_id, expected in expected_by_replica.items():
+        assert {
+            name: actual_by_replica[replica_id][name]
+            for name in serve_state._ACTION_OWNED_REPLICA_COLUMNS
+        } == expected
 
 
 def test_replica_reads_do_not_use_pickle(_mock_serve_db, monkeypatch):

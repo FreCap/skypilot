@@ -1,0 +1,181 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: resource_action_authority_workers_test
+templates:
+  - templates/resource-action-authority-workers.yaml
+tests:
+  - it: should remain completely dark by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render one exact immutable authority cohort and closed routing
+    release:
+      name: test-release
+      namespace: skypilot-system
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      resourceActions.authorityWorker.enabled: true
+      resourceActions.authorityWorker.activeCohort: authority-v1
+      resourceActions.authorityWorker.auth.existingSecret: authority-auth
+      resourceActions.authorityWorker.tls.existingSecret: authority-tls
+      resourceActions.authorityWorker.cohorts:
+        - id: authority-v1
+          replicas: 2
+          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          imagePullPolicy: Always
+    asserts:
+      - hasDocuments:
+          count: 9
+      - isKind:
+          of: ConfigMap
+        documentIndex: 0
+      - equal:
+          path: immutable
+          value: true
+        documentIndex: 0
+      - matchRegex:
+          path: data["routing.json"]
+          pattern: '"handler_allowlist":\["serve_shadow_candidate_launch","serve_shadow_candidate_down","serve_resource_action_launch","serve_resource_action_down"\]'
+        documentIndex: 0
+      - isKind:
+          of: ServiceAccount
+        documentIndex: 1
+      - equal:
+          path: automountServiceAccountToken
+          value: true
+        documentIndex: 1
+      - isKind:
+          of: Deployment
+        documentIndex: 2
+      - equal:
+          path: spec.replicas
+          value: 2
+        documentIndex: 2
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: test-release-authority-authority-v1
+        documentIndex: 2
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_ROLE
+            value: authority-worker
+        documentIndex: 2
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACTIVE_COHORT
+            value: authority-v1
+        documentIndex: 2
+      - equal:
+          path: spec.template.spec.containers[0].imagePullPolicy
+          value: Always
+        documentIndex: 2
+      - isKind:
+          of: Service
+        documentIndex: 3
+      - equal:
+          path: spec.type
+          value: ClusterIP
+        documentIndex: 3
+      - equal:
+          path: spec.selector["skypilot.co/authority-cohort"]
+          value: authority-v1
+        documentIndex: 3
+      - isKind:
+          of: NetworkPolicy
+        documentIndex: 4
+      - equal:
+          path: spec.ingress[0].from[0].podSelector.matchLabels["skypilot.co/role"]
+          value: controller
+        documentIndex: 4
+      - equal:
+          path: rules[0].verbs
+          value: ["get"]
+        documentIndex: 5
+      - equal:
+          path: rules[1].verbs
+          value: ["get"]
+        documentIndex: 5
+
+  - it: should reject a mutable image
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      resourceActions.authorityWorker.enabled: true
+      resourceActions.authorityWorker.activeCohort: authority-v1
+      resourceActions.authorityWorker.auth.existingSecret: authority-auth
+      resourceActions.authorityWorker.tls.existingSecret: authority-tls
+      resourceActions.authorityWorker.cohorts:
+        - id: authority-v1
+          replicas: 2
+          image: registry.example/authority:latest
+          imagePullPolicy: Always
+    asserts:
+      - failedTemplate:
+          errorMessage: 'resourceActions.authorityWorker cohort "authority-v1" image must be digest-pinned'
+
+  - it: should reject a non-HA cohort
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      resourceActions.authorityWorker.enabled: true
+      resourceActions.authorityWorker.activeCohort: authority-v1
+      resourceActions.authorityWorker.auth.existingSecret: authority-auth
+      resourceActions.authorityWorker.tls.existingSecret: authority-tls
+      resourceActions.authorityWorker.cohorts:
+        - id: authority-v1
+          replicas: 1
+          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          imagePullPolicy: Always
+    asserts:
+      - failedTemplate:
+          errorMessage: 'resourceActions.authorityWorker cohort "authority-v1" must have replicas: 2'
+
+  - it: should reject an active cohort outside the immutable cohort set
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      resourceActions.authorityWorker.enabled: true
+      resourceActions.authorityWorker.activeCohort: authority-v2
+      resourceActions.authorityWorker.auth.existingSecret: authority-auth
+      resourceActions.authorityWorker.tls.existingSecret: authority-tls
+      resourceActions.authorityWorker.cohorts:
+        - id: authority-v1
+          replicas: 2
+          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          imagePullPolicy: Always
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.activeCohort must name exactly one cohort
+
+  - it: should require purpose auth and TLS secrets
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      resourceActions.authorityWorker.enabled: true
+      resourceActions.authorityWorker.activeCohort: authority-v1
+      resourceActions.authorityWorker.cohorts:
+        - id: authority-v1
+          replicas: 2
+          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          imagePullPolicy: Always
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.auth existingSecret and key are required

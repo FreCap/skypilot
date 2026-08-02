@@ -6,7 +6,7 @@ finish -- bounded by the per-service `graceful_drain_seconds` cap --
 instead of sleeping a fixed 120s and then killing whatever is still
 running.
 """
-# pylint: disable=protected-access
+# pylint: disable=missing-class-docstring,protected-access
 import threading
 from unittest import mock
 
@@ -15,6 +15,7 @@ import pytest
 
 from sky import exceptions
 from sky import skypilot_config
+from sky.serve import constants as serve_constants
 from sky.serve import replica_managers
 from sky.serve import service_spec as service_spec_lib
 from sky.utils import schemas
@@ -108,14 +109,16 @@ class TestWaitForDrain:
                     '/tmp/replica.log',
                     continue_guard=lambda: next(ownership))
 
-        down.assert_called_once_with('svc-1')
+        down.assert_called_once_with('svc-1',
+                                     _expected_cluster_record_uuid=None)
 
     def test_terminate_pins_recorded_workspace_on_each_retry(self):
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name):
+        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
             assert cluster_name == 'svc-1'
+            assert _expected_cluster_record_uuid is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             if len(observed_workspaces) == 1:
                 raise RuntimeError('transient down failure')
@@ -146,7 +149,8 @@ class TestWaitForDrain:
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name):
+        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
+            assert _expected_cluster_record_uuid is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             raise exceptions.ClusterDoesNotExist(cluster_name)
 
@@ -1020,7 +1024,7 @@ class TestRecoveredStrictDrainDeadline:
              pytest.raises(RuntimeError, match='db unavailable'):
             rm._register_wait_for_idle(info)
 
-        assert rm._wait_for_idle_trackers == {}
+        assert not rm._wait_for_idle_trackers
 
     def test_deferred_off_route_write_atomically_stamps_start(self):
         rm, info = self._manager_and_info(None)
@@ -1164,7 +1168,6 @@ class TestSpecField:
     def test_bounded_by_lb_occupancy_retention(self):
         # A drain longer than the LB's off-ready occupancy retention would
         # lose the unknown protection partway through.
-        from sky.serve import constants as serve_constants
         limit = serve_constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS
         spec = service_spec_lib.SkyServiceSpec.from_yaml_config(dict(
             self._BASE))

@@ -193,6 +193,31 @@ class TestServerCommonAuth:
 
         mock_request.assert_not_called()
 
+    @mock.patch('sky.server.common._prepare_authenticated_request_params',
+                return_value=('https://api.example.test/read-only-post', {
+                    'data': b'body',
+                    'raise_for_server_unavailable': False,
+                }))
+    @mock.patch('sky.server.common.rest.request_without_retry')
+    def test_make_authenticated_request_without_retry_allows_declared_post(
+            self, mock_request, _mock_prepare):
+        response = mock.Mock()
+        mock_request.return_value = response
+
+        assert common.make_authenticated_request(
+            'POST',
+            '/read-only-post',
+            retry=False,
+            allow_non_get_without_retry=True,
+            data=b'body',
+            raise_for_server_unavailable=False) is response
+
+        mock_request.assert_called_once_with(
+            'POST',
+            'https://api.example.test/read-only-post',
+            data=b'body',
+            raise_for_server_unavailable=False)
+
     @pytest.mark.asyncio
     @mock.patch('sky.server.common._prepare_authenticated_request_params',
                 return_value=('https://api.example.test/delete', {}))

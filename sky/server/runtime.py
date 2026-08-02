@@ -37,6 +37,7 @@ from sky.server import metrics
 from sky.server import plugins
 from sky.server.blob import blob_storage as bs
 from sky.server.events import store as operational_event_store
+from sky.server.requests import authority_worker
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
@@ -55,7 +56,7 @@ from sky.utils.db import db_utils
 logger = sky_logging.init_logger(__name__)
 
 _SERVER_USER_HASH_KEY = 'server_user_hash'
-_ROLE_CHOICES = ('all', 'api', 'executor', 'controller')
+_ROLE_CHOICES = ('all', 'api', 'executor', 'controller', 'authority-worker')
 _SINGLETON_PREFIX = 'skypilot:api-server-runtime:v1'
 _CONTROLLER_LEADERSHIP_POLL_SECONDS = 2
 _CONTROLLER_LEADERSHIP_PROBE_SECONDS = 2
@@ -830,14 +831,31 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
 
         background = _start_background_loop(state.role, args.host,
                                             args.metrics_port)
-        if state.role in ('all', 'executor'):
+        authority_claim_config = None
+        if state.role == 'authority-worker':
+            if state.instance_lease is None:
+                raise RuntimeError(
+                    'The authority-worker role requires PostgreSQL instance '
+                    'leases.')
+            authority_worker.require_private_handler_inventory()
+            engine = request_postgres.initialize_and_get_db()
+            with engine.connect() as connection:
+                authority_claim_config = authority_worker.resolve_claim_config(
+                    connection)
+
+        if state.role in ('all', 'executor', 'authority-worker'):
             clean_env_module.capture_clean_server_env()
             execution_classes = None
-            if state.role == 'executor':
+            if state.role in ('executor', 'authority-worker'):
                 execution_classes = frozenset(
                     {request_registry.ExecutionClass.NORMAL})
-            queue_server, workers = executor.start(
-                state.config, execution_classes=execution_classes)
+            start_kwargs: dict[str, Any] = {
+                'execution_classes': execution_classes,
+            }
+            if authority_claim_config is not None:
+                start_kwargs['authority_claim_config'] = (
+                    authority_claim_config)
+            queue_server, workers = executor.start(state.config, **start_kwargs)
             if state.requests_recovered:
                 executor.reenqueue_recovered_requests()
             if state.role == 'all':
@@ -847,24 +865,33 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
                 from sky.jobs import managed_job_refresh_thread
                 managed_job_refresh_thread.start_managed_job_refresh_daemon()
                 background.run(_initialize_controller_requests())
-            background.run(_initialize_normal_executor_requests())
+            if state.role != 'authority-worker':
+                background.run(_initialize_normal_executor_requests())
 
-        if state.role == 'executor':
+        if state.role in ('executor', 'authority-worker'):
             if state.instance_lease is None:
                 raise RuntimeError(
-                    'The executor role requires PostgreSQL instance leases.')
+                    f'The {state.role} role requires PostgreSQL instance '
+                    'leases.')
             health_server = _RoleHealthServer(args.host, args.role_health_port,
                                               state.instance_lease)
             health_server.start()
-            state.instance_lease.set_ready(
-                True,
-                health_detail={
-                    'phase': 'claiming',
-                    'long_workers':
-                        state.config.long_worker_config.garanteed_parallelism,
-                    'short_workers':
-                        state.config.short_worker_config.garanteed_parallelism,
+            health_detail: dict[str, Any] = {
+                'phase': 'claiming',
+                'long_workers':
+                    state.config.long_worker_config.garanteed_parallelism,
+                'short_workers':
+                    state.config.short_worker_config.garanteed_parallelism,
+            }
+            if authority_claim_config is not None:
+                health_detail.update({
+                    'cohort_id': authority_claim_config.routing.cohort_id,
+                    'active_cohort_id': authority_claim_config.active_cohort_id,
+                    'cohort_lifecycle_state':
+                        authority_claim_config.lifecycle_state,
+                    'claim_contract': 'frozen_action_cohort_join_v1',
                 })
+            state.instance_lease.set_ready(True, health_detail=health_detail)
             _wait_for_executor_shutdown()
         else:
             _run_uvicorn(state, args)

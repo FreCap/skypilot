@@ -54,6 +54,7 @@ from sky.server import plugins
 from sky.server import versions
 from sky.server import watchdog
 from sky.server.events import models as event_models
+from sky.server.requests import authority_worker
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import process
@@ -1357,17 +1358,24 @@ async def prepare_request_async(
     """
     role_filter.reject_non_admin_pod_config(auth_user, request_body)
     if auth_user is not None:
-        assert auth_user.name is not None
+        # Authenticated requests historically did not require either submitted
+        # identity field because both are replaced below.
+        submitted_user_hash = request_body.env_vars.get(
+            constants.USER_ID_ENV_VAR, '')
+    else:
+        # Preserve the legacy no-auth requirement for a submitted user hash.
+        submitted_user_hash = request_body.env_vars[constants.USER_ID_ENV_VAR]
+    submitted_original_user = request_body.env_vars.get(constants.USER_ENV_VAR,
+                                                        submitted_user_hash)
+    effective_original_user, user_id = (
+        server_common.resolve_effective_request_identity(
+            auth_user, submitted_original_user, submitted_user_hash))
+    if auth_user is not None:
         # Use the authenticated user identity as the single source of truth
         # if present.
-        user_id = auth_user.id
         # Set user identity for executors.
         request_body.env_vars[constants.USER_ID_ENV_VAR] = user_id
-        request_body.env_vars[constants.USER_ENV_VAR] = auth_user.name
-    else:
-        # Fallback to legacy environment variable based identity if no
-        # authentication is set.
-        user_id = request_body.env_vars[constants.USER_ID_ENV_VAR]
+        request_body.env_vars[constants.USER_ENV_VAR] = effective_original_user
     actor_type: str | None
     if is_skypilot_system:
         user_id = constants.SKYPILOT_SYSTEM_USER_ID
@@ -1378,10 +1386,10 @@ async def prepare_request_async(
                         name=user_id,
                         user_type=models.UserType.SYSTEM.value))
     elif auth_user is not None:
-        actor_name = auth_user.name or auth_user.id
+        actor_name = effective_original_user or user_id
         actor_type = auth_user.user_type
     else:
-        actor_name = request_body.env_vars.get(constants.USER_ENV_VAR, user_id)
+        actor_name = effective_original_user
         actor_type = None
     # Capture the client's API version from the FastAPI dispatch context
     # into the request body so it survives the process boundary into the
@@ -1565,6 +1573,8 @@ def start(
     *,
     execution_classes: frozenset[request_registry.ExecutionClass] | None = None,
     controller_generation: int | None = None,
+    authority_claim_config: (authority_worker.AuthorityWorkerClaimConfig |
+                             None) = None,
 ) -> tuple[multiprocessing.Process | None, list[RequestWorker]]:
     """Start the request workers.
 
@@ -1579,11 +1589,11 @@ def start(
     factory = queue_base.get_registered_queue_backend_factory()
     # Explicitly registered plugin backends take precedence over config.
     if factory is not None:
-        if execution_classes is not None:
+        if execution_classes is not None or authority_claim_config is not None:
             raise RuntimeError(
                 'Explicit queue plugins cannot be used with role-scoped '
-                'request execution because QueueBackendFactory has no '
-                'execution-class filter contract.')
+                'request execution because QueueBackendFactory has no closed '
+                'claim-filter contract.')
         _queue_factory = factory
     elif os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
         # Runtime import avoids loading the PostgreSQL implementation before
@@ -1595,14 +1605,15 @@ def start(
                            if execution_classes is not None else None)
         _queue_factory = postgres.PostgresQueueFactory(
             execution_classes=allowed_classes,
-            controller_generation=controller_generation)
+            controller_generation=controller_generation,
+            authority_claim_config=authority_claim_config)
     elif config.queue_backend == server_config.QueueBackend.MULTIPROCESSING:
-        if execution_classes is not None:
+        if execution_classes is not None or authority_claim_config is not None:
             raise RuntimeError('Role-scoped request execution requires the '
                                'PostgreSQL request backend.')
         _queue_factory = queue_base.MultiprocessingQueueFactory()
     elif config.queue_backend == server_config.QueueBackend.LOCAL:
-        if execution_classes is not None:
+        if execution_classes is not None or authority_claim_config is not None:
             raise RuntimeError('Role-scoped request execution requires the '
                                'PostgreSQL request backend.')
         _queue_factory = queue_base.LocalQueueFactory()

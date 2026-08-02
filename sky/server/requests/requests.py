@@ -258,22 +258,16 @@ def sanitize_request_error(
 
 
 def _encoded_return_value(name: str, request_id: str, return_value: Any) -> Any:
-    """Encode a return value, dropping to None on encoder failure.
+    """Encode a return value.
 
-    An exception here would escape the executor wrapper's else-block
-    (outside its try/except) and leave the row stuck in RUNNING with the
-    worker pid populated — enabling the SIGTERM-to-idle-worker pool break.
-    All return-value serializers already guard `if return_value is not
-    None`, so None persists as JSON `null`.
+    Durable terminal-transition implementations catch encoder failures and
+    atomically persist FAILED plus the encoding error.  Keeping this helper
+    strict prevents a malformed private-handler result from becoming a
+    successful JSON null.
     """
     encoder = encoders.get_encoder(name)
-    try:
-        return encoder(return_value)
-    except Exception as e:  # pylint: disable=broad-except
-        logger.warning(f'Encoder for request {request_id} ({name}) '
-                       f'failed; storing None: '
-                       f'{common_utils.format_exception(e)}')
-        return None
+    del request_id
+    return encoder(return_value)
 
 
 REQUEST_COLUMNS = [
@@ -398,10 +392,7 @@ class Request:
         }
 
     def set_return_value(self, return_value: Any) -> None:
-        """Set the encoded return value.
-
-        On encoder failure, drop to None (see `_encoded_return_value`).
-        """
+        """Set the encoded return value, raising if validation fails."""
         self.return_value = _encoded_return_value(self.name, self.request_id,
                                                   return_value)
 
@@ -1641,6 +1632,9 @@ class RequestTaskFilter:
         finished_after: if provided, only include requests finished at or after
             this timestamp. Requests still in progress (finished_at IS NULL)
             are always included.
+        retention_safe: internal GC guard that excludes correlated requests
+            until their exact resource-action attempt is settled. PostgreSQL
+            enforces this; SQLite has no central resource-action correlation.
         limit: the number of requests to show. If None, show all requests.
 
     Raises:
@@ -1655,6 +1649,7 @@ class RequestTaskFilter:
     finished_before: float | None = None
     include_missing_finished_at: bool = False
     finished_after: float | None = None
+    retention_safe: bool = False
     limit: int | None = None
     fields: list[str] | None = None
     sort: bool = False
@@ -1793,7 +1788,12 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     (update_request / update_request_async).
     """
     serialized_result = None
-    if result is not None:
+    result_encoding_failed = False
+    should_encode_result = result is not None
+    if (name is not None and status == RequestStatus.SUCCEEDED and
+            encoders.requires_strict_return_value(name)):
+        should_encode_result = True
+    if should_encode_result:
         assert name is not None, request_id
         serializer = return_value_serializers.get_serializer(name)
         # A serializer failure must not raise: an exception here escapes the
@@ -1810,6 +1810,7 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
                 f'{request_id} ({name}); marking the request failed.',
                 exc_info=True)
             status = RequestStatus.FAILED
+            result_encoding_failed = True
             if error is None:
                 error = e
     set_clauses = ['status = ?', f'{COL_FINISHED_AT} = ?']
@@ -1817,6 +1818,11 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     if serialized_result is not None:
         set_clauses.append('return_value = ?')
         params.append(serialized_result)
+    elif result_encoding_failed:
+        # Do not retain a result from an earlier delivery when validating the
+        # terminal result for this delivery failed.
+        set_clauses.append('return_value = ?')
+        params.append(return_value_serializers.default_serializer(None))
     if error is not None:
         set_clauses.append('error = ?')
         params.append(orjson.dumps(_build_error_dict(error)).decode('utf-8'))
@@ -2041,6 +2047,7 @@ async def clean_finished_requests_with_retention(
                                          finished_before=time.time() -
                                          retention_seconds,
                                          include_missing_finished_at=True,
+                                         retention_safe=True,
                                          limit=batch_size,
                                          fields=['request_id']))
         if len(reqs) == 0:
@@ -2431,7 +2438,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                              result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None:
+        if result is not None or status == RequestStatus.SUCCEEDED:
             # The return-value encoder is looked up by request name; a
             # single-column primary-key read is far cheaper than the full
             # row (which would unpickle entrypoint and request_body).
@@ -2468,7 +2475,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                                          result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None:
+        if result is not None or status == RequestStatus.SUCCEEDED:
             async with _DB.execute_fetchall_async(
                     f'SELECT name FROM {REQUEST_TABLE} WHERE request_id = ?',
                 (request_id,)) as rows:

@@ -11003,7 +11003,7 @@ finally:
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
             ).scalar_one()
-        assert revision == '027'
+        assert revision == migration_utils.GLOBAL_USER_STATE_VERSION
     finally:
         for process in processes:
             if process.poll() is None:
@@ -11146,7 +11146,7 @@ def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
             assert connection.execute(
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
-            ).scalar_one() == '027'
+            ).scalar_one() == migration_utils.GLOBAL_USER_STATE_VERSION
         assert sqlalchemy.inspect(fresh_engine).has_table(
             'container_image_catalog')
     finally:

@@ -43,7 +43,7 @@ def configured_migration_mode() -> MigrationMode:
 
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '027'  # qualification phases and repo tombstones
+GLOBAL_USER_STATE_VERSION = '028'  # action-aware cluster record identity
 GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
@@ -52,7 +52,7 @@ SPOT_JOBS_VERSION = '026'  # durable managed-job controller ownership
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '032'  # exact non-rejected SkyServe request activity
+SERVE_VERSION = '033'  # request classification and action decision coverage
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
@@ -68,7 +68,7 @@ RECIPES_VERSION = '001'
 RECIPES_LOCK_PATH = f'~/.sky/locks/.{RECIPES_DB_NAME}.lock'
 
 API_REQUESTS_DB_NAME = 'api_requests_db'
-API_REQUESTS_VERSION = '004'
+API_REQUESTS_VERSION = '007'
 API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
 
 LIFECYCLE_ACTIONS_DB_NAME = 'lifecycle_actions_db'

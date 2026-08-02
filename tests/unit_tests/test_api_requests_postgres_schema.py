@@ -17,7 +17,22 @@ def test_postgres_record_schema_topology() -> None:
              'execution_generation', 'claim_token', 'worker_instance_id',
              'controller_generation', 'lease_expires_at', 'heartbeat_at',
              'cancel_requested_at', 'cancel_acknowledged_at',
-             'interrupted_reason', 'event_context', 'updated_at'),
+             'interrupted_reason', 'event_context', 'resource_action_id',
+             'resource_action_attempt', 'updated_at'),
+        'api_resource_actions':
+            ('action_id', 'domain', 'resource_type', 'resource_identity',
+             'desired_generation', 'action_type', 'immutable_spec',
+             'immutable_spec_sha256', 'kernel_state', 'current_attempt',
+             'next_attempt_at', 'last_result', 'last_result_sha256',
+             'terminal_disposition', 'revision', 'created_at', 'updated_at',
+             'terminal_at'),
+        'api_resource_action_attempts':
+            ('action_id', 'attempt', 'request_id', 'request_input_sha256',
+             'provider_operation_id', 'mutation_boundary',
+             'provider_io_boundary', 'provider_progress',
+             'provider_progress_sha256', 'provider_progress_revision',
+             'typed_outcome', 'typed_outcome_sha256', 'request_terminal_state',
+             'admitted_at', 'updated_at', 'settled_at'),
         'api_request_queue':
             ('request_id', 'schedule_type', 'priority', 'available_at',
              'enqueued_at', 'sequence', 'ignore_return_value', 'retryable',
@@ -57,6 +72,9 @@ def test_postgres_record_schema_topology() -> None:
 def test_postgres_schema_objects_keep_historical_facade_identity() -> None:
     assert postgres._METADATA is postgres_schema.metadata
     assert postgres.REQUESTS is postgres_schema.REQUESTS
+    assert postgres.RESOURCE_ACTIONS is postgres_schema.RESOURCE_ACTIONS
+    assert (postgres.RESOURCE_ACTION_ATTEMPTS
+            is postgres_schema.RESOURCE_ACTION_ATTEMPTS)
     assert postgres.QUEUE is postgres_schema.QUEUE
     assert postgres.STORE_METADATA is postgres_schema.STORE_METADATA
     assert postgres.SERVER_INSTANCES is postgres_schema.SERVER_INSTANCES

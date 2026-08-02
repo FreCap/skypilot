@@ -27,12 +27,14 @@ from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server.events import emission as event_emission
 from sky.server.events import models as event_models
+from sky.server.requests import authority_worker
 from sky.server.requests import postgres_schema
 from sky.server.requests import preconditions
 from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
+from sky.server.requests.serializers import encoders
 from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -53,7 +55,8 @@ _CLAIM_HEARTBEAT_INTERVAL_SECONDS = 10
 _MAX_EXPIRED_CLAIMS_PER_SWEEP = 100
 _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 _INSTANCE_STALE_AFTER_SECONDS = 20
-_VALID_SERVER_ROLES = frozenset({'all', 'api', 'executor', 'controller'})
+_VALID_SERVER_ROLES = frozenset(
+    {'all', 'api', 'executor', 'controller', 'authority-worker'})
 _CONTROLLER_LEADERSHIP_KEY = 'api-controller'
 _CONTROLLER_LEADER_LOCK_ID = 'skypilot:api-controller-leader:v1'
 _CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
@@ -66,6 +69,8 @@ def role_is_draining() -> bool:
 
 _METADATA = postgres_schema.metadata
 REQUESTS = postgres_schema.REQUESTS
+RESOURCE_ACTIONS = postgres_schema.RESOURCE_ACTIONS
+RESOURCE_ACTION_ATTEMPTS = postgres_schema.RESOURCE_ACTION_ATTEMPTS
 QUEUE = postgres_schema.QUEUE
 STORE_METADATA = postgres_schema.STORE_METADATA
 SERVER_INSTANCES = postgres_schema.SERVER_INSTANCES
@@ -112,16 +117,29 @@ def _supported_handlers(role: str) -> list[str]:
     if role == 'controller':
         return sorted(registration.name
                       for registration in registrations
-                      if registration.execution_class is
-                      request_registry.ExecutionClass.CONTROLLER)
+                      if registration.execution_class is request_registry.
+                      ExecutionClass.CONTROLLER and registration.claim_scope is
+                      request_registry.HandlerClaimScope.GENERAL)
     if role == 'executor':
-        return sorted(registration.name
-                      for registration in registrations
-                      if registration.execution_class is
-                      request_registry.ExecutionClass.NORMAL)
+        return sorted(
+            registration.name
+            for registration in registrations
+            if registration.execution_class is
+            request_registry.ExecutionClass.NORMAL and registration.claim_scope
+            is request_registry.HandlerClaimScope.GENERAL)
+    if role == 'authority-worker':
+        return sorted(
+            registration.name
+            for registration in registrations
+            if registration.claim_scope is (
+                request_registry.HandlerClaimScope.RESOURCE_ACTION_AUTHORITY))
     # The compatibility all-role process remains the only consumer for both
-    # execution classes.
-    return sorted(registration.name for registration in registrations)
+    # execution classes, but private mutation handlers are never compatible
+    # work.
+    return sorted(registration.name
+                  for registration in registrations
+                  if registration.claim_scope is (
+                      request_registry.HandlerClaimScope.GENERAL))
 
 
 def _supported_payload_versions() -> dict[str, dict[str, int]]:
@@ -905,6 +923,45 @@ def _queue_values(request: requests_lib.Request) -> dict[str, Any]:
     }
 
 
+def _insert_request_and_queue(
+    connection: sqlalchemy.engine.Connection,
+    request: requests_lib.Request,
+    *,
+    resource_action_id: uuid.UUID | None = None,
+    resource_action_attempt: int | None = None,
+) -> bool:
+    """Insert one request and its queue row in the caller's transaction."""
+    if ((resource_action_id is None) != (resource_action_attempt is None)):
+        raise ValueError('Resource-action request correlation requires both '
+                         'an action ID and an attempt number.')
+    values = _request_values_for_db(request)
+    values['resource_action_id'] = resource_action_id
+    values['resource_action_attempt'] = resource_action_attempt
+    result = connection.execute(
+        postgresql.insert(REQUESTS).values(**values).on_conflict_do_nothing(
+            index_elements=[REQUESTS.c.request_id]).returning(
+                REQUESTS.c.request_id))
+    inserted = result.scalar_one_or_none() is not None
+    if inserted and request.should_enqueue:
+        connection.execute(
+            postgresql.insert(QUEUE).values(
+                **_queue_values(request)).on_conflict_do_nothing(
+                    index_elements=[QUEUE.c.request_id]))
+    return inserted
+
+
+def _request_is_retention_safe() -> sqlalchemy.ColumnElement[bool]:
+    """Require correlated request evidence to be durably snapshotted."""
+    settled_attempt = sqlalchemy.exists().where(
+        RESOURCE_ACTION_ATTEMPTS.c.action_id == REQUESTS.c.resource_action_id,
+        RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+        REQUESTS.c.resource_action_attempt,
+        RESOURCE_ACTION_ATTEMPTS.c.request_id == REQUESTS.c.request_id,
+        RESOURCE_ACTION_ATTEMPTS.c.mutation_boundary == 'SETTLED')
+    return sqlalchemy.or_(REQUESTS.c.resource_action_id.is_(None),
+                          settled_attempt)
+
+
 def _request_filter_statement(
     req_filter: requests_lib.RequestTaskFilter,) -> sqlalchemy.sql.Select:
     statement = sqlalchemy.select(REQUESTS)
@@ -942,6 +999,8 @@ def _request_filter_statement(
         statement = statement.where(
             sqlalchemy.or_(REQUESTS.c.finished_at >= after,
                            REQUESTS.c.finished_at.is_(None)))
+    if req_filter.retention_safe:
+        statement = statement.where(_request_is_retention_safe())
     if req_filter.sort:
         statement = statement.order_by(REQUESTS.c.created_at.desc())
     if req_filter.limit is not None:
@@ -1318,20 +1377,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
     async def create_if_not_exists_async(self,
                                          request: requests_lib.Request) -> bool:
         engine = await _get_async_engine()
-        values = _request_values_for_db(request)
         async with engine.begin() as connection:
-            result = await connection.execute(
-                postgresql.insert(REQUESTS).values(
-                    **values).on_conflict_do_nothing(
-                        index_elements=[REQUESTS.c.request_id]).returning(
-                            REQUESTS.c.request_id))
-            inserted = result.scalar_one_or_none() is not None
-            if inserted and request.should_enqueue:
-                await connection.execute(
-                    postgresql.insert(QUEUE).values(
-                        **_queue_values(request)).on_conflict_do_nothing(
-                            index_elements=[QUEUE.c.request_id]))
-        return inserted
+            return await connection.run_sync(_insert_request_and_queue, request)
 
     async def create_or_refresh_internal_daemon_async(
             self, request: requests_lib.Request) -> bool:
@@ -1445,7 +1492,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         async with engine.begin() as connection:
             await connection.execute(
                 sqlalchemy.delete(REQUESTS).where(
-                    REQUESTS.c.request_id.in_(request_ids)))
+                    REQUESTS.c.request_id.in_(request_ids),
+                    _request_is_retention_safe()))
 
     async def update_status_async(self, request_id: str,
                                   status: requests_lib.RequestStatus) -> None:
@@ -1608,8 +1656,25 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             request.finished_at = time.time()
             if error is not None:
                 request.set_error(error)
-            if result is not None:
-                request.set_return_value(result)
+            should_encode_result = result is not None
+            if status == requests_lib.RequestStatus.SUCCEEDED:
+                should_encode_result = (should_encode_result or
+                                        encoders.requires_strict_return_value(
+                                            request.name))
+            if should_encode_result:
+                try:
+                    request.set_return_value(result)
+                except Exception as encoding_error:  # pylint: disable=broad-except
+                    logger.error(
+                        f'Failed to encode return value for request '
+                        f'{request_id} ({request.name}); marking the request '
+                        'failed.',
+                        exc_info=True)
+                    status = requests_lib.RequestStatus.FAILED
+                    cause = event_api_models.EventCause.HANDLER_FAILED.value
+                    request.status = status
+                    request.return_value = None
+                    request.set_error(encoding_error)
             values = _request_values_for_db(request)
             values.pop('request_id')
             transitioned = _terminalize_locked_request(
@@ -1856,6 +1921,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
         *,
         execution_classes: frozenset[str] | None = None,
         controller_generation: int | None = None,
+        authority_claim_config: (authority_worker.AuthorityWorkerClaimConfig |
+                                 None) = None,
     ):
         self._schedule_type = schedule_type
         self._instance_id = ensure_server_instance_id()
@@ -1874,8 +1941,21 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 os.environ.get(SERVER_ROLE_ENV_VAR, 'all') != 'all'):
             raise ValueError('A controller-scoped queue requires an active '
                              'controller generation.')
+        role = os.environ.get(SERVER_ROLE_ENV_VAR, 'all')
+        if authority_claim_config is not None:
+            if role != 'authority-worker':
+                raise ValueError('Authority claim routing requires the '
+                                 'authority-worker server role.')
+            if execution_classes != frozenset(
+                {request_registry.ExecutionClass.NORMAL.value}):
+                raise ValueError('Authority claim routing requires exactly '
+                                 'the normal execution class.')
+        elif role == 'authority-worker':
+            raise ValueError('The authority-worker role requires a resolved '
+                             'claim configuration.')
         self._execution_classes = execution_classes
         self._controller_generation = controller_generation
+        self._authority_claim_config = authority_claim_config
 
     def _role_predicates(self) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
         predicates: list[sqlalchemy.ColumnElement[bool]] = []
@@ -1886,6 +1966,14 @@ class PostgresQueueBackend(queue_base.QueueBackend):
             predicates.append(sqlalchemy.exists().where(
                 _controller_leadership_is_current_predicate(
                     uuid.UUID(self._instance_id), self._controller_generation)))
+        if self._authority_claim_config is None:
+            predicates.append(
+                REQUESTS.c.handler_name.not_in(
+                    request_registry.RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST
+                ))
+        else:
+            predicates.append(
+                authority_worker.claim_predicate(self._authority_claim_config))
         return tuple(predicates)
 
     def _lock_controller_leadership(
@@ -1987,7 +2075,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                     QUEUE.c.schedule_type == self._schedule_type,
                     QUEUE.c.delivery_state == 'claimed',
                     REQUESTS.c.lease_expires_at
-                    < sqlalchemy.func.clock_timestamp()).limit(
+                    < sqlalchemy.func.clock_timestamp(),
+                    *self._role_predicates()).limit(
                         _MAX_EXPIRED_CLAIMS_PER_SWEEP).with_for_update(
                             skip_locked=True)).mappings().all()
         for row in rows:
@@ -2146,7 +2235,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 REQUESTS.c.status.in_([
                     status.value for status in
                     requests_lib.RequestStatus.executable_statuses()
-                ]))
+                ]), *self._role_predicates())
             if controller_generation is not None:
                 claim_statement = claim_statement.where(
                     sqlalchemy.exists().where(
@@ -2219,9 +2308,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                        REQUESTS.c.request_id == QUEUE.c.request_id)).where(
                            QUEUE.c.schedule_type == self._schedule_type,
                            QUEUE.c.delivery_state == 'queued')
-        if self._execution_classes is not None:
-            statement = statement.where(
-                REQUESTS.c.execution_class.in_(self._execution_classes))
+        statement = statement.where(*self._role_predicates())
         with engine.connect() as connection:
             return int(connection.execute(statement).scalar_one())
 
@@ -2234,12 +2321,16 @@ class PostgresQueueFactory(queue_base.QueueBackendFactory):
         *,
         execution_classes: frozenset[str] | None = None,
         controller_generation: int | None = None,
+        authority_claim_config: (authority_worker.AuthorityWorkerClaimConfig |
+                                 None) = None,
     ) -> None:
         self._execution_classes = execution_classes
         self._controller_generation = controller_generation
+        self._authority_claim_config = authority_claim_config
 
     def create_queue(self, schedule_type: str) -> queue_base.QueueBackend:
         return PostgresQueueBackend(
             schedule_type,
             execution_classes=self._execution_classes,
-            controller_generation=self._controller_generation)
+            controller_generation=self._controller_generation,
+            authority_claim_config=self._authority_claim_config)

@@ -1338,6 +1338,88 @@
                 }
             }
         },
+        "resourceActions": {
+            "type": "object",
+            "properties": {
+                "authorityWorker": {
+                    "type": "object",
+                    "properties": {
+                        "activeCohort": {
+                            "type": "string"
+                        },
+                        "auth": {
+                            "type": "object",
+                            "properties": {
+                                "existingSecret": {
+                                    "type": "string"
+                                },
+                                "key": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "cohorts": {
+                            "type": "array",
+                            "items": {
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "maxLength": 63,
+                                        "minLength": 1
+                                    },
+                                    "image": {
+                                        "type": "string",
+                                        "minLength": 1
+                                    },
+                                    "imagePullPolicy": {
+                                        "type": "string"
+                                    },
+                                    "replicas": {
+                                        "type": "integer"
+                                    }
+                                }
+                            }
+                        },
+                        "enabled": {
+                            "type": "boolean"
+                        },
+                        "healthPort": {
+                            "type": "integer",
+                            "maximum": 65535,
+                            "minimum": 1
+                        },
+                        "preflightPort": {
+                            "type": "integer",
+                            "maximum": 65535,
+                            "minimum": 1
+                        },
+                        "retirementTombstones": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "tls": {
+                            "type": "object",
+                            "properties": {
+                                "caKey": {
+                                    "type": "string"
+                                },
+                                "certKey": {
+                                    "type": "string"
+                                },
+                                "existingSecret": {
+                                    "type": "string"
+                                },
+                                "privateKeyKey": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "runpodCredentials": {
             "type": "object",
             "properties": {
