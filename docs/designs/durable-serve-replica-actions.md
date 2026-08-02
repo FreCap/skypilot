@@ -2782,9 +2782,15 @@ write typed outcomes.
   reachability, and the redacted invocation builder pass contract tests. Until
   then the profile is shadow-only and promotion-blocking.
 - Build and push the immutable canary image for `boltz-test`. AWS/ECR auth and
-  read-only cluster access through the dedicated SSM hop are verified; the
-  current rollback baseline is Helm revision 56 with all roles pinned to
-  `sha256:6753d5fb3ccac8d6436a436a99870410248e62f03ecad08741ebd4510d1f5e18`.
+  read-only cluster access through the dedicated SSM hop are verified. The
+  2026-08-02 pre-rollout refresh found zero services, nine nonterminal system
+  requests, no Warning events, and healthy two-replica API/executor/controller
+  roles. The rollback baseline is now Helm revision 57 (`M5-S0a passive Skylet
+  jobs.db side schema`) with all roles pinned to
+  `sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`;
+  central heads remain global 027, Serve032, and API004. Re-read the live
+  revision, image, heads, and workload inventory immediately before rollout;
+  revision 56 is no longer the current rollback point.
 - Measured shadow sample minimums and the first canary service selection.
 - A separate decision on whether central principal convergence is worth its
   operational cost; it must not silently re-enter M1-M4.

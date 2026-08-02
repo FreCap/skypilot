@@ -4862,8 +4862,12 @@ provider I/O, preflight, admission, manager integration, or authority.
 First-deployment cutover evidence refreshed on 2026-08-02: read-only
 `boltz-test` inspection found API schema 004, upstream request-classification
 Serve 032, global-user-state 027, and no Serve resource-action tables. Helm
-revision 56 has every role on baseline digest
-`sha256:6753d5fb3ccac8d6436a436a99870410248e62f03ecad08741ebd4510d1f5e18`.
+revision 57, advanced by the separate `M5-S0a passive Skylet jobs.db side
+schema` rollout, has every role on baseline digest
+`sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`;
+that rollout did not advance the three central schema heads. Re-read the live
+revision immediately before deployment and use that observation, not the
+superseded revision-56 digest, as the rollback point.
 This proves the unshipped feature Serve032/033 catalog is not present there;
 the post-migration zero-row/link/mode snapshot remains a mandatory rollout
 artifact.
