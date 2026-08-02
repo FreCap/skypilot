@@ -1632,6 +1632,67 @@ class ReplicaManager:
         return self._drain_proof_stats.snapshot()
 
 
+@dataclasses.dataclass
+class _LegacyReplicaMutationRuntime:
+    """Process-local owner for the legacy/shadow replica mutation path.
+
+    This is a behavior-preserving removal seam, not the durable action runtime.
+    Authoritative launch/down cannot use these pools, request associations, or
+    retry clocks once M4 exists. Keeping them behind one object lets the M5
+    cleanup delete a named runtime instead of rediscovering state spread across
+    ``SkyPilotReplicaManager``.
+    """
+
+    launch_completion_queue: queue.SimpleQueue[int] = dataclasses.field(
+        default_factory=queue.SimpleQueue)
+    launch_completion_event: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    launch_thread_pool: thread_utils.ThreadSafeDict[
+        int, thread_utils.SafeThread] = dataclasses.field(
+            default_factory=thread_utils.ThreadSafeDict)
+    replica_to_request_id: thread_utils.ThreadSafeDict[
+        int,
+        str] = dataclasses.field(default_factory=thread_utils.ThreadSafeDict)
+    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
+        int,
+        bool] = dataclasses.field(default_factory=thread_utils.ThreadSafeDict)
+    replica_to_logical_launch_fence: thread_utils.ThreadSafeDict[
+        int, LogicalTargetState] = dataclasses.field(
+            default_factory=thread_utils.ThreadSafeDict)
+    down_thread_pool: thread_utils.ThreadSafeDict[
+        int, thread_utils.SafeThread] = dataclasses.field(
+            default_factory=thread_utils.ThreadSafeDict)
+    failed_cleanup_retry_attempts: dict[int, int] = dataclasses.field(
+        default_factory=dict)
+    failed_cleanup_retry_at: dict[int, float] = dataclasses.field(
+        default_factory=dict)
+
+    def recover(self, recover: Callable[[], None]) -> None:
+        """Run legacy status-inference recovery through the removal seam."""
+        recover()
+
+    def refresh(self, refresh: Callable[[], None]) -> None:
+        """Run legacy thread completion through the removal seam."""
+        refresh()
+
+    def clear_failed_cleanup_retry(self, replica_id: int) -> None:
+        """Forget process-local cleanup rate limiting after success."""
+        self.failed_cleanup_retry_attempts.pop(replica_id, None)
+        self.failed_cleanup_retry_at.pop(replica_id, None)
+
+    def schedule_failed_cleanup_retry(self, replica_id: int,
+                                      now: float) -> tuple[int, float]:
+        """Record one process-local retry and return attempt and delay."""
+        attempt = self.failed_cleanup_retry_attempts.get(replica_id, 0) + 1
+        self.failed_cleanup_retry_attempts[replica_id] = attempt
+        exponential_step = min(attempt - 1, 30)
+        delay_seconds = min(
+            _FAILED_CLEANUP_RETRY_BASE_SECONDS * 2**exponential_step,
+            _FAILED_CLEANUP_RETRY_MAX_SECONDS)
+        self.failed_cleanup_retry_at[replica_id] = now + delay_seconds
+        return attempt, delay_seconds
+
+
 class SkyPilotReplicaManager(ReplicaManager):
     """Replica Manager for SkyPilot clusters.
 
@@ -1644,9 +1705,232 @@ class SkyPilotReplicaManager(ReplicaManager):
             whether it is still responding to requests.
     """
 
-    _launch_completion_queue: queue.SimpleQueue[int]
-    _launch_completion_event: threading.Event
     _scale_reconciliation_event: threading.Event
+    _LEGACY_MUTATION_RUNTIME_INIT_LOCK = threading.Lock()
+
+    _LEGACY_MUTATION_FIELD_MAP = {
+        '_launch_completion_queue': 'launch_completion_queue',
+        '_launch_completion_event': 'launch_completion_event',
+        '_launch_thread_pool': 'launch_thread_pool',
+        '_replica_to_request_id': 'replica_to_request_id',
+        '_replica_to_launch_cancelled': 'replica_to_launch_cancelled',
+        '_replica_to_logical_launch_fence': 'replica_to_logical_launch_fence',
+        '_down_thread_pool': 'down_thread_pool',
+        '_failed_cleanup_retry_attempts': 'failed_cleanup_retry_attempts',
+        '_failed_cleanup_retry_at': 'failed_cleanup_retry_at',
+    }
+
+    def _publish_legacy_mutation_runtime_state(
+            self, runtime: _LegacyReplicaMutationRuntime) -> None:
+        """Publish one runtime and synchronized compatibility aliases."""
+        # Data-descriptor properties below remain the only read owner. Keeping
+        # identity-matched instance entries makes unittest.mock treat legacy
+        # instance patch points as local, so context teardown restores the
+        # captured value through the setter without retaining old worker pools.
+        for legacy_name, runtime_name in self._LEGACY_MUTATION_FIELD_MAP.items(
+        ):
+            self.__dict__[legacy_name] = getattr(runtime, runtime_name)
+        # Publish last. A caller that observes the runtime also observes every
+        # compatibility alias from the same critical section.
+        self.__dict__['_legacy_mutation_runtime'] = runtime
+
+    def _set_legacy_mutation_compat_field(self, legacy_name: str,
+                                          runtime_name: str,
+                                          value: Any) -> None:
+        """Keep a temporary instance patch point identical to its owner."""
+        runtime = self._legacy_mutation_runtime_state()
+        setattr(runtime, runtime_name, value)
+        self.__dict__[legacy_name] = value
+
+    def _reset_legacy_mutation_compat_field(
+            self, legacy_name: str, runtime_name: str,
+            default_factory: Callable[[], Any]) -> None:
+        """Recreate a deleted compatibility field with its historical type."""
+        self._set_legacy_mutation_compat_field(legacy_name, runtime_name,
+                                               default_factory())
+
+    def _legacy_mutation_runtime_state(self) -> _LegacyReplicaMutationRuntime:
+        """Return the legacy owner, adopting pre-refactor instance fields."""
+        runtime = self.__dict__.get('_legacy_mutation_runtime')
+        if runtime is not None:
+            if '_launch_completion_queue' not in self.__dict__:
+                # Lightweight tests and embedders may inject only the runtime.
+                # Repair their patch metadata once under the publication lock.
+                with self._LEGACY_MUTATION_RUNTIME_INIT_LOCK:
+                    runtime = self.__dict__['_legacy_mutation_runtime']
+                    self._publish_legacy_mutation_runtime_state(runtime)
+            return runtime
+        # Compatibility managers reconstructed without the current __init__
+        # can first touch this accessor from multiple daemon threads. Adopt and
+        # publish their old fields exactly once so a losing initializer cannot
+        # overwrite live queues, events, or workers with fresh defaults.
+        with self._LEGACY_MUTATION_RUNTIME_INIT_LOCK:
+            runtime = self.__dict__.get('_legacy_mutation_runtime')
+            if runtime is not None:
+                return runtime
+            runtime = _LegacyReplicaMutationRuntime()
+            for legacy_name, runtime_name in (
+                    self._LEGACY_MUTATION_FIELD_MAP.items()):
+                legacy_value = self.__dict__.get(legacy_name)
+                if legacy_value is not None:
+                    setattr(runtime, runtime_name, legacy_value)
+            self._publish_legacy_mutation_runtime_state(runtime)
+            return runtime
+
+    @property
+    def _launch_completion_queue(self) -> queue.SimpleQueue[int]:
+        return self._legacy_mutation_runtime_state().launch_completion_queue
+
+    @_launch_completion_queue.setter
+    def _launch_completion_queue(self, value: queue.SimpleQueue[int]) -> None:
+        self._set_legacy_mutation_compat_field('_launch_completion_queue',
+                                               'launch_completion_queue', value)
+
+    @_launch_completion_queue.deleter
+    def _launch_completion_queue(self) -> None:
+        self._reset_legacy_mutation_compat_field('_launch_completion_queue',
+                                                 'launch_completion_queue',
+                                                 queue.SimpleQueue)
+
+    @property
+    def _launch_completion_event(self) -> threading.Event:
+        return self._legacy_mutation_runtime_state().launch_completion_event
+
+    @_launch_completion_event.setter
+    def _launch_completion_event(self, value: threading.Event) -> None:
+        self._set_legacy_mutation_compat_field('_launch_completion_event',
+                                               'launch_completion_event', value)
+
+    @_launch_completion_event.deleter
+    def _launch_completion_event(self) -> None:
+        self._reset_legacy_mutation_compat_field('_launch_completion_event',
+                                                 'launch_completion_event',
+                                                 threading.Event)
+
+    @property
+    def _launch_thread_pool(
+            self) -> thread_utils.ThreadSafeDict[int, thread_utils.SafeThread]:
+        return self._legacy_mutation_runtime_state().launch_thread_pool
+
+    @_launch_thread_pool.setter
+    def _launch_thread_pool(
+        self,
+        value: thread_utils.ThreadSafeDict[int,
+                                           thread_utils.SafeThread]) -> None:
+        self._set_legacy_mutation_compat_field('_launch_thread_pool',
+                                               'launch_thread_pool', value)
+
+    @_launch_thread_pool.deleter
+    def _launch_thread_pool(self) -> None:
+        self._reset_legacy_mutation_compat_field('_launch_thread_pool',
+                                                 'launch_thread_pool',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _replica_to_request_id(self) -> thread_utils.ThreadSafeDict[int, str]:
+        return self._legacy_mutation_runtime_state().replica_to_request_id
+
+    @_replica_to_request_id.setter
+    def _replica_to_request_id(
+            self, value: thread_utils.ThreadSafeDict[int, str]) -> None:
+        self._set_legacy_mutation_compat_field('_replica_to_request_id',
+                                               'replica_to_request_id', value)
+
+    @_replica_to_request_id.deleter
+    def _replica_to_request_id(self) -> None:
+        self._reset_legacy_mutation_compat_field('_replica_to_request_id',
+                                                 'replica_to_request_id',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _replica_to_launch_cancelled(
+            self) -> thread_utils.ThreadSafeDict[int, bool]:
+        return self._legacy_mutation_runtime_state().replica_to_launch_cancelled
+
+    @_replica_to_launch_cancelled.setter
+    def _replica_to_launch_cancelled(
+            self, value: thread_utils.ThreadSafeDict[int, bool]) -> None:
+        self._set_legacy_mutation_compat_field('_replica_to_launch_cancelled',
+                                               'replica_to_launch_cancelled',
+                                               value)
+
+    @_replica_to_launch_cancelled.deleter
+    def _replica_to_launch_cancelled(self) -> None:
+        self._reset_legacy_mutation_compat_field('_replica_to_launch_cancelled',
+                                                 'replica_to_launch_cancelled',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _replica_to_logical_launch_fence(
+            self) -> thread_utils.ThreadSafeDict[int, LogicalTargetState]:
+        return (self._legacy_mutation_runtime_state().
+                replica_to_logical_launch_fence)
+
+    @_replica_to_logical_launch_fence.setter
+    def _replica_to_logical_launch_fence(
+            self,
+            value: thread_utils.ThreadSafeDict[int,
+                                               LogicalTargetState]) -> None:
+        self._set_legacy_mutation_compat_field(
+            '_replica_to_logical_launch_fence',
+            'replica_to_logical_launch_fence', value)
+
+    @_replica_to_logical_launch_fence.deleter
+    def _replica_to_logical_launch_fence(self) -> None:
+        self._reset_legacy_mutation_compat_field(
+            '_replica_to_logical_launch_fence',
+            'replica_to_logical_launch_fence', thread_utils.ThreadSafeDict)
+
+    @property
+    def _down_thread_pool(
+            self) -> thread_utils.ThreadSafeDict[int, thread_utils.SafeThread]:
+        return self._legacy_mutation_runtime_state().down_thread_pool
+
+    @_down_thread_pool.setter
+    def _down_thread_pool(
+        self,
+        value: thread_utils.ThreadSafeDict[int,
+                                           thread_utils.SafeThread]) -> None:
+        self._set_legacy_mutation_compat_field('_down_thread_pool',
+                                               'down_thread_pool', value)
+
+    @_down_thread_pool.deleter
+    def _down_thread_pool(self) -> None:
+        self._reset_legacy_mutation_compat_field('_down_thread_pool',
+                                                 'down_thread_pool',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _failed_cleanup_retry_attempts(self) -> dict[int, int]:
+        return (
+            self._legacy_mutation_runtime_state().failed_cleanup_retry_attempts)
+
+    @_failed_cleanup_retry_attempts.setter
+    def _failed_cleanup_retry_attempts(self, value: dict[int, int]) -> None:
+        self._set_legacy_mutation_compat_field('_failed_cleanup_retry_attempts',
+                                               'failed_cleanup_retry_attempts',
+                                               value)
+
+    @_failed_cleanup_retry_attempts.deleter
+    def _failed_cleanup_retry_attempts(self) -> None:
+        self._reset_legacy_mutation_compat_field(
+            '_failed_cleanup_retry_attempts', 'failed_cleanup_retry_attempts',
+            dict)
+
+    @property
+    def _failed_cleanup_retry_at(self) -> dict[int, float]:
+        return self._legacy_mutation_runtime_state().failed_cleanup_retry_at
+
+    @_failed_cleanup_retry_at.setter
+    def _failed_cleanup_retry_at(self, value: dict[int, float]) -> None:
+        self._set_legacy_mutation_compat_field('_failed_cleanup_retry_at',
+                                               'failed_cleanup_retry_at', value)
+
+    @_failed_cleanup_retry_at.deleter
+    def _failed_cleanup_retry_at(self) -> None:
+        self._reset_legacy_mutation_compat_field('_failed_cleanup_retry_at',
+                                                 'failed_cleanup_retry_at',
+                                                 dict)
 
     def _restore_spot_placement_state(self) -> None:
         """Restore durable exact-location benches once per manager process."""
@@ -1681,15 +1965,9 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _launch_completion_state(
         self,) -> tuple['queue.SimpleQueue[int]', threading.Event]:
         """Return lazily compatible completion state for launch workers."""
-        completion_queue = getattr(self, '_launch_completion_queue', None)
-        if completion_queue is None:
-            completion_queue = queue.SimpleQueue()
-            self._launch_completion_queue = completion_queue
-        completion_event = getattr(self, '_launch_completion_event', None)
-        if completion_event is None:
-            completion_event = threading.Event()
-            self._launch_completion_event = completion_event
-        return completion_queue, completion_event
+        runtime = self._legacy_mutation_runtime_state()
+        return (runtime.launch_completion_queue,
+                runtime.launch_completion_event)
 
     def _join_notified_launch_workers(self) -> None:
         """Join completion callbacks before the reducer checks is_alive()."""
@@ -1944,44 +2222,28 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _failed_cleanup_retry_state(
             self) -> tuple[dict[int, int], dict[int, float]]:
-        """Return retry maps, tolerating managers built before these fields.
+        """Return retry maps, tolerating managers built before the runtime.
 
-        Normal construction initializes both maps in ``__init__``.  Keeping
-        this accessor backward-compatible also protects lightweight embedders,
-        tests, and upgrade/recovery paths that reconstruct a manager without
-        replaying the newest initializer in full.
+        Normal construction initializes the legacy runtime in ``__init__``.
+        Its accessor also adopts old instance fields, protecting lightweight
+        embedders, tests, and upgrade/recovery paths that reconstruct a manager
+        without replaying the newest initializer in full.
         """
         # TODO(fcapponi): DEPRECATED resource-action retry-clock owner. Remove
         # at M5 after action-only down proves its rollback gate.
-        attempts: dict[int, int] | None = getattr(
-            self, '_failed_cleanup_retry_attempts', None)
-        retry_at: dict[int, float] | None = getattr(self,
-                                                    '_failed_cleanup_retry_at',
-                                                    None)
-        if attempts is None:
-            attempts = {}
-            self._failed_cleanup_retry_attempts = attempts
-        if retry_at is None:
-            retry_at = {}
-            self._failed_cleanup_retry_at = retry_at
-        return attempts, retry_at
+        runtime = self._legacy_mutation_runtime_state()
+        return (runtime.failed_cleanup_retry_attempts,
+                runtime.failed_cleanup_retry_at)
 
     def _clear_failed_cleanup_retry(self, replica_id: int) -> None:
         """Forget in-memory cleanup rate limiting after confirmed success."""
-        attempts, retry_at = self._failed_cleanup_retry_state()
-        attempts.pop(replica_id, None)
-        retry_at.pop(replica_id, None)
+        self._legacy_mutation_runtime_state().clear_failed_cleanup_retry(
+            replica_id)
 
     def _schedule_failed_cleanup_retry(self, replica_id: int) -> None:
         """Rate-limit, but never give up on, a durable cleanup failure."""
-        attempts, retry_at = self._failed_cleanup_retry_state()
-        attempt = attempts.get(replica_id, 0) + 1
-        attempts[replica_id] = attempt
-        exponential_step = min(attempt - 1, 30)
-        delay_seconds = min(
-            _FAILED_CLEANUP_RETRY_BASE_SECONDS * 2**exponential_step,
-            _FAILED_CLEANUP_RETRY_MAX_SECONDS)
-        retry_at[replica_id] = time.monotonic() + delay_seconds
+        attempt, delay_seconds = self._legacy_mutation_runtime_state(
+        ).schedule_failed_cleanup_retry(replica_id, time.monotonic())
         logger.warning(f'Replica {replica_id} cleanup will retry in '
                        f'{delay_seconds}s (attempt {attempt}).')
 
@@ -2027,22 +2289,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                self._spot_placer,
                                                task.num_nodes)
         self._fill_skip_last_log_time: float = 0.0
-        # TODO(fcapponi): DEPRECATED resource-action owners. Remove these
-        # launch/down thread pools, request/cancellation maps, and cleanup retry
-        # clocks at M5 after action-only launch/down proves its rollback gate;
-        # never use them for an eligible authoritative service.
-        self._launch_thread_pool: thread_utils.ThreadSafeDict[
-            int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._replica_to_request_id: thread_utils.ThreadSafeDict[
-            int, str] = thread_utils.ThreadSafeDict()
-        self._replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
-            int, bool] = thread_utils.ThreadSafeDict()
+        # TODO(fcapponi): DEPRECATED resource-action owner. Remove this whole
+        # legacy/shadow runtime at M5 after action-only launch/down proves its
+        # rollback gate; never select it for an eligible authoritative service.
+        self._publish_legacy_mutation_runtime_state(
+            _LegacyReplicaMutationRuntime())
         # Exact-card authority is assigned when a queued thread is admitted,
         # then checked by that thread immediately before sdk.launch(). The
-        # separate map lets recovered PENDING rows use the same current target
-        # fence without rewriting their durable replica format.
-        self._replica_to_logical_launch_fence: thread_utils.ThreadSafeDict[
-            int, LogicalTargetState] = thread_utils.ThreadSafeDict()
+        # runtime-owned map lets recovered PENDING rows use the same current
+        # target fence without rewriting their durable replica format.
         # update_service persists a version before waiting for the manager
         # lock.  A large placer-backed scale-up batch can hold that lock for
         # minutes while it assigns hundreds of replicas.  Publish the waiting
@@ -2056,13 +2311,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # individual launch watchdogs poll the event rather than multiplying
         # ownership queries by the number of in-flight replicas.
         self._ownership_lost = threading.Event()
-        self._launch_completion_queue = queue.SimpleQueue()
-        self._launch_completion_event = threading.Event()
         self._scale_reconciliation_event = threading.Event()
-        self._down_thread_pool: thread_utils.ThreadSafeDict[
-            int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._failed_cleanup_retry_attempts = {}
-        self._failed_cleanup_retry_at = {}
         self._wait_for_idle_trackers: dict[int,
                                            tuple[_ReplicaDrainTracker | None,
                                                  float]] = {}
@@ -2171,6 +2420,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                              stop_event=self._ownership_lost)
 
     def _recover_replica_operations(self):
+        """Route restart inference through the removable legacy runtime."""
+        self._legacy_mutation_runtime_state().recover(
+            self._recover_legacy_replica_operations)
+
+    def _recover_legacy_replica_operations(self) -> None:
         """Re-drive interrupted replica operations from durable state.
 
         Runs in the dedicated recovery thread started by __init__, which
@@ -2179,14 +2433,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         # TODO(fcapponi): DEPRECATED status-inference owner. Remove the
         # launch/down reconstruction branches at M5 after durable action links
         # become the sole recovery source for eligible authoritative services.
-        if self._launch_thread_pool or self._down_thread_pool:
+        legacy_runtime = self._legacy_mutation_runtime_state()
+        if (legacy_runtime.launch_thread_pool or
+                legacy_runtime.down_thread_pool):
             # Only possible on a RETRY of a partially-completed recovery
             # pass: the per-replica enqueues below skip anything already in
             # the pools, so re-running is safe.
-            logger.warning('Recovery pass re-entered with '
-                           f'{len(self._launch_thread_pool)} launch / '
-                           f'{len(self._down_thread_pool)} down threads '
-                           'already enqueued; continuing idempotently.')
+            logger.warning(
+                'Recovery pass re-entered with '
+                f'{len(legacy_runtime.launch_thread_pool)} launch / '
+                f'{len(legacy_runtime.down_thread_pool)} down threads '
+                'already enqueued; continuing idempotently.')
 
         # Seed the replica-id allocator from durable state. A fresh
         # ReplicaManager initializes `self._next_replica_id` to 1 (see
@@ -2585,7 +2842,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         fresh launch. It gates new global claims only and never preempts an
         existing launch.
         """
-        if replica_id in self._launch_thread_pool:
+        legacy_runtime = self._legacy_mutation_runtime_state()
+        if replica_id in legacy_runtime.launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
                            'already exists. Skipping.')
             return False
@@ -2959,9 +3217,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             completion_queue=completion_queue,
             completion_event=completion_event,
             args=(replica_id, launch_yaml_content, cluster_name, log_file_name,
-                  self._replica_to_request_id,
-                  self._replica_to_launch_cancelled, resources_override,
-                  retry_until_up),
+                  legacy_runtime.replica_to_request_id,
+                  legacy_runtime.replica_to_launch_cancelled,
+                  resources_override, retry_until_up),
             kwargs={
                 'availability_max_retry': availability_max_retry,
                 'exact_resources_override': location is not None,
@@ -3128,7 +3386,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             existing_replica_infos.append(info)
         # Don't start right now; we will start it later in _refresh_thread_pool
         # to avoid too many sky.launch running at the same time.
-        self._launch_thread_pool[replica_id] = t
+        legacy_runtime.launch_thread_pool[replica_id] = t
         return True
 
     def _demand_should_skip_zero_cost(
@@ -4171,6 +4429,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # TODO(fcapponi): DEPRECATED resource-action scheduler. Remove at M5
         # for eligible authoritative services after durable down admission
         # owns scheduling and retry.
+        legacy_runtime = self._legacy_mutation_runtime_state()
         left_in_record = not (is_scale_down or purge)
         if left_in_record:
             assert sync_down_logs, (
@@ -4178,7 +4437,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'the logs should always be synced down. '
                 'So that the user can see the logs to debug.')
 
-        if replica_id in self._launch_thread_pool:
+        if replica_id in legacy_runtime.launch_thread_pool:
             info = serve_state.get_replica_info_from_id(self._service_name,
                                                         replica_id)
             assert info is not None
@@ -4199,19 +4458,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                                      in_flight_drain_cap_seconds)
             info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
-            launch_thread = self._launch_thread_pool[replica_id]
+            launch_thread = legacy_runtime.launch_thread_pool[replica_id]
             if launch_thread.is_alive():
-                self._replica_to_launch_cancelled[replica_id] = True
+                legacy_runtime.replica_to_launch_cancelled[replica_id] = True
                 wait_deadline = (time.monotonic() +
                                  _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
                 timeout_reached = False
                 while True:
                     # Launch request id found. cancel it.
-                    if replica_id in self._replica_to_request_id:
-                        request_id = self._replica_to_request_id[replica_id]
+                    if replica_id in legacy_runtime.replica_to_request_id:
+                        request_id = legacy_runtime.replica_to_request_id[
+                            replica_id]
                         sdk.api_cancel(request_id)
                         break
-                    if replica_id not in self._replica_to_launch_cancelled:
+                    if replica_id not in legacy_runtime.replica_to_launch_cancelled:
                         # Indicates that the cancellation was received.
                         break
                     if not launch_thread.is_alive():
@@ -4236,13 +4496,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             else:
                 logger.info(f'Launch thread for replica {replica_id} '
                             'already finished. Delete the cluster now.')
-            self._launch_thread_pool.pop(replica_id)
-            self._replica_to_request_id.pop(replica_id)
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            if fence_map is not None:
-                fence_map.pop(replica_id)
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
 
-        if replica_id in self._down_thread_pool:
+        if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
                            'already exists. Skipping.')
             return
@@ -4409,7 +4667,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'expected_cluster_record_uuid': expected_cluster_record_uuid,
             },
         )
-        self._down_thread_pool[replica_id] = t
+        legacy_runtime.down_thread_pool[replica_id] = t
 
     def _reconcile_failed_cleanup(self,
                                   replica_infos: list[ReplicaInfo]) -> None:
@@ -4417,6 +4675,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # TODO(fcapponi): DEPRECATED resource-action retry scheduler. Remove at
         # M5 for eligible authoritative services after database-clock action
         # retries own cleanup.
+        legacy_runtime = self._legacy_mutation_runtime_state()
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in replica_infos:
@@ -4427,8 +4686,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     not down_failed and not retry_pending):
                 continue
             replica_id = info.replica_id
-            if (replica_id in self._down_thread_pool or
-                    replica_id in self._launch_thread_pool):
+            if (replica_id in legacy_runtime.down_thread_pool or
+                    replica_id in legacy_runtime.launch_thread_pool):
                 continue
             retry_at = retry_at_by_replica.get(replica_id, 0)
             if now < retry_at:
@@ -5333,7 +5592,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     f'{info.replica_id}: {reason}.')
         self._drain_proof_stats.record_logical_abort(
             _classify_abort_reason(reason))
-        down_thread_pool = getattr(self, '_down_thread_pool', {})
+        down_thread_pool = self._legacy_mutation_runtime_state(
+        ).down_thread_pool
         queued_down = down_thread_pool.get(info.replica_id)
         if (queued_down is not None and not queued_down.is_alive() and
                 info.status_property.sky_down_status
@@ -5417,7 +5677,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # instantiate the manager without running the current constructor.
         if not hasattr(self, '_wait_for_idle_trackers'):
             self._wait_for_idle_trackers = {}
-        down_thread_pool = getattr(self, '_down_thread_pool', {})
+        down_thread_pool = self._legacy_mutation_runtime_state(
+        ).down_thread_pool
         tracker_items = list(self._wait_for_idle_trackers.items())
         if not tracker_items:
             return
@@ -5691,8 +5952,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             # down worker retains the existing cancellation/cleanup path.
             bulk_absent_replica_ids: set[int] = set()
             if getattr(self, '_service_hash', None) is not None:
-                launch_pool = getattr(self, '_launch_thread_pool', {})
-                down_pool = getattr(self, '_down_thread_pool', {})
+                legacy_runtime = self._legacy_mutation_runtime_state()
+                launch_pool = legacy_runtime.launch_thread_pool
+                down_pool = legacy_runtime.down_thread_pool
                 absence_candidates: list[ReplicaInfo] = []
                 seen_candidate_ids: set[int] = set()
                 for replica_id in replica_ids:
@@ -5844,12 +6106,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # Delete local worker bookkeeping only after the durable
                     # fenced delete succeeds. A failed transaction therefore
                     # leaves the entire wave retryable on the next tick.
-                    for attr in ('_launch_thread_pool',
-                                 '_replica_to_request_id',
-                                 '_replica_to_launch_cancelled',
-                                 '_replica_to_logical_launch_fence'):
-                        mapping = getattr(self, attr, None)
-                        if mapping is not None and replica_id in mapping:
+                    legacy_runtime = self._legacy_mutation_runtime_state()
+                    for mapping in (
+                            legacy_runtime.launch_thread_pool,
+                            legacy_runtime.replica_to_request_id,
+                            legacy_runtime.replica_to_launch_cancelled,
+                            legacy_runtime.replica_to_logical_launch_fence):
+                        if replica_id in mapping:
                             mapping.pop(replica_id)
                     self._clear_failed_cleanup_retry(replica_id)
                 logger.info(
@@ -6192,9 +6455,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self, replica_id: int
     ) -> tuple[bool, str, _LogicalPendingLaunchAdmission | None]:
         """Return the final cloud-launch decision and a stable reason code."""
-        fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-        if fence_map is None:
-            return False, 'fence-map-unavailable', None
+        fence_map = (self._legacy_mutation_runtime_state().
+                     replica_to_logical_launch_fence)
         fence = fence_map.get(replica_id)
         if fence is None:
             return False, 'replica-fence-missing', None
@@ -6215,9 +6477,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         allowed, reason, admission = (
             self._queued_logical_launch_fence_decision(replica_id))
         if not allowed:
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            stored_fence = (None
-                            if fence_map is None else fence_map.get(replica_id))
+            fence_map = (self._legacy_mutation_runtime_state().
+                         replica_to_logical_launch_fence)
+            stored_fence = fence_map.get(replica_id)
             authorized_ids = ([] if admission is None else sorted(
                 admission.authorized_ids))
             logger.info(
@@ -6233,6 +6495,11 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     @with_lock
     def _refresh_thread_pool(self) -> None:
+        """Route mutation completion through the removable legacy runtime."""
+        self._legacy_mutation_runtime_state().refresh(
+            self._refresh_legacy_mutation_runtime)
+
+    def _refresh_legacy_mutation_runtime(self) -> None:
         """Refresh the launch/down thread pool.
 
         This function will checks all sky.launch and sky.down thread on
@@ -6242,6 +6509,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # TODO(fcapponi): DEPRECATED launch/down mutation owner. Remove its
         # eligible authoritative branches at M5 after action-only execution
         # and the compatible rollback gate are proven.
+        legacy_runtime = self._legacy_mutation_runtime_state()
         # A pre-field SCHEDULED retirement stays off-route across an upgrade
         # until current replacement capacity proves it can be re-driven.
         self._reconcile_legacy_uncertain_logical_retirements()
@@ -6255,7 +6523,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._clear_known_unknown_capacity_replacements()
 
         # To avoid `dictionary changed size during iteration` error.
-        launch_thread_pool_snapshot = list(self._launch_thread_pool.items())
+        launch_thread_pool_snapshot = list(
+            legacy_runtime.launch_thread_pool.items())
         # Process finished launch threads BEFORE taking the cross-process
         # resources lock: this pass performs per-replica DB writes and, for a
         # failed launch, an inline log sync that may SSH into the replica.
@@ -6301,12 +6570,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.warning(
                 f'Discarding completed launch worker for replica '
                 f'{replica_id}: its durable replica row no longer exists.')
-            self._launch_thread_pool.pop(replica_id)
-            self._replica_to_request_id.pop(replica_id)
-            self._replica_to_launch_cancelled.pop(replica_id)
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            if fence_map is not None:
-                fence_map.pop(replica_id)
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
         if stale_finished_launches:
             stale_replica_ids = set(stale_finished_launches)
             finished_launches = [(replica_id, t)
@@ -6488,11 +6755,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if reconciliation_event is not None:
                     reconciliation_event.set()
         for replica_id, info, error_in_sky_launch in completed_launches:
-            self._launch_thread_pool.pop(replica_id)
-            self._replica_to_request_id.pop(replica_id)
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            if fence_map is not None:
-                fence_map.pop(replica_id)
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
             if error_in_sky_launch:
                 # Teardown after update replica info since
                 # _terminate_replica will update the replica info too.
@@ -6528,14 +6793,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     logger.warning(
                         f'Discarding queued launch for replica {replica_id} '
                         'after controller ownership loss.')
-                    self._launch_thread_pool.pop(replica_id)
-                    self._replica_to_request_id.pop(replica_id)
-                    self._replica_to_launch_cancelled.pop(replica_id)
-                    fence_map = getattr(self,
-                                        '_replica_to_logical_launch_fence',
-                                        None)
-                    if fence_map is not None:
-                        fence_map.pop(replica_id)
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
                     continue
                 special_logical_launch = bool(
                     getattr(info, 'reserved_fill', False) or
@@ -6588,29 +6850,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'Discarding queued launch for replica '
                             f'{replica_id}: placement {location} is benched.')
                         self._remove_replica(replica_id)
-                        self._launch_thread_pool.pop(replica_id)
-                        self._replica_to_request_id.pop(replica_id)
-                        self._replica_to_launch_cancelled.pop(replica_id)
-                        fence_map = getattr(self,
-                                            '_replica_to_logical_launch_fence',
-                                            None)
-                        if fence_map is not None:
-                            fence_map.pop(replica_id)
+                        legacy_runtime.launch_thread_pool.pop(replica_id)
+                        legacy_runtime.replica_to_request_id.pop(replica_id)
+                        legacy_runtime.replica_to_launch_cancelled.pop(
+                            replica_id)
+                        legacy_runtime.replica_to_logical_launch_fence.pop(
+                            replica_id)
                         continue
                 # sky.launch not started yet; admitted below under the
                 # resources lock.
                 if (logical_target_fence is not None and
                         not special_logical_launch):
-                    fence_map = getattr(self,
-                                        '_replica_to_logical_launch_fence',
-                                        None)
-                    if fence_map is not None:
-                        fence_map[replica_id] = logical_target_fence
+                    legacy_runtime.replica_to_logical_launch_fence[
+                        replica_id] = logical_target_fence
                 launch_to_admit.append((replica_id, t, info))
 
         # Snapshot AFTER the finished-launch pass so down threads it scheduled
         # (via _terminate_replica for failed launches) are admitted this tick.
-        down_thread_pool_snapshot = list(self._down_thread_pool.items())
+        down_thread_pool_snapshot = list(
+            legacy_runtime.down_thread_pool.items())
         concurrent_downs = sum(
             1 for _, t in down_thread_pool_snapshot if t.is_alive())
         down_to_admit: list[tuple[int, thread_utils.SafeThread,
@@ -6635,7 +6893,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # Pop only after the durable completion update succeeds.  If a DB
             # write fails, retaining the finished worker makes the next tick
             # retry the handler instead of stranding a RUNNING down status.
-            self._down_thread_pool.pop(replica_id)
+            legacy_runtime.down_thread_pool.pop(replica_id)
 
         # Admission pass: read the launch budget ONCE per tick, under the
         # cross-process resources lock held across ALL admission decisions
@@ -6743,7 +7001,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             # started worker and immediately re-read/re-drive:
                             # committed readback detaches into ordinary cleanup;
                             # uncommitted readback recreates the fenced worker.
-                            self._down_thread_pool.pop(replica_id)
+                            legacy_runtime.down_thread_pool.pop(replica_id)
                             status = info.status_property
                             is_scale_down = (status.is_scale_down or
                                              status.preempted)
@@ -6780,7 +7038,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 f'Failed to start terminate worker for '
                                 f'replica {replica_id}: '
                                 f'{common_utils.format_exception(e)}')
-                            self._down_thread_pool.pop(replica_id)
+                            legacy_runtime.down_thread_pool.pop(replica_id)
                             self._wait_for_idle_trackers.pop(replica_id, None)
                             info.status_property.sky_down_status = (
                                 common_utils.ProcessStatus.SCHEDULED)
