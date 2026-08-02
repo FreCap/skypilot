@@ -2,13 +2,13 @@
 
 ## Status
 
-Reshaped after adversarial review. Milestone C1 remains the first
-implementation slice, but runtime work is blocked until the exact amended
-design passes a second adversarial review. C1 adds the wire contract,
+Accepted after the first adversarial review returned `RESHAPE` and the exact
+amended design at `4c4689e82c` passed a second review with `PURSUE`.
+Milestone C1 is the first implementation slice. It adds the wire contract,
 worker-side advertisement, typed client gateway, and strict parser without
 changing any existing transport choice.
 
-This design compares SkyPilot `fbf0c1bef3` with dstack `c9ebdaad6b`. The useful
+This design compares SkyPilot `4fc716827c` with dstack `c9ebdaad6b`. The useful
 dstack concept is one compatibility handshake before selecting a worker API.
 SkyPilot needs a stricter contract because clusters, SSH tunnels, and Skylet
 processes can all be replaced independently.

@@ -161,7 +161,7 @@ MANAGED_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}MANAGED_JOB_ID'
 # cluster yaml is updated.
 #
 # TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
-SKYLET_VERSION = '42'  # Typed bounded system-OOM recovery runtime.
+SKYLET_VERSION = '43'  # Capability-negotiated Skylet method contracts.
 # The version of the lib files that skylet/jobs use. Whenever there is an API
 # change for the job_lib or log_lib, we need to bump this version, so that the
 # user can be notified to update their SkyPilot version on the remote cluster.
