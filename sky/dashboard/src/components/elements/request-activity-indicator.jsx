@@ -14,6 +14,7 @@ import {
   REQUEST_ACTIVITY_BUCKET_MS,
   subscribeRequestActivity,
 } from '@/lib/request-activity';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 function formatBucketTime(timestamp) {
   return new Date(timestamp).toLocaleTimeString(undefined, {
@@ -28,25 +29,32 @@ function useRequestActivity() {
     getRequestActivitySnapshot,
     getServerRequestActivitySnapshot
   );
+  const initialDelayRef = useRef(null);
 
-  useEffect(() => {
+  if (initialDelayRef.current === null) {
     const now = Date.now();
-    const delay =
+    initialDelayRef.current =
       REQUEST_ACTIVITY_BUCKET_MS - (now % REQUEST_ACTIVITY_BUCKET_MS);
-    let interval;
-    const timeout = window.setTimeout(() => {
-      refreshRequestActivity();
-      interval = window.setInterval(
-        refreshRequestActivity,
-        REQUEST_ACTIVITY_BUCKET_MS
-      );
-    }, delay);
+  }
 
-    return () => {
-      window.clearTimeout(timeout);
-      if (interval !== undefined) window.clearInterval(interval);
-    };
-  }, []);
+  useVisibleRefreshInterval(
+    true,
+    REQUEST_ACTIVITY_BUCKET_MS,
+    (source) => {
+      const currentBucket =
+        Math.floor(Date.now() / REQUEST_ACTIVITY_BUCKET_MS) *
+        REQUEST_ACTIVITY_BUCKET_MS;
+      const publishedBucket =
+        activity.history[activity.history.length - 1]?.timestamp ?? null;
+      if (source === 'visibilitychange' && publishedBucket === currentBucket) {
+        return false;
+      }
+      refreshRequestActivity();
+    },
+    {
+      initialDelayMs: initialDelayRef.current,
+    }
+  );
 
   return activity;
 }
