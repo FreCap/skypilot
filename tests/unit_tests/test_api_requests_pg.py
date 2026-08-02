@@ -2222,9 +2222,9 @@ def test_strict_return_encoder_failure_terminalizes_failed_in_postgres(
             'unknown or missing' in error['message'])
     with engine.connect() as connection:
         queue_count = connection.execute(
-            sqlalchemy.select(
-                sqlalchemy.func.count()  # pylint: disable=not-callable
-            ).select_from(request_postgres.QUEUE)).scalar_one()
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 request_postgres.QUEUE)).scalar_one()
     assert queue_count == 0
 
 

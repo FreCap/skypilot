@@ -22,11 +22,11 @@ from sky.serve import serve_state_schema
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import resource_actions as kernel_actions
 from sky.utils import common_utils
-from tests.unit_tests import (
-    test_serve_resource_action_down_execution_config as down_config_fixtures)
-from tests.unit_tests import (
-    test_serve_resource_action_launch_execution_config as launch_config_fixtures)
+from tests.unit_tests import test_serve_resource_action_down_execution_config
+from tests.unit_tests import test_serve_resource_action_launch_execution_config
 
+down_config_fixtures = test_serve_resource_action_down_execution_config
+launch_config_fixtures = test_serve_resource_action_launch_execution_config
 _POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
 testcontainers_postgres = None
 if _POSTGRES_URL is None:

@@ -7,9 +7,9 @@ import json
 import pytest
 
 from sky.serve import resource_actions as actions
-from tests.unit_tests import (
-    test_serve_resource_action_launch_execution_config as launch_config_fixtures)
+from tests.unit_tests import test_serve_resource_action_launch_execution_config
 
+launch_config_fixtures = test_serve_resource_action_launch_execution_config
 _SUBMISSION_KEY = '11111111-1111-4111-8111-111111111111'
 _OTHER_SUBMISSION_KEY = '22222222-2222-4222-8222-222222222222'
 _STATE_STORE_UUID = '33333333-3333-4333-8333-333333333333'

@@ -9,11 +9,11 @@ import pytest
 
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
-from tests.unit_tests import (
-    test_serve_resource_action_down_execution_config as down_config_fixtures)
-from tests.unit_tests import (
-    test_serve_resource_action_launch_execution_config as launch_config_fixtures)
+from tests.unit_tests import test_serve_resource_action_down_execution_config
+from tests.unit_tests import test_serve_resource_action_launch_execution_config
 
+down_config_fixtures = test_serve_resource_action_down_execution_config
+launch_config_fixtures = test_serve_resource_action_launch_execution_config
 _SERVICE_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
 _CLUSTER_UUID = '33333333-3333-4333-8333-333333333333'

@@ -12,11 +12,11 @@ from sky.serve import resource_action_progress as progress
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
 from tests.unit_tests import test_serve_resource_action_capsule_leaves as leaves
-from tests.unit_tests import (
-    test_serve_resource_action_launch_execution_config as launch_fixtures)
-from tests.unit_tests import (
-    test_serve_resource_action_progress as progress_fixtures)
+from tests.unit_tests import test_serve_resource_action_launch_execution_config
+from tests.unit_tests import test_serve_resource_action_progress
 
+launch_fixtures = test_serve_resource_action_launch_execution_config
+progress_fixtures = test_serve_resource_action_progress
 _OBSERVED_AT = '2026-08-01T05:06:07.123456Z'
 _FIXTURE_MEMBERS = ('realistic', 'candidate_maximal')
 _MAX_RESOURCE_ACTION_ATTEMPT = 2**31 - 1
