@@ -2,6 +2,8 @@
 # pylint: disable=redefined-outer-name,protected-access
 
 import concurrent.futures
+import copy
+import dataclasses
 import datetime
 import os
 import shutil
@@ -20,8 +22,10 @@ from sky.serve import serve_state_schema
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import resource_actions as kernel_actions
 from sky.utils import common_utils
-from tests.unit_tests import (test_serve_resource_action_launch_execution_config
-                              as launch_config_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_down_execution_config as down_config_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_launch_execution_config as launch_config_fixtures)
 
 _POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
 testcontainers_postgres = None
@@ -126,14 +130,15 @@ def _identity(generation: int) -> dict:
 def _insert_request(
     store: resource_action_state.PostgresServeResourceActionStateStore,
     request_id: str,
-    invocation: actions.ProviderLifecycleInvocationV1,
+    invocation: actions.ServeShadowAttemptInvocationV1,
     *,
     resource_action_id: uuid.UUID | None = None,
     resource_action_attempt: int | None = None,
 ) -> None:
     now = datetime.datetime.now(_UTC)
-    name = ('sky.launch' if invocation.action_kind
-            is kernel_actions.ActionKind.LAUNCH else 'sky.down')
+    is_launch = (isinstance(invocation, actions.ProviderLifecycleInvocationV1)
+                 and invocation.action_kind is kernel_actions.ActionKind.LAUNCH)
+    name = 'sky.launch' if is_launch else 'sky.down'
     with store._database().begin() as connection:
         connection.execute(request_postgres.REQUESTS.insert().values(
             request_id=request_id,
@@ -183,37 +188,21 @@ def _launch_invocation(
 
 def _down_invocation(
         generation: int = 2) -> actions.ProviderLifecycleInvocationV1:
-    return actions.ProviderLifecycleInvocationV1.from_value({
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'redaction_profile': 'provider_lifecycle_redaction_v1',
-        'action_kind': 'down',
-        'resource_identity': _identity(generation),
-        'requested_target': _target(),
-        'launch': None,
-        'down': {
-            'cluster_name': 'svc-7',
-            'expected_cluster_record_uuid': _CLUSTER_UUID,
-            'workspace': 'boltz-test',
-            'purge': False,
-            'graceful': False,
-            'graceful_timeout': None,
-        },
-    })
+    return actions.ProviderLifecycleInvocationV1.from_value(
+        down_config_fixtures.down_invocation_payload(generation=generation))
 
 
 def _resolved_target(
-    invocation: actions.ProviderLifecycleInvocationV1,
+    invocation: actions.ServeShadowAttemptInvocationV1,
     provider_operation_id: str | None = None,
 ) -> actions.ResolvedProviderTargetV1:
-    return actions.ResolvedProviderTargetV1.from_value({
-        'version': 1,
+    raw = down_config_fixtures._progress_resolved_target()
+    raw.update({
         'requested_target_sha256': invocation.requested_target.sha256,
-        'provider_resource_id': 'pod/svc-7',
-        'workload_uid': 'uid-7',
         'provider_operation_id': provider_operation_id,
         'resolved_at': '2026-08-01T01:02:03.000004Z',
     })
+    return actions.ResolvedProviderTargetV1.from_value(raw)
 
 
 def _sample(
@@ -226,23 +215,27 @@ def _sample(
     invocation = (_launch_invocation(generation)
                   if action_kind == 'launch' else _down_invocation(generation))
     assert invocation.launch is not None or action_kind == 'down'
-    resources_hash = ('1' * 64 if invocation.launch is None else
-                      invocation.launch.resources.sha256)
-    prior_target = (None if action_kind == 'launch' else
-                    _resolved_target(invocation).canonical_value())
-    plan = actions.ProviderLifecyclePlanV1.from_value({
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'action_kind': action_kind,
-        'resource_identity': _identity(generation),
-        'placement_decision_sha256': placement_sha256,
-        'resources_snapshot_sha256': resources_hash,
-        'workspace_identity_sha256': 'f' * 64,
-        'requested_target': _target(),
-        'prior_resolved_target': prior_target,
-        'request_payload_sha256': invocation.sha256,
-        'redaction_profile': 'provider_lifecycle_redaction_v1',
-    })
+    if action_kind == 'launch':
+        assert invocation.launch is not None
+        plan_value = {
+            'version': 1,
+            'profile': 'pod_cluster_v1',
+            'action_kind': action_kind,
+            'resource_identity': _identity(generation),
+            'placement_decision_sha256': placement_sha256,
+            'resources_snapshot_sha256': invocation.launch.resources.sha256,
+            'workspace_identity_sha256': 'f' * 64,
+            'requested_target': _target(),
+            'prior_launch_basis_sha256': None,
+            'prior_cleanup_target_sha256': None,
+            'request_payload_sha256': invocation.sha256,
+            'redaction_profile': 'provider_lifecycle_redaction_v1',
+        }
+    else:
+        plan_value = down_config_fixtures.down_plan_payload(
+            generation=generation)
+        plan_value['placement_decision_sha256'] = placement_sha256
+    plan = actions.ProviderLifecyclePlanV1.from_value(plan_value)
     spec = actions.ServeReplicaActionSpecV1.from_value({
         'version': 1,
         'provider_plan': plan.canonical_value(),
@@ -257,7 +250,7 @@ def _sample(
 
 
 def _observation(
-    invocation: actions.ProviderLifecycleInvocationV1,
+    invocation: actions.ServeShadowAttemptInvocationV1,
     *,
     present: bool,
     provider_operation_id: str | None = None,
@@ -270,9 +263,11 @@ def _observation(
         'state': 'present' if present else 'absent',
         'certainty': 'authoritative',
         'observed_provider_operation_id': provider_operation_id,
-        'observed_provider_resource_id': ('pod/svc-7' if present else None),
+        'observed_provider_resource_id':
+            (resolved.provider_resource_id if resolved is not None else None),
         'observed_cluster_record_uuid': _CLUSTER_UUID if present else None,
-        'observed_workload_uid': 'uid-7' if present else None,
+        'observed_workload_uid':
+            (resolved.workload_uid if resolved is not None else None),
         'observed_replica_incarnation_label': _REPLICA_UUID
                                               if present else None,
         'resolved_target': None
@@ -287,7 +282,7 @@ _DEFAULT_OBSERVATION = object()
 
 
 def _outcome(
-    invocation: actions.ProviderLifecycleInvocationV1,
+    invocation: actions.ServeShadowAttemptInvocationV1,
     *,
     disposition: str = 'succeeded',
     observation: actions.ProviderLifecycleObservationV1 | None |
@@ -295,9 +290,11 @@ def _outcome(
     provider_operation_id: str | None = None,
 ) -> actions.ServeReplicaActionOutcomeV1:
     if observation is _DEFAULT_OBSERVATION:
+        is_launch = (isinstance(invocation,
+                                actions.ProviderLifecycleInvocationV1) and
+                     invocation.action_kind is kernel_actions.ActionKind.LAUNCH)
         observation = (_observation(invocation,
-                                    present=invocation.action_kind
-                                    is kernel_actions.ActionKind.LAUNCH,
+                                    present=is_launch,
                                     provider_operation_id=provider_operation_id)
                        if disposition == 'succeeded' else None)
     retryable = disposition in ('retryable', 'uncertain')
@@ -393,45 +390,12 @@ def _accept_worker_cohort(engine, store) -> None:
     evidence_time = database_now - datetime.timedelta(seconds=1)
     timestamp = evidence_time.astimezone(_UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
-    def artifact(path: str, digest_character: str) -> dict[str, object]:
-        return {
-            'repo_path': path,
-            'byte_size': 17,
-            'sha256': digest_character * 64,
-        }
-
-    qualification = {
-        'requested_reference':
-            ('registry.example/authority@sha256:' + '1' * 64),
-        'oci_manifest_digest': 'sha256:' + '1' * 64,
-        'oci_config_digest': 'sha256:' + '2' * 64,
-        'qualification_artifact': artifact('images/authority.json', '3'),
-    }
-    pod_template_contract = artifact('charts/worker.yaml', '4')
-    artifact_inventory = artifact('inventories/artifacts.json', '5')
-    callable_inventory = artifact('inventories/callables.json', '6')
-    manifest = {
-        'version': 1,
-        'cohort_id': 'authority-v1',
-        'namespace': 'skypilot-system',
-        'deployment_name': 'skypilot-authority-v1',
-        'service_account_name': 'skypilot-authority-v1',
-        'container_name': 'skypilot-authority-worker',
-        'image': qualification,
-        'pod_template_contract': pod_template_contract,
-        'artifact_inventory': artifact_inventory,
-        'callable_inventory': callable_inventory,
-        'claim_contract': 'frozen_action_cohort_join_v1',
-        'handler_allowlist': list(
-            actions.PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1),
-    }
-    cohort_value = {
-        'version': 1,
-        'manifest': manifest,
-        'manifest_sha256': actions.canonical_sha256(manifest),
-        'deployment_uid': 'deployment-uid-v1',
-        'service_account_uid': 'service-account-uid-v1',
-    }
+    cohort_value = copy.deepcopy(launch_config_fixtures._canonical_cohort())
+    manifest = cohort_value['manifest']
+    qualification = manifest['image']
+    pod_template_contract = manifest['pod_template_contract']
+    artifact_inventory = manifest['artifact_inventory']
+    callable_inventory = manifest['callable_inventory']
     cohort = actions.WorkerCohortIdentityV1.from_value(cohort_value)
 
     def worker(pod_uid: str) -> dict[str, object]:
@@ -511,12 +475,23 @@ def _prepare_worker_cohort_reference(
     sample: resource_action_state.NewShadowSample,
     *,
     controller_owner_fence: str | None = None,
+    preparation_capability_sha256: str | None = None,
 ) -> actions.WorkerCohortReferenceInputV1:
     identity = sample.provider_plan.resource_identity
+    invocation = sample.immutable_spec.invocation
+    capability_sha256 = actions.canonical_sha256({
+        'test_preparation_capability_for': str(sample.action_id),
+    })
+    if invocation.action_kind is kernel_actions.ActionKind.LAUNCH:
+        capability_sha256 = (
+            invocation.require_launch().source.identity_canonicalization.
+            context.preparation_capability_sha256)
+    if preparation_capability_sha256 is not None:
+        capability_sha256 = preparation_capability_sha256
     reference = actions.WorkerCohortReferenceInputV1(
         version=1,
         decision_id=sample.action_id,
-        cohort_id='authority-v1',
+        cohort_id=invocation.executor_cohort.cohort_id,
         service_hash=identity.service_hash,
         replica_incarnation=identity.replica_incarnation,
         desired_generation=identity.desired_generation,
@@ -525,9 +500,7 @@ def _prepare_worker_cohort_reference(
                                 if controller_owner_fence is None else
                                 controller_owner_fence),
         lifecycle_epoch=_LIFECYCLE_EPOCH,
-        preparation_capability_sha256=actions.canonical_sha256({
-            'test_preparation_capability_for': str(sample.action_id),
-        }))
+        preparation_capability_sha256=capability_sha256)
     prepared = store.prepare_worker_cohort_reference(reference)
     assert prepared.record.reference_state is actions.WorkerCohortReferenceState.PREPARING
     return reference
@@ -591,6 +564,31 @@ def _admit(store, sample, *, prepared_reference=None):
                        prepared_reference=prepared_reference)
 
 
+def test_persisted_plan_reader_rejects_pre_dedup_down_shape(
+        shadow_database) -> None:
+    engine, store = shadow_database
+    _add_service(engine)
+    sample, _ = _sample('down', 2)
+    admitted = _admit(store, sample)
+    crossed = sample.provider_plan.canonical_value()
+    crossed['prior_launch_basis'] = None
+    crossed['prior_cleanup_target'] = None
+    crossed.pop('prior_launch_basis_sha256')
+    crossed.pop('prior_cleanup_target_sha256')
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                resource_action_state_schema.SHADOW_SAMPLES).where(
+                    resource_action_state_schema.SHADOW_SAMPLES.c.
+                    would_be_action_id == admitted.action_id).values(
+                        provider_plan=crossed,
+                        provider_plan_sha256=actions.canonical_sha256(crossed)))
+
+    with pytest.raises(kernel_actions.InvariantViolation,
+                       match='unknown or missing'):
+        store.get_sample(admitted.action_id)
+
+
 def _admit_launch_with_reference(engine, store, sample, prepared_reference):
     replica_values = serve_state._replica_row_values('svc', 7, _replica())
     with sqlalchemy.orm.Session(engine) as session, session.begin():
@@ -603,17 +601,6 @@ def _admit_launch_with_reference(engine, store, sample, prepared_reference):
             prepared_reference=prepared_reference)
 
 
-def _admit_future_cohort_contract_fixture(store, sample, prepared_reference):
-    """Seed the linked graph shape expected after the DTO cohort migration."""
-    with sqlalchemy.orm.Session(store._database()) as session, session.begin():
-        service_row = store._locked_shadow_service(session, sample, _OWNER,
-                                                   _LIFECYCLE_EPOCH)
-        store._validate_prepared_reference_service_fence(
-            prepared_reference, service_row)
-        return store._admit_after_service_lock_in_session(
-            session, sample, prepared_reference)
-
-
 def _complete_one(store,
                   sample,
                   invocation,
@@ -621,11 +608,7 @@ def _complete_one(store,
                   *,
                   disposition: str = 'succeeded',
                   prepared_reference=None):
-    if prepared_reference is None:
-        parent = _admit(store, sample)
-    else:
-        parent = _admit_future_cohort_contract_fixture(store, sample,
-                                                       prepared_reference)
+    parent = _admit(store, sample, prepared_reference=prepared_reference)
     role = (actions.ShadowRequestRole.PRIMARY_LAUNCH
             if invocation.action_kind is kernel_actions.ActionKind.LAUNCH else
             actions.ShadowRequestRole.PRIMARY_DOWN)
@@ -740,43 +723,171 @@ def test_admit_exact_adoption_typed_spec_and_borrowed_transaction(
     assert store.get_sample(second.action_id) is None
 
 
-def test_linked_represented_admission_fails_before_every_graph_mutation(
+def test_linked_down_admission_is_atomic_and_lost_ack_replayable(
+        shadow_database) -> None:
+    engine, store = shadow_database
+    _add_service(engine)
+    _accept_worker_cohort(engine, store)
+    sample, _ = _sample('down', 2)
+    reference = _prepare_worker_cohort_reference(store, sample)
+    admitted = _admit(store, sample, prepared_reference=reference)
+    replay = _admit(store, sample, prepared_reference=reference)
+
+    assert replay == admitted
+    retained = store.get_worker_cohort_reference(sample.action_id)
+    assert retained is not None
+    assert retained.reference_state is actions.WorkerCohortReferenceState.SHADOW_ACTIVE
+    assert retained.revision == 2
+    coverage = store.get_shadow_coverage(sample.action_id)
+    assert coverage is not None
+    assert coverage.worker_cohort_ref_id == sample.action_id
+    assert store.get_sample(sample.action_id) == admitted
+
+
+def test_linked_launch_replica_admission_is_atomic_and_lost_ack_replayable(
         shadow_database) -> None:
     engine, store = shadow_database
     _add_service(engine)
     _accept_worker_cohort(engine, store)
     sample, _ = _sample()
     reference = _prepare_worker_cohort_reference(store, sample)
+    admitted = _admit_launch_with_reference(engine, store, sample, reference)
+    replay = _admit_launch_with_reference(engine, store, sample, reference)
+
+    assert replay == admitted
+    retained = store.get_worker_cohort_reference(sample.action_id)
+    assert retained is not None
+    assert retained.reference_state is actions.WorkerCohortReferenceState.SHADOW_ACTIVE
+    assert retained.revision == 2
+    assert store.get_shadow_coverage(sample.action_id) is not None
+    assert store.get_sample(sample.action_id) == admitted
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(  # pylint: disable=not-callable
+                serve_state_schema.replicas_table)).scalar_one() == 1
+
+
+def test_linked_launch_capability_mismatch_rejects_before_any_mutation(
+        shadow_database) -> None:
+    engine, store = shadow_database
+    _add_service(engine)
+    _accept_worker_cohort(engine, store)
+    sample, _ = _sample()
+    reference = _prepare_worker_cohort_reference(
+        store, sample, preparation_capability_sha256='0' * 64)
+
     with pytest.raises(kernel_actions.ActionConflict,
-                       match='execution_config.capsule.executor_cohort'):
-        _admit(store, sample, prepared_reference=reference)
+                       match='does not bind the immutable invocation'):
+        _admit_launch_with_reference(engine, store, sample, reference)
+
     retained = store.get_worker_cohort_reference(sample.action_id)
     assert retained is not None
     assert retained.reference_state is actions.WorkerCohortReferenceState.PREPARING
     assert retained.revision == 1
     assert store.get_shadow_coverage(sample.action_id) is None
     assert store.get_sample(sample.action_id) is None
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(  # pylint: disable=not-callable
+                serve_state_schema.replicas_table)).scalar_one() == 0
 
 
-def test_linked_launch_replica_admission_fails_before_replica_mutation(
+def test_linked_down_cohort_id_mismatch_rejects_before_any_mutation(
         shadow_database) -> None:
     engine, store = shadow_database
     _add_service(engine)
     _accept_worker_cohort(engine, store)
-    sample, _ = _sample()
+    sample, _ = _sample('down', 2)
     reference = _prepare_worker_cohort_reference(store, sample)
+    crossed = dataclasses.replace(reference, cohort_id='crossed-cohort')
+
     with pytest.raises(kernel_actions.ActionConflict,
-                       match='execution_config.capsule.executor_cohort'):
-        _admit_launch_with_reference(engine, store, sample, reference)
+                       match='cohort ID differs'):
+        _admit(store, sample, prepared_reference=crossed)
+
+    retained = store.get_worker_cohort_reference(sample.action_id)
+    assert retained is not None
+    assert retained.reference.canonical_bytes == reference.canonical_bytes
+    assert retained.reference_state is actions.WorkerCohortReferenceState.PREPARING
+    assert store.get_shadow_coverage(sample.action_id) is None
+    assert store.get_sample(sample.action_id) is None
+
+
+def test_linked_down_locked_cohort_byte_mismatch_rejects_before_any_mutation(
+        shadow_database) -> None:
+    engine, store = shadow_database
+    _add_service(engine)
+    _accept_worker_cohort(engine, store)
+    sample, _ = _sample('down', 2)
+    reference = _prepare_worker_cohort_reference(store, sample)
+    cohort_raw = sample.immutable_spec.invocation.executor_cohort.canonical_value(
+    )
+    cohort_raw['service_account_uid'] = 'crossed-service-account-uid'
+    crossed_cohort = actions.WorkerCohortIdentityV1.from_value(cohort_raw)
+    table = resource_action_state_schema.WORKER_COHORTS
+    with engine.begin() as connection:
+        registrations_raw = copy.deepcopy(
+            connection.execute(
+                sqlalchemy.select(table.c.registration_attestations).where(
+                    table.c.cohort_id == reference.cohort_id)).scalar_one())
+        registrations_raw['cohort_identity_sha256'] = crossed_cohort.sha256
+        for registration in registrations_raw['workers']:
+            registration['worker']['service_account_uid'] = (
+                crossed_cohort.service_account_uid)
+        registrations = actions.WorkerCohortRegistrationSetV1.from_value(
+            registrations_raw)
+        registrations.validate_for_cohort(crossed_cohort, require_two=True)
+        connection.execute(
+            sqlalchemy.update(table).where(
+                table.c.cohort_id == reference.cohort_id).values(
+                    cohort_identity=crossed_cohort.canonical_value(),
+                    cohort_identity_sha256=crossed_cohort.sha256,
+                    registration_attestations=registrations.canonical_value(),
+                    registration_attestations_sha256=registrations.sha256))
+
+    with pytest.raises(kernel_actions.ActionConflict,
+                       match='does not bind the immutable invocation'):
+        _admit(store, sample, prepared_reference=reference)
+
     retained = store.get_worker_cohort_reference(sample.action_id)
     assert retained is not None
     assert retained.reference_state is actions.WorkerCohortReferenceState.PREPARING
     assert store.get_shadow_coverage(sample.action_id) is None
     assert store.get_sample(sample.action_id) is None
-    with engine.connect() as connection:
-        assert connection.execute(
-            sqlalchemy.select(sqlalchemy.func.count()).select_from(  # pylint: disable=not-callable
-                serve_state_schema.replicas_table)).scalar_one() == 0
+
+
+@pytest.mark.parametrize('partial_shape',
+                         ['coverage_only', 'complete_unlinked'])
+def test_linked_down_rejects_every_preexisting_graph_shape_without_repair(
+        shadow_database, partial_shape: str) -> None:
+    engine, store = shadow_database
+    _add_service(engine)
+    _accept_worker_cohort(engine, store)
+    sample, _ = _sample('down', 2)
+    reference = _prepare_worker_cohort_reference(store, sample)
+
+    if partial_shape == 'coverage_only':
+        with sqlalchemy.orm.Session(engine) as session, session.begin():
+            database_now = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            store._insert_or_adopt_shadow_coverage_in_session(
+                session, _represented_coverage(sample), database_now)
+    else:
+        _admit(store, sample)
+    coverage_before = store.get_shadow_coverage(sample.action_id)
+    parent_before = store.get_sample(sample.action_id)
+
+    with pytest.raises(kernel_actions.ActionConflict,
+                       match='partial or preexisting shadow graph'):
+        _admit(store, sample, prepared_reference=reference)
+
+    retained = store.get_worker_cohort_reference(sample.action_id)
+    assert retained is not None
+    assert retained.reference_state is actions.WorkerCohortReferenceState.PREPARING
+    assert retained.revision == 1
+    assert store.get_shadow_coverage(sample.action_id) == coverage_before
+    assert store.get_sample(sample.action_id) == parent_before
 
 
 def test_launch_replica_admission_is_atomic_replayable_and_preserved(
@@ -848,8 +959,18 @@ def test_launch_replica_admission_rolls_back_both_sides(shadow_database,
     original = (resource_action_state.PostgresServeResourceActionStateStore.
                 _admit_after_service_lock_in_session)
 
-    def _fail_after_parent(self, session, new_sample, prepared_reference=None):
-        original(self, session, new_sample, prepared_reference)
+    def _fail_after_parent(self,
+                           session,
+                           new_sample,
+                           service_row,
+                           prepared_reference=None,
+                           linked_replay=None):
+        original(self,
+                 session,
+                 new_sample,
+                 service_row,
+                 prepared_reference,
+                 linked_replay=linked_replay)
         raise RuntimeError('rollback marker')
 
     monkeypatch.setattr(
@@ -1086,6 +1207,34 @@ def test_prepare_is_contiguous_exact_and_request_binding_is_global(
     with pytest.raises(kernel_actions.ActionConflict,
                        match='another shadow attempt'):
         store.bind_request(other.action_id, 1, 'real-request')
+
+
+@pytest.mark.parametrize(('action_kind', 'generation', 'role'), [
+    ('launch', 1, actions.ShadowRequestRole.PRIMARY_LAUNCH),
+    ('down', 2, actions.ShadowRequestRole.PRIMARY_DOWN),
+])
+def test_prepare_replay_uses_invocation_canonical_bytes(
+        shadow_database, action_kind: str, generation: int,
+        role: actions.ShadowRequestRole) -> None:
+    engine, store = shadow_database
+    _add_service(engine)
+    sample, invocation = _sample(action_kind, generation)
+    parent = _admit(store, sample)
+    refined = (invocation.as_launch()
+               if action_kind == 'launch' else invocation.as_down())
+
+    prepared = store.prepare_attempt(sample.action_id, parent.revision, 1, 1,
+                                     role,
+                                     actions.PlannedExecutionKind.API_REQUEST,
+                                     invocation)
+    replay = store.prepare_attempt(sample.action_id, parent.revision, 1, 1,
+                                   role,
+                                   actions.PlannedExecutionKind.API_REQUEST,
+                                   refined)
+
+    assert replay.adopted
+    assert replay.attempt.invocation.canonical_bytes == (
+        prepared.attempt.invocation.canonical_bytes)
 
 
 def test_request_binding_serializes_across_both_shadow_ledgers(

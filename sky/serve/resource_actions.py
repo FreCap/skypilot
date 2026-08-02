@@ -3169,18 +3169,26 @@ class ProviderLocatorV1(_CanonicalContract):
 
 @dataclasses.dataclass(frozen=True)
 class ResolvedProviderTargetV1(_CanonicalContract):
-    """Write-once provider-native target evidence."""
+    """Design-complete API006 resolved target retained after launch.
+
+    This is deliberately the same canonical wire as the API006 provider
+    progress target.  Keeping the complete three-object identity here avoids
+    projecting successful launch evidence through the older lossy
+    provider-resource/workload-only shape before a down is admitted.
+    """
 
     version: int
     requested_target_sha256: str
     provider_resource_id: str | None
     workload_uid: str | None
+    kubernetes_objects: tuple['ProviderKubernetesResolvedObjectV1', ...]
     provider_operation_id: str | None
     resolved_at: str
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
         'version', 'requested_target_sha256', 'provider_resource_id',
-        'workload_uid', 'provider_operation_id', 'resolved_at'
+        'workload_uid', 'kubernetes_objects', 'provider_operation_id',
+        'resolved_at'
     })
 
     def __post_init__(self) -> None:
@@ -3195,21 +3203,74 @@ class ResolvedProviderTargetV1(_CanonicalContract):
                 self, field,
                 _optional_text(getattr(self, field),
                                name=f'resolved_target.{field}'))
+        if (type(self.kubernetes_objects) is not tuple or
+                len(self.kubernetes_objects)
+                != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or any(
+                    type(item) is not ProviderKubernetesResolvedObjectV1
+                    for item in self.kubernetes_objects)):
+            raise ValueError('resolved target requires exactly three typed '
+                             'Kubernetes objects.')
+        expected_roles = tuple(
+            entry.role for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1)
+        if tuple(item.role
+                 for item in self.kubernetes_objects) != expected_roles:
+            raise ValueError('resolved target objects are not in canonical '
+                             'role order.')
+        if not all(item.has_complete_allocations
+                   for item in self.kubernetes_objects):
+            raise ValueError('resolved target requires every server '
+                             'allocation.')
+        pod = self.kubernetes_objects[2]
+        if self.workload_uid != pod.uid:
+            raise ValueError('resolved target workload UID must equal the '
+                             'head Pod UID.')
         object.__setattr__(
             self, 'resolved_at',
             _timestamp(self.resolved_at, name='resolved_target.resolved_at'))
+        _ = self.canonical_bytes
 
     @classmethod
     def from_value(cls, value: Any) -> 'ResolvedProviderTargetV1':
         raw = _closed_object(value, name='resolved target', keys=cls._KEYS)
-        return cls(**raw)
+        objects = raw['kubernetes_objects']
+        if type(objects) is not list:
+            raise TypeError('resolved target kubernetes_objects must be a '
+                            'list.')
+        if len(objects) != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1):
+            raise ValueError('resolved target requires exactly three '
+                             'Kubernetes objects.')
+        return cls(version=raw['version'],
+                   requested_target_sha256=raw['requested_target_sha256'],
+                   provider_resource_id=raw['provider_resource_id'],
+                   workload_uid=raw['workload_uid'],
+                   kubernetes_objects=tuple(
+                       ProviderKubernetesResolvedObjectV1.from_value(item)
+                       for item in objects),
+                   provider_operation_id=raw['provider_operation_id'],
+                   resolved_at=raw['resolved_at'])
 
     def canonical_value(self) -> JsonObject:
-        return dataclasses.asdict(self)
+        return {
+            'version': 1,
+            'requested_target_sha256': self.requested_target_sha256,
+            'provider_resource_id': self.provider_resource_id,
+            'workload_uid': self.workload_uid,
+            'kubernetes_objects': [
+                item.canonical_value() for item in self.kubernetes_objects
+            ],
+            'provider_operation_id': self.provider_operation_id,
+            'resolved_at': self.resolved_at,
+        }
 
     def validate_requested_target(self, target: ProviderLocatorV1) -> None:
         if self.requested_target_sha256 != target.sha256:
             raise ValueError('Resolved target does not match requested target.')
+
+
+# API006 historically used the noun-first spelling.  Keep one implementation
+# and one canonical wire so progress can migrate to this shared DTO without a
+# conversion or import cycle.
+ProviderResolvedTargetV1 = ResolvedProviderTargetV1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3621,7 +3682,7 @@ def _validate_provider_kubernetes_role_allocations_v1(
 ) -> tuple[ProviderKubernetesServerAllocationV1, ...]:
     """Validate one role's atomic, canonically ordered server allocations."""
 
-    if not isinstance(allocations, tuple):
+    if type(allocations) is not tuple:
         raise TypeError(f'{name} must be a tuple.')
     if role in (ProviderObjectRoleV1.HEAD_SSH_SERVICE,
                 ProviderObjectRoleV1.HEAD_SERVICE):
@@ -3638,8 +3699,9 @@ def _validate_provider_kubernetes_role_allocations_v1(
             raise ValueError(f'{name} Pod must contain {requirement}.')
     else:
         raise ValueError(f'{name} has an unsupported object role.')
-    if any(not isinstance(allocation, ProviderKubernetesServerAllocationV1)
-           for allocation in allocations):
+    if any(
+            type(allocation) is not ProviderKubernetesServerAllocationV1
+            for allocation in allocations):
         raise TypeError(f'{name} must contain typed server allocations.')
     pointers = tuple(allocation.json_pointer for allocation in allocations)
     if role in (ProviderObjectRoleV1.HEAD_SSH_SERVICE,
@@ -3832,8 +3894,8 @@ class ProviderKubernetesResolvedObjectSlotV1(_CanonicalContract):
         if role is not role_entry.role:
             raise ValueError('resolved object slot sequence and role do not '
                              'match.')
-        if self.object is not None and not isinstance(
-                self.object, ProviderKubernetesResolvedObjectV1):
+        if (self.object is not None and
+                type(self.object) is not ProviderKubernetesResolvedObjectV1):
             raise TypeError('resolved object slot object has an invalid type.')
         if ((disposition
              is ProviderKubernetesResolvedObjectSlotDispositionV1.COMMITTED)
@@ -3888,10 +3950,10 @@ class PartialResolvedProviderTargetV1(_CanonicalContract):
             self, 'requested_target_sha256',
             _sha256(self.requested_target_sha256,
                     name='partial_target.requested_target_sha256'))
-        if (not isinstance(self.kubernetes_objects, tuple) or
+        if (type(self.kubernetes_objects) is not tuple or
                 len(self.kubernetes_objects)
-                != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or
-                any(not isinstance(slot, ProviderKubernetesResolvedObjectSlotV1)
+                != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or any(
+                    type(slot) is not ProviderKubernetesResolvedObjectSlotV1
                     for slot in self.kubernetes_objects)):
             raise ValueError('partial target requires exactly three typed '
                              'Kubernetes object slots.')
@@ -4082,8 +4144,8 @@ class ProviderKubernetesHandleV1(_CanonicalContract):
             self, 'launched_resources_sha256',
             _sha256(self.launched_resources_sha256,
                     name='handle.launched_resources_sha256'))
-        if not isinstance(self.provider_config,
-                          ProviderKubernetesHandleProviderConfigV1):
+        if type(self.provider_config) is not (
+                ProviderKubernetesHandleProviderConfigV1):
             raise TypeError('handle provider_config has an invalid type.')
         if self.provider_config.pod_name != f'{self.cluster_name_on_cloud}-head':
             raise ValueError('handle Pod name does not match '
@@ -6373,7 +6435,7 @@ class ProviderWorkspaceIdentityV1(_CanonicalContract):
         object.__setattr__(
             self, 'workspace',
             _text(self.workspace, name='workspace_identity.workspace'))
-        if not isinstance(self.kubernetes_scope, ProviderKubernetesScopeV1):
+        if type(self.kubernetes_scope) is not ProviderKubernetesScopeV1:
             raise TypeError('workspace Kubernetes scope has an invalid type.')
         _ = self.canonical_bytes
 
@@ -6423,20 +6485,21 @@ class ProviderKubernetesCleanupObjectV1(_CanonicalContract):
                            name='cleanup_object.role')
         if role is not role_entry.role:
             raise ValueError('cleanup object sequence and role do not match.')
-        if not isinstance(self.plan, ProviderKubernetesObjectPlanV1):
+        if type(self.plan) is not ProviderKubernetesObjectPlanV1:
             raise TypeError('cleanup object plan has an invalid type.')
+        if type(self.committed_server_allocations) is not tuple:
+            raise TypeError('cleanup object committed allocations must be '
+                            'a tuple.')
         if (self.plan.sequence != sequence or self.plan.role is not role or
                 self.plan.kind is not role_entry.kind):
             raise ValueError('cleanup object does not match its embedded plan.')
         committed_uid = _optional_text(self.committed_uid,
                                        name='cleanup_object.committed_uid')
+        allocations: tuple[ProviderKubernetesServerAllocationV1, ...]
         if committed_uid is None:
-            if self.committed_server_allocations:
+            if len(self.committed_server_allocations) != 0:
                 raise ValueError('cleanup object without a committed UID '
                                  'cannot retain server allocations.')
-            if not isinstance(self.committed_server_allocations, tuple):
-                raise TypeError('cleanup object committed allocations must be '
-                                'a tuple.')
             allocations = self.committed_server_allocations
         else:
             allocations = _validate_provider_kubernetes_role_allocations_v1(
@@ -6528,6 +6591,124 @@ class ProviderKubernetesClusterRowDispositionV1(str, enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderPartialLaunchCleanupLegalShapeV1(_CanonicalContract):
+    """One mechanically enumerable partial-launch cleanup admission shape."""
+
+    case_id: str
+    launch_phase: str
+    committed_object_count: int
+    pod_node_allocation: bool
+    cluster_row_disposition: ProviderKubernetesClusterRowDispositionV1
+
+    _POST_HANDLE_PHASES: ClassVar[frozenset[str]] = frozenset({
+        'HANDLE_COMMITTED', 'RUNTIME_READY', 'JOB_INTENT', 'JOB_COMMITTED',
+        'JOB_RUNNING', 'ENDPOINT_RESOLVED'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'case_id',
+            _text(self.case_id,
+                  name='partial cleanup legal shape case_id',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        if type(self.launch_phase) is not str:
+            raise TypeError('partial cleanup legal shape launch_phase must be '
+                            'text.')
+        count = _nonnegative_integer(
+            self.committed_object_count,
+            name='partial cleanup legal shape committed_object_count')
+        if count > len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1):
+            raise ValueError('partial cleanup legal shape has too many '
+                             'committed objects.')
+        object.__setattr__(self, 'committed_object_count', count)
+        node = _boolean(self.pod_node_allocation,
+                        name='partial cleanup legal shape pod_node_allocation')
+        disposition = _enum_value(
+            ProviderKubernetesClusterRowDispositionV1,
+            self.cluster_row_disposition,
+            name='partial cleanup legal shape cluster_row_disposition')
+        object.__setattr__(self, 'cluster_row_disposition', disposition)
+
+        phase = self.launch_phase
+        if phase == 'CREATE_INTENT':
+            legal = count in (0, 1, 2) and not node and disposition is (
+                ProviderKubernetesClusterRowDispositionV1.NOT_FOUND)
+        elif phase == 'OBJECTS_PARTIAL':
+            legal = count in (1, 2, 3) and not node and disposition is (
+                ProviderKubernetesClusterRowDispositionV1.NOT_FOUND)
+        elif phase in ('OBJECTS_EXACT', 'HANDLE_INTENT'):
+            legal = count == 3 and node and disposition is (
+                ProviderKubernetesClusterRowDispositionV1.NOT_FOUND)
+        elif phase in self._POST_HANDLE_PHASES:
+            legal = count == 3 and node
+        else:
+            legal = False
+        if not legal:
+            raise ValueError('partial cleanup legal shape is not in the '
+                             'literal v1 phase/disposition graph.')
+        _ = self.canonical_bytes
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'case_id': self.case_id,
+            'launch_phase': self.launch_phase,
+            'committed_object_count': self.committed_object_count,
+            'pod_node_allocation': self.pod_node_allocation,
+            'cluster_row_disposition': self.cluster_row_disposition.value,
+        }
+
+
+PROVIDER_PARTIAL_LAUNCH_CLEANUP_LEGAL_SHAPE_MANIFEST_V1 = (
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'create_intent_0_not_found', 'CREATE_INTENT', 0, False,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'objects_partial_1_not_found', 'OBJECTS_PARTIAL', 1, False,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'create_intent_1_not_found', 'CREATE_INTENT', 1, False,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'objects_partial_2_not_found', 'OBJECTS_PARTIAL', 2, False,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'create_intent_2_not_found', 'CREATE_INTENT', 2, False,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'objects_partial_3_unscheduled_not_found', 'OBJECTS_PARTIAL', 3, False,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'objects_exact_not_found', 'OBJECTS_EXACT', 3, True,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    ProviderPartialLaunchCleanupLegalShapeV1(
+        'handle_intent_not_found', 'HANDLE_INTENT', 3, True,
+        ProviderKubernetesClusterRowDispositionV1.NOT_FOUND),
+    *tuple(
+        ProviderPartialLaunchCleanupLegalShapeV1(
+            f'{phase.lower()}_{disposition.value}', phase, 3, True, disposition)
+        for phase in (
+            'HANDLE_COMMITTED',
+            'RUNTIME_READY',
+            'JOB_INTENT',
+            'JOB_COMMITTED',
+            'JOB_RUNNING',
+            'ENDPOINT_RESOLVED',
+        )
+        for disposition in (
+            ProviderKubernetesClusterRowDispositionV1.NOT_FOUND,
+            ProviderKubernetesClusterRowDispositionV1.EXACT_HANDLE,
+        )),
+)
+
+
+def enumerate_provider_partial_launch_cleanup_legal_shapes_v1(
+) -> tuple[ProviderPartialLaunchCleanupLegalShapeV1, ...]:
+    """Return the immutable, exhaustive v1 partial-down shape manifest."""
+
+    return PROVIDER_PARTIAL_LAUNCH_CLEANUP_LEGAL_SHAPE_MANIFEST_V1
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderKubernetesCleanupTargetV1(_CanonicalContract):
     """Complete immutable down-addressing preimage for one launch basis."""
 
@@ -6573,8 +6754,8 @@ class ProviderKubernetesCleanupTargetV1(_CanonicalContract):
             _uuid(self.cluster_record_uuid,
                   name='cleanup_target.cluster_record_uuid'))
         self._validate_objects()
-        if self.handle is not None and not isinstance(
-                self.handle, ProviderKubernetesHandleV1):
+        if (self.handle is not None and
+                type(self.handle) is not ProviderKubernetesHandleV1):
             raise TypeError('cleanup target handle has an invalid type.')
         if ((disposition
              is ProviderKubernetesClusterRowDispositionV1.EXACT_HANDLE)
@@ -6597,9 +6778,9 @@ class ProviderKubernetesCleanupTargetV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     def _validate_objects(self) -> None:
-        if (not isinstance(self.objects, tuple) or len(
-                self.objects) != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or
-                any(not isinstance(item, ProviderKubernetesCleanupObjectV1)
+        if (type(self.objects) is not tuple or len(self.objects)
+                != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or any(
+                    type(item) is not ProviderKubernetesCleanupObjectV1
                     for item in self.objects)):
             raise ValueError('cleanup target requires exactly three typed '
                              'objects.')
@@ -6720,12 +6901,480 @@ class ProviderKubernetesCleanupTargetV1(_CanonicalContract):
                             key=lambda item: item.delete_sequence))
 
     def validate_requested_target(self, target: ProviderLocatorV1) -> None:
+        if type(target) is not ProviderLocatorV1:
+            raise TypeError('cleanup target requested target has an invalid '
+                            'type.')
         if (self.requested_target_sha256 != target.sha256 or
                 self.cluster_name != target.sky_cluster_name or
                 self.cluster_record_uuid != target.sky_cluster_record_uuid):
             raise ValueError('Cleanup target does not match requested target.')
         if self.handle is not None:
             self.handle.validate_requested_target(target)
+
+
+class ProviderPriorLaunchSourceStoreV1(str, enum.Enum):
+    """Closed retained-row stores from which a launch basis may originate."""
+
+    API_RESOURCE_ACTIONS = 'api_resource_actions'
+    SERVE_RESOURCE_ACTION_SHADOW_SAMPLES = (
+        'serve_resource_action_shadow_samples')
+
+
+def _validate_prior_launch_basis_common_v1(
+    *,
+    source_store: ProviderPriorLaunchSourceStoreV1 | str,
+    allowed_source_stores: frozenset[ProviderPriorLaunchSourceStoreV1],
+    launch_action_id: uuid.UUID,
+    launch_resource_identity: ProviderResourceIdentityV1,
+    launch_requested_target: ProviderLocatorV1,
+    launch_resources: ProviderPodResourceSnapshotV1,
+    launch_workspace_identity: ProviderWorkspaceIdentityV1,
+    launch_cleanup_target_sha256: str,
+    launch_immutable_spec_sha256: str,
+    exact_resources_override: bool,
+) -> ProviderPriorLaunchSourceStoreV1:
+    """Validate one standalone retained-source basis reference."""
+
+    source = _enum_value(ProviderPriorLaunchSourceStoreV1,
+                         source_store,
+                         name='prior_launch_basis.source_store')
+    if source not in allowed_source_stores:
+        raise ValueError('prior launch basis source store is unsupported for '
+                         'its basis kind.')
+    if type(launch_action_id) is not uuid.UUID:
+        raise TypeError('prior launch basis action ID has an invalid type.')
+    for field, value, expected_type in (
+        ('launch_resource_identity', launch_resource_identity,
+         ProviderResourceIdentityV1),
+        ('launch_requested_target', launch_requested_target, ProviderLocatorV1),
+        ('launch_resources', launch_resources, ProviderPodResourceSnapshotV1),
+        ('launch_workspace_identity', launch_workspace_identity,
+         ProviderWorkspaceIdentityV1),
+    ):
+        if type(value) is not expected_type:
+            raise TypeError(f'prior launch basis {field} has an invalid type.')
+    expected_action_id = launch_resource_identity.action_identity(
+        kernel_actions.ActionKind.LAUNCH).action_id
+    if launch_action_id != expected_action_id:
+        raise ValueError('prior launch basis action ID does not match its '
+                         'launch resource identity.')
+    if not launch_requested_target.is_authoritative_pod_locator:
+        raise ValueError('prior launch basis requires the authoritative '
+                         'Kubernetes Pod locator.')
+    kubernetes = launch_requested_target.kubernetes
+    assert kubernetes is not None
+    if (kubernetes.replica_incarnation_label
+            != str(launch_resource_identity.replica_incarnation)):
+        raise ValueError('prior launch basis locator does not match its '
+                         'replica incarnation.')
+    if (launch_resources.cluster_fingerprint_sha256
+            != kubernetes.cluster_fingerprint_sha256 or
+            launch_resources.namespace != kubernetes.namespace):
+        raise ValueError('prior launch basis resources do not match its '
+                         'requested target.')
+    if (launch_workspace_identity.kubernetes_scope.canonical_bytes
+            != kubernetes.scope.canonical_bytes):
+        raise ValueError('prior launch basis workspace scope does not match '
+                         'its requested target.')
+    _sha256(launch_cleanup_target_sha256,
+            name='prior_launch_basis.launch_cleanup_target_sha256')
+    _sha256(launch_immutable_spec_sha256,
+            name='prior_launch_basis.launch_immutable_spec_sha256')
+    if _boolean(exact_resources_override,
+                name='prior_launch_basis.exact_resources_override') is not True:
+        raise ValueError('prior launch basis exact_resources_override must be '
+                         'true.')
+    return source
+
+
+@dataclasses.dataclass(frozen=True)
+class CompletedLaunchBasisV1(_CanonicalContract):
+    """Complete successful launch evidence retained by a primary down."""
+
+    version: int
+    basis_kind: ProviderKubernetesCleanupBasisKindV1
+    source_store: ProviderPriorLaunchSourceStoreV1
+    launch_action_id: uuid.UUID
+    launch_resource_identity: ProviderResourceIdentityV1
+    launch_requested_target: ProviderLocatorV1
+    launch_resources: ProviderPodResourceSnapshotV1
+    launch_workspace_identity: ProviderWorkspaceIdentityV1
+    launch_resolved_target: ResolvedProviderTargetV1
+    launch_resolved_target_sha256: str
+    launch_handle: ProviderKubernetesHandleV1
+    launch_handle_sha256: str
+    launch_cleanup_target_sha256: str
+    launch_immutable_spec_sha256: str
+    exact_resources_override: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'basis_kind', 'source_store', 'launch_action_id',
+        'launch_resource_identity', 'launch_requested_target',
+        'launch_resources', 'launch_workspace_identity',
+        'launch_resolved_target', 'launch_resolved_target_sha256',
+        'launch_handle', 'launch_handle_sha256', 'launch_cleanup_target_sha256',
+        'launch_immutable_spec_sha256', 'exact_resources_override'
+    })
+    _SOURCE_STORES: ClassVar[frozenset[ProviderPriorLaunchSourceStoreV1]] = (
+        frozenset({
+            ProviderPriorLaunchSourceStoreV1.API_RESOURCE_ACTIONS,
+            ProviderPriorLaunchSourceStoreV1.
+            SERVE_RESOURCE_ACTION_SHADOW_SAMPLES,
+        }))
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='completed launch basis version')
+        basis_kind = _enum_value(ProviderKubernetesCleanupBasisKindV1,
+                                 self.basis_kind,
+                                 name='completed_launch_basis.basis_kind')
+        if basis_kind is not (
+                ProviderKubernetesCleanupBasisKindV1.COMPLETED_LAUNCH):
+            raise ValueError('completed launch basis kind is unsupported.')
+        source = _validate_prior_launch_basis_common_v1(
+            source_store=self.source_store,
+            allowed_source_stores=self._SOURCE_STORES,
+            launch_action_id=self.launch_action_id,
+            launch_resource_identity=self.launch_resource_identity,
+            launch_requested_target=self.launch_requested_target,
+            launch_resources=self.launch_resources,
+            launch_workspace_identity=self.launch_workspace_identity,
+            launch_cleanup_target_sha256=self.launch_cleanup_target_sha256,
+            launch_immutable_spec_sha256=self.launch_immutable_spec_sha256,
+            exact_resources_override=self.exact_resources_override)
+        for field, expected_type in (
+            ('launch_resolved_target', ResolvedProviderTargetV1),
+            ('launch_handle', ProviderKubernetesHandleV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'completed launch basis {field} has an '
+                                'invalid type.')
+        resolved_hash = _sha256(
+            self.launch_resolved_target_sha256,
+            name='completed_launch_basis.launch_resolved_target_sha256')
+        if resolved_hash != self.launch_resolved_target.sha256:
+            raise ValueError('completed launch basis resolved target hash does '
+                             'not match its complete preimage.')
+        handle_hash = _sha256(
+            self.launch_handle_sha256,
+            name='completed_launch_basis.launch_handle_sha256')
+        if handle_hash != self.launch_handle.sha256:
+            raise ValueError('completed launch basis handle hash does not '
+                             'match its complete preimage.')
+        self.launch_resolved_target.validate_requested_target(
+            self.launch_requested_target)
+        self.launch_handle.validate_requested_target(
+            self.launch_requested_target)
+        if self.launch_handle.launched_resources_sha256 != (
+                self.launch_resources.sha256):
+            raise ValueError('completed launch basis handle resources hash '
+                             'does not match launch resources.')
+        handle_config = self.launch_handle.provider_config
+        ssh_service, head_service, pod = (
+            self.launch_resolved_target.kubernetes_objects)
+        if (self.launch_resolved_target.provider_resource_id
+                != f'pod/{handle_config.pod_name}' or
+                self.launch_resolved_target.workload_uid
+                != handle_config.pod_uid or
+                handle_config.namespace != pod.namespace or
+                handle_config.pod_name != pod.name or
+                handle_config.pod_uid != pod.uid or
+                handle_config.head_service_uid != head_service.uid or
+                handle_config.head_ssh_service_uid != ssh_service.uid):
+            raise ValueError('completed launch basis resolved object identity '
+                             'does not match its launch handle.')
+        pod_allocations = pod.server_allocations
+        if (not pod_allocations or
+                pod_allocations[0].json_pointer != '/spec/nodeName' or
+                pod_allocations[0].value.canonical_value()
+                != handle_config.node_name):
+            raise ValueError('completed launch basis resolved Pod allocation '
+                             'does not match its launch handle.')
+        scope = self.launch_workspace_identity.kubernetes_scope
+        if self.launch_handle.provider_config.scope_sha256 != scope.sha256:
+            raise ValueError('completed launch basis handle scope does not '
+                             'match its workspace identity.')
+        object.__setattr__(self, 'basis_kind', basis_kind)
+        object.__setattr__(self, 'source_store', source)
+        object.__setattr__(self, 'launch_resolved_target_sha256', resolved_hash)
+        object.__setattr__(self, 'launch_handle_sha256', handle_hash)
+        object.__setattr__(
+            self, 'launch_cleanup_target_sha256',
+            _sha256(self.launch_cleanup_target_sha256,
+                    name=('completed_launch_basis.'
+                          'launch_cleanup_target_sha256')))
+        object.__setattr__(
+            self, 'launch_immutable_spec_sha256',
+            _sha256(self.launch_immutable_spec_sha256,
+                    name=('completed_launch_basis.'
+                          'launch_immutable_spec_sha256')))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'CompletedLaunchBasisV1':
+        _bounded_canonical_json_bytes(value,
+                                      name='completed launch basis',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='completed launch basis',
+                                     keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            basis_kind=raw['basis_kind'],
+            source_store=raw['source_store'],
+            launch_action_id=_uuid(raw['launch_action_id'],
+                                   name='completed_launch_basis.action_id'),
+            launch_resource_identity=ProviderResourceIdentityV1.from_value(
+                raw['launch_resource_identity']),
+            launch_requested_target=ProviderLocatorV1.from_value(
+                raw['launch_requested_target']),
+            launch_resources=ProviderPodResourceSnapshotV1.from_value(
+                raw['launch_resources']),
+            launch_workspace_identity=ProviderWorkspaceIdentityV1.from_value(
+                raw['launch_workspace_identity']),
+            launch_resolved_target=ResolvedProviderTargetV1.from_value(
+                raw['launch_resolved_target']),
+            launch_resolved_target_sha256=raw['launch_resolved_target_sha256'],
+            launch_handle=ProviderKubernetesHandleV1.from_value(
+                raw['launch_handle']),
+            launch_handle_sha256=raw['launch_handle_sha256'],
+            launch_cleanup_target_sha256=raw['launch_cleanup_target_sha256'],
+            launch_immutable_spec_sha256=raw['launch_immutable_spec_sha256'],
+            exact_resources_override=raw['exact_resources_override'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'basis_kind': self.basis_kind.value,
+            'source_store': self.source_store.value,
+            'launch_action_id': str(self.launch_action_id),
+            'launch_resource_identity':
+                self.launch_resource_identity.canonical_value(),
+            'launch_requested_target':
+                self.launch_requested_target.canonical_value(),
+            'launch_resources': self.launch_resources.canonical_value(),
+            'launch_workspace_identity':
+                self.launch_workspace_identity.canonical_value(),
+            'launch_resolved_target':
+                self.launch_resolved_target.canonical_value(),
+            'launch_resolved_target_sha256': self.launch_resolved_target_sha256,
+            'launch_handle': self.launch_handle.canonical_value(),
+            'launch_handle_sha256': self.launch_handle_sha256,
+            'launch_cleanup_target_sha256': self.launch_cleanup_target_sha256,
+            'launch_immutable_spec_sha256': self.launch_immutable_spec_sha256,
+            'exact_resources_override': True,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PartialLaunchCleanupBasisV1(_CanonicalContract):
+    """Quiesced partial-launch evidence retained by a cleanup down."""
+
+    version: int
+    basis_kind: ProviderKubernetesCleanupBasisKindV1
+    source_store: ProviderPriorLaunchSourceStoreV1
+    launch_action_id: uuid.UUID
+    launch_attempt: int
+    launch_resource_identity: ProviderResourceIdentityV1
+    launch_requested_target: ProviderLocatorV1
+    launch_resources: ProviderPodResourceSnapshotV1
+    launch_workspace_identity: ProviderWorkspaceIdentityV1
+    launch_provider_cursor_sha256: str
+    launch_provider_progress_revision: int
+    launch_quiescence_sha256: str
+    launch_cleanup_target_sha256: str
+    launch_immutable_spec_sha256: str
+    exact_resources_override: bool
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'basis_kind', 'source_store', 'launch_action_id',
+        'launch_attempt', 'launch_resource_identity', 'launch_requested_target',
+        'launch_resources', 'launch_workspace_identity',
+        'launch_provider_cursor_sha256', 'launch_provider_progress_revision',
+        'launch_quiescence_sha256', 'launch_cleanup_target_sha256',
+        'launch_immutable_spec_sha256', 'exact_resources_override'
+    })
+    _SOURCE_STORES: ClassVar[frozenset[ProviderPriorLaunchSourceStoreV1]] = (
+        frozenset({ProviderPriorLaunchSourceStoreV1.API_RESOURCE_ACTIONS}))
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='partial launch cleanup basis version')
+        basis_kind = _enum_value(ProviderKubernetesCleanupBasisKindV1,
+                                 self.basis_kind,
+                                 name='partial_launch_cleanup_basis.basis_kind')
+        if basis_kind is not (
+                ProviderKubernetesCleanupBasisKindV1.PARTIAL_LAUNCH_CLEANUP):
+            raise ValueError('partial launch cleanup basis kind is '
+                             'unsupported.')
+        source = _validate_prior_launch_basis_common_v1(
+            source_store=self.source_store,
+            allowed_source_stores=self._SOURCE_STORES,
+            launch_action_id=self.launch_action_id,
+            launch_resource_identity=self.launch_resource_identity,
+            launch_requested_target=self.launch_requested_target,
+            launch_resources=self.launch_resources,
+            launch_workspace_identity=self.launch_workspace_identity,
+            launch_cleanup_target_sha256=self.launch_cleanup_target_sha256,
+            launch_immutable_spec_sha256=self.launch_immutable_spec_sha256,
+            exact_resources_override=self.exact_resources_override)
+        attempt = _positive_integer(
+            self.launch_attempt,
+            name='partial_launch_cleanup_basis.launch_attempt')
+        revision = _positive_integer(self.launch_provider_progress_revision,
+                                     name=('partial_launch_cleanup_basis.'
+                                           'launch_provider_progress_revision'))
+        cursor_hash = _sha256(self.launch_provider_cursor_sha256,
+                              name=('partial_launch_cleanup_basis.'
+                                    'launch_provider_cursor_sha256'))
+        quiescence_hash = _sha256(
+            self.launch_quiescence_sha256,
+            name='partial_launch_cleanup_basis.launch_quiescence_sha256')
+        object.__setattr__(self, 'basis_kind', basis_kind)
+        object.__setattr__(self, 'source_store', source)
+        object.__setattr__(self, 'launch_attempt', attempt)
+        object.__setattr__(self, 'launch_provider_progress_revision', revision)
+        object.__setattr__(self, 'launch_provider_cursor_sha256', cursor_hash)
+        object.__setattr__(self, 'launch_quiescence_sha256', quiescence_hash)
+        object.__setattr__(
+            self, 'launch_cleanup_target_sha256',
+            _sha256(self.launch_cleanup_target_sha256,
+                    name=('partial_launch_cleanup_basis.'
+                          'launch_cleanup_target_sha256')))
+        object.__setattr__(
+            self, 'launch_immutable_spec_sha256',
+            _sha256(self.launch_immutable_spec_sha256,
+                    name=('partial_launch_cleanup_basis.'
+                          'launch_immutable_spec_sha256')))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'PartialLaunchCleanupBasisV1':
+        _bounded_canonical_json_bytes(value,
+                                      name='partial launch cleanup basis',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='partial launch cleanup basis',
+                                     keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            basis_kind=raw['basis_kind'],
+            source_store=raw['source_store'],
+            launch_action_id=_uuid(
+                raw['launch_action_id'],
+                name='partial_launch_cleanup_basis.action_id'),
+            launch_attempt=raw['launch_attempt'],
+            launch_resource_identity=ProviderResourceIdentityV1.from_value(
+                raw['launch_resource_identity']),
+            launch_requested_target=ProviderLocatorV1.from_value(
+                raw['launch_requested_target']),
+            launch_resources=ProviderPodResourceSnapshotV1.from_value(
+                raw['launch_resources']),
+            launch_workspace_identity=ProviderWorkspaceIdentityV1.from_value(
+                raw['launch_workspace_identity']),
+            launch_provider_cursor_sha256=raw['launch_provider_cursor_sha256'],
+            launch_provider_progress_revision=raw[
+                'launch_provider_progress_revision'],
+            launch_quiescence_sha256=raw['launch_quiescence_sha256'],
+            launch_cleanup_target_sha256=raw['launch_cleanup_target_sha256'],
+            launch_immutable_spec_sha256=raw['launch_immutable_spec_sha256'],
+            exact_resources_override=raw['exact_resources_override'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'basis_kind': self.basis_kind.value,
+            'source_store': self.source_store.value,
+            'launch_action_id': str(self.launch_action_id),
+            'launch_attempt': self.launch_attempt,
+            'launch_resource_identity':
+                self.launch_resource_identity.canonical_value(),
+            'launch_requested_target':
+                self.launch_requested_target.canonical_value(),
+            'launch_resources': self.launch_resources.canonical_value(),
+            'launch_workspace_identity':
+                self.launch_workspace_identity.canonical_value(),
+            'launch_provider_cursor_sha256': self.launch_provider_cursor_sha256,
+            'launch_provider_progress_revision':
+                self.launch_provider_progress_revision,
+            'launch_quiescence_sha256': self.launch_quiescence_sha256,
+            'launch_cleanup_target_sha256': self.launch_cleanup_target_sha256,
+            'launch_immutable_spec_sha256': self.launch_immutable_spec_sha256,
+            'exact_resources_override': True,
+        }
+
+
+PriorLaunchBasisV1 = CompletedLaunchBasisV1 | PartialLaunchCleanupBasisV1
+
+
+def prior_launch_basis_from_value_v1(value: Any) -> PriorLaunchBasisV1:
+    """Parse the exact discriminated prior-launch evidence union."""
+
+    if type(value) is not dict:
+        raise TypeError('prior launch basis must be a JSON object.')
+    basis_kind = value.get('basis_kind')
+    if type(basis_kind) is not str:
+        raise TypeError('prior_launch_basis.basis_kind must be text.')
+    if basis_kind == ProviderKubernetesCleanupBasisKindV1.COMPLETED_LAUNCH.value:
+        return CompletedLaunchBasisV1.from_value(value)
+    if basis_kind == (
+            ProviderKubernetesCleanupBasisKindV1.PARTIAL_LAUNCH_CLEANUP.value):
+        return PartialLaunchCleanupBasisV1.from_value(value)
+    raise ValueError('prior launch basis kind is unsupported.')
+
+
+def _validate_prior_launch_cleanup_target_binding_v1(
+    prior_launch_basis: PriorLaunchBasisV1,
+    cleanup_target: ProviderKubernetesCleanupTargetV1,
+) -> None:
+    """Bind the sole cleanup-target preimage to its retained-source basis."""
+
+    if type(prior_launch_basis) not in (CompletedLaunchBasisV1,
+                                        PartialLaunchCleanupBasisV1):
+        raise TypeError('prior launch cleanup binding basis has an invalid '
+                        'type.')
+    if type(cleanup_target) is not ProviderKubernetesCleanupTargetV1:
+        raise TypeError('prior launch cleanup binding target has an invalid '
+                        'type.')
+    cleanup_target.validate_requested_target(
+        prior_launch_basis.launch_requested_target)
+    if cleanup_target.basis_kind is not prior_launch_basis.basis_kind:
+        raise ValueError('cleanup target basis kind does not match its prior '
+                         'launch basis.')
+    if cleanup_target.sha256 != prior_launch_basis.launch_cleanup_target_sha256:
+        raise ValueError('cleanup target hash does not match its prior launch '
+                         'basis commitment.')
+    if type(prior_launch_basis) is CompletedLaunchBasisV1:
+        if (cleanup_target.handle is None or
+                cleanup_target.handle.canonical_bytes
+                != prior_launch_basis.launch_handle.canonical_bytes):
+            raise ValueError('completed cleanup target handle is not '
+                             'byte-equal to its prior launch handle.')
+        resolved_objects = (
+            prior_launch_basis.launch_resolved_target.kubernetes_objects)
+        for resolved, cleanup in zip(resolved_objects, cleanup_target.objects):
+            plan = cleanup.plan
+            if (resolved.role is not cleanup.role or
+                    resolved.kind is not plan.kind or
+                    resolved.namespace != plan.namespace or
+                    resolved.name != plan.name or
+                    resolved.uid != cleanup.committed_uid or
+                    resolved.observed_semantic_sha256
+                    != plan.requested_semantic_sha256 or
+                    tuple(item.canonical_bytes
+                          for item in resolved.server_allocations)
+                    != tuple(item.canonical_bytes
+                             for item in cleanup.committed_server_allocations)):
+                raise ValueError('completed cleanup target object evidence is '
+                                 'not byte-equal to its prior launch resolved '
+                                 'target and source plan.')
+        pod = cleanup_target.objects[2]
+        if (prior_launch_basis.launch_resolved_target.provider_resource_id
+                != f'pod/{pod.plan.name}' or
+                prior_launch_basis.launch_resolved_target.workload_uid
+                != pod.committed_uid):
+            raise ValueError('completed cleanup target Pod identity does not '
+                             'match its prior launch resolved target.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9421,6 +10070,477 @@ class ProviderKubernetesExecutionConfigV1(_CanonicalContract):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderKubernetesDownExecutionCapsuleV1(_CanonicalContract):
+    """Closed current-authority preimage for exact Kubernetes cleanup."""
+
+    version: int
+    implementation_contract: str
+    executor_cohort: ProviderAuthorityWorkerCohortV1
+    config_projection: ProviderKubernetesConfigProjectionV1
+    config_projection_sha256: str
+    scope: ProviderKubernetesScopeV1
+    principals: ProviderKubernetesPrincipalsV1
+    prerequisites: tuple[ProviderKubernetesPrerequisiteV1, ...]
+    cleanup_target: ProviderKubernetesCleanupTargetV1
+    cleanup_target_sha256: str
+    mutation_contract: ProviderKubernetesDownMutationContractV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'implementation_contract', 'executor_cohort',
+        'config_projection', 'config_projection_sha256', 'scope', 'principals',
+        'prerequisites', 'cleanup_target', 'cleanup_target_sha256',
+        'mutation_contract'
+    })
+    _IMPLEMENTATION_CONTRACT: ClassVar[
+        str] = 'kubernetes_serve_exact_cleanup_v1'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='down execution capsule version')
+        if type(self.implementation_contract) is not str:
+            raise TypeError('down execution capsule implementation_contract '
+                            'must be text.')
+        if self.implementation_contract != self._IMPLEMENTATION_CONTRACT:
+            raise ValueError('down execution capsule implementation_contract '
+                             'is unsupported.')
+        for field, expected_type in (
+            ('executor_cohort', ProviderAuthorityWorkerCohortV1),
+            ('config_projection', ProviderKubernetesConfigProjectionV1),
+            ('scope', ProviderKubernetesScopeV1),
+            ('principals', ProviderKubernetesPrincipalsV1),
+            ('cleanup_target', ProviderKubernetesCleanupTargetV1),
+            ('mutation_contract', ProviderKubernetesDownMutationContractV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'down execution capsule {field} has an '
+                                'invalid type.')
+        object.__setattr__(
+            self, 'prerequisites',
+            _provider_kubernetes_prerequisite_inventory_tuple(
+                self.prerequisites,
+                name='down execution capsule prerequisites'))
+        projection_hash = _sha256(
+            self.config_projection_sha256,
+            name='down execution capsule config_projection_sha256')
+        if projection_hash != self.config_projection.sha256:
+            raise ValueError('down execution capsule config projection hash '
+                             'does not match its complete preimage.')
+        cleanup_hash = _sha256(
+            self.cleanup_target_sha256,
+            name='down execution capsule cleanup_target_sha256')
+        if cleanup_hash != self.cleanup_target.sha256:
+            raise ValueError('down execution capsule cleanup target hash does '
+                             'not match its complete preimage.')
+        object.__setattr__(self, 'config_projection_sha256', projection_hash)
+        object.__setattr__(self, 'cleanup_target_sha256', cleanup_hash)
+        self._validate_internal_projection()
+        _ = self.canonical_bytes
+
+    def _validate_internal_projection(self) -> None:
+        config = self.config_projection
+        scope = self.scope
+        principals = self.principals
+        if not scope.in_cluster:
+            raise ValueError('down execution capsule scope must be in-cluster.')
+        namespaces = (
+            scope.namespace,
+            config.target_namespace,
+            principals.workload.namespace,
+            principals.caller_authorization.rules.namespace,
+            *(item.plan.namespace for item in self.cleanup_target.objects),
+        )
+        if any(namespace != scope.namespace for namespace in namespaces):
+            raise ValueError('down execution capsule target namespaces are '
+                             'not byte-equal.')
+        caller_scope = (
+            scope.caller_service_account_namespace,
+            scope.caller_service_account_name,
+            scope.caller_service_account_uid,
+        )
+        caller_principal = (principals.caller.namespace, principals.caller.name,
+                            principals.caller.uid)
+        workload_scope = (
+            scope.workload_service_account_namespace,
+            scope.workload_service_account_name,
+            scope.workload_service_account_uid,
+        )
+        workload_principal = (principals.workload.namespace,
+                              principals.workload.name, principals.workload.uid)
+        if caller_scope != caller_principal or workload_scope != workload_principal:
+            raise ValueError('down execution capsule principals do not match '
+                             'the Kubernetes scope.')
+        by_role = {item.role: item for item in self.prerequisites}
+        authority_namespace = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.AUTHORITY_RELEASE_NAMESPACE]
+        target_namespace = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.TARGET_NAMESPACE]
+        kube_system_namespace = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.KUBE_SYSTEM_NAMESPACE]
+        if (authority_namespace.name != self.executor_cohort.manifest.namespace
+                or authority_namespace.name != principals.caller.namespace or
+                self.executor_cohort.manifest.service_account_name
+                != principals.caller.name or
+                self.executor_cohort.service_account_uid
+                != principals.caller.uid):
+            raise ValueError('down execution capsule authority cohort, '
+                             'Namespace, and caller principal do not match.')
+        if (target_namespace.name != scope.namespace or
+                target_namespace.uid != scope.target_namespace_uid or
+                kube_system_namespace.name != 'kube-system' or
+                kube_system_namespace.uid != scope.kube_system_namespace_uid):
+            raise ValueError('down execution capsule Namespace prerequisites '
+                             'do not match the Kubernetes scope.')
+        for role, principal in (
+            (ProviderKubernetesPrerequisiteRoleV1.CALLER_SERVICE_ACCOUNT,
+             principals.caller),
+            (ProviderKubernetesPrerequisiteRoleV1.WORKLOAD_SERVICE_ACCOUNT,
+             principals.workload),
+        ):
+            prerequisite = by_role[role]
+            if type(prerequisite.spec) is not (
+                    ProviderKubernetesServiceAccountPrerequisiteSpecV1):
+                raise ValueError('down execution capsule ServiceAccount '
+                                 'prerequisite has an invalid spec.')
+            if prerequisite.spec.projection.canonical_bytes != (
+                    principal.canonical_bytes):
+                raise ValueError('down execution capsule ServiceAccount '
+                                 'prerequisite does not match its principal.')
+        network_policy = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.ENDPOINT_NETWORK_POLICY]
+        if network_policy.namespace != scope.namespace:
+            raise ValueError('down execution capsule NetworkPolicy namespace '
+                             'does not match the target namespace.')
+        if (self.cleanup_target.handle is not None and
+                self.cleanup_target.handle.provider_config.scope_sha256
+                != scope.sha256):
+            raise ValueError('down execution capsule cleanup handle scope does '
+                             'not match the current Kubernetes scope.')
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesDownExecutionCapsuleV1':
+        _bounded_canonical_json_bytes(value,
+                                      name='Kubernetes down execution capsule',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes down execution capsule',
+                                     keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            implementation_contract=raw['implementation_contract'],
+            executor_cohort=ProviderAuthorityWorkerCohortV1.from_value(
+                raw['executor_cohort']),
+            config_projection=ProviderKubernetesConfigProjectionV1.from_value(
+                raw['config_projection']),
+            config_projection_sha256=raw['config_projection_sha256'],
+            scope=ProviderKubernetesScopeV1.from_value(raw['scope']),
+            principals=ProviderKubernetesPrincipalsV1.from_value(
+                raw['principals']),
+            prerequisites=_provider_kubernetes_prerequisite_inventory_from_value(
+                raw['prerequisites'],
+                name='down execution capsule prerequisites'),
+            cleanup_target=ProviderKubernetesCleanupTargetV1.from_value(
+                raw['cleanup_target']),
+            cleanup_target_sha256=raw['cleanup_target_sha256'],
+            mutation_contract=(
+                ProviderKubernetesDownMutationContractV1.from_value(
+                    raw['mutation_contract'])))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'implementation_contract': self._IMPLEMENTATION_CONTRACT,
+            'executor_cohort': self.executor_cohort.canonical_value(),
+            'config_projection': self.config_projection.canonical_value(),
+            'config_projection_sha256': self.config_projection_sha256,
+            'scope': self.scope.canonical_value(),
+            'principals': self.principals.canonical_value(),
+            'prerequisites': [
+                item.canonical_value() for item in self.prerequisites
+            ],
+            'cleanup_target': self.cleanup_target.canonical_value(),
+            'cleanup_target_sha256': self.cleanup_target_sha256,
+            'mutation_contract': self.mutation_contract.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderDownPolicySubjectV1(_CanonicalContract):
+    """Closed down policy projection bound by its enclosing config."""
+
+    version: int
+    requested_target: ProviderLocatorV1
+    workspace: str
+    prior_launch_basis_sha256: str
+    cleanup_target_sha256: str
+    execution_capsule_sha256: str
+    admin_policy_mode: str
+    managed_secrets_mode: str
+    purge: bool
+    graceful: bool
+    graceful_timeout: None
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'requested_target', 'workspace', 'prior_launch_basis_sha256',
+        'cleanup_target_sha256', 'execution_capsule_sha256',
+        'admin_policy_mode', 'managed_secrets_mode', 'purge', 'graceful',
+        'graceful_timeout'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='down policy subject version')
+        if type(self.requested_target) is not ProviderLocatorV1:
+            raise TypeError('down policy subject requested_target has an '
+                            'invalid type.')
+        if not self.requested_target.is_authoritative_pod_locator:
+            raise ValueError('down policy subject requires the authoritative '
+                             'Kubernetes Pod locator.')
+        object.__setattr__(
+            self, 'workspace',
+            _text(self.workspace, name='down_policy_subject.workspace'))
+        for field in ('prior_launch_basis_sha256', 'cleanup_target_sha256',
+                      'execution_capsule_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field),
+                        name=f'down_policy_subject.{field}'))
+        fixed_text = {
+            'admin_policy_mode': 'absent_controller_and_executor',
+            'managed_secrets_mode': 'absent',
+        }
+        for field, expected in fixed_text.items():
+            if type(getattr(self, field)) is not str:
+                raise TypeError(f'down policy subject {field} must be text.')
+            if getattr(self, field) != expected:
+                raise ValueError(f'down policy subject {field} is unsupported.')
+        for field in ('purge', 'graceful'):
+            value = _boolean(getattr(self, field),
+                             name=f'down policy subject {field}')
+            if value:
+                raise ValueError(f'down policy subject {field} must be false.')
+        if self.graceful_timeout is not None:
+            raise ValueError('down policy subject graceful_timeout must be '
+                             'null.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ProviderDownPolicySubjectV1':
+        _bounded_canonical_json_bytes(value,
+                                      name='down policy subject',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='down policy subject',
+                                     keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   requested_target=ProviderLocatorV1.from_value(
+                       raw['requested_target']),
+                   workspace=raw['workspace'],
+                   prior_launch_basis_sha256=raw['prior_launch_basis_sha256'],
+                   cleanup_target_sha256=raw['cleanup_target_sha256'],
+                   execution_capsule_sha256=raw['execution_capsule_sha256'],
+                   admin_policy_mode=raw['admin_policy_mode'],
+                   managed_secrets_mode=raw['managed_secrets_mode'],
+                   purge=raw['purge'],
+                   graceful=raw['graceful'],
+                   graceful_timeout=raw['graceful_timeout'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'requested_target': self.requested_target.canonical_value(),
+            'workspace': self.workspace,
+            'prior_launch_basis_sha256': self.prior_launch_basis_sha256,
+            'cleanup_target_sha256': self.cleanup_target_sha256,
+            'execution_capsule_sha256': self.execution_capsule_sha256,
+            'admin_policy_mode': 'absent_controller_and_executor',
+            'managed_secrets_mode': 'absent',
+            'purge': False,
+            'graceful': False,
+            'graceful_timeout': None,
+        }
+
+
+def project_provider_down_policy_subject_v1(
+    requested_target: ProviderLocatorV1,
+    workspace: str,
+    prior_launch_basis: PriorLaunchBasisV1,
+    capsule: ProviderKubernetesDownExecutionCapsuleV1,
+) -> ProviderDownPolicySubjectV1:
+    """Construct the only valid down policy subject from typed preimages."""
+
+    for field, value, expected_types in (
+        ('requested_target', requested_target, (ProviderLocatorV1,)),
+        ('prior_launch_basis', prior_launch_basis,
+         (CompletedLaunchBasisV1, PartialLaunchCleanupBasisV1)),
+        ('capsule', capsule, (ProviderKubernetesDownExecutionCapsuleV1,)),
+    ):
+        if type(value) not in expected_types:
+            raise TypeError(f'down policy projector {field} has an invalid '
+                            'type.')
+    workspace = _text(workspace, name='down policy projector workspace')
+    if prior_launch_basis.launch_requested_target.canonical_bytes != (
+            requested_target.canonical_bytes):
+        raise ValueError('down policy projector requested target does not '
+                         'match its prior launch basis.')
+    if prior_launch_basis.launch_workspace_identity.workspace != workspace:
+        raise ValueError('down policy projector workspace does not match its '
+                         'prior launch basis.')
+    cleanup_target = capsule.cleanup_target
+    _validate_prior_launch_cleanup_target_binding_v1(prior_launch_basis,
+                                                     cleanup_target)
+    cleanup_hash = cleanup_target.sha256
+    if capsule.cleanup_target_sha256 != cleanup_hash:
+        raise ValueError('down policy projector cleanup target hashes do not '
+                         'match the complete input.')
+    cleanup_target.validate_requested_target(requested_target)
+    kubernetes = requested_target.kubernetes
+    assert kubernetes is not None
+    if (kubernetes.scope.canonical_bytes != capsule.scope.canonical_bytes or
+            capsule.config_projection.workspace != workspace or
+            capsule.config_projection.target_namespace != kubernetes.namespace):
+        raise ValueError('down policy projector target, workspace, and capsule '
+                         'scope do not match.')
+    return ProviderDownPolicySubjectV1(
+        version=1,
+        requested_target=requested_target,
+        workspace=workspace,
+        prior_launch_basis_sha256=prior_launch_basis.sha256,
+        cleanup_target_sha256=cleanup_hash,
+        execution_capsule_sha256=capsule.sha256,
+        admin_policy_mode='absent_controller_and_executor',
+        managed_secrets_mode='absent',
+        purge=False,
+        graceful=False,
+        graceful_timeout=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesDownExecutionConfigV1(_CanonicalContract):
+    """Down capsule and policy proofs bound into one immutable graph."""
+
+    version: int
+    capsule: ProviderKubernetesDownExecutionCapsuleV1
+    execution_capsule_sha256: str
+    policy_subject: ProviderDownPolicySubjectV1
+    policy_subject_sha256: str
+    controller: ProviderPolicyBoundaryProofV1
+    executor: ProviderPolicyBoundaryProofV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'capsule', 'execution_capsule_sha256', 'policy_subject',
+        'policy_subject_sha256', 'policy'
+    })
+    _POLICY_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'controller', 'executor'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='down execution config version')
+        for field, expected_type in (
+            ('capsule', ProviderKubernetesDownExecutionCapsuleV1),
+            ('policy_subject', ProviderDownPolicySubjectV1),
+            ('controller', ProviderPolicyBoundaryProofV1),
+            ('executor', ProviderPolicyBoundaryProofV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'down execution config {field} has an invalid '
+                                'type.')
+        capsule_hash = _sha256(
+            self.execution_capsule_sha256,
+            name='down execution config execution_capsule_sha256')
+        if capsule_hash != self.capsule.sha256:
+            raise ValueError('down execution config capsule hash does not '
+                             'match its complete preimage.')
+        subject_hash = _sha256(
+            self.policy_subject_sha256,
+            name='down execution config policy_subject_sha256')
+        if subject_hash != self.policy_subject.sha256:
+            raise ValueError('down execution config policy subject hash does '
+                             'not match its complete preimage.')
+        subject = self.policy_subject
+        if (subject.execution_capsule_sha256 != capsule_hash or
+                subject.cleanup_target_sha256
+                != self.capsule.cleanup_target_sha256 or
+                subject.workspace != self.capsule.config_projection.workspace):
+            raise ValueError('down execution config policy subject is not '
+                             'bound to its capsule.')
+        self.capsule.cleanup_target.validate_requested_target(
+            subject.requested_target)
+        if self.controller.boundary != 'serve_controller_prepare':
+            raise ValueError('down execution config controller proof is in '
+                             'the wrong boundary slot.')
+        if self.executor.boundary != 'api_executor_pre_io':
+            raise ValueError('down execution config executor proof is in the '
+                             'wrong boundary slot.')
+        for field, proof in (('controller', self.controller), ('executor',
+                                                               self.executor)):
+            if proof.config_projection_sha256 != (
+                    self.capsule.config_projection_sha256):
+                raise ValueError(f'down execution config {field} proof config '
+                                 'projection hash does not match.')
+            if proof.policy_subject_sha256 != subject_hash:
+                raise ValueError(f'down execution config {field} proof policy '
+                                 'subject hash does not match.')
+            if (proof.projection_before_sha256 != subject_hash or
+                    proof.projection_after_sha256 != subject_hash):
+                raise ValueError(f'down execution config {field} proof '
+                                 'projection hashes do not match.')
+        object.__setattr__(self, 'execution_capsule_sha256', capsule_hash)
+        object.__setattr__(self, 'policy_subject_sha256', subject_hash)
+        _ = self.canonical_bytes
+
+    def validate_outer_projection(
+        self,
+        requested_target: ProviderLocatorV1,
+        workspace: str,
+        prior_launch_basis: PriorLaunchBasisV1,
+    ) -> None:
+        projected = project_provider_down_policy_subject_v1(
+            requested_target, workspace, prior_launch_basis, self.capsule)
+        if projected.canonical_bytes != self.policy_subject.canonical_bytes:
+            raise ValueError('down execution config policy subject is not '
+                             'byte-equal to its outer projection.')
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ProviderKubernetesDownExecutionConfigV1':
+        _bounded_canonical_json_bytes(value,
+                                      name='Kubernetes down execution config',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes down execution config',
+                                     keys=cls._KEYS)
+        policy = _closed_object_shallow(raw['policy'],
+                                        name='down execution config policy',
+                                        keys=cls._POLICY_KEYS)
+        return cls(version=raw['version'],
+                   capsule=ProviderKubernetesDownExecutionCapsuleV1.from_value(
+                       raw['capsule']),
+                   execution_capsule_sha256=raw['execution_capsule_sha256'],
+                   policy_subject=ProviderDownPolicySubjectV1.from_value(
+                       raw['policy_subject']),
+                   policy_subject_sha256=raw['policy_subject_sha256'],
+                   controller=ProviderPolicyBoundaryProofV1.from_value(
+                       policy['controller']),
+                   executor=ProviderPolicyBoundaryProofV1.from_value(
+                       policy['executor']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'capsule': self.capsule.canonical_value(),
+            'execution_capsule_sha256': self.execution_capsule_sha256,
+            'policy_subject': self.policy_subject.canonical_value(),
+            'policy_subject_sha256': self.policy_subject_sha256,
+            'policy': {
+                'controller': self.controller.canonical_value(),
+                'executor': self.executor.canonical_value(),
+            },
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderLaunchInvocationV1(_CanonicalContract):
     """Redacted provider-effective launch invocation."""
 
@@ -9600,13 +10720,16 @@ class ProviderDownInvocationV1(_CanonicalContract):
     cluster_name: str
     expected_cluster_record_uuid: uuid.UUID
     workspace: str
+    prior_launch_basis: PriorLaunchBasisV1
+    execution_config: ProviderKubernetesDownExecutionConfigV1
     purge: bool
     graceful: bool
     graceful_timeout: None
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
-        'cluster_name', 'expected_cluster_record_uuid', 'workspace', 'purge',
-        'graceful', 'graceful_timeout'
+        'cluster_name', 'expected_cluster_record_uuid', 'workspace',
+        'prior_launch_basis', 'execution_config', 'purge', 'graceful',
+        'graceful_timeout'
     })
 
     def __post_init__(self) -> None:
@@ -9621,21 +10744,41 @@ class ProviderDownInvocationV1(_CanonicalContract):
                   name='down.expected_cluster_record_uuid'))
         object.__setattr__(self, 'workspace',
                            _text(self.workspace, name='down.workspace'))
+        if type(self.prior_launch_basis) not in (CompletedLaunchBasisV1,
+                                                 PartialLaunchCleanupBasisV1):
+            raise TypeError('down prior_launch_basis has an invalid type.')
+        if type(self.execution_config) is not (
+                ProviderKubernetesDownExecutionConfigV1):
+            raise TypeError('down execution_config has an invalid type.')
         for name, value in (('purge', self.purge), ('graceful', self.graceful)):
             _boolean(value, name=f'down.{name}')
             if value:
                 raise ValueError(f'down {name} must be false.')
         if self.graceful_timeout is not None:
             raise ValueError('down graceful_timeout must be null.')
+        self.validate_outer_projection(
+            self.prior_launch_basis.launch_requested_target)
+        _ = self.canonical_bytes
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderDownInvocationV1':
-        raw = _closed_object(value, name='down invocation', keys=cls._KEYS)
+        _bounded_canonical_json_bytes(value,
+                                      name='down invocation',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='down invocation',
+                                     keys=cls._KEYS)
         return cls(cluster_name=raw['cluster_name'],
                    expected_cluster_record_uuid=_uuid(
                        raw['expected_cluster_record_uuid'],
                        name='down.expected_cluster_record_uuid'),
                    workspace=raw['workspace'],
+                   prior_launch_basis=prior_launch_basis_from_value_v1(
+                       raw['prior_launch_basis']),
+                   execution_config=(
+                       ProviderKubernetesDownExecutionConfigV1.from_value(
+                           raw['execution_config'])),
                    purge=raw['purge'],
                    graceful=raw['graceful'],
                    graceful_timeout=raw['graceful_timeout'])
@@ -9646,10 +10789,38 @@ class ProviderDownInvocationV1(_CanonicalContract):
             'expected_cluster_record_uuid': str(
                 self.expected_cluster_record_uuid),
             'workspace': self.workspace,
+            'prior_launch_basis': self.prior_launch_basis.canonical_value(),
+            'execution_config': self.execution_config.canonical_value(),
             'purge': False,
             'graceful': False,
             'graceful_timeout': None,
         }
+
+    def validate_outer_projection(self,
+                                  requested_target: ProviderLocatorV1) -> None:
+        """Require exact equality to target, basis, capsule, and policy."""
+
+        if type(requested_target) is not ProviderLocatorV1:
+            raise TypeError('down outer requested target has an invalid type.')
+        basis = self.prior_launch_basis
+        cleanup_target = self.execution_config.capsule.cleanup_target
+        if requested_target.canonical_bytes != (
+                basis.launch_requested_target.canonical_bytes):
+            raise ValueError('down requested target is not byte-equal to its '
+                             'prior launch basis.')
+        if (self.cluster_name != requested_target.sky_cluster_name or
+                self.cluster_name != cleanup_target.cluster_name or
+                self.expected_cluster_record_uuid
+                != requested_target.sky_cluster_record_uuid or
+                self.expected_cluster_record_uuid
+                != cleanup_target.cluster_record_uuid):
+            raise ValueError('down cluster identity does not match target and '
+                             'cleanup evidence.')
+        if self.workspace != basis.launch_workspace_identity.workspace:
+            raise ValueError('down workspace does not match its prior launch '
+                             'basis.')
+        self.execution_config.validate_outer_projection(requested_target,
+                                                        self.workspace, basis)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9725,6 +10896,20 @@ class ProviderLifecycleInvocationV1(_CanonicalContract):
                     != self.requested_target.sky_cluster_record_uuid):
                 raise ValueError('down invocation does not match the requested '
                                  'target.')
+            self.down.validate_outer_projection(self.requested_target)
+            prior_identity = self.down.prior_launch_basis.launch_resource_identity
+            stable_identity_fields = ('service_hash', 'service_incarnation',
+                                      'replica_id', 'replica_incarnation')
+            if any(
+                    getattr(self.resource_identity, field) != getattr(
+                        prior_identity, field)
+                    for field in stable_identity_fields):
+                raise ValueError('down invocation resource identity does not '
+                                 'match its prior launch identity.')
+            if self.resource_identity.desired_generation != (
+                    prior_identity.desired_generation + 1):
+                raise ValueError('down invocation generation must immediately '
+                                 'follow its prior launch generation.')
         _ = self.canonical_bytes
 
     @classmethod
@@ -9802,6 +10987,86 @@ class ProviderLifecycleInvocationV1(_CanonicalContract):
                 self.down is None):
             raise ValueError('provider lifecycle invocation is not down.')
         return self.down
+
+    @property
+    def executor_cohort(self) -> ProviderAuthorityWorkerCohortV1:
+        """Return the sole complete executor cohort frozen in the capsule."""
+
+        if self.action_kind is kernel_actions.ActionKind.LAUNCH:
+            return self.require_launch(
+            ).execution_config.capsule.executor_cohort
+        return self.require_down().execution_config.capsule.executor_cohort
+
+    def validate_prepared_worker_cohort_reference_v1(
+        self,
+        service_name: str,
+        controller_owner_fence: str,
+        lifecycle_epoch: int,
+        reference: WorkerCohortReferenceInputV1,
+        locked_cohort: ProviderAuthorityWorkerCohortV1,
+    ) -> None:
+        """Bind a PREPARING reference to this exact immutable invocation.
+
+        The locked cohort is authoritative only as an equality fence: no field
+        may be populated from it.  Launch reconstructs the entire reference
+        from its post-auth canonicalization context, including the preparation
+        capability commitment.  Down has no identity-canonicalization call, so
+        its capability commitment remains reference-owned while every other
+        field is reconstructed from the invocation and locked service fences.
+        """
+
+        service_name = _text(service_name,
+                             name='prepared reference service_name',
+                             maximum_bytes=_MAX_SERVICE_NAME_BYTES)
+        controller_owner_fence = _text(
+            controller_owner_fence,
+            name='prepared reference controller_owner_fence')
+        lifecycle_epoch = _positive_integer(
+            lifecycle_epoch, name='prepared reference lifecycle_epoch')
+        if type(reference) is not WorkerCohortReferenceInputV1:
+            raise TypeError('prepared worker cohort reference has an invalid '
+                            'type.')
+        if type(locked_cohort) is not ProviderAuthorityWorkerCohortV1:
+            raise TypeError('locked worker cohort has an invalid type.')
+
+        embedded_cohort = self.executor_cohort
+        if (embedded_cohort.canonical_bytes != locked_cohort.canonical_bytes or
+                embedded_cohort.cohort_id != reference.cohort_id):
+            raise ValueError('prepared reference executor cohort does not '
+                             'match the locked cohort canonical bytes and ID.')
+        identity = self.resource_identity
+        if self.action_kind is kernel_actions.ActionKind.LAUNCH:
+            context = (
+                self.require_launch().source.identity_canonicalization.context)
+            if (context.input.service_name != service_name or
+                    context.input.resource_identity.canonical_bytes
+                    != identity.canonical_bytes or
+                    context.decision_id != self.action_id or
+                    context.cohort_id != embedded_cohort.cohort_id or
+                    context.controller_owner_fence != controller_owner_fence or
+                    context.lifecycle_epoch != lifecycle_epoch):
+                raise ValueError('launch preparation context does not match '
+                                 'the invocation, cohort, or locked service '
+                                 'fences.')
+            capability_sha256 = context.preparation_capability_sha256
+        else:
+            capability_sha256 = reference.preparation_capability_sha256
+
+        expected = WorkerCohortReferenceInputV1(
+            version=1,
+            decision_id=self.action_id,
+            cohort_id=embedded_cohort.cohort_id,
+            service_hash=identity.service_hash,
+            replica_incarnation=identity.replica_incarnation,
+            desired_generation=identity.desired_generation,
+            action_type=self.action_kind,
+            controller_owner_fence=controller_owner_fence,
+            lifecycle_epoch=lifecycle_epoch,
+            preparation_capability_sha256=capability_sha256)
+        if expected.canonical_bytes != reference.canonical_bytes:
+            raise ValueError('prepared reference does not match every '
+                             'decision/resource/service/replica/generation/'
+                             'action/owner/lifecycle field.')
 
     def as_launch(self) -> 'ProviderLaunchLifecycleInvocationV1':
         """Return a statically refined launch view with identical bytes."""
@@ -9883,6 +11148,235 @@ class ProviderDownLifecycleInvocationV1(ProviderLifecycleInvocationV1):
 
 
 @dataclasses.dataclass(frozen=True)
+class ServeLegacyDownRequestV1(_CanonicalContract):
+    """Exact legacy SDK arguments retained by a launch-cleanup child."""
+
+    cluster_name: str
+    expected_cluster_record_uuid: uuid.UUID
+    workspace: str
+    purge: bool
+    graceful: bool
+    graceful_timeout: None
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'cluster_name', 'expected_cluster_record_uuid', 'workspace', 'purge',
+        'graceful', 'graceful_timeout'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'cluster_name',
+            _text(self.cluster_name,
+                  name='legacy cleanup down.cluster_name',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(
+            self, 'expected_cluster_record_uuid',
+            _uuid(self.expected_cluster_record_uuid,
+                  name='legacy cleanup down.expected_cluster_record_uuid'))
+        object.__setattr__(
+            self, 'workspace',
+            _text(self.workspace, name='legacy cleanup down.workspace'))
+        for field in ('purge', 'graceful'):
+            if _boolean(getattr(self, field),
+                        name=f'legacy cleanup down.{field}'):
+                raise ValueError(f'legacy cleanup down {field} must be false.')
+        if self.graceful_timeout is not None:
+            raise ValueError('legacy cleanup down graceful_timeout must be '
+                             'null.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> 'ServeLegacyDownRequestV1':
+        raw = _closed_object(value,
+                             name='legacy cleanup down request',
+                             keys=cls._KEYS)
+        return cls(cluster_name=raw['cluster_name'],
+                   expected_cluster_record_uuid=_uuid(
+                       raw['expected_cluster_record_uuid'],
+                       name=('legacy cleanup down.'
+                             'expected_cluster_record_uuid')),
+                   workspace=raw['workspace'],
+                   purge=raw['purge'],
+                   graceful=raw['graceful'],
+                   graceful_timeout=raw['graceful_timeout'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'cluster_name': self.cluster_name,
+            'expected_cluster_record_uuid': str(
+                self.expected_cluster_record_uuid),
+            'workspace': self.workspace,
+            'purge': False,
+            'graceful': False,
+            'graceful_timeout': None,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ServeLegacyLaunchCleanupDownInvocationV1(_CanonicalContract):
+    """Child-only fingerprint for the legacy cleanup between launch retries."""
+
+    version: int
+    contract: str
+    request_role: ShadowRequestRole
+    effect_kind: kernel_actions.ActionKind
+    profile: ProviderProfile
+    redaction_profile: str
+    parent_launch_action_id: uuid.UUID
+    parent_launch_request_payload_sha256: str
+    resource_identity: ProviderResourceIdentityV1
+    requested_target: ProviderLocatorV1
+    legacy_down_request: ServeLegacyDownRequestV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'contract', 'request_role', 'effect_kind', 'profile',
+        'redaction_profile', 'parent_launch_action_id',
+        'parent_launch_request_payload_sha256', 'resource_identity',
+        'requested_target', 'legacy_down_request'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='legacy launch cleanup invocation version')
+        if self.contract != 'serve_legacy_launch_cleanup_down_v1':
+            raise ValueError('legacy launch cleanup invocation contract is '
+                             'unsupported.')
+        request_role = _enum_value(
+            ShadowRequestRole,
+            self.request_role,
+            name='legacy launch cleanup invocation.request_role')
+        object.__setattr__(self, 'request_role', request_role)
+        if request_role is not ShadowRequestRole.LAUNCH_CLEANUP_DOWN:
+            raise ValueError('legacy launch cleanup invocation requires the '
+                             'cleanup request role.')
+        try:
+            effect_kind = _action_kind(
+                self.effect_kind,
+                name='legacy launch cleanup invocation.effect_kind')
+        except (TypeError, ValueError) as e:
+            raise ValueError('legacy launch cleanup invocation effect kind is '
+                             'unsupported.') from e
+        object.__setattr__(self, 'effect_kind', effect_kind)
+        if effect_kind is not kernel_actions.ActionKind.DOWN:
+            raise ValueError('legacy launch cleanup invocation effect kind '
+                             'must be down.')
+        profile = _enum_value(ProviderProfile,
+                              self.profile,
+                              name='legacy launch cleanup invocation.profile')
+        object.__setattr__(self, 'profile', profile)
+        if profile is not ProviderProfile.POD_CLUSTER_V1:
+            raise ValueError('legacy launch cleanup invocation profile is '
+                             'unsupported.')
+        if self.redaction_profile != 'provider_lifecycle_redaction_v1':
+            raise ValueError('legacy launch cleanup invocation redaction '
+                             'profile is unsupported.')
+        object.__setattr__(
+            self, 'parent_launch_action_id',
+            _uuid(self.parent_launch_action_id,
+                  name=('legacy launch cleanup invocation.'
+                        'parent_launch_action_id')))
+        object.__setattr__(
+            self, 'parent_launch_request_payload_sha256',
+            _sha256(self.parent_launch_request_payload_sha256,
+                    name=('legacy launch cleanup invocation.'
+                          'parent_launch_request_payload_sha256')))
+        if type(self.resource_identity) is not ProviderResourceIdentityV1:
+            raise TypeError('legacy launch cleanup resource identity has an '
+                            'invalid type.')
+        if type(self.requested_target) is not ProviderLocatorV1:
+            raise TypeError('legacy launch cleanup requested target has an '
+                            'invalid type.')
+        if type(self.legacy_down_request) is not ServeLegacyDownRequestV1:
+            raise TypeError('legacy launch cleanup down request has an '
+                            'invalid type.')
+        expected_action_id = self.resource_identity.action_identity(
+            kernel_actions.ActionKind.LAUNCH).action_id
+        if self.parent_launch_action_id != expected_action_id:
+            raise ValueError('legacy launch cleanup parent action ID does not '
+                             'match its resource identity.')
+        if self.requested_target.profile is not profile:
+            raise ValueError('legacy launch cleanup target profile differs.')
+        kubernetes = self.requested_target.kubernetes
+        if (kubernetes is not None and kubernetes.replica_incarnation_label
+                != str(self.resource_identity.replica_incarnation)):
+            raise ValueError('legacy launch cleanup target does not match its '
+                             'replica incarnation.')
+        request = self.legacy_down_request
+        if (request.cluster_name != self.requested_target.sky_cluster_name or
+                request.expected_cluster_record_uuid
+                != self.requested_target.sky_cluster_record_uuid):
+            raise ValueError('legacy launch cleanup down request does not '
+                             'match its frozen target.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> 'ServeLegacyLaunchCleanupDownInvocationV1':
+        raw = _closed_object(value,
+                             name='legacy launch cleanup invocation',
+                             keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   contract=raw['contract'],
+                   request_role=_enum_value(
+                       ShadowRequestRole,
+                       raw['request_role'],
+                       name='legacy launch cleanup invocation.request_role'),
+                   effect_kind=_action_kind(
+                       raw['effect_kind'],
+                       name='legacy launch cleanup invocation.effect_kind'),
+                   profile=_enum_value(
+                       ProviderProfile,
+                       raw['profile'],
+                       name='legacy launch cleanup invocation.profile'),
+                   redaction_profile=raw['redaction_profile'],
+                   parent_launch_action_id=_uuid(
+                       raw['parent_launch_action_id'],
+                       name=('legacy launch cleanup invocation.'
+                             'parent_launch_action_id')),
+                   parent_launch_request_payload_sha256=raw[
+                       'parent_launch_request_payload_sha256'],
+                   resource_identity=ProviderResourceIdentityV1.from_value(
+                       raw['resource_identity']),
+                   requested_target=ProviderLocatorV1.from_value(
+                       raw['requested_target']),
+                   legacy_down_request=ServeLegacyDownRequestV1.from_value(
+                       raw['legacy_down_request']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'contract': 'serve_legacy_launch_cleanup_down_v1',
+            'request_role': ShadowRequestRole.LAUNCH_CLEANUP_DOWN.value,
+            'effect_kind': kernel_actions.ActionKind.DOWN.value,
+            'profile': ProviderProfile.POD_CLUSTER_V1.value,
+            'redaction_profile': 'provider_lifecycle_redaction_v1',
+            'parent_launch_action_id': str(self.parent_launch_action_id),
+            'parent_launch_request_payload_sha256':
+                self.parent_launch_request_payload_sha256,
+            'resource_identity': self.resource_identity.canonical_value(),
+            'requested_target': self.requested_target.canonical_value(),
+            'legacy_down_request': self.legacy_down_request.canonical_value(),
+        }
+
+
+ServeShadowAttemptInvocationV1 = (ProviderLifecycleInvocationV1 |
+                                  ServeLegacyLaunchCleanupDownInvocationV1)
+
+
+def serve_shadow_attempt_invocation_from_value_v1(
+        value: Any,
+        request_role: ShadowRequestRole) -> ServeShadowAttemptInvocationV1:
+    """Decode the exact child union member selected by its persisted role."""
+
+    role = _enum_value(ShadowRequestRole,
+                       request_role,
+                       name='shadow attempt request role')
+    if role is ShadowRequestRole.LAUNCH_CLEANUP_DOWN:
+        return ServeLegacyLaunchCleanupDownInvocationV1.from_value(value)
+    return ProviderLifecycleInvocationV1.from_value(value)
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderLifecyclePlanV1(_CanonicalContract):
     """Frozen provider plan and content commitments for one action."""
 
@@ -9894,7 +11388,8 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
     resources_snapshot_sha256: str
     workspace_identity_sha256: str
     requested_target: ProviderLocatorV1
-    prior_resolved_target: ResolvedProviderTargetV1 | None
+    prior_launch_basis_sha256: str | None
+    prior_cleanup_target_sha256: str | None
     request_payload_sha256: str
     redaction_profile: str
 
@@ -9902,7 +11397,8 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
         'version', 'profile', 'action_kind', 'resource_identity',
         'placement_decision_sha256', 'resources_snapshot_sha256',
         'workspace_identity_sha256', 'requested_target',
-        'prior_resolved_target', 'request_payload_sha256', 'redaction_profile'
+        'prior_launch_basis_sha256', 'prior_cleanup_target_sha256',
+        'request_payload_sha256', 'redaction_profile'
     })
 
     def __post_init__(self) -> None:
@@ -9933,14 +11429,20 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
                 != str(self.resource_identity.replica_incarnation)):
             raise ValueError('Kubernetes replica label does not match plan '
                              'resource identity.')
-        if self.prior_resolved_target is not None:
-            if type(self.prior_resolved_target) is not ResolvedProviderTargetV1:
-                raise TypeError('plan prior resolved target has invalid type.')
-            self.prior_resolved_target.validate_requested_target(
-                self.requested_target)
-        if (action_kind is kernel_actions.ActionKind.LAUNCH and
-                self.prior_resolved_target is not None):
-            raise ValueError('launch plan prior_resolved_target must be null.')
+        for field in ('prior_launch_basis_sha256',
+                      'prior_cleanup_target_sha256'):
+            value = getattr(self, field)
+            if value is not None:
+                object.__setattr__(self, field,
+                                   _sha256(value, name=f'plan.{field}'))
+        if action_kind is kernel_actions.ActionKind.LAUNCH:
+            if (self.prior_launch_basis_sha256 is not None or
+                    self.prior_cleanup_target_sha256 is not None):
+                raise ValueError('launch plan prior hashes must be null.')
+        else:
+            if (self.prior_launch_basis_sha256 is None or
+                    self.prior_cleanup_target_sha256 is None):
+                raise ValueError('down plan prior hashes must be nonnull.')
         if self.redaction_profile != 'provider_lifecycle_redaction_v1':
             raise ValueError('provider plan redaction profile is unsupported.')
         _ = self.canonical_bytes
@@ -9951,26 +11453,25 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
                                          name='provider lifecycle plan',
                                          keys=cls._KEYS,
                                          action_kind_name='plan.action_kind')
-        prior = (None if raw['prior_resolved_target'] is None else
-                 ResolvedProviderTargetV1.from_value(
-                     raw['prior_resolved_target']))
-        return cls(version=raw['version'],
-                   profile=_enum_value(ProviderProfile,
-                                       raw['profile'],
-                                       name='plan.profile'),
-                   action_kind=_enum_value(kernel_actions.ActionKind,
-                                           raw['action_kind'],
-                                           name='plan.action_kind'),
-                   resource_identity=ProviderResourceIdentityV1.from_value(
-                       raw['resource_identity']),
-                   placement_decision_sha256=raw['placement_decision_sha256'],
-                   resources_snapshot_sha256=raw['resources_snapshot_sha256'],
-                   workspace_identity_sha256=raw['workspace_identity_sha256'],
-                   requested_target=ProviderLocatorV1.from_value(
-                       raw['requested_target']),
-                   prior_resolved_target=prior,
-                   request_payload_sha256=raw['request_payload_sha256'],
-                   redaction_profile=raw['redaction_profile'])
+        return cls(
+            version=raw['version'],
+            profile=_enum_value(ProviderProfile,
+                                raw['profile'],
+                                name='plan.profile'),
+            action_kind=_enum_value(kernel_actions.ActionKind,
+                                    raw['action_kind'],
+                                    name='plan.action_kind'),
+            resource_identity=ProviderResourceIdentityV1.from_value(
+                raw['resource_identity']),
+            placement_decision_sha256=raw['placement_decision_sha256'],
+            resources_snapshot_sha256=raw['resources_snapshot_sha256'],
+            workspace_identity_sha256=raw['workspace_identity_sha256'],
+            requested_target=ProviderLocatorV1.from_value(
+                raw['requested_target']),
+            prior_launch_basis_sha256=raw['prior_launch_basis_sha256'],
+            prior_cleanup_target_sha256=raw['prior_cleanup_target_sha256'],
+            request_payload_sha256=raw['request_payload_sha256'],
+            redaction_profile=raw['redaction_profile'])
 
     def canonical_value(self) -> JsonObject:
         return {
@@ -9982,9 +11483,8 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
             'resources_snapshot_sha256': self.resources_snapshot_sha256,
             'workspace_identity_sha256': self.workspace_identity_sha256,
             'requested_target': self.requested_target.canonical_value(),
-            'prior_resolved_target':
-                (None if self.prior_resolved_target is None else
-                 self.prior_resolved_target.canonical_value()),
+            'prior_launch_basis_sha256': self.prior_launch_basis_sha256,
+            'prior_cleanup_target_sha256': self.prior_cleanup_target_sha256,
             'request_payload_sha256': self.request_payload_sha256,
             'redaction_profile': self.redaction_profile,
         }
@@ -10008,6 +11508,39 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
         if (invocation.launch is not None and self.resources_snapshot_sha256
                 != invocation.launch.resources.sha256):
             raise ValueError('resource snapshot hash does not match launch.')
+        if invocation.down is not None:
+            basis = invocation.down.prior_launch_basis
+            cleanup = invocation.down.execution_config.capsule.cleanup_target
+            if self.prior_launch_basis_sha256 != basis.sha256:
+                raise ValueError('down plan prior launch basis hash does not '
+                                 'match the invocation preimage.')
+            if self.prior_cleanup_target_sha256 != cleanup.sha256:
+                raise ValueError('down plan cleanup target hash does not match '
+                                 'the invocation capsule preimage.')
+            _validate_prior_launch_cleanup_target_binding_v1(basis, cleanup)
+            if basis.launch_requested_target.canonical_bytes != (
+                    self.requested_target.canonical_bytes):
+                raise ValueError('down plan requested target is not byte-equal '
+                                 'to its prior launch basis.')
+            stable_identity_fields = ('service_hash', 'service_incarnation',
+                                      'replica_id', 'replica_incarnation')
+            if any(
+                    getattr(self.resource_identity, field) != getattr(
+                        basis.launch_resource_identity, field)
+                    for field in stable_identity_fields):
+                raise ValueError('down plan resource identity does not match '
+                                 'its prior launch identity.')
+            if self.resource_identity.desired_generation != (
+                    basis.launch_resource_identity.desired_generation + 1):
+                raise ValueError('down plan generation must immediately follow '
+                                 'its prior launch generation.')
+            if self.resources_snapshot_sha256 != basis.launch_resources.sha256:
+                raise ValueError('down plan resources hash does not match its '
+                                 'prior launch resources.')
+            if self.workspace_identity_sha256 != (
+                    basis.launch_workspace_identity.sha256):
+                raise ValueError('down plan workspace hash does not match its '
+                                 'prior launch workspace identity.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -10065,7 +11598,7 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
                              'immutable spec provider plan.')
 
     def launch_cleanup_down_invocation(
-            self) -> ProviderDownLifecycleInvocationV1:
+            self) -> ServeLegacyLaunchCleanupDownInvocationV1:
         """Derive the sole non-primary invocation allowed by this wrapper."""
 
         if self.invocation.action_kind is not kernel_actions.ActionKind.LAUNCH:
@@ -10074,15 +11607,18 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
         if launch is None:
             raise ValueError('cleanup down requires a launch invocation.')
         target = self.invocation.requested_target
-        return ProviderDownLifecycleInvocationV1(
+        return ServeLegacyLaunchCleanupDownInvocationV1(
             version=1,
+            contract='serve_legacy_launch_cleanup_down_v1',
+            request_role=ShadowRequestRole.LAUNCH_CLEANUP_DOWN,
+            effect_kind=kernel_actions.ActionKind.DOWN,
             profile=self.invocation.profile,
             redaction_profile=self.invocation.redaction_profile,
-            action_kind=kernel_actions.ActionKind.DOWN,
+            parent_launch_action_id=self.action_id,
+            parent_launch_request_payload_sha256=self.invocation.sha256,
             resource_identity=self.invocation.resource_identity,
             requested_target=target,
-            launch=None,
-            down=ProviderDownInvocationV1(
+            legacy_down_request=ServeLegacyDownRequestV1(
                 cluster_name=target.sky_cluster_name,
                 expected_cluster_record_uuid=target.sky_cluster_record_uuid,
                 workspace=launch.source.content.workspace,
@@ -10092,17 +11628,22 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
 
     def validate_shadow_child_invocation(
             self, role: ShadowRequestRole,
-            invocation: ProviderLifecycleInvocationV1) -> None:
+            invocation: ServeShadowAttemptInvocationV1) -> None:
         """Require the exact primary invocation or derived cleanup exception."""
 
-        if not isinstance(role, ShadowRequestRole):
+        if type(role) is not ShadowRequestRole:
             raise TypeError('shadow request role has an invalid type.')
-        if not isinstance(invocation, ProviderLifecycleInvocationV1):
-            raise TypeError('child invocation has an invalid type.')
-        expected: ProviderLifecycleInvocationV1
         if role is ShadowRequestRole.LAUNCH_CLEANUP_DOWN:
-            expected = self.launch_cleanup_down_invocation()
+            if type(invocation) is not (
+                    ServeLegacyLaunchCleanupDownInvocationV1):
+                raise TypeError('cleanup child invocation has an invalid '
+                                'type.')
+            expected: ServeShadowAttemptInvocationV1 = (
+                self.launch_cleanup_down_invocation())
         else:
+            if not isinstance(invocation, ProviderLifecycleInvocationV1):
+                raise TypeError('primary child invocation has an invalid '
+                                'type.')
             expected_role = (ShadowRequestRole.PRIMARY_LAUNCH
                              if self.invocation.action_kind
                              is kernel_actions.ActionKind.LAUNCH else
@@ -10523,7 +12064,7 @@ class ServeReplicaActionOutcomeV1(_CanonicalContract):
         }
 
     def validate_for_invocation(
-            self, invocation: ProviderLifecycleInvocationV1) -> None:
+            self, invocation: ServeShadowAttemptInvocationV1) -> None:
         """Require action-specific evidence before accepting this outcome.
 
         Provider submission acknowledgement is not proof that a resource
@@ -10534,7 +12075,9 @@ class ServeReplicaActionOutcomeV1(_CanonicalContract):
         must still belong to the invocation's frozen target.
         """
 
-        if not isinstance(invocation, ProviderLifecycleInvocationV1):
+        if (not isinstance(invocation, ProviderLifecycleInvocationV1) and
+                type(invocation)
+                is not ServeLegacyLaunchCleanupDownInvocationV1):
             raise TypeError('invocation has an invalid type.')
         if self.observation is not None:
             self.observation.validate_target(invocation.requested_target)
@@ -10546,7 +12089,10 @@ class ServeReplicaActionOutcomeV1(_CanonicalContract):
         observation = self.observation
         if observation is None:
             raise ValueError('succeeded outcome requires an observation.')
-        if invocation.action_kind is kernel_actions.ActionKind.LAUNCH:
+        action_kind = (invocation.action_kind if isinstance(
+            invocation, ProviderLifecycleInvocationV1) else
+                       invocation.effect_kind)
+        if action_kind is kernel_actions.ActionKind.LAUNCH:
             if observation.state is not ProviderObservationState.PRESENT:
                 raise ValueError('succeeded launch requires a PRESENT '
                                  'observation.')

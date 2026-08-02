@@ -11,18 +11,18 @@ import pytest
 from sky.serve import resource_actions as actions
 from sky.utils import common_utils
 from tests.unit_tests import test_serve_resource_action_capsule_leaves as leaves
-from tests.unit_tests import (test_serve_resource_action_execution_foundation as
-                              foundation)
-from tests.unit_tests import (test_serve_resource_action_kubernetes_scope as
-                              scope_fixtures)
-from tests.unit_tests import (test_serve_resource_action_launch_identity as
-                              identity_fixtures)
-from tests.unit_tests import (test_serve_resource_action_provider_plan as
-                              plan_fixtures)
-from tests.unit_tests import (test_serve_resource_action_provider_values as
-                              value_fixtures)
-from tests.unit_tests import (test_serve_resource_action_runtime_endpoint as
-                              runtime_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_execution_foundation as foundation)
+from tests.unit_tests import (
+    test_serve_resource_action_kubernetes_scope as scope_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_launch_identity as identity_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_provider_plan as plan_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_provider_values as value_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_runtime_endpoint as runtime_fixtures)
 
 _CLUSTER_UUID = '33333333-3333-4333-8333-333333333333'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'

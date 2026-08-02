@@ -1,4 +1,5 @@
 """Pure contract tests for durable SkyServe resource actions."""
+# pylint: disable=protected-access
 
 import copy
 import dataclasses
@@ -9,8 +10,10 @@ import pytest
 from sky.serve import resource_action_state
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
-from tests.unit_tests import (test_serve_resource_action_launch_execution_config
-                              as launch_config_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_down_execution_config as down_config_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_launch_execution_config as launch_config_fixtures)
 
 _SERVICE_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
@@ -101,23 +104,8 @@ def _launch_invocation(generation: int = 1,
 
 
 def _down_invocation() -> dict:
-    return {
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'redaction_profile': 'provider_lifecycle_redaction_v1',
-        'action_kind': 'down',
-        'resource_identity': _identity(2),
-        'requested_target': _target(),
-        'launch': None,
-        'down': {
-            'cluster_name': 'svc-7',
-            'expected_cluster_record_uuid': _CLUSTER_UUID,
-            'workspace': 'boltz-test',
-            'purge': False,
-            'graceful': False,
-            'graceful_timeout': None,
-        },
-    }
+    return copy.deepcopy(
+        down_config_fixtures.down_invocation_payload(generation=2))
 
 
 def _launch_plan() -> dict:
@@ -133,40 +121,21 @@ def _launch_plan() -> dict:
         'resources_snapshot_sha256': invocation.launch.resources.sha256,
         'workspace_identity_sha256': 'f' * 64,
         'requested_target': _target(),
-        'prior_resolved_target': None,
+        'prior_launch_basis_sha256': None,
+        'prior_cleanup_target_sha256': None,
         'request_payload_sha256': invocation.sha256,
         'redaction_profile': 'provider_lifecycle_redaction_v1',
     }
 
 
 def _resolved_target() -> dict:
-    target = actions.ProviderLocatorV1.from_value(_target())
-    return {
-        'version': 1,
-        'requested_target_sha256': target.sha256,
-        'provider_resource_id': 'pod/svc-7',
-        'workload_uid': 'uid-7',
-        'provider_operation_id': None,
-        'resolved_at': '2026-08-01T01:02:03.000004Z',
-    }
+    raw = down_config_fixtures._progress_resolved_target()
+    raw['resolved_at'] = '2026-08-01T01:02:03.000004Z'
+    return raw
 
 
 def _down_plan() -> dict:
-    invocation = actions.ProviderLifecycleInvocationV1.from_value(
-        _down_invocation())
-    return {
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'action_kind': 'down',
-        'resource_identity': _identity(2),
-        'placement_decision_sha256': 'e' * 64,
-        'resources_snapshot_sha256': '1' * 64,
-        'workspace_identity_sha256': 'f' * 64,
-        'requested_target': _target(),
-        'prior_resolved_target': _resolved_target(),
-        'request_payload_sha256': invocation.sha256,
-        'redaction_profile': 'provider_lifecycle_redaction_v1',
-    }
+    return copy.deepcopy(down_config_fixtures.down_plan_payload(generation=2))
 
 
 def _launch_spec() -> dict:
@@ -199,17 +168,18 @@ def _shadow_projection() -> dict:
 
 def _observation() -> dict:
     target = actions.ProviderLocatorV1.from_value(_target())
+    resolved = _resolved_target()
     return {
         'version': 1,
         'target_sha256': target.sha256,
         'state': 'present',
         'certainty': 'authoritative',
         'observed_provider_operation_id': None,
-        'observed_provider_resource_id': 'pod/svc-7',
+        'observed_provider_resource_id': resolved['provider_resource_id'],
         'observed_cluster_record_uuid': _CLUSTER_UUID,
-        'observed_workload_uid': 'uid-7',
+        'observed_workload_uid': resolved['workload_uid'],
         'observed_replica_incarnation_label': _REPLICA_UUID,
-        'resolved_target': _resolved_target(),
+        'resolved_target': resolved,
         'ready': True,
         'evidence_sha256': '4' * 64,
         'observed_at': '2026-08-01T01:02:04.000005Z',
@@ -271,9 +241,9 @@ def test_down_invocation_literal_golden_bytes_hash_and_action_id() -> None:
         _down_invocation())
     assert invocation.canonical_bytes == actions.canonical_json_bytes(
         invocation.canonical_value())
-    assert len(invocation.canonical_bytes) == 3_505
+    assert len(invocation.canonical_bytes) == 38_423
     assert invocation.sha256 == (
-        '5d097b7c913ac745c70dc3d90d816cae6832a18353fa1e74b01764be34959f53')
+        '8f3c55acd0f199b88acefbead76e6e2e4219fdb80fce484221c6f80a1f901929')
     assert invocation.action_id == uuid.UUID(
         '324a4cdd-4640-57ae-aea8-b3f65851f735')
 
@@ -368,9 +338,9 @@ def test_locator_and_plan_literal_golden_bytes_and_hashes() -> None:
     plan = actions.ProviderLifecyclePlanV1.from_value(_launch_plan())
     assert plan.canonical_bytes == actions.canonical_json_bytes(
         plan.canonical_value())
-    assert len(plan.canonical_bytes) == 3_717
+    assert len(plan.canonical_bytes) == 3_756
     assert plan.sha256 == (
-        '829d7678d96b7b1184a755af884fcc54f719109c465108fba097ef0d67652e9f')
+        'd80e71dbe94a2409b8b1c1fe2445e9022537bc96516ac727b37d48d0b4459000')
 
 
 def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
@@ -379,18 +349,17 @@ def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
                        b',"provider_plan":' +
                        launch.provider_plan.canonical_bytes + b',"version":1}')
     assert launch.canonical_bytes == expected_launch
+    assert len(launch.canonical_bytes) == 53_621
     assert launch.sha256 == (
-        '3482c254dbc873dd03f5dce48d168a1ed41eb3c516f864e295061036e4071f64')
+        '97d3bf9736498dae488bb7503f8f6d1ddd8445382716b278dbd59e21eb6afa4c')
     assert launch.action_id == uuid.UUID('a1fa64dd-eea2-59db-b7b6-733d8001a086')
+    assert len(launch.canonical_bytes) <= 60_000
 
     down = actions.ServeReplicaActionSpecV1.from_value(_down_spec())
-    expected_down = (b'{"invocation":' + down.invocation.canonical_bytes +
-                     b',"provider_plan":' + down.provider_plan.canonical_bytes +
-                     b',"version":1}')
-    assert down.canonical_bytes == expected_down
-    assert down.sha256 == (
-        '0f1c2c78034749571f1826154a6aa6b68743b0d5e436014caab13a6fe549d6ba')
-    assert down.action_id == uuid.UUID('324a4cdd-4640-57ae-aea8-b3f65851f735')
+    assert (len(down.canonical_bytes), down.sha256) == (
+        42_345,
+        '3a3e01c448377b43f20defc3e2f683e4c02aebebb496ae4485eaf3b39cc950f9')
+    assert len(down.canonical_bytes) <= 60_000
 
 
 @pytest.mark.parametrize('mutate,match', [
@@ -541,20 +510,14 @@ def test_persisted_plan_rejects_nested_contract_subclasses() -> None:
         dataclasses.replace(plan, requested_target=evil_locator)
 
     down_plan = actions.ProviderLifecyclePlanV1.from_value(_down_plan())
-    resolved_target = down_plan.prior_resolved_target
-    assert resolved_target is not None
-
-    class EvilResolvedTarget(actions.ResolvedProviderTargetV1):
-        pass
-
-    evil_resolved_target = EvilResolvedTarget(
-        **{
-            field.name: getattr(resolved_target, field.name)
-            for field in dataclasses.fields(resolved_target)
-        })
-    with pytest.raises(TypeError, match='prior resolved target'):
+    with pytest.raises(ValueError, match='prior_launch_basis_sha256'):
         dataclasses.replace(down_plan,
-                            prior_resolved_target=evil_resolved_target)
+                            prior_launch_basis_sha256=_EqualitySpoofingString(
+                                '0' * 64))
+    with pytest.raises(ValueError, match='prior_cleanup_target_sha256'):
+        dataclasses.replace(down_plan,
+                            prior_cleanup_target_sha256=_EqualitySpoofingString(
+                                '0' * 64))
 
 
 def test_action_spec_primary_invocation_is_an_exact_byte_copy() -> None:
@@ -579,61 +542,49 @@ def test_action_spec_cleanup_down_is_the_only_child_invocation_exception(
 ) -> None:
     spec = actions.ServeReplicaActionSpecV1.from_value(_launch_spec())
     cleanup = spec.launch_cleanup_down_invocation()
-    assert cleanup.action_kind.value == 'down'
+    assert cleanup.effect_kind.value == 'down'
+    assert cleanup.request_role is actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN
+    assert cleanup.parent_launch_action_id == spec.action_id
+    assert cleanup.parent_launch_request_payload_sha256 == spec.invocation.sha256
     assert cleanup.resource_identity == spec.invocation.resource_identity
     assert cleanup.requested_target == spec.invocation.requested_target
-    assert cleanup.down is not None
-    assert cleanup.down.workspace == 'boltz-test'
+    assert cleanup.legacy_down_request.workspace == 'boltz-test'
     assert cleanup.sha256 == (
-        'b7afe613a077dc97ba8685722d836b378280b8aa5a552cd18244e35b11495579')
+        'a84fd1151b110d6b4dbb45b2905f2435d6fdb10d234f0a2683e86e5ea88a4f9e')
     spec.validate_shadow_child_invocation(
         actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, cleanup)
 
     changed_value = cleanup.canonical_value()
-    changed_value['down']['workspace'] = 'another-workspace'
-    changed = actions.ProviderLifecycleInvocationV1.from_value(changed_value)
+    changed_value['legacy_down_request']['workspace'] = 'another-workspace'
+    changed = actions.ServeLegacyLaunchCleanupDownInvocationV1.from_value(
+        changed_value)
     with pytest.raises(ValueError, match='not byte-equal'):
         spec.validate_shadow_child_invocation(
             actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, changed)
 
-    changed_identity_value = cleanup.canonical_value()
-    changed_identity_value['resource_identity']['desired_generation'] = 2
-    changed_identity = actions.ProviderLifecycleInvocationV1.from_value(
-        changed_identity_value)
+    changed_parent_hash = cleanup.canonical_value()
+    changed_parent_hash['parent_launch_request_payload_sha256'] = '0' * 64
+    changed_identity = (actions.ServeLegacyLaunchCleanupDownInvocationV1.
+                        from_value(changed_parent_hash))
     with pytest.raises(ValueError, match='not byte-equal'):
         spec.validate_shadow_child_invocation(
             actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, changed_identity)
 
-    down_spec = actions.ServeReplicaActionSpecV1.from_value(_down_spec())
-    with pytest.raises(ValueError, match='requires a launch action spec'):
-        down_spec.launch_cleanup_down_invocation()
-    with pytest.raises(ValueError, match='requires a launch action spec'):
-        down_spec.validate_shadow_child_invocation(
-            actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, down_spec.invocation)
+    forbidden = cleanup.canonical_value()
+    forbidden['prior_launch_basis'] = None
+    with pytest.raises(ValueError, match='unknown or missing'):
+        actions.ServeLegacyLaunchCleanupDownInvocationV1.from_value(forbidden)
 
 
-def test_action_spec_enforces_combined_65536_byte_bound() -> None:
+def test_action_spec_completed_down_stays_below_rollout_and_parser_bounds(
+) -> None:
     value = _down_spec()
-    context_identity = [f'{index:03d}-' + 'x' * 996 for index in range(30)]
-    for member in ('provider_plan', 'invocation'):
-        kubernetes = value[member]['requested_target']['kubernetes']
-        kubernetes['scope']['context_identity'] = context_identity
-        kubernetes['cluster_fingerprint_sha256'] = (
-            actions.ProviderKubernetesScopeV1.from_value(
-                kubernetes['scope']).sha256)
-    target = actions.ProviderLocatorV1.from_value(
-        value['invocation']['requested_target'])
-    value['provider_plan']['prior_resolved_target'][
-        'requested_target_sha256'] = target.sha256
-    invocation = actions.ProviderLifecycleInvocationV1.from_value(
-        value['invocation'])
-    value['provider_plan']['request_payload_sha256'] = invocation.sha256
-    plan = actions.ProviderLifecyclePlanV1.from_value(value['provider_plan'])
-    assert len(invocation.canonical_bytes) < 65_536
-    assert len(plan.canonical_bytes) < 65_536
-    assert len(actions.canonical_json_bytes(value)) > 65_536
-    with pytest.raises(ValueError, match='exceeds 65536'):
-        actions.ServeReplicaActionSpecV1.from_value(value)
+    spec = actions.ServeReplicaActionSpecV1.from_value(value)
+
+    assert spec.canonical_bytes == actions.canonical_json_bytes(value)
+    assert len(spec.canonical_bytes) == 42_345
+    assert len(spec.canonical_bytes) <= 60_000
+    assert len(spec.canonical_bytes) <= 65_536
 
 
 @pytest.mark.parametrize('mutate,match', [
@@ -645,8 +596,6 @@ def test_action_spec_enforces_combined_65536_byte_bound() -> None:
         {'API_TOKEN': 'secret'}), 'unknown or missing'),
     (lambda value: value['launch']['resources'].update({'kubeconfig': 'secret'}
                                                       ), 'unknown or missing'),
-    (lambda value: value.update({'down': _down_invocation()['down']}),
-     'requires only launch'),
     (lambda value: value['resource_identity'].update(
         {'service_incarnation': _CLUSTER_UUID}), 'service_hash'),
     (lambda value: value['requested_target']['kubernetes'].update(

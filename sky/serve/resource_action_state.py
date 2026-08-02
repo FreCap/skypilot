@@ -61,7 +61,8 @@ def _profile_is_authoritative(
         if (launch is None or launch.file_mounts_blob_id is not None or
                 launch.tls_material_ref is not None):
             return False
-    elif plan.prior_resolved_target is None:
+    elif (plan.prior_launch_basis_sha256 is None or
+          plan.prior_cleanup_target_sha256 is None):
         return False
     # TODO(fcapponi): Return true only after Global028 propagation and the
     # label-qualified Kubernetes write/read/delete fixtures pass end to end.
@@ -174,7 +175,7 @@ class ShadowAttemptRecord:
     planned_execution_kind: actions.PlannedExecutionKind
     phase: actions.ShadowAttemptPhase
     legacy_request_id: str | None
-    invocation: actions.ProviderLifecycleInvocationV1
+    invocation: actions.ServeShadowAttemptInvocationV1
     provider_operation_id: str | None
     actual_outcome: actions.ServeReplicaActionOutcomeV1 | None
     proposed_outcome: actions.ServeReplicaActionOutcomeV1 | None
@@ -832,7 +833,7 @@ def _sample_record(row: Mapping[str, Any]) -> ShadowSampleRecord:
 
 def _validate_invocation(
         sample: ShadowSampleRecord, role: actions.ShadowRequestRole,
-        invocation: actions.ProviderLifecycleInvocationV1) -> None:
+        invocation: actions.ServeShadowAttemptInvocationV1) -> None:
     sample.immutable_spec.validate_shadow_child_invocation(role, invocation)
 
 
@@ -861,8 +862,8 @@ def _attempt_record(row: Mapping[str, Any],
                                                   name='provider_operation_id',
                                                   maximum_bytes=1024)
         invocation_value = _json_object(row['invocation'], name='invocation')
-        invocation = actions.ProviderLifecycleInvocationV1.from_value(
-            invocation_value)
+        invocation = actions.serve_shadow_attempt_invocation_from_value_v1(
+            invocation_value, role)
         _hash_matches(invocation_value,
                       row['invocation_sha256'],
                       name='invocation')
@@ -2485,22 +2486,165 @@ class PostgresServeResourceActionStateStore:
             raise kernel_actions.ClaimLost(
                 'Preparation reference lifecycle fence no longer matches.')
 
+    def _validate_linked_shadow_admission_before_mutation(
+        self,
+        session: orm.Session,
+        new_sample: NewShadowSample,
+        prepared_reference: actions.WorkerCohortReferenceInputV1,
+        service_row: Mapping[str, Any],
+    ) -> bool:
+        """Lock and validate the complete linked graph without mutating it.
+
+        Returns true only for exact lost-commit replay at the pre-submit
+        boundary.  The lock order within this helper is cohort -> reference ->
+        coverage -> parent; callers acquire service and any replica row first.
+        """
+
+        if type(prepared_reference) is not (
+                actions.WorkerCohortReferenceInputV1):
+            raise TypeError('prepared_reference has an invalid type.')
+        invocation = new_sample.immutable_spec.invocation
+        embedded_cohort = invocation.executor_cohort
+        if embedded_cohort.cohort_id != prepared_reference.cohort_id:
+            raise kernel_actions.ActionConflict(
+                'Prepared reference cohort ID differs from the immutable '
+                'execution capsule.')
+        cohort_row = self._locked_worker_cohort(session,
+                                                prepared_reference.cohort_id)
+        if cohort_row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown worker cohort {prepared_reference.cohort_id!r}.')
+        cohort = _worker_cohort_record(cohort_row)
+        if cohort.lifecycle_state not in (
+                actions.WorkerCohortLifecycleState.ACCEPTING,
+                actions.WorkerCohortLifecycleState.DRAINING):
+            raise kernel_actions.ClaimLost(
+                'Prepared work cannot bind to this cohort lifecycle state.')
+        reference_row = self._locked_worker_cohort_reference(
+            session, prepared_reference.decision_id)
+        if reference_row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown cohort reference {prepared_reference.decision_id}.')
+        current = _worker_cohort_reference_record(reference_row)
+
+        controller_pid = service_row['controller_pid']
+        controller_ip = service_row['controller_ip']
+        if controller_pid is None or controller_ip is None:
+            raise kernel_actions.ClaimLost(
+                'Linked shadow admission requires a nonnull controller owner.')
+        controller_owner_fence = f'{controller_pid}:{controller_ip}'
+        try:
+            invocation.validate_prepared_worker_cohort_reference_v1(
+                new_sample.service_name, controller_owner_fence,
+                service_row['lifecycle_epoch'], prepared_reference,
+                cohort.cohort_identity)
+        except (TypeError, ValueError) as e:
+            raise kernel_actions.ActionConflict(
+                f'Prepared reference does not bind the immutable invocation: '
+                f'{e}') from e
+        if (current.reference.canonical_bytes
+                != prepared_reference.canonical_bytes):
+            raise kernel_actions.ClaimLost(
+                'Preparation reference immutable bytes changed.')
+
+        coverage_row = self._locked_shadow_coverage(session,
+                                                    new_sample.action_id)
+        coverage_attempt_rows = session.execute(
+            sqlalchemy.select(state_schema.SHADOW_COVERAGE_ATTEMPTS).where(
+                state_schema.SHADOW_COVERAGE_ATTEMPTS.c.decision_id ==
+                new_sample.action_id).order_by(
+                    state_schema.SHADOW_COVERAGE_ATTEMPTS.c.request_sequence).
+            with_for_update()).mappings().all()
+        parent_row = self._locked_sample(session, new_sample.action_id)
+        child_rows = session.execute(
+            sqlalchemy.select(state_schema.SHADOW_ATTEMPTS).where(
+                state_schema.SHADOW_ATTEMPTS.c.would_be_action_id ==
+                new_sample.action_id).order_by(
+                    state_schema.SHADOW_ATTEMPTS.c.request_sequence).
+            with_for_update()).mappings().all()
+        graph_exists = (coverage_row is not None, parent_row is not None)
+        if (current.reference_state
+                is actions.WorkerCohortReferenceState.PREPARING and
+                current.revision == 1):
+            if (graph_exists != (False, False) or coverage_attempt_rows or
+                    child_rows):
+                raise kernel_actions.ActionConflict(
+                    'Preparing reference has a partial or preexisting shadow '
+                    'graph; admission cannot repair it.')
+            return False
+        if (current.reference_state
+                is not actions.WorkerCohortReferenceState.SHADOW_ACTIVE or
+                current.revision != 2):
+            raise kernel_actions.StaleRevision(
+                'Preparation reference is not PREPARING revision one or the '
+                'exact SHADOW_ACTIVE replay revision.')
+        if (graph_exists != (True, True) or coverage_attempt_rows or
+                child_rows):
+            raise kernel_actions.ActionConflict(
+                'Active preparation reference lacks the complete pre-submit '
+                'shadow graph for exact replay.')
+
+        assert coverage_row is not None and parent_row is not None
+        coverage = _shadow_coverage_record(coverage_row)
+        identity = new_sample.provider_plan.resource_identity
+        if (coverage.service_name != new_sample.service_name or
+                coverage.service_hash != identity.service_hash or
+                coverage.service_incarnation != identity.service_incarnation or
+                coverage.replica_id != identity.replica_id or
+                coverage.replica_incarnation != identity.replica_incarnation or
+                coverage.desired_generation != identity.desired_generation or
+                coverage.action_type is not new_sample.provider_plan.action_kind
+                or coverage.normalization_outcome
+                is not actions.NormalizationOutcome.REPRESENTABLE or
+                coverage.not_representable_reason is not None or
+                coverage.worker_cohort_ref_id != new_sample.action_id):
+            raise kernel_actions.ActionConflict(
+                'Active preparation coverage differs from the immutable '
+                'represented decision.')
+        parent = _sample_record(parent_row)
+        if (parent.phase is not actions.ShadowParentPhase.PENDING or
+                parent.revision != 1 or
+                parent.service_name != new_sample.service_name or
+                parent.immutable_spec.canonical_bytes
+                != new_sample.immutable_spec.canonical_bytes or
+                parent.immutable_spec_sha256 != new_sample.immutable_spec_sha256
+                or parent.provider_plan.canonical_bytes
+                != new_sample.provider_plan.canonical_bytes or
+                parent.provider_plan_sha256 != new_sample.provider_plan_sha256
+                or parent.profile_eligibility
+                is not new_sample.profile_eligibility):
+            raise kernel_actions.ActionConflict(
+                'Active preparation parent differs or has advanced beyond '
+                'the exact pre-submit replay boundary.')
+        return True
+
     def _admit_after_service_lock_in_session(
         self,
         session: orm.Session,
         new_sample: NewShadowSample,
+        service_row: Mapping[str, Any],
         prepared_reference: actions.WorkerCohortReferenceInputV1 | None = None,
+        linked_replay: bool | None = None,
     ) -> ShadowSampleRecord:
         """Insert/adopt a represented decision after service/replica locks.
 
         A prepared reference binds under the canonical cohort -> reference ->
-        coverage -> parent order.  ``None`` intentionally retains the
-        incomplete-foundation path used by legacy tests; promotion treats that
-        unlinked coverage as a blocker.
+        coverage -> parent order. ``linked_replay`` is the result of the
+        mutation-free locked validation performed by the public admission
+        primitive after its service/replica locks.
         """
         if prepared_reference is not None and not isinstance(
                 prepared_reference, actions.WorkerCohortReferenceInputV1):
             raise TypeError('prepared_reference has an invalid type.')
+        if prepared_reference is None:
+            if linked_replay is not None:
+                raise ValueError('unlinked admission cannot carry linked '
+                                 'replay state.')
+        elif linked_replay is None:
+            linked_replay = self._validate_linked_shadow_admission_before_mutation(
+                session, new_sample, prepared_reference, service_row)
+        elif type(linked_replay) is not bool:
+            raise TypeError('linked_replay must be an exact boolean.')
         plan = new_sample.provider_plan
         identity = plan.resource_identity
         coverage_identity = actions.CoverageDecisionIdentityV1(
@@ -2516,57 +2660,14 @@ class PostgresServeResourceActionStateStore:
                 'Represented sample and coverage identities differ.')
         reference_id = None
         if prepared_reference is not None:
-            if (prepared_reference.decision_id != new_sample.action_id or
-                    prepared_reference.service_hash != identity.service_hash or
-                    prepared_reference.replica_incarnation
-                    != identity.replica_incarnation or
-                    prepared_reference.desired_generation
-                    != identity.desired_generation or
-                    prepared_reference.action_type is not plan.action_kind):
-                raise ValueError('Prepared worker cohort reference does not '
-                                 'match the represented sample.')
             binding = self.bind_worker_cohort_reference_in_session(
                 session, prepared_reference, 1,
                 actions.WorkerCohortReferenceState.SHADOW_ACTIVE)
             reference_id = prepared_reference.decision_id
-            existing_coverage = self._locked_shadow_coverage(
-                session, new_sample.action_id)
-            existing_coverage_attempts = session.execute(
-                sqlalchemy.select(state_schema.SHADOW_COVERAGE_ATTEMPTS).where(
-                    state_schema.SHADOW_COVERAGE_ATTEMPTS.c.decision_id ==
-                    new_sample.action_id).order_by(
-                        state_schema.SHADOW_COVERAGE_ATTEMPTS.c.request_sequence
-                    ).with_for_update()).mappings().all()
-            existing_parent = session.execute(
-                sqlalchemy.select(state_schema.SHADOW_SAMPLES).where(
-                    state_schema.SHADOW_SAMPLES.c.would_be_action_id ==
-                    new_sample.action_id).with_for_update()).mappings().first()
-            existing_children = session.execute(
-                sqlalchemy.select(state_schema.SHADOW_ATTEMPTS).where(
-                    state_schema.SHADOW_ATTEMPTS.c.would_be_action_id ==
-                    new_sample.action_id).order_by(
-                        state_schema.SHADOW_ATTEMPTS.c.request_sequence).
-                with_for_update()).mappings().all()
-            graph_exists = (existing_coverage is not None, existing_parent
-                            is not None)
-            if binding.adopted and graph_exists != (True, True):
+            if binding.adopted is not linked_replay:
                 raise kernel_actions.ActionConflict(
-                    'Active preparation reference lacks a complete represented '
-                    'shadow graph for exact replay.')
-            if binding.adopted:
-                assert existing_parent is not None
-                replay_parent = _sample_record(existing_parent)
-                if (replay_parent.phase is not actions.ShadowParentPhase.PENDING
-                        or replay_parent.revision != 1 or
-                        existing_coverage_attempts or existing_children):
-                    raise kernel_actions.ActionConflict(
-                        'Represented shadow graph has advanced beyond the exact '
-                        'pre-submit replay boundary.')
-            elif (graph_exists != (False, False) or
-                  existing_coverage_attempts or existing_children):
-                raise kernel_actions.ActionConflict(
-                    'Preparing reference has preexisting represented shadow '
-                    'state; admission cannot repair a partial graph.')
+                    'Preparation reference changed after linked admission '
+                    'validation.')
         database_now = session.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
         coverage = self._insert_or_adopt_shadow_coverage_in_session(
@@ -2639,7 +2740,8 @@ class PostgresServeResourceActionStateStore:
                 record.immutable_spec.canonical_bytes
                 != new_sample.immutable_spec.canonical_bytes or
                 record.immutable_spec_sha256 != new_sample.immutable_spec_sha256
-                or record.provider_plan != new_sample.provider_plan or
+                or record.provider_plan.canonical_bytes
+                != new_sample.provider_plan.canonical_bytes or
                 record.provider_plan_sha256 != new_sample.provider_plan_sha256
                 or record.profile_eligibility
                 is not new_sample.profile_eligibility):
@@ -2671,11 +2773,6 @@ class PostgresServeResourceActionStateStore:
         if prepared_reference is not None and not isinstance(
                 prepared_reference, actions.WorkerCohortReferenceInputV1):
             raise TypeError('prepared_reference has an invalid type.')
-        if prepared_reference is not None:
-            raise kernel_actions.ActionConflict(
-                'Linked represented admission requires the immutable '
-                'invocation execution_config.capsule.executor_cohort; the '
-                'current flattened spec cannot commit that cohort.')
         plan = new_sample.provider_plan
         identity = plan.resource_identity
         if (plan.action_kind is not kernel_actions.ActionKind.LAUNCH or
@@ -2707,9 +2804,6 @@ class PostgresServeResourceActionStateStore:
         if bool(service_row['pool']):
             raise kernel_actions.ClaimLost(
                 'Resource-action launch admission excludes pool services.')
-        if prepared_reference is not None:
-            self._validate_prepared_reference_service_fence(
-                prepared_reference, service_row)
         table = serve_state_schema.replicas_table
         row = session.execute(
             sqlalchemy.select(table).where(
@@ -2728,18 +2822,27 @@ class PostgresServeResourceActionStateStore:
             'launch_shadow_sample_id': new_sample.action_id,
             'down_shadow_sample_id': None,
         }
+        if row is not None and (row['cluster_name'] != values['cluster_name'] or
+                                any(row[name] != value
+                                    for name, value in action_values.items())):
+            raise kernel_actions.ActionConflict(
+                'Replica row already has a different or name-only action '
+                'identity.')
+        linked_replay = None
+        if prepared_reference is not None:
+            self._validate_prepared_reference_service_fence(
+                prepared_reference, service_row)
+            linked_replay = self._validate_linked_shadow_admission_before_mutation(
+                session, new_sample, prepared_reference, service_row)
         if row is None:
             session.execute(
                 postgresql.insert(table).values(**values, **action_values))
-        else:
-            if (row['cluster_name'] != values['cluster_name'] or
-                    any(row[name] != value
-                        for name, value in action_values.items())):
-                raise kernel_actions.ActionConflict(
-                    'Replica row already has a different or name-only action '
-                    'identity.')
         return self._admit_after_service_lock_in_session(
-            session, new_sample, prepared_reference)
+            session,
+            new_sample,
+            service_row,
+            prepared_reference,
+            linked_replay=linked_replay)
 
     def admit_in_session(
         self,
@@ -2757,19 +2860,21 @@ class PostgresServeResourceActionStateStore:
         if prepared_reference is not None and not isinstance(
                 prepared_reference, actions.WorkerCohortReferenceInputV1):
             raise TypeError('prepared_reference has an invalid type.')
-        if prepared_reference is not None:
-            raise kernel_actions.ActionConflict(
-                'Linked represented admission requires the immutable '
-                'invocation execution_config.capsule.executor_cohort; the '
-                'current flattened spec cannot commit that cohort.')
         service_row = self._locked_shadow_service(session, new_sample,
                                                   expected_controller_owner,
                                                   expected_lifecycle_epoch)
+        linked_replay = None
         if prepared_reference is not None:
             self._validate_prepared_reference_service_fence(
                 prepared_reference, service_row)
+            linked_replay = self._validate_linked_shadow_admission_before_mutation(
+                session, new_sample, prepared_reference, service_row)
         return self._admit_after_service_lock_in_session(
-            session, new_sample, prepared_reference)
+            session,
+            new_sample,
+            service_row,
+            prepared_reference,
+            linked_replay=linked_replay)
 
     def admit(
         self,
@@ -2822,7 +2927,7 @@ class PostgresServeResourceActionStateStore:
         logical_attempt: int,
         request_role: actions.ShadowRequestRole,
         planned_execution_kind: actions.PlannedExecutionKind,
-        invocation: actions.ProviderLifecycleInvocationV1,
+        invocation: actions.ServeShadowAttemptInvocationV1,
     ) -> PreparedShadowAttempt:
         """Commit the next PRE_SUBMIT child before entering an SDK call."""
         self._require_session(session)
@@ -2837,7 +2942,9 @@ class PostgresServeResourceActionStateStore:
         execution = (planned_execution_kind if isinstance(
             planned_execution_kind, actions.PlannedExecutionKind) else
                      actions.PlannedExecutionKind(planned_execution_kind))
-        if not isinstance(invocation, actions.ProviderLifecycleInvocationV1):
+        if (not isinstance(invocation, actions.ProviderLifecycleInvocationV1)
+                and type(invocation)
+                is not actions.ServeLegacyLaunchCleanupDownInvocationV1):
             raise TypeError('invocation has an invalid type.')
         parent_row = self._locked_sample(session, parsed)
         if parent_row is None:
@@ -2857,7 +2964,8 @@ class PostgresServeResourceActionStateStore:
                     existing.logical_attempt != logical or
                     existing.request_role is not role or
                     existing.planned_execution_kind is not execution or
-                    existing.invocation != invocation):
+                    existing.invocation.canonical_bytes
+                    != invocation.canonical_bytes):
                 raise kernel_actions.StaleRevision(
                     'Prepared shadow attempt replay does not match the '
                     'committed sequence/revision.')
@@ -2998,7 +3106,7 @@ class PostgresServeResourceActionStateStore:
         logical_attempt: int,
         request_role: actions.ShadowRequestRole,
         planned_execution_kind: actions.PlannedExecutionKind,
-        invocation: actions.ProviderLifecycleInvocationV1,
+        invocation: actions.ServeShadowAttemptInvocationV1,
     ) -> PreparedShadowAttempt:
         with orm.Session(self._database()) as session, session.begin():
             return self.prepare_attempt_in_session(

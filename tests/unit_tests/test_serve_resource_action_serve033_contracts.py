@@ -9,8 +9,10 @@ import pytest
 
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
-from tests.unit_tests import (test_serve_resource_action_launch_execution_config
-                              as launch_config_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_down_execution_config as down_config_fixtures)
+from tests.unit_tests import (
+    test_serve_resource_action_launch_execution_config as launch_config_fixtures)
 
 _SERVICE_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
@@ -267,23 +269,7 @@ def _launch_invocation() -> dict:
 
 
 def _down_invocation() -> dict:
-    return {
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'redaction_profile': 'provider_lifecycle_redaction_v1',
-        'action_kind': 'down',
-        'resource_identity': _identity(2),
-        'requested_target': _target(),
-        'launch': None,
-        'down': {
-            'cluster_name': 'svc-7',
-            'expected_cluster_record_uuid': _CLUSTER_UUID,
-            'workspace': 'workspace',
-            'purge': False,
-            'graceful': False,
-            'graceful_timeout': None,
-        },
-    }
+    return down_config_fixtures.down_invocation_payload(generation=2)
 
 
 def test_normalization_enums_are_closed_and_precedence_is_exact() -> None:
