@@ -12,6 +12,8 @@ import os
 import time
 from typing import Any, TYPE_CHECKING
 
+from sky.server.requests.serializers import encoders
+
 if TYPE_CHECKING:
     from sky.server import daemons as daemons_lib
     from sky.server.requests.requests import Request
@@ -269,8 +271,18 @@ class RequestBackend(abc.ABC):
             request.finished_at = time.time()
             if error is not None:
                 request.set_error(error)
-            if result is not None:
-                request.set_return_value(result)
+            should_encode_result = result is not None
+            if status == requests_lib.RequestStatus.SUCCEEDED:
+                should_encode_result = (should_encode_result or
+                                        encoders.requires_strict_return_value(
+                                            request.name))
+            if should_encode_result:
+                try:
+                    request.set_return_value(result)
+                except Exception as encoding_error:  # pylint: disable=broad-except
+                    request.status = requests_lib.RequestStatus.FAILED
+                    request.return_value = None
+                    request.set_error(encoding_error)
         return True
 
     async def set_request_finished_async(self,
@@ -291,8 +303,18 @@ class RequestBackend(abc.ABC):
             request.finished_at = time.time()
             if error is not None:
                 request.set_error(error)
-            if result is not None:
-                request.set_return_value(result)
+            should_encode_result = result is not None
+            if status == requests_lib.RequestStatus.SUCCEEDED:
+                should_encode_result = (should_encode_result or
+                                        encoders.requires_strict_return_value(
+                                            request.name))
+            if should_encode_result:
+                try:
+                    request.set_return_value(result)
+                except Exception as encoding_error:  # pylint: disable=broad-except
+                    request.status = requests_lib.RequestStatus.FAILED
+                    request.return_value = None
+                    request.set_error(encoding_error)
         return True
 
     def transition_request_terminal(self,

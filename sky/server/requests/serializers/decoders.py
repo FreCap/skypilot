@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from sky import jobs as managed_jobs
 from sky import models
+from sky.adaptors import common as adaptors_common
 from sky.catalog import common
 from sky.data import storage
 from sky.provision.kubernetes import utils as kubernetes_utils
@@ -17,6 +18,9 @@ from sky.utils import status_lib
 
 if typing.TYPE_CHECKING:
     from sky import backends
+
+resource_action_progress = adaptors_common.LazyImport(
+    'sky.serve.resource_action_progress')
 
 handlers: dict[str, Any] = {}
 
@@ -76,6 +80,13 @@ def get_decoder(name: str):
 def default_decode_handler(return_value: Any) -> Any:
     """The default handler."""
     return return_value
+
+
+@register_decoders('serve_resource_action_launch', 'serve_resource_action_down')
+def decode_serve_resource_action_return(return_value: Any) -> dict[str, Any]:
+    """Closed-validate a persisted private resource-action return."""
+    return resource_action_progress.ServeReplicaActionRequestReturnV1.from_value(
+        return_value).canonical_value()
 
 
 @register_decoders('status')

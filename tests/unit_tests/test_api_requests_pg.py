@@ -2187,6 +2187,46 @@ def test_terminal_event_commits_with_request_and_queue_exactly_once(
     assert queue_count == 0
 
 
+@pytest.mark.parametrize('result', [None, {}])
+def test_strict_return_encoder_failure_terminalizes_failed_in_postgres(
+        request_database, result):
+    engine, backend = request_database
+    registration = registry.resolve_handler('serve_resource_action_launch')
+    request = requests.Request(
+        request_id='strict-result-failure',
+        name='sky.serve_resource_action_launch',
+        entrypoint=registration.func,
+        request_body=payloads.RequestBody(),
+        status=requests.RequestStatus.RUNNING,
+        created_at=time.time(),
+        user_id='system',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+    )
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+
+    assert backend.transition_request_terminal(
+        request.request_id,
+        requests.RequestStatus.SUCCEEDED,
+        event_api_models.EventCause.HANDLER_SUCCEEDED.value,
+        result=result)
+
+    stored = backend.get_request(request.request_id)
+    assert stored is not None
+    assert stored.status is requests.RequestStatus.FAILED
+    assert stored.return_value is None
+    error = stored.get_error()
+    assert error is not None
+    assert error['type'] in ('TypeError', 'ValueError')
+    assert ('JSON object' in error['message'] or
+            'unknown or missing' in error['message'])
+    with engine.connect() as connection:
+        queue_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.QUEUE)).scalar_one()
+    assert queue_count == 0
+
+
 def test_event_insert_failure_rolls_back_terminal_transition_and_delivery(
         request_database, monkeypatch):
     engine, backend = request_database

@@ -7,6 +7,7 @@ import pytest
 
 from sky import core
 from sky.server.requests import payloads
+from sky.server.requests import registry
 from sky.server.requests import requests
 from sky.server.requests import resource_actions as actions
 
@@ -213,6 +214,38 @@ def test_request_input_validate_rejects_closed_preimage_mutations() -> None:
         except ValueError:
             continue
         pytest.fail(f'closed request input accepted mutation: {name}')
+
+
+def test_private_action_request_name_is_bound_to_strict_return_codec() -> None:
+    identity = _identity()
+    registration = registry.resolve_handler('serve_resource_action_launch')
+    request = requests.Request(
+        request_id=actions.request_id_for_attempt(identity.action_id, 1),
+        name='sky.serve_resource_action_launch',
+        entrypoint=registration.func,
+        request_body=payloads.RequestBody(),
+        status=requests.RequestStatus.PENDING,
+        created_at=0,
+        user_id='system',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+        producer_version='resource-action-test-v1',
+    )
+    request_input = actions.ActionRequestInput.from_request(
+        identity.action_id, 1, request)
+    request_input.validate()
+
+    request.name = 'serve.resource_action.launch'
+    with pytest.raises(ValueError, match='requires request name'):
+        actions.ActionRequestInput.from_request(identity.action_id, 1, request)
+
+    value = dict(request_input.value)
+    value['name'] = request.name
+    forged = dataclasses.replace(request_input,
+                                 value=value,
+                                 sha256=actions.canonical_sha256(value))
+    with pytest.raises(ValueError, match='requires request name'):
+        forged.validate()
 
 
 def test_action_reduction_shape_is_closed() -> None:

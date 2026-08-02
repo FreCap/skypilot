@@ -34,6 +34,7 @@ from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
+from sky.server.requests.serializers import encoders
 from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -1655,8 +1656,25 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             request.finished_at = time.time()
             if error is not None:
                 request.set_error(error)
-            if result is not None:
-                request.set_return_value(result)
+            should_encode_result = result is not None
+            if status == requests_lib.RequestStatus.SUCCEEDED:
+                should_encode_result = (should_encode_result or
+                                        encoders.requires_strict_return_value(
+                                            request.name))
+            if should_encode_result:
+                try:
+                    request.set_return_value(result)
+                except Exception as encoding_error:  # pylint: disable=broad-except
+                    logger.error(
+                        f'Failed to encode return value for request '
+                        f'{request_id} ({request.name}); marking the request '
+                        'failed.',
+                        exc_info=True)
+                    status = requests_lib.RequestStatus.FAILED
+                    cause = event_api_models.EventCause.HANDLER_FAILED.value
+                    request.status = status
+                    request.return_value = None
+                    request.set_error(encoding_error)
             values = _request_values_for_db(request)
             values.pop('request_id')
             transitioned = _terminalize_locked_request(

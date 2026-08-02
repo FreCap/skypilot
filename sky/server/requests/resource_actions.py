@@ -18,6 +18,7 @@ from typing import Any, Protocol, TYPE_CHECKING
 import unicodedata
 import uuid
 
+from sky.server import constants as server_constants
 from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 
@@ -344,6 +345,20 @@ def _deadline_text(value: float | None) -> str | None:
     return converted.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
 
+def _validate_request_name_for_handler(
+        registration: request_registry.HandlerRegistration,
+        request_name: str) -> None:
+    """Bind private authority handlers to their strict return-codec name."""
+    if registration.claim_scope is not (
+            request_registry.HandlerClaimScope.RESOURCE_ACTION_AUTHORITY):
+        return
+    expected_name = server_constants.REQUEST_NAME_PREFIX + registration.name
+    if request_name != expected_name:
+        raise ValueError(
+            f'Private handler {registration.name!r} requires request name '
+            f'{expected_name!r}.')
+
+
 @dataclasses.dataclass(frozen=True)
 class ActionRequestInput:
     """Canonical immutable input commitment for one API request attempt."""
@@ -402,6 +417,7 @@ class ActionRequestInput:
 
         registration = request_registry.registration_for_handler(
             request.entrypoint)
+        _validate_request_name_for_handler(registration, request.name)
         if registration.execution_class is not (
                 request_registry.ExecutionClass.NORMAL):
             raise ValueError('V1 action requests must use the normal executor.')
@@ -504,6 +520,7 @@ class ActionRequestInput:
             normalized['handler_name'])
         if registration.name != normalized['handler_name']:
             raise ValueError('request_input handler_name is not canonical.')
+        _validate_request_name_for_handler(registration, normalized['name'])
         if (registration.execution_class
                 is not request_registry.ExecutionClass.NORMAL or
                 normalized['execution_class']
