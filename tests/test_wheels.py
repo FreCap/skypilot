@@ -13,6 +13,12 @@ import pytest
 import sky
 from sky.backends import wheel_utils
 from sky.server import common
+from sky.setup_files import dependencies
+from sky.setup_files import worker_runtime_packaging
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_WORKER_RUNTIME_PROJECT = (_REPO_ROOT / 'addons' / 'submission-containment' /
+                           'python-runtime')
 
 
 def _load_setup_module():
@@ -23,6 +29,83 @@ def _load_setup_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_worker_runtime_dependency_remains_dormant():
+    """S0b1a0 must not make ordinary source installs resolve a new index."""
+    assert dependencies.COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION == '1.0.0'
+    assert all(worker_runtime_packaging.WORKER_RUNTIME_DISTRIBUTION not in
+               requirement.lower()
+               for requirement in dependencies.install_requires)
+
+
+def test_worker_runtime_wheel_is_deterministic_and_isolated(tmp_path):
+    first = worker_runtime_packaging.build_worker_runtime_wheel(
+        _REPO_ROOT, tmp_path / 'first')
+    second = worker_runtime_packaging.build_worker_runtime_wheel(
+        _REPO_ROOT, tmp_path / 'second')
+
+    assert first.read_bytes() == second.read_bytes()
+    version = dependencies.COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION
+    record = worker_runtime_packaging.verify_worker_runtime_wheel(
+        first, version)
+    assert record.filename == first.name
+
+    dist_info = f'skypilot_worker_runtime_v1-{version}.dist-info'
+    with zipfile.ZipFile(first) as wheel:
+        assert wheel.namelist() == [
+            'skypilot_worker_runtime/__init__.py',
+            f'{dist_info}/METADATA',
+            f'{dist_info}/WHEEL',
+            f'{dist_info}/RECORD',
+        ]
+        assert not any(name.startswith('sky/') for name in wheel.namelist())
+        assert f'{dist_info}/entry_points.txt' not in wheel.namelist()
+
+    probe = ('import sys; '
+             f'sys.path.insert(0, {str(first)!r}); '
+             'import skypilot_worker_runtime; '
+             'assert not any(name == "sky" or name.startswith("sky.") '
+             'for name in sys.modules)')
+    completed = subprocess.run([sys.executable, '-I', '-c', probe],
+                               capture_output=True,
+                               text=True,
+                               check=False)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_worker_runtime_pep517_backend_matches_direct_build(tmp_path):
+    direct = worker_runtime_packaging.build_worker_runtime_wheel(
+        _REPO_ROOT, tmp_path / 'direct')
+    pep517_dir = tmp_path / 'pep517'
+    completed = subprocess.run([
+        sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--wheel-dir',
+        str(pep517_dir),
+        str(_WORKER_RUNTIME_PROJECT)
+    ],
+                               capture_output=True,
+                               text=True,
+                               check=False)
+    assert completed.returncode == 0, completed.stderr
+    pep517 = next(pep517_dir.glob('*.whl'))
+    assert pep517.read_bytes() == direct.read_bytes()
+
+
+def test_worker_runtime_build_does_not_require_git(tmp_path):
+    copied_repo = tmp_path / 'source-without-git'
+    copied_project = (copied_repo / 'addons' / 'submission-containment' /
+                      'python-runtime')
+    copied_project.parent.mkdir(parents=True)
+    shutil.copytree(_WORKER_RUNTIME_PROJECT, copied_project)
+    copied_setup_files = copied_repo / 'sky' / 'setup_files'
+    copied_setup_files.mkdir(parents=True)
+    shutil.copy2(_REPO_ROOT / 'sky/setup_files/dependencies.py',
+                 copied_setup_files)
+
+    wheel = worker_runtime_packaging.build_worker_runtime_wheel(
+        copied_repo, tmp_path / 'wheel')
+    worker_runtime_packaging.verify_worker_runtime_wheel(
+        wheel, dependencies.COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION)
 
 
 @pytest.fixture
