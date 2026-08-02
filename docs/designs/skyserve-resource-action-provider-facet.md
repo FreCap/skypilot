@@ -11,8 +11,10 @@ prior-launch-basis parser/admission paths remain pending; the
 candidate-only normalization boundary and atomic durable coverage handshake are
 in progress; the closed Kubernetes transport/scope leaf is implemented and
 independently verified; topology/image/config-policy/principal/authorization
-foundation leaves are implemented and locally verified; full execution-config
-composition remains pending; bounded resource values and the generic
+foundation leaves are implemented and locally verified; the complete launch
+execution-config composition and exact outer launch invocation are implemented
+and independently verified, while the down composition remains pending;
+bounded resource values and the generic
 prerequisite/object-plan/renderer foundations, exact prerequisite role/kind map
 and role-dispatched prerequisite leaf, and launch-only endpoint
 projection/workload leaves are implemented and independently verified, while
@@ -27,8 +29,9 @@ contract leaves are implemented and independently verified; the launch-only
 server-effective identity wire contracts, shared resolver, no-enqueue endpoint,
 store validation, and bounded client are implemented and independently
 verified, while manager integration, contextual action-bound submit comparison,
-identity-to-source projector, down-current-identity absence, enclosing capsule
-and execution-config composition, and live preflight remain pending; shared
+down-current-identity absence, down capsule/config composition, and live
+preflight remain pending; the launch identity-to-source projector and enclosing
+capsule/config composition are implemented and independently verified; shared
 leaf-validator, named raw-field, and bounded canonical-JSON exact-type
 hardening is implemented and independently verified; runtime provider
 propagation, observation, and shadow instrumentation remain pending
@@ -4760,6 +4763,20 @@ full-value user-hash check and middleware boundary. This evidence does not
 claim manager-side capability generation/discard, source projection, admission
 binding, or any caller of the still-dark client.
 
+Further P1 launch execution-config verification evidence on 2026-08-02: the
+closed Kubernetes locator, content-addressed launch source and identity proof,
+request-identity projector, execution capsule, nonrecursive policy subject,
+complete launch execution config, and exact outer launch invocation are
+implemented. The composition requires byte-equal scope, topology, workload,
+source, policy, request body, resource, application-port, cohort, Skylet, and
+object-plan projections; reserves every control-plane/Skylet port; and rejects
+subtyped persisted wrappers, nested children, collection leaves, and crossed
+capsule/config graphs. A six-file focused matrix passes all 397 tests against
+PostgreSQL; targeted mypy is clean, pylint is 10.00/10, and independent
+adversarial review reproduced the persisted-wrapper regressions and accepted
+the tranche. This evidence does not claim down execution-config composition,
+provider I/O, preflight, admission, manager integration, or authority.
+
 First-deployment cutover evidence refreshed on 2026-08-02: read-only
 `boltz-test` inspection found API schema 004, upstream request-classification
 Serve 032, global-user-state 027, and no Serve resource-action tables. Helm
@@ -5281,10 +5298,11 @@ absence result through a public API.
   network preflight plus both launch LB Deployment-to-ServiceAccount projections
   on the selected Boltz canary path, and verify the down preflight performs zero
   LB Deployment GETs.
-- Implementation and contract verification of execution config and access
-  inventory, the two nonrecursive policy-subject projectors and their contextual
-  consumption, complete preflight seeds and controller/executor dual
-  policy-absence proof sequence,
+- Implementation and contract verification of the down execution config, its
+  nonrecursive policy-subject projector, and contextual consumption of both
+  launch and down policy subjects; the launch execution config, policy-subject
+  projector, and access inventory are complete. Complete preflight seeds and
+  the controller/executor dual policy-absence proof sequence,
   preparation/counted-slot gate,
   normalized spec/partial UID-qualified adoption/deletion, redacted invocation
   builder, private handler claim filter, and request-handler pre-I/O/

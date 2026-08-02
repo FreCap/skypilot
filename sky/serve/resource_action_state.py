@@ -83,10 +83,9 @@ class NewShadowSample:
             _bounded_text(self.service_name,
                           name='service_name',
                           maximum_bytes=256))
-        if not isinstance(self.immutable_spec,
-                          actions.ServeReplicaActionSpecV1):
+        if type(self.immutable_spec) is not actions.ServeReplicaActionSpecV1:
             raise TypeError('immutable_spec has an invalid type.')
-        if not isinstance(self.provider_plan, actions.ProviderLifecyclePlanV1):
+        if type(self.provider_plan) is not actions.ProviderLifecyclePlanV1:
             raise TypeError('provider_plan has an invalid type.')
         eligibility = (self.profile_eligibility if isinstance(
             self.profile_eligibility, actions.ProfileEligibility) else
@@ -101,7 +100,8 @@ class NewShadowSample:
             raise ValueError('provider profile has not cleared the '
                              'authoritative eligibility gate.')
         launch = self.immutable_spec.invocation.launch
-        if launch is not None and launch.source.service_name != self.service_name:
+        if (launch is not None and
+                launch.source.content.service_name != self.service_name):
             raise ValueError('launch source service name differs from the '
                              'shadow sample service name.')
         normalized_action = kernel_actions.NewResourceAction(

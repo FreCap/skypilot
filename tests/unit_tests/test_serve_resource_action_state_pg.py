@@ -20,6 +20,8 @@ from sky.serve import serve_state_schema
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import resource_actions as kernel_actions
 from sky.utils import common_utils
+from tests.unit_tests import (test_serve_resource_action_launch_execution_config
+                              as launch_config_fixtures)
 
 _POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
 testcontainers_postgres = None
@@ -158,23 +160,7 @@ def _insert_request(
 
 
 def _target() -> dict:
-    return {
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'cloud': 'kubernetes',
-        'region': None,
-        'zone': None,
-        'sky_cluster_name': 'svc-7',
-        'sky_cluster_record_uuid': _CLUSTER_UUID,
-        'kubernetes': {
-            'cluster_fingerprint_sha256': 'a' * 64,
-            'namespace': 'serve-test',
-            'workload_kind': 'Pod',
-            'workload_name': 'svc-7',
-            'cluster_record_uuid_label': _CLUSTER_UUID,
-            'replica_incarnation_label': _REPLICA_UUID,
-        },
-    }
+    return launch_config_fixtures._target()
 
 
 def _launch_invocation(
@@ -186,48 +172,11 @@ def _launch_invocation(
         'action_kind': 'launch',
         'resource_identity': _identity(generation),
         'requested_target': _target(),
-        'launch': {
-            'source': {
-                'store': 'serve_version_specs',
-                'service_name': 'svc',
-                'service_incarnation': _SERVICE_UUID,
-                'service_version': 1,
-                'yaml_content_sha256': 'b' * 64,
-                'workspace': 'boltz-test',
-            },
-            'resources': {
-                'version': 1,
-                'cloud': 'kubernetes',
-                'cluster_fingerprint_sha256': 'a' * 64,
-                'namespace': 'serve-test',
-                'instance_type': None,
-                'accelerator': None,
-                'cpus': '2+',
-                'memory': '4+',
-                'image_id': None,
-                'disk_size_gb': 50,
-                'disk_tier': None,
-                'ports': ['8000'],
-                'labels': [],
-                'use_spot': False,
-            },
-            'replica_env': {
-                'SKYPILOT_SERVE_REPLICA_ID': '7'
-            },
-            'security_group_scope': 'serve-svc',
-            'admin_policy_input_sha256': 'c' * 64,
-            'admin_policy_output_sha256': 'd' * 64,
-            'retry_until_up': True,
-            'exact_resources_override': True,
-            'backend': 'cloud_vm_ray',
-            'optimize_target': 'cost',
-            'dryrun': False,
-            'no_setup': False,
-            'clone_disk_from': None,
-            'fast': False,
-            'file_mounts_blob_id': None,
-            'tls_material_ref': None,
-        },
+        'launch': launch_config_fixtures.launch_payload(
+            _identity(generation),
+            _target(),
+            launch_config_fixtures._resource_snapshot(),
+            workspace='boltz-test'),
         'down': None,
     })
 
@@ -779,8 +728,8 @@ def test_admit_exact_adoption_typed_spec_and_borrowed_transaction(
             provider_plan=conflicting.provider_plan,
             profile_eligibility=actions.ProfileEligibility.UNSUPPORTED)
     mutated_spec = sample.immutable_spec.canonical_value()
-    mutated_spec['invocation']['launch']['admin_policy_input_sha256'] = '8' * 64
-    with pytest.raises(ValueError, match='request payload hash'):
+    mutated_spec['invocation']['launch']['retry_until_up'] = False
+    with pytest.raises(ValueError, match='launch options'):
         actions.ServeReplicaActionSpecV1.from_value(mutated_spec)
 
     second, _ = _sample(generation=2)

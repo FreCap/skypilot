@@ -6,8 +6,11 @@ import uuid
 
 import pytest
 
+from sky.serve import resource_action_state
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
+from tests.unit_tests import (test_serve_resource_action_launch_execution_config
+                              as launch_config_fixtures)
 
 _SERVICE_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
@@ -71,88 +74,28 @@ def _identity(generation: int = 1) -> dict:
 
 
 def _target() -> dict:
-    return {
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'cloud': 'kubernetes',
-        'region': None,
-        'zone': None,
-        'sky_cluster_name': 'svc-7',
-        'sky_cluster_record_uuid': _CLUSTER_UUID,
-        'kubernetes': {
-            'cluster_fingerprint_sha256': 'a' * 64,
-            'namespace': 'serve-prod',
-            'workload_kind': 'Pod',
-            'workload_name': 'svc-7',
-            'cluster_record_uuid_label': _CLUSTER_UUID,
-            'replica_incarnation_label': _REPLICA_UUID,
-        },
-    }
+    return launch_config_fixtures._target()
 
 
 def _resources() -> dict:
-    return {
-        'version': 1,
-        'cloud': 'kubernetes',
-        'cluster_fingerprint_sha256': 'a' * 64,
-        'namespace': 'serve-prod',
-        'instance_type': None,
-        'accelerator': {
-            'name': 'H100',
-            'count': 1,
-        },
-        'cpus': '8+',
-        'memory': '32+',
-        'image_id': 'docker:example/image@sha256:' + '9' * 64,
-        'disk_size_gb': 100,
-        'disk_tier': None,
-        'ports': ['8000', '8001'],
-        'labels': [{
-            'key': 'app',
-            'value': 'serve'
-        }, {
-            'key': 'replica',
-            'value': '7'
-        }],
-        'use_spot': False,
-    }
+    return launch_config_fixtures._resource_snapshot()
 
 
-def _launch_invocation() -> dict:
+def _launch_invocation(generation: int = 1,
+                       *,
+                       workspace: str = 'boltz-test') -> dict:
+    identity = _identity(generation)
     return {
         'version': 1,
         'profile': 'pod_cluster_v1',
         'redaction_profile': 'provider_lifecycle_redaction_v1',
         'action_kind': 'launch',
-        'resource_identity': _identity(),
+        'resource_identity': identity,
         'requested_target': _target(),
-        'launch': {
-            'source': {
-                'store': 'serve_version_specs',
-                'service_name': 'svc',
-                'service_incarnation': _SERVICE_UUID,
-                'service_version': 3,
-                'yaml_content_sha256': 'b' * 64,
-                'workspace': 'boltz-test',
-            },
-            'resources': _resources(),
-            'replica_env': {
-                'SKYPILOT_SERVE_REPLICA_ID': '7'
-            },
-            'security_group_scope': 'serve-svc',
-            'admin_policy_input_sha256': 'c' * 64,
-            'admin_policy_output_sha256': 'd' * 64,
-            'retry_until_up': True,
-            'exact_resources_override': True,
-            'backend': 'cloud_vm_ray',
-            'optimize_target': 'cost',
-            'dryrun': False,
-            'no_setup': False,
-            'clone_disk_from': None,
-            'fast': False,
-            'file_mounts_blob_id': None,
-            'tls_material_ref': None,
-        },
+        'launch': launch_config_fixtures.launch_payload(identity,
+                                                        _target(),
+                                                        _resources(),
+                                                        workspace=workspace),
         'down': None,
     }
 
@@ -311,78 +254,26 @@ def _outcome(*,
 def test_launch_invocation_literal_golden_bytes_hash_and_action_id() -> None:
     invocation = actions.ProviderLifecycleInvocationV1.from_value(
         _launch_invocation())
-    assert invocation.canonical_bytes == (
-        b'{"action_kind":"launch","down":null,"launch":{'
-        b'"admin_policy_input_sha256":"cccccccccccccccccccccccccccccccccccc'
-        b'cccccccccccccccccccccccccccc","admin_policy_output_sha256":"dddddddd'
-        b'dddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
-        b'"backend":"cloud_vm_ray","clone_disk_from":null,"dryrun":false,'
-        b'"exact_resources_override":true,"fast":false,"file_mounts_blob_id":'
-        b'null,"no_setup":false,"optimize_target":"cost","replica_env":{'
-        b'"SKYPILOT_SERVE_REPLICA_ID":"7"},"resources":{"accelerator":{'
-        b'"count":1,"name":"H100"},"cloud":"kubernetes",'
-        b'"cluster_fingerprint_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-        b'aaaaaaaaaaaaaaaaaaaaaaaaaaaa","cpus":"8+","disk_size_gb":100,'
-        b'"disk_tier":null,"image_id":"docker:example/image@sha256:'
-        b'9999999999999999999999999999999999999999999999999999999999999999",'
-        b'"instance_type":null,"labels":[{"key":"app","value":"serve"},{'
-        b'"key":"replica","value":"7"}],"memory":"32+","namespace":'
-        b'"serve-prod","ports":["8000","8001"],"use_spot":false,'
-        b'"version":1},"retry_until_up":true,"security_group_scope":'
-        b'"serve-svc","source":{"service_incarnation":"11111111-1111-4111-'
-        b'8111-111111111111","service_name":"svc","service_version":3,'
-        b'"store":"serve_version_specs","workspace":"boltz-test",'
-        b'"yaml_content_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-        b'bbbbbbbbbbbbbbbbbbbbbbbb"},"tls_material_ref":null},"profile":'
-        b'"pod_cluster_v1","redaction_profile":'
-        b'"provider_lifecycle_redaction_v1","requested_target":{"cloud":'
-        b'"kubernetes","kubernetes":{"cluster_fingerprint_sha256":'
-        b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-        b'"cluster_record_uuid_label":"33333333-3333-4333-8333-333333333333",'
-        b'"namespace":"serve-prod","replica_incarnation_label":'
-        b'"22222222-2222-4222-8222-222222222222","workload_kind":"Pod",'
-        b'"workload_name":"svc-7"},"profile":"pod_cluster_v1","region":null,'
-        b'"sky_cluster_name":"svc-7","sky_cluster_record_uuid":'
-        b'"33333333-3333-4333-8333-333333333333","version":1,"zone":null},'
-        b'"resource_identity":{"desired_generation":1,"replica_id":7,'
-        b'"replica_incarnation":"22222222-2222-4222-8222-222222222222",'
-        b'"service_hash":"11111111-1111-4111-8111-111111111111",'
-        b'"service_incarnation":"11111111-1111-4111-8111-111111111111"},'
-        b'"version":1}')
+    assert invocation.canonical_bytes == actions.canonical_json_bytes(
+        invocation.canonical_value())
+    assert len(invocation.canonical_bytes) == 49_821
     assert invocation.sha256 == (
-        '43ef241087744463c109d23df2d89eec653862a614fa5b2b4f159ad72b8dbe3c')
+        '16b2165cf70aa3c0e99b088342e6197fcb8e2eba437d205372c42498d77b7c96')
     assert invocation.action_id == uuid.UUID(
         'a1fa64dd-eea2-59db-b7b6-733d8001a086')
     assert invocation.launch is not None
     assert invocation.launch.resources.sha256 == (
-        '3ef165259e42862cffe0b9ca275e2711e76bd20bb05f8cf846aed0cfb9eea4c6')
+        'ddfb2d078e7d76a8e6b20ad0951aedb3219b76b09399dfab1b960d6af5492d62')
 
 
 def test_down_invocation_literal_golden_bytes_hash_and_action_id() -> None:
     invocation = actions.ProviderLifecycleInvocationV1.from_value(
         _down_invocation())
-    assert invocation.canonical_bytes == (
-        b'{"action_kind":"down","down":{"cluster_name":"svc-7",'
-        b'"expected_cluster_record_uuid":"33333333-3333-4333-8333-'
-        b'333333333333","graceful":false,"graceful_timeout":null,"purge":'
-        b'false,"workspace":"boltz-test"},"launch":null,"profile":'
-        b'"pod_cluster_v1","redaction_profile":'
-        b'"provider_lifecycle_redaction_v1","requested_target":{"cloud":'
-        b'"kubernetes","kubernetes":{"cluster_fingerprint_sha256":'
-        b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-        b'"cluster_record_uuid_label":"33333333-3333-4333-8333-333333333333",'
-        b'"namespace":"serve-prod","replica_incarnation_label":'
-        b'"22222222-2222-4222-8222-222222222222","workload_kind":"Pod",'
-        b'"workload_name":"svc-7"},"profile":"pod_cluster_v1","region":null,'
-        b'"sky_cluster_name":"svc-7","sky_cluster_record_uuid":'
-        b'"33333333-3333-4333-8333-333333333333","version":1,"zone":null},'
-        b'"resource_identity":{"desired_generation":2,"replica_id":7,'
-        b'"replica_incarnation":"22222222-2222-4222-8222-222222222222",'
-        b'"service_hash":"11111111-1111-4111-8111-111111111111",'
-        b'"service_incarnation":"11111111-1111-4111-8111-111111111111"},'
-        b'"version":1}')
+    assert invocation.canonical_bytes == actions.canonical_json_bytes(
+        invocation.canonical_value())
+    assert len(invocation.canonical_bytes) == 3_505
     assert invocation.sha256 == (
-        '53b16b443ae4caaffd8ab9539d3017dd9853f411db4bad29faa6d0c6b75b351d')
+        '5d097b7c913ac745c70dc3d90d816cae6832a18353fa1e74b01764be34959f53')
     assert invocation.action_id == uuid.UUID(
         '324a4cdd-4640-57ae-aea8-b3f65851f735')
 
@@ -468,41 +359,18 @@ def test_provider_resource_identity_action_identity_exact_kind_gate() -> None:
 
 def test_locator_and_plan_literal_golden_bytes_and_hashes() -> None:
     locator = actions.ProviderLocatorV1.from_value(_target())
-    assert locator.canonical_bytes == (
-        b'{"cloud":"kubernetes","kubernetes":{"cluster_fingerprint_sha256":"aa'
-        b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","clu'
-        b'ster_record_uuid_label":"33333333-3333-4333-8333-333333333333","name'
-        b'space":"serve-prod","replica_incarnation_label":"22222222-2222-4222-'
-        b'8222-222222222222","workload_kind":"Pod","workload_name":"svc-7"},"p'
-        b'rofile":"pod_cluster_v1","region":null,"sky_cluster_name":"svc-7","s'
-        b'ky_cluster_record_uuid":"33333333-3333-4333-8333-333333333333","vers'
-        b'ion":1,"zone":null}')
+    assert locator.canonical_bytes == actions.canonical_json_bytes(
+        locator.canonical_value())
+    assert len(locator.canonical_bytes) == 2_938
     assert locator.sha256 == (
-        'e2c114a700e6c83517fbb39bf037b887cdde766cf25cefa91f0e5d3b273daa2e')
+        '21a7dab73f56fef56fae733682a1275c307c3d7e9fb507fb1d3af6afd603a607')
 
     plan = actions.ProviderLifecyclePlanV1.from_value(_launch_plan())
-    assert plan.canonical_bytes == (
-        b'{"action_kind":"launch","placement_decision_sha256":"eeeeeeeeeeeeeee'
-        b'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","prior_resolved_t'
-        b'arget":null,"profile":"pod_cluster_v1","redaction_profile":"provider'
-        b'_lifecycle_redaction_v1","request_payload_sha256":"43ef241087744463c'
-        b'109d23df2d89eec653862a614fa5b2b4f159ad72b8dbe3c","requested_target":'
-        b'{"cloud":"kubernetes","kubernetes":{"cluster_fingerprint_sha256":"aa'
-        b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","clu'
-        b'ster_record_uuid_label":"33333333-3333-4333-8333-333333333333","name'
-        b'space":"serve-prod","replica_incarnation_label":"22222222-2222-4222-'
-        b'8222-222222222222","workload_kind":"Pod","workload_name":"svc-7"},"p'
-        b'rofile":"pod_cluster_v1","region":null,"sky_cluster_name":"svc-7","s'
-        b'ky_cluster_record_uuid":"33333333-3333-4333-8333-333333333333","vers'
-        b'ion":1,"zone":null},"resource_identity":{"desired_generation":1,"rep'
-        b'lica_id":7,"replica_incarnation":"22222222-2222-4222-8222-2222222222'
-        b'22","service_hash":"11111111-1111-4111-8111-111111111111","service_i'
-        b'ncarnation":"11111111-1111-4111-8111-111111111111"},"resources_snaps'
-        b'hot_sha256":"3ef165259e42862cffe0b9ca275e2711e76bd20bb05f8cf846aed0c'
-        b'fb9eea4c6","version":1,"workspace_identity_sha256":"ffffffffffffffff'
-        b'ffffffffffffffffffffffffffffffffffffffffffffffff"}')
+    assert plan.canonical_bytes == actions.canonical_json_bytes(
+        plan.canonical_value())
+    assert len(plan.canonical_bytes) == 3_717
     assert plan.sha256 == (
-        '030916d7936d8d18f6790417afba8b4f13c2687d82e540a5fb29b21ac0f6186f')
+        '829d7678d96b7b1184a755af884fcc54f719109c465108fba097ef0d67652e9f')
 
 
 def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
@@ -512,7 +380,7 @@ def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
                        launch.provider_plan.canonical_bytes + b',"version":1}')
     assert launch.canonical_bytes == expected_launch
     assert launch.sha256 == (
-        'c35900943d14875a0cc177186d7b03afdca8070f87f8484a35edcdcdfbe86ebf')
+        '3482c254dbc873dd03f5dce48d168a1ed41eb3c516f864e295061036e4071f64')
     assert launch.action_id == uuid.UUID('a1fa64dd-eea2-59db-b7b6-733d8001a086')
 
     down = actions.ServeReplicaActionSpecV1.from_value(_down_spec())
@@ -521,7 +389,7 @@ def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
                      b',"version":1}')
     assert down.canonical_bytes == expected_down
     assert down.sha256 == (
-        '64f812f81d47290d8ccb7ab183055fedd8c5999c8494e7c6a38f117bec8a80e7')
+        '0f1c2c78034749571f1826154a6aa6b68743b0d5e436014caab13a6fe549d6ba')
     assert down.action_id == uuid.UUID('324a4cdd-4640-57ae-aea8-b3f65851f735')
 
 
@@ -533,7 +401,7 @@ def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
     (lambda value: value['provider_plan'].update(
         {'resources_snapshot_sha256': '0' * 64}), 'resource snapshot'),
     (lambda value: value['invocation']['launch'].update(
-        {'admin_policy_input_sha256': '0' * 64}), 'payload hash'),
+        {'retry_until_up': False}), 'launch options'),
 ])
 def test_action_spec_rejects_unknown_float_and_unlinked_mutations(
         mutate, match: str) -> None:
@@ -546,12 +414,13 @@ def test_action_spec_rejects_unknown_float_and_unlinked_mutations(
 @pytest.mark.parametrize('member', ['provider_plan', 'invocation'])
 def test_action_spec_rejects_identity_mismatch(member: str) -> None:
     value = _launch_spec()
-    identity = value[member]['resource_identity']
-    replacement = '55555555-5555-4555-8555-555555555555'
-    identity['service_hash'] = replacement
-    identity['service_incarnation'] = replacement
     if member == 'invocation':
-        value[member]['launch']['source']['service_incarnation'] = replacement
+        value[member] = _launch_invocation(generation=2)
+    else:
+        identity = value[member]['resource_identity']
+        replacement = '55555555-5555-4555-8555-555555555555'
+        identity['service_hash'] = replacement
+        identity['service_incarnation'] = replacement
     with pytest.raises(ValueError, match='action IDs differ'):
         actions.ServeReplicaActionSpecV1.from_value(value)
 
@@ -579,13 +448,121 @@ def test_action_spec_requires_typed_members_and_exact_parent_plan_copy(
         spec.validate_parent_provider_plan(changed_plan_value)
 
 
+def test_persisted_plan_and_spec_graph_rejects_subclasses() -> None:
+    plan = actions.ProviderLifecyclePlanV1.from_value(_launch_plan())
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _launch_invocation())
+    spec = actions.ServeReplicaActionSpecV1(1, plan, invocation)
+
+    class EvilPlan(actions.ProviderLifecyclePlanV1):
+
+        def canonical_value(self) -> dict:
+            value = super().canonical_value()
+            value['injected'] = 'accepted-but-unreadable'
+            return value
+
+    evil_plan = EvilPlan(**{
+        field.name: getattr(plan, field.name)
+        for field in dataclasses.fields(plan)
+    })
+    with pytest.raises(TypeError, match='provider_plan'):
+        actions.ServeReplicaActionSpecV1(1, evil_plan, invocation)
+    with pytest.raises(TypeError, match='parent provider_plan'):
+        spec.validate_parent_provider_plan(evil_plan)
+
+    class EvilInvocation(actions.ProviderLifecycleInvocationV1):
+
+        def canonical_value(self) -> dict:
+            value = super().canonical_value()
+            value['injected'] = 'accepted-but-unreadable'
+            return value
+
+    evil_invocation = EvilInvocation(
+        **{
+            field.name: getattr(invocation, field.name)
+            for field in dataclasses.fields(invocation)
+        })
+    with pytest.raises(TypeError, match='invocation'):
+        actions.ServeReplicaActionSpecV1(1, plan, evil_invocation)
+    with pytest.raises(TypeError, match='invocation'):
+        plan.validate_invocation(evil_invocation)
+
+    class EvilSpec(actions.ServeReplicaActionSpecV1):
+
+        def canonical_value(self) -> dict:
+            value = super().canonical_value()
+            value['injected'] = 'accepted-but-unreadable'
+            return value
+
+    evil_spec = EvilSpec(1, plan, invocation)
+    with pytest.raises(TypeError, match='immutable_spec'):
+        resource_action_state.NewShadowSample(
+            service_name='svc',
+            immutable_spec=evil_spec,
+            provider_plan=plan,
+            profile_eligibility=actions.ProfileEligibility.UNSUPPORTED)
+    with pytest.raises(TypeError, match='provider_plan'):
+        resource_action_state.NewShadowSample(
+            service_name='svc',
+            immutable_spec=spec,
+            provider_plan=evil_plan,
+            profile_eligibility=actions.ProfileEligibility.UNSUPPORTED)
+
+    refined = invocation.as_launch()
+    spec.validate_shadow_child_invocation(
+        actions.ShadowRequestRole.PRIMARY_LAUNCH, refined)
+
+
+def test_persisted_plan_rejects_nested_contract_subclasses() -> None:
+    plan = actions.ProviderLifecyclePlanV1.from_value(_launch_plan())
+
+    class EvilIdentity(actions.ProviderResourceIdentityV1):
+        pass
+
+    identity = plan.resource_identity
+    evil_identity = EvilIdentity(
+        **{
+            field.name: getattr(identity, field.name)
+            for field in dataclasses.fields(identity)
+        })
+    with pytest.raises(TypeError, match='resource identity'):
+        dataclasses.replace(plan, resource_identity=evil_identity)
+
+    class EvilLocator(actions.ProviderLocatorV1):
+        pass
+
+    locator = plan.requested_target
+    evil_locator = EvilLocator(
+        **{
+            field.name: getattr(locator, field.name)
+            for field in dataclasses.fields(locator)
+        })
+    with pytest.raises(TypeError, match='requested target'):
+        dataclasses.replace(plan, requested_target=evil_locator)
+
+    down_plan = actions.ProviderLifecyclePlanV1.from_value(_down_plan())
+    resolved_target = down_plan.prior_resolved_target
+    assert resolved_target is not None
+
+    class EvilResolvedTarget(actions.ResolvedProviderTargetV1):
+        pass
+
+    evil_resolved_target = EvilResolvedTarget(
+        **{
+            field.name: getattr(resolved_target, field.name)
+            for field in dataclasses.fields(resolved_target)
+        })
+    with pytest.raises(TypeError, match='prior resolved target'):
+        dataclasses.replace(down_plan,
+                            prior_resolved_target=evil_resolved_target)
+
+
 def test_action_spec_primary_invocation_is_an_exact_byte_copy() -> None:
     spec = actions.ServeReplicaActionSpecV1.from_value(_launch_spec())
     spec.validate_shadow_child_invocation(
         actions.ShadowRequestRole.PRIMARY_LAUNCH, spec.invocation)
 
-    changed_value = _launch_invocation()
-    changed_value['launch']['admin_policy_input_sha256'] = '0' * 64
+    changed_value = _launch_invocation(workspace='another-workspace')
     changed = actions.ProviderLifecycleInvocationV1.from_value(changed_value)
     with pytest.raises(ValueError, match='not byte-equal'):
         spec.validate_shadow_child_invocation(
@@ -608,7 +585,7 @@ def test_action_spec_cleanup_down_is_the_only_child_invocation_exception(
     assert cleanup.down is not None
     assert cleanup.down.workspace == 'boltz-test'
     assert cleanup.sha256 == (
-        'bacb34fa8db0ffaab3f3339cb5b91efb1f0c6cf735f363eb6c57c60fa85c9415')
+        'b7afe613a077dc97ba8685722d836b378280b8aa5a552cd18244e35b11495579')
     spec.validate_shadow_child_invocation(
         actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, cleanup)
 
@@ -636,18 +613,24 @@ def test_action_spec_cleanup_down_is_the_only_child_invocation_exception(
 
 
 def test_action_spec_enforces_combined_65536_byte_bound() -> None:
-    value = _launch_spec()
-    value['invocation']['launch']['resources']['labels'] = [{
-        'key': f'{index:03d}' + 'k' * 247,
-        'value': 'v' * 250,
-    } for index in range(120)]
+    value = _down_spec()
+    context_identity = [f'{index:03d}-' + 'x' * 996 for index in range(30)]
+    for member in ('provider_plan', 'invocation'):
+        kubernetes = value[member]['requested_target']['kubernetes']
+        kubernetes['scope']['context_identity'] = context_identity
+        kubernetes['cluster_fingerprint_sha256'] = (
+            actions.ProviderKubernetesScopeV1.from_value(
+                kubernetes['scope']).sha256)
+    target = actions.ProviderLocatorV1.from_value(
+        value['invocation']['requested_target'])
+    value['provider_plan']['prior_resolved_target'][
+        'requested_target_sha256'] = target.sha256
     invocation = actions.ProviderLifecycleInvocationV1.from_value(
         value['invocation'])
-    assert invocation.launch is not None
-    value['provider_plan']['resources_snapshot_sha256'] = (
-        invocation.launch.resources.sha256)
     value['provider_plan']['request_payload_sha256'] = invocation.sha256
+    plan = actions.ProviderLifecyclePlanV1.from_value(value['provider_plan'])
     assert len(invocation.canonical_bytes) < 65_536
+    assert len(plan.canonical_bytes) < 65_536
     assert len(actions.canonical_json_bytes(value)) > 65_536
     with pytest.raises(ValueError, match='exceeds 65536'):
         actions.ServeReplicaActionSpecV1.from_value(value)
@@ -667,12 +650,13 @@ def test_action_spec_enforces_combined_65536_byte_bound() -> None:
     (lambda value: value['resource_identity'].update(
         {'service_incarnation': _CLUSTER_UUID}), 'service_hash'),
     (lambda value: value['requested_target']['kubernetes'].update(
-        {'replica_incarnation_label': _CLUSTER_UUID}), 'replica label'),
+        {'replica_incarnation_label': _CLUSTER_UUID}),
+     'topology identity labels'),
     (lambda value: value['requested_target'].update(
         {'sky_cluster_record_uuid': _CLUSTER_UUID.replace('-', '')}),
      'lowercase hyphenated'),
     (lambda value: value['launch']['resources'].update({'disk_size_gb': 100.0}),
-     'forbids floats'),
+     'forbids floating-point values'),
     (lambda value: value['launch']['resources'].update(
         {'ports': ['8001', '8000']}), 'sorted and unique'),
     (lambda value: value['launch']['resources'].update({
@@ -684,11 +668,11 @@ def test_action_spec_enforces_combined_65536_byte_bound() -> None:
             'value': 'serve'
         }]
     }), 'sorted by unique key'),
-    (lambda value: value['launch']['source'].update(
+    (lambda value: value['launch']['source']['content'].update(
         {'service_name': 'x' * 1025}), '1..1024'),
     (lambda value: value['launch']['replica_env'].update(
         {'SKYPILOT_SERVE_REPLICA_ID': '1' * 1025}), '1..1024'),
-    (lambda value: value['launch']['source'].update(
+    (lambda value: value['launch']['source']['content'].update(
         {'service_name': 'e\u0301'}), 'not canonical|NFC-normalized'),
     (lambda value: value['requested_target'].update({'version': 2}),
      'integer 1'),
@@ -704,9 +688,12 @@ def test_invocation_rejects_closed_shape_identity_bounds_and_secrets(
 def test_redaction_profile_marks_opaque_material_outside_first_cohort() -> None:
     value = _launch_invocation()
     value['launch']['tls_material_ref'] = 'secret/tls-material-v1'
-    invocation = actions.ProviderLifecycleInvocationV1.from_value(value)
+    with pytest.raises(ValueError, match='tls_material_ref must be null'):
+        actions.ProviderLifecycleInvocationV1.from_value(value)
+    invocation = actions.ProviderLifecycleInvocationV1.from_value(
+        _launch_invocation())
     assert invocation.launch is not None
-    assert not invocation.launch.first_authority_cohort_redacted
+    assert invocation.launch.first_authority_cohort_redacted
 
 
 def test_provider_evidence_contracts_are_closed_and_cross_checked() -> None:
@@ -1004,8 +991,13 @@ def test_succeeded_down_rejects_eventual_or_present_observation(
 
 def test_outcome_proof_rejects_wrong_target_and_invocation_type() -> None:
     wrong_target = _target()
-    wrong_target['sky_cluster_name'] = 'another-cluster'
-    wrong_target['kubernetes']['workload_name'] = 'another-cluster'
+    wrong_target['sky_cluster_record_uuid'] = _SERVICE_UUID
+    wrong_target['kubernetes']['cluster_record_uuid_label'] = _SERVICE_UUID
+    for mutable_object in wrong_target['kubernetes']['topology'][
+            'mutable_objects']:
+        for label in mutable_object['labels']:
+            if label['key'] == 'skypilot.co/cluster-record-uuid':
+                label['value'] = _SERVICE_UUID
     wrong_target_hash = actions.ProviderLocatorV1.from_value(
         wrong_target).sha256
     observation = _observation()

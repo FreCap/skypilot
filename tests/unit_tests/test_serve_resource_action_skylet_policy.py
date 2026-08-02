@@ -7,6 +7,8 @@ import json
 import pytest
 
 from sky.serve import resource_actions as actions
+from tests.unit_tests import (test_serve_resource_action_launch_execution_config
+                              as launch_config_fixtures)
 
 _SUBMISSION_KEY = '11111111-1111-4111-8111-111111111111'
 _OTHER_SUBMISSION_KEY = '22222222-2222-4222-8222-222222222222'
@@ -132,7 +134,7 @@ def test_leaf_contracts_reject_unknown_top_level_keys(factory, parser) -> None:
 
 def test_job_spec_direct_construction_uses_tuples_but_wire_uses_lists() -> None:
     raw = _job_spec()
-    source = actions.ProviderLaunchSourceV1.from_value(raw['source'])
+    source = actions.ProviderLaunchContentSourceV1.from_value(raw['source'])
     direct = actions.ProviderSkyletJobSpecV1(
         version=raw['version'],
         schema_id=raw['schema_id'],
@@ -149,9 +151,17 @@ def test_job_spec_direct_construction_uses_tuples_but_wire_uses_lists() -> None:
         restart_policy=raw['restart_policy'])
 
     assert direct.canonical_value() == raw
+
+    class DeceptiveTuple(tuple):
+
+        def __bool__(self) -> bool:
+            return False
+
     for field in ('mounts', 'secrets'):
         with pytest.raises(TypeError, match=f'{field} must be a tuple'):
             dataclasses.replace(direct, **{field: []})
+        with pytest.raises(TypeError, match=f'{field} must be a tuple'):
+            dataclasses.replace(direct, **{field: DeceptiveTuple(('hidden',))})
         wire = _job_spec()
         wire[field] = ()
         with pytest.raises((TypeError, ValueError)):
@@ -189,45 +199,12 @@ def test_decimal_integer_text_rejects_noncanonical_or_out_of_bounds_values(
         actions.ProviderSkyletJobSpecV1.from_value(raw)
 
 
-def test_launch_invocation_reuses_signed_int64_decimal_bound() -> None:
-    source = actions.ProviderLaunchSourceV1.from_value(_source())
-    resources = actions.ProviderPodResourceSnapshotV1.from_value({
-        'version': 1,
-        'cloud': 'kubernetes',
-        'cluster_fingerprint_sha256': '9' * 64,
-        'namespace': 'serve-canary',
-        'instance_type': None,
-        'accelerator': None,
-        'cpus': '1',
-        'memory': '1',
-        'image_id': None,
-        'disk_size_gb': 20,
-        'disk_tier': None,
-        'ports': [],
-        'labels': [],
-        'use_spot': False,
-    })
-    launch = actions.ProviderLaunchInvocationV1(
-        source=source,
-        resources=resources,
-        replica_id_text=str(_MAX_BIGINT),
-        security_group_scope='serve-svc',
-        admin_policy_input_sha256='a' * 64,
-        admin_policy_output_sha256='a' * 64,
-        retry_until_up=True,
-        exact_resources_override=True,
-        backend='cloud_vm_ray',
-        optimize_target='cost',
-        dryrun=False,
-        no_setup=False,
-        clone_disk_from=None,
-        fast=False,
-        file_mounts_blob_id=None,
-        tls_material_ref=None)
-
-    assert launch.replica_id_text == str(_MAX_BIGINT)
+def test_launch_policy_subject_reuses_signed_int64_decimal_bound() -> None:
+    subject = launch_config_fixtures._subject()
+    maximum = dataclasses.replace(subject, replica_id_text=str(_MAX_BIGINT))
+    assert maximum.replica_id_text == str(_MAX_BIGINT)
     with pytest.raises(ValueError, match='canonical decimal integer text'):
-        dataclasses.replace(launch, replica_id_text=str(_MAX_BIGINT + 1))
+        dataclasses.replace(subject, replica_id_text=str(_MAX_BIGINT + 1))
 
 
 @pytest.mark.parametrize(('mutate', 'match'), [

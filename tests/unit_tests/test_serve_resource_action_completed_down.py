@@ -116,33 +116,68 @@ def _workspace_identity() -> dict:
 
 
 def _target() -> dict:
+    scope_sha256 = actions.ProviderKubernetesScopeV1.from_value(_scope()).sha256
+    topology = {
+        'version': 1,
+        'kind': 'single_direct_pod_two_services',
+        'node_count': 1,
+        'application_port': '8080',
+        'resources_ports': ['8080'],
+        'mutable_objects': [{
+            'kind': kind,
+            'role': role,
+            'name': name,
+            'labels': [{
+                'key': key,
+                'value': value
+            } for key, value in sorted({
+                **{
+                    item['key']: item['value'] for item in _identity_labels()
+                },
+                'role-specific': role,
+            }.items())],
+        } for role, kind, name in (('head_ssh_service', 'Service',
+                                    'svc-replica-head-ssh'),
+                                   ('head_service', 'Service',
+                                    'svc-replica-head'), ('head_pod', 'Pod',
+                                                          'svc-replica-head'))],
+        'shared_prerequisites': 'preexisting_read_only',
+    }
     return {
         'version': 1,
         'profile': 'pod_cluster_v1',
         'cloud': 'kubernetes',
         'region': None,
         'zone': None,
-        'sky_cluster_name': 'serve-display',
+        'sky_cluster_name': 'svc',
         'sky_cluster_record_uuid': _CLUSTER_UUID,
         'kubernetes': {
-            # This legacy additive locator leaf does not embed the complete
-            # scope.  Keep its cluster fingerprint visibly distinct so the
-            # handle cannot accidentally treat it as scope_sha256.
-            'cluster_fingerprint_sha256': 'f' * 64,
+            'scope': _scope(),
+            'cluster_fingerprint_sha256': scope_sha256,
             'namespace': 'serve-canary',
+            'name_basis': {
+                'version': 1,
+                'display_name': 'svc',
+                'frozen_user_hash': 'replica',
+                'max_length': 42,
+                'cluster_name_hash_length': 8,
+            },
+            'provider_cluster_name': 'svc-replica',
             'workload_kind': 'Pod',
             'workload_name': 'svc-replica-head',
             'cluster_record_uuid_label': _CLUSTER_UUID,
             'replica_incarnation_label': _REPLICA_UUID,
+            'topology': topology,
         },
     }
 
 
 def _resource_snapshot() -> dict:
+    scope_sha256 = actions.ProviderKubernetesScopeV1.from_value(_scope()).sha256
     return {
         'version': 1,
         'cloud': 'kubernetes',
-        'cluster_fingerprint_sha256': 'f' * 64,
+        'cluster_fingerprint_sha256': scope_sha256,
         'namespace': 'serve-canary',
         'instance_type': '2CPU--4GB',
         'accelerator': None,
@@ -305,7 +340,7 @@ def _handle() -> dict:
     return {
         'version': 1,
         'cluster_record_uuid': _CLUSTER_UUID,
-        'cluster_name': 'serve-display',
+        'cluster_name': 'svc',
         'cluster_name_on_cloud': 'svc-replica',
         'requested_target_sha256': target.sha256,
         'launched_resources_sha256': resources.sha256,
@@ -343,7 +378,7 @@ def _cleanup_target(*,
         'version': 1,
         'basis_kind': basis_kind,
         'requested_target_sha256': target.sha256,
-        'cluster_name': 'serve-display',
+        'cluster_name': 'svc',
         'cluster_record_uuid': _CLUSTER_UUID,
         'objects': [
             _cleanup_object(role,
@@ -438,7 +473,7 @@ def test_partial_target_accepts_every_committed_prefix(
     if committed_count == 2:
         assert len(parsed.canonical_bytes) == 1_476
         assert parsed.sha256 == (
-            '462c6b117f4c266595ca86c03b9f1ede9f34dc4dc1ae40c7db93d33668b3c5b2')
+            'b7313adc3b1a189ed50e4f40233f8e3002315a0b3d90b0ffa7d07aff41acd508')
 
 
 def test_resolved_slot_rejects_nullability_role_order_and_nonprefix() -> None:
@@ -469,9 +504,9 @@ def test_handle_roundtrip_hash_and_all_bound_preimages() -> None:
 
     assert parsed.canonical_value() == raw
     assert parsed.sha256 == actions.canonical_sha256(raw)
-    assert len(parsed.canonical_bytes) == 867
+    assert len(parsed.canonical_bytes) == 857
     assert parsed.sha256 == (
-        '188a216cdf4696805d832e7daad03189ccc94fa049f21f1d847cc068007085ce')
+        'dfc7d947c1b36a525074cbeecb2746a74e1c4473f622b705acde97054119bcd8')
     assert actions.ProviderKubernetesHandleV1.from_value(
         parsed.canonical_value()).canonical_bytes == parsed.canonical_bytes
     parsed.validate_requested_target(
@@ -482,8 +517,8 @@ def test_handle_roundtrip_hash_and_all_bound_preimages() -> None:
         actions.ProviderWorkspaceIdentityV1.from_value(_workspace_identity()))
     target = actions.ProviderLocatorV1.from_value(_target())
     assert target.kubernetes is not None
-    assert (parsed.provider_config.scope_sha256
-            != target.kubernetes.cluster_fingerprint_sha256)
+    assert (parsed.provider_config.scope_sha256 ==
+            target.kubernetes.cluster_fingerprint_sha256)
 
 
 @pytest.mark.parametrize(('field', 'value'), [
@@ -580,9 +615,9 @@ def test_completed_cleanup_roundtrip_hash_handle_and_delete_projection(
 
     assert parsed.canonical_value() == raw
     assert parsed.sha256 == actions.canonical_sha256(raw)
-    assert len(parsed.canonical_bytes) == 7_172
+    assert len(parsed.canonical_bytes) == 7_152
     assert parsed.sha256 == (
-        'fae8f132f024d606c72764d778e56ed8f056bb88221a5ab8c16366da5743177b')
+        '49d6435cf094c3fb4410e1b4405560854c8e0be37b9213db163ce038e88e3e5f')
     assert actions.ProviderKubernetesCleanupTargetV1.from_value(
         parsed.canonical_value()).canonical_bytes == parsed.canonical_bytes
     assert [item.role.value for item in parsed.objects
@@ -769,28 +804,22 @@ def test_existing_flattened_resolved_target_wire_is_unchanged() -> None:
         actions.ResolvedProviderTargetV1.from_value(new_shape)
 
 
-def test_existing_flattened_locator_wire_is_unchanged() -> None:
-    expected = (
-        b'{"cloud":"kubernetes","kubernetes":{"cluster_fingerprint_sha256":'
-        b'"' + b'f' * 64 + b'","cluster_record_uuid_label":'
-        b'"11111111-1111-4111-8111-111111111111","namespace":"serve-canary",'
-        b'"replica_incarnation_label":'
-        b'"22222222-2222-4222-8222-222222222222","workload_kind":"Pod",'
-        b'"workload_name":"svc-replica-head"},"profile":"pod_cluster_v1",'
-        b'"region":null,"sky_cluster_name":"serve-display",'
-        b'"sky_cluster_record_uuid":'
-        b'"11111111-1111-4111-8111-111111111111","version":1,"zone":null}')
-
+def test_canonical_locator_wire_embeds_complete_addressing_preimages() -> None:
     parsed = actions.ProviderLocatorV1.from_value(_target())
-
-    assert parsed.canonical_bytes == expected
-    assert len(parsed.canonical_bytes) == 516
-    assert parsed.sha256 == (
-        '29a9382d6680dddf10324f9b16e8da4f69f1a805bd573cee76275d7f3b57286f')
-    new_shape = _target()
-    new_shape['kubernetes']['scope'] = _scope()
+    assert parsed.canonical_bytes == actions.canonical_json_bytes(
+        parsed.canonical_value())
+    assert parsed.kubernetes is not None
+    assert parsed.kubernetes.cluster_fingerprint_sha256 == (
+        parsed.kubernetes.scope.sha256)
+    assert set(parsed.kubernetes.canonical_value()) == {
+        'scope', 'cluster_fingerprint_sha256', 'namespace', 'name_basis',
+        'provider_cluster_name', 'workload_kind', 'workload_name',
+        'cluster_record_uuid_label', 'replica_incarnation_label', 'topology'
+    }
+    missing_scope = _target()
+    del missing_scope['kubernetes']['scope']
     with pytest.raises(ValueError, match='unknown or missing'):
-        actions.ProviderLocatorV1.from_value(new_shape)
+        actions.ProviderLocatorV1.from_value(missing_scope)
 
 
 def test_new_exact_collections_reject_cardinality_before_child_parsing(

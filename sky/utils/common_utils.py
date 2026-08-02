@@ -988,6 +988,28 @@ def validate_schema(obj, schema, err_msg_prefix='', skip_none=True):
             raise exceptions.InvalidSkyPilotConfigError(err_msg)
 
 
+_EXPLICIT_USER_LABEL_RE = re.compile(r'^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$')
+
+
+def clean_username_for_explicit_user_v1(username: str) -> str:
+    """Clean one explicit username without consulting ambient identity."""
+    if type(username) is not str:
+        raise TypeError('username must be text.')
+    if not username or len(username.encode('utf-8')) > 1024:
+        raise ValueError('username must be 1..1024 UTF-8 bytes.')
+    if not username.isascii():
+        raise ValueError('username must be ASCII.')
+    username = username.lower()
+    username = re.sub(r'[^a-z0-9-_]', '', username)
+    username = re.sub(r'^[0-9-]+', '', username)
+    username = re.sub(r'-$', '', username)
+    username = username[:63]
+    if _EXPLICIT_USER_LABEL_RE.fullmatch(username) is None:
+        raise ValueError('cleaned username must be a canonical Kubernetes '
+                         'label value.')
+    return username
+
+
 def get_cleaned_username(username: str = '') -> str:
     """Cleans the username. Underscores are allowed, as we will
      handle it when mapping to the cluster_name_on_cloud in
@@ -1009,12 +1031,7 @@ def get_cleaned_username(username: str = '') -> str:
       A cleaned username.
     """
     username = username or get_current_user_name()
-    username = username.lower()
-    username = re.sub(r'[^a-z0-9-_]', '', username)
-    username = re.sub(r'^[0-9-]+', '', username)
-    username = re.sub(r'-$', '', username)
-    username = username[:63]
-    return username
+    return clean_username_for_explicit_user_v1(username)
 
 
 def fill_template(template_ref: str, variables: dict[str, Any],

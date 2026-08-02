@@ -9,6 +9,8 @@ import pytest
 
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
+from tests.unit_tests import (test_serve_resource_action_launch_execution_config
+                              as launch_config_fixtures)
 
 _SERVICE_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
@@ -241,42 +243,11 @@ def _identity(generation: int = 1) -> dict:
 
 
 def _target() -> dict:
-    return {
-        'version': 1,
-        'profile': 'pod_cluster_v1',
-        'cloud': 'kubernetes',
-        'region': None,
-        'zone': None,
-        'sky_cluster_name': 'svc-7',
-        'sky_cluster_record_uuid': _CLUSTER_UUID,
-        'kubernetes': {
-            'cluster_fingerprint_sha256': 'a' * 64,
-            'namespace': 'serve-prod',
-            'workload_kind': 'Pod',
-            'workload_name': 'svc-7',
-            'cluster_record_uuid_label': _CLUSTER_UUID,
-            'replica_incarnation_label': _REPLICA_UUID,
-        },
-    }
+    return launch_config_fixtures._target()
 
 
 def _resources() -> dict:
-    return {
-        'version': 1,
-        'cloud': 'kubernetes',
-        'cluster_fingerprint_sha256': 'a' * 64,
-        'namespace': 'serve-prod',
-        'instance_type': None,
-        'accelerator': None,
-        'cpus': '8',
-        'memory': '32',
-        'image_id': 'docker:example/image@sha256:' + '9' * 64,
-        'disk_size_gb': 100,
-        'disk_tier': None,
-        'ports': ['8000'],
-        'labels': [],
-        'use_spot': False,
-    }
+    return launch_config_fixtures._resource_snapshot()
 
 
 def _launch_invocation() -> dict:
@@ -287,33 +258,10 @@ def _launch_invocation() -> dict:
         'action_kind': 'launch',
         'resource_identity': _identity(),
         'requested_target': _target(),
-        'launch': {
-            'source': {
-                'store': 'serve_version_specs',
-                'service_name': 'svc',
-                'service_incarnation': _SERVICE_UUID,
-                'service_version': 3,
-                'yaml_content_sha256': 'b' * 64,
-                'workspace': 'workspace',
-            },
-            'resources': _resources(),
-            'replica_env': {
-                'SKYPILOT_SERVE_REPLICA_ID': '7'
-            },
-            'security_group_scope': 'not_applicable:kubernetes',
-            'admin_policy_input_sha256': 'c' * 64,
-            'admin_policy_output_sha256': 'd' * 64,
-            'retry_until_up': True,
-            'exact_resources_override': True,
-            'backend': 'cloud_vm_ray',
-            'optimize_target': 'cost',
-            'dryrun': False,
-            'no_setup': False,
-            'clone_disk_from': None,
-            'fast': False,
-            'file_mounts_blob_id': None,
-            'tls_material_ref': None,
-        },
+        'launch': launch_config_fixtures.launch_payload(_identity(),
+                                                        _target(),
+                                                        _resources(),
+                                                        workspace='workspace'),
         'down': None,
     }
 
