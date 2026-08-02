@@ -286,6 +286,60 @@ class TestPaidCapacityAuthorityPG:
                                                 workspace='workspace',
                                                 num_nodes=1)
 
+    def test_outcome_persistence_reports_only_committed_claim_pools(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        _, pool_key = self._paid_pool('us-east-1a', 'g6.xlarge')
+        claimed = self._info('svc', 1)
+        unclaimed = self._info('svc', 2)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            claimed,
+            pool_key=pool_key,
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        claimed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        unclaimed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        applied_pool_keys: set[str] = set()
+
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, claimed), (2, unclaimed)], {
+                1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+                2: paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+            },
+            base_limit=2,
+            max_limit=8,
+            now=101,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'),
+            applied_outcome_pool_keys=applied_pool_keys)
+        assert applied_pool_keys == {pool_key}
+
+        no_claim_pool_keys: set[str] = set()
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, claimed)],
+            {1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=102,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'),
+            applied_outcome_pool_keys=no_claim_pool_keys)
+        assert not no_claim_pool_keys
+
     def test_priority_waiter_and_success_failure_ramp(self, broker_engine,
                                                       monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
@@ -605,6 +659,63 @@ class TestPaidCapacityAuthorityPG:
         assert set(pool_keys) == set(claim_pool_keys)
         assert len(replica_ids) == 3
         assert waiter_count == 0
+
+    def test_stale_dynamic_snapshots_serialize_last_service_slot(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        def _claim(replica_id: int) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                self._info('svc', replica_id),
+                pool_key=f'pool-{replica_id}',
+                priority=20,
+                base_limit=4,
+                max_limit=8,
+                service_limit=24,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'))
+
+        for replica_id in range(1, 24):
+            assert _claim(replica_id) == 'acquired'
+
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def _race(replica_id: int) -> None:
+            try:
+                barrier.wait(timeout=20)
+                results.append(_claim(replica_id))
+            except Exception as error:  # pylint: disable=broad-except
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=_race, args=(replica_id,))
+            for replica_id in (24, 25)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), 'dynamic service admission hung'
+
+        assert not errors, errors
+        assert sorted(results) == ['acquired', 'service_saturated']
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim_count = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(serve_state.paid_capacity_claims_table).where(
+                    serve_state.paid_capacity_claims_table.c.service_name ==
+                    'svc')).scalar_one()
+        assert claim_count == 24
 
     def test_service_envelope_preserves_legacy_overage_and_prunes_stale(
             self, broker_engine, monkeypatch):

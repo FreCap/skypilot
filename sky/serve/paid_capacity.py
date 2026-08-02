@@ -40,6 +40,10 @@ _BASE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_LAUNCH_WINDOW'
 _MAX_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_LOCATION_MAX_LAUNCH_WINDOW'
 _SERVICE_LIMIT_DEFAULT = 16
 _SERVICE_LIMIT_ENV_VAR = 'SKYPILOT_SERVE_PAID_SERVICE_LAUNCH_WINDOW'
+_SERVICE_MAX_LIMIT_ENV_VAR = ('SKYPILOT_SERVE_PAID_SERVICE_MAX_LAUNCH_WINDOW')
+_SERVICE_LIMIT_PROFILES_ENV_VAR = (
+    'SKYPILOT_SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES')
+_SERVICE_LIMIT_PROFILES_VERSION = 1
 _EXPLORATION_FRONTIER_ENV_VAR = (
     'SKYPILOT_SERVE_PAID_LOCATION_EXPLORATION_FRONTIER')
 _MAX_EXPLORATION_FRONTIER_ENV_VAR = (
@@ -87,6 +91,14 @@ class LaunchOutcome(enum.Enum):
     OTHER_FAILURE = 'other_failure'
 
 
+@dataclasses.dataclass(frozen=True)
+class CompletedLaunchPersistence:
+    """Committed result of one completed launch wave."""
+
+    ownership_valid: bool
+    applied_pool_keys: frozenset[str] = frozenset()
+
+
 @dataclasses.dataclass
 class LaunchBudget:
     """One wave's advisory headroom and exact pool identity."""
@@ -98,6 +110,7 @@ class LaunchBudget:
     priority_deferred_pool_keys: set[str] = dataclasses.field(
         default_factory=set)
     service_remaining: int | None = None
+    service_claim_limit: int | None = None
     frontier_limit: int | None = None
     frontier_key_by_location: dict[spot_placer.Location,
                                    FrontierKey] = (dataclasses.field(
@@ -145,6 +158,17 @@ class AdmissionLimit:
     cooldown_until: float | None
 
 
+@dataclasses.dataclass(frozen=True)
+class ServiceLimitProfile:
+    """One exact service-incarnation adaptive-window override."""
+
+    workspace: str
+    service_name: str
+    service_hash: str
+    max_launch_window: int
+    max_exploration_frontier: int | None = None
+
+
 @functools.cache
 def _parse_positive_int(raw_value: str | None, default: int,
                         variable: str) -> int:
@@ -186,6 +210,102 @@ def service_limit() -> int:
                                _SERVICE_LIMIT_DEFAULT, _SERVICE_LIMIT_ENV_VAR)
 
 
+@functools.cache
+def _parse_service_limit_profiles(
+        raw_value: str | None) -> tuple[ServiceLimitProfile, ...]:
+    """Parse exact-incarnation adaptive-window profiles, failing closed."""
+    if not raw_value:
+        return ()
+    try:
+        document = json.loads(raw_value)
+        if (not isinstance(document, dict) or
+                set(document) != {'version', 'profiles'} or
+                type(document['version']) is not int or  # pylint: disable=unidiomatic-typecheck
+                document['version'] != _SERVICE_LIMIT_PROFILES_VERSION
+                or not isinstance(document['profiles'], list)):
+            raise ValueError('document has invalid fields or version')
+        profiles = []
+        identities = set()
+        for value in document['profiles']:
+            required_fields = {
+                'workspace', 'service_name', 'service_hash', 'max_launch_window'
+            }
+            allowed_fields = required_fields | {'max_exploration_frontier'}
+            if (not isinstance(value, dict) or
+                    not required_fields.issubset(value) or
+                    not set(value).issubset(allowed_fields)):
+                raise ValueError('profile has invalid fields')
+            workspace = value['workspace']
+            service_name = value['service_name']
+            service_hash = value['service_hash']
+            max_launch_window = value['max_launch_window']
+            profile_max_frontier = value.get('max_exploration_frontier')
+            if (not isinstance(workspace, str) or not workspace or
+                    not isinstance(service_name, str) or not service_name or
+                    not isinstance(service_hash, str) or not service_hash or
+                    type(max_launch_window) is not int or  # pylint: disable=unidiomatic-typecheck
+                    max_launch_window <= 0 or
+                (profile_max_frontier is not None and
+                 (type(profile_max_frontier) is not int or  # pylint: disable=unidiomatic-typecheck
+                  profile_max_frontier <= 0))):
+                raise ValueError('profile contains invalid values')
+            identity = (workspace, service_name, service_hash)
+            if identity in identities:
+                raise ValueError('profile identities must be unique')
+            identities.add(identity)
+            profiles.append(
+                ServiceLimitProfile(
+                    workspace=workspace,
+                    service_name=service_name,
+                    service_hash=service_hash,
+                    max_launch_window=max_launch_window,
+                    max_exploration_frontier=(profile_max_frontier)))
+        return tuple(profiles)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        logger.warning('Ignoring invalid paid service launch-window profile '
+                       f'document: {error}.')
+        return ()
+
+
+def _matching_service_profile(
+        workspace: str | None, service_name: str | None,
+        service_hash: str | None) -> ServiceLimitProfile | None:
+    if not workspace or not service_name or not service_hash:
+        return None
+    profiles = _parse_service_limit_profiles(
+        os.environ.get(_SERVICE_LIMIT_PROFILES_ENV_VAR))
+    return next(
+        (profile for profile in profiles
+         if (profile.workspace, profile.service_name,
+             profile.service_hash) == (workspace, service_name, service_hash)),
+        None)
+
+
+def max_service_limit(*,
+                      workspace: str | None = None,
+                      service_name: str | None = None,
+                      service_hash: str | None = None) -> int:
+    """Return the effective adaptive ceiling for one service incarnation."""
+    floor = service_limit()
+    configured = _parse_positive_int(os.environ.get(_SERVICE_MAX_LIMIT_ENV_VAR),
+                                     _SERVICE_LIMIT_DEFAULT,
+                                     _SERVICE_MAX_LIMIT_ENV_VAR)
+    profile = _matching_service_profile(workspace, service_name, service_hash)
+    if profile is not None:
+        configured = profile.max_launch_window
+    if configured < floor:
+        _warn_service_max_below_floor(floor, configured)
+    return max(floor, configured)
+
+
+@functools.cache
+def _warn_service_max_below_floor(floor: int, configured: int) -> None:
+    logger.warning(
+        'Paid service maximum launch window '
+        f'{configured} is below the cold launch window {floor}; using '
+        f'{floor}.')
+
+
 def exploration_frontier() -> int:
     """Return the number of paid pools one service/card may explore."""
     return _parse_positive_int(os.environ.get(_EXPLORATION_FRONTIER_ENV_VAR),
@@ -198,6 +318,18 @@ def max_exploration_frontier() -> int:
     configured = _parse_positive_int(
         os.environ.get(_MAX_EXPLORATION_FRONTIER_ENV_VAR),
         _MAX_EXPLORATION_FRONTIER_DEFAULT, _MAX_EXPLORATION_FRONTIER_ENV_VAR)
+    return max(exploration_frontier(), configured)
+
+
+def max_service_exploration_frontier(*,
+                                     workspace: str | None = None,
+                                     service_name: str | None = None,
+                                     service_hash: str | None = None) -> int:
+    """Return one incarnation's delayed-feedback frontier ceiling."""
+    configured = max_exploration_frontier()
+    profile = _matching_service_profile(workspace, service_name, service_hash)
+    if (profile is not None and profile.max_exploration_frontier is not None):
+        configured = profile.max_exploration_frontier
     return max(exploration_frontier(), configured)
 
 
@@ -398,8 +530,42 @@ def _pool_key_payload(key: str) -> dict[str, Any] | None:
         payload = json.loads(key)
     except (TypeError, ValueError):
         return None
-    if (not isinstance(payload, dict) or
-            payload.get('version') != _POOL_KEY_VERSION):
+    expected_fields = {
+        'version', 'workspace', 'cloud', 'region', 'zone', 'instance_type',
+        'accelerators', 'use_spot', 'num_nodes'
+    }
+    if (not isinstance(payload, dict) or set(payload) != expected_fields or
+            type(payload.get('version')) is not int or  # pylint: disable=unidiomatic-typecheck
+            payload['version'] != _POOL_KEY_VERSION
+            or not isinstance(payload.get('workspace'), str)
+            or not payload['workspace']
+            or not isinstance(payload.get('cloud'), str) or not payload['cloud']
+            or not isinstance(payload.get('region'), str)
+            or not payload['region'] or
+        (payload.get('zone') is not None and
+         (not isinstance(payload['zone'], str) or not payload['zone'])) or
+        (payload.get('instance_type') is not None and
+         (not isinstance(payload['instance_type'], str) or
+          not payload['instance_type']))
+            or type(payload.get('use_spot')) is not bool or  # pylint: disable=unidiomatic-typecheck
+            type(payload.get('num_nodes')) is not int or  # pylint: disable=unidiomatic-typecheck
+            payload['num_nodes'] <= 0
+            or not isinstance(payload.get('accelerators'), list)):
+        return None
+    names = []
+    for accelerator in payload['accelerators']:
+        if (not isinstance(accelerator, list) or len(accelerator) != 2 or
+                not isinstance(accelerator[0], str) or not accelerator[0] or
+                accelerator[0] != accelerator[0].casefold() or
+                not isinstance(accelerator[1], (int, float)) or
+                isinstance(accelerator[1], bool) or
+                not math.isfinite(accelerator[1]) or accelerator[1] <= 0):
+            return None
+        names.append(accelerator[0])
+    if len(names) != len(set(names)) or names != sorted(names,
+                                                        key=str.casefold):
+        return None
+    if json.dumps(payload, sort_keys=True, separators=(',', ':')) != key:
         return None
     return payload
 
@@ -409,16 +575,7 @@ def frontier_key_from_pool_key(key: str) -> FrontierKey | None:
     payload = _pool_key_payload(key)
     if payload is None:
         return None
-    accelerators = payload.get('accelerators')
-    if not isinstance(accelerators, list):
-        return None
-    names = []
-    for accelerator in accelerators:
-        if (not isinstance(accelerator, list) or len(accelerator) != 2 or
-                not isinstance(accelerator[0], str)):
-            return None
-        names.append(accelerator[0].casefold())
-    return tuple(sorted(names, key=str.casefold))
+    return tuple(accelerator[0] for accelerator in payload['accelerators'])
 
 
 def failure_domain_from_pool_key(key: str) -> FailureDomainKey | None:
@@ -516,17 +673,91 @@ def _service_claim_count(
         for info in existing_replica_infos)
 
 
+def _evidence_aware_service_limit(
+    *,
+    paid_locations: Iterable[spot_placer.Location],
+    states_by_pool_key: Mapping[str, Mapping[str, Any]],
+    pool_key_by_location: Mapping[spot_placer.Location, str],
+    frontier_key_by_location: Mapping[spot_placer.Location, FrontierKey],
+    owned_pool_keys_by_frontier: Mapping[FrontierKey, set[str]],
+    unknown_owned_pool_keys: set[str],
+    requested_frontier_keys: set[FrontierKey] | None,
+    floor: int,
+    ceiling: int,
+    frontier_ceiling: int | None = None,
+) -> int:
+    """Return a bounded service envelope backed by durable pool success."""
+    floor = max(1, int(floor))
+    ceiling = max(floor, int(ceiling))
+    if ceiling == floor:
+        return floor
+
+    ordered_candidates: dict[FrontierKey,
+                             list[str]] = (collections.defaultdict(list))
+    for location in paid_locations:
+        frontier = frontier_key_by_location.get(location,
+                                                frontier_key(location))
+        if (requested_frontier_keys is not None and
+                frontier not in requested_frontier_keys):
+            continue
+        pool = pool_key_by_location.get(location)
+        if pool is not None and pool not in ordered_candidates[frontier]:
+            ordered_candidates[frontier].append(pool)
+
+    productive_limit = 0
+    base_frontier = exploration_frontier()
+    maximum_frontier = max(
+        base_frontier,
+        max_exploration_frontier()
+        if frontier_ceiling is None else frontier_ceiling)
+    for frontier, candidates in ordered_candidates.items():
+        owned = (set(owned_pool_keys_by_frontier.get(frontier, set())) |
+                 unknown_owned_pool_keys)
+        frontier_width = min(maximum_frontier, max(base_frontier, len(owned)))
+        # Opaque claims consume every card frontier and contribute no positive
+        # evidence. Known owned pools follow in candidate cost order, then the
+        # cheapest eligible unowned pools fill the remaining bounded frontier.
+        opaque_pools = set(unknown_owned_pool_keys)
+        known_owned_pools = set(owned_pool_keys_by_frontier.get(
+            frontier, set()))
+        ordered_pools = sorted(opaque_pools)
+        ordered_pools.extend(
+            pool for pool in candidates
+            if pool in known_owned_pools and pool not in ordered_pools)
+        ordered_pools.extend(pool for pool in sorted(known_owned_pools)
+                             if pool not in ordered_pools)
+        ordered_pools.extend(
+            pool for pool in candidates if pool not in ordered_pools)
+        for pool in ordered_pools[:frontier_width]:
+            if pool in opaque_pools:
+                continue
+            state = states_by_pool_key.get(pool)
+            if (state is None or state.get('admission_state') != 'active' or
+                    state.get('last_success_at') is None):
+                continue
+            admission_limit = state.get('admission_limit')
+            if (type(admission_limit) is int and  # pylint: disable=unidiomatic-typecheck
+                    admission_limit > 0):
+                productive_limit += admission_limit
+                if productive_limit >= ceiling:
+                    return ceiling
+    return min(ceiling, max(floor, productive_limit))
+
+
 def build_launch_budget(
     placer: spot_placer.SpotPlacer,
     *,
     workspace: str,
     existing_replica_infos: list['replica_managers.ReplicaInfo'],
     globally_managed: bool,
+    service_name: str | None = None,
+    service_hash: str | None = None,
+    requested_frontier_keys: set[FrontierKey] | None = None,
 ) -> LaunchBudget:
     """Read one advisory shared-capacity snapshot for all active paid pools."""
     zero_cost = set(placer.zero_cost_locations())
     paid_locations = [
-        location for location in placer.active_locations()
+        location for location in placer.ranked_active_locations()
         if location not in zero_cost
     ]
     keys = {
@@ -554,7 +785,6 @@ def build_launch_budget(
         for location, key in keys.items()
     }
     service_claims = _service_claim_count(existing_replica_infos)
-    service_claim_limit = service_limit()
     frontier_keys = {
         location: frontier_key(location) for location in paid_locations
     }
@@ -603,18 +833,36 @@ def build_launch_budget(
             oldest_by_frontier[parsed_frontier] = min(
                 normalized_claimed_at,
                 oldest_by_frontier.get(parsed_frontier, normalized_claimed_at))
+    configured_frontier = exploration_frontier()
+    configured_max_frontier = max_service_exploration_frontier(
+        workspace=workspace,
+        service_name=service_name,
+        service_hash=service_hash)
+    service_claim_limit = _evidence_aware_service_limit(
+        paid_locations=paid_locations,
+        states_by_pool_key=states,
+        pool_key_by_location=keys,
+        frontier_key_by_location=frontier_keys,
+        owned_pool_keys_by_frontier=owned_by_frontier,
+        unknown_owned_pool_keys=unknown_owned_pool_keys,
+        requested_frontier_keys=requested_frontier_keys,
+        floor=service_limit(),
+        ceiling=max_service_limit(workspace=workspace,
+                                  service_name=service_name,
+                                  service_hash=service_hash),
+        frontier_ceiling=configured_max_frontier)
     _log_admission_summary(states,
                            service_claims=service_claims,
                            service_claim_limit=service_claim_limit)
-    configured_frontier = exploration_frontier()
     return LaunchBudget(
         remaining_by_location=remaining,
         pool_key_by_location=keys,
         states_by_pool_key=states,
         globally_managed=True,
         service_remaining=max(0, service_claim_limit - service_claims),
+        service_claim_limit=service_claim_limit,
         frontier_limit=configured_frontier,
-        max_frontier_limit=max(configured_frontier, max_exploration_frontier()),
+        max_frontier_limit=configured_max_frontier,
         frontier_feedback_delay_seconds=(exploration_feedback_delay_seconds()),
         frontier_key_by_location=frontier_keys,
         failure_domain_by_location=failure_domains,
@@ -1045,7 +1293,8 @@ def try_persist_claim(
                      min(constants.LB_REQUEST_PRIORITY_MAX, priority)),
         base_limit=base_limit(),
         max_limit=max_limit(),
-        service_limit=service_limit(),
+        service_limit=(budget.service_claim_limit if budget.service_claim_limit
+                       is not None else service_limit()),
         now=None,
         success_ttl_seconds=success_ttl_seconds(),
         failure_cooldown_seconds=failure_cooldown_seconds(),
@@ -1116,18 +1365,24 @@ def persist_completed_launches(
     controller_owner: tuple[int | None, str | None] | None,
     replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
     outcomes: dict[int, LaunchOutcome],
-) -> bool | None:
+) -> CompletedLaunchPersistence | None:
     """Persist completed rows and feed claimed outcomes into the ramp."""
     if service_hash is None or not central_authority_available():
         return None
-    return serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
-        service_name,
-        service_hash,
-        replica_infos,
-        outcomes,
-        base_limit=base_limit(),
-        max_limit=max_limit(),
-        now=None,
-        success_ttl_seconds=success_ttl_seconds(),
-        failure_cooldown_seconds=failure_cooldown_seconds(),
-        expected_controller_owner=controller_owner)
+    applied_pool_keys: set[str] = set()
+    ownership_valid = (
+        serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            service_name,
+            service_hash,
+            replica_infos,
+            outcomes,
+            base_limit=base_limit(),
+            max_limit=max_limit(),
+            now=None,
+            success_ttl_seconds=success_ttl_seconds(),
+            failure_cooldown_seconds=failure_cooldown_seconds(),
+            expected_controller_owner=controller_owner,
+            applied_outcome_pool_keys=applied_pool_keys))
+    return CompletedLaunchPersistence(
+        ownership_valid=ownership_valid,
+        applied_pool_keys=frozenset(applied_pool_keys))

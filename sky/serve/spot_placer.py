@@ -808,6 +808,27 @@ class SpotPlacer:
         """
         raise NotImplementedError
 
+    def ranked_active_locations(
+            self,
+            allowed_locations: set[Location] | None = None) -> list[Location]:
+        """Return active candidates in the placer's actual cost order.
+
+        This is an observation-only counterpart to repeated
+        select_next_location calls over paid candidates. It deliberately
+        delegates every rank to _min_cost_location so specialized placers,
+        such as capacity-aware per-slot pricing, keep identical semantics.
+        """
+        remaining = [
+            location for location in self.active_locations()
+            if allowed_locations is None or location in allowed_locations
+        ]
+        ranked = []
+        while remaining:
+            selected = self._min_cost_location(remaining)
+            ranked.append(selected)
+            remaining.remove(selected)
+        return ranked
+
     def resolve_location(
             self,
             location: Location,

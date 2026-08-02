@@ -2688,6 +2688,7 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
     success_ttl_seconds: float,
     failure_cooldown_seconds: float = 10 * 60,
     expected_controller_owner: tuple[int | None, str | None] | None,
+    applied_outcome_pool_keys: set[str] | None = None,
 ) -> bool:
     """Persist a completed launch wave and release claims atomically."""
     engine = _db_manager.get_engine()
@@ -2797,6 +2798,11 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
                         last_success_at=now,
                         updated_at=now))
         session.commit()
+        if applied_outcome_pool_keys is not None:
+            # Expose only claim-backed outcomes after their transaction is
+            # durable. Callers use this as the authorization boundary for an
+            # immediate replacement tick.
+            applied_outcome_pool_keys.update(outcomes_by_pool)
     return True
 
 
