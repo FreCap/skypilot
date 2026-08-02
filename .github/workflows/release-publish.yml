@@ -64,6 +64,13 @@ jobs:
           build
           --user
 
+      - name: Verify standalone worker runtime release resource
+        run: |
+          python sky/setup_files/worker_runtime_packaging.py \
+            verify-source-resource \
+            --repo-root . \
+            --output-dir "${RUNNER_TEMP}/worker-runtime"
+
       - name: Build a binary wheel and a source tarball
         run: >-
           python -m

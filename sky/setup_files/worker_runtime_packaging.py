@@ -7,6 +7,9 @@ available, and by the API server when it constructs an internal worker bundle.
 
 import argparse
 import base64
+from collections.abc import Iterable
+from collections.abc import Mapping
+from collections.abc import Sequence
 import csv
 import dataclasses
 from email import parser as email_parser
@@ -21,7 +24,7 @@ import runpy
 import shutil
 import stat
 import tempfile
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 import zipfile
 
 WORKER_RUNTIME_DISTRIBUTION = 'skypilot-worker-runtime-v1'
@@ -281,7 +284,7 @@ def build_worker_runtime_wheel(repo_root: pathlib.Path,
         'Summary: Provider-free coordinated worker runtime for SkyPilot\n'
         'License: Apache-2.0\n'
         'Requires-Python: >=3.10\n'
-        '\n').encode('utf-8')
+        '\n').encode()
     wheel_metadata = ('Wheel-Version: 1.0\n'
                       'Generator: skypilot-worker-runtime-packager-v1\n'
                       'Root-Is-Purelib: true\n'
@@ -525,6 +528,27 @@ def load_release_worker_runtime_artifact(resource_dir: pathlib.Path,
     return wheel
 
 
+def verify_source_and_release_worker_runtime(
+        repo_root: pathlib.Path, output_dir: pathlib.Path) -> pathlib.Path:
+    """Rebuilds the runtime and proves the checked-in release bytes match."""
+    repo_root = repo_root.resolve()
+    version = _runtime_version(repo_root)
+    built_wheel = build_worker_runtime_wheel(repo_root, output_dir)
+    lock_path = (repo_root / 'addons' / 'submission-containment' /
+                 'python-runtime' / WORKER_RUNTIME_LOCK_FILENAME)
+    built_record = verify_worker_runtime_lock(repo_root, built_wheel, lock_path)
+    resource_dir = (repo_root / 'sky' / 'skylet' / 'runtime_wheels' / 'v1')
+    release_wheel = load_release_worker_runtime_artifact(resource_dir, version)
+    release_record = WheelRecord.from_path(release_wheel)
+    if built_record != release_record:
+        raise ValueError(
+            'rebuilt worker runtime does not match the release resource')
+    if built_wheel.read_bytes() != release_wheel.read_bytes():
+        raise ValueError(
+            'rebuilt worker runtime bytes do not match the release resource')
+    return built_wheel
+
+
 def make_internal_bundle_manifest(
         source_input_sha256: str, main_wheel: pathlib.Path,
         worker_wheel: pathlib.Path) -> InternalBundleManifest:
@@ -631,17 +655,24 @@ def materialize_internal_bundle(cache_root: pathlib.Path,
             shutil.rmtree(temporary)
 
 
-def render_remote_bundle_verifier(expected_digest: str,
-                                  expected_runtime_version: str) -> str:
+def render_remote_bundle_verifier(expected_runtime_version: str) -> str:
     """Renders a self-contained verifier that prints main/runtime paths."""
     runtime_filename = worker_runtime_wheel_filename(expected_runtime_version)
     domain = INTERNAL_BUNDLE_DIGEST_DOMAIN
     return f'''import hashlib
 import json
 import pathlib
+import shlex
 import sys
 
+if len(sys.argv) != 3:
+    raise SystemExit('SkyPilot wheel bundle verifier requires path and digest')
 bundle = pathlib.Path(sys.argv[1])
+expected_digest = sys.argv[2]
+if (len(expected_digest) != 64 or
+        any(character not in '0123456789abcdef'
+            for character in expected_digest)):
+    raise SystemExit('invalid expected SkyPilot wheel bundle digest')
 manifest_path = bundle / {INTERNAL_BUNDLE_MANIFEST!r}
 if not bundle.is_dir() or bundle.is_symlink():
     raise SystemExit('invalid SkyPilot wheel bundle directory')
@@ -686,24 +717,160 @@ for record in wheels:
     if len(contents) != record['size'] or hashlib.sha256(contents).hexdigest() != record['sha256']:
         raise SystemExit('SkyPilot wheel digest mismatch')
 digest = hashlib.sha256({domain!r} + raw).hexdigest()
-if digest != {expected_digest!r}:
+if digest != expected_digest:
     raise SystemExit('SkyPilot wheel bundle digest mismatch')
-print(bundle / wheels[0]['filename'])
-print(bundle / wheels[1]['filename'])'''
+print('SKYPILOT_MAIN_WHEEL=' + shlex.quote(str(bundle / wheels[0]['filename'])))
+print('SKYPILOT_RUNTIME_WHEEL=' + shlex.quote(str(bundle / wheels[1]['filename'])))'''
 
 
 def render_installed_distribution_probe(expected_sky_version: str,
                                         expected_runtime_version: str) -> str:
-    return f'''import importlib.metadata
+    """Renders an exact installed-tree probe for two verified wheel paths."""
+    return f'''import hashlib
+import importlib
+import importlib.metadata
+import importlib.util
+import pathlib
+import re
+import shutil
+import stat
+import sys
+import zipfile
 
-if importlib.metadata.version('skypilot') != {expected_sky_version!r}:
-    raise SystemExit('installed SkyPilot version mismatch')
-if importlib.metadata.version({WORKER_RUNTIME_DISTRIBUTION!r}) != {expected_runtime_version!r}:
-    raise SystemExit('installed worker runtime version mismatch')
-import sky
-import skypilot_worker_runtime
+def fail(message):
+    raise SystemExit(message)
+
+def digest_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def digest_member(wheel, info):
+    digest = hashlib.sha256()
+    with wheel.open(info) as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def normalized_project_name(value):
+    return re.sub(r'[-_.]+', '-', value).lower()
+
+def verify_distribution(project, import_name, expected_version, wheel_arg):
+    wheel_path = pathlib.Path(wheel_arg)
+    if not wheel_path.is_file() or wheel_path.is_symlink():
+        fail(f'expected {{project}} wheel is not a regular file')
+    try:
+        wheel = zipfile.ZipFile(wheel_path)
+    except zipfile.BadZipFile as error:
+        fail(f'expected {{project}} wheel is not a valid ZIP: {{error}}')
+    with wheel:
+        infos = [info for info in wheel.infolist() if not info.is_dir()]
+        names = [info.filename for info in infos]
+        if len(names) != len(set(names)):
+            fail(f'expected {{project}} wheel has duplicate members')
+        expected = {{}}
+        package_roots = set()
+        for info in infos:
+            name = info.filename
+            path = pathlib.PurePosixPath(name)
+            if (path.is_absolute() or path.as_posix() != name or
+                    '..' in path.parts or '\\\\' in name):
+                fail(f'expected {{project}} wheel has an unsafe member')
+            mode = info.external_attr >> 16
+            if mode and not stat.S_ISREG(mode):
+                fail(f'expected {{project}} wheel has a non-regular member')
+            if name.endswith('.dist-info/RECORD'):
+                continue
+            if path.parts[0].endswith('.data'):
+                fail(f'expected {{project}} wheel uses unsupported .data')
+            expected[name] = info
+            if not path.parts[0].endswith('.dist-info'):
+                package_roots.add(path.parts[0])
+        spec = importlib.util.find_spec(import_name)
+        if spec is None or spec.origin is None:
+            fail(f'installed {{project}} import package is missing')
+        active_module = pathlib.Path(spec.origin)
+        if active_module.name != '__init__.py':
+            fail(f'installed {{project}} import package is not regular')
+        install_root = active_module.parent.parent
+        matches = [
+            candidate for candidate in importlib.metadata.distributions(
+                path=[str(install_root)])
+            if normalized_project_name(candidate.metadata.get('Name', '')) ==
+            normalized_project_name(project)
+        ]
+        if len(matches) != 1:
+            fail(f'installed {{project}} distribution metadata is ambiguous')
+        distribution = matches[0]
+        if distribution.version != expected_version:
+            fail(f'installed {{project}} version mismatch')
+        for name, info in expected.items():
+            actual = pathlib.Path(distribution.locate_file(name))
+            if not actual.is_file() or actual.is_symlink():
+                fail(f'installed {{project}} file is missing: {{name}}')
+            if (actual.stat().st_size != info.file_size or
+                    digest_file(actual) != digest_member(wheel, info)):
+                fail(f'installed {{project}} file mismatch: {{name}}')
+        bytecode_roots = set()
+        for root in package_roots:
+            installed_root = pathlib.Path(distribution.locate_file(root))
+            if not installed_root.is_dir() or installed_root.is_symlink():
+                fail(f'installed {{project}} package root is invalid: {{root}}')
+            for actual in installed_root.rglob('*'):
+                if actual.is_dir():
+                    if actual.is_symlink():
+                        fail(f'installed {{project}} package has a symlink')
+                    continue
+                relative = actual.relative_to(installed_root).as_posix()
+                name = f'{{root}}/{{relative}}'
+                if name in expected:
+                    continue
+                parts = pathlib.PurePosixPath(relative).parts
+                if ('__pycache__' in parts and actual.suffix == '.pyc' and
+                        actual.is_file() and not actual.is_symlink()):
+                    bytecode_root = next(
+                        parent for parent in (actual, *actual.parents)
+                        if parent.name == '__pycache__')
+                    bytecode_roots.add(bytecode_root)
+                    continue
+                fail(f'installed {{project}} has an unexpected file: {{name}}')
+        return distribution, package_roots, bytecode_roots
+
+def verify_import(project, import_name, distribution):
+    module = importlib.import_module(import_name)
+    module_file = pathlib.Path(module.__file__)
+    expected_module = pathlib.Path(
+        distribution.locate_file(import_name.replace('.', '/') +
+                                 '/__init__.py'))
+    if (not module_file.is_file() or not expected_module.is_file() or
+            not module_file.samefile(expected_module)):
+        fail(f'imported {{project}} package root mismatch')
+    module_paths = tuple(pathlib.Path(path) for path in module.__path__)
+    if (len(module_paths) != 1 or not module_paths[0].is_dir() or
+            not module_paths[0].samefile(expected_module.parent)):
+        fail(f'imported {{project}} package search path mismatch')
+    return module
+
+if len(sys.argv) != 3:
+    fail('installed distribution probe requires two wheel paths')
+sky_distribution, sky_roots, sky_bytecode = verify_distribution(
+    'skypilot', 'sky', {expected_sky_version!r}, sys.argv[1])
+runtime_distribution, runtime_roots, runtime_bytecode = verify_distribution(
+    {WORKER_RUNTIME_DISTRIBUTION!r},
+    {WORKER_RUNTIME_IMPORT_PACKAGE!r}, {expected_runtime_version!r},
+    sys.argv[2])
+if not sky_roots.isdisjoint(runtime_roots):
+    fail('installed SkyPilot distributions have overlapping package roots')
+for bytecode_root in sorted(sky_bytecode | runtime_bytecode):
+    shutil.rmtree(bytecode_root)
+sys.dont_write_bytecode = True
+sky = verify_import('skypilot', 'sky', sky_distribution)
+verify_import({WORKER_RUNTIME_DISTRIBUTION!r},
+              {WORKER_RUNTIME_IMPORT_PACKAGE!r}, runtime_distribution)
 if sky.__version__ != {expected_sky_version!r}:
-    raise SystemExit('imported SkyPilot version mismatch')'''
+    fail('imported SkyPilot version mismatch')'''
 
 
 def _parse_args() -> argparse.Namespace:
@@ -723,6 +890,10 @@ def _parse_args() -> argparse.Namespace:
     resource.add_argument('--repo-root', type=pathlib.Path, required=True)
     resource.add_argument('--wheel', type=pathlib.Path, required=True)
     resource.add_argument('--resource-dir', type=pathlib.Path, required=True)
+
+    verify = subparsers.add_parser('verify-source-resource')
+    verify.add_argument('--repo-root', type=pathlib.Path, required=True)
+    verify.add_argument('--output-dir', type=pathlib.Path, required=True)
     return parser.parse_args()
 
 
@@ -738,6 +909,10 @@ def _main() -> None:
         print(
             write_release_resource(args.wheel, args.resource_dir,
                                    _runtime_version(args.repo_root)))
+    elif args.command == 'verify-source-resource':
+        print(
+            verify_source_and_release_worker_runtime(args.repo_root,
+                                                     args.output_dir))
     else:
         raise AssertionError(f'unhandled command: {args.command}')
 

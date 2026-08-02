@@ -1,10 +1,14 @@
 """Constants for SkyPilot."""
+import base64
 import enum
+import shlex
+import zlib
 
 from packaging import version
 
 import sky
 from sky.setup_files import dependencies
+from sky.setup_files import worker_runtime_packaging as runtime_packaging
 
 # The base directory for all SkyPilot runtime artifacts.
 # Historically, we have always used $HOME, but we couldn't
@@ -303,6 +307,29 @@ UV_INSTALLATION_COMMANDS = (
 )
 
 _sky_version = str(version.parse(sky.__version__))
+_worker_runtime_version = (
+    dependencies.COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION)
+
+
+def _quote_python_script(script: str) -> str:
+    """Returns a shell-safe, single-line Python ``-c`` argument."""
+    payload = base64.b64encode(zlib.compress(script.encode('utf-8'),
+                                             level=9)).decode('ascii')
+    argument = (
+        'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode('
+        f'{payload!r})),"<sky-bootstrap>","exec"))')
+    assert '\n' not in argument
+    return shlex.quote(argument)
+
+
+_wheel_bundle_verifier = _quote_python_script(
+    runtime_packaging.render_remote_bundle_verifier(_worker_runtime_version))
+_installed_distribution_probe = _quote_python_script(
+    runtime_packaging.render_installed_distribution_probe(
+        _sky_version, _worker_runtime_version))
+_installed_distribution_probe_command = (
+    f'{SKY_PYTHON_CMD} -c {_installed_distribution_probe} '
+    '"$SKYPILOT_MAIN_WHEEL" "$SKYPILOT_RUNTIME_WHEEL"')
 RAY_STATUS = f'RAY_ADDRESS=127.0.0.1:{SKY_REMOTE_RAY_PORT} {SKY_RAY_CMD} status'
 RAY_INSTALLATION_COMMANDS = (
     f'{SKY_UV_INSTALL_CMD};'
@@ -377,9 +404,18 @@ COPY_SKYPILOT_TEMPLATES_COMMANDS = (
 
 SKYPILOT_WHEEL_INSTALLATION_COMMANDS = (
     f'{SKY_UV_INSTALL_CMD};'
-    f'{{ {SKY_UV_PIP_CMD} list | grep "skypilot " && '
-    '[ "$(cat ~/.sky/wheels/current_sky_wheel_hash)" == "{sky_wheel_hash}" ]; } || '  # pylint: disable=line-too-long
-    f'{{ {SKY_UV_PIP_CMD} uninstall skypilot; '
+    f'_sky_probe() {{ {_installed_distribution_probe_command}; }}; '
+    f'_sky_bundle_dir="$HOME/.sky/wheels/{{sky_wheel_hash}}"; '
+    f'_sky_bundle_exports="$({SKY_PYTHON_CMD} -c {_wheel_bundle_verifier} '
+    '"$_sky_bundle_dir" "{sky_wheel_hash}")" || exit 1; '
+    'eval "$_sky_bundle_exports" || exit 1; '
+    f'{{ [ -f "$HOME/.sky/wheels/current_sky_wheel_hash" ] && '
+    '[ "$(cat "$HOME/.sky/wheels/current_sky_wheel_hash")" = '
+    '"{sky_wheel_hash}" ] && '
+    '_sky_probe; } || '
+    '{ '
+    f'{SKY_UV_PIP_CMD} uninstall skypilot '
+    f'{runtime_packaging.WORKER_RUNTIME_DISTRIBUTION} || exit 1; '
     # uv cannot install azure-cli normally, since it depends on pre-release
     # packages. Manually install azure-cli with the --prerelease=allow flag
     # first. This will allow skypilot to successfully install. See
@@ -390,11 +426,18 @@ SKYPILOT_WHEEL_INSTALLATION_COMMANDS = (
     'if [ "{cloud}" = "azure" ]; then '
     f'{SKY_UV_PIP_CMD} install --prerelease=allow "{dependencies.AZURE_CLI}";'
     'fi;'
-    # Install skypilot from wheel
-    f'{SKY_UV_PIP_CMD} install "$(echo ~/.sky/wheels/{{sky_wheel_hash}}/'
-    f'skypilot-{_sky_version}*.whl)[{{cloud}}, remote]" && '
-    'echo "{sky_wheel_hash}" > ~/.sky/wheels/current_sky_wheel_hash || '
-    'exit 1; }; ')
+    # Install both qualified local wheels in one resolver invocation.  The
+    # resolver may fetch ordinary SkyPilot dependencies, but it cannot satisfy
+    # the worker runtime from an index because that explicit local wheel is a
+    # root requirement.
+    f'{SKY_UV_PIP_CMD} install '
+    '"${SKYPILOT_MAIN_WHEEL}[{cloud}, remote]" '
+    '"${SKYPILOT_RUNTIME_WHEEL}" && '
+    '_sky_probe && '
+    '_sky_marker_tmp="$HOME/.sky/wheels/.current_sky_wheel_hash.$$" && '
+    'printf "%s\\n" "{sky_wheel_hash}" > "$_sky_marker_tmp" && '
+    'mv -f "$_sky_marker_tmp" '
+    '"$HOME/.sky/wheels/current_sky_wheel_hash" || exit 1; }; ')
 
 # Install ray and skypilot on the remote cluster if they are not already
 # installed. {var} will be replaced with the actual value in

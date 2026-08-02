@@ -19,6 +19,7 @@ from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.backends import backend_utils
+from sky.backends import cloud_vm_ray_backend
 from sky.exceptions import ClusterNotUpError
 from sky.provision import docker_utils
 from sky.provision import instance_setup
@@ -28,9 +29,27 @@ from sky.resources import Resources
 from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import status_lib
 from sky.utils import yaml_utils
+
+
+def test_provider_templates_use_shared_wheel_installer():
+    """Every reachable provider template delegates worker installation."""
+    templates = {
+        cloud_vm_ray_backend._get_cluster_config_template(cloud)
+        for _, cloud in registry.CLOUD_REGISTRY.items()
+    }
+    assert 'local-ray.yml.j2' not in templates
+
+    template_root = pathlib.Path(__file__).parents[2] / 'sky' / 'templates'
+    shared_installers = ('ray_skypilot_installation_commands',
+                         'skypilot_wheel_installation_commands')
+    for template in templates:
+        contents = (template_root / template).read_text(encoding='utf-8')
+        assert any(installer in contents for installer in shared_installers), (
+            f'{template} bypasses the shared SkyPilot wheel installer')
 
 
 def test_add_auth_rejects_unsupported_cloud(tmp_path):
@@ -533,7 +552,7 @@ def test_builtin_do_writer_is_byte_and_hash_deterministic(
     assert second_bytes == first_bytes
     assert str(tmp_path).encode('utf-8') not in first_bytes
     assert hashlib.sha256(first_bytes).hexdigest() == (
-        '1c921678d548cc015faa45540081ffb5d5d31b2db3cfca7469b6492d2d198d00')
+        'afd42bbb1181835d8c12f2e9e5520b3b66bee87710d3513f3c1bbaab685e9787')
     assert normalized_config == {
         'cluster_name': 'display-00000000',
         'max_workers': 1,
@@ -569,12 +588,12 @@ def test_builtin_do_writer_is_byte_and_hash_deterministic(
     }
     assert len(setup_commands) == 1
     assert hashlib.sha256(setup_commands[0].encode('utf-8')).hexdigest() == (
-        '4c0e616e07d7d063691bfde378e1378ce52b6dd93a879bbb759602b8a966c9ec')
+        'd25c4252af5d93deed9c403d5fab38d58eecc9e50b8064f0e8cc4e235e39f261')
     assert first_result['config_hash'] == first_real_hash
     assert second_result['config_hash'] == second_real_hash
     assert second_result['config_hash'] == first_result['config_hash']
     assert first_result['config_hash'] == (
-        '7b53f062fa013c96c3afa5b3e52fb25ce36352a51c11d89d46ded7729173964b')
+        '2f5a14c8e3bce79349f48db4984c941493126af4934bd02701d3ad02e5dfa96d')
 
 
 def test_builtin_do_writer_restores_existing_cluster_before_hash_and_name(
@@ -752,24 +771,24 @@ def test_host_network_probe_is_only_builtin_render_delta(
         current_render.replace(canonical_root, b'<TMP>')).hexdigest()
     expected_hashes = {
         'kubernetes-host-network-false': (
-            '1ad2ec4dc4e48a057bab83ebcd41b344307acfde6a1869794399b9b2e1c3b418',
-            '7072727546c878addf5a2270e850a14f0e4d060da7b19e2df71c353b9cf0fa5f',
+            '37ea063f413cdac1f27140ec53da34336747e6c377260570cbd88afb3326a426',
+            '96bc26cba5c35bfdf4979c2372d0013fd5f15e062673fe5ea1b6a54ce54a1cac',
         ),
         'kubernetes-host-network-true': (
-            '0c008a015257edc2669ef24e3a34ebed81e5fb7b1d8ccabbb03c06e211d27247',
-            'c477f93d965bdf66903925c0e1f9f306108a4dde2eb35f88a855ccf982132f66',
+            'd13b292460ca5c368c83b9e1b2cdd3f5f8790c7ed4e6d4317635d815989f1501',
+            '5d0e83ab72ae9905c8aeeaf1d18b08a8778cfa148c1aeffb4038c4a5bd1072d3',
         ),
         'kubernetes-oci-roce': (
-            'ade6d30625309ebad9354aae916610aaf4bf00e2e900f314e8e77937231e87ef',
-            '2c510b79dd6de34e8b0f4a99b0ad91a5e4ff619bf3ab3bc701e23b470b001acf',
+            'bd88f2c02829ceb298568983f940ef87f32f04b1e9b210b16feac53b037d2a8e',
+            '2161061192392c5d8957992c2b5d457f4531be630157d51838a167bd74b59959',
         ),
         'ssh-host-network-false': (
-            '8ffc8f17bcfb2c2369b94a08c7cb511e6eaae41006966953cf84b0e8e5e91fd8',
-            'aa4fb2a14edc506d88f033bcba8d7a119b04ae8e0c4e9fea1846ff747ca9a245',
+            'bf08ce1722b84096d1c00d774915aa9853d9849ea5d35059f781fab447b58e7e',
+            '163feda8868fba7a2fd9b2df29fc0e04d16b390bb280e827aeed8158ee751127',
         ),
         'ssh-host-network-true': (
-            'fa20655d2211484668724d119cff82fcdeb3fba9a74426c9b96a03097190fc81',
-            '8c05fb8d8ff4e372e129988539181a3a591f8388d1d3e8c6c27605981e1af297',
+            '675d42b13e23c215c56257ead94b3c25b3b40a8f45a2d38dca591aa9898ff9e9',
+            '5319addeb7e7fbe758184c9cd2a82330a5e8bbea13cc371f1b5b7f41f711e1b0',
         ),
     }
     assert (legacy_hash, current_hash) == expected_hashes[scenario]

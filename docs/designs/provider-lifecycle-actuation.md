@@ -17,8 +17,14 @@ that exact merge, and runs in test Helm revision 57 at immutable image digest
 `sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`.
 A disposable v40 direct worker retained ordinary job behavior, exposed the
 exact three dormant side tables and five indexes with zero side rows and no
-trigger, then terminated cleanly. The next gate is the reviewed S0b design
-correction below; no coordinated-worker capability or runtime is active.
+trigger, then terminated cleanly. That is historical v40 qualification for the
+already deployed M5-S0a slice. PR 1181 subsequently advanced the inherited
+ordinary-worker baseline on this integration branch to `SKYLET_VERSION = 42`
+and `SKYLET_LIB_VERSION = 9`; PR 1194 synchronized the passive-schema invariant
+test with that baseline. M5-S0b1a0 inherits those versions and does not change
+either constant, activate coordinated mode, or restart an ordinary worker. The
+next gate is the reviewed S0b design correction below; no
+coordinated-worker capability or runtime is active.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -8012,9 +8018,17 @@ not a mode of legacy Skylet. The top-level package
 `RemoveSubmissionArtifactKeyed`. The four `Get` methods and log read are
 observational; freeze and removal are signed mutations. Legacy
 `sky.skylet.skylet`, `attempt_skylet.py`, its TCP listener, imported `EVENTS`,
-handlers, watchdog, PID files, and `SKYLET_VERSION = 40` remain byte-compatible
-through M5. No global Skylet version bump, mixed handler registry, or
-legacy-worker restart is part of coordinated activation.
+handlers, watchdog, and PID files remain on the inherited ordinary-worker path.
+The exact baseline for M5-S0b1a0 is `SKYLET_VERSION = 42` and
+`SKYLET_LIB_VERSION = 9`, inherited from PR 1181. The coordinated gates do not
+themselves change those constants. M5-S0b1a0 changes generic package delivery
+but not the ordinary Skylet entrypoint, scheduler, handler, watchdog, or
+lifecycle semantics. Skylet v40 remains the characterized compatibility and
+rollback floor from the deployed M5-S0a slice; this does not assert that v40 and
+v42 are mutually byte-identical. Any
+later integration-base Skylet or library version change reopens this contract
+and its v40-through-current qualification before the stack advances. No mixed
+handler registry or legacy-worker restart is part of coordinated activation.
 
 `skypilot_worker_runtime` is an independently packaged dependency root, not a
 subpackage of `sky`. Its one canonical source tree is
@@ -8061,22 +8075,60 @@ resource. It never attempts to reconstruct standalone source from installed
 the transferred bundle has one copy. Its cache key and directory name are the
 SHA-256 of `SKYPILOT_INTERNAL_WHEEL_BUNDLE_V1\0` followed by the exact
 canonical manifest bytes; the manifest does not contain its own digest.
-Source-tree changes, the installed opaque-wheel digest,
-package version, lock, or builder change therefore invalidate the cache;
-reuse rehashes the complete exact file set before returning it.
+The normalized source-input digest is taken from a setuptools `build_py`
+projection of the same staged, release-shaped package inputs used by the
+internal wheel, plus normalized root build-control files. It never hashes
+checkout-only dashboard sources, image-build assets, design notes, or other
+files absent from an installed release. Package-owned source, build control,
+dependency metadata, qualified standalone-wheel identity, package version, or
+builder changes therefore invalidate the cache while source and unpacked
+release installations converge on one identity. Reuse rehashes the complete
+exact file set before returning it. Cache garbage collection removes only
+recognized digest-named cache directories and preserves wheel-hash markers,
+their `.old` comparison copy, and unknown operator-owned entries.
 
 Existing directory transfer copies the three-file bundle to
 `~/.sky/wheels/<bundle-digest>/`. Before installation the remote script
-requires that exact file set and recomputes both wheel digests. One resolver
-invocation names both local wheel paths explicitly, with the internal SkyPilot
+requires that exact file set and recomputes the manifest and both wheel
+digests, even when the bundle marker matches. The rendered bundle digest is a
+separate quoted verifier argument; the encoded Python payload contains no
+late-bound template value. The caller captures and checks verifier exit status
+before evaluating its two shell-safe path assignments, so verification failure
+cannot reach the installed-state probe or package mutation. The skip probe
+rejects the unsupported wheel `.data` layout, then
+compares every non-`RECORD` wheel member byte-for-byte with its regular,
+non-symlink installed distribution file. Within the active installation root
+it requires one normalized metadata owner for each distribution, rejects
+unexpected non-bytecode files and symlinks under every owned package root,
+requires the two distributions' package roots to be disjoint, removes their
+owned `__pycache__` trees, disables bytecode writes for the probe, and proves
+the imported `sky` and `skypilot_worker_runtime` files and package search paths
+belong only to those exact distributions. Package version equality or a marker
+can never establish installed identity. A failed probe enters ordinary
+replacement. After
+verification it removes both prior `skypilot` and
+`skypilot-worker-runtime-v1` distributions; same-version or tampered installed
+main or runtime bytes cannot satisfy the resolver. One resolver invocation then
+names both verified local wheel paths explicitly, with the internal SkyPilot
 extras, so it performs no index lookup for the standalone distribution. It
-writes `current_sky_wheel_hash` only after exact distribution-version and
-import probes pass; mismatch leaves the prior marker unchanged and fails the
-install. The ordinary v40 environment therefore receives both distributions
-without enabling coordinated mode. The dedicated coordinated venv installs
-only the same verified standalone wheel and its hash-locked dependencies,
-never the main wheel. Thus no environment has two distributions claiming the
-same import path.
+repeats the exact installed-file and import-root probe and writes
+`current_sky_wheel_hash` only after it passes; mismatch leaves the prior marker
+unchanged and fails the install. The
+ordinary target therefore receives the current v42 main distribution and the
+standalone distribution without enabling coordinated mode. A pre-existing v40
+worker follows the characterized ordinary updater and becomes v42; it does not
+remain a v40 process after installing the current bundle. The dedicated
+coordinated venv installs only the same verified standalone wheel and its hash-
+locked dependencies, never the main wheel. Thus no environment has two
+distributions claiming the same import path.
+
+This is a package-drift and active-import integrity boundary for the qualified
+purelib Linux wheel profile, not a hostile-local-user security boundary. Wheel
+`RECORD`, installer-added `.dist-info` metadata, generated console scripts,
+file modes, timestamps, xattrs, and artifacts outside the two owned package
+roots are not identity inputs. A future wheel with `.data` members must define
+and qualify relocation and script-rewrite semantics before this probe may
+accept it.
 
 The package's worker entrypoint, reducer, scheduler, artifact client,
 containment client, canonical encoders, and generated server-side wire
@@ -8221,14 +8273,16 @@ refreshes status must use the reducer or reject the coordinated row.
 
 ###### Immutable coordinated activation and central-only lifecycle ownership
 
-Legacy workers continue to run only Skylet v40. They do not insert a row into
-either S0b singleton and preserve current `StopEvent`, `SetAutostop`, hook,
-indicator, exception, listener, and provider-retry behavior byte-for-byte.
-M5-S0a shipped only the three keyed side tables and five indexes. Neither S0b
-singleton exists before S0b1c, and neither new singleton schema has a legacy
-token or nullable legacy branch. Absence of both singleton rows is the sole
-legacy state. This removes a cross-database legacy transition and its partial-
-state recovery problem.
+Ordinary workers continue to run the inherited Skylet v42 path; deployed or
+rolled-back v40 workers remain supported by the explicit compatibility floor.
+Neither version inserts a row into either S0b singleton, and the coordinated
+gates preserve each version's existing `StopEvent`, `SetAutostop`, hook,
+indicator, exception, listener, and provider-retry behavior. M5-S0a shipped
+only the three keyed side tables and five indexes. Neither S0b singleton exists
+before S0b1c, and neither new singleton schema has a legacy token or nullable
+legacy branch. Absence of both singleton rows is the sole legacy state. This
+removes a cross-database legacy transition and its partial-state recovery
+problem.
 
 `COORDINATED_V1` is selected only from a root-owned bootstrap marker installed
 before the first coordinated-worker instruction by the qualified private
@@ -8283,16 +8337,18 @@ through the peer-authenticated manager socket; it does not follow the marker
 path itself. Missing, late, replaced, or changed identity is a permanent
 activation failure for that physical worker.
 
-Legacy v40 never reads or writes these coordinated singletons. A later marker
-cannot promote a worker on which the private birth transaction allowed legacy
-Skylet to start. For a fresh coordinated marker, startup first installs and
-validates the `jobs.db` mode guard and negative-authority catalog, commits the
+Ordinary Skylet v40 through v42 never reads or writes these coordinated
+singletons. A later marker cannot promote a worker on which the private birth
+transaction allowed an ordinary Skylet to start. For a fresh coordinated
+marker, startup first installs and validates the `jobs.db` mode guard and
+negative-authority catalog, commits the
 `COORDINATED_V1` row, and then records the identical bootstrap bytes and fence
 in `skylet_config.db`. A crash between those commits leaves legacy writes
 already denied and no control listener; restart may complete only the same
 identity. M5-S0 has no marker producer, so existing and ordinarily launched
-workers stay on the byte-compatible legacy path. The later private launch
-producer is reachable only for a fresh physical worker.
+workers stay on their version-specific ordinary path without coordinated
+activation. The later private launch producer is reachable only for a fresh
+physical worker.
 
 The lifecycle fence is therefore a local first-boot activation proof, not a
 second teardown state machine or a remote privileged mutation. During the
@@ -8314,9 +8370,10 @@ fenced worker is destroyed rather than downgraded.
 
 ###### Coordinated startup barrier and exactly-one control listener
 
-Legacy Skylet v40 follows its exact existing startup path and does not execute
-this barrier. The fresh private birth path proves before boot that no legacy
-Skylet unit, watchdog, cron entry, reboot rearm, or ordinary-user SSH
+Ordinary Skylet v42, and the v40 compatibility floor, follow their respective
+existing startup paths and do not execute this barrier. The fresh private birth
+path proves before boot that no legacy Skylet unit, watchdog, cron entry, reboot
+rearm, or ordinary-user SSH
 authorization is enabled for the image. The long-lived root manager is the activation owner. It acquires
 the worker-wide owner lock before predecessor eviction and retains the same
 open-file-description lock for its entire process lifetime. No oneshot unit or
@@ -8355,9 +8412,9 @@ READY the server accepts only the standard health method and returns
 from the coordinated systemd service plus the manager's lifetime lock, not the
 historical PID file, TCP port, or opportunistic dynamic port. The legacy
 `attempt_skylet.py` path is never installed or invoked on a coordinated worker.
-A copied v40 executable cannot acquire the control identity, open either
-database or protected socket, receive authoritative traffic, use a live
-provisioning session, elevate privileges, or obtain provider lifecycle
+A copied ordinary v40 or v42 executable cannot acquire the control identity,
+open either database or protected socket, receive authoritative traffic, use a
+live provisioning session, elevate privileges, or obtain provider lifecycle
 credentials.
 
 The migration does not alter `jobs` or `pending_jobs`. Current Skylets use
@@ -8446,13 +8503,16 @@ write, including one with no mapped row.
 
 ###### M5-S0a persistence foundation pre-slice
 
-M5-S0 first lands one separately reviewed, merged, deployed, and monitored
-v40-compatible persistence pre-slice before any coordinated process is advertised.
-M5-S0a creates no keyed row, registers no RPC, changes no scheduler or status
-path, and keeps `SKYLET_VERSION = 40`. This distinction is required because a
-Skylet version bump force-kills and restarts the existing daemon: allocating a
-new legacy Skylet version for schema-only code would cause an unnecessary
-restart and couple unrelated legacy and coordinated protocols. The complete coordinated implementation must
+M5-S0 first landed one separately reviewed, merged, deployed, and monitored
+v40-compatible persistence pre-slice before any coordinated process was
+advertised. M5-S0a created no keyed row, registered no RPC, changed no
+scheduler or status path, and kept the then-current `SKYLET_VERSION = 40`.
+PR 1181 later advanced the inherited ordinary baseline to v42 for an unrelated
+typed system-OOM runtime; that parent change is not part of M5-S0a or
+coordinated activation. This distinction is required because a Skylet version
+bump force-kills and restarts the existing daemon: allocating a new legacy
+Skylet version for schema-only code would cause an unnecessary restart and
+couple unrelated legacy and coordinated protocols. The complete coordinated implementation must
 instead prove its required fresh-worker
 activation. M5-S0a does not satisfy any coordinated capability, activation, or
 worker-compatibility gate.
@@ -8631,8 +8691,9 @@ CREATE TABLE keyed_submission_seals (
 ###### S0b runtime guard and config-database schema
 
 S0b adds the following dormant `jobs.db` singleton. Its installer creates the
-table and triggers but no row while the running process remains v40. The first
-coordinated process may insert exactly one all-non-null `COORDINATED_V1` row;
+table and triggers but no row while the running process remains on the ordinary
+path, currently v42 and compatible back through v40. The first coordinated
+process may insert exactly one all-non-null `COORDINATED_V1` row;
 no M5 code updates or deletes it. S0a did not ship this table, so there is no
 compatibility reason to encode a `LEGACY` row. The coordinated row is committed
 before any config-database bootstrap state so stale legacy connections lose
@@ -9057,9 +9118,9 @@ END;
 
 The reducer separately enforces the exact closed state-transition graph and
 the correspondence between each transient state and the one legacy mutation
-it admits. The SQL above is persistent negative authority against stale v40,
-generic writers, direct code-generation, and partially upgraded writers. It is not
-a second scheduler.
+it admits. The SQL above is persistent negative authority against stale v40 or
+v42 ordinary writers, generic writers, direct code-generation, and partially
+upgraded writers. It is not a second scheduler.
 
 Three code-owned catalog manifests use the same byte framing, with objects
 sorted by `(type, name)` using bytewise UTF-8 order. Their exact prefixes are
@@ -9151,8 +9212,8 @@ All identifier, digest, token, and canonical-byte fields are additionally
 validated by the coordinated reducer before insertion. SQLite owns only the closed
 state, nullability, numeric, primary-key, and uniqueness invariants above; it
 does not guess future digest or UUID versions. Foreign keys are deliberately
-absent because existing v40 connections do not enable SQLite foreign-key
-enforcement. The reducer must validate the parent submission in its same
+absent because qualified ordinary v40 and v42 connections do not enable SQLite
+foreign-key enforcement. The reducer must validate the parent submission in its same
 `BEGIN IMMEDIATE` transaction. The partial unique local-owner index enforces at
 most one `LOCAL_CGROUP_V2_DIRECT_V1` row per submission; the coordinated reducer and
 full-plan digest enforce the required at-least-one row before admission.
@@ -9165,14 +9226,15 @@ SQLite omits from `sqlite_master.sql` and then applies exactly
 `SQLITE_MASTER_SQL_V1` above. Repeated and concurrent installation is
 create-or-validate.
 A reserved-name or owned-object shape mismatch rolls back every object created
-by that attempt, reports keyed schema unavailable, and leaves ordinary v40 job
-initialization available; an I/O error, corrupt database, or failure involving
-either legacy table still propagates. The later coordinated capability revalidates this
+by that attempt, reports keyed schema unavailable, and leaves ordinary v40 and
+v42 job initialization available; an I/O error, corrupt database, or failure
+involving either legacy table still propagates. The later coordinated capability revalidates this
 exact object set and advertises no keyed profile when it is unavailable.
 
 M5-S0a deliberately installs no trigger and no mapped-row producer. The exact
-persistent negative-authority catalog above lands dormant in an S0b v40 slice,
-together with no mode row and no producer. It becomes active only when the
+persistent negative-authority catalog above lands dormant in an S0b ordinary-
+worker slice, qualified against the current v42 baseline and the v40
+compatibility floor, together with no mode row and no producer. It becomes active only when the
 complete coordinated startup barrier commits `COORDINATED_V1`. Its `RAISE(ROLLBACK,
 ...)` guards reject unkeyed legacy inserts and every unauthorized update or
 delete, reject pending inserts after either applicable seal, preserve immutable
@@ -9181,11 +9243,12 @@ to the exact stored provisional process, reject replace or rekey, and prevent
 rewriting of side-table identities and stored receipts. The reducer owns the
 closed state graph; the triggers are durable negative authority.
 
-A v40 binary can still add and queue ordinary jobs after the dormant schema and
-triggers appear while the coordinated row is absent. Once the coordinated
-guard commits, no ordinary job or pending-row write remains legal, whether or
-not a keyed mapping already exists. A stale v40 scheduler fails before its
-first database mutation; process spawn is independently blocked because the
+A v40 or v42 binary can still add and queue ordinary jobs after the dormant
+schema and triggers appear while the coordinated row is absent. Once the
+coordinated guard commits, no ordinary job or pending-row write remains legal,
+whether or not a keyed mapping already exists. A stale ordinary scheduler from
+either qualified version fails before its first database mutation; process
+spawn is independently blocked because the
 control UID has no legacy command path and the payload UID cannot open the
 database. A stale `CancelJobs` request cannot reach an authoritative mutation
 listener. The long-lived manager proves no
@@ -10263,8 +10326,8 @@ birth. There is no in-place executable swap and no ledger-schema downgrade.
 
 Rollback is therefore explicit:
 
-- dormant artifacts and empty additive tables on an ordinary v40 worker can be
-  removed or ignored without restarting or changing legacy Skylet; and
+- dormant artifacts and empty additive tables on an ordinary v40 or v42 worker
+  can be removed or ignored without restarting or changing ordinary Skylet; and
 - any coordinated marker, `COORDINATED_V1` row, fence, manager ledger entry,
   cgroup owner, receipt, or tombstone makes in-place downgrade illegal. A
   failed deployment normally drains and destroys that worker or rolls forward
@@ -10994,8 +11057,9 @@ The four feature groups below are additive and promote no coordinator decision
 or external effect until the provider-actuation dependency below is qualified.
 Each group is itself split into the bounded merge, deploy, and monitoring gates
 listed below. Together they apply coordinated-worker protocol `1`, API-requests
-`005`, API version `69`, Serve `033`, and spot-jobs `027`; legacy Skylet remains
-`40`. PostgreSQL version-0 paths preserve their
+`005`, API version `69`, Serve `033`, and spot-jobs `027`; the coordinated work
+does not bump the inherited ordinary Skylet v42 or library version 9, and v40
+remains the compatibility floor. PostgreSQL version-0 paths preserve their
 existing decisions, writes, and locking exactly, and SQLite retains its
 existing filesystem-lock path. M5 does not attempt an in-place cutover of
 either topology.
@@ -11555,17 +11619,24 @@ with a new typed birth and new scope. Otherwise rollback is a forward fix.
 
 ##### Milestones and removal gates
 
-M5-S0 begins with M5-S0a, the already separate persistence gate. M5-S0a
-installs only the exact v1 side tables and named indexes specified above, keeps
-Skylet `40`, and has no trigger, side-row producer, or capability claim. Its
-upgrade and rollback tests must pass before merge. Deployment proves the API
-image and newly provisioned or naturally restarted v40 workers retain ordinary
-legacy behavior; it does not force-restart the existing worker fleet and cannot
+M5-S0 began with M5-S0a, the already separate persistence gate. M5-S0a
+installed only the exact v1 side tables and named indexes specified above, kept
+the then-current Skylet `40`, and had no trigger, side-row producer, or
+capability claim. Its upgrade and rollback tests passed before merge.
+Deployment proved the API image and a disposable v40 worker retained ordinary
+legacy behavior; it did not force-restart the existing worker fleet and cannot
 count as coordinated-runtime qualification.
 
-M5-S0b is split into eleven additional ordered gates. None consumes a new legacy
-Skylet version. Ordinary workers remain on byte-compatible v40 throughout;
-fresh coordinated workers use the independently versioned runtime protocol.
+PR 1181 subsequently advanced the integration baseline to ordinary Skylet v42
+and library version 9. M5-S0b is split into eleven additional ordered gates.
+None independently consumes a new ordinary Skylet or library version: each
+gate inherits v42/9, and any later base-version movement requires this design
+and the compatibility matrices to be requalified before merge. Ordinary v42
+workers remain on their existing path, v40 remains the tested upgrade and
+rollback floor, and fresh coordinated workers use the independently versioned
+runtime protocol. In the gates below, "does not bump" means the gate changes
+neither ordinary Skylet version constant nor ordinary Skylet executable; it
+does not claim that v40 and v42 have identical bytes.
 
 M5-S0b0 is this design-only correction. It commits the exact responsibility,
 authorization, global guard, startup, lifecycle-quiescence, packaging, DDL,
@@ -11573,8 +11644,8 @@ trigger, rollback, and subgate contracts. It changes no runtime and requires no
 deployment. An adversarial review of this exact committed design must return
 `PURSUE` before implementation.
 
-M5-S0b1a0 keeps Skylet `40` and lands only the index-independent packaging
-foundation. It creates the separate
+M5-S0b1a0 does not bump the inherited ordinary Skylet v42 or library version 9
+and lands only the index-independent packaging foundation. It creates the separate
 `addons/submission-containment/python-runtime/` build root and standalone
 distribution, restricts main-wheel package discovery, embeds and verifies the
 opaque standalone wheel in release artifacts, and makes the internal worker
@@ -11585,15 +11656,31 @@ resolution. Ordinary source and editable installation retains its existing
 one-command path. Standalone-specific qualification installs the local build
 explicitly; worker installation resolves both explicit local wheel paths
 without an index. No existing primitive or facade moves in this gate.
+The shared packaging helpers are an explicit importable `sky.setup_files`
+package so an internal wheel loaded directly from its ZIP has no fallback edge
+to a developer checkout. Stable and nightly release jobs rebuild and verify the
+standalone wheel under runner-temporary storage before building the main
+distribution; only `dist/` is uploaded, and no standalone publication artifact
+is written there. Every provider template reachable from the built-in cloud
+registry delegates to the generic wheel installer. The unmapped
+`local-ray.yml.j2` compatibility artifact remains dormant in this gate and is
+not a second supported installation path.
 Release-wheel, internal-wheel, standalone-wheel, source/editable-install,
 installed-API reconstruction, cache invalidation, bundle-transfer,
-tampered-bundle, offline v40 install, package-file ownership, and
-import-isolation matrices must prove one canonical source and zero overlapping
-import-file owners. Deploying the resulting ordinary v40 image changes no
-singleton, listener, process, or capability.
+tampered-bundle, offline ordinary-v42 install, characterized v40-to-v42
+ordinary update, same-`1.1.0` stale-v40-main plus current-runtime and current-
+marker rejection, a valid rendered-command marker fast path with no package
+mutation, installed-file tamper, package-file ownership, and import-isolation
+matrices must prove one canonical source and zero overlapping import-file
+owners. Deploying the resulting ordinary v42 API image changes no
+singleton, listener, process, or capability by itself. If the existing updater
+later touches a v40 worker, the inherited PR 1181 version change performs its
+ordinary v40-to-v42 restart; that parent behavior is qualified separately and
+is not coordinated activation.
 
-M5-S0b1a1 keeps Skylet `40` and activates only distribution dependency and
-publication. Before its dependency commit or release-workflow activation
+M5-S0b1a1 does not bump the inherited ordinary Skylet v42 or library version 9
+and activates only distribution dependency and publication. Before its
+dependency commit or release-workflow activation
 reaches an integration branch, an explicitly authorized bootstrap operator
 reserves `skypilot-worker-runtime-v1` on TestPyPI and PyPI, binds the intended
 trusted publisher or scoped credentials on both, publishes the exact qualified
@@ -11611,8 +11698,9 @@ source, editable, wheel, sdist, Docker, worker-floor, and backward-compatibility
 install matrices must pass with the exact dependency before merge. This gate
 adds no runtime entrypoint, process, listener, capability, or provider effect.
 
-M5-S0b1b keeps Skylet `40` and relocates only the already-shipped pure keyed
-schema primitives into the now-qualified standalone dependency root.
+M5-S0b1b does not bump the inherited ordinary Skylet v42 or library version 9
+and relocates only the already-shipped pure keyed schema primitives into the
+now-qualified standalone dependency root.
 `sky.skylet.keyed_submission_state` becomes the compatibility facade only
 after direct-import, monkeypatch, call-signature, exception, pickle where
 applicable, and direct exported object-identity characterization passes from
@@ -11620,8 +11708,9 @@ the release, internal, and source environments. No persistence schema or
 runtime behavior changes, and the standalone dependency still exposes no
 entrypoint or handler.
 
-M5-S0b1c keeps Skylet `40` and adds only dormant persistence installers for
-`keyed_submission_runtime`, the exact negative-authority trigger catalog, the
+M5-S0b1c does not bump the inherited ordinary Skylet v42 or library version 9
+and adds only dormant persistence installers for `keyed_submission_runtime`,
+the exact negative-authority trigger catalog, the
 two config-database tables and immutable triggers, the exact
 neutral `LEGACY_CONFIG_PREREQUISITE_V1` create-or-validate function plus its
 characterized legacy call site, and the versioned containment and
@@ -11634,19 +11723,21 @@ concurrent, wrong-shape, corrupt, and rollback databases plus exact
 design-to-catalog bytes, numeric-token boundaries, fresh-empty protected and
 upgraded legacy config paths, exact config table and autoindex shapes,
 command-size limits, quota-receipt guards, and frozen
-terminal-inventory guards are tested before deployment to one disposable v40
-worker.
+terminal-inventory guards are tested before deployment to one disposable v42
+worker and against the v40 compatibility database fixtures.
 
-M5-S0b2 keeps Skylet `40` and adds only additive coordinated protocol messages,
-canonical identity and Ed25519 authorization types, method and payload digests,
+M5-S0b2 does not bump the inherited ordinary Skylet v42 or library version 9
+and adds only additive coordinated protocol messages, canonical identity and
+Ed25519 authorization types, method and payload digests,
 artifact plan, prepare, launch, log-cursor, finalization, retention, and
 freeze, inventory, offset-read, range-digest, and explicit-removal types,
 capability/readback results, and coordinated client/router
 methods. It does not register a handler or caller. A legacy endpoint is a hard
 incompatibility and never permission to generate SSH code.
 
-M5-S0b3a keeps Skylet `40` and adds the independently testable dormant
-`SubmissionArtifactOwnerV1` library, exact artifact ledger owner, intent-first
+M5-S0b3a does not bump the inherited ordinary Skylet v42 or library version 9
+and adds the independently testable dormant `SubmissionArtifactOwnerV1`
+library, exact artifact ledger owner, intent-first
 staging and atomic publication, sealed-FD open, protected log write and offset
 readback, finalization, inventory freeze, retention, and explicit removal. It
 runs only in hermetic tests, creates no system principal or unit, and registers
@@ -11654,8 +11745,9 @@ no worker RPC. Fault injection covers every `PREPARING` row/filesystem pairing,
 cursor recovery, retained read/tail, freeze membership, and removal response
 loss before this gate merges.
 
-M5-S0b3b keeps Skylet `40` and adds only the independently buildable native
-containment manager, launcher, and outcome shim plus their durable ledger and
+M5-S0b3b does not bump the inherited ordinary Skylet v42 or library version 9
+and adds only the independently buildable native containment manager, launcher,
+and outcome shim plus their durable ledger and
 bounded event/log-channel protocol. Hermetic Linux integration tests exercise
 containment prepare and launch, sealed descriptor consumption, event delivery,
 natural completion, cancel, failed-launch and never-launched seal, empty proof,
@@ -11663,23 +11755,26 @@ reaping, retirement, restart reconciliation, UID and socket isolation, and the
 escape probe. It installs or activates no principal, bridge, SSH policy, unit,
 or marker.
 
-M5-S0b3c keeps Skylet `40` and adds the fixed standalone venv, signed build
-manifest, forced-command bridge, restricted login executable, exact principal
+M5-S0b3c does not bump the inherited ordinary Skylet v42 or library version 9
+and adds the fixed standalone venv, signed build manifest, forced-command
+bridge, restricted login executable, exact principal
 and SSH-policy definitions, and unit-file bytes. Its normal installer only
 validates immutable package topology; it does not create principals, install
 or enable units, change `sshd`, start a service, publish a marker, or advertise
 capability. Package, `python -I` import-isolation, forced-command, effective
 `sshd -T`, credential, and unit-coupling tests pass against the exact digests.
 
-M5-S0b4 keeps Skylet `40` and adds the separately packaged dormant
-`skypilot_worker_runtime` entrypoint in its dedicated venv, single-writer reducer, coordinated-
+M5-S0b4 does not bump the inherited ordinary Skylet v42 or library version 9
+and adds the separately packaged dormant `skypilot_worker_runtime` entrypoint
+in its dedicated venv, single-writer reducer, coordinated-
 only scheduler, exact trigger validation, manager and artifact clients, closed
 RPC registry including authenticated artifact inventory, offset readback,
 freeze, and removal, and bidirectional reconciler. It is installed but unreachable:
 no ordinary path creates a marker, enables its units, inserts a mode row, or
 creates a fence. It does not import legacy events or generic mutation services
-and changes no v40 executable, handler, event construction, watchdog, listener,
-or caller. Reducer tests use fake containment and artifact owners plus the
+and changes no ordinary v42 or compatibility-v40 executable, handler, event
+construction, watchdog, listener, or caller. Reducer tests use fake
+containment and artifact owners plus the
 exact SQL catalog. A complete `sys.modules` and static import-graph assertion
 proves no `sky` module is loaded by the exact installed worker command.
 
@@ -11689,11 +11784,12 @@ lock, systemd failure coupling, forced SSH-to-UDS bridge, exact SSH policy,
 signed authorization interceptor, closed keyed RPC registration, artifact and
 containment recovery, credential and privilege probes, and READY publication.
 No bootstrap marker producer is reachable from an ordinary pool path, so the
-production fleet remains unchanged v40 and no legacy canary is force-restarted.
-The disposable worker proves the coordinated-only Unix listener, absence of
-every legacy process and restart path, removal of provisioning access,
-hook-free identity, negative worker lifecycle credentials, and an uploaded v40
-Skylet's inability to access protected state or perform lifecycle actuation. A
+ordinary fleet remains on its inherited v42 path, v40 workers are not
+force-restarted, and no ordinary canary is force-restarted. The disposable
+worker proves the coordinated-only Unix listener, absence of every legacy
+process and restart path, removal of provisioning access, hook-free identity,
+negative worker lifecycle credentials, and uploaded v40 and v42 Skylets'
+inability to access protected state or perform lifecycle actuation. A
 partial capability, listener, manager lock, artifact owner, guard, catalog,
 fence, SSH policy, or reconciliation failure publishes no READY state and has
 no legacy fallback.
@@ -11885,19 +11981,21 @@ The design is not promotable without all of the following:
   those extracted files, declares the exact standalone dependency, and carries
   one byte-identical opaque wheel resource. Source and installed-API internal
   builders produce the same manifest-hashed bundle, invalidate on either wheel
-  input, transfer both, reject tampering, and install by explicit local paths.
-  Release, internal, source,
-  and ordinary v40 environments preserve the characterized facade, while the
-  standalone dedicated venv imports no `sky` module;
+  input, transfer both, reject bundle and installed-file tampering, and install
+  by explicit local paths. The same-package-version stale-v40-main/current-
+  runtime/current-marker case cannot skip the v42 replacement. Release,
+  internal, source, ordinary v42, and characterized v40-to-v42 update
+  environments preserve the facade, while the standalone dedicated venv
+  imports no `sky` module;
 - the coordinated migration preserves the legacy `jobs` and `pending_jobs` schemas,
-  duplicate legacy pending rows, and ordinary v40 writes while the mode row is
-  absent. Both new singleton DDLs accept only `COORDINATED_V1`; any other token
+  duplicate legacy pending rows, and ordinary v40-through-v42 writes while the
+  mode row is absent. Both new singleton DDLs accept only `COORDINATED_V1`; any other token
   is a wrong-shape catalog and quarantine, not a compatibility state.
   Exact design-to-catalog comparison passes. After the
   `COORDINATED_V1` sentinel commits, persistent triggers reject every unkeyed
   job or pending insert, update, and delete, a same-transaction second keyed
-  pending insert, orphan future-job pending row, stale-v40 pending update before
-  spawn, status or PID update, and pending delete. The side-row-first
+  pending insert, orphan future-job pending row, stale ordinary v40 or v42
+  pending update before spawn, status or PID update, and pending delete. The side-row-first
   `AddJobKeyed` order is atomic under crash, response loss, and concurrent
   retry; the reversed legacy-row-first order is rejected by the trigger.
   Generic `AddJob`, `QueueJob`,
@@ -11977,8 +12075,8 @@ The design is not promotable without all of the following:
 - generic `CancelJobs`, cancel-all, wrong-runtime, wrong-digest,
   wrong-containment, delayed retired-owner, and PID-reuse cases perform no
   process, cgroup, supervisor, or database mutation for a keyed row;
-  a v40 listener or independently launched v40 service process prevents
-  manager READY until predecessor eviction completes, and a simultaneous or
+  a v40 or v42 listener, or an independently launched ordinary service process,
+  prevents manager READY until predecessor eviction completes, and a simultaneous or
   later restart attempt cannot obtain the manager lock, protected state,
   authoritative traffic, elevation, provisioning credential, or provider
   lifecycle authority. A late stale writer is independently rejected by the
@@ -11997,15 +12095,17 @@ The design is not promotable without all of the following:
   startup, restart, SIGTERM, idle timeout, malformed marker, preexisting
   autostop config, indicator, hook claim, and stored hook tests all produce zero
   local lifecycle effect and no READY state in coordinated mode. A separate
-  byte-compatibility corpus proves ordinary v40 workers retain the exact old
-  autostop, hook, indicator, exception, listener, and provider-retry path.
+  compatibility corpus proves ordinary v42 workers retain their exact inherited
+  autostop, hook, indicator, exception, listener, and provider-retry path and
+  separately proves the same no-regression boundary for v40 fixtures.
   Every legacy and current launch, resource, autostop, down, and preemption hook
   input is rejected during coordinated planning before row birth, marker
   creation, or provider effect, and the down path never reaches a hook CAS or
   hook codegen;
 - an ordinary worker receives no coordinated marker, singleton, enabled unit,
-  listener, principal activation, or process change and continues to run the
-  exact legacy v40 entrypoint. A fresh coordinated worker has the signed marker,
+  listener, principal activation, or process change and continues to run its
+  exact ordinary entrypoint, currently v42 with v40 retained as the compatibility
+  floor. A fresh coordinated worker has the signed marker,
   one-way singleton, manager and artifact ledgers, coordinated Unix listener,
   and no legacy Skylet process, watchdog, TCP listener, or generic mutation
   service;
@@ -12038,8 +12138,8 @@ The design is not promotable without all of the following:
   and destruction of every older trusting worker are tested as distinct cases;
 - after READY the payload has no sudo, polkit, setuid/file-capability, trusted-
   group, privileged-socket, systemd, or ordinary-login path; the one-time
-  provisioning principal has no key or live session. An uploaded v40 Skylet
-  cannot open protected databases or sockets, receive authoritative traffic,
+  provisioning principal has no key or live session. An uploaded v40 or v42
+  Skylet cannot open protected databases or sockets, receive authoritative traffic,
   obtain platform lifecycle credentials, or call provider stop/down. The pilot
   worker role's denied lifecycle actions and the central executor's sole
   SkyPilot-issued lifecycle credential ownership are proved from effective
@@ -13823,8 +13923,9 @@ the exact removal-ledger SHA-256 was
 Independent authority, reliability, and repository-mapping reviews all
 returned `PURSUE` on those same bytes.
 
-The accepted correction makes the coordinated worker a separately packaged,
-provider-free mutation owner while keeping ordinary Skylet v40 byte-compatible.
+At the time of this verdict, the accepted correction made the coordinated
+worker a separately packaged, provider-free mutation owner while keeping the
+then-current ordinary Skylet v40 path byte-compatible.
 It closes direct command and request sizes, terminalizes log quota through the
 existing reducer race before any hard kill, freezes exact artifact terminal
 evidence, distinguishes loss before and after freeze, and creates an immutable
@@ -13851,13 +13952,25 @@ the unchanged removal-ledger SHA-256 was
 `91e4de097f3d49062bebcdaecdce207fddd212f109068ffa8c7520cdcf4e8342`.
 Independent authority and release-path reviews both accepted those bytes.
 
-The split preserves every ordinary one-command source and editable install,
-keeps the standalone wheel outside all publication upload artifacts, and lets
-ordinary v40 workers qualify the exact two-local-wheel bundle without an index
-lookup for the standalone distribution. The main distribution retains its
+At the time of this verdict, the split preserved every ordinary one-command
+source and editable install, kept the standalone wheel outside all publication
+upload artifacts, and let the then-current ordinary v40 workers qualify the
+exact two-local-wheel bundle without an index lookup for the standalone
+distribution. The main distribution retains its
 existing dependency metadata throughout M5-S0b1a0. M5-S0b1a1 cannot reach an
 integration branch until an explicitly authorized bootstrap publication has
 made the exact qualified `1.0.0` wheel available on both TestPyPI and PyPI and
 fetch-back SHA-256 checks match the checked-in bytes. This verdict grants no
 public-package mutation, dependency activation, coordinated entrypoint,
 provider effect, or legacy-owner removal authority.
+
+PR 1181 merged after Review 35 and advanced the inherited ordinary baseline to
+Skylet v42 and library version 9 for typed bounded system-OOM recovery. The
+initial M5-S0b1a0 rebase preserved the coordinated stack's aggregate stable
+patch ID but exposed stale version and lock metadata. This correction changes
+no Skylet constant or ordinary Skylet executable. It regenerates lock
+provenance against the rebased standalone-source commit, qualifies the current
+v42 bundle and the v40-to-v42 ordinary update boundary separately, and inherits
+PR 1194's exact v42 passive-schema assertion. This correction activates no
+coordinated mode and grants no additional authority. It requires a new exact-
+design and exact-head review before merge.

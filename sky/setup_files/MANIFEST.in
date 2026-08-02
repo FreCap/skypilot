@@ -10,6 +10,7 @@ include sky/skylet/providers/scp/*
 include sky/skylet/providers/*.py
 include sky/skylet/ray_patches/*.patch
 include sky/skylet/ray_patches/*.diff
+recursive-include sky/skylet/runtime_wheels/v1 *.whl manifest.json
 include sky/jobs/dashboard/*
 include sky/jobs/dashboard/templates/*
 include sky/jobs/dashboard/static/*
