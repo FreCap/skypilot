@@ -309,6 +309,34 @@ class BatchCoordinator:
         if not all(active_cleanup_results):
             return
 
+        queue_snapshot_tasks: dict[str,
+                                   asyncio.Task[tuple[bool, bool,
+                                                      list[Any] | None]]] = {}
+
+        async def _get_queue_snapshot(
+                cluster_name: str) -> tuple[bool, bool, list[Any] | None]:
+            snapshot_task = queue_snapshot_tasks.get(cluster_name)
+            if snapshot_task is None:
+
+                async def _fetch_queue_snapshot(
+                ) -> tuple[bool, bool, list[Any] | None]:
+                    within_deadline, succeeded, queue_request_id = (
+                        await _run_call('worker queue request',
+                                        sdk.queue,
+                                        cluster_name,
+                                        skip_finished=True))
+                    if not within_deadline:
+                        return False, False, None
+                    if not succeeded:
+                        return True, False, None
+                    within_deadline, succeeded, queued_jobs = await _run_call(
+                        'worker queue result', sdk.get, queue_request_id)
+                    return within_deadline, succeeded, queued_jobs
+
+                snapshot_task = asyncio.create_task(_fetch_queue_snapshot())
+                queue_snapshot_tasks[cluster_name] = snapshot_task
+            return await snapshot_task
+
         async def _resolve_durable_worker_job_id(
                 record: dict[str, Any]) -> tuple[bool, int | None]:
             """Resolve one durable worker record under the shared deadline."""
@@ -327,17 +355,8 @@ class BatchCoordinator:
 
             if worker_job_id is None:
                 cluster_name = record['worker_cluster']
-                within_deadline, succeeded, queue_request_id = await _run_call(
-                    'worker queue request',
-                    sdk.queue,
-                    cluster_name,
-                    skip_finished=True)
-                if not within_deadline:
-                    return False, None
-                if not succeeded:
-                    return True, None
-                within_deadline, succeeded, queued_jobs = await _run_call(
-                    'worker queue result', sdk.get, queue_request_id)
+                within_deadline, succeeded, queued_jobs = (
+                    await _get_queue_snapshot(cluster_name))
                 if not within_deadline:
                     return False, None
                 if not succeeded:
