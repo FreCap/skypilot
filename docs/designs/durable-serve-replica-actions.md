@@ -2327,6 +2327,25 @@ is deferred until a separately reviewed drain protocol exists.
 
 ## Migration and stacked implementation
 
+The open implementation stack is:
+
+- [PR #1190](https://github.com/boltz-bio/skypilot/pull/1190), the dark durable
+  action foundation described through M3 below; and
+- [PR #1191](https://github.com/boltz-bio/skypilot/pull/1191), a blocked draft
+  that only isolates the process-local launch/down ownership behind a named
+  legacy runtime so the eventual M5 deletion has one reviewable boundary.
+
+PR #1191 is deliberately not titled or described as M5 removal. In its current
+preparatory form it preserves legacy/shadow behavior and cannot merge. It must
+remain draft until M4 implements the renderer, dispatcher, provider I/O,
+reducer projection, and recovery; `PLA-GAP-005` is closed; at least 24 hours
+and 100 launches plus 100 downs establish clean live evidence with zero
+unresolved divergence; every crash-boundary canary passes; the compatible
+rollback window closes; and all applicable `PLA-M5-*` source, test, telemetry,
+and release-window gates pass. The draft must then be amended to actually
+delete the isolated legacy runtime and fallbacks, with final-steady-state
+tests, before it is eligible to merge.
+
 ### M0: bounded canonical design
 
 - Accept this exact file and the companion provider contract.
