@@ -13,6 +13,16 @@ admission/session, request-handler dispatcher, provider observation/effect
 capture, and live provider authority are not implemented. Authority remains
 disabled, and this status does not claim M4 or provider-authoritative rollout.
 
+Source commit `a836825ef9c219563bb2abc740707c825c26edc5` and immutable
+image digest
+`sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`
+completed a dark `boltz-test` API -> ordinary executor -> controller rollout,
+compatible-image rollback with retained additive heads, and staged re-upgrade.
+This establishes additive-schema and mixed-image deployment compatibility only.
+Authority-worker resources remained disabled and absent; no provider session,
+private-handler dispatch, shadow sample, action row, provider I/O, or M4
+authority was exercised.
+
 Last updated: 2026-08-02
 
 Canonical owner: this file governs only the provider-mutation and observation
@@ -4869,18 +4879,22 @@ immutable values and persistence behavior only: it does not implement or prove
 the renderer, normalizer, preflight, runtime admission/session, dispatcher,
 provider I/O, shadow parity, or live authority.
 
-First-deployment cutover evidence refreshed on 2026-08-02: read-only
-`boltz-test` inspection found API schema 004, upstream request-classification
-Serve 032, global-user-state 027, and no Serve resource-action tables. Helm
-revision 57, advanced by the separate `M5-S0a passive Skylet jobs.db side
-schema` rollout, has every role on baseline digest
-`sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`;
-that rollout did not advance the three central schema heads. Re-read the live
-revision immediately before deployment and use that observation, not the
-superseded revision-56 digest, as the rollback point.
-This proves the unshipped feature Serve032/033 catalog is not present there;
-the post-migration zero-row/link/mode snapshot remains a mandatory rollout
-artifact.
+First-deployment cutover evidence completed on 2026-08-02. The read-only
+`boltz-test` baseline at Helm revision 57 had API004, upstream
+request-classification Serve032, global-user-state 027, every ordinary role on
+digest
+`sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`,
+zero services/replicas/clusters, and no resource-action tables. Revisions 58–60
+performed the dark API -> ordinary executor -> controller upgrade to source
+commit `a836825ef` and digest
+`sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`.
+Revision 61 returned all three ordinary roles to the compatible baseline image
+with the current chart while retaining global-user-state 028, Serve033, and
+API007. Revisions 62–64 repeated the staged upgrade and left the new digest as
+the final state. The exact per-revision evidence is recorded under Deployment
+and rollback. This proves that the unshipped feature-only Serve032 shape was
+absent and that the guarded Serve033 migration handled the upstream catalog;
+it does not prove this provider facet.
 
 ### P2: live shadow observation
 
@@ -5175,8 +5189,10 @@ Contract tests must cover:
   selectors with distinct explicit ServiceAccounts and exact GET-only evidence,
   separate canary workload namespace, ClusterIP Service, NetworkPolicy, exact
   namespaced/cluster RBAC
-  grants and forbidden verbs, plus API -> new worker cohort -> controller
-  rollout and current-chart rollback while both cohorts remain claimable;
+  grants and forbidden verbs, plus the dark API -> ordinary executor ->
+  controller rollout/current-chart compatible-image rollback, and separately
+  gated versioned authority-cohort add/switch/drain/retirement tests while both
+  cohorts remain claimable;
 - API006 -> API007 migration preserves every existing request, queue, action,
   attempt, and server-instance row while widening only the named role CHECK;
   downgrade rejects any remaining `authority-worker` instance; ordinary API007
@@ -5218,20 +5234,55 @@ write-once commitments and preserves nonterminal shadow/action state. It does
 not run provider compensation or schema down. After first authority, rollback
 to a pre-action-aware image is unsupported.
 
-As of 2026-08-02 this section remains a rollout contract, not deployment
-evidence. `resourceActions.authorityWorker.enabled` must remain `false`: no
-live provider dispatcher or admitted provider session exists, no profile has
-passed the authority gates, and no M4/provider-authoritative service is
-claimed.
+The dark binary/schema rollout and compatible-image rollback now have live
+`boltz-test` evidence. `resourceActions.authorityWorker.enabled` nevertheless
+remains `false`: no authority-worker resource, admitted provider session,
+dispatcher, provider mutation, shadow sample, or M4 service was exercised.
 
-The companion inherits the parent's exact role rollout: build one immutable
-digest, upgrade the API role first until all required heads converge, upgrade
-the new authority-worker cohort second and attest it, then upgrade controllers
-last. Every `helm upgrade` uses `--reuse-values` and explicitly pins every
-untouched API/controller image and every extant worker cohort. The first
-additive migration stage omits `--atomic`; repair or
-rollback uses the current chart with the prior compatible immutable digests
-against the retained heads, never native `helm rollback`.
+For a dark action-aware image, upgrade API first, ordinary executors second,
+and controllers last, explicitly pinning every untouched role at each
+`helm upgrade --reuse-values`. Authority-worker cohorts are absent from this
+sequence. Their future deployment is separately gated by renderer/runtime/
+preflight and cohort-attestation evidence. The first additive migration stage
+omits `--atomic`; repair or rollback uses the current chart and compatible
+prior digests against retained additive heads, never native `helm rollback`.
+
+### `boltz-test` dark rollout evidence (2026-08-02)
+
+The new artifact used immutable tag `resource-actions-a836825ef`, source commit
+`a836825ef9c219563bb2abc740707c825c26edc5`, and digest
+`sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`
+(`new`). The compatible baseline digest was
+`sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`
+(`old`). Deployment evidence remains scoped to that source commit if the PR is
+subsequently rebased.
+
+| Revision | Purpose | API / executor / controller | Migration result | Heads after checkpoint |
+|---|---|---|---|---|
+| 57 | Observed baseline | old / old / old | prior rollout | 027 / Serve032 / API004 |
+| 58 | Dark API/migration stage | new / old / old | succeeded, 10:05:51–10:06:56 UTC | 028 / Serve033 / API007 |
+| 59 | Dark ordinary-executor stage | new / new / old | succeeded, 10:13:33–10:13:45 UTC | 028 / Serve033 / API007 |
+| 60 | Dark controller stage | new / new / new | succeeded, 10:21:02–10:21:14 UTC | 028 / Serve033 / API007 |
+| 61 | Current-chart compatible-image rollback | old / old / old | old migrator succeeded, 10:26:51–10:27:02 UTC | retained 028 / Serve033 / API007 |
+| 62 | Re-upgrade API stage | new / old / old | succeeded, 10:36:15–10:36:26 UTC | retained 028 / Serve033 / API007 |
+| 63 | Re-upgrade ordinary-executor stage | new / new / old | succeeded, 10:42:48–10:43:00 UTC | retained 028 / Serve033 / API007 |
+| 64 | Re-upgrade controller/final stage | new / new / new | succeeded, 10:46:32–10:47:04 UTC | retained 028 / Serve033 / API007 |
+
+Every checkpoint converged the changed role to 2/2 at the intended digest with
+zero restarts. All eight action/shadow/coverage/cohort tables remained empty;
+services, replicas, and clusters remained zero; all 18 pre-existing requests
+were preserved while normal processing reduced nonterminal requests from 9 to
+6; final ungranted locks were zero; and no authority-worker resource existed.
+The final state had two ready API endpoints and no matching schema, migration,
+private-handler, or resource-action error in role logs.
+
+Karpenter/capacity churn generated 134 aggregated `FailedScheduling` events,
+10 `Underutilized` evictions, two transient AWS-CNI
+`FailedCreatePodSandBox` events, and 167 startup/readiness `Unhealthy` events
+for the selected rollout objects between 10:05 and 10:49 UTC. Every affected
+ordinary Deployment recovered to 2/2 with zero restarts. With zero actions and
+provider I/O disabled, this is ordinary Deployment recovery evidence, not an
+action crash-canary or provider-authority result.
 
 On `boltz-test`, every authority-worker Deployment, versioned ServiceAccount,
 selector Service, purpose Secret projection, static-manifest projection, and
@@ -5452,14 +5503,16 @@ absence result through a public API.
   reconstruction and equal-hash/unequal-byte conflict handling. Measure
   realistic and candidate-maximal renderer/preflight/runtime goldens below the
   bound before enabling any authority.
-- Rendered and live verification of the dedicated authority-worker Helm
+- The dark API -> ordinary executor -> controller rollout/current-chart
+  rollback is complete. Still open are rendered and live verification of the
+  dedicated authority-worker Helm
   versioned-cohort contract, `REGISTERING`/two-ready-Pod activation,
   release-namespace worker/Service/RBAC/projections, two distinct frozen LB
   Deployments and explicit ServiceAccounts, separate canary workload namespace,
   purpose-specific TLS/token transport, exact same-client facade and
   RBAC/access-review matrices, controller-only preflight network path,
   frozen-cohort claim routing/retention, surviving-API tombstone verification,
-  and the pinned API -> new worker cohort -> controller rollout/current-chart
-  rollback sequence.
+  two-Pod attestation, and a later authority-cohort rollout/rollback with
+  nonterminal references pinned to their cohort.
 - A measured complete-shadow window and minimum volume for launch, retry,
   ambiguity, and down.

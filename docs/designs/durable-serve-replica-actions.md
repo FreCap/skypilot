@@ -16,6 +16,18 @@ instrumentation remain open. Authority is disabled, no service has been
 promoted, and the named legacy thread/map/retry-clock owners remain in place;
 the restructuring has not yet earned its claimed operational payoff.
 
+Source commit `a836825ef9c219563bb2abc740707c825c26edc5` was built as
+immutable image
+`sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`
+and exercised on `boltz-test` through a staged dark API -> ordinary executor ->
+controller rollout, current-chart compatible-image rollback with retained
+additive schema, and staged re-upgrade. Every stage kept
+`resourceActions.authorityWorker.enabled=false`, converged or retained
+global-user-state 028, Serve033, and API007, and left all action, shadow,
+coverage, and cohort tables empty. This is binary/schema/mixed-version rollback
+evidence only. It does not prove shadow parity, provider I/O, crash recovery of
+an action, M4 authority, or the operational payoff.
+
 Last updated: 2026-08-02
 
 Canonical owner: this file. The provider-side companion is
@@ -2586,35 +2598,44 @@ lease, or alternate lock order. Otherwise keep the kernel Serve-scoped.
 ## Deployment and rollback
 
 The isolated test target is Kubernetes context `boltz-test`, namespace/release
-`skypilot-ha/skypilot-ha`, with PostgreSQL and two API/controller replicas.
+`skypilot-ha/skypilot-ha`, with PostgreSQL and two API, ordinary-executor, and
+controller replicas.
 Authority-worker Deployments, ServiceAccounts, selector Service, Secrets,
 manifest projections, and their NetworkPolicy stay in that release namespace;
 only provider workload objects use the separate `skypilot-actions-canary`
 namespace. Production is not a fault-injection target.
 
-Deployment order is:
+The dark compatibility rollout, with authority workers disabled and absent, is
+API -> ordinary executor -> controller:
 
 1. build and push an immutable image digest;
 2. deploy only the API role with `helm upgrade --reuse-values`, explicitly
-   keeping the dark authority-worker role disabled when no cohort exists (or
-   pinning every already-deployed cohort to its immutable digest), pinning the
-   controller role to its prior immutable digest, and letting the API's blocking
+   keeping the authority-worker role disabled, pinning ordinary executors and
+   controllers to the prior immutable digest, and letting the API's blocking
    additive migration hook reach the required heads;
 3. verify all independent milestone-specific heads: M1a is API005 with
    unchanged Serve031/global-user-state 027; legacy-controller-only M2 shadow
    requires API005, Serve033, and global-user-state 028; any private-handler
    shadow, M3 provider dispatch, and M4 authority require API007, Serve033, and
-   global-user-state 028, with no cross-lineage Alembic dependency;
-4. deploy a new immutable versioned authority-worker cohort at the new digest
-   while retaining/pinning every cohort with a `PREPARING`, `SHADOW_ACTIVE`, or
-   `ACTION_ACTIVE` reference and pinning API/controller roles, then prove its
-   exact static manifest, live identity, capability, and handler inventory
-   before selecting it for new admissions;
-5. deploy controller roles at the new digest while pinning API and
-   authority-worker roles, then prove the complete image/head/handler
-   inventory;
-6. collect parity and crash evidence; and
-7. promote only an explicitly selected canary service.
+   global-user-state 028, with no cross-lineage Alembic dependency; also verify
+   preserved requests/inventory, zero action-family rows, and zero
+   authority-worker resources;
+4. deploy ordinary executors at the new digest while pinning API to the new
+   digest and controllers to the prior digest;
+5. deploy controllers last with API and ordinary executors pinned to the new
+   digest;
+6. run compatible-image rollback with the current chart and prior digest for
+   all three ordinary roles while retaining additive heads; and
+7. repeat API -> ordinary executor -> controller to restore the new digest.
+
+A versioned authority-worker cohort is a later, separately gated M2/M3
+deployment. It is not part of this dark rollout and must not be rendered,
+attested, selected, or described as exercised here. Once that runtime exists,
+deploy a new immutable cohort while retaining every cohort with a `PREPARING`,
+`SHADOW_ACTIVE`, or `ACTION_ACTIVE` reference; prove its exact static manifest,
+live identity, capability, and handler inventory before new admission; then
+collect parity/crash evidence and promote only an explicitly selected canary
+service.
 
 The first ready worker self-attests the projected static manifest and live
 Deployment/ServiceAccount UIDs and inserts `REGISTERING`; two distinct ready
@@ -2640,6 +2661,55 @@ milestone is repaired with another current-chart `helm upgrade --reuse-values`
 that pins every role explicitly and deploys the prior compatible immutable
 digest against the retained additive schema; `helm rollback` is not used.
 Database principal topology and credentials are unchanged by this program.
+
+### `boltz-test` dark rollout evidence (2026-08-02)
+
+The tested artifact used ECR immutable tag `resource-actions-a836825ef`, source
+commit `a836825ef9c219563bb2abc740707c825c26edc5`, and digest
+`sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`
+(`new`). The compatible baseline digest was
+`sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`
+(`old`). The eventual PR head may be rebased beyond the deployed source commit;
+this evidence remains scoped to the artifact above.
+
+| Helm revision | Started (UTC) | Purpose | API / executor / controller | Migration job (UTC) | Heads after checkpoint |
+|---|---|---|---|---|---|
+| 57 | 03:05:54 | Observed baseline | old / old / old | prior rollout | 027 / Serve032 / API004 |
+| 58 | 10:05:42 | Dark stage 1: API and migrations | new / old / old | 10:05:51–10:06:56, succeeded | 028 / Serve033 / API007 |
+| 59 | 10:13:24 | Dark stage 2: ordinary executor | new / new / old | 10:13:33–10:13:45, succeeded | 028 / Serve033 / API007 |
+| 60 | 10:20:53 | Dark stage 3: controller | new / new / new | 10:21:02–10:21:14, succeeded | 028 / Serve033 / API007 |
+| 61 | 10:26:42 | Current-chart compatible-image rollback | old / old / old | 10:26:51–10:27:02, succeeded on old | retained 028 / Serve033 / API007 |
+| 62 | 10:36:06 | Re-upgrade stage 1: API | new / old / old | 10:36:15–10:36:26, succeeded | retained 028 / Serve033 / API007 |
+| 63 | 10:42:39 | Re-upgrade stage 2: ordinary executor | new / new / old | 10:42:48–10:43:00, succeeded | retained 028 / Serve033 / API007 |
+| 64 | 10:46:23 | Re-upgrade stage 3: controller; final | new / new / new | 10:46:32–10:47:04, succeeded | retained 028 / Serve033 / API007 |
+
+Each checkpoint was held until every changed role converged to exactly 2/2
+ready replicas at the intended digest with zero container restarts. The final
+revision had two ready API endpoints, zero services, replicas, and clusters,
+zero ungranted PostgreSQL locks, and no schema, migration, private-handler, or
+resource-action error in the role-log scan. The 18 pre-existing API requests
+were preserved; normal executor processing reduced nonterminal requests from
+9 to 6 during the exercise.
+
+At every checkpoint, all eight action-family tables remained empty:
+`api_resource_actions`, `api_resource_action_attempts`,
+`serve_resource_action_shadow_samples`,
+`serve_resource_action_shadow_attempts`,
+`serve_resource_action_worker_cohorts`,
+`serve_resource_action_worker_cohort_refs`,
+`serve_resource_action_shadow_coverage`, and
+`serve_resource_action_shadow_coverage_attempts`. No authority-worker
+Deployment, ServiceAccount, Service, Secret, NetworkPolicy, Role, or RoleBinding
+was present.
+
+The rollout encountered ordinary Kubernetes infrastructure churn. Across the
+10:05–10:49 UTC event window the selected role/migration objects accumulated
+134 `FailedScheduling` events while Karpenter supplied capacity, 10
+`Underutilized` evictions, two transient AWS-CNI `FailedCreatePodSandBox`
+events, and 167 startup/readiness `Unhealthy` events. Every affected Deployment
+recovered to 2/2 at the intended digest with zero restarts. Because no resource
+action existed and provider I/O was disabled, this is ordinary Deployment
+recovery evidence, not an M3/M4 action crash-canary result.
 
 ## Fault-injection and verification
 
@@ -2885,30 +2955,20 @@ write typed outcomes.
   are implemented; capped live rendered bodies and preflight envelopes still
   require measurement. Authority remains disabled until the runtime and live
   gates pass.
-- Rendered and live verification of the dedicated versioned authority-worker
-  Helm cohort, exact RBAC/admission/NetworkPolicy, purpose token/TLS preflight,
+- The dark API -> ordinary executor -> controller rollout and current-chart
+  compatible-image rollback are verified above. Still open are rendered/live
+  activation of the dedicated versioned authority-worker Helm cohort, exact
+  RBAC/admission/NetworkPolicy, purpose token/TLS preflight,
   static-manifest/live-UID qualification, complete-spec submit/observe, worker
-  registration/two-Pod attestation, staged API -> worker -> controller rollout,
-  namespace-local worker Service/RBAC/projections, surviving-API tombstone
-  verification, fail-closed retirement over preparation/action/private-shadow
-  references, and current-chart rollback with nonterminal work pinned to its
-  cohort.
+  registration/two-Pod attestation, claim routing/retirement, surviving-API
+  tombstone verification, and rollback while nonterminal action/private-shadow
+  references pin a cohort.
 - A checked-in inventory of the initial `pod_cluster_v1` eligible cohort after
   preallocated cluster UUID propagation, Kubernetes replica-incarnation
   labeling, normalized admitted-object/partial-UID readback, prebooted
   Ray/Skylet and action-keyed job recovery, exact handle/endpoint, dual-LB
   reachability, and the redacted invocation builder pass contract tests. Until
   then the profile is shadow-only and promotion-blocking.
-- Build and push the immutable canary image for `boltz-test`. AWS/ECR auth and
-  read-only cluster access through the dedicated SSM hop are verified. The
-  2026-08-02 pre-rollout refresh found zero services, nine nonterminal system
-  requests, no Warning events, and healthy two-replica API/executor/controller
-  roles. The rollback baseline is now Helm revision 57 (`M5-S0a passive Skylet
-  jobs.db side schema`) with all roles pinned to
-  `sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`;
-  central heads remain global 027, Serve032, and API004. Re-read the live
-  revision, image, heads, and workload inventory immediately before rollout;
-  revision 56 is no longer the current rollback point.
 - Measured shadow sample minimums and the first canary service selection.
 - Authoritative canary evidence followed by deletion of the launch/down
   SafeThread owners, `_replica_to_request_id`, cleanup retry maps/clocks, and
