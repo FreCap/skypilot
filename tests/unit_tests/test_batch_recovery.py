@@ -2226,6 +2226,51 @@ async def test_superseded_cleanup_fans_out_active_workers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_superseded_cleanup_retires_cleaned_active_workers_immediately(
+        monkeypatch):
+    batch_coordinator = _make_coordinator()
+    with batch_coordinator._active_workers_lock:
+        batch_coordinator._active_workers['worker-a'] = 17
+
+    monkeypatch.setattr(coordinator.sdk, 'exec',
+                        mock.Mock(return_value='shutdown-request'))
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(return_value=None))
+    monkeypatch.setattr(coordinator.sdk, 'cancel',
+                        mock.Mock(return_value='cancel-request'))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records', mock.Mock(return_value=[]))
+
+    await asyncio.wait_for(batch_coordinator.handle_superseded(timeout=10),
+                           timeout=1)
+
+    with batch_coordinator._active_workers_lock:
+        assert not batch_coordinator._active_workers
+
+
+def test_cancel_worker_job_by_id_keeps_newer_active_worker_registration(
+        monkeypatch):
+    batch_coordinator = _make_coordinator()
+    with batch_coordinator._active_workers_lock:
+        batch_coordinator._active_workers['worker-a'] = 18
+
+    monkeypatch.setattr(coordinator.sdk, 'cancel',
+                        mock.Mock(return_value='cancel-request'))
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(return_value=None))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record',
+                        mock.Mock(return_value=True))
+
+    batch_coordinator._cancel_worker_job_by_id('worker-a', 17,
+                                               batch_coordinator._worker_token)
+
+    with batch_coordinator._active_workers_lock:
+        assert batch_coordinator._active_workers == {'worker-a': 18}
+
+
+@pytest.mark.asyncio
 async def test_superseded_cleanup_queries_each_owned_cluster_once(monkeypatch):
     batch_coordinator = _make_coordinator()
     records = [{
@@ -2426,8 +2471,8 @@ async def test_superseded_cleanup_durable_timeout_starts_no_later_call(
                         'remove_batch_worker_record', remove_record)
 
     try:
-        await batch_coordinator.handle_superseded(timeout=0.05)
-        assert launch_recovery_entered.is_set()
+        await batch_coordinator.handle_superseded(timeout=0.2)
+        assert await asyncio.to_thread(launch_recovery_entered.wait, 1)
     finally:
         release_launch_recovery.set()
 

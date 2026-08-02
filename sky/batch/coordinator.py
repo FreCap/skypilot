@@ -225,6 +225,15 @@ class BatchCoordinator:
             self._active_workers.pop(cluster_name)
             return not self._superseded_cleanup_started
 
+    def _retire_active_worker(self, cluster_name: str,
+                              worker_job_id: int) -> bool:
+        """Forget one active worker only if the exact snapshot still matches."""
+        with self._active_workers_lock:
+            if self._active_workers.get(cluster_name) != worker_job_id:
+                return False
+            self._active_workers.pop(cluster_name)
+            return True
+
     async def handle_superseded(self, timeout: float = 60) -> None:
         """Bound cleanup of only this superseded incarnation's workers.
 
@@ -279,6 +288,7 @@ class BatchCoordinator:
                     worker_token,
                     cluster_name,
                     worker_job_id=worker_job_id)
+                self._retire_active_worker(cluster_name, worker_job_id)
             return within_deadline
 
         async def _cleanup_active_worker(cluster_name: str,
@@ -1252,6 +1262,7 @@ class BatchCoordinator:
                     worker_token,
                     cluster_name,
                     worker_job_id=worker_job_id)
+                self._retire_active_worker(cluster_name, worker_job_id)
                 return
             except Exception as e:  # pylint: disable=broad-except
                 if attempt == 1:
