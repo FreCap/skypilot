@@ -1,7 +1,7 @@
 # SkyServe System OOM Recovery
 
-_Status: per-job capability architecture awaiting exact adversarial review;
-the inert runtime foundation is merged; #1182 and draft #1183 must be
+_Status: corrected per-job capability architecture pending exact acceptance
+review; the inert runtime foundation is merged; #1182 and draft #1183 must be
 rewritten; production activation is blocked_
 
 _Last updated: 2026-08-02_
@@ -138,7 +138,7 @@ backend rejection is resolved by the bounded protocol below.
 - the job has one node, one run task/future, no managed-secret reference, no
   task-level persistent outer `container_image`, and no external process
   manager outside the typed local-Docker ownership contract;
-- an owner-fenced controller launch intent carries contract version 1,
+- an owner-fenced controller launch intent carries contract version 2,
   authorization version 3, and runtime-profile version 2, and
   matches the exact service incarnation, replica ID/generation, workspace,
   safety-relevant task digest, immutable runtime-image digest, and typed
@@ -213,8 +213,8 @@ Authorization version 3 and runtime profile version 2 are different version
 domains. They are never compared for equality. The trusted matcher explicitly
 maps an accepted `SystemOomRecoveryAuthorizationV3` to runtime profile 2 and
 the exact capability string above; the controller reducer validates the same
-mapping when it first observes `ARMED`. Runtime profile/marker version 2 is not
-renamed, reinterpreted, or replaced by authorization v3.
+mapping when it first observes any valid recovery phase. Runtime profile/marker
+version 2 is not renamed, reinterpreted, or replaced by authorization v3.
 
 The document is not a user environment variable or service-name-only switch.
 Changing the task or allowed market/shape envelope invalidates the static
@@ -236,13 +236,27 @@ launch generation, profile ID, and exact job ID when available. Logs include
 the decision/reason and the evidence observed at that boundary, but raw account
 and instance values never become metric labels or user-visible output.
 
-The task digest binds effective post-policy setup/run/event callbacks,
-environment names and non-secret values, mounts/storage/volumes, hooks,
-resources, and runtime artifacts. Managed-secret references are ineligible
-because their resolved environment and temporary-file provenance cannot yet be
-normalized without hiding an admin-policy mutation. The server-assigned
-numeric replica ID is the only normalized effective environment value; its key
-and numeric shape remain bound.
+The task digest is the SHA-256 of canonical sorted-key compact JSON produced
+from the effective task's redacted YAML form after removing only `name`,
+`service`, and `_user_specified_yaml`, and replacing a valid numeric
+server-assigned replica-ID environment value with the fixed
+`<server-replica-id>` token. Setup, run, event callbacks, environment names and
+non-secret values, mounts/storage/volumes, hooks, and every other task field
+remain byte-significant after canonicalization. The submitted `resources`
+object is replaced by a recursive runtime-resource identity: it preserves
+`any_of`/`ordered` shape (canonical-sorting list members) and only `image_id`,
+`container_image`, `volumes`, `_cluster_config_overrides`,
+`_docker_login_config`, and the digest member of
+`_resolved_container_image`. Thus placement-only cloud, region, zone,
+instance-type, accelerators, CPU, memory, disk, ports, labels, market, and
+ordering spelling do not bind this digest. Authorization v3's closed resource
+envelope and the actual provision-result checks bind the selected placement,
+market, shape, and memory separately. Any admin-policy mutation outside that
+exact normalization changes the digest and fails closed. Managed-secret
+references are ineligible because their resolved environment and temporary-
+file provenance cannot yet be normalized without hiding such a mutation. The
+replica-ID key and numeric shape remain bound even though its numeric value is
+normalized.
 
 ### Existing legacy launch plus exact controller handoff
 
@@ -252,7 +266,7 @@ owner-fenced compare-and-sets one historical intent in `ReplicaInfo`:
 ```text
 SystemRecoveryLaunchIntentV1 = {
   version: 1,
-  controller_contract_version: 1,
+  controller_contract_version: 2,
   recovery_authorization_version: 3,
   recovery_authorization_profile_id: Text,
   recovery_authorization_sha256: Sha256,
@@ -262,31 +276,95 @@ SystemRecoveryLaunchIntentV1 = {
   service_hash: NonemptyText,
   replica_id: PositiveInteger,
   launch_generation: PositiveInteger,
+  launch_nonce: 64LowerHex,
   workspace: Text,
   resource_envelope_sha256: Sha256,
   task_sha256: Sha256,
   runtime_image_digest: "sha256:" + 64LowerHex,
-  owned_container_spec_sha256: Sha256
+  owned_container_spec_sha256: Sha256,
+  execution_envelope_sha256: Sha256
 }
 ```
 
-The internal launch context likewise carries authorization version 3 and
-runtime profile version 2 in separate keys. #1182 does not overload or
-reinterpret the shipped v1/v2 profile-version key. An old server that does not
-understand the new authorization key cannot match v3 and therefore generates
-an ordinary job.
+The internal launch context has exactly two closed forms. The controller-to-
+endpoint `SystemRecoveryLaunchContextV2Unbound` contains exactly:
+
+```text
+{
+  controller_contract_version: 2,
+  recovery_authorization_version: 3,
+  recovery_authorization_profile_id: Text,
+  recovery_authorization_sha256: Sha256,
+  runtime_profile_version: 2,
+  expected_runtime_capability:
+      "subreaper-v2+owned-local-docker-v1",
+  sky_serve_service_name: NonemptyText,
+  sky_serve_service_hash: NonemptyText,
+  sky_serve_service_version: PositiveInteger,
+  sky_serve_controller_pid: IntegerOrNull,
+  sky_serve_controller_ip: TextOrNull,
+  replica_id: PositiveInteger,
+  launch_generation: PositiveInteger,
+  launch_nonce: 64LowerHex,
+  workspace: Text,
+  resource_envelope_sha256: Sha256,
+  task_sha256: Sha256,
+  runtime_image_digest: "sha256:" + 64LowerHex,
+  owned_container_spec_sha256: Sha256,
+  execution_envelope_sha256: Sha256
+}
+```
+
+The service fence and controller owner tuple must equal current server state.
+The endpoint-to-backend `SystemRecoveryLaunchContextV2Bound` contains exactly
+the same fields except that `launch_nonce` is removed and one
+`bound_request_id: RequestIdText` is added. Unknown, missing, wrong-typed, or
+wrong-form fields reject the recovery-bearing request before executor
+scheduling rather than being ignored. The random 256-bit nonce authorizes only
+one atomic endpoint bind: it never names a lifecycle operation, provider
+mutation, cleanup, replay, or queue message, is never accepted by the backend,
+and is not a public API field.
+
+Neither context carries the shipped
+`SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY` used by controller contract 1.
+#1182 does not overload or reinterpret that v1/v2 key. A PR1/old server
+requires controller contract 1 plus the legacy key, so it rejects a v3 context
+even if a v2 authorization document is accidentally still installed. The new
+server maps controller-contract-2/authorization-v3 explicitly to runtime
+profile 2; numeric equality is never the mapping rule.
 
 The same owner-fenced write sets the recovery launch disposition to
 `CANDIDATE`. Failure to persist it means the controller omits the recovery
 contract from the existing internal Serve launch context and the generated job
-is ordinary. The controller then calls the same legacy `sdk.launch`. As soon as
-`sdk.launch` returns its ordinary request ID, the controller owner/generation-
-fenced persists it as optional `ReplicaInfo.launch_request_id`. This is only an
-association with the existing request; it adds no request marker, column,
-claim generation, retention/GC rule, header, advisory lock, handle format, or
-cleanup receipt. Failure to persist the returned ID makes recovery
-unadoptable and selects ordinary legacy teardown; it never triggers request
-discovery.
+is ordinary. The controller then calls the same legacy `sdk.launch`. Only the
+first outer launch request for that replica generation may carry the recovery
+contract. In the existing `/launch` handler, before executor scheduling, the
+API server uses its already-created ordinary request ID plus the closed launch
+context to consume the exact nonce and owner/generation-fenced bind that ID as
+optional `ReplicaInfo.launch_request_id`. It then overwrites the in-memory
+context's bound-request field with that server-known value. The backend requires
+the current request ID, server-bound context ID, persisted association, and
+fresh-provision evidence request ID to agree. A caller cannot mint a bound
+context, and the legitimate backend cannot run before association is durable.
+This uses the existing request ID and `extra_launch_context` envelope; it adds
+no public payload field, request marker/column, claim generation, retention/GC
+rule, header, advisory lock, handle format, or cleanup receipt. `sdk.launch`'s
+returned ID must equal the already-bound ID. Bind/return mismatch makes
+recovery unadoptable and selects ordinary legacy teardown; it never triggers
+request discovery.
+
+The existing outer launch loop can issue another ordinary request after a
+failed request and confirmed legacy cluster cleanup. It must never overwrite
+the recovery-bearing request association or reuse its context. Before any such
+retry, the controller atomically and irreversibly changes this generation's
+disposition from `CANDIDATE` to `ORDINARY`; the retry omits every recovery key
+and follows the existing launch behavior. If `sdk.launch` raises before
+returning, the controller first checks only the exact row association: a
+server-bound ID is adopted and streamed, while an unbound intent takes the
+demotion-and-cleanup path. It never searches request history. If legacy cleanup
+does not confirm success, no retry occurs. Thus a replica generation has at
+most one recovery-bearing request/job association even though the ordinary
+legacy retry loop remains available after demotion.
 
 At the backend submission boundary, the API/server revalidates the internal
 Serve owner/generation context and exact post-policy task. The one-shot lease
@@ -311,7 +389,20 @@ restart it may fetch the result only by the exact durable
 `ReplicaInfo.launch_request_id` already bound to that replica. A missing
 request ID, missing/malformed exact result, failed owner CAS, or job mismatch
 keeps a potentially capable replica off-route and schedules/adopts ordinary
-legacy teardown.
+legacy teardown. A failed exact request is first cleaned up by the legacy path
+and then, if retryable, re-driven only as `ORDINARY` as described above.
+
+Launch-result callbacks never acquire the replica-manager lock: current
+teardown may hold that lock while joining the launch thread. Instead, one
+Serve-state primitive locks the exact PostgreSQL replica row, revalidates
+service owner plus replica/generation, patches the recovery subdocument, and
+rewrites both versioned JSON and compatibility pickle from that locked value.
+All generic whole-row replica writers lock and preserve the latest stored
+recovery subdocument/revision rather than overwriting it from a stale in-memory
+snapshot. Controller status/probe reductions use the same explicit patch
+primitive and then refresh their local object. This single-writer subdocument
+protocol prevents both lock inversion and lost request/job/reducer updates;
+it adds no table column or migration.
 
 The Ray job can already be live when job-ID persistence fails. That cannot
 retroactively disarm its bounded driver. The driver may complete one replay,
@@ -459,9 +550,22 @@ trip. It never parses logs or polls an application queue.
 `ReplicaInfo` version 13 stores the historical launch intent, launch
 disposition (`CANDIDATE`, `ORDINARY`, or `CAPABLE`), optional ordinary
 `launch_request_id`, exact service job ID, one-shot candidate-ready/
-arm-release anchors, and one nested `ReplicaSystemRecovery`. Version 12 and
-older rows default the new fields to ordinary/no recovery; the versioned JSON
-extension needs no PostgreSQL schema migration.
+arm-release anchors, one monotonically increasing recovery-subdocument
+revision, and one nested `ReplicaSystemRecovery`. Version 12 and older rows
+default the new
+fields to ordinary/no recovery; the versioned JSON extension needs no
+PostgreSQL schema migration. During the supported rollback transition, a
+v13-labelled row with the **entire** recovery bundle absent is also decoded as
+`ORDINARY`: that exact shape is what an old v12 writer produces after all
+candidate/capable rows have been drained. A partial or internally inconsistent
+bundle is never granted that exception and is quarantined off-route. Replica
+enumeration decodes each row independently: one malformed recovery bundle
+cannot abort the fleet read. Its row is returned as a typed quarantined
+replica, is never routed or reduced as ordinary/capable, emits one bounded
+reason-only audit record without the raw payload, and is handed to the same
+owner-fenced legacy teardown scheduler. Failure to acquire cleanup ownership
+leaves it visibly quarantined for the next reconciliation rather than deleting
+or guessing its state.
 
 The first exact `PRESENT` observation initializes the validated nested object;
 the controller never invents remote event/attempt identity. It stores
@@ -473,33 +577,48 @@ strings or booleans are introduced.
 
 Candidate authorization alone never activates the recovery startup barrier.
 Before first routing, a `CANDIDATE` row resolves only against the exact bound
-job: `PRESENT/ARMED` is accepted only when authorization v3 maps to runtime
-profile 2 and capability `subreaper-v2+owned-local-docker-v1`, then atomically
-persists `CAPABLE` plus the nested state. `ABSENT` before the arm window closes
-is only “no row now”; it cannot release the candidate because a valid driver
-may still arm later.
+job. Any valid `PRESENT` phase with authorization v3 explicitly mapped to
+runtime profile 2 and capability
+`subreaper-v2+owned-local-docker-v1` proves the job previously passed through
+`ARMED`: `ARMED` atomically persists `CAPABLE/ARMED`; `WAITING_CLEANUP`,
+`WAITING_MEMORY`, or `RESUBMITTING` persists `CAPABLE/RECOVERING`;
+`RETRY_SUBMITTED` persists `CAPABLE/RETRY_SUBMITTED` with exact adoption and
+still requires a later fresh probe; and `EXHAUSTED` persists terminal state
+and schedules legacy teardown. The controller need not have sampled the
+intermediate `ARMED` row. `ABSENT` before the arm window closes is only “no row
+now”; it cannot release the candidate because a valid driver may still arm
+later.
 
 The candidate's first successful readiness probe persists one immutable
 `candidate_ready_observed_at` and
-`ordinary_release_not_before = candidate_ready_observed_at + 35 seconds`.
-The replica stays off-route under its existing initial-readiness budget. At or
-after that time, one new readiness probe begun after the persisted deadline
-must succeed, and the same reconciliation cycle must re-read the exact job as
-nonterminal plus recovery detail `ABSENT`. Only that conjunction atomically
-persists `ORDINARY` and releases a mixed-fleet GCP, Kubernetes, larger AWS, or
-other backend rejection to current behavior. Because the driver's captured
-arm-window start precedes original task submission and application readiness,
-this controller deadline is no earlier than the driver's fixed arm deadline. A
-prior `ABSENT` followed by a late valid `PRESENT/ARMED` therefore becomes
-`CAPABLE`, never an uncoordinated ordinary driver.
+`ordinary_release_not_before = candidate_ready_observed_at + 35 seconds`. In
+the same process it starts a 35-second monotonic guard. On controller process
+replacement, boot change, or any unprovable clock continuity, every unresolved
+candidate with a ready anchor starts a fresh full monotonic guard. Release
+requires **both** the durable wall deadline and that process-local monotonic
+guard; a forward/backward wall-clock jump or restart can delay release but
+cannot make it early. At or after both gates, one new readiness probe begun
+after the persisted deadline and monotonic guard must succeed, and the same
+reconciliation cycle must re-read the exact job as nonterminal plus recovery
+detail `ABSENT`. Only that conjunction atomically persists `ORDINARY` and
+releases a mixed-fleet GCP, Kubernetes, larger AWS, or other backend rejection
+to current behavior. Because the driver's captured arm-window start precedes
+original task submission and successful application readiness, the combined
+controller hold cannot finish before the driver's fixed arm deadline. A prior
+`ABSENT` followed by any late valid `PRESENT` phase therefore becomes
+`CAPABLE` (or terminal if `EXHAUSTED`), never an uncoordinated ordinary driver.
 
-The fixed candidate hold never extends the service's existing initial-
-readiness deadline. If that deadline wins, or if a candidate observation is
-`MALFORMED` or `UNSPECIFIED`, the controller keeps the replica off-route and
-schedules/adopts legacy teardown; neither status can release to ordinary.
-Missing request/job association does the same. Exact pre-launch non-AWS
-overrides skipped candidacy entirely, so they incur no arm-resolution hold. No
-latest-job lookup is permitted.
+Before the first success, the service's existing initial-readiness deadline
+still wins and is never reset. A success inside that budget satisfies the
+application-readiness condition, but the candidate remains off-route for the
+bounded system-admission hold above; a low configured initial delay therefore
+does not tear down an application that already proved ready. Ordinary
+post-ready consecutive-failure handling continues during the hold. A
+`MALFORMED` or `UNSPECIFIED` candidate remains off-route and schedules/adopts
+legacy teardown; neither status can release to ordinary. Missing request/job
+association does the same. Exact pre-launch non-AWS overrides skipped
+candidacy entirely, so they incur no arm-resolution hold. No latest-job lookup
+is permitted.
 
 At controller startup, only a previously persisted `CAPABLE` row enters the
 recovery-specific forced-off-route 35-second exact-status barrier. An unresolved
@@ -511,7 +630,8 @@ initial-readiness deadline; it never inherits the 35-second recovery barrier.
 job, runtime-profile/capability mismatch, event identity mismatch, or barrier
 expiry exhausts and schedules legacy teardown.
 
-When the controller observes `ARMED`, it persists capability. A ready capable
+When the controller first observes any valid phase, it persists capability and
+the corresponding reduced state as one patch. A ready `CAPABLE/ARMED`
 replica's first failed probe sets a one-way 35-second event-detection latch.
 Later success from the old attempt cannot clear it or route the replica. If the
 exact event is not adopted before expiry, recovery exhausts.
@@ -559,13 +679,17 @@ machine as it does today. If job-ID/intent evidence is missing, the controller
 does not wait for or infer recovery; it selects ordinary replacement.
 
 For AWS Spot, `RAY_NODE_OOM` and interruption/preemption are distinct causes.
-An AWS notice, observed interruption/termination, terminal driver
-loss, or already-durable preemption/down intent takes precedence regardless of
-observation order. The controller keeps the replica off-route and follows
-ordinary replacement. The driver does not query a cloud API, interpret a
-generic exit as OOM, or recover preemption. If a typed OOM occurs with no
-interruption evidence while the Spot VM and driver remain live, the one-replay
-path is allowed. A later provider notice still wins.
+Only preemption/termination already observed and durably recorded by the
+existing legacy liveness/down path takes precedence; this initiative adds no
+notice receiver or same-cycle provider fence. The controller keeps such a
+replica off-route and follows ordinary replacement. Before that observation,
+a typed OOM may replay while the Spot VM and driver remain live. The driver
+does not query a cloud API, interpret a generic exit as OOM, or recover
+preemption. Actual provider termination kills the driver/VM, and the later
+legacy liveness observation becomes terminal. The existing small stale-probe
+window between provider termination and durable observation remains ordinary
+Spot behavior; no claim is made that notice time itself instantly fences
+routing.
 
 The service remains `resource_action_mode=legacy` throughout. API005-007,
 Serve033 action links/modes/cohorts, and resource-action provider progress are
@@ -579,7 +703,7 @@ this legacy one and is outside this stack.
 ```text
 existing SkyServe legacy launch request
   | owner-fenced candidate authorization intent already persisted
-  | ordinary launch_request_id persisted after sdk.launch returns
+  | /launch binds its server-known ordinary request ID before scheduling
   v
 existing provision/backend path
   | exact one-shot FreshProvisionEvidenceLease
@@ -597,7 +721,7 @@ unchanged API-v1 job_system_recovery row
   v
 pure SkyServe controller reducer
   | ready + arm-window expiry + exact ABSENT: candidate -> ORDINARY
-  | ARMED capability-v2: candidate -> CAPABLE
+  | any valid capability-v2 phase: candidate -> CAPABLE/reduced phase
   | MALFORMED/UNSPECIFIED/deadline: legacy teardown
   | recovered: fresh probe -> READY
   | exhausted/preempted/evidence loss
@@ -619,14 +743,22 @@ The responsibility boundary is intentionally small:
 
 ### One-shot fresh-provision evidence
 
-`RetryingVmProvisioner` constructs immutable `FreshProvisionEvidence` directly
-from the exact successful `ProvisionRecord`. It binds request, display/provider
-cluster names, cluster hash, provider, requested node count, head and complete
-created-instance IDs, owner-fenced service identity, EC2 instance ID, AWS
-account/region/availability zone, actual market/instance type, and resolved
-catalog memory. Creation rejects an existing cluster,
-resumed IDs, partial/duplicate creates, a head outside the created set, dry
-runs, and skipped/non-proof-carrying results.
+`RetryingVmProvisioner` constructs immutable `FreshProvisionEvidence` from the
+exact successful `ProvisionRecord` plus closed AWS facts captured for its
+created EC2 ID. The record supplies the complete created-ID set, head, provider
+and region/zone result. One request-scoped `DescribeInstances` result for that
+exact created ID supplies `InstanceId`, `InstanceType`,
+`Placement.AvailabilityZone`, and actual lifecycle market (`spot` only when
+`InstanceLifecycle == "spot"`; absence means on-demand). The active request's
+STS caller identity supplies the AWS account, and the resolved handle's exact
+instance type is looked up through the AWS catalog for memory. Requested
+`use_spot` or a task memory hint is never treated as actual-result proof. The
+evidence binds those facts with the ordinary request, display/provider cluster
+names, cluster hash, node count, and owner-fenced service identity. Creation
+rejects an existing cluster, resumed IDs, partial/duplicate creates, a head
+outside the created set, dry runs, skipped/non-proof-carrying results, missing
+AWS facts, or any disagreement among provision record, Describe result, STS,
+handle, and catalog.
 
 The payload lives only in a noncopyable, nonserializable
 `FreshProvisionEvidenceLease`. Aliases share one private lock and atomic
@@ -706,6 +838,9 @@ claim, request, provider journal, or absence inference.
 - The exact historical launch intent, ordinary launch request ID, and service
   job ID are required for controller adoption. Missing evidence selects VM
   replacement, not discovery.
+- The API endpoint binds its own ordinary request ID by consuming the exact
+  random launch nonce before executor scheduling. A client-supplied unbound
+  context cannot reach backend admission.
 - Authorization v3 maps explicitly to runtime profile/capability v2. No reducer
   compares those different version domains for equality.
 - `JobSystemRecoveryInfo` API v1 and supervisor marker/capability v2 remain
@@ -715,8 +850,9 @@ claim, request, provider journal, or absence inference.
   pre-submission monotonic start. Once disabled, the same job cannot later arm
   or replay.
 - `ABSENT` never releases a candidate before a fresh post-arm-window readiness
-  success and an exact same-cycle status/detail re-read. `MALFORMED` and
-  `UNSPECIFIED` candidates tear down rather than route.
+  success, both durable-wall and process-monotonic 35-second guards, and an
+  exact same-cycle status/detail re-read. `MALFORMED` and `UNSPECIFIED`
+  candidates tear down rather than route.
 - The fresh-provision lease is consumed once and cannot cross fallback,
   controller restart, handle rebind, or a later submission.
 - The current legacy path remains the only launch/down/cloud authority. No
@@ -724,8 +860,8 @@ claim, request, provider journal, or absence inference.
   is created.
 - A durable teardown/preemption intent always wins routing and VM outcome. A
   bounded replay may race briefly but cannot reverse it.
-- AWS Spot interruption and Ray OOM remain separate typed causes; interruption
-  never becomes a recoverable OOM because both happen near one another.
+- AWS Spot interruption and Ray OOM remain separate typed causes; only typed
+  Ray OOM can replay, and observed/durable legacy preemption always wins.
 - Readiness routes a recovered replica only after a probe begun after exact
   `RETRY_SUBMITTED` adoption.
 - Ambiguous supervisor/container cleanup is failure, not permission to replay.
@@ -740,9 +876,8 @@ claim, request, provider journal, or absence inference.
 
 ## Known conservative limitations
 
-- A capable replica can become ready and OOM before `ARMED` is observed; it may
-  follow ordinary teardown. This reduces recovery rate without widening
-  authority.
+- A controller may first see a phase after `ARMED`; valid downstream phases are
+  adopted directly, but missing/malformed exact detail still selects teardown.
 - Ray `.remote()` has no synchronous cancellation point. A late future is not
   adopted and is cancelled/fenced, but a stuck GCS call may delay local
   cancellation while legacy teardown remains authoritative.
@@ -751,9 +886,11 @@ claim, request, provider journal, or absence inference.
 - The existing legacy launch/down path retains its current ambiguous-request
   and failed-cleanup behavior. This feature does not claim durable cloud
   operation recovery.
-- An AWS Spot interruption may destroy the driver before it writes final detail.
-  That is ordinary preemption and may make recovery telemetry incomplete; it
-  never authorizes replay or routing.
+- An AWS Spot interruption may destroy the driver before it writes final
+  detail. That is ordinary preemption and may make recovery telemetry
+  incomplete. Before the legacy liveness path observes it, one stale
+  successful probe can briefly race provider termination exactly as it can
+  today; after durable observation it never authorizes replay or routing.
 
 ## Alternatives considered
 
@@ -837,9 +974,9 @@ recovery state, pure reducers, CAPABLE-only startup/detection/deadline
 barriers, the additive authorization-document-v3 reader and explicit
 authorization-v3-to-runtime-profile/capability-v2 mapping, fresh AWS
 eligibility with immutable EC2/account/region/AZ binding, backend catalog plus
-driver cgroup admission, Spot-preemption precedence, legacy teardown
+driver cgroup admission, observed-Spot-preemption precedence, legacy teardown
 schedule/adoption, and bounded compatibility/admission logs. Only this PR
-emits controller contract version 1. It does not change
+emits controller contract version 2. It does not change
 `JobSystemRecoveryInfo` API v1, its protobuf, or marker/capability v2.
 
 The current #1182 protected-request/header/API-migration/protected-AWS cleanup
@@ -883,6 +1020,7 @@ seven-day observation window.
 | Authorization document v2 | Typed `OwnedContainerSpec` but lacks the exact authorization-v3 provider/identity/memory envelope; never selected by production after #1182 | #1183 removes the authorization-v2 reader; runtime profile and marker/capability v2 remain |
 | Marker schema v1 and `subreaper-v1+local-docker-empty-inventory-v1` | Read-only compatibility for already-generated artifacts | #1183 removes after marker/telemetry audit |
 | Status-only old-runtime recovery decoding | Missing detail can only select ordinary VM behavior/replacement | #1183 removes after image and seven-day gates |
+| All-fields-absent v13 recovery bundle written by a v12 rollback controller | Decodes only as `ORDINARY` after candidate/capable drain; partial state quarantines | #1183 removes when rewritten #1182 is the rollback floor |
 | Old #1182 protected request/header/API migration/protected AWS cleanup | Never shipped; no transition writer or row exists | Deleted while rewriting #1182; no compatibility/migration |
 
 The legacy launch/down SafeThreads, `_replica_to_request_id`, cleanup retry
@@ -914,7 +1052,7 @@ an ad hoc `--reuse-values` mutation outside the owning IaC state.
    contains no unrelated Helm-value or infrastructure drift and no local/
    central recovery-schema change.
 2. Verify all API/controllers and candidate replica images expose the required
-   supervisor-marker-v2, controller-contract-v1, and job-detail-v1 capability.
+   supervisor-marker-v2, controller-contract-v2, and job-detail-v1 capability.
    Existing replicas remain ordinary; the authorization affects only newly
    launched jobs.
 3. Install an exact authorization-v3 entry for a dedicated fresh AWS on-demand
@@ -924,8 +1062,11 @@ an ad hoc `--reuse-values` mutation outside the owning IaC state.
    authorization-removal rollback with Ray's threshold unchanged.
 4. Install a separate exact AWS Spot 16-GB authorization-v3 entry. Verify the
    legacy launch remains Spot with its existing no-on-demand-fallback
-   configuration, run first/second OOM, then inject a Spot-interruption-versus-
-   OOM race and prove preemption/legacy replacement wins.
+   configuration and run first/second OOM. For the terminal-loss race, invoke
+   EC2 `TerminateInstances` against only the inventoried canary instance while
+   inducing the OOM; after the existing liveness path has durably recorded
+   preemption/down, prove no reducer transition or probe can route/recover it
+   and legacy replacement wins. This test makes no early-notice claim.
 5. Enable the reviewed production authorization only for newly launched AWS
    Spot 16-GB replicas in `boltz-l4-fleet`. GCP, Kubernetes, larger AWS, and
    any fallback/mismatch must persist `ORDINARY` without entering the CAPABLE
@@ -940,15 +1081,19 @@ through Terraform/Terragrunt first; no newly generated job can arm afterward.
 Persist/adopt legacy teardown for every active `CAPABLE` or unresolved
 `CANDIDATE` replica and wait until zero such active rows remain. `ORDINARY`
 rows need no recovery teardown. A blocked/ambiguous cleanup blocks controller
-rollback; its retained evidence does not satisfy the audit. Then apply the last
-compatible exact digest through the owning infrastructure stack after a clean
-reviewed plan.
+rollback. Then apply the last compatible exact digest through the owning
+infrastructure stack after a clean reviewed plan. If that old writer touches an
+`ORDINARY` row, it may erase the complete v13 recovery bundle while retaining
+the v13 version label; rewritten #1182 recognizes only that all-fields-absent
+rollback shape as ordinary on a later re-upgrade. Partial bundles remain
+malformed. This compatibility reader is temporary and #1183 removes it once
+rewritten #1182 is the rollback floor.
 
 An already-generated driver remains bounded to one replay after authorization
 removal. Therefore rolling below #1182 before active `CAPABLE` and unresolved
 `CANDIDATE` replicas are gone is unsupported: an old controller cannot enforce
-the fresh-probe fence. The
-replica-local API-v1 companion table and protobuf fields remain unchanged
+the fresh-probe fence. The replica-local API-v1 companion table and protobuf
+fields remain unchanged
 across rollback. Central schemas were never changed. No rollback deletes
 action evidence, because this feature creates none.
 
@@ -985,31 +1130,46 @@ action evidence, because this feature creates none.
 
 ### Controller and legacy lifecycle races
 
-- Version-12/13 serialization tests round-trip candidate intent, launch
-  disposition, optional ordinary request ID, exact job ID, barrier anchors,
-  and nested state; malformed rows quarantine independently.
+- Version-12/13 serialization tests round-trip candidate intent/nonce, launch
+  disposition, optional ordinary request ID, exact job ID, monotonic
+  subdocument revision, barrier anchors, and nested state. An all-fields-absent
+  v13 rollback shape alone defaults ordinary; partial/malformed recovery data
+  is isolated per row, forced off-route, logged without raw payload, and fed to
+  the existing teardown owner without aborting the fleet read.
 - Reducer tables/property tests cover duplicate, stale, skipped, reordered,
   malformed, terminal, teardown, preemption, restart, and fresh-probe events.
-- Launch tests crash before/after intent CAS, `sdk.launch` return, ordinary
-  request-ID owner CAS, backend job start, exact result persistence, and job-ID
-  owner CAS. Missing request/job evidence never invokes latest-job discovery
-  and schedules/adopts legacy teardown.
+- Launch tests crash before/after intent CAS, API-endpoint nonce consumption,
+  server request-ID binding, executor scheduling, `sdk.launch` return, backend
+  job start, exact result persistence, and job-ID owner CAS. A lost POST
+  response adopts only the ID already bound in the exact replica row. Missing
+  request/job evidence never invokes latest-job discovery and schedules/adopts
+  legacy teardown.
 - Tests recover job ID only from the exact bound legacy request result and
   reject latest-job, name-only, or mismatched generation results.
 - Admission reducer races prove an early exact-job `ABSENT` remains
-  `CANDIDATE`, a later pre-deadline `PRESENT/ARMED` becomes `CAPABLE`, and only
-  a fresh post-deadline ready probe plus same-cycle nonterminal/`ABSENT` re-read
-  persists `ORDINARY`. Restart cannot reset the anchors; `MALFORMED`/
-  `UNSPECIFIED` schedule teardown. Exact non-AWS overrides bypass candidacy,
-  while mixed-fleet GCP/Kubernetes/larger-AWS results use the bounded release
-  protocol and never enter the CAPABLE startup barrier.
-- Deterministic races cover job-ID/intent callbacks versus teardown in both
-  lock orders, prove teardown never joins while holding the manager lock, and
-  prove exactly one existing cleanup owner/request is adopted or scheduled.
-- Legacy integration tests assert request bodies, claim/retry behavior,
-  cluster handles/YAML, provider calls, cancellation, down, failed-cleanup
-  retry, and replacement remain byte/behavior compatible and no OOM-specific
-  request/action/database state is created.
+  `CANDIDATE`; first observations at `ARMED`, every active downstream phase,
+  `RETRY_SUBMITTED`, and `EXHAUSTED` reduce to their exact capable/terminal
+  states; and only a fresh post-deadline ready probe plus same-cycle
+  nonterminal/`ABSENT` re-read persists `ORDINARY`. Forward/backward wall-clock
+  jumps and controller restart cannot satisfy the process-monotonic guard
+  early. `MALFORMED`/`UNSPECIFIED` schedule teardown. Exact non-AWS overrides
+  bypass candidacy, while mixed-fleet GCP/Kubernetes/larger-AWS results use the
+  bounded release protocol and never enter the CAPABLE startup barrier. A
+  low-initial-delay candidate that succeeds before its application deadline
+  remains alive but off-route through the bounded admission hold.
+- Deterministic races cover request/job/reducer patches versus teardown in both
+  row-lock orders, prove callbacks never acquire the manager lock even while
+  current teardown joins their thread, prove stale whole-row writes preserve
+  the latest recovery revision, and prove exactly one existing cleanup
+  owner/request is adopted or scheduled.
+- Legacy integration tests assert noncandidate/disabled request bodies remain
+  byte-compatible. Candidate requests differ only by the enumerated internal
+  context and endpoint precondition; after the first request fails, confirmed
+  cleanup and every later retry are ordinary and cannot overwrite its
+  association. Cluster handles/YAML, provider calls, cancellation, down,
+  failed-cleanup retry, and replacement otherwise retain existing behavior.
+  No request/action table or column beyond versioned `ReplicaInfo` JSON is
+  created.
 - Mixed-fleet tests show one service can launch recovery-capable AWS jobs and
   ordinary GCP/Kubernetes jobs while remaining resource-action legacy.
 
@@ -1025,10 +1185,14 @@ teardown replaces the VM. Re-read identity/RAM/threshold unchanged.
 
 Repeat on a fresh AWS Spot 16-GB replica. Prove the existing launch's actual
 market is Spot and no on-demand fallback was introduced. First test a pure OOM
-with no interruption. Then inject a real or provider-faithful Spot interruption
-racing an OOM: preemption/down must remain terminal, no post-fence probe may
-route the replica, the driver may not classify interruption as OOM, and legacy
-replacement proceeds. GCP/Kubernetes jobs remain ordinary controls.
+with no interruption. Then call EC2 `TerminateInstances` for only the
+inventory-verified canary instance while racing an OOM. Capture the existing
+controller liveness observation and durable preemption/down transition; all
+terminal assertions start at that durable observation, after which no probe or
+recovery transition may route the replica and legacy replacement must proceed.
+The driver may not classify generic termination as OOM. This deliberately
+tests actual provider loss, not an unimplemented early AWS-notice/SQS path.
+GCP/Kubernetes jobs remain ordinary controls.
 
 ### Negative architecture tests
 
@@ -1038,12 +1202,34 @@ replacement proceeds. GCP/Kubernetes jobs remain ordinary controls.
   cleanup, another request/queue/lease, a `JobSystemRecoveryInfo` API-v1/
   protobuf field, or a marker-v2 field.
 - API/auth tests prove user input or an ordinary service-name match cannot emit
-  the controller contract or arm a job.
+  the controller contract or arm a job. Guessed/replayed contexts, an absent,
+  wrong, or already-consumed nonce, request-ID mismatch, unknown context keys,
+  and an old server with a v2 authorization document plus a new context all
+  fail closed. Executor scheduling cannot begin before the exact endpoint bind
+  commits, and the backend rejects an unbound form.
 - Telemetry records authorization-document-v1/v2 selection, runtime-marker-v1
   and status-only reads, authorization-v3 candidate/ordinary/capable outcomes,
   API-v1 recovery/exhaustion, evidence-loss fallback, market/provider, and
   preemption races using bounded nonsecret labels. Structured admission logs
   are separately bounded and never become metric labels.
+
+PR2 adds one low-cardinality counter,
+`sky_serve_system_oom_recovery_events_total`, to the existing metrics endpoint.
+Its closed `event` label is one of `authorization_v1_selected`,
+`authorization_v2_selected`, `marker_v1_read`, `status_only_read`,
+`authorization_v3_candidate`, `authorization_v3_ordinary`,
+`authorization_v3_capable`, `recovery_started`, `recovery_succeeded`,
+`recovery_exhausted`, `evidence_lost`, or `preemption_observed`; `provider` is
+one of `aws`, `gcp`, `kubernetes`, `other`, or `unknown`, and `market` is one of
+`on_demand`, `spot`, `other`, or `unknown`. No service, profile, request, job,
+account, region, instance, or reason value is a metric label. Production
+monitoring must retain this series for at least eight days before the removal
+clock starts. Each of the seven UTC 24-hour gate queries requires both zero
+`increase()` for the three deprecated-read events and gap-free scrape-health
+evidence; counter reset, missing target, or scrape gap resets the clock. The
+timestamped query result and eligible-image inventory are retained with both
+PRs. Exact per-replica associations remain in current `ReplicaInfo`; bounded
+structured logs supply diagnostic correlation but are not lifecycle authority.
 
 ## PR 3 removal gates
 
@@ -1055,23 +1241,33 @@ recorded here and in both stacked PR descriptions:
    replicas. Every active authorization-v3 `CAPABLE` replica has its exact
    ordinary launch request ID, service job ID, runtime profile 2, and matching
    supervisor-marker/capability v2.
-2. No authorization document v1 or v2 remains in any environment. Historical
-   intent evidence remains queryable; deleting the current authorization
-   cannot satisfy gate 1 by itself.
+2. No authorization document v1 or v2 remains in any rendered deployment,
+   secret/config source, or live API/controller environment. Current active
+   replica audit plus the retained bounded compatibility-telemetry window—not
+   deleted `ReplicaInfo` history—provides removal evidence; deleting the
+   current authorization alone cannot satisfy gate 1 or gate 4.
 3. Every API/controller and eligible replica image meets the approved
    controller/job-detail/Skylet/library versions and emits only controller
-   contract 1 plus unchanged `JOB_SYSTEM_RECOVERY_API_VERSION == 1` and runtime
+   contract 2 plus unchanged `JOB_SYSTEM_RECOVERY_API_VERSION == 1` and runtime
    profile/marker capability v2. No status-only eligible runtime remains.
 4. From completion of one full eligible AWS Spot fleet rollout, compatibility
    telemetry reports zero authorization-document-v1/v2 selection,
    runtime-marker-v1 read, and status-only recovery read for seven continuous
    24-hour periods. Any hit or eligible image change resets the clock.
-5. A remote audit reports zero marker-v1 directories on every active eligible
-   VM. Age pruning alone is not evidence.
+5. A two-pass remote audit reports zero marker-v1 directories on every active
+   eligible VM. The audit first snapshots active eligible replica rows and
+   their exact immutable EC2 IDs, exact job IDs, and runtime digests, scans only
+   that inventory, then repeats after one full controller probe interval.
+   Inventory churn is excluded only with a retained terminal replica-state plus
+   completed legacy-cleanup record; all other missing/unreachable targets fail
+   the gate. Both timestamped inventories, per-target results, and churn
+   dispositions are attached to the PR evidence. Age pruning alone is not
+   evidence.
 6. Both real 16-GB authorization-v3/runtime-profile-2/supervisor-v2 smoke
    sequences pass with the Ray threshold unchanged: on-demand first-OOM
-   recovery plus second-OOM legacy replacement, and Spot OOM recovery plus an
-   interruption/OOM race where preemption wins. GCP and Kubernetes negative
+   recovery plus second-OOM legacy replacement, and Spot OOM recovery plus the
+   exact `TerminateInstances`/OOM race where, from durable preemption/down
+   observation onward, legacy replacement wins. GCP and Kubernetes negative
    controls persist `ORDINARY` without the CAPABLE barrier.
 7. The supported rollback target is rewritten #1182 on the unchanged legacy
    lifecycle. Terraform/Terragrunt-owned rollback/re-upgrade, authorization
@@ -1086,9 +1282,11 @@ recorded here and in both stacked PR descriptions:
   is not sufficient if runtime reports more than 16 GB.
 - Freeze the exact production service/task/image/authorization digests after the
   current task is digest-pinned. A mutable Docker image remains ineligible.
-- Select and document the provider-faithful Spot interruption injection method
-  and the exact provider/preemption evidence used by the reducer. A generic
-  process exit must not be labeled interruption or OOM.
+- Provision the dedicated Spot canary permissions for the exact
+  `TerminateInstances` injection described above and record the existing
+  liveness observation plus durable preemption/down evidence used by the
+  reducer. A generic process exit must not be labeled interruption or OOM, and
+  no SQS/EventBridge/early-notice receiver is part of this gate.
 - Verify `sdk.launch` exposes its ordinary request ID before every relevant
   controller-restart window and that the exact bound result carries a durable
   service job ID. Any uncloseable association gap remains ordinary replacement
