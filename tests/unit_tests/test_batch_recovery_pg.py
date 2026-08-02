@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import datetime
+import importlib
 import os
 import shutil
 import threading
@@ -41,6 +42,73 @@ def postgres_engine():
     finally:
         engine.dispose()
         container.stop()
+
+
+def test_postgres_waiting_job_index_shape_and_idle_plan(postgres_engine):
+    migration_027 = importlib.import_module(
+        'sky.schemas.db.spot_jobs.027_add_waiting_job_priority_index')
+    first_job_id = 9_000_000
+    job_count = 5_000
+
+    with postgres_engine.begin() as connection:
+        index = migration_027._postgres_index_state(connection)
+        assert index is not None
+        assert migration_027._postgres_shape_matches(index)
+        connection.execute(state.job_info_table.insert(), [{
+            'spot_job_id': first_job_id + offset,
+            'schedule_state': state.ManagedJobScheduleState.DONE.value,
+            'priority': 0,
+            'is_batch': False,
+        } for offset in range(job_count)])
+        connection.exec_driver_sql('ANALYZE job_info')
+
+        active_batch_states = [
+            state.ManagedJobScheduleState.LAUNCHING.value,
+            state.ManagedJobScheduleState.ALIVE.value,
+            state.ManagedJobScheduleState.ALIVE_WAITING.value,
+            state.ManagedJobScheduleState.ALIVE_BACKOFF.value,
+        ]
+        busy_batch_pools = sqlalchemy.select(state.job_info_table.c.pool).where(
+            sqlalchemy.and_(
+                state.job_info_table.c.pool.isnot(None),
+                state.job_info_table.c.is_batch.is_(True),
+                state.job_info_table.c.schedule_state.in_(active_batch_states),
+            )).correlate(None).scalar_subquery()
+        candidate = sqlalchemy.select(
+            state.job_info_table.c.spot_job_id,
+            state.job_info_table.c.schedule_state,
+            state.job_info_table.c.pool,
+        ).where(
+            sqlalchemy.and_(
+                state.job_info_table.c.schedule_state.in_([
+                    state.ManagedJobScheduleState.WAITING.value,
+                ]),
+                sqlalchemy.or_(
+                    state.job_info_table.c.is_batch.isnot(True),
+                    ~state.job_info_table.c.pool.in_(busy_batch_pools),
+                ),
+            )).order_by(
+                state.job_info_table.c.priority.desc(),
+                state.job_info_table.c.spot_job_id.asc(),
+            ).limit(1).with_for_update()
+        sql = candidate.compile(dialect=postgres_engine.dialect,
+                                compile_kwargs={'literal_binds': True})
+        plan_document = connection.exec_driver_sql(
+            f'EXPLAIN (FORMAT JSON) {sql}').scalar_one()
+
+        connection.execute(state.job_info_table.delete().where(
+            state.job_info_table.c.spot_job_id.between(
+                first_job_id, first_job_id + job_count - 1)))
+        connection.exec_driver_sql('ANALYZE job_info')
+
+    plan = plan_document[0]['Plan']
+    assert plan['Node Type'] == 'Limit'
+    lock_rows = plan['Plans'][0]
+    assert lock_rows['Node Type'] == 'LockRows'
+    index_scan = lock_rows['Plans'][0]
+    assert index_scan['Node Type'] == 'Index Scan'
+    assert index_scan['Relation Name'] == 'job_info'
+    assert index_scan['Index Name'] == 'ix_job_info_schedule_priority'
 
 
 def test_postgres_job_event_writers_preserve_utc_instants(

@@ -629,6 +629,197 @@ def test_schema_026_adds_managed_job_controller_ownership(
     engine.dispose()
 
 
+def test_schema_027_indexes_waiting_jobs_in_scheduler_order(
+        tmp_path, monkeypatch):
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "scheduler-index.db"}')
+
+    @contextlib.contextmanager
+    def unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', unlocked)
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '026')
+    # Revision 001 creates indexes from current metadata for fresh databases.
+    # Remove it to exercise the real 026-to-027 upgrade path.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'DROP INDEX IF EXISTS ix_job_info_schedule_priority')
+
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '027')
+
+    with engine.connect() as connection:
+        summary = next(row for row in connection.exec_driver_sql(
+            "PRAGMA index_list('job_info')").mappings()
+                       if row['name'] == 'ix_job_info_schedule_priority')
+        index_rows = connection.exec_driver_sql(
+            "PRAGMA index_xinfo('ix_job_info_schedule_priority')").mappings()
+        keys = [row for row in index_rows if bool(row['key'])]
+        revision = connection.execute(
+            sqlalchemy.text('SELECT version_num FROM '
+                            'alembic_version_spot_jobs_db')).scalar_one()
+
+    assert not bool(summary['unique'])
+    assert not bool(summary['partial'])
+    assert [row['name'] for row in keys
+           ] == ['schedule_state', 'priority', 'spot_job_id']
+    assert [bool(row['desc']) for row in keys] == [False, True, False]
+    assert revision == '027'
+    engine.dispose()
+
+
+def test_schema_027_fresh_bootstrap_matches_migrated_shape(
+        tmp_path, monkeypatch):
+    migration = importlib.import_module(
+        'sky.schemas.db.spot_jobs.027_add_waiting_job_priority_index')
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "fresh-scheduler-index.db"}')
+
+    @contextlib.contextmanager
+    def unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', unlocked)
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '027')
+
+    with engine.connect() as connection:
+        index = migration._sqlite_index_state(connection)
+        revision = connection.execute(
+            sqlalchemy.text('SELECT version_num FROM '
+                            'alembic_version_spot_jobs_db')).scalar_one()
+
+    assert index is not None
+    assert migration._sqlite_shape_matches(index)
+    assert revision == '027'
+    engine.dispose()
+
+
+def test_schema_027_rejects_same_name_with_wrong_order(tmp_path, monkeypatch):
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "malformed-scheduler-index.db"}')
+
+    @contextlib.contextmanager
+    def unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', unlocked)
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '026')
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'DROP INDEX IF EXISTS ix_job_info_schedule_priority')
+        connection.exec_driver_sql(
+            'CREATE INDEX ix_job_info_schedule_priority ON job_info '
+            '(schedule_state, priority ASC, spot_job_id ASC)')
+
+    with pytest.raises(RuntimeError, match='unexpected shape'):
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SPOT_JOBS_DB_NAME,
+                                             '027')
+
+    with engine.connect() as connection:
+        revision = connection.execute(
+            sqlalchemy.text('SELECT version_num FROM '
+                            'alembic_version_spot_jobs_db')).scalar_one()
+    assert revision == '026'
+    engine.dispose()
+
+
+def test_schema_027_builds_postgres_index_concurrently(monkeypatch):
+    migration = importlib.import_module(
+        'sky.schemas.db.spot_jobs.027_add_waiting_job_priority_index')
+    bind = mock.Mock()
+    bind.dialect.name = 'postgresql'
+    create_index = mock.Mock()
+    monkeypatch.setattr(migration, '_postgres_index_state', lambda _: None)
+    monkeypatch.setattr(migration.op, 'get_bind', lambda: bind)
+    monkeypatch.setattr(migration.op, 'create_index', create_index)
+
+    @contextlib.contextmanager
+    def autocommit_block():
+        yield
+
+    context = mock.Mock()
+    context.autocommit_block = autocommit_block
+    monkeypatch.setattr(migration.op, 'get_context', lambda: context)
+
+    migration.upgrade()
+
+    args = create_index.call_args.args
+    assert args[:2] == ('ix_job_info_schedule_priority', 'job_info')
+    assert [str(column) for column in args[2]
+           ] == ['schedule_state', 'priority DESC', 'spot_job_id ASC']
+    assert create_index.call_args.kwargs == {'postgresql_concurrently': True}
+
+
+def test_schema_027_repairs_invalid_postgres_index(monkeypatch):
+    migration = importlib.import_module(
+        'sky.schemas.db.spot_jobs.027_add_waiting_job_priority_index')
+    bind = mock.Mock()
+    bind.dialect.name = 'postgresql'
+    bind.dialect.identifier_preparer.quote_schema.side_effect = (
+        lambda value: f'"{value}"')
+    bind.dialect.identifier_preparer.quote.side_effect = (
+        lambda value: f'"{value}"')
+    create_index = mock.Mock()
+    monkeypatch.setattr(
+        migration, '_postgres_index_state', lambda _: {
+            'table_schema': 'public',
+            'table_name': 'job_info',
+            'index_schema': 'public',
+            'is_valid': False,
+            'is_ready': False,
+        })
+    monkeypatch.setattr(migration.op, 'create_index', create_index)
+
+    migration._ensure_index(bind)
+
+    bind.exec_driver_sql.assert_called_once_with(
+        'DROP INDEX CONCURRENTLY IF EXISTS '
+        '"public"."ix_job_info_schedule_priority"')
+    assert create_index.call_args.kwargs == {'postgresql_concurrently': True}
+
+
+def test_schema_027_rejects_valid_postgres_index_with_wrong_order(monkeypatch):
+    migration = importlib.import_module(
+        'sky.schemas.db.spot_jobs.027_add_waiting_job_priority_index')
+    bind = mock.Mock()
+    bind.dialect.name = 'postgresql'
+    index = {
+        'table_schema': 'public',
+        'table_name': 'job_info',
+        'index_schema': 'public',
+        'is_valid': True,
+        'is_ready': True,
+        'is_unique': False,
+        'is_primary': False,
+        'is_exclusion': False,
+        'is_unfiltered': True,
+        'is_expression_free': True,
+        'access_method': 'btree',
+        'key_count': 3,
+        'attribute_count': 3,
+        'key_columns': ['schedule_state', 'priority', 'spot_job_id'],
+        'key_options': [0, 0, 0],
+    }
+    monkeypatch.setattr(migration, '_postgres_index_state', lambda _: index)
+    create_index = mock.Mock()
+    monkeypatch.setattr(migration.op, 'create_index', create_index)
+
+    with pytest.raises(RuntimeError, match='unexpected shape'):
+        migration._ensure_index(bind)
+
+    bind.exec_driver_sql.assert_not_called()
+    create_index.assert_not_called()
+
+
 def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
     engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "target.db"}')
     upgrade = mock.Mock()
@@ -638,9 +829,9 @@ def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
 
     upgrade.assert_called_once_with(engine,
                                     migration_utils.SPOT_JOBS_DB_NAME,
-                                    '026',
+                                    '027',
                                     mode='auto')
-    assert migration_utils.SPOT_JOBS_VERSION == '026'
+    assert migration_utils.SPOT_JOBS_VERSION == '027'
     engine.dispose()
 
 

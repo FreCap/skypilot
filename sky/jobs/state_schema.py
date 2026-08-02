@@ -157,6 +157,10 @@ job_info_table = sqlalchemy.Table(
                       sqlalchemy.Text,
                       server_default=None),
 )
+sqlalchemy.Index('ix_job_info_schedule_priority',
+                 job_info_table.c.schedule_state,
+                 job_info_table.c.priority.desc(),
+                 job_info_table.c.spot_job_id.asc())
 
 # Separate table for API access token IDs associated with managed jobs.
 # Maps job_id -> token_id for cleanup when the job completes.
