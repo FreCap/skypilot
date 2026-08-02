@@ -36,6 +36,22 @@ class _FakeBackend:
         return {1: jobs_utils.job_lib.JobStatus.SUCCEEDED}
 
 
+def test_stream_logs_facade_preserves_id_dispatch_and_arguments(monkeypatch):
+    """The generated-command entrypoint must keep its historical dispatch."""
+    stream_by_id = mock.Mock(return_value=('streamed', 0))
+    monkeypatch.setattr(jobs_utils, 'stream_logs_by_id', stream_by_id)
+
+    result = jobs_utils.stream_logs(job_id=42,
+                                    job_name='ignored-name',
+                                    follow=False,
+                                    tail=17,
+                                    tail_offset=9,
+                                    task='eval')
+
+    assert result == ('streamed', 0)
+    stream_by_id.assert_called_once_with(42, False, 17, 9, 'eval')
+
+
 class TestWaitForNextTask:
     """Checks the lifecycle and polling boundaries between JobGroup tasks."""
 
