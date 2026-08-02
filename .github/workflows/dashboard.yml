@@ -30,6 +30,7 @@ jobs:
           src/components/recipe-hub.test.jsx \
           src/components/recipe-detail.test.jsx \
           src/components/clusters.test.jsx \
+          src/components/utils.test.jsx \
           src/components/volumes.test.jsx \
           src/components/estimated-spend.test.jsx \
           src/components/infra.test.jsx \
