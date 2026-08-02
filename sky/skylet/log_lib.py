@@ -441,7 +441,6 @@ def run_bash_command_with_log_and_return_pid(
 
 
 def run_bash_command_with_log_and_return_pid_with_system_oom_recovery(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-        bash_command: str | None,
         log_path: str,
         recovery_context: dict[str, object],
         recovery_plan: system_oom_recovery.RecoveryLaunchPlan,
@@ -457,31 +456,12 @@ def run_bash_command_with_log_and_return_pid_with_system_oom_recovery(  # pylint
     """
     if not isinstance(recovery_plan, system_oom_recovery.RecoveryLaunchPlan):
         raise TypeError('recovery_plan must be a RecoveryLaunchPlan')
-    inner_command = None
-    if (recovery_plan.profile_version ==
-            system_oom_recovery.PROFILE_VERSION_DIRECT_SHELL):
-        if not isinstance(bash_command, str):
-            raise ValueError('direct-shell recovery requires a command')
-        with tempfile.NamedTemporaryFile('w', prefix='sky_app_1_',
-                                         delete=False) as fp:
-            wrapped_command = make_task_bash_script(bash_command,
-                                                    env_vars=env_vars)
-            fp.write(wrapped_command)
-            fp.flush()
-            script_path = fp.name
-        # Deprecated profile v1 intentionally preserves the ordinary
-        # interactive-shell launch byte for byte. It is deleted by stacked PR
-        # 3 after the canonical migration gates pass.
-        inner_command = f'/bin/bash -i {script_path}'
-    else:
-        if bash_command is not None:
-            raise ValueError('owned-container recovery rejects shell command')
-        recovery_plan = recovery_plan.bind_environment(env_vars)
+    recovery_plan = recovery_plan.bind_environment(env_vars)
 
     recovery_context = system_oom_recovery.bind_supervisor_parent(
         recovery_context, os.getpid())
     supervisor_command = system_oom_recovery.build_supervisor_command(
-        inner_command, recovery_context, recovery_plan)
+        recovery_context, recovery_plan)
     return_code = run_with_log(supervisor_command,
                                log_path,
                                stream_logs=stream_logs,

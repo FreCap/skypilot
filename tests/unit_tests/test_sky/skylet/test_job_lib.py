@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from sky.skylet import job_lib
+from sky.skylet import system_oom_recovery
 from sky.utils import message_utils
 from sky.utils.db import db_utils
 
@@ -30,7 +31,7 @@ def _add_running_job() -> int:
 
 def _armed_info() -> job_lib.JobSystemRecoveryInfo:
     return job_lib.JobSystemRecoveryInfo(
-        capability='skyserve-system-oom-recovery-v1',
+        capability=system_oom_recovery.CAPABILITY_V2,
         phase=job_lib.JobSystemRecoveryPhase.ARMED,
         original_attempt_id='attempt-0',
         replacement_attempt_id=None,
@@ -110,9 +111,11 @@ def test_recovery_info_rejects_boolean_schema_and_scalar_fields():
         job_lib.JobSystemRecoveryInfo.from_dict(payload)
 
 
-def test_unknown_detail_status_is_malformed_not_unspecified():
+@pytest.mark.parametrize('protobuf_status', [0, 99])
+def test_zero_or_unknown_detail_status_is_malformed(protobuf_status):
+    assert not hasattr(job_lib.JobSystemRecoveryDetailStatus, 'UNSPECIFIED')
     assert job_lib.JobSystemRecoveryDetailStatus.from_protobuf(
-        99) == job_lib.JobSystemRecoveryDetailStatus.MALFORMED
+        protobuf_status) == job_lib.JobSystemRecoveryDetailStatus.MALFORMED
 
 
 def test_add_job_uses_exact_inserted_row_for_duplicate_timestamp(
@@ -278,7 +281,7 @@ def test_exhaustion_rolls_back_recovery_if_status_write_fails(job_database):
     assert job_lib.get_job_system_recovery_info(job_id) == waiting
 
 
-def test_status_payload_new_and_legacy_compatibility(job_database):
+def test_status_payload_new_and_legacy_fail_closed(job_database):
     job_id = _add_running_job()
     armed = _armed_info()
     assert job_lib.arm_job_system_recovery(job_id, armed)
@@ -299,7 +302,28 @@ def test_status_payload_new_and_legacy_compatibility(job_database):
     assert statuses == {job_id: job_lib.JobStatus.RUNNING}
     assert infos == {}
     assert detail_statuses == {
-        job_id: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+        job_id: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
+    }
+
+
+@pytest.mark.parametrize('detail_statuses', [{}, {'7': 'UNSPECIFIED'}])
+def test_missing_or_legacy_ssh_detail_status_is_malformed(detail_statuses):
+    payload = message_utils.encode_payload({
+        'version': 1,
+        'job_statuses': {
+            7: job_lib.JobStatus.RUNNING.value
+        },
+        'system_recovery_infos': {},
+        'system_recovery_detail_statuses': detail_statuses,
+    })
+
+    statuses, infos, statuses_by_job = (
+        job_lib.load_statuses_with_system_recovery_payload(payload))
+
+    assert statuses == {7: job_lib.JobStatus.RUNNING}
+    assert infos == {}
+    assert statuses_by_job == {
+        7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
     }
 
 

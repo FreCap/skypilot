@@ -76,8 +76,6 @@ _PHASE_ORDER = {
 }
 
 _CAPABILITY_PROFILE_VERSIONS = {
-    # Read-only transition compatibility.  Authorization v3 never selects v1.
-    'subreaper-v1+local-docker-empty-inventory-v1': 1,
     SYSTEM_RECOVERY_CAPABILITY: RUNTIME_RECOVERY_PROFILE_VERSION,
 }
 

@@ -150,9 +150,10 @@ def test_multi_node_2nodes():
 
 def test_system_oom_recovery_codegen_is_single_attempt_authority():
     """The private Serve path emits one replayable, Ray-nonretrying task."""
-    codegen = task_codegen.RayCodeGen(
-        system_oom_recovery_plan=system_oom_recovery.RecoveryLaunchPlan.
-        direct_shell())
+    spec = system_oom_recovery.OwnedContainerSpec(
+        image='example.invalid/model@sha256:' + 'a' * 64)
+    codegen = task_codegen.RayCodeGen(system_oom_recovery_plan=(
+        system_oom_recovery.RecoveryLaunchPlan.owned_container(spec)))
     codegen.add_prologue(job_id=1)
     codegen.add_setup(
         1,
@@ -167,7 +168,7 @@ def test_system_oom_recovery_codegen_is_single_attempt_authority():
     )
     codegen.add_task(
         1,
-        bash_script='python serve.py',
+        bash_script=spec.render(),
         task_name='serve',
         resources_dict={
             'CPU': 4.0,
@@ -194,14 +195,18 @@ def test_system_oom_recovery_codegen_is_single_attempt_authority():
     assert 'get_or_fail_with_recovery(' in result
     assert ('run_bash_command_with_log_and_return_pid_with_system_oom_recovery'
             in result)
+    assert 'remote_task.remote(\n                log_path,' in result
+    assert 'remote_task.remote(\n                script,' not in result
+    assert '--command' not in result
     assert 'with job_lib.job_status_lock(1):' in result
     assert 'not current_job_status.is_terminal()' in result
 
 
 def test_system_oom_recovery_codegen_rejects_multiple_run_tasks():
-    codegen = task_codegen.RayCodeGen(
-        system_oom_recovery_plan=system_oom_recovery.RecoveryLaunchPlan.
-        direct_shell())
+    spec = system_oom_recovery.OwnedContainerSpec(
+        image='example.invalid/model@sha256:' + 'a' * 64)
+    codegen = task_codegen.RayCodeGen(system_oom_recovery_plan=(
+        system_oom_recovery.RecoveryLaunchPlan.owned_container(spec)))
     codegen.add_prologue(job_id=1)
     codegen.add_setup(
         1,
@@ -213,7 +218,7 @@ def test_system_oom_recovery_codegen_rejects_multiple_run_tasks():
     )
     codegen.add_task(
         1,
-        bash_script='python serve.py',
+        bash_script=spec.render(),
         task_name='serve',
         resources_dict={'CPU': 1.0},
         log_dir='/sky/logs/tasks',

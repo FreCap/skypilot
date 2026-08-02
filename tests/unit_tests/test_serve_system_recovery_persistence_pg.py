@@ -719,30 +719,7 @@ def test_initial_replica_paths_are_insert_only_on_key_conflict(
     assert paid_claim is None
 
 
-def test_all_fields_absent_v13_rewrite_restores_json_pickle_parity(
-        recovery_database) -> None:
-    engine = recovery_database
-    row = _raw_replica_row(engine, 7)
-    rollback = row['replica_state']
-    rollback['replica_info_version'] = 13
-    for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        rollback.pop(field_name)
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.update(serve_state.replicas_table).where(
-                serve_state.replicas_table.c.service_name == _SERVICE_NAME,
-                serve_state.replicas_table.c.replica_id == 7).values(
-                    replica_state=rollback))
-
-    rewritten = serve_state.rewrite_rollback_replica_system_recovery_state(
-        _SERVICE_NAME, **_fence())
-    assert rewritten == 1
-    completed = _raw_replica_row(engine, 7)['replica_state']
-    assert set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).issubset(completed)
-    _assert_json_pickle_parity(engine, 7)
-
-
-def test_exact_rollback_transition_identity_can_fence_delete(
+def test_all_fields_absent_v13_is_quarantined_without_compatibility_rewrite(
         recovery_database) -> None:
     engine = recovery_database
     row = _raw_replica_row(engine, 7)
@@ -759,6 +736,35 @@ def test_exact_rollback_transition_identity_can_fence_delete(
 
     transitioned = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
     assert transitioned is not None
+    assert transitioned.system_recovery_quarantine == (
+        recovery_state.SystemRecoveryQuarantine(
+            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
+    assert not transitioned.is_ready
+    persisted = _raw_replica_row(engine, 7)
+    assert not set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).intersection(
+        persisted['replica_state'])
+
+
+def test_all_fields_absent_v13_quarantine_identity_can_fence_delete(
+        recovery_database) -> None:
+    engine = recovery_database
+    row = _raw_replica_row(engine, 7)
+    rollback = row['replica_state']
+    rollback['replica_info_version'] = 13
+    for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
+        rollback.pop(field_name)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == _SERVICE_NAME,
+                serve_state.replicas_table.c.replica_id == 7).values(
+                    replica_state=rollback))
+
+    transitioned = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
+    assert transitioned is not None
+    assert transitioned.system_recovery_quarantine == (
+        recovery_state.SystemRecoveryQuarantine(
+            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
     with _capture_sql(engine) as statements:
         assert serve_state.remove_replica(
             _SERVICE_NAME,

@@ -2536,10 +2536,6 @@ _SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK = (
     'system_recovery',
     'system_recovery_quarantine',
 )
-_V13_ADDITIVE_STORAGE_FIELDS_FALLBACK = (
-    'replica_record_id',
-    *_SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK,
-)
 
 
 class ReplicaSystemRecoveryStateError(RuntimeError):
@@ -2589,16 +2585,6 @@ def _system_recovery_storage_fields() -> tuple[str, ...]:
         raise ReplicaSystemRecoveryMutationRejected(
             'Replica system-recovery storage fields do not match the '
             'accepted v13 contract.')
-    return fields
-
-
-def _v13_additive_storage_fields() -> tuple[str, ...]:
-    fields = replica_info_lib.V13_ADDITIVE_STORAGE_FIELDS
-    if (not isinstance(fields, tuple) or
-            fields != _V13_ADDITIVE_STORAGE_FIELDS_FALLBACK):
-        raise ReplicaSystemRecoveryMutationRejected(
-            'Replica v13 additive storage fields do not match the accepted '
-            'contract.')
     return fields
 
 
@@ -3336,54 +3322,6 @@ def set_replica_system_recovery_job_id(
         expected_lifecycle_epoch=expected_lifecycle_epoch,
         expected_controller_owner=expected_controller_owner,
         expected_revision=expected_revision)
-
-
-def rewrite_rollback_replica_system_recovery_state(
-    service_name: str,
-    *,
-    expected_service_hash: str,
-    expected_lifecycle_epoch: int,
-    expected_controller_owner: tuple[int | None, str | None],
-) -> int:
-    """Rewrite every exact all-fields-absent v13 rollback shape in-place."""
-    engine = _require_system_recovery_postgres()
-    fields = _v13_additive_storage_fields()
-    rewritten = 0
-    with orm.Session(engine) as session, session.begin():
-        _lock_system_recovery_service_owner_in_session(
-            session,
-            service_name,
-            expected_service_hash,
-            expected_lifecycle_epoch,
-            expected_controller_owner,
-            require_launch_allowed=False)
-        rows = session.execute(
-            sqlalchemy.select(replicas_table.c.replica_id,
-                              replicas_table.c.replica_state_version,
-                              replicas_table.c.replica_state).
-            where(replicas_table.c.service_name == service_name).order_by(
-                replicas_table.c.replica_id).with_for_update()).fetchall()
-        for row in rows:
-            state = row.replica_state
-            if (not isinstance(state, dict) or
-                    state.get('replica_info_version') != 13 or
-                    any(field_name in state for field_name in fields)):
-                continue
-            try:
-                info = _replica_from_state(row.replica_state_version, state)
-            except Exception as error:
-                raise ReplicaSystemRecoveryMutationRejected(
-                    'Rollback-shaped v13 replica could not be rewritten.'
-                ) from error
-            complete = info.to_storage_dict()
-            if any(field_name not in complete for field_name in fields):
-                raise ReplicaSystemRecoveryMutationRejected(
-                    'Replica v13 writer did not emit a complete recovery '
-                    'bundle.')
-            _write_locked_replica_info_in_session(session, service_name,
-                                                  int(row.replica_id), info)
-            rewritten += 1
-    return rewritten
 
 
 def get_service_placement_policy_states(

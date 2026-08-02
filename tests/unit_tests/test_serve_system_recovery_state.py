@@ -115,6 +115,14 @@ def test_launch_intent_is_closed_and_strictly_versioned() -> None:
         recovery_state.SystemRecoveryLaunchIntent.from_dict(payload)
 
 
+def test_removed_runtime_v1_capability_is_rejected() -> None:
+    with pytest.raises(recovery_state.RecoveryStateError,
+                       match='Unknown recovery capability'):
+        dataclasses.replace(
+            _observation(recovery_state.RemoteRecoveryPhase.ARMED),
+            capability='subreaper-v1+local-docker-empty-inventory-v1')
+
+
 @pytest.mark.parametrize(
     ('phase', 'controller_state', 'off_route', 'teardown'), [
         (recovery_state.RemoteRecoveryPhase.ARMED,

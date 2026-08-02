@@ -180,27 +180,53 @@ def test_v12_pickle_and_json_derive_the_same_transition_identity() -> None:
             from_json.replica_record_id)
 
 
-def test_exact_all_fields_absent_v13_is_the_only_rollback_shape() -> None:
-    rollback = _replica().to_storage_dict()
-    rollback['replica_info_version'] = 13
-    rollback['created_at'] = 123.5
+def test_all_fields_absent_v13_quarantines_json_pickle_and_memory() -> None:
+    source = _replica()
+    source.created_at = 123.5
+    missing = source.to_storage_dict()
+    missing['replica_info_version'] = 13
     for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        rollback.pop(field)
+        missing.pop(field)
 
-    restored = replica_info.ReplicaInfo.from_storage_dict(rollback)
+    from_json = replica_info.ReplicaInfo.from_storage_dict(missing)
+    pickle_state = copy.deepcopy(source.__dict__)
+    pickle_state['_version'] = 13
+    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
+        pickle_state.pop(field)
+    from_pickle = replica_info.ReplicaInfo.__new__(replica_info.ReplicaInfo)
+    from_pickle.__setstate__(pickle_state)
 
-    assert restored.system_recovery_disposition == (
-        recovery_state.SystemRecoveryDisposition.ORDINARY)
-    assert restored.system_recovery_revision == 0
-    assert restored.system_recovery_quarantine is None
-    rewritten = restored.to_storage_dict()
-    assert set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).issubset(rewritten)
-    v12 = copy.deepcopy(rollback)
+    in_memory = _replica()
+    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
+        delattr(in_memory, field)
+    serialized = in_memory.to_storage_dict()
+
+    expected = recovery_state.SystemRecoveryQuarantine(
+        recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE)
+    for restored in (from_json, from_pickle, in_memory):
+        assert restored.system_recovery_quarantine == expected
+        assert not restored.is_ready
+        assert set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).issubset(
+            restored.to_storage_dict())
+    for restored in (from_json, from_pickle):
+        assert restored.status == serve_state.ReplicaStatus.FAILED_CLEANUP
+    assert in_memory.status == serve_state.ReplicaStatus.NOT_READY
+    assert from_pickle.replica_record_id == from_json.replica_record_id
+    assert serialized['system_recovery_quarantine'] == expected.to_dict()
+
+    v12 = copy.deepcopy(missing)
     v12['replica_info_version'] = 12
-    assert (replica_info.ReplicaInfo.from_storage_dict(v12).replica_record_id ==
-            restored.replica_record_id)
+    v12_restored = replica_info.ReplicaInfo.from_storage_dict(v12)
+    assert v12_restored.system_recovery_quarantine is None
+    assert v12_restored.system_recovery_disposition == (
+        recovery_state.SystemRecoveryDisposition.ORDINARY)
+    assert v12_restored.replica_record_id == from_json.replica_record_id
 
-    future = copy.deepcopy(rollback)
+def test_future_replica_info_versions_are_quarantined() -> None:
+    missing = _replica().to_storage_dict()
+    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
+        missing.pop(field)
+    future = copy.deepcopy(missing)
     future['replica_info_version'] = 15
     future_restored = replica_info.ReplicaInfo.from_storage_dict(future)
     assert future_restored.system_recovery_quarantine == (
