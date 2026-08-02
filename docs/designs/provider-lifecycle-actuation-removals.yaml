@@ -216,7 +216,9 @@ coverage_gaps:
 - id: PLA-GAP-005
   milestone: M5
   responsibility: Name and implement one generation-fenced pooled-worker provider actuation owner with
-    pre-effect target identity, authoritative object query, and signed no-later-create closure receipts
+    pre-effect target identity, authoritative object query, signed no-later-create closure receipts,
+    a worker role with negative lifecycle authority, and one central SkyPilot-issued lifecycle
+    credential owner
   candidate_locators:
   - kind: python_symbol
     path: sky/serve/replica_managers.py
@@ -236,18 +238,29 @@ coverage_gaps:
   owner: M5-S4 pooled-worker provider actuation qualification
   reason: No current provider implementation owns every create retry behind a generation fence or can
     issue the operation-closing receipt required to rule out a late create, so coordinated pool
-    activation and final removal of version-0 launch or teardown ownership remain unsafe
+    activation and final removal of version-0 launch or teardown ownership remain unsafe; current
+    worker credentials may also permit a stale or uploaded worker binary to reclaim lifecycle actuation
   closure_gate: Update the canonical design with one named pilot provider and exact target and object
     schemas, sole-credential egress owner, retry ledger, issuer keys, authoritative query, signed
-    generation and operation closure, live conformance, and deployment evidence; replace this gap with
-    exact implementation and compatibility artifacts before any coordinated birth or M5 removal gate
+    generation and operation closure, worker-role policy that denies launch, stop, terminate, delete,
+    resize, and scale, live negative worker-side actuation conformance, and deployment evidence; replace
+    this gap with exact implementation and compatibility artifacts before any coordinated birth or M5
+    removal gate
 - id: PLA-GAP-006
   milestone: M5
-  responsibility: Implement and qualify LOCAL_CGROUP_V2_DIRECT_V1 submission containment with a
-    root-owned supervisor, durable prepare ledger, control and payload principal separation,
-    submission-scoped payload event channel, race-free direct launch, crash-recoverable natural
-    completion, durable no-later-launch seal, recursive cgroup kill and empty proof, reaping, and
-    permanent retirement
+  responsibility: Implement and qualify a separately versioned coordinated worker control plane and
+    LOCAL_CGROUP_V2_DIRECT_V1 with one reducer, global SQLite mutation guards, a protected Unix control
+    socket with signed controller authorization, a standalone top-level worker package with no sky or
+    provider import edge, first-instruction lifecycle quiescence and hook-free
+    admission, a manager-held lifetime lock, immutable native and SSH-policy packaging, a restricted
+    bridge login, negative payload and worker credential profiles, immutable key validity and retirement,
+    SubmissionArtifactOwnerV1 for intent-first sealed executable bytes, cursor-bound protected retained
+    log readback, bounded direct commands and requests, durable log-quota failure, exact inventory freeze
+    with frozen terminal receipt evidence, explicit removal and pre-freeze or post-freeze recorded loss, a root-owned
+    supervisor, durable prepare ledgers, control, bridge, shim, and payload principal separation,
+    submission-scoped payload and log channels, side-row-first add, race-free direct launch,
+    crash-recoverable natural completion, durable no-later-launch seal, recursive cgroup kill and empty
+    proof, reaping, finalization, explicit artifact removal, and permanent retirement
   candidate_locators:
   - kind: python_symbol
     path: sky/skylet/job_lib.py
@@ -256,23 +269,110 @@ coverage_gaps:
     path: sky/skylet/job_lib.py
     symbol: cancel_jobs
   - kind: python_symbol
+    path: sky/skylet/skylet.py
+    symbol: start_grpc_server
+  - kind: python_symbol
+    path: sky/skylet/skylet.py
+    symbol: main
+  - kind: python_symbol
+    path: sky/skylet/attempt_skylet.py
+    symbol: restart_skylet
+  - kind: python_symbol
+    path: sky/skylet/events.py
+    symbol: StopEvent
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: AutostopServiceImpl.SetAutostop
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: JobsServiceImpl.AddJob
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: JobsServiceImpl.QueueJob
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: JobsServiceImpl.CancelJobs
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: JobsServiceImpl.FailAllInProgressJobs
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: JobsServiceImpl.SetJobInfoWithoutJobId
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: JobsServiceImpl.TailLogs
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: JobsServiceImpl.GetLogDirsForJobs
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: ManagedJobsServiceImpl.CancelJobs
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: ServeServiceImpl.AddVersion
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: ServeServiceImpl.TerminateServices
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: ServeServiceImpl.TerminateReplica
+  - kind: python_symbol
+    path: sky/skylet/services.py
+    symbol: ServeServiceImpl.UpdateService
+  - kind: python_symbol
+    path: sky/skylet/configs.py
+    symbol: set_config
+  - kind: python_symbol
+    path: sky/skylet/job_lib_codegen.py
+    symbol: JobLibCodeGen
+  - kind: python_symbol
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: CloudVmRayResourceHandle.get_grpc_channel
+  - kind: python_symbol
     path: sky/backends/task_codegen.py
     symbol: RayCodeGen
   - kind: python_symbol
     path: sky/backends/task_codegen.py
     symbol: SlurmCodeGen
-  owner: M5-S0 and M5-S3 submission containment qualification
-  reason: Current Skylet cancellation owns a local process shape while Ray and Slurm can execute work
-    in runtime-owned processes or allocations outside that shape; no current direct executor provides
-    the durable seal, recursive absence receipt, and escape isolation required before pool capacity can
-    be released safely
-  closure_gate: Merge and deploy the dormant containment supervisor and direct single-node executor;
-    pass executable prepare and never-launched response-loss, shim-to-payload UID handoff, bounded
-    request-ack IPC isolation, gate-closed failed-launch sealing, channel-loss completion and
-    cancellation ordering, daemon escape, fork race, crash recovery, reaping,
-    retirement, legacy compatibility, and Ray and Slurm rejection conformance; and replace this gap
-    with exact implementation and rollout evidence before coordinated birth or the M5 assignment and
-    teardown removal gates
+  - kind: python_symbol
+    path: sky/core.py
+    symbol: _maybe_run_down_hooks
+  owner: M5-S0b0, M5-S0b1a, M5-S0b1b, M5-S0b1c, M5-S0b2, M5-S0b3a,
+    M5-S0b3b, M5-S0b3c, M5-S0b4, M5-S0b5, and M5-S3 coordinated worker
+    qualification
+  reason: Current Skylet exposes unauthenticated TCP mutation, permits direct SSH, mutable path and log
+    ownership, and raw SQLite
+    writers, starts handlers before recovery, owns local provider teardown through StopEvent, and
+    cancels only a local process shape while Ray and Slurm can execute work outside that shape; no
+    current direct executor provides one durable mutation owner, immutable executable and log owner,
+    payload-inaccessible control, executable bridge confinement, lifetime startup lock, negative
+    privilege and lifecycle-credential profile, recursive absence receipt, or escape isolation required
+    before pool capacity can be released safely
+  closure_gate: Merge the canonical single-owner design, then independently merge and deploy the
+    standalone, release, and internal two-wheel packaging foundation with opaque-wheel preservation,
+    installed-API reconstruction, manifest-hashed cache, verified transfer and local-path install,
+    compatibility facade, dormant
+    coordinated-only runtime and config schema, signed wire and key-lifetime identities, artifact owner,
+    immutable manager and shim, restricted-login and SSH-policy packaging, and the standalone dormant
+    reducer before fresh-worker-only activation; prove exact global guard catalog including unknown-trigger
+    and explicit-index rejection, exact owned autoindex shape, the neutral fresh-or-upgraded legacy config
+    prerequisite initializer and autoindex validation, and portable numeric-token canonicalization,
+    side-row-first add, Unix-socket and forced-command isolation, signed replay fencing, key retirement,
+    manager-held lock and predecessor recovery, lifecycle quiescence and hook-free planning, payload and
+    worker credential isolation, old-binary no-effect, acyclic queue and artifact identities, bounded direct
+    commands and mutation requests with typed legacy-only ineligibility, intent-first artifact prepare and
+    every crash pairing, sealed-FD launch, protected log drain, durable log-quota receipt linearization
+    before the winning cancellation or completion operation seals, immediate quota hard-kill ordering with
+    no pre-kill root wait, and
+    authenticated offset readback, durable all-member retention freeze with exact terminal receipt evidence,
+    separate pre-freeze and post-freeze recorded-loss branches, down-request creation only after irreversible
+    removal or loss disposition, explicit removal and recorded-local-loss destruction,
+    never-launched response loss, shim-to-payload UID handoff,
+    bounded request-ack IPC isolation, gate-closed failed-launch sealing, channel-loss completion and
+    cancellation ordering, daemon escape, fork race, crash recovery, reaping, retirement, legacy
+    compatibility, forbidden in-place rollback, and Ray and Slurm rejection
+    conformance; and replace this gap with exact implementation and rollout evidence before
+    coordinated birth or the M5 assignment and teardown removal gates
 artifacts:
 - id: PLA-M1-001
   milestone: M1
@@ -16304,6 +16404,30 @@ artifacts:
     - id: m5_direct_submission_containment_qualified
       satisfied: false
       evidence: []
+    - id: m5_submission_artifact_owner_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_artifact_offset_readback_and_retention_freeze_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_coordinated_worker_auth_privilege_and_lock_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_standalone_worker_import_isolation_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_three_wheel_packaging_and_facade_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_sql_catalog_numeric_and_legacy_config_prerequisite_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_coordinated_command_and_request_bounds_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_log_quota_terminalization_qualified
+      satisfied: false
+      evidence: []
     schema:
     - id: legacy_pool_assignment_body_owns_no_schema
       satisfied: true
@@ -16406,6 +16530,24 @@ artifacts:
       satisfied: false
       evidence: []
     - id: m5_direct_submission_containment_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_submission_artifact_owner_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_artifact_retention_scope_or_recorded_loss_teardown_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_frozen_terminal_evidence_and_pre_or_post_freeze_loss_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_down_identity_after_irreversible_artifact_disposition_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_negative_worker_lifecycle_authority_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_hook_free_worker_teardown_qualified
       satisfied: false
       evidence: []
     schema:

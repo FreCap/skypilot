@@ -11,6 +11,14 @@ diagnostic-only. M3-S2 has an exact locally verified candidate image, but its
 test-cluster deployment remains pending. The M3 action graph, action runtime,
 authoritative volume writer, and remaining M4 implementation still require
 their dedicated exact-design adversarial reviews and activation gates.
+M5-S0a is also merged and deployed: PR 1186 merged as
+`fcb286bc73bca4bc3eef08faecbbbaad1adea74c`, passed all 32 visible checks on
+that exact merge, and runs in test Helm revision 57 at immutable image digest
+`sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`.
+A disposable v40 direct worker retained ordinary job behavior, exposed the
+exact three dormant side tables and five indexes with zero side rows and no
+trigger, then terminated cleanly. The next gate is the reviewed S0b design
+correction below; no coordinated-worker capability or runtime is active.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -880,6 +888,17 @@ items are the remaining high-value architectural concepts. They are separately
 reviewed workstreams within this migration and become M7 completion
 prerequisites through their removal rows, but they do not expand M3-S3.
 
+A later exact audit of dstack's server, shim, and runner boundary at the same
+`c9ebdaad6` source found one additional concept that belongs inside M5 rather
+than a fourth M7 workstream: split child execution into prepare, launch,
+observe, terminate, retain, and remove owners. In dstack, termination can stop
+runtime ownership while later removal destroys retained runner material. M5
+ports that responsibility split through `SubmissionArtifactOwnerV1` and the
+containment adapter. It deliberately does not port process-memory runner state,
+mutable path execution, unauthenticated local HTTP, permissive reverse sockets,
+downloaded executables, server-nonrecognition garbage collection, or a
+provider effect followed only later by durable identity.
+
 #### Negotiated Skylet capabilities and one fallback router
 
 dstack's runner client negotiates a runner or shim version once, then routes
@@ -913,6 +932,13 @@ The first slice is read-only: add backward-compatible `GetCapabilities`, then
 route only `GetJobStatus` through the central selector. Old Skylets return
 `UNIMPLEMENTED` and use the existing transport. No launch, cancellation,
 teardown, or job-state behavior changes in that slice.
+
+`SkyletCapabilitiesV1` remains scoped to that legacy and read-only compatibility
+router. Coordinated workers expose a distinct
+`CoordinatedWorkerCapabilitiesV1` on their protected Unix endpoint, keyed by
+bootstrap identity and runtime incarnation. It has no generic handler, direct
+SSH, or legacy transport fallback. Neither capability type can be substituted
+for the other.
 
 The removal gate requires single-flight handshakes with the bounded refresh
 contract above, mixed old and new Skylet qualification, zero unexplained
@@ -966,14 +992,18 @@ jobs and Serve correctly own different domain state machines, but they should
 not each own raw child-cluster transport and result normalization.
 
 SkyPilot will add `ChildWorkloadSpecV1`, `ChildWorkloadObservationV1`, and a
-versioned `ChildWorkloadActuatorV1` with launch, observe, cancel, and terminate
-operations. Managed jobs and Serve remain the sole owners of admission,
+versioned `ChildWorkloadActuatorV1` with explicit prepare, launch, observe,
+cancel, terminate, retain, and remove operations. Preparation binds immutable
+executable or provider intent before effect; terminate proves runtime absence
+without deleting evidence; remove consumes separate retention authority.
+Managed jobs and Serve remain the sole owners of admission,
 recovery, autoscaling, rollout, replica health, retry policy, and terminal
 domain state. Their adapters compile domain intent into the shared child
 contract and reduce typed observations back into their own state machines.
 
 The design does not copy dstack's universal `RunModel`, one shared resource
-status enum, or a single giant submitted-job worker. The first slice is
+status enum, process-memory runner state, mutable path execution, or a single
+giant submitted-job worker. The first slice is
 read-only: route managed-job and Serve child status polling through
 `ChildWorkloadObservationV1` and prove caller-visible parity. Launch and
 teardown migrate only after the M3 action kernel is stable and can durably own
@@ -1049,6 +1079,12 @@ shared facade to conceal the same duplicated lifecycle ownership underneath.
 | Domain status projection | Domain reducer |
 | Child ownership and exact deletion proof | Domain cleanup policy plus provider observation |
 | Durable lifecycle event and transition commit | Domain transaction through shared helper |
+| Coordinated worker job admission, legacy-row projection, cancellation intent, and terminal projection | `CoordinatedWorkerReducerV1`, the sole coordinated SQLite writer |
+| Coordinated worker command-byte preparation, sealed executable handoff, trusted log creation and drain, retention, readback, and explicit removal | `SubmissionArtifactOwnerV1`, the sole submission artifact and log owner |
+| Coordinated worker process creation, containment, signalling, reap, and absence receipt | Root containment manager through one qualified containment adapter |
+| Coordinated worker transport, capability, authenticated routing, and two-way inventory reconciliation | Incarnation-bound coordinated worker control plane |
+| Coordinated worker provider stop/down | Central domain lifecycle action; no local worker owner |
+| Initial coordinated lifecycle hooks | Unsupported and rejected by planning under `NONE_V1` |
 
 The action runtime may carry and validate a domain fence. It must not invent
 or replace that fence. Serve keeps its lifecycle epoch, managed jobs keep
@@ -7292,8 +7328,18 @@ An old provider call admitted before the scope was minted cannot address it.
   null when the close committed while the service was active version `1` and
   equals the service transition operation when the close committed at
   `-1/DEACTIVATING`;
+- `pool_close_identity_digest TEXT NULL`, the complete immutable
+  `PoolWorkerCloseIdentityV1` digest prepared by every close transaction;
+- `pool_artifact_retention_scope_digest TEXT NULL`, filled exactly once after
+  the signed worker freeze and central membership transaction and retained
+  even if a later recorded-local-loss authorization is required;
+- `pool_artifact_local_loss_authorization_digest TEXT NULL`, filled exactly
+  once only by the privileged recorded-local-loss path. It is disjoint from a
+  frozen scope digest only when loss was authorized before freeze; after
+  freeze, both immutable digests remain non-null;
 - `pool_retirement_identity_digest TEXT NULL`, the complete immutable
-  `PoolWorkerRetirementIdentityV1` digest prepared by every close transaction;
+  `PoolWorkerRetirementIdentityV1` digest prepared only after the artifact
+  retention scope freezes;
   and
 - `pool_down_identity_digest TEXT NULL`, prepared only after a matching
   provider object and global cluster record make a coordinated down request
@@ -7315,8 +7361,9 @@ not a second optimizer inside the transaction.
 
 Serve `033` adds a permanent `pool_worker_physical_targets` registry keyed by
 cluster name, with unique worker incarnation, service hash, replica ID, launch
-operation and identity digest, nullable retirement operation and identity
-digest, nullable retirement-transition operation, non-null provider-target
+operation and identity digest, nullable retirement operation, close-identity,
+final retirement-identity, artifact-retention-scope, and local-loss-
+authorization digests, nullable retirement-transition operation, non-null provider-target
 digest, nullable global cluster hash and
 provider-object digest, nullable provider/gateway no-later-create receipt ID
 and digest, and state `RESERVED`, `LIVE`, `QUARANTINED`, or `RETIRED`. Row birth
@@ -7343,8 +7390,9 @@ index also rejects duplicate
 non-null worker incarnations on live replicas. Ordinary replica upserts must
 never overwrite an existing worker incarnation, worker-fence operation,
 identity or receipt digest, launch operation, payload, identity or state,
-admission fence, retirement token, operation ID, retirement identity, or down
-identity digest from an `excluded` row. The replica and permanent-target copies
+admission fence, retirement token, operation ID, close identity, artifact
+scope, local-loss authorization, retirement identity, or down identity digest
+from an `excluded` row. The replica and permanent-target copies
 of retirement-transition provenance are written together and must match.
 
 `pool_down_provider_target_digest` and the permanent target's corresponding
@@ -7425,14 +7473,25 @@ later replica is born with the complete version-1 identity instead of being
 backfilled. Worker-fence identity fields are immutable for the row lifetime,
 while the receipt may move from null to its one exact digest before READY. For a
 coordinated row, `pool_admission_closed = FALSE` requires null retirement
-token, operation ID, retirement identity, and down identity fields. `TRUE`
-requires a canonical non-null token, operation ID, and SHA-256 retirement
-identity digest. Its retirement-transition operation is null exactly when the
+token, operation ID, close identity, retention scope, local-loss authorization,
+retirement identity, and down identity fields. `TRUE` first requires a
+canonical non-null token, operation ID, and SHA-256 close-identity digest. It
+then permits exactly one of three irreversible artifact-disposition branches:
+`FROZEN_RECEIPTS_V1` has matching non-null scope and retirement-identity
+digests with null local-loss authorization; `LOSS_BEFORE_FREEZE_V1` has a
+non-null local-loss authorization digest with null scope and null
+`pool_retirement_identity_digest`; and `LOSS_AFTER_FREEZE_V1` retains the matching
+non-null scope and retirement-identity digests and adds one non-null local-loss
+authorization digest. No branch can change its disposition tag or clear a
+digest. Its retirement-transition operation is null exactly when the
 close transaction observed active version `1`; when that transaction observed
 `-1/DEACTIVATING`, it is non-null and equals the locked service transition
 operation. A later service transition never rewrites the null provenance of an
 already closed worker. The down digest remains null until an object is observed
-and then moves once to the exact `InternalPoolDownIdentityV1` digest. All close
+and one artifact-disposition branch is irreversibly selected: central state
+`REMOVED` for `FROZEN_RECEIPTS_V1`, or `LOSS_AUTHORIZED` for either loss
+branch. It then moves once to the exact `InternalPoolDownIdentityV1` digest.
+All close
 fields are immutable or one-way after close.
 
 Version-1 provisioning does not reuse a worker row across ambiguous failed
@@ -7456,8 +7515,8 @@ The row-birth transaction prepares the complete private launch identity before
 any request or provider effect and sets `pool_launch_state = INTENT`.
 Immediately before entering the retained launch boundary, the capable executor
 CASes that exact row to `EFFECT_STARTED`. It may publish `READY` only after the
-matching cluster handle and provider identity are durable, the exact Skylet
-runtime is live, and the local worker lifecycle fence has been installed and
+matching cluster handle and provider identity are durable, the exact
+coordinated runtime is live, and the local worker lifecycle fence has been installed and
 read back. `QUARANTINED` consumes the row and permits no second logical launch.
 `ABSENT` requires both the provider-specific exact-absence proof and the
 permanent target's no-later-create proof. No state or retry may replace the
@@ -7515,7 +7574,14 @@ adds nullable `pool_down_authority_version`, `pool_down_service_name`,
 `pool_down_worker_incarnation`, `pool_down_cluster_hash`,
 `pool_down_provider_target_digest`, `pool_down_provider_object_digest`,
 `pool_down_retirement_token`, `pool_down_operation_id`, and
-`pool_down_transition_operation_id` projections. The last field is
+`pool_down_transition_operation_id`, plus the nullable
+`pool_down_artifact_retention_scope_digest` and
+`pool_down_artifact_local_loss_authorization_digest` projections and non-null
+`pool_down_artifact_disposition`. `FROZEN_RECEIPTS_V1` requires a non-null
+scope and null loss authorization, `LOSS_BEFORE_FREEZE_V1` requires a null
+scope and non-null loss authorization, and `LOSS_AFTER_FREEZE_V1` requires
+both. The disposition tag selects exactly one closed branch, and every
+non-null projection must match its immutable retirement row. The transition field is
 provenance-based, not derived from the service's current version: it is null
 iff the immutable retirement row says the close committed while the service
 was active version `1`, and it equals that row's
@@ -7684,7 +7750,9 @@ internal user; request and handler names; the closed launch payload type,
 format, version, producer version, and complete canonical JSON; exact service
 name and hash; replica ID; cluster name; worker incarnation; worker-fence
 operation ID and digest; launch operation ID; exact task, resources, workspace,
-mount identity, backend, optimizer and setup options; fixed `dryrun=false`,
+mount identity, backend, optimizer and setup options; fixed
+`lifecycle_hook_profile=NONE_V1`, canonical empty-hook digest, worker
+credential-profile digest, coordinated-runtime and artifact-set digests; fixed `dryrun=false`,
 `down=false`, `idle_minutes_to_autostop=null`, and
 `is_launched_by_sky_serve_controller=true`; long execution class; schedule,
 priority and retry policy; ignore-return-value flag; and the exact durable
@@ -7709,11 +7777,26 @@ earlier provider-entered generation; any receipt gap, foreign resource, changed
 generation, or ambiguous effect quarantines the row. A provider-specific
 actuation owner must propagate and query the operation identity and issue the
 formal receipt; an ordinary provider adapter may not self-assert it. After launch, the worker remains
-nonassignable until Skylet v41 is live and the exact local lifecycle fence is
+nonassignable until coordinated-worker protocol v1 is live and the exact local lifecycle fence is
 installed and read back; only that sequence permits `READY`. Response loss,
 executor death, and a stale request after row replacement therefore adopt one
 matching worker, retry only after prior generations are formally fenced, or
 quarantine without a second effect.
+
+Worker mutation authorization uses a separate asymmetric issuer rather than
+reusing that HTTP HMAC. The Ed25519 private key is mounted only into the
+capable executor-side `CoordinatedWorkerAuthorizationIssuerV1`, never an API,
+controller, Skylet, bridge, or payload process. Its signing transaction reads
+the current database clock and revalidates the exact domain intent, request
+ID, current claim token and execution generation, specialized-controller
+leader UUID and generation, worker incarnation, bootstrap and fence identity,
+method, and payload digest. It signs only after all values match and fixes the
+60-second expiry from that database clock. A controller asks the issuer to
+sign; it never receives the private key. Loss of leadership or claim therefore
+prevents a stale controller from minting a new worker operation. The worker's
+immutable public keyset and short expiry bound the remaining delivery window,
+while its domain create-or-return ledger prevents a delivered signature from
+authorizing a different or second effect.
 
 Here, provider support is stronger than operation tags plus a point-in-time
 list. The qualified actuation owner is the sole holder of pooled-worker create
@@ -7738,8 +7821,15 @@ enabled for version `1`.
 This document defines the consumer and verification contract but names no
 current issuer or eligible provider. M5-S4 must update the canonical design with
 one concrete provider protocol and its sole-credential/egress enforcement
-before any activation. A normal in-process adapter, provider tag, timeout, or
-operator assertion cannot mint a receipt.
+before any activation. That pilot must also bind a negative worker credential
+profile: the platform-issued worker role has no launch, stop, terminate,
+delete, resize, or scale permission, while the central actuation owner is the
+sole holder of SkyPilot-issued lifecycle credentials. Separately scoped data-
+plane access may remain. User-supplied external credentials are not covered by
+this claim until an egress authority is designed, so qualification must reject
+any task that would expose such credentials to the initial coordinated
+profile. A normal in-process adapter, provider tag, timeout, or operator
+assertion cannot mint a receipt.
 
 The permanent target row anchors the retained late-create cleanup owner while
 the service and replica remain present, retains the launch request locator and
@@ -7753,12 +7843,22 @@ survives later logical cleanup only to prevent name and identity reuse.
 
 Retirement and provider down are separate identities. Every close transaction
 mints `pool_retirement_operation_id` and stores
-`PoolWorkerRetirementIdentityV1`: exact birth scope, service and worker
-identity, replica and physical target, provider-target digest, close mode,
-retirement token and operation, and any admitting deactivation operation. That
-identity exists even when no provider object was ever accepted. If a matching
-provider object exists, the same operation UUID becomes the private down
-request ID and is safe to expose in normal request diagnostics.
+`PoolWorkerCloseIdentityV1`: exact birth scope, service and worker identity,
+replica and physical target, provider-target digest, close mode, retirement
+token and operation, fixed `lifecycle_hook_profile=NONE_V1`, the canonical
+empty-hook digest, artifact-retention policy and membership-encoding versions,
+and any admitting deactivation operation. That close identity exists even when
+no provider object was ever accepted and permanently closes new central
+assignment. After every assignment is terminal, the signed worker-side freeze
+and matching central scope transaction defined below add the immutable
+artifact-retention-scope digest and produce
+`PoolWorkerRetirementIdentityV1`. That identity freezes ordinary retirement
+inputs but does not yet select provider-down disposition. No down request
+exists until the central artifact scope reaches `REMOVED`, or a separately
+authorized local-loss transaction reaches `LOSS_AUTHORIZED` and selects
+whether loss occurred before or after freeze. Once that branch is selected, if
+a matching provider object exists, the same operation UUID becomes the
+private down request ID and is safe to expose in normal request diagnostics.
 `InternalPoolDownIdentityV1` then contains
 the authenticated internal user; request and handler names; the closed private
 payload type, format, version, producer version, and canonical JSON; exact
@@ -7767,13 +7867,20 @@ global `cluster_hash`; provider-target digest; provider-object digest;
 retirement operation ID; retirement token; nullable service-transition
 operation ID matching the immutable retirement-transition provenance; fixed `terminate=true`,
 `purge=false`, `graceful=false`, `graceful_timeout=null`, and
-`user_initiated=false` semantics; normal execution class; short schedule;
+`user_initiated=false` semantics; fixed `lifecycle_hook_profile=NONE_V1` and
+canonical empty-hook digest; immutable artifact-retention-scope digest and
+retention policy version, exact local-loss authorization digest, or both as
+selected by the closed artifact-disposition tag. That tag is exactly
+`FROZEN_RECEIPTS_V1`, `LOSS_BEFORE_FREEZE_V1`, or
+`LOSS_AFTER_FREEZE_V1` and enforces the nullability contract above; normal
+execution class; short schedule;
 queue priority and retry flags; ignore-return-value flag; and null
 precondition. The private payload constructor does not expose setters for
 those five fixed teardown options. Its executor passes them explicitly to the
 retained `core.down()` boundary and rejects any generic `StopOrDownBody` or
-deserialized field outside the closed schema. The object-discovery transaction
-stores the down digest before any request is sent. The controller must
+deserialized field outside the closed schema. Provider-object discovery may be
+stored earlier, but only the later artifact-disposition transaction stores the
+down digest before any request is sent. The controller must
 reconstruct the same digest, then signs method, path, user, operation ID, that
 digest, current leader UUID and generation, and bounded timestamp. The full
 signed message therefore covers leadership and freshness, while those changing
@@ -7784,6 +7891,12 @@ from every diagnostic surface. A public `/down`, a signed exec identity, a
 generic down payload, or a down identity with one changed field cannot create
 the request. A retirement with no observed object creates no down request and
 can finish only through the fenced attempt and operation-closing receipt path.
+Artifact freeze alone likewise creates no request. The transaction that first
+observes both an exact provider object and one irreversible artifact-
+disposition branch constructs and stores the one immutable down identity and
+creates or returns the same-ID request. Thus a `FROZEN` or `REMOVING` scope can
+still advance to `LOSS_AUTHORIZED` without rewriting a request, while a
+created request can never change disposition.
 
 Cancellation uses a third non-interchangeable private identity. The `BOUND`
 transaction that first stores the exact remote job ID also mints a random
@@ -7873,129 +7986,360 @@ operation. Birth recovery accepts exactly either the matching
 operation and birth-publication state `PENDING`; no other version-1 request may
 borrow that exception.
 
-Skylet version `41` adds new `GetKeyedSubmissionCapability`, `AddJobKeyed`,
-`QueueJobKeyed`, `CancelJobKeyed`, `GetJobBySubmissionKey`, and
-`SealSubmissionKeyAbsent` RPC methods. The v41 autostop service separately adds
-`InstallPoolWorkerLifecycleFence` and `GetPoolWorkerLifecycleFence`. It does
-not add optional authority fields
-to existing mutation methods: an old Skylet must return `UNIMPLEMENTED` before
-mutation rather than ignore an unknown proto3 field. At process start, the
-keyed service generates a random runtime-incarnation UUID. A capability request
-contains a fresh caller nonce; the response echoes it and returns protocol
-version, implementation digest, local schema version, runtime UUID, and a
-closed list of qualified submission-containment profiles and implementation
-digests. Before
-each keyed job or lifecycle-fence operation, the caller obtains that response
-and sends its exact runtime UUID and echoed nonce. A mismatch fails before
-mutation. A retry re-probes, performs exact keyed lookup in persistent local
-state, and adopts a present matching effect before accepting a new runtime
-UUID. Job lookup is an observation only and can never prove absence.
+###### Single worker mutation owner and authenticated control plane
 
-Version 41 supports two immutable runtime modes. The default is `LEGACY`; it
-preserves the current `StopEvent`, `SetAutostop`, hook, indicator, exception,
-and provider-retry behavior byte-for-byte and rejects lifecycle-fence install
-and keyed mutation as `FAILED_PRECONDITION`. `COORDINATED_V1` is selected only
-from a root-owned bootstrap marker installed before the first v41 Skylet start by
-the qualified private worker-launch path. `PoolWorkerBootstrapIdentityV1`
-contains the fresh coordination-scope UUID, service hash, worker incarnation,
-cluster name, launch operation, lifecycle-fence operation and digest, expected
-Skylet implementation digest, and fixed runtime mode. On its first v41 start,
-Skylet creates one singleton `pool_worker_bootstrap_state` row in
-`skylet_config.db` regardless of marker presence: an absent marker commits
-immutable `LEGACY` with a null digest, while an exact marker commits immutable
-`COORDINATED_V1` with its canonical digest. Later marker creation on a `LEGACY`
-row, marker absence or replacement on a coordinated row, mode change, or
-identity mismatch cannot rewrite that row and fails coordinated capability and
-mutation. Capability readback reports the persisted mode and marker digest.
-M5-S0 includes no marker producer, so every pre-existing and ordinarily
-launched worker remains on the exact legacy path. M5-S3 adds the dormant
-private-launch marker producer, but it is unreachable until S4 permits a fresh
-coordinated birth.
+The coordinated worker is a separate executable, import root, and protocol,
+not a mode of legacy Skylet. The top-level package
+`skypilot_worker_runtime` owns
+`COORDINATED_WORKER_PROTOCOL_VERSION = 1` and exposes only
+`GetKeyedSubmissionCapability`, `AddJobKeyed`, `QueueJobKeyed`,
+`CancelJobKeyed`, `GetJobBySubmissionKey`, `SealSubmissionKeyAbsent`,
+`GetPoolWorkerLifecycleFence`, `GetPoolWorkerArtifactInventory`,
+`ReadSubmissionArtifactLog`, `FreezeSubmissionArtifactRetentionScope`, and
+`RemoveSubmissionArtifactKeyed`. The four `Get` methods and log read are
+observational; freeze and removal are signed mutations. Legacy
+`sky.skylet.skylet`, `attempt_skylet.py`, its TCP listener, imported `EVENTS`,
+handlers, watchdog, PID files, and `SKYLET_VERSION = 40` remain byte-compatible
+through M5. No global Skylet version bump, mixed handler registry, or
+legacy-worker restart is part of coordinated activation.
 
-In `COORDINATED_V1` mode, version 41 closes the worker's independent idle-
-teardown owner with one local file lock shared by `StopEvent`, `SetAutostop`,
-and both lifecycle-fence RPCs. This protocol is active from the first Skylet
-event-loop iteration, before fence installation, so a legacy idle decision can never be
-in flight when install succeeds. The fence is one-way for the physical worker
-lifetime. There is no release RPC: a coordinated worker must be permanently
-terminated, not downgraded in place, before service deactivation or worker-
-image rollback. Keyed job RPCs still revalidate the exact active fence before
-mutation, but no cross-database release-versus-add protocol exists to race with
-them.
+`skypilot_worker_runtime` is an independently packaged dependency root, not a
+subpackage of `sky`. Its one canonical source tree is
+`addons/submission-containment/python-runtime/src/skypilot_worker_runtime/`.
+The separate build root
+`addons/submission-containment/python-runtime/pyproject.toml` produces only the
+distribution `skypilot-worker-runtime-v1`, that import package, generated
+coordinated bindings, and declared package metadata. Its PEP 440 version is
+derived from the one repository constant
+`COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION`, initially `1.0.0`; any source,
+proto, generated-binding, or dependency change requires a new value. Its lock
+records the version, source commit, and exact wheel and dependency hashes. It contains no `sky` package, provider plugin, legacy
+Skylet module, main SkyPilot metadata, or second copy of its own import files.
 
-In coordinated mode, `StopEvent` takes the lifecycle lock before reading
-autostop configuration and holds it through its idle decision and a durable
-teardown claim, but releases it before hook or provider I/O. A teardown winner
-records a random attempt ID, current boot identity, cluster/provider identity,
-immutable canonical autostop payload, exact cluster-YAML digest, complete hook
-snapshot and digest, and state `CLAIMED` in `skylet_config.db`; the immutable
-payload is separate from the mutable current autostop config. The same
-transaction writes the autostopping indicator. `SetAutostop` may update the
-future config but cannot erase or rewrite that attempt. A pre-effect
-cancellation can terminalize only a still-`CLAIMED` attempt. Once any hook or
-provider phase starts, cancel is a future-config change and the attempt remains
-a blocking effect record.
+The main release wheel never owns files under `skypilot_worker_runtime`; its
+package discovery is explicitly restricted to `sky` and its documented
+first-party packages, and it declares an exact requirement on the matching
+`skypilot-worker-runtime-v1` version. Release publication uploads both wheels
+as one qualified artifact set. To preserve those bytes after a release-wheel
+installation, the main release wheel also carries that exact standalone wheel
+as an opaque package-data artifact under
+`sky/skylet/runtime_wheels/v1/`, beside a minimal manifest containing its
+filename, version, size, and SHA-256. Owning this nested wheel file does not
+make the main distribution own any extracted `skypilot_worker_runtime` import
+file. Release CI byte-compares the nested artifact with the separately
+published wheel and rejects a missing, rebuilt, or differently compressed
+copy.
 
-The durable phase machine is `CLAIMED -> HOOK_STARTED -> HOOK_COMPLETED ->
-PROVIDER_ENTERED`, followed only by proved `TERMINAL` or `AMBIGUOUS`.
-`HOOK_STARTED` is committed before the hook process and `HOOK_COMPLETED` after
-its result. `PROVIDER_ENTERED` is committed before the first provider call.
-A crash or exception after either entered phase never clears the attempt and
-never blindly repeats that effect. Recovery may continue from
-`HOOK_COMPLETED` into provider entry. S0 does not implement or assume a general
-provider teardown reconciler. If the provider call returns normally, the same
-owner commits `TERMINAL`; a caught timeout or exception commits `AMBIGUOUS`,
-and a restart that finds `PROVIDER_ENTERED` after a crash also commits
-`AMBIGUOUS` without performing a provider call.
-A later milestone may resolve that row only through an explicitly promoted
-provider capability that binds an idempotent teardown operation to an
-authoritative query. Until then, operator proof or permanent worker teardown is
-required, and the row blocks lifecycle-fence install and pool activation. An
-inconclusive hook phase likewise remains `AMBIGUOUS`. All payload bytes remain
-local and are redacted from logs and RPC diagnostics. Thus a fence installer
-either wins before the event reads configuration or observes a durable claim
-before it can report success.
+The internal worker-wheel builder emits a closed
+`SKYPILOT_INTERNAL_WHEEL_BUNDLE_V1` directory containing exactly the internal
+`skypilot` wheel, the exact standalone wheel, and a manifest with builder
+version, normalized internal-SkyPilot source-input digest, and exactly two
+ordered filename, size, and SHA-256 wheel records. From a source checkout it builds the
+standalone wheel from the canonical build root and verifies its lock; from an
+installed API server it extracts and verifies the opaque release-wheel
+resource. It never attempts to reconstruct standalone source from installed
+`sky/`. The internal SkyPilot wheel omits the opaque nested-wheel resource, so
+the transferred bundle has one copy. Its cache key and directory name are the
+SHA-256 of `SKYPILOT_INTERNAL_WHEEL_BUNDLE_V1\0` followed by the exact
+canonical manifest bytes; the manifest does not contain its own digest.
+Source-tree changes, the installed opaque-wheel digest,
+package version, lock, or builder change therefore invalidate the cache;
+reuse rehashes the complete exact file set before returning it.
 
-The existing hook claim file becomes a compatibility mirror, not the recovery
-authority for an idle teardown. Before a snapshotted hook runs, v41 commits
-`HOOK_STARTED` and the same attempt ID, then claims or verifies the file under
-the lifecycle lock. If another teardown event already owns that file, the idle
-attempt becomes `AMBIGUOUS` and performs no second hook or provider effect.
-Skylet startup on the same boot reconstructs the mirror from a durable
-nonterminal attempt and does not unconditionally clear it. A changed boot may
-retire the mirror only after runtime and provider identity re-probe. A crash in
-`HOOK_STARTED` never reruns the hook; `HOOK_COMPLETED` is the durable receipt
-that permits the provider phase. Other hook event ingress keeps its
-characterized file CAS, but any unresolved foreign claim also blocks lifecycle-
-fence install. This removes restart-driven duplicate hook execution from the S0
-claim without pretending an arbitrary user hook is idempotent.
+Existing directory transfer copies the three-file bundle to
+`~/.sky/wheels/<bundle-digest>/`. Before installation the remote script
+requires that exact file set and recomputes both wheel digests. One resolver
+invocation names both local wheel paths explicitly, with the internal SkyPilot
+extras, so it performs no index lookup for the standalone distribution. It
+writes `current_sky_wheel_hash` only after exact distribution-version and
+import probes pass; mismatch leaves the prior marker unchanged and fails the
+install. The ordinary v40 environment therefore receives both distributions
+without enabling coordinated mode. The dedicated coordinated venv installs
+only the same verified standalone wheel and its hash-locked dependencies,
+never the main wheel. Thus no environment has two distributions claiming the
+same import path.
 
-An additive `pool_worker_lifecycle_fences` table in that same database retains
-the one-way install row keyed by operation UUID. The canonical
-`PoolWorkerLifecycleFenceIdentityV1` is service hash, cluster name, worker
-incarnation, operation UUID, protocol and digest versions, and the fixed
-requirements `autostop_disabled=true` and `autodown_disabled=true`. Install is
-create-or-return: under the shared file lock, one SQLite transaction rejects a
-current-boot teardown claim, autostopping indicator, nonterminal keyed
-submission, keyed pending row, or nonterminal local or external containment
-scope; compares every
-identity field; disables autostop in the existing config row; clears only an
-unclaimed stale indicator; and commits the exact `FENCED` row. It then re-reads
-the transaction result and returns the full identity and config digest. A
-matching retry returns that row. A changed or previously conflicting operation
-identity, incompatible active fence, or ambiguous teardown returns a closed
-failure and performs no write.
+The package's worker entrypoint, reducer, scheduler, artifact client,
+containment client, canonical encoders, and generated server-side wire
+bindings have no import edge to `sky`, `sky.__init__`, a provider package, or a
+legacy Skylet module. The canonical coordinated proto source and generated
+bindings live under this standalone package; the central SkyPilot client may
+import those client bindings, but the dependency edge never points back from
+the worker package into `sky.schemas`. Neutral S0a storage primitives move to
+this dependency root only after the three-wheel packaging foundation passes;
+the neutral explicit-connection legacy-config prerequisite initializer joins
+them before dormant config schema installation.
+`sky.skylet.keyed_submission_state` remains a characterized compatibility
+facade with the same call signatures, direct exported object identities where
+applicable, and no reverse import from the standalone worker into `sky`.
+Import-isolation qualification starts the exact installed entrypoint under
+`python -I`, records the complete module graph, and fails if any module named
+`sky` or any legacy, generic mutation, or provider owner is reachable.
 
-While an active fence exists, `StopEvent` returns before its idle decision and
-v41 `SetAutostop` rejects every request that would arm stop or down. The fence
-has no released state and is never cleared on the live worker. Fence state and
-identity survive a v41 process restart, and capability readback returns them
-with the fresh runtime UUID. Deactivation first closes and permanently downs
-every version-1 worker, proves provider absence, retires its permanent physical
-target, and deletes the replica row. A v40 process does not honor this new
-lock, so a live fenced worker also categorically blocks worker-image rollback;
-the control plane can downgrade only after the worker inventory is proved
-empty.
+The fresh private worker-launch path selects the coordinated executable from
+the immutable bootstrap marker before it starts any SkyPilot worker process.
+It never starts, then converts, a legacy Skylet. Fence installation is a local
+first-boot transition, not a remotely callable operation. The coordinated
+protocol does not add optional authority fields to an existing mutation
+method: a legacy Skylet has no coordinated service, so a coordinated caller
+gets transport or method unavailability before mutation. Capability and lookup
+methods are observational and can never prove absence or grant mutation
+authority.
+
+`CoordinatedWorkerReducerV1` is the keyed reducer and the only `jobs.db` writer in
+`COORDINATED_V1`. RPC handlers, receipt reconciliation, scheduler ticks,
+status observation, cancellation, completion, and startup recovery submit
+immutable reducer commands; none owns a second connection-level mutation
+policy. The trusted
+outcome shim reports bounded events to the containment manager, the manager
+durably owns process effects and receipts, and only the reducer mirrors an
+accepted receipt into SQLite. Payload commands cannot open `jobs.db` or
+`skylet_config.db`, inherit a manager or reducer descriptor, run as the coordinated
+control UID, or invoke a shell as that UID. Legacy `JobLibCodeGen`, generated
+task status writers, raw SQLite writers, and direct SSH code generation are not
+compatibility paths in coordinated mode. They are denied before their first
+filesystem, process, database, hook, or provider effect.
+
+Every keyed mutation carries canonical
+`ControllerAuthorizationV1` bytes and an Ed25519 signature. The closed bytes
+contain schema and digest versions, key ID, audience
+`SKYPILOT_COORDINATED_WORKER_V1`, exact RPC method, bootstrap-identity digest,
+service hash, worker incarnation, launch operation ID, current coordinated-runtime
+UUID, lifecycle-fence operation ID and identity digest, controller deployment
+ID, current specialized-controller leader UUID and generation, caller nonce,
+server challenge, domain operation ID, complete request-payload digest, central
+request ID and execution generation, issued-at time, and an expiry no more than
+60 seconds later. Each verification-key entry frozen in the root-owned
+bootstrap identity binds the key ID, Ed25519 public key, immutable `not_before`
+and `not_after` bounds, and controller deployment scope. The worker requires
+the complete authorization interval to fall within the selected key interval.
+The private signing key never enters the worker. Rotation publishes current
+and next keys only on newly born workers; a coordinated worker is destroyed
+before the last key it trusts expires. Retirement completes only after every
+trusting worker is destroyed or the key has naturally expired. V1 has no
+mutable worker-side revocation list: an emergency compromise closes the bridge
+network path and destroys affected workers rather than pretending an
+unreachable worker consumed a revocation.
+
+`GetKeyedSubmissionCapability` is the sole pre-authorization handshake and is
+reachable only through the certificate-bound forced bridge; it accepts only a
+fresh caller nonce and returns no job or artifact data. Every other coordinated
+method, including lookup, lifecycle-fence readback, inventory, and log range
+read, carries `ControllerAuthorizationV1`. Observational methods replace the
+domain mutation operation with their closed read-identity digest; they still
+bind method, bootstrap, worker, runtime UUID, both nonces, central request,
+leader generation, key interval, issue time, and expiry and never open a write
+transaction.
+
+For add, queue, launch, cancel, finalization, or retention operations, the
+complete payload digest also binds the applicable containment plan, artifact
+plan, prepared or launch receipt, stdout and stderr identities, log cursor,
+finalization receipt, and retention operation. Omitting an inapplicable member
+uses the versioned canonical null token; dropping it from the signed schema is
+not permitted.
+
+The central issuer tracks each key as `ACTIVE`, `DRAINING`, or `RETIRED`. New
+workers receive only `ACTIVE` keys. The issuer never signs with a `DRAINING`
+key, and the inventory owner may move it to `RETIRED` only after a durable query
+proves zero live coordinated workers whose frozen bootstrap trusts it. Both the
+authorization issue and expiry timestamps must fall inside the key interval.
+
+At process start the coordinated service generates a random runtime UUID. A
+capability request contains a fresh caller nonce; a READY response echoes it
+and returns a fresh server challenge, the runtime UUID, protocol and
+implementation digests, exact schema and trigger-catalog digests, immutable
+runtime mode and bootstrap digest, lifecycle-fence readback, closed qualified
+containment and artifact profiles, hook-free profile and digest, SSH-policy
+digest, and worker credential-profile digest. A mutating handler verifies canonical bytes,
+signature, audience, key ID, method, bootstrap and worker identity, current
+runtime UUID, both nonces, payload digest, request ownership, and clock bounds
+before opening a write transaction. Initial admission requires an unexpired
+authorization. Response-loss retry obtains a fresh capability and signature,
+then create-or-returns only the already durable matching domain operation.
+The submission key, add or queue digest, cancel operation, absence seal, or
+lifecycle-fence operation is the persistent replay ledger. Reuse for another
+method, payload, worker, runtime, or operation fails before mutation. A runtime
+UUID or nonce is freshness evidence only; it is never caller authorization by
+itself.
+
+The coordinated executable exposes no TCP mutation listener. Its gRPC endpoint is the
+Unix socket `/run/skypilot/skylet-control/control.sock` inside a directory the
+payload UID cannot traverse. A dedicated SSH certificate principal runs only
+the root-owned `skylet-control-bridge-v1` forced command through the exact
+restricted login wrapper and signed `sshd` drop-in defined below. That bridge
+can open only this fixed socket and proxies one bounded framed byte stream;
+SSH configuration prohibits caller-selected commands, PTY, agent, X11,
+environment, user-rc, TCP, tunnel, or arbitrary stream-local forwarding. A local controller
+bridge exposes an ephemeral loopback endpoint to gRPC and carries its bytes
+over that forced SSH stream. Neither ordinary user SSH nor the one-time
+provisioning principal can invoke the bridge after READY.
+
+The coordinated control socket is mode `0660`, owner
+`skypilot-control:skypilot-control`; only the dedicated bridge UID joins that
+group. The manager command endpoint is a separate `AF_UNIX SOCK_SEQPACKET`
+socket with mode `0660`, owner `root:skypilot-control`, and `SO_PEERCRED`
+admission of the exact control UID. Payload code runs as a distinct UID and
+cannot traverse either socket directory or the control-state directory. The
+kernel therefore denies payload access before gRPC parsing. Signed
+authorization remains mandatory because bridge peer credentials identify the
+trusted transport process, not the remote controller generation, method,
+operation, or payload. A host or image that cannot prove both OS isolation and
+signed authorization advertises no coordinated capability.
+
+The coordinated executable never imports or registers the generic `AddJob`, `QueueJob`, `CancelJobs`,
+`FailAllInProgressJobs`, `SetJobInfoWithoutJobId`, managed-jobs `CancelJobs`,
+Serve `AddVersion`, `TerminateServices`, `TerminateReplica`, and
+`UpdateService`, or `SetAutostop` handlers. A mistakenly addressed legacy RPC
+therefore fails at service lookup before parsing or materializing user paths,
+writing a script or log, signalling a process, updating config, running a hook,
+or entering provider code. Shared generic scheduler, status-refresh, and cleanup paths
+skip keyed rows before any signal or write. The control-plane keyed callers do
+not use the existing `UNIMPLEMENTED` to SSH fallback. The restricted control
+principal has no remote-command channel on which such a fallback could run.
+Read-only legacy status and log operations may remain available when they do
+not update status as a side effect; a nominally read method that currently
+refreshes status must use the reducer or reject the coordinated row.
+
+###### Immutable coordinated activation and central-only lifecycle ownership
+
+Legacy workers continue to run only Skylet v40. They do not insert a row into
+either S0b singleton and preserve current `StopEvent`, `SetAutostop`, hook,
+indicator, exception, listener, and provider-retry behavior byte-for-byte.
+M5-S0a shipped only the three keyed side tables and five indexes. Neither S0b
+singleton exists before S0b1c, and neither new singleton schema has a legacy
+token or nullable legacy branch. Absence of both singleton rows is the sole
+legacy state. This removes a cross-database legacy transition and its partial-
+state recovery problem.
+
+`COORDINATED_V1` is selected only from a root-owned bootstrap marker installed
+before the first coordinated-worker instruction by the qualified private
+worker-launch path. The coordinated executable accepts only
+`COORDINATED_V1`. It commits the jobs-database singleton first and then the
+config-database bootstrap plus lifecycle fence. The only recoverable partial
+state is jobs `COORDINATED_V1` with config absent: restart may complete it only
+from the same marker, artifact set, and bootstrap identity while all guarded
+legacy writes remain denied. Config present with jobs absent, a singleton with
+any token other than `COORDINATED_V1`, mixed mode, or any
+digest disagreement is permanent quarantine.
+
+A coordinated worker is lifecycle-quiescent from its first instruction. Its
+module graph contains no `StopEvent`, Kubernetes SIGTERM lifecycle hook,
+autostop evaluator or indicator, lifecycle-hook runner, provider SDK, or local
+stop/down path. The initial coordinated placement profile binds
+`lifecycle_hook_profile=NONE_V1` and the canonical empty-hook digest into
+launch, bootstrap, retirement, and down identities. Central planning rejects
+every nonempty launch, resource, autostop, down, or preemption hook before row
+birth, marker creation, or provider launch. Existing hook-bearing pools stay
+on the legacy path. A future central hook adapter requires its own exact
+persisted hook bytes and digest, attempt state, execution identity, retry
+contract, and terminal receipt; no worker-local hook snapshot is silently
+reassigned to central code. The central lifecycle coordinator is the sole
+owner of provider stop/down and any later qualified central hook or Ray
+shutdown effect. Initially coordinated workers must be on-demand; spot or
+preemptible workers remain ineligible until an authoritative preemption event
+adapter hands one exact event to that same central lifecycle owner.
+
+`PoolWorkerBootstrapIdentityV1` contains the fresh coordination-scope UUID,
+service hash, worker incarnation, cluster name, launch operation,
+lifecycle-fence operation and digest, expected coordinated-runtime, manager,
+launcher, artifact-owner and containment-profile implementation digests, fixed
+runtime mode, hook-free profile and digest, worker credential-profile digest,
+control transport profile, and controller verification-key set. Its canonical compact
+JSON uses sorted keys, UTF-8, no insignificant whitespace, base64url without
+padding for binary values, lowercase canonical UUIDs, and one trailing LF in
+the file; the identity digest covers the bytes before that LF.
+
+The marker path is `/etc/skypilot/worker-bootstrap-v1.json`. Its directory is
+`root:skypilot-control` mode `0750`; the regular file is
+`root:skypilot-control` mode `0440`, has one link, is at most 16 KiB, and is
+never rewritten. The root installer creates a same-directory temporary file
+with `openat2()` beneath a no-symlink directory FD, `O_CREAT|O_EXCL|O_NOFOLLOW`
+and mode `0400`, writes and fsyncs the exact bytes, applies the final group and
+mode through the open FD, fsyncs again, publishes with
+`renameat2(RENAME_NOREPLACE)`, and fsyncs the directory. The root manager opens
+the final path through that directory FD, verifies owner, group, mode, link
+count, type, size, canonical bytes, digests, and expected artifacts, then
+rechecks device and inode after reading. The coordinated executable obtains the verified identity
+through the peer-authenticated manager socket; it does not follow the marker
+path itself. Missing, late, replaced, or changed identity is a permanent
+activation failure for that physical worker.
+
+Legacy v40 never reads or writes these coordinated singletons. A later marker
+cannot promote a worker on which the private birth transaction allowed legacy
+Skylet to start. For a fresh coordinated marker, startup first installs and
+validates the `jobs.db` mode guard and negative-authority catalog, commits the
+`COORDINATED_V1` row, and then records the identical bootstrap bytes and fence
+in `skylet_config.db`. A crash between those commits leaves legacy writes
+already denied and no control listener; restart may complete only the same
+identity. M5-S0 has no marker producer, so existing and ordinarily launched
+workers stay on the byte-compatible legacy path. The later private launch
+producer is reachable only for a fresh physical worker.
+
+The lifecycle fence is therefore a local first-boot activation proof, not a
+second teardown state machine or a remote privileged mutation. During the
+startup barrier the coordinated executable derives its exact identity from the verified bootstrap,
+requires empty legacy and keyed job inventories, exact manager inventory
+reconciliation, no autostop config row, no autostopping indicator, no stored
+hook state, and no teardown-claim file. On first boot, after the jobs mode guard
+commits, one `skylet_config.db` `BEGIN IMMEDIATE` transaction inserts the
+bootstrap row and immutable `FENCED` identity and receipt together. On restart
+it reads and exact-compares both rows without rewriting either. The central
+controller only reads that receipt through
+`GetPoolWorkerLifecycleFence` and compares it with the launch row. A matching
+restart returns it; any preexisting lifecycle state or changed identity
+quarantines the worker. Keyed mutation requires that exact active fence. The
+fence has no release operation and survives process restart. Deactivation
+closes and permanently downs the worker, proves provider absence, retires its
+physical target, and only then deletes the replica row. A coordinated or
+fenced worker is destroyed rather than downgraded.
+
+###### Coordinated startup barrier and exactly-one control listener
+
+Legacy Skylet v40 follows its exact existing startup path and does not execute
+this barrier. The fresh private birth path proves before boot that no legacy
+Skylet unit, watchdog, cron entry, reboot rearm, or ordinary-user SSH
+authorization is enabled for the image. The long-lived root manager is the activation owner. It acquires
+the worker-wide owner lock before predecessor eviction and retains the same
+open-file-description lock for its entire process lifetime. No oneshot unit or
+exited launcher is credited with retaining an FD. The coordinated worker
+service binds to the manager and stops when the manager loses READY or the
+lock. No coordinated handler binds before the following barrier succeeds:
+
+1. The root manager validates the immutable marker and signed artifact set,
+   acquires and retains the owner lock, disables and masks every legacy start
+   path, terminates every prior Skylet-shaped process, waits for each process
+   and socket inode to disappear, proves no process retains a control-database
+   FD, and proves no legacy TCP or coordinated Unix listener remains.
+2. The same manager validates native artifact
+   digests, opens its durable ledger, reconciles its cgroup and process
+   inventory, and reaches READY without deleting an unknown owner.
+3. The coordinated executable installs or validates every table, index, and
+   trigger, proves fresh lifecycle-quiescent config and empty manager
+   inventory, persists the `jobs.db` mode guard before any other local state,
+   then atomically persists and cross-checks the config-database bootstrap and
+   lifecycle fence.
+4. The coordinated executable revalidates the exact lifecycle fence state and reconciles keyed
+   submissions, absence seals,
+   containment rows, and the manager's `ListOwnedV1` inventory. Missing,
+   duplicate, changed, or unbound ownership quarantines the worker.
+5. The coordinated executable constructs only its closed handler set. It binds
+   the one fixed Unix socket while the manager still holds the owner
+   lock, validates its owner, group, mode, inode, and peer-credential policy,
+   then publishes a root-readable READY record
+   bound to main PID, process-start identity, boot ID, runtime UUID, bootstrap,
+   schema, trigger-catalog, and manager-runtime digests.
+
+Coordinated capability is served only after step 5. Before bind the socket does
+not exist and clients observe transport unavailable; after bind but before
+READY the server accepts only the standard health method and returns
+`NOT_SERVING`. A mutating call cannot race recovery. Listener ownership comes
+from the coordinated systemd service plus the manager's lifetime lock, not the
+historical PID file, TCP port, or opportunistic dynamic port. The legacy
+`attempt_skylet.py` path is never installed or invoked on a coordinated worker.
+A copied v40 executable cannot acquire the control identity, open either
+database or protected socket, receive authoritative traffic, use a live
+provisioning session, elevate privileges, or obtain provider lifecycle
+credentials.
 
 The migration does not alter `jobs` or `pending_jobs`. Current Skylets use
 positional inserts into both tables, so even nullable appended columns would
@@ -8076,18 +8420,23 @@ mapping, `AddJobKeyed` also rejects an orphan pending row for its newly
 allocated job ID. The SQLite write lock prevents an old connection from
 borrowing any uncommitted marker, and the row-existence predicate rejects a
 same-transaction second insert. Duplicate legacy or keyed mutation of a mapped
-row is therefore rejected, while ordinary legacy behavior is unchanged.
+row is therefore rejected. Ordinary legacy behavior is unchanged only while
+the coordinated singleton is absent on an immutable legacy worker; once
+`COORDINATED_V1` commits, the global guards intentionally reject every unkeyed
+write, including one with no mapped row.
 
 ###### M5-S0a persistence foundation pre-slice
 
 M5-S0 first lands one separately reviewed, merged, deployed, and monitored
-v40-compatible persistence pre-slice before any v41 process is advertised.
+v40-compatible persistence pre-slice before any coordinated process is advertised.
 M5-S0a creates no keyed row, registers no RPC, changes no scheduler or status
 path, and keeps `SKYLET_VERSION = 40`. This distinction is required because a
-Skylet version bump force-kills and restarts the existing daemon: using `41`
-for schema-only code would both cause an unnecessary restart and prevent the
-complete v41 implementation from forcing its required later restart. M5-S0a
-does not satisfy any v41 capability, activation, or worker-compatibility gate.
+Skylet version bump force-kills and restarts the existing daemon: allocating a
+new legacy Skylet version for schema-only code would cause an unnecessary
+restart and couple unrelated legacy and coordinated protocols. The complete coordinated implementation must
+instead prove its required fresh-worker
+activation. M5-S0a does not satisfy any coordinated capability, activation, or
+worker-compatibility gate.
 
 `KEYED_SUBMISSION_SCHEMA_VERSION = 1` is a code-owned constant, not
 `PRAGMA user_version`; the existing database is shared with unversioned legacy
@@ -8260,57 +8609,571 @@ CREATE TABLE keyed_submission_seals (
 );
 ```
 
+###### S0b runtime guard and config-database schema
+
+S0b adds the following dormant `jobs.db` singleton. Its installer creates the
+table and triggers but no row while the running process remains v40. The first
+coordinated process may insert exactly one all-non-null `COORDINATED_V1` row;
+no M5 code updates or deletes it. S0a did not ship this table, so there is no
+compatibility reason to encode a `LEGACY` row. The coordinated row is committed
+before any config-database bootstrap state so stale legacy connections lose
+write authority at the first durable boundary. Coordinated activation requires
+the exact marker digest and the exact code-owned schema and trigger catalog
+digests.
+
+```sql
+CREATE TABLE keyed_submission_runtime (
+  singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+  runtime_mode TEXT NOT NULL CHECK (runtime_mode = 'COORDINATED_V1'),
+  bootstrap_identity_digest TEXT NOT NULL,
+  keyed_schema_digest TEXT NOT NULL,
+  trigger_catalog_digest TEXT NOT NULL,
+  initialized_at REAL NOT NULL CHECK (initialized_at >= 0)
+);
+```
+
+S0b also owns these exact additive objects in `skylet_config.db`. It uses a
+dedicated connection with `isolation_level=None`, `BEGIN IMMEDIATE`, explicit
+commit on success, and explicit rollback on every exception. It must not use
+`configs.set_config()` or `db_utils.safe_cursor()`: the former commits each
+write separately, while the latter currently commits from `finally`, including
+exception exits. The existing `config` table remains byte-compatible for
+ordinary legacy workers.
+The coordinated executable may insert only the all-non-null
+`COORDINATED_V1` row. Absence remains the only legacy state.
+
+```sql
+CREATE TABLE pool_worker_bootstrap_state (
+  singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+  runtime_mode TEXT NOT NULL CHECK (runtime_mode = 'COORDINATED_V1'),
+  bootstrap_identity BLOB NOT NULL,
+  bootstrap_identity_digest TEXT NOT NULL,
+  marker_attestation BLOB NOT NULL,
+  marker_attestation_digest TEXT NOT NULL,
+  controller_keyset_digest TEXT NOT NULL,
+  config_catalog_digest TEXT NOT NULL,
+  initialized_at REAL NOT NULL CHECK (initialized_at >= 0)
+);
+
+CREATE TABLE pool_worker_lifecycle_fences (
+  singleton INTEGER NOT NULL UNIQUE CHECK (singleton = 1),
+  operation_id TEXT NOT NULL PRIMARY KEY,
+  bootstrap_identity_digest TEXT NOT NULL,
+  fence_identity BLOB NOT NULL,
+  fence_identity_digest TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state = 'FENCED'),
+  receipt BLOB NOT NULL,
+  receipt_digest TEXT NOT NULL UNIQUE,
+  created_at REAL NOT NULL CHECK (created_at >= 0)
+);
+
+CREATE TRIGGER coordinated_config_insert_guard
+BEFORE INSERT ON config
+WHEN EXISTS (
+  SELECT 1 FROM pool_worker_bootstrap_state
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated worker rejects legacy config insert');
+END;
+
+CREATE TRIGGER coordinated_config_update_guard
+BEFORE UPDATE ON config
+WHEN EXISTS (
+  SELECT 1 FROM pool_worker_bootstrap_state
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated worker rejects legacy config update');
+END;
+
+CREATE TRIGGER coordinated_config_delete_guard
+BEFORE DELETE ON config
+WHEN EXISTS (
+  SELECT 1 FROM pool_worker_bootstrap_state
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated worker rejects legacy config delete');
+END;
+
+CREATE TRIGGER pool_worker_bootstrap_state_no_update
+BEFORE UPDATE ON pool_worker_bootstrap_state
+BEGIN
+  SELECT RAISE(ROLLBACK, 'pool worker bootstrap state is immutable');
+END;
+
+CREATE TRIGGER pool_worker_bootstrap_state_no_replace
+BEFORE INSERT ON pool_worker_bootstrap_state
+WHEN EXISTS (SELECT 1 FROM pool_worker_bootstrap_state)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'pool worker bootstrap state already exists');
+END;
+
+CREATE TRIGGER pool_worker_bootstrap_state_no_delete
+BEFORE DELETE ON pool_worker_bootstrap_state
+BEGIN
+  SELECT RAISE(ROLLBACK, 'pool worker bootstrap state is permanent');
+END;
+
+CREATE TRIGGER pool_worker_lifecycle_fences_no_update
+BEFORE UPDATE ON pool_worker_lifecycle_fences
+BEGIN
+  SELECT RAISE(ROLLBACK, 'pool worker lifecycle fence is immutable');
+END;
+
+CREATE TRIGGER pool_worker_lifecycle_fences_no_replace
+BEFORE INSERT ON pool_worker_lifecycle_fences
+WHEN EXISTS (SELECT 1 FROM pool_worker_lifecycle_fences)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'pool worker lifecycle fence already exists');
+END;
+
+CREATE TRIGGER pool_worker_lifecycle_fences_no_delete
+BEFORE DELETE ON pool_worker_lifecycle_fences
+BEGIN
+  SELECT RAISE(ROLLBACK, 'pool worker lifecycle fence is permanent');
+END;
+```
+
+There is deliberately no coordinated idle-teardown attempt table. A worker
+selected as `COORDINATED_V1` has no local lifecycle actuator to persist. The
+bootstrap row proves immutable mode and marker identity; the fence row proves
+central activation. Provider lifecycle intent, provider entry, query evidence,
+and terminal receipts remain in the central lifecycle action owner. Initial
+hook progress does not exist because the profile is `NONE_V1`; any future
+central hook ledger belongs to a separately reviewed adapter.
+
+###### Exact coordinated negative-authority trigger catalog
+
+The following SQL is the complete S0b trigger catalog in `jobs.db`. It is
+dormant while no `COORDINATED_V1` singleton exists. `AddJobKeyed` takes
+`BEGIN IMMEDIATE`, reads the greater of `sqlite_sequence.seq` and current
+`MAX(job_id)`, allocates the next positive ID, inserts the keyed side row in
+`INSERTING`, and then inserts the legacy row with that explicit ID. Thus the
+global insert guard never depends on SQLite assigning `NEW.rowid` after a
+`BEFORE INSERT` trigger. Queue, launch receipt, status, and pending cleanup
+similarly publish an uncommitted transient side state before touching a legacy
+row and restore a durable side state in the same transaction. Another
+connection cannot observe or borrow that transient authority.
+
+```sql
+CREATE TRIGGER keyed_submission_runtime_no_update
+BEFORE UPDATE ON keyed_submission_runtime
+BEGIN
+  SELECT RAISE(ROLLBACK, 'keyed submission runtime is immutable');
+END;
+
+CREATE TRIGGER keyed_submission_runtime_no_replace
+BEFORE INSERT ON keyed_submission_runtime
+WHEN EXISTS (SELECT 1 FROM keyed_submission_runtime)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'keyed submission runtime already exists');
+END;
+
+CREATE TRIGGER keyed_submission_runtime_no_delete
+BEFORE DELETE ON keyed_submission_runtime
+BEGIN
+  SELECT RAISE(ROLLBACK, 'keyed submission runtime is permanent');
+END;
+
+CREATE TRIGGER coordinated_jobs_insert_guard
+BEFORE INSERT ON jobs
+WHEN EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+AND NOT EXISTS (
+  SELECT 1 FROM keyed_submissions
+  WHERE job_id = NEW.job_id AND username = NEW.username
+    AND state = 'INSERTING')
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated jobs insert requires keyed reducer');
+END;
+
+CREATE TRIGGER coordinated_jobs_update_guard
+BEFORE UPDATE ON jobs
+WHEN EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+AND NOT EXISTS (
+  SELECT 1 FROM keyed_submissions
+  WHERE job_id = OLD.job_id AND job_id = NEW.job_id
+    AND state IN (
+      'INSERTING', 'UPDATING', 'RECEIPTING', 'STATUS_UPDATING', 'DELETING'))
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated jobs update requires keyed reducer');
+END;
+
+CREATE TRIGGER coordinated_jobs_delete_guard
+BEFORE DELETE ON jobs
+WHEN EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+BEGIN
+  SELECT RAISE(ROLLBACK, 'coordinated jobs history is permanent');
+END;
+
+CREATE TRIGGER coordinated_pending_jobs_insert_guard
+BEFORE INSERT ON pending_jobs
+WHEN EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+AND NOT EXISTS (
+  SELECT 1 FROM keyed_submissions AS submission
+  WHERE submission.job_id = NEW.job_id AND submission.state = 'INSERTING'
+    AND NOT EXISTS (
+      SELECT 1 FROM pending_jobs AS pending
+      WHERE pending.job_id = NEW.job_id)
+    AND NOT EXISTS (
+      SELECT 1 FROM keyed_submission_seals AS seal
+      WHERE seal.username = submission.username
+        AND seal.submission_key = submission.submission_key
+        AND seal.phase IN ('ADD', 'QUEUE')))
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated pending insert requires keyed reducer');
+END;
+
+CREATE TRIGGER coordinated_pending_jobs_update_guard
+BEFORE UPDATE ON pending_jobs
+WHEN EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+AND NOT EXISTS (
+  SELECT 1 FROM keyed_submissions
+  WHERE job_id = OLD.job_id AND job_id = NEW.job_id
+    AND state = 'UPDATING'
+    AND OLD.run_cmd IS NEW.run_cmd
+    AND OLD.created_time IS NEW.created_time
+    AND OLD.submit = 0 AND NEW.submit > 0)
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated pending update requires keyed reducer');
+END;
+
+CREATE TRIGGER coordinated_pending_jobs_delete_guard
+BEFORE DELETE ON pending_jobs
+WHEN EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+AND NOT EXISTS (
+  SELECT 1 FROM keyed_submissions
+  WHERE job_id = OLD.job_id AND state = 'DELETING')
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'coordinated pending delete requires keyed reducer');
+END;
+
+CREATE TRIGGER keyed_submissions_insert_guard
+BEFORE INSERT ON keyed_submissions
+WHEN NOT EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+OR NEW.state != 'INSERTING'
+OR EXISTS (
+  SELECT 1 FROM keyed_submissions
+  WHERE username = NEW.username AND submission_key = NEW.submission_key)
+OR EXISTS (
+  SELECT 1 FROM keyed_submissions WHERE job_id = NEW.job_id)
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'keyed submission insert lacks coordinated authority');
+END;
+
+CREATE TRIGGER keyed_submissions_identity_guard
+BEFORE UPDATE ON keyed_submissions
+WHEN OLD.username IS NOT NEW.username
+OR OLD.submission_key IS NOT NEW.submission_key
+OR OLD.job_id IS NOT NEW.job_id
+OR OLD.add_digest IS NOT NEW.add_digest
+OR OLD.service_hash IS NOT NEW.service_hash
+OR OLD.worker_incarnation IS NOT NEW.worker_incarnation
+OR OLD.lifecycle_fence_operation_id IS NOT
+   NEW.lifecycle_fence_operation_id
+OR OLD.lifecycle_fence_identity_digest IS NOT
+   NEW.lifecycle_fence_identity_digest
+OR OLD.containment_plan IS NOT NEW.containment_plan
+OR OLD.containment_plan_digest IS NOT NEW.containment_plan_digest
+OR OLD.local_cgroup_scope_uuid IS NOT NEW.local_cgroup_scope_uuid
+OR (OLD.queue_digest IS NOT NULL AND
+    OLD.queue_digest IS NOT NEW.queue_digest)
+OR (OLD.driver_token IS NOT NULL AND
+    OLD.driver_token IS NOT NEW.driver_token)
+OR (OLD.provisional_root_pid IS NOT NULL AND
+    OLD.provisional_root_pid IS NOT NEW.provisional_root_pid)
+OR (OLD.provisional_process_start_identity IS NOT NULL AND
+    OLD.provisional_process_start_identity IS NOT
+    NEW.provisional_process_start_identity)
+OR (OLD.local_supervisor_operation_id IS NOT NULL AND
+    OLD.local_supervisor_operation_id IS NOT
+    NEW.local_supervisor_operation_id)
+OR (OLD.supervisor_launch_receipt_digest IS NOT NULL AND
+    OLD.supervisor_launch_receipt_digest IS NOT
+    NEW.supervisor_launch_receipt_digest)
+OR (OLD.cancel_operation_id IS NOT NULL AND
+    OLD.cancel_operation_id IS NOT NEW.cancel_operation_id)
+OR (OLD.cancel_digest IS NOT NULL AND
+    OLD.cancel_digest IS NOT NEW.cancel_digest)
+OR (OLD.cancel_origin_state IS NOT NULL AND
+    OLD.cancel_origin_state IS NOT NEW.cancel_origin_state)
+OR (OLD.cancel_grace_policy_version IS NOT NULL AND
+    OLD.cancel_grace_policy_version IS NOT
+    NEW.cancel_grace_policy_version)
+OR (OLD.cancel_host_boot_id IS NOT NULL AND
+    OLD.cancel_host_boot_id IS NOT NEW.cancel_host_boot_id)
+OR (OLD.cancel_deadline_boottime_ns IS NOT NULL AND
+    OLD.cancel_deadline_boottime_ns IS NOT
+    NEW.cancel_deadline_boottime_ns)
+OR (OLD.completion_operation_id IS NOT NULL AND
+    OLD.completion_operation_id IS NOT NEW.completion_operation_id)
+OR (OLD.completion_identity_digest IS NOT NULL AND
+    OLD.completion_identity_digest IS NOT NEW.completion_identity_digest)
+OR (OLD.pending_legacy_status IS NOT NULL AND
+    OLD.pending_legacy_status IS NOT NEW.pending_legacy_status)
+OR (OLD.supervisor_outcome_receipt_digest IS NOT NULL AND
+    OLD.supervisor_outcome_receipt_digest IS NOT
+    NEW.supervisor_outcome_receipt_digest)
+OR (OLD.terminal_legacy_status IS NOT NULL AND
+    OLD.terminal_legacy_status IS NOT NEW.terminal_legacy_status)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'keyed submission identity is immutable');
+END;
+
+CREATE TRIGGER keyed_submissions_no_delete
+BEFORE DELETE ON keyed_submissions
+BEGIN
+  SELECT RAISE(ROLLBACK, 'keyed submission history is permanent');
+END;
+
+CREATE TRIGGER keyed_containments_insert_guard
+BEFORE INSERT ON keyed_submission_containments
+WHEN NOT EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+OR NOT EXISTS (
+  SELECT 1 FROM keyed_submissions
+  WHERE username = NEW.username AND submission_key = NEW.submission_key
+    AND state = 'INSERTING')
+OR EXISTS (
+  SELECT 1 FROM keyed_submission_containments
+  WHERE username = NEW.username AND submission_key = NEW.submission_key
+    AND ordinal = NEW.ordinal)
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'containment insert requires keyed reducer');
+END;
+
+CREATE TRIGGER keyed_containments_identity_guard
+BEFORE UPDATE ON keyed_submission_containments
+WHEN OLD.username IS NOT NEW.username
+OR OLD.submission_key IS NOT NEW.submission_key
+OR OLD.ordinal IS NOT NEW.ordinal
+OR OLD.kind IS NOT NEW.kind
+OR OLD.implementation_digest IS NOT NEW.implementation_digest
+OR OLD.owner_uuid IS NOT NEW.owner_uuid
+OR OLD.identity_digest IS NOT NEW.identity_digest
+OR OLD.provider_native_owner_locator IS NOT
+   NEW.provider_native_owner_locator
+OR (OLD.prepare_receipt IS NOT NULL AND
+    OLD.prepare_receipt IS NOT NEW.prepare_receipt)
+OR (OLD.prepare_receipt_digest IS NOT NULL AND
+    OLD.prepare_receipt_digest IS NOT NEW.prepare_receipt_digest)
+OR (OLD.launch_receipt IS NOT NULL AND
+    OLD.launch_receipt IS NOT NEW.launch_receipt)
+OR (OLD.launch_receipt_digest IS NOT NULL AND
+    OLD.launch_receipt_digest IS NOT NEW.launch_receipt_digest)
+OR (OLD.effect_receipt IS NOT NULL AND
+    OLD.effect_receipt IS NOT NEW.effect_receipt)
+OR (OLD.effect_receipt_digest IS NOT NULL AND
+    OLD.effect_receipt_digest IS NOT NEW.effect_receipt_digest)
+OR (OLD.seal_receipt IS NOT NULL AND
+    OLD.seal_receipt IS NOT NEW.seal_receipt)
+OR (OLD.seal_receipt_digest IS NOT NULL AND
+    OLD.seal_receipt_digest IS NOT NEW.seal_receipt_digest)
+OR (OLD.empty_receipt IS NOT NULL AND
+    OLD.empty_receipt IS NOT NEW.empty_receipt)
+OR (OLD.empty_receipt_digest IS NOT NULL AND
+    OLD.empty_receipt_digest IS NOT NEW.empty_receipt_digest)
+OR (OLD.retirement_receipt IS NOT NULL AND
+    OLD.retirement_receipt IS NOT NEW.retirement_receipt)
+OR (OLD.retirement_receipt_digest IS NOT NULL AND
+    OLD.retirement_receipt_digest IS NOT NEW.retirement_receipt_digest)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'containment identity or receipt is immutable');
+END;
+
+CREATE TRIGGER keyed_containments_no_delete
+BEFORE DELETE ON keyed_submission_containments
+BEGIN
+  SELECT RAISE(ROLLBACK, 'containment history is permanent');
+END;
+
+CREATE TRIGGER keyed_submission_seals_insert_guard
+BEFORE INSERT ON keyed_submission_seals
+WHEN NOT EXISTS (
+  SELECT 1 FROM keyed_submission_runtime
+  WHERE singleton = 1 AND runtime_mode = 'COORDINATED_V1')
+OR EXISTS (
+  SELECT 1 FROM keyed_submission_seals
+  WHERE username = NEW.username AND submission_key = NEW.submission_key
+    AND phase = NEW.phase)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'absence seal lacks coordinated authority');
+END;
+
+CREATE TRIGGER keyed_submission_seals_no_update
+BEFORE UPDATE ON keyed_submission_seals
+BEGIN
+  SELECT RAISE(ROLLBACK, 'absence seal is immutable');
+END;
+
+CREATE TRIGGER keyed_submission_seals_no_delete
+BEFORE DELETE ON keyed_submission_seals
+BEGIN
+  SELECT RAISE(ROLLBACK, 'absence seal is permanent');
+END;
+```
+
+The reducer separately enforces the exact closed state-transition graph and
+the correspondence between each transient state and the one legacy mutation
+it admits. The SQL above is persistent negative authority against stale v40,
+generic writers, direct code-generation, and partially upgraded writers. It is not
+a second scheduler.
+
+Three code-owned catalog manifests use the same byte framing, with objects
+sorted by `(type, name)` using bytewise UTF-8 order. Their exact prefixes are
+`SKYPILOT_KEYED_SCHEMA_V1\0` for the three M5-S0a tables and five indexes,
+`SKYPILOT_KEYED_TRIGGER_V1\0` for `keyed_submission_runtime` and every
+`jobs.db` trigger above, and `SKYPILOT_POOL_CONFIG_V1\0` for both config-
+database tables and all config-database triggers above:
+
+```text
+ASCII one exact manifest prefix named above
+for each owned table, index, or trigger:
+  minimal ASCII decimal UTF-8-octet-count(type) ":" UTF-8 type
+  minimal ASCII decimal UTF-8-octet-count(name) ":" UTF-8 name
+  minimal ASCII decimal UTF-8-octet-count(canonical_sql) ":" UTF-8 canonical_sql
+ASCII "END\0"
+```
+
+`canonical_sql` uses the single named algorithm `SQLITE_MASTER_SQL_V1`. A
+closed maximal-munch lexer recognizes SQLite identifiers, punctuation,
+operators, single-quoted literals with doubled quotes, quoted identifiers,
+ASCII whitespace, and numeric literals matching exactly
+`(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|0[xX][0-9A-Fa-f]+`.
+A leading sign is a separate operator token, not part of a number. Numeric
+underscores are rejected so behavior does not depend on the installed SQLite
+minor version. Comments, NUL, invalid UTF-8, unterminated quoted tokens, and
+any byte sequence outside those token classes are rejected. It removes only
+the standalone `IF NOT EXISTS` token sequence in the
+owned `CREATE` production because SQLite omits that sequence, replaces each
+nonempty ASCII-whitespace run outside a quoted token with one U+0020 without
+ever joining adjacent tokens, trims leading and trailing whitespace, and
+strips one standalone terminal semicolon. It preserves all bytes inside quoted
+tokens and every other UTF-8 byte. Thus `service_hash TEXT` and
+`service_hashTEXT` have different canonical bytes and cannot collide. Length
+fields have no sign, leading zero, or surrounding whitespace. The manifest
+digest is SHA-256 over that exact framed byte stream. The repository test
+extracts every SQL statement in the canonical
+blocks above, partitions it by owning database and manifest, and compares its
+framed bytes, object names, and digest to the code constants. The jobs mode row
+stores the first two digests; the config bootstrap row stores the third.
+Runtime validation reads each database's `sqlite_master` and requires the same
+complete object sets and digests before coordinated mode can reach READY. It
+also rejects every unowned trigger or explicit index attached to `jobs`, `pending_jobs`,
+`keyed_submissions`, `keyed_submission_containments`,
+`keyed_submission_seals`, `keyed_submission_runtime`, `config`,
+`pool_worker_bootstrap_state`, or `pool_worker_lifecycle_fences`. An unowned
+trigger could borrow a legitimate transient reducer state, while an unowned
+unique or partial index could impose a second state machine on legitimate
+rows, so name-prefix filtering is insufficient. Every explicit index with
+non-null `sqlite_master.sql` on a protected table must be in that manifest's
+exact owned index set. SQLite-created autoindexes with null SQL are accepted
+only when `PRAGMA index_list` and `index_xinfo` match the exact uniqueness,
+origin, partial flag, collation, direction, and ordered columns implied by the
+owned table DDL; an extra implicit or explicit shape fails closed. Unrelated
+tables and their indexes may remain. Any missing, extra reserved-name,
+protected-table trigger or index, unexpected autoindex, or wrong-shape owned
+object fails closed.
+
+The preexisting `config` table is not owned or mutated by
+`SKYPILOT_POOL_CONFIG_V1`. It is the separate closed prerequisite
+`LEGACY_CONFIG_PREREQUISITE_V1`. One neutral standalone function,
+`ensure_legacy_config_prerequisite_v1(connection)`, accepts only an explicit
+SQLite connection, imports no `sky` module, and executes the exact
+`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)` before
+validating it. The ordinary `sky.skylet.configs` initializer calls that shared
+function for its existing runtime-path database. Fresh coordinated bootstrap
+opens the protected `/var/lib/skypilot-control/skylet_config.db` itself and
+calls the same function; it never depends on the legacy module or ambient
+`SKY_RUNTIME_DIR` path. In one `BEGIN IMMEDIATE`, a fresh empty database
+creates and validates this prerequisite before installing the two new config
+tables and triggers. An upgraded database validates its existing table without
+rewriting data. In both cases coordinated startup requires the resulting
+`SQLITE_MASTER_SQL_V1` bytes to equal exactly
+`CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)`. It further requires
+exactly one `PRAGMA index_list('config')` row: sequence `0`, name
+`sqlite_autoindex_config_1`, unique `1`, origin `pk`, partial `0`; and exactly
+two ordered `PRAGMA index_xinfo('sqlite_autoindex_config_1')` rows: sequence
+`0`, cid `0`, name `key`, descending `0`, collation `BINARY`, key `1`; then
+sequence `1`, cid `-1`, null name, descending `0`, collation `BINARY`, key `0`.
+The config manifest owns only `pool_worker_bootstrap_state`,
+`pool_worker_lifecycle_fences`, and their named triggers. A missing or changed
+legacy prerequisite, extra config autoindex, or any config trigger or explicit
+index rolls back the fresh combined installation or prevents READY without
+claiming ownership of legacy config data. The neutral initializer owns only
+this compatibility create-or-validate step; legacy config reads and writes
+remain in their characterized owner until the coordinated singleton makes the
+guard triggers active.
+
 All identifier, digest, token, and canonical-byte fields are additionally
-validated by the v41 reducer before insertion. SQLite owns only the closed
+validated by the coordinated reducer before insertion. SQLite owns only the closed
 state, nullability, numeric, primary-key, and uniqueness invariants above; it
 does not guess future digest or UUID versions. Foreign keys are deliberately
 absent because existing v40 connections do not enable SQLite foreign-key
 enforcement. The reducer must validate the parent submission in its same
 `BEGIN IMMEDIATE` transaction. The partial unique local-owner index enforces at
-most one `LOCAL_CGROUP_V2_DIRECT_V1` row per submission; the v41 reducer and
+most one `LOCAL_CGROUP_V2_DIRECT_V1` row per submission; the coordinated reducer and
 full-plan digest enforce the required at-least-one row before admission.
 
 The installer runs only after the legacy additive-column commits, requires no
 active transaction, and creates all three tables and five named indexes in one
 `BEGIN IMMEDIATE`. It validates the code-owned canonical SQL for every object
 before commit. Canonicalization removes the exact `IF NOT EXISTS` clause that
-SQLite omits from `sqlite_master.sql`, removes ASCII whitespace outside
-single-quoted literals, strips one trailing semicolon, and otherwise preserves
-every UTF-8 byte. Repeated and concurrent installation is create-or-validate.
+SQLite omits from `sqlite_master.sql` and then applies exactly
+`SQLITE_MASTER_SQL_V1` above. Repeated and concurrent installation is
+create-or-validate.
 A reserved-name or owned-object shape mismatch rolls back every object created
 by that attempt, reports keyed schema unavailable, and leaves ordinary v40 job
 initialization available; an I/O error, corrupt database, or failure involving
-either legacy table still propagates. The later v41 capability revalidates this
+either legacy table still propagates. The later coordinated capability revalidates this
 exact object set and advertises no keyed profile when it is unavailable.
 
-M5-S0a deliberately installs no trigger and no mapped-row producer. The
-persistent negative-authority triggers land in M5-S0b together with the only
-v41 reducer able to satisfy their transient guard protocol. Their literal SQL
-and catalog-validation bytes must be added to this canonical design before S0b
-implementation. The S0b triggers must use `RAISE(ROLLBACK, ...)`, reject
-pending inserts after either applicable seal, preserve immutable pending-row
-identity while advancing `submit` from zero, bind PID publication to the exact
-stored provisional process, enforce exact status transitions and retired-owner
-terminalization, reject mapped job replace, rekey, or delete, and prevent
-replacement or rewriting of side-table identities and already stored receipt
-columns. Landing them with the reducer avoids expanding every v40 write path
-before any keyed owner exists while retaining the final stale-writer barrier
-before the first keyed row can be produced.
+M5-S0a deliberately installs no trigger and no mapped-row producer. The exact
+persistent negative-authority catalog above lands dormant in an S0b v40 slice,
+together with no mode row and no producer. It becomes active only when the
+complete coordinated startup barrier commits `COORDINATED_V1`. Its `RAISE(ROLLBACK,
+...)` guards reject unkeyed legacy inserts and every unauthorized update or
+delete, reject pending inserts after either applicable seal, preserve immutable
+pending-row identity while advancing `submit` from zero, bind PID publication
+to the exact stored provisional process, reject replace or rekey, and prevent
+rewriting of side-table identities and stored receipts. The reducer owns the
+closed state graph; the triggers are durable negative authority.
 
-A v40 binary can still add and queue ordinary jobs after the schema appears.
-If it later sees an existing keyed pending row, its autonomous `_run_job()`
-fails on the guarded pending update before process spawn, its status heuristic
-fails before a keyed job update, and its cleanup fails before pending deletion.
-Once keyed rows are used, central activation independently forbids a v40
-Skylet, but the persistent local triggers remain the durable last barrier.
-Those triggers fence v40 scheduler and database writers before spawn or a
-legacy-table mutation. They cannot prevent the raw v40 `CancelJobs` handler
-from signalling a process before its later database write. The supported
-takeover boundary therefore also requires exactly one v41 listener, proves no
-predecessor service process remains, and never sends a legacy cancel RPC for a
-keyed row. A capable v41 generic handler rejects keyed IDs before signalling.
-An arbitrary independently launched v40 RPC server is outside the S0 safety
-claim and blocks activation or worker-image rollback.
+A v40 binary can still add and queue ordinary jobs after the dormant schema and
+triggers appear while the coordinated row is absent. Once the coordinated
+guard commits, no ordinary job or pending-row write remains legal, whether or
+not a keyed mapping already exists. A stale v40 scheduler fails before its
+first database mutation; process spawn is independently blocked because the
+control UID has no legacy command path and the payload UID cannot open the
+database. A stale `CancelJobs` request cannot reach an authoritative mutation
+listener. The long-lived manager proves no
+predecessor listener or process remains, while the persistent mode and SQL
+guards reject a late stale writer. An independently launched process cannot
+acquire the manager's owner lock, control UID, protected socket, or database FD;
+any such observation quarantines activation or rollback.
 
 Keyed execution is admitted only through a qualified
 `SubmissionContainmentAdapterV1`. The common protocol prepares an immutable
@@ -8320,7 +9183,7 @@ and verifies a terminal absence receipt. Capacity release requires `RETIRED`
 receipts from every local and external owner in the plan; managed-job status,
 driver exit, a Ray status string, or one empty process query cannot substitute.
 A backend adds only its canonical owner locator, actuation, query, and receipt
-verifier. Common Skylet code owns storage, ordering, replay, quarantine, and
+verifier. Common coordinated-runtime code owns storage, ordering, replay, quarantine, and
 release policy.
 
 Preparation is an explicit adapter operation, not an inferred lack of a
@@ -8329,7 +9192,7 @@ then calls idempotent `PrepareOwnerV1` for each exact identity before queue
 admission. For the local adapter, the supervisor create-or-returns a durable
 `PREPARED` ledger entry and permanent UUID reservation without creating a
 cgroup, process, gate, or other workload effect; changed identity conflicts.
-Skylet verifies that receipt and advances the side row `PLANNED -> PREPARED`.
+The coordinated reducer verifies that receipt and advances the side row `PLANNED -> PREPARED`.
 `QueueJobKeyed` rejects a plan unless every owner is `PREPARED`. Thus a crash
 after `LAUNCHING` but before `CreateAndLaunchV1` still has an authoritative
 supervisor ledger and cannot be mistaken for an absent unowned launch.
@@ -8358,7 +9221,7 @@ and reap, removes the root, persists `RETIRED`, and returns a permanent
 no-later-effect receipt. Changed identity, an open gate, or ambiguous ledger
 quarantines and performs no cleanup.
 
-Skylet mirrors `OWNERS_SEALED` and `OWNERS_RETIRED` from those receipts and only
+The coordinated reducer mirrors `OWNERS_SEALED` and `OWNERS_RETIRED` from those receipts and only
 then uses transient `DELETING` to remove pending state, write legacy
 `FAILED_DRIVER`, and commit keyed `FAILED`. Exact response-loss and restart
 retries query and resume the same failed-launch operation at `SEALED`, `EMPTY`,
@@ -8414,7 +9277,7 @@ needed, only the payload subtree is visible inside a private cgroup and mount
 namespace, while the inaccessible manager root remains the recursive kill
 target.
 
-Skylet runs as a dedicated control identity, the native outcome shim runs as a
+The coordinated runtime runs as a dedicated control identity, the native outcome shim runs as a
 second non-root trusted identity, job commands run as a third unprivileged
 payload identity, and peer credentials admit only the control identity to the
 supervisor command socket. The payload identity cannot ptrace, signal, inspect,
@@ -8424,23 +9287,39 @@ trusted shim receives one inherited, submission-scoped, bounded bidirectional
 `SOCK_SEQPACKET` request/ack FD created and retained by the supervisor; user
 commands never inherit it. It is not the command socket and supports no launch,
 signal, cgroup, query, or database operation. Shim-to-manager frames are closed
-to `PAYLOAD_READY` and `LOGICAL_OUTCOME_V1` with the manager-supplied sequence
-and sealed submission identity. Manager-to-shim frames are closed to the exact
-durable acknowledgment for the immediately preceding sequence; unsolicited,
+to `PAYLOAD_READY`, bounded `LOG_CHUNK_V1`, per-stream `LOG_EOF_V1`, and
+`LOGICAL_OUTCOME_V1`, with the manager-supplied sequence, stream offset where
+applicable, and sealed submission and artifact identities. Manager-to-shim frames are closed to the exact
+durable acknowledgment for the immediately preceding sequence, including the
+terminal acknowledgment that carries the digest of an accepted
+`LOG_QUOTA_EXCEEDED_V1` receipt; unsolicited,
 out-of-order, oversized, duplicate-changed, or command-shaped frames close and
 quarantine the channel. The supervisor binds the FD to its owner ledger,
-durably records each accepted event before sending its acknowledgment, and
+routes log frames only to `SubmissionArtifactOwnerV1`, durably records each
+accepted event or log cursor before sending its acknowledgment, and
 retains a separate one-way payload-gate writer.
-Skylet's trusted control reconciler queries that ledger and alone mirrors launch
+The shim may read and retain the one bounded logical status from its private
+driver pipe, but it sends `LOGICAL_OUTCOME_V1` only after both log streams have
+sent durably acknowledged EOF. A quota terminal acknowledgment permanently
+suppresses that logical-outcome send. Therefore a quota receipt always
+linearizes before any logical outcome, and an already recorded logical outcome
+plus a new quota receipt is an invariant violation rather than an outcome
+priority guess.
+The coordinated runtime's trusted reducer queries that ledger and alone mirrors launch
 receipts, start state, logical outcome, cleanup phases, and terminal legacy
 status into SQLite.
 
-The payload has no host root, `CAP_SYS_ADMIN`, manager command FD or database
-access, writable ancestor or sibling `cgroup.procs`, host cgroup namespace or
-systemd bus, privileged container socket, or equivalent out-of-tree spawner. A
-same-UID Skylet and workload is ineligible unless a separately qualified
-isolation profile proves the payload cannot ptrace the manager, steal its FDs,
-call the helper, or reach writable host cgroupfs. The supervisor owns a durable
+The payload has no host root, sudo rule, polkit authorization, setuid or
+file-capability elevation path, ambient, permitted, effective, inheritable, or
+bounding capability, trusted group membership, writable privileged
+configuration, manager command FD, database access, writable ancestor or
+sibling `cgroup.procs`, host cgroup namespace or systemd bus, Docker,
+containerd, libvirt, LXD, privileged container socket, or equivalent
+out-of-tree spawner. Ordinary user SSH is disabled after coordinated READY; the
+payload UID is not a login principal. A same-UID control process and workload
+is ineligible unless a separately qualified isolation profile proves the
+payload cannot ptrace the manager, steal its FDs, call the helper, or reach
+writable host cgroupfs. The supervisor owns a durable
 registry and permanent tombstone for every containment UUID. A worker that
 lacks this principal separation, a
 single unified cgroup-v2 mount, real systemd delegation, recursive
@@ -8448,6 +9327,938 @@ single unified cgroup-v2 mount, real systemd delegation, recursive
 `cgroup.events` readback, or supervisor-registry recovery advertises no local
 containment capability. These are behavioral runtime probes, not version
 checks or best-effort warnings.
+
+###### Submission artifact and log owner
+
+`SubmissionArtifactOwnerV1` is the exclusive owner of executable input and log
+artifacts. It is a separately testable subsystem of the coordinated runtime,
+with a ledger and API disjoint from reducer and containment state. The coordinated reducer
+owns domain intent and projections; the artifact owner alone prepares bytes,
+creates log sinks, hands sealed descriptors to launch, drains and finalizes
+logs, serves retained readback, and removes retained artifacts. The containment
+adapter never resolves a user path or creates a log file. A script path and log
+directory in legacy-shaped rows are display metadata only.
+
+The closed API is:
+
+```text
+PrepareSubmissionArtifactV1(
+  queue_intent, plan, outer_queue_digest, exact_bytes) -> prepared_receipt
+OpenSubmissionArtifactForLaunchV1(prepared_receipt)
+  -> sealed_command_fd, shim_log_channel, launch_artifact_receipt
+FinalizeSubmissionArtifactV1(outcome_receipt, process_absence_receipt)
+  -> finalized_receipt
+ReadSubmissionArtifactLogV1(read_identity)
+  -> bounded_bytes, next_read_cursor, durable_limit, eof, final_digest
+FreezeSubmissionArtifactRetentionScopeV1(scope_identity)
+  -> frozen_scope_header, freeze_receipt
+RemoveSubmissionArtifactV1(retention_operation) -> removal_receipt
+ListOwnedSubmissionArtifactsV1(
+  frozen_scope_digest, after_member_key, limit) -> page, next_key
+```
+
+V1 is intentionally bounded rather than pretending that an unbounded command
+fits a unary control RPC. `COORDINATED_DIRECT_COMMAND_MAX_BYTES_V1 = 102400`
+is the maximum exact command byte count, and
+`COORDINATED_MUTATION_REQUEST_MAX_BYTES_V1 = 2097152` is the maximum
+deterministically serialized protobuf request envelope, including signed
+authorization and command bytes, for every mutating method. Both constants are
+fields of the capability, protocol digest, bootstrap identity, and signed
+build manifest. Before a version-1 assignment is born, the central planner
+encodes the exact request and applies both limits. A command of 102400 bytes is
+eligible; 102401 bytes yields `INELIGIBLE_COMMAND_SIZE_V1`. A request of
+2097152 bytes is eligible; one byte more yields
+`INELIGIBLE_REQUEST_SIZE_V1`. The task remains eligible only for the
+version-0 legacy pool path, including its existing rsync behavior. If no such
+pool is allowed, admission remains durably unassigned with that typed reason.
+The coordinated caller never truncates, splits, compresses, uploads through
+SSH, or falls back after assignment. `RESUMABLE_ARTIFACT_UPLOAD_V2` is a
+separate future protocol requiring intent-first chunk offsets, digests,
+acknowledgments, restart recovery, and abandonment authority; it is not an
+implicit V1 compatibility path. The 4 MiB forced-bridge frame bound therefore
+has headroom over the complete V1 request bound and is not itself the domain
+limit. Independently of planner eligibility, the bridge rejects an oversized
+frame and the worker interceptor rejects a serialized mutation above 2097152
+bytes before authorization or transaction entry. The artifact owner recomputes
+and rejects a command above 102400 bytes before inserting its intent row. A
+signed caller cannot bypass either worker-side bound.
+
+`ReadSubmissionArtifactLogV1` is a side-effect-free offset read, not a second
+durability cursor. Its signed identity binds bootstrap, username, submission
+key, artifact owner, plan digest, stream and stream-identity digest, exact byte
+offset, maximum response size from 1 through 1 MiB, and optional previously
+observed final digest. The owner opens the protected inode through its retained
+directory FD, verifies the immutable identity and current durable write cursor,
+and returns only the prefix range `[offset, min(offset + max_bytes,
+durable_bytes))` plus that range digest. `next_read_cursor` is the returned end
+offset. An offset beyond the durable limit, a changed final digest, or any
+inode or prefix disagreement fails closed. Tail follows by polling with the
+returned cursor; readback never advances or rewrites the durable log ledger.
+The coordinated `ReadSubmissionArtifactLog` RPC accepts only this closed
+identity and signed controller authorization. `GetPoolWorkerArtifactInventory`
+requires the frozen scope digest and returns at most 256 members ordered by the
+exact membership tuple, with an exclusive `after_member_key`, next key, total
+member count, membership digest, and scope digest on every page. The request
+limit is 1 through 256 and the encoded page is additionally capped at 1 MiB,
+ending before the first member that would exceed it. The permanent
+freeze makes keyset pagination stable without a process-held cross-RPC SQLite
+snapshot; duplicate, skipped, out-of-order, changed-header, or over-limit pages
+fail the central recomputation. These two methods replace coordinated use of legacy
+`TailLogs` and `GetLogDirsForJobs`; there is no SSH pathname fallback.
+Open-for-launch, read, finalization, and removal share one identity-keyed
+artifact lock. A read
+accepted before removal returns only the durable range it pinned; removal waits
+for that bounded read. A read accepted after `REMOVING` or `REMOVED` returns the
+closed removed result and never follows an old inode. No caller-visible cursor
+or open descriptor extends retention authority.
+
+The artifact owner opens `/var/lib/skypilot-control/artifacts-v1.db` with
+`isolation_level=None`, `PRAGMA foreign_keys=ON`, and explicit
+`BEGIN IMMEDIATE`. It is the only process that can traverse the database
+directory. `ARTIFACT_LEDGER_SCHEMA_VERSION = 1` owns these exact objects:
+
+```sql
+CREATE TABLE submission_artifacts (
+  bootstrap_identity_digest TEXT NOT NULL,
+  username TEXT NOT NULL,
+  submission_key TEXT NOT NULL,
+  job_id INTEGER NOT NULL CHECK (job_id > 0),
+  artifact_owner_uuid TEXT NOT NULL UNIQUE,
+  add_digest TEXT NOT NULL,
+  queue_intent_digest TEXT NOT NULL,
+  queue_digest TEXT NOT NULL,
+  plan BLOB NOT NULL,
+  plan_digest TEXT NOT NULL UNIQUE,
+  command_media_type TEXT NOT NULL CHECK (
+    command_media_type IN ('NATIVE_V1', 'SHELL_V1')),
+  command_size INTEGER NOT NULL CHECK (
+    command_size >= 0 AND command_size <= 102400),
+  command_digest TEXT NOT NULL,
+  interpreter_digest TEXT NOT NULL,
+  argv_digest TEXT NOT NULL,
+  environment_digest TEXT NOT NULL,
+  stdout_identity_digest TEXT NOT NULL,
+  stderr_identity_digest TEXT NOT NULL,
+  log_quota_bytes INTEGER NOT NULL CHECK (log_quota_bytes >= 0),
+  retention_policy_version TEXT NOT NULL,
+  artifact_dir_relpath TEXT NOT NULL,
+  staging_dir_relpath TEXT NOT NULL,
+  command_relpath TEXT NOT NULL,
+  stdout_relpath TEXT NOT NULL,
+  stderr_relpath TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN (
+    'PREPARING', 'PREPARED', 'FINALIZING', 'FINALIZED',
+    'REMOVING', 'REMOVED', 'QUARANTINED')),
+  prepared_receipt BLOB,
+  prepared_receipt_digest TEXT,
+  launch_artifact_receipt BLOB,
+  launch_artifact_receipt_digest TEXT,
+  finalization_operation_id TEXT,
+  outcome_receipt_digest TEXT,
+  process_absence_receipt_digest TEXT,
+  finalization_receipt BLOB,
+  finalization_receipt_digest TEXT,
+  freeze_terminal_kind TEXT CHECK (
+    freeze_terminal_kind IS NULL OR freeze_terminal_kind IN (
+      'FINALIZED_RETAINED_V1', 'REMOVED_BEFORE_FREEZE_V1')),
+  freeze_terminal_evidence_digest TEXT,
+  removal_operation_id TEXT,
+  removal_receipt BLOB,
+  removal_receipt_digest TEXT,
+  quarantine_reason_digest TEXT,
+  created_at REAL NOT NULL CHECK (created_at >= 0),
+  updated_at REAL NOT NULL CHECK (updated_at >= created_at),
+  PRIMARY KEY (bootstrap_identity_digest, username, submission_key),
+  CHECK ((prepared_receipt IS NULL) =
+         (prepared_receipt_digest IS NULL)),
+  CHECK ((launch_artifact_receipt IS NULL) =
+         (launch_artifact_receipt_digest IS NULL)),
+  CHECK ((finalization_receipt IS NULL) =
+         (finalization_receipt_digest IS NULL)),
+  CHECK ((freeze_terminal_kind IS NULL) =
+         (freeze_terminal_evidence_digest IS NULL)),
+  CHECK ((removal_receipt IS NULL) =
+         (removal_receipt_digest IS NULL)),
+  CHECK (state IN ('PREPARING', 'REMOVING', 'REMOVED', 'QUARANTINED') OR
+         prepared_receipt IS NOT NULL),
+  CHECK (state NOT IN ('FINALIZING', 'FINALIZED') OR
+         (finalization_operation_id IS NOT NULL AND
+          outcome_receipt_digest IS NOT NULL AND
+          process_absence_receipt_digest IS NOT NULL)),
+  CHECK (state != 'FINALIZED' OR finalization_receipt IS NOT NULL),
+  CHECK (state NOT IN ('REMOVING', 'REMOVED') OR
+         removal_operation_id IS NOT NULL),
+  CHECK (state != 'REMOVED' OR removal_receipt IS NOT NULL),
+  CHECK (state != 'QUARANTINED' OR
+         quarantine_reason_digest IS NOT NULL)
+);
+
+CREATE TABLE submission_artifact_log_cursors (
+  bootstrap_identity_digest TEXT NOT NULL,
+  username TEXT NOT NULL,
+  submission_key TEXT NOT NULL,
+  stream TEXT NOT NULL CHECK (stream IN ('STDOUT', 'STDERR')),
+  stream_identity_digest TEXT NOT NULL,
+  next_sequence INTEGER NOT NULL CHECK (next_sequence >= 0),
+  durable_bytes INTEGER NOT NULL CHECK (durable_bytes >= 0),
+  rolling_digest TEXT NOT NULL,
+  eof INTEGER NOT NULL CHECK (eof IN (0, 1)),
+  final_digest TEXT,
+  quota_exceeded_receipt BLOB,
+  quota_exceeded_receipt_digest TEXT,
+  updated_at REAL NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (
+    bootstrap_identity_digest, username, submission_key, stream),
+  FOREIGN KEY (bootstrap_identity_digest, username, submission_key)
+    REFERENCES submission_artifacts (
+      bootstrap_identity_digest, username, submission_key),
+  CHECK ((eof = 0 AND final_digest IS NULL) OR
+         (eof = 1 AND final_digest IS NOT NULL)),
+  CHECK ((quota_exceeded_receipt IS NULL) =
+         (quota_exceeded_receipt_digest IS NULL)),
+  CHECK (quota_exceeded_receipt IS NULL OR eof = 1)
+);
+
+CREATE TABLE submission_artifact_retention_scopes (
+  bootstrap_identity_digest TEXT NOT NULL PRIMARY KEY,
+  retirement_operation_id TEXT NOT NULL UNIQUE,
+  scope_identity BLOB NOT NULL,
+  scope_identity_digest TEXT NOT NULL UNIQUE,
+  retention_policy_version TEXT NOT NULL,
+  membership_count INTEGER NOT NULL CHECK (membership_count >= 0),
+  membership_digest TEXT NOT NULL UNIQUE,
+  terminal_inventory_digest TEXT NOT NULL UNIQUE,
+  retention_scope_digest TEXT NOT NULL UNIQUE,
+  freeze_receipt BLOB NOT NULL,
+  freeze_receipt_digest TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state = 'FROZEN'),
+  created_at REAL NOT NULL CHECK (created_at >= 0)
+);
+
+CREATE TRIGGER submission_artifacts_identity_guard
+BEFORE UPDATE ON submission_artifacts
+WHEN OLD.bootstrap_identity_digest IS NOT NEW.bootstrap_identity_digest
+OR OLD.username IS NOT NEW.username
+OR OLD.submission_key IS NOT NEW.submission_key
+OR OLD.job_id IS NOT NEW.job_id
+OR OLD.artifact_owner_uuid IS NOT NEW.artifact_owner_uuid
+OR OLD.add_digest IS NOT NEW.add_digest
+OR OLD.queue_intent_digest IS NOT NEW.queue_intent_digest
+OR OLD.queue_digest IS NOT NEW.queue_digest
+OR OLD.plan IS NOT NEW.plan
+OR OLD.plan_digest IS NOT NEW.plan_digest
+OR OLD.command_media_type IS NOT NEW.command_media_type
+OR OLD.command_size IS NOT NEW.command_size
+OR OLD.command_digest IS NOT NEW.command_digest
+OR OLD.interpreter_digest IS NOT NEW.interpreter_digest
+OR OLD.argv_digest IS NOT NEW.argv_digest
+OR OLD.environment_digest IS NOT NEW.environment_digest
+OR OLD.stdout_identity_digest IS NOT NEW.stdout_identity_digest
+OR OLD.stderr_identity_digest IS NOT NEW.stderr_identity_digest
+OR OLD.log_quota_bytes IS NOT NEW.log_quota_bytes
+OR OLD.retention_policy_version IS NOT NEW.retention_policy_version
+OR OLD.artifact_dir_relpath IS NOT NEW.artifact_dir_relpath
+OR OLD.staging_dir_relpath IS NOT NEW.staging_dir_relpath
+OR OLD.command_relpath IS NOT NEW.command_relpath
+OR OLD.stdout_relpath IS NOT NEW.stdout_relpath
+OR OLD.stderr_relpath IS NOT NEW.stderr_relpath
+OR (OLD.prepared_receipt IS NOT NULL AND
+    OLD.prepared_receipt IS NOT NEW.prepared_receipt)
+OR (OLD.prepared_receipt_digest IS NOT NULL AND
+    OLD.prepared_receipt_digest IS NOT NEW.prepared_receipt_digest)
+OR (OLD.launch_artifact_receipt IS NOT NULL AND
+    OLD.launch_artifact_receipt IS NOT NEW.launch_artifact_receipt)
+OR (OLD.launch_artifact_receipt_digest IS NOT NULL AND
+    OLD.launch_artifact_receipt_digest IS NOT
+    NEW.launch_artifact_receipt_digest)
+OR (OLD.finalization_operation_id IS NOT NULL AND
+    OLD.finalization_operation_id IS NOT NEW.finalization_operation_id)
+OR (OLD.outcome_receipt_digest IS NOT NULL AND
+    OLD.outcome_receipt_digest IS NOT NEW.outcome_receipt_digest)
+OR (OLD.process_absence_receipt_digest IS NOT NULL AND
+    OLD.process_absence_receipt_digest IS NOT
+    NEW.process_absence_receipt_digest)
+OR (OLD.finalization_receipt IS NOT NULL AND
+    OLD.finalization_receipt IS NOT NEW.finalization_receipt)
+OR (OLD.finalization_receipt_digest IS NOT NULL AND
+    OLD.finalization_receipt_digest IS NOT NEW.finalization_receipt_digest)
+OR (OLD.freeze_terminal_kind IS NOT NULL AND
+    OLD.freeze_terminal_kind IS NOT NEW.freeze_terminal_kind)
+OR (OLD.freeze_terminal_evidence_digest IS NOT NULL AND
+    OLD.freeze_terminal_evidence_digest IS NOT
+    NEW.freeze_terminal_evidence_digest)
+OR (OLD.removal_operation_id IS NOT NULL AND
+    OLD.removal_operation_id IS NOT NEW.removal_operation_id)
+OR (OLD.removal_receipt IS NOT NULL AND
+    OLD.removal_receipt IS NOT NEW.removal_receipt)
+OR (OLD.removal_receipt_digest IS NOT NULL AND
+    OLD.removal_receipt_digest IS NOT NEW.removal_receipt_digest)
+OR (OLD.quarantine_reason_digest IS NOT NULL AND
+    OLD.quarantine_reason_digest IS NOT NEW.quarantine_reason_digest)
+OR OLD.created_at IS NOT NEW.created_at
+OR NEW.updated_at < OLD.updated_at
+BEGIN
+  SELECT RAISE(ROLLBACK, 'submission artifact identity is immutable');
+END;
+
+CREATE TRIGGER submission_artifact_insert_after_scope_guard
+BEFORE INSERT ON submission_artifacts
+WHEN EXISTS (
+  SELECT 1 FROM submission_artifact_retention_scopes
+  WHERE bootstrap_identity_digest = NEW.bootstrap_identity_digest)
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'frozen artifact retention scope rejects new artifacts');
+END;
+
+CREATE TRIGGER submission_artifacts_no_delete
+BEFORE DELETE ON submission_artifacts
+BEGIN
+  SELECT RAISE(ROLLBACK, 'submission artifact history is permanent');
+END;
+
+CREATE TRIGGER submission_artifact_log_identity_guard
+BEFORE UPDATE ON submission_artifact_log_cursors
+WHEN OLD.bootstrap_identity_digest IS NOT NEW.bootstrap_identity_digest
+OR OLD.username IS NOT NEW.username
+OR OLD.submission_key IS NOT NEW.submission_key
+OR OLD.stream IS NOT NEW.stream
+OR OLD.stream_identity_digest IS NOT NEW.stream_identity_digest
+OR NEW.next_sequence < OLD.next_sequence
+OR NEW.durable_bytes < OLD.durable_bytes
+OR (OLD.eof = 1 AND NEW.eof != 1)
+OR (OLD.final_digest IS NOT NULL AND
+    OLD.final_digest IS NOT NEW.final_digest)
+OR (OLD.quota_exceeded_receipt IS NOT NULL AND
+    OLD.quota_exceeded_receipt IS NOT NEW.quota_exceeded_receipt)
+OR (OLD.quota_exceeded_receipt_digest IS NOT NULL AND
+    OLD.quota_exceeded_receipt_digest IS NOT
+    NEW.quota_exceeded_receipt_digest)
+OR NEW.updated_at < OLD.updated_at
+BEGIN
+  SELECT RAISE(ROLLBACK, 'submission artifact log identity is immutable');
+END;
+
+CREATE TRIGGER submission_artifact_logs_no_delete
+BEFORE DELETE ON submission_artifact_log_cursors
+BEGIN
+  SELECT RAISE(ROLLBACK, 'submission artifact log history is permanent');
+END;
+
+CREATE TRIGGER submission_artifact_retention_scopes_no_update
+BEFORE UPDATE ON submission_artifact_retention_scopes
+BEGIN
+  SELECT RAISE(ROLLBACK, 'artifact retention scope is immutable');
+END;
+
+CREATE TRIGGER submission_artifact_retention_scope_complete_guard
+BEFORE INSERT ON submission_artifact_retention_scopes
+WHEN EXISTS (
+  SELECT 1 FROM submission_artifacts
+  WHERE bootstrap_identity_digest = NEW.bootstrap_identity_digest
+    AND (freeze_terminal_kind IS NULL OR
+         freeze_terminal_evidence_digest IS NULL))
+BEGIN
+  SELECT RAISE(ROLLBACK,
+               'artifact retention terminal inventory is incomplete');
+END;
+
+CREATE TRIGGER submission_artifact_retention_scopes_no_replace
+BEFORE INSERT ON submission_artifact_retention_scopes
+WHEN EXISTS (
+  SELECT 1 FROM submission_artifact_retention_scopes
+  WHERE bootstrap_identity_digest = NEW.bootstrap_identity_digest)
+BEGIN
+  SELECT RAISE(ROLLBACK, 'artifact retention scope already exists');
+END;
+
+CREATE TRIGGER submission_artifact_retention_scopes_no_delete
+BEFORE DELETE ON submission_artifact_retention_scopes
+BEGIN
+  SELECT RAISE(ROLLBACK, 'artifact retention scope is permanent');
+END;
+```
+
+The artifact owner enforces the closed state graph `PREPARING -> PREPARED ->
+FINALIZING -> FINALIZED -> REMOVING -> REMOVED`, the direct never-launched
+`PREPARING -> REMOVING` and `PREPARED -> REMOVING` edges, and quarantine from
+every nonterminal state. The first direct edge atomically records the removal
+operation before discarding unpublished staging bytes; the same ledger state
+then rejects every later prepare or publish, and its removal receipt is the
+permanent no-later-publication proof. An
+open-for-launch retry may fill one immutable launch-artifact receipt while the
+row stays `PREPARED`; it returns a newly created descriptor over the same bytes
+and receipt identity, never an old process-local FD identity. No row is
+deleted. Startup validates a code-owned `SKYPILOT_ARTIFACT_LEDGER_V1\0`
+manifest using the same minimal-decimal framing and
+`SQLITE_MASTER_SQL_V1` canonicalization defined above over these exact three
+tables and triggers. It rejects every unowned trigger or explicit index on a
+protected artifact table and accepts only the exact SQLite autoindex shapes
+implied by this DDL before inventory reconciliation.
+
+Prepare uses an intent-first, atomically published directory protocol. The
+artifact owner first inserts the complete immutable `PREPARING` row and commits
+before touching the filesystem. `artifact_dir_relpath` is a deterministic
+base32 encoding of the bootstrap, artifact-owner UUID, and plan digest;
+`staging_dir_relpath` is that exact value plus `.preparing`. Both are one path
+component. Under a retained root FD, a matching retry creates or reopens only
+the protected staging directory, writes the command and creates both empty log
+objects there, validates exact type, UID, GID, mode, link count, byte count and
+digest, calls `fdatasync` on every object and `fsync` on the staging directory,
+then publishes the complete directory with
+`renameat2(RENAME_NOREPLACE)` and `fsync` on the artifact root. It finally
+inserts the two zero cursors and changes the row to `PREPARED` with one
+deterministically reconstructible receipt in a single `BEGIN IMMEDIATE`
+transaction. No individual final file is renamed, so the published directory
+is either absent or complete.
+
+Recovery classifies every possible durable pairing before READY:
+
+- a `PREPARING` row with neither directory remains a durable intent awaiting
+  the same signed prepare and exact bytes;
+- a `PREPARING` row with only its staging directory resumes validation. A
+  matching prepare may rewrite an incomplete command only while it remains in
+  this unpublished directory; complete matching files are reused;
+- a `PREPARING` row with only the complete published directory verifies all
+  bytes and metadata, recreates the deterministic prepared receipt, and commits
+  the missing cursors and `PREPARED` transition;
+- both directories, any unexpected entry, a final directory without its row,
+  a short or changed published object, or a row/filesystem identity mismatch
+  is quarantined and never deleted to make recovery pass; and
+- a `PREPARED` or later row requires the complete published directory and the
+  exact two cursor rows. Missing, staging, or changed state quarantines.
+
+The owner never claims that a crash before prepare commit leaves no intent.
+Response loss before or after each boundary joins this state machine. A
+`PREPARING` intent can be permanently removed only by the exact never-launched
+seal or frozen-retirement operation, which first proves that no final
+publication or launch can still occur.
+
+For each log chunk, the owner appends at exactly `durable_bytes`, calls
+`fdatasync`, then advances `next_sequence`, `durable_bytes`, and the rolling
+digest in one database transaction before acknowledging. Recovery truncates
+only an uncommitted suffix beyond the durable cursor after verifying the
+protected inode and prefix digest; a short file, changed prefix, extra hard
+link, or identity mismatch quarantines. Finalization records EOF and final
+digests for both streams before issuing its receipt.
+
+Quota exhaustion is one closed terminal protocol, not backpressure with no
+owner. If the next nonempty frame would make the combined durable stdout and
+stderr byte count exceed the artifact's immutable `log_quota_bytes`, the
+artifact owner appends none of that frame. In the same transaction it stores
+`LOG_QUOTA_EXCEEDED_V1`, including stream, sequence, current offset, rejected
+chunk size and digest, quota, durable prefix cursor and digest, and marks the
+offending stream EOF with its retained-prefix final digest. An empty frame at
+the boundary remains admissible; an exact fill is durably acknowledged, and
+the first later nonempty byte takes the quota path. The matching receipt and
+digest are immutable in the cursor row. Exact retry returns that receipt;
+same-sequence changed bytes quarantine.
+
+The manager durably accepts the quota receipt in its own ledger before sending
+the terminal acknowledgment on the shim's submission channel. That ledger
+record is the closed
+supervisor outcome-receipt kind `LOG_QUOTA_EXCEEDED_V1`; it is the durable typed
+failure reason and requires no new keyed-state enum or SQLite column. The
+terminal acknowledgment tells the shim to stop forwarding both streams. The
+shim retains no rejected bytes and drains and discards pipe input only while
+the manager exposes the durable receipt and the coordinated runtime submits it
+to the reducer, preventing a pipe deadlock without creating unbounded memory
+or storage. The manager may not seal, signal, or kill until it later receives
+the exact reducer-authorized cancellation or completion operation.
+
+Under the existing per-job lock, the reducer linearizes the stored receipt
+against cancellation exactly once. If `CANCELLING` committed first, that exact
+cancel operation remains the sole cleanup and terminal-status owner; the
+receipt is retained in the manager ledger and is a closed fatal-escalation
+condition of `TERM_10S_THEN_HARD_KILL_V1`, so the same cancel operation advances
+directly to `HARD_KILL_ENTERED` with no second grace interval. Otherwise an
+exact `STARTED` row commits `COMPLETING/OUTCOME_RECORDED`, a new completion
+operation and identity bound to the quota receipt, pending legacy status
+`FAILED_DRIVER`, and cleanup profile `IMMEDIATE_HARD_SEAL_V1`. Only after that
+commit may the manager execute the matching cancellation or completion seal
+and recursive kill. The durable typed reason remains the supervisor receipt;
+the keyed terminal state is the existing `FAILED`, its
+`supervisor_outcome_receipt_digest` binds that receipt when completion wins,
+and its unchanged legacy projection is `FAILED_DRIVER`. A pre-effect,
+already-completing, terminal, or identity-conflicting row quarantines instead
+of inventing a second owner.
+
+Reducer and manager restart recovery re-drives that exact operation through
+containment absence and artifact finalization; the other stream finalizes only
+its already durable prefix. Response loss, artifact-owner restart, manager restart,
+and simultaneous stdout and stderr overage all converge on whichever receipt
+the artifact owner's single write lock commits first. Once one receipt exists,
+the other stream returns that same artifact-terminal outcome without appending;
+every changed duplicate quarantines. No quota path waits indefinitely for another log frame
+or silently reclassifies the payload exit.
+
+`QueueIntentV1` is canonicalized first. It binds job ID, add digest, exact
+command media type, byte count and SHA-256, display-only script and log paths,
+deterministic managed-job proto bytes, execution profile, and containment plan
+digest, but no artifact plan or outer queue digest. Its SHA-256 is
+`queue_intent_digest`.
+
+`SubmissionArtifactPlanV1` then binds bootstrap identity, username, submission
+key, job ID, add digest, `queue_intent_digest`, never-reused artifact-owner
+UUID, command media type, exact byte count and SHA-256, fixed interpreter and argv digest,
+environment digest, stdout and stderr identities, quota, artifact schema and
+implementation digests, and retention policy version. Prepare is
+create-or-return by that complete identity. The outer `queue_digest` is
+SHA-256 over a distinct domain prefix, `queue_intent_digest`, and the complete
+artifact-plan digest. `PrepareSubmissionArtifactV1` receives the canonical
+queue-intent bytes, plan, outer digest, and command bytes; it recomputes all
+three digests, verifies their cross-fields, and rejects any disagreement before
+the intent row. This ordering is acyclic: queue intent, then artifact plan,
+then outer queue identity. Under the protected
+`/var/lib/skypilot-control/artifacts-v1/` root, the owner uses retained
+directory FDs, `openat2()` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`,
+`O_CREAT|O_EXCL|O_NOFOLLOW`, exact owner and mode checks, write plus file and
+directory `fsync`, and no-replace publication. Submission directories are
+`skypilot-control:skypilot-control` mode `0700`, the immutable command is one-link mode `0400`, and log
+objects are one-link mode `0600`; every open revalidates device, inode, owner,
+mode, type, link count, and size through the retained parent FD. A different plan or digest
+conflicts. An unrecognized artifact is quarantined, never garbage-collected.
+
+Open re-reads and hashes the protected bytes, copies them into a memfd, applies
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`, verifies the seals and
+descriptor identity, and transfers that read-only command FD plus the exact
+artifact receipt to the manager with `SCM_RIGHTS`. Native payloads use
+`execveat(AT_EMPTY_PATH)`; direct shell payloads invoke one manifest-qualified
+interpreter on `/proc/self/fd/<sealed-fd>` while retaining only that read-only
+FD. No launch executes a pathname from a payload-writable namespace.
+
+The payload receives only stdout and stderr pipe writers. The trusted shim owns
+the readers and forwards bounded, sequenced log frames on its submission
+channel; the artifact owner appends those frames to protected no-follow log
+objects and durably acknowledges each sequence. The payload never receives,
+reopens, replaces, truncates, seeks, or inherits a file descriptor for the log
+objects. Manager or shim response loss resumes from the durable log cursor.
+Channel loss finalizes the retained prefix and feeds the existing
+`CHANNEL_LOST_V1` outcome contract rather than reconstructing success.
+
+The coordinated runtime establishes one peer-credentialed, incarnation-bound
+artifact channel to the manager. The manager forwards at most one unacknowledged
+log frame per stream and does not acknowledge the shim until the artifact
+owner's durable cursor advances. Artifact-owner restart reopens its ledger and
+resumes from those cursors; changed runtime, cursor, artifact identity, or
+duplicate-changed frame quarantines. Prolonged owner unavailability closes the
+payload gate or enters `CHANNEL_LOST_V1`; the manager never buffers an
+unbounded process-memory log history.
+
+`QueueJobKeyed` obtains a matching prepare receipt before it commits `QUEUED`.
+A crash may therefore leave a prepared artifact beside an `UNQUEUED` row, but
+not an unauthoritative executable path. Retry joins the exact owner inventory.
+A winning `QUEUE` absence seal must drive that exact prepared identity through
+`RemoveSubmissionArtifactV1` under its permanent no-later-launch tombstone
+before terminalizing the add-only shell. Launch requires the prepared and
+launch-artifact receipts in addition to the containment receipt.
+
+Process retirement and artifact retention are separate responsibilities.
+Recursive cgroup absence retires the execution owner and releases capacity.
+The artifact owner then drains the final acknowledged log sequence, seals its
+writers, and returns a finalization receipt; command bytes and logs remain
+readable under the central retention policy. Only an explicit, identity-bound
+retention operation may remove them. A server that merely fails to recognize a
+submission, an empty process query, worker restart, or age-based local scan is
+never removal authority. This ports dstack's useful prepare, run, observe,
+terminate, and remove split while replacing mutable path execution and
+best-effort cleanup with immutable descriptors and durable receipts.
+
+Initial M5 registers no time-based local garbage collector. Post-launch
+artifacts use `RETAIN_UNTIL_WORKER_RETIREMENT_V1` and remain after job terminal.
+The only removal authorities are a winning never-launched queue seal or a
+central `SubmissionRetentionOperationV1` durably admitted during exact worker
+retirement. That operation binds service scope, worker incarnation and
+bootstrap, assignment and submission identities, artifact owner UUID, plan and
+finalization receipt digests, retention policy, required log-export receipt or
+the explicit `LOCAL_ONLY_V1` policy, removal not-before time, and operation ID.
+The controller signs it for `RemoveSubmissionArtifactV1`; changed or missing
+members conflict. Worker retirement cannot call provider down until every
+reachable artifact returns its removal receipt or an explicitly required export
+adapter has made its own receipt durable. Unexpected authoritative provider
+absence proves local bytes no longer exist but never fabricates export success.
+A future duration-based or cross-worker retention policy requires its own
+central owner and does not become local best-effort GC.
+
+Artifact retirement has one exact freeze boundary. After central admission is
+closed and every assignment bound to the worker is terminal, the controller
+constructs `ArtifactRetentionScopeIdentityV1` from the coordination-scope UUID,
+service hash, worker incarnation, bootstrap and lifecycle-fence digests,
+retirement operation ID, retention policy version, and membership encoding
+version. `FreezeSubmissionArtifactRetentionScope` carries that signed identity.
+Under the reducer's global admission lock and the artifact owner's write lock,
+the worker requires zero nonterminal keyed submission, prepare, launch,
+finalization, or manager operation. Every artifact row must be `FINALIZED` or
+`REMOVED`; a never-launched `PREPARING` or `PREPARED` row is first driven by its
+exact seal to `REMOVED`. In one SQLite transaction, the owner selects every
+`submission_artifacts` row for the bootstrap identity without filtering by
+server recognition, age, or current visibility, orders rows bytewise by the
+UTF-8 tuple `(username, submission_key, artifact_owner_uuid)`, hashes the
+minimal-decimal framed immutable member projection and a parallel terminal
+evidence projection, and inserts the permanent
+`submission_artifact_retention_scopes` row. The member projection contains
+username, submission key, job ID, artifact-owner UUID, add, queue-intent,
+outer-queue, plan, command, stdout-identity, stderr-identity, and
+retention-policy digests. For a row that is `FINALIZED` at freeze, the terminal
+projection is `FINALIZED_RETAINED_V1` plus its finalization-receipt digest. For
+a row already `REMOVED`, it is `REMOVED_BEFORE_FREEZE_V1` plus the pre-freeze
+removal operation ID and removal-receipt digest. The owner fills the paired
+immutable `freeze_terminal_kind` and `freeze_terminal_evidence_digest` on
+every artifact in the same transaction as the scope insert. The
+`terminal_inventory_digest` hashes the ordered terminal projections. The
+scope digest is the domain-separated SHA-256 of the canonical scope identity,
+member count, membership digest, and terminal-inventory digest. The freeze
+receipt binds all of those fields. The insert guard makes identity membership
+and terminal evidence closed before that receipt is returned. Exact retry
+reconstructs both digests from the permanent frozen fields even if a retained
+artifact was removed after freeze; any extra, missing, nonterminal, changed,
+or receipt-inconsistent member quarantines.
+
+The worker-side freeze first joins the artifact ledger to the reducer snapshot:
+every artifact must match one permanent keyed submission on username, key, job,
+add, queue-intent, outer-queue, and plan identities, and every keyed submission
+whose queue identity was ever admitted must have exactly one artifact row.
+An add-only submission with no admitted queue identity is outside artifact
+membership and is covered by its permanent add or queue absence state, never by
+an inferred missing file. The central freeze transaction makes the same join
+against every assignment ever bound to the worker incarnation. It rejects an
+artifact without an exact assignment, a queued assignment without its member,
+or a digest mismatch before persisting the scope. Thus the membership rule is
+the complete immutable artifact ledger constrained by both durable submission
+owners, not whichever rows one side happens to recognize.
+
+`AddJobKeyed`, `QueueJobKeyed`, artifact prepare, and freeze acquire that one
+runtime admission lock before any per-job or artifact lock. Freeze holds it
+through the local scope commit and response construction. After that commit,
+the artifact insert trigger rejects new members and the reducer checks the
+permanent scope row before every add or queue transaction. Startup discovers a
+scope row and closes admission before binding the listener. This lock order and
+durable check prevent a stale but previously signed queue from entering between
+the last inventory read and membership closure; no cross-database atomicity is
+assumed.
+
+The central PostgreSQL owner persists the returned scope before removal in two
+relational shapes. `pool_worker_artifact_retention_scopes` is keyed by
+`retirement_operation_id` and has a unique worker incarnation and nullable
+unique frozen-scope digest,
+plus service hash, bootstrap digest, retention policy and encoding versions,
+nullable member count, membership digest, and terminal-inventory digest,
+nullable immutable worker freeze receipt and digest, nullable local-loss
+authorization and last-known-inventory evidence digests, timestamps, and the closed state `FROZEN`, `REMOVING`,
+`REMOVED`, `LOSS_AUTHORIZED`, or `DESTROYED_WITH_LOCAL_LOSS`. The first three
+states require a non-null member count, membership digest,
+terminal-inventory digest, and paired freeze-receipt fields and a null loss
+authorization. The two loss states require a non-null loss authorization.
+Their frozen scope, membership, terminal inventory, and receipt fields remain
+nonnull and immutable when loss followed freeze, but are all null when loss
+was authorized before freeze. The only edges are `FROZEN -> REMOVING -> REMOVED`,
+`FROZEN|REMOVING -> LOSS_AUTHORIZED -> DESTROYED_WITH_LOCAL_LOSS`, or initial
+insert at `LOSS_AUTHORIZED` when freeze was impossible.
+`pool_worker_artifact_retention_members` is keyed
+by `(retirement_operation_id, username, submission_key)` with unique artifact-
+owner UUID and contains the exact immutable member projection, frozen terminal
+kind, the corresponding finalization or pre-freeze removal evidence, nullable
+required-export receipt, and separately named post-freeze retirement-removal
+operation and receipt fields. Member rows exist only for a successfully frozen
+scope. Scope identity, frozen terminal evidence, and member fields are
+immutable; only the named export and retirement-removal receipt columns and
+forward state edges may fill. A single transaction inserts
+the scope and all members after recomputing the worker receipt and exact order.
+`PoolWorkerRetirementIdentityV1` and `InternalPoolDownIdentityV1` are prepared
+only after that durable freeze and bind its scope digest and policy version.
+
+The exact logical PostgreSQL column contract is:
+
+```text
+pool_worker_artifact_retention_scopes
+  retirement_operation_id UUID PRIMARY KEY
+  service_hash TEXT NOT NULL
+  worker_incarnation UUID NOT NULL UNIQUE
+  bootstrap_identity_digest SHA256_TEXT NOT NULL
+  scope_identity_digest SHA256_TEXT NOT NULL UNIQUE
+  retention_policy_version TEXT NOT NULL
+  membership_encoding_version TEXT NOT NULL
+  member_count BIGINT NULL
+  membership_digest SHA256_TEXT NULL
+  terminal_inventory_digest SHA256_TEXT NULL
+  retention_scope_digest SHA256_TEXT NULL UNIQUE
+  freeze_receipt BYTEA NULL
+  freeze_receipt_digest SHA256_TEXT NULL UNIQUE
+  local_loss_authorization_digest SHA256_TEXT NULL UNIQUE
+  last_known_inventory_evidence_digest SHA256_TEXT NULL
+  state RETENTION_SCOPE_STATE NOT NULL
+  created_at TIMESTAMPTZ NOT NULL
+  updated_at TIMESTAMPTZ NOT NULL
+
+pool_worker_artifact_retention_members
+  retirement_operation_id UUID NOT NULL REFERENCES
+    pool_worker_artifact_retention_scopes(retirement_operation_id)
+  username TEXT NOT NULL
+  submission_key TEXT NOT NULL
+  job_id BIGINT NOT NULL
+  artifact_owner_uuid UUID NOT NULL
+  add_digest SHA256_TEXT NOT NULL
+  queue_intent_digest SHA256_TEXT NOT NULL
+  queue_digest SHA256_TEXT NOT NULL
+  plan_digest SHA256_TEXT NOT NULL
+  command_digest SHA256_TEXT NOT NULL
+  stdout_identity_digest SHA256_TEXT NOT NULL
+  stderr_identity_digest SHA256_TEXT NOT NULL
+  retention_policy_version TEXT NOT NULL
+  freeze_terminal_kind FROZEN_ARTIFACT_TERMINAL_KIND NOT NULL
+  finalization_receipt_digest SHA256_TEXT NULL
+  pre_freeze_removal_operation_id UUID NULL
+  pre_freeze_removal_receipt_digest SHA256_TEXT NULL
+  required_export_policy LOCAL_ONLY_OR_EXPORT_REQUIRED NOT NULL
+  export_receipt_digest SHA256_TEXT NULL
+  retirement_removal_operation_id UUID NULL
+  retirement_removal_receipt_digest SHA256_TEXT NULL
+  PRIMARY KEY (retirement_operation_id, username, submission_key)
+  UNIQUE (retirement_operation_id, artifact_owner_uuid)
+```
+
+`SHA256_TEXT` and the closed token types, pairwise nullability checks, member
+count check, digest recomputation, identity immutability, and the state edges
+above are PostgreSQL constraints or guarded reducer transitions, not comments
+left to callers. `FINALIZED_RETAINED_V1` requires only a finalization-receipt
+digest; `REMOVED_BEFORE_FREEZE_V1` requires only the paired pre-freeze removal
+operation and receipt. Later retirement removal fills only the separately
+named retirement fields. Post-freeze local loss never erases or rewrites any
+frozen member evidence.
+
+An unreadable or unreachable artifact owner has a separate explicit physical-
+destruction path so receipt safety cannot deadlock teardown. The ordinary path
+still requires the complete freeze, export, and removal receipts. A privileged
+central `ArtifactLocalLossAuthorizationV1` may instead be admitted with an
+operator or predeclared policy principal, stable request ID, service and worker
+identity, bootstrap, last known membership evidence, exact unreadable or
+unreachable reason, required-export disposition, provider target, and
+`DESTROY_WITH_RECORDED_LOCAL_LOSS_V1`. It permanently closes worker admission
+and bridge access and creates or changes the central scope to
+`LOSS_AUTHORIZED`; it does
+not invent a worker inventory, removal receipt, or export success. Only the
+central provider lifecycle owner may then destroy that exact physical target.
+If authorization precedes freeze, member count, membership,
+terminal-inventory, retention-scope, freeze-receipt, and ordinary retirement
+digests remain null and the down identity uses `LOSS_BEFORE_FREEZE_V1`. If a
+previously frozen or removing worker becomes unreachable, those fields and all
+central member rows remain non-null and immutable, the loss authorization is
+added, and the down identity uses `LOSS_AFTER_FREEZE_V1`. The ordinary complete
+receipt path alone uses `FROZEN_RECEIPTS_V1` and keeps loss authorization null.
+`LOCAL_ONLY_V1` may name a predeclared automatic loss principal in the worker
+birth identity. `EXPORT_REQUIRED_V1` always requires a separately
+authenticated, audited break-glass request with explicit data-loss consent; a
+retry loop, timeout, controller leader, or provider adapter cannot mint it.
+Authoritative provider absence records `DESTROYED_WITH_LOCAL_LOSS` and the
+unmet export result. Without this explicit authorization, the only choices are
+a forward repair or manual provider intervention. This is worker destruction,
+never permission to install an old image over coordinated state.
+
+###### Privileged component packaging, restart, and rollback
+
+The qualified image contains one immutable worker-runtime build manifest and
+five independently hashed native artifacts built from
+`addons/submission-containment/`: `skypilot-containmentd-v1`,
+`skypilot-native-launcher-v1`, `skypilot-outcome-shim-v1`,
+`skylet-control-bridge-v1`, and `skylet-bridge-shell-v1`. They are built in CI
+with the repository-pinned Go toolchain and module lock, `CGO_ENABLED=0`,
+`-trimpath`, an empty Go build ID, and a source commit embedded in a read-only
+version section. CI signs the compact canonical build manifest, which contains
+the source commit, Go toolchain and module-graph digests, target OS and
+architecture, each artifact SHA-256 and size, Python coordinated-runtime tree
+and locked dependency digests, the standalone, main release, and internal
+worker wheel names, versions, SHA-256 digests, dependency metadata, and
+package-file inventories, dedicated Python interpreter and venv-tree digests,
+unit-file and SSH-policy-template digests, containment and artifact
+ledger schema versions, and closed protocol versions. The image build copies
+the exact artifacts; a worker never downloads a server-provided executable or
+resolves a version named `latest`.
+
+The root installer verifies the build-manifest signature and every artifact
+before publishing any path. Artifacts live at the fixed versioned path
+`/usr/libexec/skypilot/worker-runtime-v1/`, owned `root:root`, with directories
+mode `0755`, executables `0555`, and manifest `0444`. Its dedicated venv
+contains only the pinned `skypilot-worker-runtime-v1` distribution and
+reviewed hash-locked runtime dependencies; generated coordinated bindings are
+files owned by that distribution. It does not contain the main `skypilot`
+distribution or any `sky` package and does not read system or user site
+packages. The signed manifest binds
+an `artifact_set_digest` computed over ordered framed artifact name, size, and
+digest records but excludes the manifest itself. Unit bytes use only this fixed
+versioned path and their digests are fields in the manifest, so neither the
+manifest nor a unit hashes a path containing its own digest. The installer
+rejects a preexisting byte mismatch and never swaps a writable `current`
+symlink. A coordinated worker is fresh and immutable for M5; any changed build
+manifest requires drain, destruction, and replacement. The bootstrap identity
+binds both build-manifest and artifact-set digests.
+
+The image creates these principals before marker publication:
+
+- `skypilot-control`, a system UID and group with home
+  `/var/lib/skypilot-control` and shell `/usr/sbin/nologin`;
+- `skypilot-bridge`, a system UID with empty root-owned home
+  `/var/empty/skypilot-bridge` mode `0555`, login executable
+  `/usr/libexec/skypilot/worker-runtime-v1/skylet-bridge-shell-v1`, and the sole
+  supplementary membership in group `skypilot-control`;
+- `skypilot-shim`, a non-root system UID with no login; and
+- `skypilot-payload`, the unprivileged non-login workload UID with home
+  `/home/skypilot-payload` and no membership in a trusted group; and
+- `skypilot-provision`, a one-time provisioning UID whose authentication
+  material and every live session are removed before manager READY.
+
+The installer records the resolved numeric UID and GID values in its signed
+marker attestation; names alone are not identity. The coordinated databases
+are `/var/lib/skypilot-control/jobs.db` and
+`/var/lib/skypilot-control/skylet_config.db` in a directory mode `0700`, owner
+`skypilot-control:skypilot-control`; database, WAL, and shared-memory files are
+mode `0600`. Payload code cannot traverse that directory. Ordinary legacy
+workers keep their existing runtime paths and ownership because they run a
+different executable.
+
+The final image-baked SSH policy is `/etc/ssh/sshd_config.d/60-skypilot-
+coordinated.conf`, `root:root` mode `0444`, with these effective directives:
+
+```text
+TrustedUserCAKeys /etc/ssh/skypilot-controller-ca-v1.pub
+AllowUsers skypilot-bridge
+Match User skypilot-bridge
+  AuthenticationMethods publickey
+  PubkeyAuthentication yes
+  AuthorizedKeysFile none
+  AuthorizedPrincipalsFile /etc/ssh/skypilot-bridge-principals-v1
+  ForceCommand /usr/libexec/skypilot/worker-runtime-v1/skylet-control-bridge-v1 --socket=/run/skypilot/skylet-control/control.sock --max-frame=4194304
+  DisableForwarding yes
+  AllowAgentForwarding no
+  AllowTcpForwarding no
+  AllowStreamLocalForwarding no
+  X11Forwarding no
+  PermitTTY no
+  PermitTunnel no
+  PermitUserRC no
+  PermitUserEnvironment no
+  PasswordAuthentication no
+  KbdInteractiveAuthentication no
+  GSSAPIAuthentication no
+  HostbasedAuthentication no
+```
+
+The controller CA file and the one-line principal file containing exactly
+`skypilot-coordinated-controller-v1` are `root:root` mode `0444`. Their exact
+bytes and digests, the drop-in, resolved UID/GID records, fixed forced-command
+string, and file metadata are bound by the signed bootstrap identity and marker
+attestation; the drop-in template, principals bytes, and bridge-shell binary are
+also bound by the build manifest. The restricted login executable accepts only
+the OpenSSH invocation `-c` followed by that exact forced-command string,
+rejects every other argument, clears nonessential environment variables,
+ignores `SSH_ORIGINAL_COMMAND`, and execs the bridge with the fixed socket and
+frame limit. Activation runs both `sshd -t` and effective-policy validation via
+`sshd -T -C user=skypilot-bridge,host=<canonical-host>,addr=<controller-ip>`.
+Wrong principal, expired certificate, alternate subsystem, malformed `-c`,
+environment injection, forwarding, or another socket fails before bridge exec.
+
+The manager ledger is
+`/var/lib/skypilot-containmentd/containments-v1.db`, directory mode `0700` and
+file mode `0600`, both `root:root`. The artifact ledger and artifact root live
+under `/var/lib/skypilot-control/`, mode `0600` for the database and `0700` for
+its directory, owner `skypilot-control:skypilot-control`. Manager and coordinated runtime directories are
+created by systemd at `/run/skypilot-containmentd` and
+`/run/skypilot/skylet-control`; the first is `root:skypilot-control` mode
+`0750`, the second `skypilot-control:skypilot-control` mode `0750`. Their
+socket paths and the READY record are never under a payload-writable ancestor.
+
+Three image-baked unit files own activation and process uniqueness:
+
+```text
+skypilot-coordinated-activate.service
+  Type=oneshot, User=root, RemainAfterExit=yes
+  Before=skypilot-containmentd.service skypilot-coordinated-worker.service
+  ExecStart=/usr/libexec/skypilot/worker-runtime-v1/skypilot-native-launcher-v1 validate-installed-worker
+
+skypilot-containmentd.service
+  Requires=skypilot-coordinated-activate.service
+  After=skypilot-coordinated-activate.service
+  Type=notify, User=root, Group=root, Delegate=yes
+  Restart=always, RestartSec=1, KillMode=process
+  RuntimeDirectory=skypilot-containmentd, RuntimeDirectoryMode=0750
+  StateDirectory=skypilot-containmentd, StateDirectoryMode=0700
+  ExecStart=/usr/libexec/skypilot/worker-runtime-v1/skypilot-containmentd-v1
+
+skypilot-coordinated-worker.service
+  BindsTo=skypilot-containmentd.service
+  After=skypilot-containmentd.service
+  Type=notify, User=skypilot-control, Group=skypilot-control
+  Restart=always, RestartSec=1, KillMode=process
+  RuntimeDirectory=skypilot/skylet-control, RuntimeDirectoryMode=0750
+  StateDirectory=skypilot-control, StateDirectoryMode=0700
+  ExecStart=/usr/libexec/skypilot/worker-runtime-v1/venv/bin/python -I -m skypilot_worker_runtime
+```
+
+The committed unit files additionally set `NoNewPrivileges=yes`,
+`ProtectSystem=strict`, `ProtectKernelTunables=yes`,
+`ProtectKernelModules=yes`, `ProtectControlGroups=yes` on the coordinated runtime,
+`PrivateTmp=yes`, `LockPersonality=yes`, `RestrictSUIDSGID=yes`, and explicit
+`ReadWritePaths` for only the state and runtime paths above. The manager alone
+receives the minimal reviewed capability bounding set needed for UID/GID
+transition, cgroup ownership, namespace creation, pidfd signalling, and its
+qualified network policy. `Delegate=yes` grants its one systemd cgroup subtree;
+the manager never writes outside it. `KillMode=process` is intentional: a
+manager crash must leave already owned payload cgroups available for ledger
+reconciliation instead of making systemd an unrecorded cancellation owner.
+Planned worker destruction first closes admission and drives every owner to a
+retired receipt, then stops the coordinated runtime before the manager. Host shutdown may kill
+the machine but cannot make a surviving physical worker assignable without the
+full reboot reconciliation barrier.
+
+The activation oneshot verifies installed bytes, the marker, SSH policy, state
+paths, and credential-profile digest. It neither acquires a lifetime lock nor
+starts another service. The long-lived manager then acquires and retains the
+root-owned activation lock, disables and masks legacy watchdog and reboot-rearm
+units, finds every process whose executable or command identity is Skylet-
+shaped, terminates and waits for it, checks no process retains a
+control-database FD, proves no legacy TCP or coordinated Unix listener remains,
+opens and reconciles its containment ledger, and only then reports READY. The
+coordinated runtime separately validates and reconciles the artifact ledger
+before worker READY. Neither owner deletes a
+ledger, artifact, cgroup, bootstrap row, fence, keyed row, or claim to make
+startup pass. `BindsTo` stops the coordinated service and removes its listener
+on manager loss before manager restart reconciliation.
+
+Before READY, activation locks the provisioning account, removes its keys and
+certificates, terminates every provisioning SSH session, and installs the final
+`AllowUsers skypilot-bridge` policy. The payload and every other ordinary SSH
+UID have no login path. The bootstrap credential-profile digest also proves
+that the platform-issued worker instance role or service identity has no
+provider launch, stop, terminate, delete, resize, or scale authority. Data-
+plane permissions may use a separately reviewed role. S4 must prove the central
+actuation owner is the sole holder of SkyPilot-issued lifecycle credentials;
+user-supplied external credentials remain outside that claim until a separate
+egress authority is designed.
+
+Manager restart with the same immutable digest reopens the ledger, enumerates
+the delegated cgroup tree and live shims, joins exact identities, quarantines
+disagreement, and only then reports READY. Coordinated-runtime restart repeats the startup
+barrier and reducer reconciliation. During M5 the manifest digest is immutable
+for a coordinated physical worker: native component or Python runtime upgrade
+uses drain, verified retirement, permanent provider teardown, and fresh worker
+birth. There is no in-place executable swap and no ledger-schema downgrade.
+
+Rollback is therefore explicit:
+
+- dormant artifacts and empty additive tables on an ordinary v40 worker can be
+  removed or ignored without restarting or changing legacy Skylet; and
+- any coordinated marker, `COORDINATED_V1` row, fence, manager ledger entry,
+  cgroup owner, receipt, or tombstone makes in-place downgrade illegal. A
+  failed deployment normally drains and destroys that worker or rolls forward
+  with the same manifest identity. If local ledgers are unreadable, destruction
+  requires the explicit central local-loss authorization above and records the
+  unsatisfied export or removal evidence; it does not wait for an impossible
+  worker receipt. It never restores a legacy image over retained coordinated
+  state.
+
+This adopts dstack's valuable separately packaged server, runner, and root-
+shim boundary while rejecting its weaker executable download and replacement
+path. Package identity, activation, state ownership, and rollback are one
+incarnation-bound contract rather than four independent best-effort checks.
 
 `CgroupContainmentCapabilityV1` binds the systemd unit and control-group
 identity, actual delegation ownership, manager and native-launcher digests and
@@ -8467,13 +10278,37 @@ proves the old operation cannot recreate its path. A seccomp denial, writable
 escape path, missing delegation, failed readback, or surviving helper removes
 the capability.
 
+`SubmissionArtifactCapabilityV1` separately binds the artifact-owner runtime
+and schema digests, protected filesystem and mount identities, `openat2`
+resolution flags, memfd and seal behavior, `SCM_RIGHTS` peer policy, fixed
+interpreter identities, log protocol and quotas, durable cursor semantics,
+retention policy, and supported media types. Its probe races symlink and
+pathname replacement against staging and launch, attempts hard-link and
+directory escape, tampers with staged bytes, tries to truncate and reopen each
+log from payload, crashes before and after every durable receipt, and verifies
+the executed bytes and retained logs by digest. Failure removes only the
+artifact capability and therefore makes the direct coordinated execution
+profile ineligible even when cgroup containment passes.
+
 The add digest is the canonical hash of username, job name, stable run
 timestamp, resources, metadata, service hash, worker incarnation, active
 lifecycle-fence operation and digest, and the full containment plan digest.
-`AddJobKeyed` holds one
-`BEGIN IMMEDIATE` transaction through seal check, explicit-column legacy job
-insert, side-row insert, exact-conflict comparison, log-directory derivation,
-and log-directory update. It does not call the existing commit-owning
+`AddJobKeyed` uses this exact single-transaction order:
+
+1. take `BEGIN IMMEDIATE`;
+2. validate the active fence, tombstones, exact retry, and orphan pending state;
+3. allocate the explicit positive job ID from `sqlite_sequence` and current
+   maximum under that write lock;
+4. insert `keyed_submissions` in transient `INSERTING`;
+5. insert every immutable containment row as `PLANNED`;
+6. insert the legacy `jobs` row with the explicit ID;
+7. derive and update its display log directory while the parent remains
+   `INSERTING`;
+8. advance the keyed row to durable `UNQUEUED`; and
+9. commit.
+
+It never reverses the side-row and legacy-row inserts, because the global
+insert trigger rejects that order. It does not call the existing commit-owning
 `add_job()` or `set_log_dir_no_lock()`. A repeated add returns the existing job
 ID and log directory only when every field and digest match. Add, queue,
 cancel, lookup, and phase seal first require the same currently active local
@@ -8502,12 +10337,17 @@ against an exact `UNQUEUED` row, that first commit leaves the job `UNQUEUED` but
 permanently prevents `QueueJobKeyed`. While retaining the file lock, or after a
 crash by reacquiring it and joining the tombstone, the seal owner drives every
 immutable `PLANNED` or `PREPARED` containment through idempotent
-`SealNeverLaunchedV1`. Only after every row is `RETIRED` with its permanent
-no-later-launch receipt does a final `BEGIN IMMEDIATE` transaction revalidate
+`SealNeverLaunchedV1` and joins artifact inventory by the expected queue digest.
+Any matching prepared artifact is permanently sealed against launch and removed
+through `RemoveSubmissionArtifactV1` bound to the queue-seal operation. Only
+after every containment row is `RETIRED` with its permanent no-later-launch
+receipt and every matching prepared artifact has its removal receipt does a
+final `BEGIN IMMEDIATE` transaction revalidate
 the tombstone, use transient `STATUS_UPDATING` to change legacy `INIT` to
 `CANCELLED`, and commit the direct keyed `UNQUEUED -> CANCELLED` edge; no
 process or external owner was admitted.
-It therefore leaves neither a nonterminal keyed row nor an unretired owner. A keyed queue
+It therefore leaves neither a nonterminal keyed row, an unretired owner, nor a
+prepared executable. A keyed queue
 checks the tombstone while holding that file lock and before any file or
 database mutation. Any pending row, non-`INIT` job status, PID, supervisor receipt,
 or queue state without the expected digest returns `AMBIGUOUS` and writes no
@@ -8525,32 +10365,36 @@ canonical task YAML projection, and protobuf inputs use deterministic
 serialization. A future field or normalization change requires a new digest
 version and RPC version.
 
-The queue digest is the canonical hash of job ID, codegen bytes or the exact
-uploaded script bytes, script path, remote log directory, and deterministic
-managed-job proto bytes, execution profile, and containment plan digest.
-`QueueJobKeyed` takes the per-job file lock before any
-file or database mutation and first rejects either applicable tombstone. It
-atomically writes code through temporary-file rename, then uses one
-`BEGIN IMMEDIATE` transaction to recheck the seals, compare or initialize the
-queue digest, perform the trigger-authorized one pending-row insert, change the
-job status from `INIT` to `PENDING`, and durably reach launch state `QUEUED`.
+The queue identity is constructed in the acyclic order above.
+`queue_intent_digest` hashes the exact `QueueIntentV1` bytes without an
+artifact-plan or outer-queue field. The artifact-plan digest then binds that
+intent digest, and the outer `queue_digest` hashes only its domain/version,
+`queue_intent_digest`, and the complete `SubmissionArtifactPlanV1` digest.
+`QueueJobKeyed` takes the per-job file lock
+before artifact or database mutation and first rejects either applicable
+tombstone. It calls idempotent `PrepareSubmissionArtifactV1` and verifies its
+durable receipt, then uses one `BEGIN IMMEDIATE` transaction to recheck the
+seals, compare or initialize the queue digest, perform the trigger-authorized
+one pending-row insert, change the job status from `INIT` to `PENDING`, and
+durably reach launch state `QUEUED`.
 It does not call the commit-owning `JobScheduler.queue()` or
 `_set_status_no_lock()`. The shared file lock keeps a queue-absence seal from
-linearizing between the pre-file check and that commit.
-A matching retry verifies or repairs a missing pre-launch artifact and invokes
-the scheduler; it is not a no-op merely because a digest exists. A crash before
-rename leaves no database intent. A crash after rename but before the
-transaction leaves an unauthoritative exact artifact that a retry verifies and
-reuses unless a later queue seal rejects it. A crash after the transaction
-leaves a durable `QUEUED` row that recovery schedules.
+linearizing between prepare and that commit. A matching retry joins the exact
+artifact-owner ledger and invokes the coordinated scheduler; it is not a no-op
+merely because a digest exists. A crash before the artifact intent transaction
+leaves no artifact intent. A crash after the `PREPARING` commit may leave any
+of the explicitly classified intent, staging, or published-directory states;
+matching retry resumes it and a later queue seal explicitly removes it. A crash
+after prepare but before the jobs transaction leaves an authoritative prepared
+owner. A crash after the jobs transaction leaves a durable `QUEUED` row that
+recovery schedules.
 
-`JobScheduler.schedule_step()` identifies keyed rows before calling any legacy
-status, reboot, pending, or spawn helper. `update_status()` splits its input:
-legacy IDs retain the exact current PID and boot-time heuristic, while keyed
+`CoordinatedSubmissionSchedulerV1` handles only keyed rows and is the only
+scheduler imported by the coordinated executable. Legacy `JobScheduler` and
+`update_status()` remain unchanged in the legacy module graph. Coordinated
 `QUEUED` and `LAUNCHING` rows are never marked `FAILED_DRIVER` before a
-supervisor launch or exit receipt and `STARTED` and `COMPLETING` rows use the
-keyed receipt-aware reconciler. The keyed
-branch never calls `_run_job()`, `remove_job_no_lock()`,
+supervisor launch or exit receipt, and `STARTED` and `COMPLETING` rows use the
+receipt-aware reconciler. The coordinated scheduler never calls `_run_job()`, `remove_job_no_lock()`,
 `_set_status_no_lock()`, `set_status()`, or `JobScheduler.queue()`. Pending
 submit updates, status changes, PID writes, and terminal cleanup use new
 non-committing SQL helpers inside the state-owner transaction. Bulk failure and
@@ -8560,21 +10404,26 @@ explicitly.
 Before spawn, one transaction changes `QUEUED` to transient `UPDATING`, updates
 `pending_jobs.submit`, stores a random driver token and the immutable local
 containment operation, revalidates every adapter `PREPARED` receipt, and commits
-durable `LAUNCHING`. The scheduler
+durable `LAUNCHING`. The coordinated scheduler
 retains the same per-job file lock across that commit and
-`launch_keyed_contained()` until the exact supervisor and cgroup receipt is
-durable or launcher failure is recorded; a live scheduler cannot start a
+`OpenSubmissionArtifactForLaunchV1` plus `CreateAndLaunchV1` until the exact
+artifact, supervisor, and cgroup receipts are durable or launcher failure is
+recorded; a live scheduler cannot start a
 process after cancellation acquires the lock. The launcher never uses the
 legacy background `nohup bash -c` shape.
 
 The root supervisor's `CreateAndLaunchV1` create-or-return call requires and
 transitions the exact `PREPARED` ledger. It binds the worker
 bootstrap digest, submission and job identity, add and queue digests, owner
-UUID, command and launcher digests, control and workload identities, host boot
+UUID, artifact plan, prepared and launch-artifact receipt digests, sealed
+command-FD identity and seals, launcher digest, control and workload identities, host boot
 ID, manager runtime and implementation digests, delegated-root digest,
 isolation profile, and the one never-reused cgroup scope UUID already minted in
-the immutable containment plan, plus the closed payload-event protocol. It
-opens the unique kill
+the immutable containment plan, plus the closed payload-event and artifact-log
+protocols. It receives descriptors only from the peer-authenticated artifact
+owner with `SCM_RIGHTS`, verifies the sealed command memfd, artifact receipt,
+and exact descriptor count and types, and rejects any pathname in the launch
+request. It opens the unique kill
 root and payload child FD-relative from its retained delegated-root FD, then
 launches the small native shim directly into the payload cgroup with
 `clone3(CLONE_INTO_CGROUP | CLONE_PIDFD)`. The child blocks on a
@@ -8591,55 +10440,59 @@ permission to spawn a second shim under the same submission key; the manager
 records its closed pre-effect failure receipt and the reducer enters
 `SealFailedLaunchV1` before publishing failure.
 
-Skylet still holds the per-job lock. It opens or adopts the returned pidfd
+The coordinated scheduler still holds the per-job lock. It opens or adopts the returned pidfd
 before inspecting process identity, verifies the supervisor registry and exact
 cgroup FDs, and stores the provisional tuple and `LAUNCHED` containment row on
 the exact `LAUNCHING` submission. The native shim creates the qualified private
 cgroup and mount namespace, hides the host hierarchy, starts as the dedicated
 shim UID with only effective `CAP_SETUID`, `CAP_SETGID`, and `CAP_SETPCAP`,
 closes every manager
-command FD, and verifies its cgroup and immutable launch tuple. Before any user
+command FD other than the sealed command input and log-pipe writers, and
+verifies its cgroup and immutable launch tuple. Before any user
 bytes execute, the fixed native shim creates a private status pipe and forks
 exactly once. In the child it clears supplementary groups, sets the configured
 payload GID and UID with `setresgid()` and `setresuid()`, clears effective,
 permitted, inheritable, ambient, and bounding capabilities, sets
-`no_new_privs`, closes the shim event endpoint, reports readiness over the
+`no_new_privs`, closes the shim event endpoint, retains only the sealed command
+FD and stdout/stderr pipe writers required by the fixed launcher, reports readiness over the
 private pipe, and blocks on the separate supervisor-owned payload gate. In the
 parent, the shim immediately drops its three capabilities, sets `no_new_privs`,
-retains only the bounded request/ack endpoint and private status pipe, and emits
+retains only the bounded request/ack endpoint, private status pipe, and log
+pipe readers, and emits
 `PAYLOAD_READY` after verifying the child's credential and gate state. Neither
 process opens the job lock or SQLite database. The capability probe executes
 this exact handoff and rejects any residual capability, supplementary group,
 wrong UID/GID, inherited event or command FD, or pre-gate user instruction.
 
-The trusted Skylet reducer reads the manager's durable `PAYLOAD_READY` receipt,
+The trusted coordinated reducer reads the manager's durable `PAYLOAD_READY` receipt,
 uses transient `RECEIPTING` to store its digest and mirror only the PID into
 legacy `jobs.pid`, and then calls idempotent `ReleasePayloadV1`. The manager
 rejects release after any seal, durably records `EFFECT_ADMITTED` before opening
-the gate, and returns that receipt. Skylet commits `STARTED` only after exact
+the gate, and returns that receipt. The reducer commits `STARTED` only after exact
 `EFFECT_ADMITTED` readback. Response loss is closed: recovery queries the
 manager ledger, commits `STARTED` if effect was admitted, retries release if the
 gate is still closed, or enters the stored cancel or failure cleanup path if it
 was sealed. The unchanged legacy schema has no OS or containment receipt
 columns; `jobs.start_at` remains a lifecycle timestamp and is never process
-identity. A Skylet crash before provisional publication leaves the gate closed;
+identity. A coordinated-runtime crash before provisional publication leaves the gate closed;
 recovery stores the exact tuple and continues only if the keyed submission is
 still `LAUNCHING`, otherwise it seals and retires the no-effect containment.
 
 The root supervisor is the shim's parent and durable reaping owner. It calls
 `wait` exactly once for every generation, including immediate exit, records
-exit and reaped evidence in its registry, and wakes Skylet recovery; it never
+exit and reaped evidence in its registry, and wakes coordinated recovery; it never
 infers job success from exit code. A supervisor crash reparents the shim to
 the qualified host service manager or init, whose subreaping behavior and
-registry reconciliation are capability gates. Skylet never calls `waitpid` on
+registry reconciliation are capability gates. The coordinated runtime never calls `waitpid` on
 a non-child. Terminal containment requires both the supervisor's reaped
 evidence or qualified init adoption and recursive cgroup absence, so repeated
 keyed jobs cannot accumulate zombie roots.
 If supervisor restart loses a live shim event channel before an outcome was
 durably recorded, recovery never reconstructs success from exit status and does
-not seal first. After identifying the same ledger and cgroup, the manager writes
+not seal first. A durable `LOG_QUOTA_EXCEEDED_V1` receipt is already an outcome
+and is re-driven before channel-loss classification. Otherwise, after identifying the same ledger and cgroup, the manager writes
 the closed `CHANNEL_LOST_V1` outcome receipt, which maps only to
-`FAILED_DRIVER`, without performing cleanup. Under the per-job lock, the Skylet
+`FAILED_DRIVER`, without performing cleanup. Under the per-job lock, the coordinated
 reducer then linearizes that receipt against cancellation. An already committed
 `CANCELLING` row keeps cancellation ownership and ignores the synthetic outcome;
 otherwise an `EFFECT_ADMITTED` row is recovered to `STARTED` if necessary and
@@ -8653,7 +10506,8 @@ or cleanup effect.
 After gate release the already demoted payload child execs the qualified direct
 driver, while the unprivileged trusted shim remains its parent and outcome
 reporter. The driver returns
-one closed logical status over a private inherited pipe; the shim forwards an
+one closed logical status over a private inherited pipe; the shim holds that
+bounded value until both stream EOF acknowledgments, then forwards an
 exactly-once `LOGICAL_OUTCOME_V1` message on the manager request/ack endpoint and waits for
 its durable acknowledgment before exiting. An exit without that closed message
 becomes `FAILED_DRIVER`; the supervisor itself never infers user success from
@@ -8662,8 +10516,8 @@ and root-process exit do not move descendants out of the immutable cgroup.
 PIDFD, PID, PGID, SID, token, and `/proc` checks may support diagnostics and a
 graceful first signal but never authorize terminal release. Generated direct-
 driver status functions report only through the private payload pipe; they do
-not open SQLite or enter the keyed reducer. The trusted Skylet control
-reconciler alone applies the manager's durable outcome receipt under the keyed
+not open SQLite or enter the keyed reducer. The trusted coordinated reducer
+alone applies the manager's durable outcome receipt under the keyed
 state machine. The parent performs no post-spawn PID write and the direct
 profile never invokes Ray or Slurm codegen.
 
@@ -8672,6 +10526,11 @@ queue digests, containment plan digest, cancel operation ID and digest, runtime
 UUID, nonce proof, and fixed `TERM_10S_THEN_HARD_KILL_V1` grace policy. The
 policy and ten-second duration are covered by the central cancel identity; the
 worker mints the one absolute deadline only on first acceptance.
+The versioned policy defines ten seconds as the ordinary maximum grace and
+names only `LOG_QUOTA_EXCEEDED_V1` as a trusted fatal escalation receipt. If
+that receipt becomes durable after cancellation wins, the same cancellation
+operation may advance to `HARD_KILL_ENTERED` before its deadline; it does not
+mint a completion operation, change terminal `CANCELLED`, or reset grace.
 Under the per-job lock it validates the full immutable submission identity and
 durably records one matching `CANCELLING` intent, its origin state, current host
 boot ID, one `CLOCK_BOOTTIME + 10 seconds` absolute deadline, and cancel phase
@@ -8684,10 +10543,25 @@ window. A retry with the same identity resumes only that branch:
   planned or prepared local and external containment identities through exact
   `SealNeverLaunchedV1` calls,
   advances every owner to `RETIRED` with its permanent no-later-launch
-  tombstone, uses transient `DELETING` to remove the pending row, writes legacy
+  tombstone, explicitly removes the prepared never-launched artifact under the
+  same queue/cancel authority, uses transient `DELETING` to remove the pending row, writes legacy
   `CANCELLED`, writes cancel phase `OWNERS_RETIRED`, and commits keyed
   `CANCELLED`; the scheduler cannot spawn after losing the same lock; and
-- from `LAUNCHING` or `STARTED`, the owner resolves only the exact supervisor
+- from `LAUNCHING`, the owner resolves the exact supervisor operation under the
+  same per-job lock and branches on the manager ledger, never on the provisional
+  SQLite tuple. Manager state `PREPARED` invokes the manager's atomic
+  `SealNeverLaunchedV1`: either that permanent seal wins before creation, in
+  which case no cgroup exists and the prepared artifact is removed, or a
+  concurrently accepted matching create returns the one `LAUNCHED` receipt and
+  cancellation continues with `SealAndKillV1`. Manager state `LAUNCHED` uses
+  that latter path directly. Missing, conflicting, or indeterminate manager
+  identity quarantines and performs neither seal nor signal. Every qualified
+  external owner in the immutable plan makes the analogous authoritative
+  prepared-versus-launched choice through its adapter before terminalization.
+  Thus a crash after
+  the reducer committed `LAUNCHING` but before `CreateAndLaunchV1` does not call
+  a kill method for a nonexistent owner; and
+- from `STARTED`, the owner resolves only the exact launched supervisor
   operation and every stored external owner. A missing provisional tuple is
   reconciled through the supervisor ledger and retained cgroup identity, never
   by token or process enumeration. It invokes idempotent `SealAndKillV1`.
@@ -8707,7 +10581,7 @@ that exact root's `cgroup.events` until recursive `populated 0`, using the
 [kernel cgroup-v2 kill and recursive-population semantics](https://docs.kernel.org/admin-guide/cgroup-v2.html), separately
 requires its root-child reap receipt, persists `EMPTY`, removes empty descendants bottom-up,
 removes the never-reused kill root, persists `RETIRED`, and retains a permanent
-no-later-launch tombstone. Skylet mirrors `OWNERS_RETIRED` only after every
+no-later-launch tombstone. The coordinated reducer mirrors `OWNERS_RETIRED` only after every
 planned owner has its receipt. Concurrent forks remain inside the kill root;
 session changes, double forks, root exit, and token removal do not weaken the
 proof. A missing or replacement cgroup, nonterminal submission with no matching
@@ -8724,38 +10598,57 @@ the equally closed `CHANNEL_LOST_V1` receipt before any cleanup. Under the
 per-job lock, the trusted reducer accepts one of those receipts only for the
 exact `STARTED` owner, mints a completion
 operation, binds `CompletionIdentityV1` to the submission, containment plan,
-supervisor ledger generation, outcome receipt, and pending legacy status, and
+supervisor ledger generation, outcome receipt, pending legacy status, and
+cleanup profile `NATURAL_DRAIN_V1`, and
 commits `COMPLETING/OUTCOME_RECORDED` before cleanup. A concurrent cancel wins
 only if it committed `CANCELLING` first; once `COMPLETING` commits, exact cancel
 is a no-op that re-drives completion and cannot replace the user's stored
 outcome.
 
 `SealAfterCompletionV1` create-or-returns by that completion identity. It
-persists `SEALED` before rejecting every later release, clone, attach, or reopen,
-waits for or reaps the outcome-reporting root, then uses the same authoritative
-`cgroup.kill`, recursive `populated 0`, bottom-up removal, and permanent
-no-later-launch tombstone as cancellation to retire any leaked descendants. The
-logical outcome is already durable, so killing a reporter after its receipt
+persists `SEALED` before rejecting every later release, clone, attach, or
+reopen. For `NATURAL_DRAIN_V1` it waits for or reaps the outcome-reporting root,
+then uses the same authoritative `cgroup.kill`, recursive `populated 0`,
+bottom-up removal, and permanent no-later-launch tombstone as cancellation to
+retire any leaked descendants. For quota-bound
+`IMMEDIATE_HARD_SEAL_V1`, it does not wait for the shim, payload, pipe EOF, or
+root exit. In one manager-ledger transaction it verifies the exact completion
+identity and quota receipt, persists `SEALED` and `HARD_KILL_ENTERED`, and then
+immediately writes `1` to the exact kill root's `cgroup.kill`. It waits for
+that root's recursive `populated 0` and persists `EMPTY`, obtains the
+supervisor's exact root reap or qualified-init adoption receipt, removes empty
+descendants and the root bottom-up, and persists the permanent `RETIRED`
+tombstone. A crash after either durable phase re-drives only the remaining
+steps; it never returns to a pre-kill wait. Kill closes the writers that the
+quota-stopped shim was draining, so artifact finalization observes and seals
+only the durable prefixes after containment retirement. The
+manager outcome is already durable, so killing a reporter after its receipt
 cannot erase or change it. External adapters receive the same completion
-identity and must seal and retire their exact owners. Skylet advances completion
+identity and must explicitly qualify both cleanup profiles before coordinated
+advertisement. The coordinated reducer advances completion
 phase to `OWNERS_SEALED` and then `OWNERS_RETIRED` only from adapter receipts.
-One final `BEGIN IMMEDIATE` transaction uses transient `DELETING` to write the
+Containment retirement releases worker capacity. Before terminal job
+projection, `FinalizeSubmissionArtifactV1` must drain the last acknowledged log
+sequence, close writers, and persist the matching finalization receipt; it does
+not remove retained command bytes or logs. One final `BEGIN IMMEDIATE`
+transaction verifies that receipt and uses transient `DELETING` to write the
 pending legacy status, remove the pending row, and commit keyed `SUCCEEDED` or
 the exact keyed `FAILED` subtype. Crashes after outcome receipt, completion
 intent, any seal, empty proof, or retirement resume only the stored completion
 operation. No terminal job status is visible before every planned owner is
-`RETIRED`.
+`RETIRED` and the artifact finalization receipt is durable.
 
 Every external containment adapter follows the same stored plan and must seal,
 cancel, prove exact absence, and retire its owner. Only after every row is
-`RETIRED` does terminalization use transient `DELETING` to update legacy status
-and remove the pending row before committing keyed `CANCELLED`. Natural driver
+`RETIRED` and the artifact owner returns the exact finalization receipt does
+terminalization use transient `DELETING` to update legacy status and remove the
+pending row before committing keyed `CANCELLED`. Natural driver
 completion uses the separate completion operation above; root exit while
 recursive `populated=1` is not terminal.
 A matching cancel after logical completion is a no-op only after all owners are
-retired. A changed identity, cancel-all, capable generic `CancelJobs` call for a
-keyed ID, or ambiguous containment performs no unrelated effect. Generic v41
-`CancelJobs` and `FailAllInProgressJobs` exclude keyed rows.
+retired. A changed identity, cancel-all, or ambiguous containment performs no
+unrelated effect. The coordinated executable has no generic `CancelJobs` or
+`FailAllInProgressJobs` service.
 
 Supervisor recovery scans only its exclusive delegated `submissions` subtree
 and joins it to the root-owned ledger. It reopens and verifies `LAUNCHED`
@@ -8768,23 +10661,37 @@ that same operation to finish retirement. A host boot-ID change needs its own
 qualified reboot receipt and cannot stand in for an external Ray, Slurm, or
 other runtime proof.
 
-Skylet recovery re-probes the supervisor and compares its runtime UUID and
+Coordinated-runtime recovery re-probes the supervisor and compares its runtime UUID and
 capability digest. A mismatch closes new admission while exact existing ledger
 entries reconcile or quarantine; there is no process-group or legacy fallback.
 `CANCELLING` recovery never launches, and no `STARTED` or pre-receipt keyed
 submission spawns a second shim under the same key. Repeated queue and
 cancel calls return success only for their matching digest and recoverable
 state. Exact lookup returns job ID, all stored digests, authoritative state,
-driver and containment receipts, cancel identity and origin, current Skylet
-runtime, and supervisor runtime incarnation.
+driver, containment, and artifact receipts, cancel identity and origin, current
+coordinated runtime, and supervisor runtime incarnation.
 
 Internal keyed execution requires these versioned gRPC methods and a fresh
 runtime-incarnation proof plus the exact active worker lifecycle-fence identity
 on every effect. It must not fall back to legacy RPC methods or the SSH
 add/queue path.
 
+The closed wire registry has one implementation for each method named in the
+control-plane section. `GetPoolWorkerArtifactInventory` calls only
+the frozen-scope, bounded-page `ListOwnedSubmissionArtifactsV1` and returns its
+membership projection and current receipts. `ReadSubmissionArtifactLog` calls
+only the offset-bounded `ReadSubmissionArtifactLogV1` and carries no display
+path. `FreezeSubmissionArtifactRetentionScope` serializes the reducer admission
+barrier with `FreezeSubmissionArtifactRetentionScopeV1` and returns the exact
+scope receipt. `RemoveSubmissionArtifactKeyed` calls only
+`RemoveSubmissionArtifactV1` with the signed member retention operation. The
+last two use the mutation authorization interceptor and permanent operation
+ledgers; inventory and reads use the same authenticated method, bootstrap,
+runtime, nonce, expiry, and payload binding but cannot write. No generic legacy
+log service, remote shell, or local pathname is registered as a fallback.
+
 This remote idempotency is required even though the API request row is durable.
-The unary Skylet client retries ambiguous transport failures, and current
+The unary coordinated-worker client retries ambiguous transport failures, and current
 `AddJob` and `QueueJob` mutations are not idempotent. Stable HTTP correlation
 alone would merely move the lost-response window to the worker.
 
@@ -8854,7 +10761,7 @@ Recovery of `INTENT` is deterministic:
 - an absent API request permits create-or-return with the same prepared body;
 - a pending or running request is observed, not duplicated;
 - a successful request binds its exact remote ID;
-- a failed, cancelled, or missing request triggers exact Skylet lookup by the
+- a failed, cancelled, or missing request triggers exact coordinated-worker lookup by the
   same submission key;
 - exactly one digest-matching remote job is adopted;
 - an observation reporting no keyed job is followed by an atomic `ADD` seal;
@@ -8910,29 +10817,40 @@ admission even when a binding remains, but it neither releases capacity nor
 claims that the remote attempt is absent. For either admitted mode, one commit
 sets `pool_admission_closed`, a random `pool_retirement_token`, a distinct
 random retirement operation ID, the typed retirement-transition provenance on
-both replica and permanent target, and the complete worker-retirement identity
+both replica and permanent target, and the complete worker-close identity
 digest. The provenance is null under locked active version `1` and equals the
 locked service operation under `-1/DEACTIVATING`; no other version or direction
-is admitted. It writes the down identity digest only if a provider object and global
-cluster identity are already bound; later authoritative discovery may populate
-that digest once before creating the same-ID down request. Assignment winning
+is admitted. It cannot write the ordinary retirement identity until artifact
+scope freeze. It cannot write any down identity or request until central state
+is `REMOVED`, `LOSS_AUTHORIZED` before freeze, or `LOSS_AUTHORIZED` after a
+retained freeze. Later authoritative discovery may populate the same-ID down
+request only after one of those irreversible branches is selected. Assignment winning
 first makes graceful retirement busy; closing
 admission first makes the worker unavailable to every later assignment. A
 forced close may win over a live assignment only because the domain has
 already required replacement or shutdown, and managed-job recovery retains
 ownership of that exact attempt.
 
-Only after commit may the existing teardown worker run. It carries the exact
+Only after commit may the teardown coordinator run. It carries the exact
 service hash, worker incarnation, replica ID, cluster name, global
 `cluster_hash`, provider-target digest, provider-object digest, retirement
 token, operation ID, identity digest, and any deactivation transition operation
 that admitted the close. In central PostgreSQL mode it does not call
-`core.down()` directly. It
-creates or observes the signed private coordinated-down request whose stable ID
-was minted by the close transaction. A controller restart scans closed admitted
-replicas and re-drives that same idempotent request regardless of the obsolete
-autoscaler selection epoch. SQLite retains its explicitly named direct
-compatibility path.
+`core.down()` directly. It first drives the signed worker freeze, persists the
+exact central retention scope and members, and drives one
+`SubmissionRetentionOperationV1` for each member. A required export receipt is
+revalidated before local removal; `LOCAL_ONLY_V1` explicitly accepts that
+worker retirement ends readback. Any reachable unfinalized artifact, missing
+removal receipt, required export gap, or inventory mismatch blocks request
+creation. The only alternative is a durable matching
+`ArtifactLocalLossAuthorizationV1` in `LOSS_AUTHORIZED`, which cannot satisfy
+an export or removal gate. Once one branch is irreversible, an observed exact
+provider object permits the coordinator to create or observe the signed
+private coordinated-down request whose stable ID was minted by the close
+transaction. A controller restart scans closed admitted replicas and re-drives
+the artifact stage, then that same idempotent request, regardless of the
+obsolete autoscaler selection epoch. SQLite retains its explicitly named
+direct compatibility path.
 
 The new executor enters `execute_coordinated_pool_termination()` immediately
 before the permanent coordinated teardown effect boundary. In one authorization
@@ -8945,7 +10863,12 @@ also equal the current deactivation operation; an already closed version-1
 worker retains null provenance and may continue after the service enters
 deactivation only under the same immutable birth scope.
 Both cases require closed admission, matching service hash, worker incarnation,
-replica ID, cluster name, operation ID, close token, and stored digest.
+replica ID, cluster name, operation ID, close token, and stored digest. The
+transaction also requires exactly the disposition named by the request:
+`FROZEN_RECEIPTS_V1` requires central `REMOVED` plus every required export and
+retirement-removal receipt; either loss tag requires central
+`LOSS_AUTHORIZED`, its exact authorization, and the corresponding absent or
+retained frozen evidence. No worker artifact call remains after this check.
 `ACTIVATING` is never accepted. The transaction also locks the permanent target
 and requires the same global `cluster_hash`, provider-target digest,
 provider-object digest, launch operation, and non-retired state. It then
@@ -8961,7 +10884,11 @@ provider accepted an object but response loss prevents exact handle
 reconstruction, the common coordinator does not invent a generic handle and
 does not call `core.down()`. It invokes the S4 provider-actuation owner's
 `close_observed_target()` primitive with the same cluster hash, target digest,
-object digest, attempt ledger, and retirement identity. That owner repeats the
+object digest, attempt ledger, and exact close identity. For
+`FROZEN_RECEIPTS_V1` it additionally requires the exact retirement identity;
+for `LOSS_AFTER_FREEZE_V1` it requires that same retirement identity plus the
+loss authorization; and for `LOSS_BEFORE_FREEZE_V1` it requires a null
+retirement identity plus the exact loss authorization. That owner repeats the
 authoritative target query immediately before mutation, records the accepted
 close call in the fenced actuation ledger, and returns only provider absence or
 ambiguous evidence. Retirement still requires authoritative absence and the
@@ -8972,6 +10899,12 @@ is permanent and the name cannot be reused, so an ambiguous or duplicate
 provider-down call remains safe after lease loss: the executor may re-drive
 only the same closed worker and can never retarget a successor. Log sync, drain
 waits, API calls, provider calls, and thread waits hold no database transaction.
+
+Because request creation follows artifact-disposition selection, a later
+artifact-owner failure cannot require a request rewrite. Authoritative
+unexpected provider absence may close physical cleanup while preserving the
+export-failure or local-loss result; it never marks an unperformed export
+successful.
 
 For the handle-backed path, the expected target propagates without
 reinterpretation through `core.down()`
@@ -8984,8 +10917,10 @@ requires the same non-null global `cluster_hash`, reconstructs
 `PoolProviderTargetIdentityV1` from the refreshed handle and pure projector,
 obtains `PoolObservedProviderObjectIdentityV1` from the qualified authoritative
 query, and compares both digests in constant time. Only after that match may it
-run the retained teardown-hook CAS and hook body against the refreshed handle.
-It repeats the same target check after the hook and Ray-stop phases and
+verify the bound `lifecycle_hook_profile=NONE_V1` and canonical empty-hook
+digest, then proceed directly to the next S4-qualified lifecycle phase. It
+never calls `_maybe_run_down_hooks()`, a remote hook CAS, or worker hook
+codegen. It repeats the same target check after any later qualified Ray-stop phase and
 immediately before `provisioner.teardown_cluster()` or any legacy-provider stop
 or terminate mutation. Missing state, an unsupported projector, a changed
 cloud-local name or scope, a hash mismatch, or an ambiguous reconstruction
@@ -8993,8 +10928,9 @@ performs no later remote mutation and leaves the coordinated request retryable
 or quarantined. A matching absent observation is returned to the retained
 reducer but is not terminal proof without the operation-closing no-later-create
 receipt. These are common backend preconditions, not copies in every provider
-implementation; a provider is eligible only when all of its hook, Ray, and
-teardown effects are downstream of them.
+implementation; a provider is eligible only when all of its qualified Ray and
+teardown effects are downstream of them. Future central hook execution is a
+separate milestone and cannot reuse this hook-free identity.
 
 Current `core.down()` and both common actuation preconditions reject a cluster that
 resolves to a version-1 coordinated replica unless the active request context
@@ -9035,11 +10971,12 @@ never remove the scope allocation or permanent target tombstone.
 
 ##### Fresh activation and rollback
 
-The four releases below are additive and promote no coordinator decision or
-external effect until the provider-actuation dependency below is qualified.
-They apply Skylet `41`, API-requests
-`005`, API version `69`, Serve `033`, and spot-jobs `027` in separate merge,
-deploy, and monitoring gates. PostgreSQL version-0 paths preserve their
+The four feature groups below are additive and promote no coordinator decision
+or external effect until the provider-actuation dependency below is qualified.
+Each group is itself split into the bounded merge, deploy, and monitoring gates
+listed below. Together they apply coordinated-worker protocol `1`, API-requests
+`005`, API version `69`, Serve `033`, and spot-jobs `027`; legacy Skylet remains
+`40`. PostgreSQL version-0 paths preserve their
 existing decisions, writes, and locking exactly, and SQLite retains its
 existing filesystem-lock path. M5 does not attempt an in-place cutover of
 either topology.
@@ -9101,7 +11038,8 @@ and stale-authority fences do not.
 At version `1`, the replica trigger guards insertion, deletion, and changes to
 worker incarnation, worker-fence operation, identity or receipt digest, launch
 operation, payload, identity or state, admission close, retirement token,
-retirement operation ID, retirement identity or down identity digest, service
+retirement operation ID, close identity, artifact scope, local-loss
+authorization, retirement identity or down identity digest, service
 or replica key, cluster name, status, down status, version, state version,
 authoritative JSON state, or its rollback blob. These are authority-bearing because readiness,
 launch, drain, and destructive state currently share the JSON projection.
@@ -9258,14 +11196,14 @@ activation blocker and must finish, be cancelled before claim, or prove exact
 absence. These database admission fences close the current old-controller
 direct-`core.down()` route: new code uses the typed request, a late old leader
 cannot become authoritative, and an old executor cannot claim the request.
-They fence the repository's legitimate process paths, not arbitrary external
-use of leaked provider credentials. Stronger protection against an arbitrary
-manually launched old binary would require isolating provider-down credentials
-and egress to the capable executor role; that broader credential split is not
-claimed by M5 and is recorded as a later M4 action-runtime gate.
+They fence the repository's legitimate process paths. M5-S4 separately requires
+provider policy and credential or egress isolation so an arbitrary worker-side
+old binary has no SkyPilot-issued lifecycle authority; database fencing is not
+misrepresented as that protection. User-supplied external credentials remain
+outside the initial coordinated profile.
 
 Every assignment path performs one of those guarded durable writes before
-`sdk.exec` or Skylet mutation. Every destructive source performs the guarded
+`sdk.exec` or coordinated-worker mutation. Every destructive source performs the guarded
 close CAS before scheduling a thread or creating a down request. A transaction
 without the marker fails before the external effect. Activation is forbidden
 until tests prove that ordering for every source. The capable-code
@@ -9288,10 +11226,15 @@ schema presence. It requires:
 3. Kubernetes evidence that every role pod uses that same immutable image and
    no predecessor pod or controller child remains;
 4. a launch template pinned to the qualified immutable worker image with
-   Skylet `41` keyed add, queue, cancel, lookup, absence-seal, and worker-
-   lifecycle-fence support, a first-boot `COORDINATED_V1` bootstrap marker, and
-   no SSH fallback; plus the exact `skypilot-containmentd` and native-launcher
-   digests, dedicated control and payload identities, and a passing
+   coordinated-worker protocol `1` keyed add, queue, cancel, lookup, absence-seal, and worker-
+   lifecycle-fence readback, a first-boot `COORDINATED_V1` bootstrap marker,
+   protected Unix control socket, forced-command SSH bridge, signed worker
+   authorization, and no command-generation fallback; plus the exact signed
+   worker-runtime manifest, `skypilot-containmentd`, artifact owner, launcher,
+   shim, bridge, restricted login, SSH-policy, systemd-unit and Python runtime
+   digests, dedicated control, bridge, shim, and payload identities, no
+   ordinary or provisioning SSH access, hook profile `NONE_V1`, the negative
+   worker lifecycle-credential profile, and passing
    `LOCAL_CGROUP_V2_DIRECT_V1` behavioral probe. The initial service permits
    only single-node direct execution and rejects Ray, Slurm, and every
    unqualified external execution owner;
@@ -9397,8 +11340,8 @@ deactivation path after the birth owner is gone. The activating abort handoff
 writes `ABORTED` while terminalizing the birth request. No public down request
 can race a `PENDING` birth, and no success crash leaves a nonterminal request
 without a valid domain precondition. Every worker is subsequently a fresh
-private-launch birth with a permanent physical target and a coordinated-mode
-v41 lifecycle fence before READY.
+private-launch birth with a permanent physical target and a coordinated-runtime
+v1 lifecycle fence before READY.
 
 No existing version-0 service row may take this path. Such pools stay on the
 characterized legacy implementation until decommissioned. A formerly used
@@ -9593,37 +11536,131 @@ with a new typed birth and new scope. Otherwise rollback is a forward fix.
 
 ##### Milestones and removal gates
 
-M5-S0 is split into two ordered merge, deploy, and monitoring gates. M5-S0a
+M5-S0 begins with M5-S0a, the already separate persistence gate. M5-S0a
 installs only the exact v1 side tables and named indexes specified above, keeps
 Skylet `40`, and has no trigger, side-row producer, or capability claim. Its
 upgrade and rollback tests must pass before merge. Deployment proves the API
 image and newly provisioned or naturally restarted v40 workers retain ordinary
 legacy behavior; it does not force-restart the existing worker fleet and cannot
-count as the v41 compatibility gate.
+count as coordinated-runtime qualification.
 
-M5-S0b adds only Skylet `41` keyed add, queue, exact cancel, observational
-lookup, atomic absence seal, validation and consumption of the additive side
-tables, and the local mutation and side-identity triggers,
-supervisor prepare, launch, payload-event, completion, and retirement receipts,
-receipt-aware scheduling, the dormant
-`SubmissionContainmentAdapterV1` reducer, root-owned
-`skypilot-containmentd` protocol and native-launcher client, local
-containment-ledger mirror, local idle-teardown claim and worker-lifecycle-fence
-RPCs, immutable runtime-mode bootstrap reader, and compatibility tests. It does
-not alter the legacy job or pending table, contains no bootstrap marker
-producer, and no central caller sends a key, launches a containment, or installs
-a fence. Legacy
-mode preserves the existing `StopEvent` and `SetAutostop` implementation and
-provider retry behavior exactly; the new durable teardown protocol is exercised
-only by isolated coordinated-mode tests. S0b force-restarts the capable worker
-canary, merges, deploys, and completes the actual v41 worker compatibility
-monitoring gate before M5-S1 begins.
+M5-S0b is split into ten additional ordered gates. None consumes a new legacy
+Skylet version. Ordinary workers remain on byte-compatible v40 throughout;
+fresh coordinated workers use the independently versioned runtime protocol.
+
+M5-S0b0 is this design-only correction. It commits the exact responsibility,
+authorization, global guard, startup, lifecycle-quiescence, packaging, DDL,
+trigger, rollback, and subgate contracts. It changes no runtime and requires no
+deployment. An adversarial review of this exact committed design must return
+`PURSUE` before implementation.
+
+M5-S0b1a keeps Skylet `40` and lands only the packaging foundation. It creates
+the separate `addons/submission-containment/python-runtime/` build root and
+standalone distribution, restricts main-wheel package discovery, adds the
+exact main-wheel dependency, and makes the internal worker builder and
+installer preserve the opaque standalone wheel and produce, transfer, verify,
+and install the two-wheel bundle. No existing primitive or
+facade moves in this gate. Release-wheel, internal-wheel, standalone-wheel,
+source/editable-install, installed-API reconstruction, cache invalidation,
+bundle-transfer, tampered-bundle, offline v40 install, dependency-metadata,
+package-file ownership, and import-isolation matrices must prove one canonical
+source and zero overlapping import-file owners. Deploying the resulting ordinary v40
+image changes no singleton, listener, process, or capability.
+
+M5-S0b1b keeps Skylet `40` and relocates only the already-shipped pure keyed
+schema primitives into the now-qualified standalone dependency root.
+`sky.skylet.keyed_submission_state` becomes the compatibility facade only
+after direct-import, monkeypatch, call-signature, exception, pickle where
+applicable, and direct exported object-identity characterization passes from
+the release, internal, and source environments. No persistence schema or
+runtime behavior changes, and the standalone dependency still exposes no
+entrypoint or handler.
+
+M5-S0b1c keeps Skylet `40` and adds only dormant persistence installers for
+`keyed_submission_runtime`, the exact negative-authority trigger catalog, the
+two config-database tables and immutable triggers, the exact
+neutral `LEGACY_CONFIG_PREREQUISITE_V1` create-or-validate function plus its
+characterized legacy call site, and the versioned containment and
+submission-artifact ledger schema code. It creates no runtime mode, bootstrap,
+fence, keyed submission, containment, seal, artifact, or log row and starts no
+ledger owner or principal. No artifact filesystem operation, readback server,
+containment process, bridge, unit, or runtime entrypoint exists in this gate.
+The SQLite triggers remain false with no coordinated row. Fresh, upgraded,
+concurrent, wrong-shape, corrupt, and rollback databases plus exact
+design-to-catalog bytes, numeric-token boundaries, fresh-empty protected and
+upgraded legacy config paths, exact config table and autoindex shapes,
+command-size limits, quota-receipt guards, and frozen
+terminal-inventory guards are tested before deployment to one disposable v40
+worker.
+
+M5-S0b2 keeps Skylet `40` and adds only additive coordinated protocol messages,
+canonical identity and Ed25519 authorization types, method and payload digests,
+artifact plan, prepare, launch, log-cursor, finalization, retention, and
+freeze, inventory, offset-read, range-digest, and explicit-removal types,
+capability/readback results, and coordinated client/router
+methods. It does not register a handler or caller. A legacy endpoint is a hard
+incompatibility and never permission to generate SSH code.
+
+M5-S0b3a keeps Skylet `40` and adds the independently testable dormant
+`SubmissionArtifactOwnerV1` library, exact artifact ledger owner, intent-first
+staging and atomic publication, sealed-FD open, protected log write and offset
+readback, finalization, inventory freeze, retention, and explicit removal. It
+runs only in hermetic tests, creates no system principal or unit, and registers
+no worker RPC. Fault injection covers every `PREPARING` row/filesystem pairing,
+cursor recovery, retained read/tail, freeze membership, and removal response
+loss before this gate merges.
+
+M5-S0b3b keeps Skylet `40` and adds only the independently buildable native
+containment manager, launcher, and outcome shim plus their durable ledger and
+bounded event/log-channel protocol. Hermetic Linux integration tests exercise
+containment prepare and launch, sealed descriptor consumption, event delivery,
+natural completion, cancel, failed-launch and never-launched seal, empty proof,
+reaping, retirement, restart reconciliation, UID and socket isolation, and the
+escape probe. It installs or activates no principal, bridge, SSH policy, unit,
+or marker.
+
+M5-S0b3c keeps Skylet `40` and adds the fixed standalone venv, signed build
+manifest, forced-command bridge, restricted login executable, exact principal
+and SSH-policy definitions, and unit-file bytes. Its normal installer only
+validates immutable package topology; it does not create principals, install
+or enable units, change `sshd`, start a service, publish a marker, or advertise
+capability. Package, `python -I` import-isolation, forced-command, effective
+`sshd -T`, credential, and unit-coupling tests pass against the exact digests.
+
+M5-S0b4 keeps Skylet `40` and adds the separately packaged dormant
+`skypilot_worker_runtime` entrypoint in its dedicated venv, single-writer reducer, coordinated-
+only scheduler, exact trigger validation, manager and artifact clients, closed
+RPC registry including authenticated artifact inventory, offset readback,
+freeze, and removal, and bidirectional reconciler. It is installed but unreachable:
+no ordinary path creates a marker, enables its units, inserts a mode row, or
+creates a fence. It does not import legacy events or generic mutation services
+and changes no v40 executable, handler, event construction, watchdog, listener,
+or caller. Reducer tests use fake containment and artifact owners plus the
+exact SQL catalog. A complete `sys.modules` and static import-graph assertion
+proves no `sky` module is loaded by the exact installed worker command.
+
+M5-S0b5 activates the separate runtime only on a fresh disposable marker
+worker. It combines local first-boot fence transition, the manager-held startup
+lock, systemd failure coupling, forced SSH-to-UDS bridge, exact SSH policy,
+signed authorization interceptor, closed keyed RPC registration, artifact and
+containment recovery, credential and privilege probes, and READY publication.
+No bootstrap marker producer is reachable from an ordinary pool path, so the
+production fleet remains unchanged v40 and no legacy canary is force-restarted.
+The disposable worker proves the coordinated-only Unix listener, absence of
+every legacy process and restart path, removal of provisioning access,
+hook-free identity, negative worker lifecycle credentials, and an uploaded v40
+Skylet's inability to access protected state or perform lifecycle actuation. A
+partial capability, listener, manager lock, artifact owner, guard, catalog,
+fence, SSH policy, or reconciliation failure publishes no READY state and has
+no legacy fallback.
 
 M5-S1 adds only API-requests `005`, API version `69`, HMAC-authorized stable
 internal worker launch, exec, exact cancel, and coordinated-down
 create-or-return routes, typed launch, cancel and down authority projections,
-stable-ID middleware behavior, existing-field role capability advertisement,
-prepared identity hashing, redaction, and response-ID verification. No pool
+stable-ID middleware behavior, the Ed25519 coordinated-worker authorization
+issuer and `ACTIVE/DRAINING/RETIRED` key-inventory policy, artifact-plan and
+receipt hashing, existing-field role capability advertisement, prepared
+identity hashing, redaction, and response-ID verification. No pool
 caller sends a key, launch or cancel identity, or down authority and no pool
 service activates. It has its own merge, deploy, and monitoring gate.
 
@@ -9638,7 +11675,9 @@ M5-S3 migrates worker row birth and private launch, assignment, exact
 cancellation, normal terminal release, serial-task release, and every graceful
 and forced destructive source one bounded change at a time, including parent
 pool requests and the typed coordinated-down adapter. It also adds the dormant
-single-node direct execution producer and rejects Ray, Slurm, multi-node, and
+single-node direct execution producer, root marker and dedicated-principal
+installer, provisioning-credential retirement, hook-free admission, worker
+credential-profile enforcement, control bridge activation, and rejects Ray, Slurm, multi-node, and
 other unqualified containment profiles before coordinated assignment.
 Each source change merges, deploys, and proves its version-0 shadow or
 compatibility behavior before the next one. It stops with every service at
@@ -9648,7 +11687,9 @@ M5-S4 is a hard external dependency, not an assumed receipt. Before registering
 `JOBS_POOL_APPLY_COORDINATED_V1`, the canonical design must be updated in place
 to name at least one pilot provider and the exact generation-fenced actuation
 owner, canonical signed receipt payload and issuer key rotation, internal retry
-coverage, authoritative query, close protocol, and conformance fixtures. That
+coverage, authoritative query, close protocol, negative worker lifecycle-role
+policy, sole central SkyPilot-issued lifecycle credential owner, and
+conformance fixtures. That
 implementation must merge, deploy, and pass its own adversarial review. No
 current provider is declared eligible by this document. Only after that update,
 repository search, the executable removal manifest, writer-order tests,
@@ -9691,23 +11732,26 @@ The design is not promotable without all of the following:
   destructive effect;
 - private worker launch response loss before request acceptance, after
   target-scope and global-cluster-hash publication, before provider entry, after
-  provider creation, after object and handle publication, after Skylet
+  provider creation, after object and handle publication, after coordinated-runtime
   readiness, after local fence install, and before READY either adopts the one
   matching operation, re-drives only after provider-specific proved absence and
   no-later-create receipts for every earlier execution generation, or
   quarantines. Never-accepted and pre-publication absent attempts retire without
   constructing a down request, while an observed object requires its immutable
-  object digest. In the exact race where owner A passes its effect fence,
+  object digest and an irreversible artifact disposition before request
+  creation. In the exact race where owner A passes its effect fence,
   owner B observes absence, and A resumes late, B cannot re-drive, retire, or
   delete until A's generation is formally fenced; any late matching create is
   adopted or closed by the retained owner. A stale request after replica
   deletion or reuse performs zero effect, and a new version-1 insert cannot use
   a null-launch exception;
 - fault injection after assignment commit, after HTTP acceptance, after
-  Skylet add, after Skylet queue-file rename, before driver spawn, after spawn
-  before the supervisor receipt, after `LAUNCHED` before Skylet publication,
+  coordinated add, artifact intent, byte staging, prepare receipt, queue
+  commit, sealed-FD creation, FD passing, before driver spawn, after spawn
+  before the supervisor receipt, after `LAUNCHED` before reducer publication,
   after `PAYLOAD_READY`, after `EFFECT_ADMITTED` before SQLite `STARTED`, after
-  SQLite `STARTED` before job effect, before remote-ID binding, after retirement commit, and before
+  SQLite `STARTED` before job effect, during final log drain, after artifact
+  finalization, before remote-ID binding, after retirement commit, and before
   teardown all converge without duplicate effects or a second shim. Every
   `LAUNCHED` but gate-closed failure first commits the restricted failed-launch
   completion identity, then re-drives only `SealFailedLaunchV1` through seal,
@@ -9726,34 +11770,127 @@ The design is not promotable without all of the following:
   only one side wins, matching repeated seals are idempotent, mismatched seals
   fail closed, a committed seal permanently rejects the delayed mutation, and
   a winning queue seal terminalizes the exact add-only `UNQUEUED` shell with no
-  pending row or process and advances every planned or prepared containment owner to
-  `RETIRED` with an immutable never-launched receipt;
+  pending row or process, advances every planned or prepared containment owner
+  to `RETIRED`, and explicitly removes the exact prepared artifact with
+  immutable never-launched and removal receipts;
 - `PrepareOwnerV1` response loss before and after manager-ledger commit, a crash
   with side state `PLANNED` and manager state `PREPARED`, and a crash after
   `LAUNCHING` before `CreateAndLaunchV1` all join the exact owner without a
   cgroup or second launch. Queue rejects any owner without a verified prepare
   receipt, and `SealNeverLaunchedV1` retires both planned and prepared cases
   with one permanent tombstone;
-- the Skylet migration preserves the legacy `jobs` and `pending_jobs` schemas,
-  duplicate legacy pending rows, and ordinary v40 writes; persistent triggers
-  reject a same-transaction second keyed pending insert, orphan future-job
-  pending row, stale-v40 pending update before spawn, status or PID update,
-  and pending delete, while capable generic `CancelJobs` and
-  `FailAllInProgressJobs` reject or exclude keyed rows and ordinary legacy
-  scheduling remains unchanged;
+- command bytes at 102400 and 102401 and exact serialized mutation envelopes
+  at 2097152 and 2097153 prove eligible versus
+  `INELIGIBLE_COMMAND_SIZE_V1` or `INELIGIBLE_REQUEST_SIZE_V1` before
+  assignment. Oversized tasks remain on version-0 legacy handling and no
+  coordinated SSH, rsync, truncation, compression, or implicit streaming path
+  is invoked;
+- `PrepareSubmissionArtifactV1` response loss before and after intent commit,
+  staging sync, atomic directory publication, cursor commit, and prepared
+  receipt, every absent/staging/final `PREPARING` pairing, and a crash with a
+  prepared artifact beside `UNQUEUED` converge on one artifact identity.
+  Duplicate-matching and duplicate-conflicting queue intents, plans, and outer
+  queue digests prove the construction is acyclic and cannot cross-bind;
+  orphan preparation, queue-seal removal, and inventory reconciliation remain
+  exact.
+  Pathname replacement, symlink, hard-link, truncation, digest mismatch,
+  payload directory traversal, log reopen, and stdout or stderr target
+  replacement attacks fail; execution consumes only the sealed memfd and the
+  payload receives only pipe writers. Success, failure, cancellation, and
+  manager restart finalize exactly one log prefix. Exact quota fill, the first
+  byte over quota, simultaneous stdout and stderr overage, quota-receipt
+  response loss, artifact-owner restart, and manager restart retain only the
+  acknowledged prefix, return one immutable `LOG_QUOTA_EXCEEDED_V1` receipt,
+  linearize cancellation-first and quota-completion-first under the reducer
+  lock, bind the winning operation before hard seal, and for quota completion
+  prove `SEALED`, `HARD_KILL_ENTERED`, `cgroup.kill`, `EMPTY`, root reap, then
+  `RETIRED` without a pre-kill root wait. It then finalizes both streams,
+  preserve the typed reason in the manager receipt, and project keyed `FAILED`
+  to legacy `FAILED_DRIVER` when completion wins without pipe deadlock or
+  unbounded discard. Authenticated zero-length,
+  bounded, EOF, final-digest, repeated-cursor, and concurrent offset reads
+  reproduce the durable prefix without changing its write cursor or exposing a
+  path. Capacity release does not delete retained bytes and only a signed
+  retention operation removes them;
+- worker retirement freezes one artifact-retention scope, rejects an
+  unfinalized, omitted, extra, or foreign artifact, recomputes the exact ordered
+  immutable membership and terminal inventory, binds every
+  `FINALIZED_RETAINED_V1` finalization receipt and every
+  `REMOVED_BEFORE_FREEZE_V1` operation and receipt, blocks every later artifact
+  insert, and persists the same worker and central freeze receipt. A later
+  retirement removal fills only its separate receipt columns. Loss before
+  freeze keeps all frozen evidence null; loss after freeze preserves all
+  frozen evidence and adds only the loss authorization. Freeze or `REMOVING`
+  alone creates no down request; exact tests prove only central `REMOVED` or a
+  committed pre-freeze or post-freeze `LOSS_AUTHORIZED` branch can mint its
+  immutable disposition projection. It verifies every required export receipt,
+  obtains every reachable removal receipt before provider entry, and records
+  unexpected provider absence separately from export success. No terminal-job
+  transition, local age scan, server nonrecognition, or empty process query
+  authorizes artifact removal. An unreadable-ledger test proves ordinary down
+  blocks, while an explicit recorded-local-loss authorization permits only the
+  exact central physical destruction and leaves removal and required export
+  unsatisfied;
+- build-manifest and artifact-set digests are independently recomputable with
+  no self-reference; changing any native binary, Python tree, unit, restricted
+  login, SSH drop-in, principals mapping, CA bytes, schema, mode, UID/GID, or
+  forced-command string prevents activation. No downloaded executable,
+  writable version selector, `latest` fallback, or in-place coordinated-worker
+  upgrade is accepted. The standalone wheel contains exactly the canonical
+  runtime package and generated bindings; the main release wheel owns none of
+  those extracted files, declares the exact standalone dependency, and carries
+  one byte-identical opaque wheel resource. Source and installed-API internal
+  builders produce the same manifest-hashed bundle, invalidate on either wheel
+  input, transfer both, reject tampering, and install by explicit local paths.
+  Release, internal, source,
+  and ordinary v40 environments preserve the characterized facade, while the
+  standalone dedicated venv imports no `sky` module;
+- the coordinated migration preserves the legacy `jobs` and `pending_jobs` schemas,
+  duplicate legacy pending rows, and ordinary v40 writes while the mode row is
+  absent. Both new singleton DDLs accept only `COORDINATED_V1`; any other token
+  is a wrong-shape catalog and quarantine, not a compatibility state.
+  Exact design-to-catalog comparison passes. After the
+  `COORDINATED_V1` sentinel commits, persistent triggers reject every unkeyed
+  job or pending insert, update, and delete, a same-transaction second keyed
+  pending insert, orphan future-job pending row, stale-v40 pending update before
+  spawn, status or PID update, and pending delete. The side-row-first
+  `AddJobKeyed` order is atomic under crash, response loss, and concurrent
+  retry; the reversed legacy-row-first order is rejected by the trigger.
+  Generic `AddJob`, `QueueJob`,
+  `CancelJobs`, `FailAllInProgressJobs`, managed-job and Serve mutators,
+  `SetAutostop`, direct code generation, and task-generated status writers all
+  fail before filesystem, signal, process, config, hook, provider, or database
+  effect. An exact receipt transaction proves `RECEIPTING` authorizes only its
+  bound `jobs.pid` update. Every unknown trigger or explicit index on a
+  protected table, including one attempting to piggyback on
+  `STATUS_UPDATING` or impose uniqueness on both initial log cursors, prevents
+  READY. Exact DDL-derived autoindexes pass, while unrelated tables and their
+  indexes remain allowed. `LEGACY_CONFIG_PREREQUISITE_V1` accepts only the
+  exact legacy config table and `sqlite_autoindex_config_1` shape without
+  claiming either as owned. Its neutral explicit-connection initializer makes
+  both a fresh empty protected database and an upgraded legacy database reach
+  those exact bytes without importing legacy Skylet in the coordinated path.
+  `SQLITE_MASTER_SQL_V1` keeps token boundaries,
+  accepts decimal, fractional, exponent, and hexadecimal numeric boundaries,
+  rejects numeric underscores, and distinguishes a typed column from a
+  concatenated identifier. Legacy scheduling remains
+  unchanged only on an ordinary worker with no coordinated singleton;
 - periodic status refresh during keyed `QUEUED` and `LAUNCHING` never applies
   the legacy PID or reboot heuristic, every keyed status writer enters the
   identity-bound reducer, payload code has neither DB nor command-socket access,
   and direct keyed shim-to-driver execution preserves its
-  exact supervisor operation, root PID/start diagnostics, and cgroup identity.
-  The executable handoff proves the shim alone starts with only `CAP_SETUID`,
+  exact supervisor operation, root PID/start diagnostics, cgroup identity, and
+  artifact receipt. The executable handoff proves the shim alone starts with only `CAP_SETUID`,
   `CAP_SETGID`, and `CAP_SETPCAP`, the child reaches the exact payload UID/GID with zero residual
   capabilities before gate release, the shim drops its own capabilities, user
   code inherits neither event nor command FD, and each bounded event receives
   only its matching durable acknowledgment;
 - exact `CancelJobKeyed` versus scheduling passes both lock orders from
   `QUEUED` and `LAUNCHING`, including response loss before and after cancel
-  intent, immutable grace-deadline commit, `GRACE_ENTERED`, TERM hint, deadline
+  intent. A reducer `LAUNCHING` row with manager `PREPARED` permanently seals
+  never-launched state and removes its artifact without a cgroup; manager
+  `LAUNCHED` uses the exact launch receipt and kill path; missing or conflicting
+  manager state quarantines. The same races then cover immutable grace-deadline commit, `GRACE_ENTERED`, TERM hint, deadline
   expiry, `HARD_KILL_ENTERED`, kill-root creation, clone, supervisor receipt,
   gate release, payload-ready and effect-admitted receipts, durable seal,
   recursive kill, empty proof,
@@ -9772,7 +11909,7 @@ The design is not promotable without all of the following:
   without launch, process, or provider effect before publishing keyed
   `CANCELLED`; a missing never-launched receipt leaves the job nonterminal;
 - keyed containment recovery covers exit before waiter registration, natural
-  driver terminal with a surviving daemon, exact cancellation, Skylet restart,
+  driver terminal with a surviving daemon, exact cancellation, coordinated-runtime restart,
   manager restart with populated and sealed roots, host reboot identity change,
   unknown populated cgroups, path or inode replacement, and crashes after
   mkdir, clone, `LAUNCHED`, `SEALED`, kill, `EMPTY`, rmdir, and before
@@ -9793,35 +11930,79 @@ The design is not promotable without all of the following:
   channel writes `CHANNEL_LOST_V1` before cleanup and both lock orders prove
   that either cancellation or completion, never an emergency seal outside the
   reducer, owns retirement;
-- capable-v41 generic `CancelJobs`, cancel-all, wrong-runtime, wrong-digest,
+- generic `CancelJobs`, cancel-all, wrong-runtime, wrong-digest,
   wrong-containment, delayed retired-owner, and PID-reuse cases perform no
   process, cgroup, supervisor, or database mutation for a keyed row;
-  a v40 listener or independently launched v40 service process blocks
-  activation and rollback rather than satisfying a zero-signal claim;
+  a v40 listener or independently launched v40 service process prevents
+  manager READY until predecessor eviction completes, and a simultaneous or
+  later restart attempt cannot obtain the manager lock, protected state,
+  authoritative traffic, elevation, provisioning credential, or provider
+  lifecycle authority. A late stale writer is independently rejected by the
+  durable mode and SQL guards;
 - direct single-node containment passes qualification, while single-node Ray,
   multi-node Ray, Slurm, rootful Docker, host `systemd-run`, unmanaged MPI or
   SSH fan-out, and every missing external owner fail before assignment. Future
   adapters pass exact-owner, response-loss adoption, durable seal,
   authoritative absence, no-later-effect, and composite all-owners-retired
   conformance before advertisement;
-- coordinated-mode `StopEvent` decision versus lifecycle-fence install passes both local-lock
-  orders: the fence wins and no teardown claim or provider effect occurs, or
-  the event's durable claim wins and install fails. Delays after config read,
-  idle decision, claim commit, indicator write, hook claim, provider entry, and
-  provider failure never produce fence-success followed by teardown. Crash or
-  exception after `PROVIDER_ENTERED` in an isolated coordinated-mode S0 test
-  becomes `AMBIGUOUS`, performs no provider re-drive, and blocks install until
-  explicit proof or worker down;
-- matching worker-fence install, readback, process restart, and
-  response-loss retries are idempotent; changed service, worker, cluster,
-  operation, config, or runtime identity fails closed; active keyed work and
-  ambiguous idle teardown block install. A missing, changed, or late bootstrap
-  marker cannot enter coordinated mode; legacy-mode v41 uses the exact old
-  autostop, hook, indicator, exception, and provider-retry path with no new
-  lifecycle lock or attempt state;
+- the exact dedicated-venv `python -I -m skypilot_worker_runtime` startup proves
+  no module named `sky` is loaded and its static dependency graph cannot reach
+  legacy events, generic mutation services, or provider lifecycle code, so `StopEvent` is never
+  constructed, the preemption SIGTERM hook handler is never installed, no
+  reboot rearm runs, and no local hook or provider path is reachable. Import,
+  startup, restart, SIGTERM, idle timeout, malformed marker, preexisting
+  autostop config, indicator, hook claim, and stored hook tests all produce zero
+  local lifecycle effect and no READY state in coordinated mode. A separate
+  byte-compatibility corpus proves ordinary v40 workers retain the exact old
+  autostop, hook, indicator, exception, listener, and provider-retry path.
+  Every legacy and current launch, resource, autostop, down, and preemption hook
+  input is rejected during coordinated planning before row birth, marker
+  creation, or provider effect, and the down path never reaches a hook CAS or
+  hook codegen;
+- an ordinary worker receives no coordinated marker, singleton, enabled unit,
+  listener, principal activation, or process change and continues to run the
+  exact legacy v40 entrypoint. A fresh coordinated worker has the signed marker,
+  one-way singleton, manager and artifact ledgers, coordinated Unix listener,
+  and no legacy Skylet process, watchdog, TCP listener, or generic mutation
+  service;
+- manager death before lock acquisition, after masking legacy launchers, during
+  predecessor eviction, after listener and database-FD proof, during ledger
+  recovery, before manager READY, before coordinated bind, and after worker
+  READY stops or prevents the coordinated service as specified. The same open
+  lock FD is attested for the manager lifetime; a oneshot PID or
+  `RemainAfterExit` state is never accepted. Simultaneous legacy restart,
+  coordinated start while manager-unready, prior-socket residue, and manager
+  restart with live owned cgroups all fail closed or reconcile exactly;
+- local first-boot worker-fence creation, readback, process restart, and
+  response-loss observation are idempotent; changed service, worker, cluster,
+  operation, bootstrap, config, or runtime identity fails closed. No remote
+  install method exists. A missing, changed, or late bootstrap marker cannot
+  enter coordinated mode, and active keyed work or manager disagreement cannot
+  rewrite the fence;
+- payload, ordinary user SSH, legacy-listener, wrong bridge UID, and direct Unix-socket
+  attempts fail before gRPC parsing. Forged signatures, unknown key IDs, keys
+  outside their immutable validity interval, replay under another method or payload, stale controller generation,
+  expired authorization, wrong bootstrap, fence, worker, request generation,
+  runtime UUID, caller nonce, or server challenge perform zero writes and zero
+  effects. Exact response-loss retry re-probes, re-signs the same domain
+  operation, and returns the one stored result. The bridge cannot execute an
+  arbitrary command, alternate subsystem, malformed shell `-c`, injected
+  environment, forwarding request, or another socket. `sshd -t` and effective
+  `sshd -T` match the signed policy. Wrong principal, expired certificate, and
+  untrusted CA fail. Authorization expiry, key-interval expiry, central issuer
+  refusal for `DRAINING` or `RETIRED`, a fresh worker excluding a retired key,
+  and destruction of every older trusting worker are tested as distinct cases;
+- after READY the payload has no sudo, polkit, setuid/file-capability, trusted-
+  group, privileged-socket, systemd, or ordinary-login path; the one-time
+  provisioning principal has no key or live session. An uploaded v40 Skylet
+  cannot open protected databases or sockets, receive authoritative traffic,
+  obtain platform lifecycle credentials, or call provider stop/down. The pilot
+  worker role's denied lifecycle actions and the central executor's sole
+  SkyPilot-issued lifecycle credential ownership are proved from effective
+  provider policy and a live negative actuation probe;
 - response-loss retries reuse the exact stored absolute precondition deadline
   and identity digest before and after terminal queue-row deletion;
-- an absent or garbage-collected API request treats exact Skylet lookup as
+- an absent or garbage-collected API request treats exact coordinated-worker lookup as
   observation only; release requires a matching committed `SEALED_ABSENT`, and
   ambiguous pending, status, PID, or receipt evidence quarantines;
 - forged HMACs, replayed timestamps, caller-supplied leader headers, public
@@ -9829,9 +12010,8 @@ The design is not promotable without all of the following:
   with any exec, cancel, or down identity member cannot select a private
   request ID; down tampering includes payload or producer version,
   `terminate`, `purge`, `graceful`, `graceful_timeout`, and `user_initiated`;
-- legacy Skylets return `UNIMPLEMENTED` for the new methods, v41 legacy mode
-  returns `FAILED_PRECONDITION` for coordinated mutations, and a keyed request
-  bound to a prior Skylet or containment-manager runtime performs no new
+- legacy Skylets expose no coordinated endpoint, and a keyed request bound to
+  a prior coordinated or containment-manager runtime performs no new
   mutation after restart while its exact durable owner is reconciled or
   quarantined;
 - raw old destructive request inserts, claims, requeues, and transitions to
@@ -9877,13 +12057,16 @@ The design is not promotable without all of the following:
   replica deletion reject missing or stale service hash, worker incarnation,
   replica ID, global `cluster_hash`, provider-target or provider-object digest,
   close token, retirement operation ID, transition operation, retirement
-  identity, or down identity for `_terminate_replica()`, controller cleanup,
+  identity when the disposition is `FROZEN_RECEIPTS_V1` or
+  `LOSS_AFTER_FREEZE_V1`, exact null retirement identity plus close identity
+  and loss authorization for `LOSS_BEFORE_FREEZE_V1`, or down identity for
+  `_terminate_replica()`, controller cleanup,
   both purge paths, failed-launch compensation, and direct bulk deletion. Fault
   injection after outer authorization, after handle refresh, before and after
-  the refreshed teardown hook, after Ray stop, after the cluster-row re-read,
+  hook-free profile verification, after any later qualified Ray stop, after the cluster-row re-read,
   and immediately before provider teardown proves that a changed cluster hash,
   cloud-local name, provider scope, canonical target locator, or observed object
-  produces no mismatched SSH, hook, Ray, or provider call. Exact absence remains
+  produces no mismatched SSH, Ray, or provider call and no hook call at all. Exact absence remains
   nonterminal without the no-later-create receipt, and coordinated orphan rows
   remain quarantined. A response-lost accepted object with no published handle
   either reconstructs and publishes the exact matching handle before
@@ -9936,10 +12119,16 @@ The design is not promotable without all of the following:
   while rejecting every other effect-bearing request or claim, closes the
   permanent scope, terminalizes the child,
   and deletes the coordinated service row and delivery atomically without
-  exposing version `0`. Old-image rollback refuses an active keyed worker row,
-  pending row, non-retired containment, active local lifecycle fence,
-  coordinated bootstrap marker, armed autostop configuration, or nonterminal
-  typed batch;
+  exposing version `0`. Old-image rollback refuses a coordinated mode row,
+  keyed worker or pending row, manager owner or tombstone, containment or
+  artifact receipt, retained artifact or log, lifecycle fence, coordinated
+  bootstrap marker, protected READY record, unreadable manager or artifact
+  ledger, armed autostop configuration, or nonterminal typed
+  batch. Any coordinated evidence requires a forward repair, ordinary
+  receipt-complete worker destruction, or the explicit recorded-local-loss
+  destruction path for unreadable state, never an in-place legacy image. Tests
+  prove the loss path can reach authoritative provider absence without a
+  fabricated local receipt and leaves required export visibly unsatisfied;
 - current and final manifest validation retains PLA-GAP-005 until one named
   pilot provider closes the S4 actuation and receipt contract, and the
   PostgreSQL version-0 assignment and teardown compatibility owners cannot be
@@ -9949,7 +12138,7 @@ The design is not promotable without all of the following:
 - planner import tests enforce the low-state dependency boundary, and proposal
   serialization contains no provider objects, SDK objects, readiness snapshot,
   or display metadata;
-- no provider, SDK, SSH, Skylet, file upload, log sync, or thread wait occurs
+- no provider, SDK, SSH, worker RPC, artifact or log I/O, file upload, or thread wait occurs
   inside a coordinator transaction; and
 - feature-off PostgreSQL and every SQLite test preserve legacy return values,
   exceptions, field timing, and scheduling behavior.
@@ -10455,7 +12644,13 @@ Each stacked commit follows this gate:
 10. Run the applicable in-cluster conformance or canary.
 11. Check pod restarts, failed jobs, stuck terminating pods, orphaned
     workloads, and new error logs.
-12. Roll back on any failed gate and verify the prior revision is healthy.
+12. Apply the milestone-specific recovery contract on any failed gate, then
+    verify the resulting live revision and workload state. A normal reversible
+    slice may roll back to the prior revision. M5 may do so only while no
+    coordinated marker, singleton, fence, ledger owner, artifact, receipt, or
+    tombstone exists. Once any coordinated evidence exists, recovery is a
+    forward fix or drain plus permanent destruction of every affected worker,
+    never an in-place old-image rollback.
 
 No deployment result is inferred from a successful image push or Helm command.
 The final live revision is re-read after monitoring. Until the health endpoint
@@ -11573,3 +13768,31 @@ evidence, a persisted effect attempt, and exact-ID pre-effect revalidation
 before any dual-family row can reach mutation. This review grants no
 dependency, provider-read, lifecycle, database, deployment, or removal-ledger
 authority.
+
+### Review 34
+
+Verdict: `PURSUE` for the M5-S0b0 single-worker mutation owner and authenticated
+control-plane design. The exact pre-verdict canonical design SHA-256 was
+`dab2a75d4e75e5f7d702f72b42fba6582ed9d0e4defbd37caecc581e203b18f2`, and
+the exact removal-ledger SHA-256 was
+`91e4de097f3d49062bebcdaecdce207fddd212f109068ffa8c7520cdcf4e8342`.
+Independent authority, reliability, and repository-mapping reviews all
+returned `PURSUE` on those same bytes.
+
+The accepted correction makes the coordinated worker a separately packaged,
+provider-free mutation owner while keeping ordinary Skylet v40 byte-compatible.
+It closes direct command and request sizes, terminalizes log quota through the
+existing reducer race before any hard kill, freezes exact artifact terminal
+evidence, distinguishes loss before and after freeze, and creates an immutable
+provider-down request only after artifact removal or loss disposition is
+irreversible. Packaging retains one byte-identical standalone wheel inside a
+release installation so source and installed API servers can reproduce the
+same manifest-hashed two-wheel worker bundle. One neutral explicit-connection
+initializer creates or validates the legacy config prerequisite on both the
+ordinary and fresh protected paths without importing legacy Skylet into the
+coordinated runtime.
+
+This verdict authorizes the design-only M5-S0b0 merge and then only the ordered
+M5-S0b1a packaging foundation. It grants no coordinated worker activation,
+provider lifecycle effect, assignment, artifact removal, physical teardown,
+legacy owner removal, or production rollout authority.
