@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access
 
+import asyncio
 from unittest import mock
 
 import pytest
@@ -91,6 +92,56 @@ class TestWaitForNextTask:
         assert result == next_snapshot
         assert snapshot_read.call_args_list == [mock.call(42), mock.call(42)]
         sleep.assert_called_once_with(jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS)
+
+    def test_cancellation_stops_wait_before_next_snapshot(self, monkeypatch):
+        current_snapshot = managed_job_state.JobLogStreamSnapshot(
+            0, managed_job_state.ManagedJobStatus.RUNNING, None, None, None,
+            'first')
+        snapshot_read = mock.Mock(side_effect=[
+            current_snapshot,
+            AssertionError('re-read snapshot after cancellation'),
+        ])
+        wait = mock.Mock(side_effect=asyncio.CancelledError())
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
+        monkeypatch.setattr(jobs_utils,
+                            '_sleep_log_follow_wait',
+                            wait,
+                            raising=False)
+        monkeypatch.setattr(
+            jobs_utils.time, 'sleep',
+            mock.Mock(side_effect=AssertionError('used raw sleep')))
+
+        with pytest.raises(asyncio.CancelledError):
+            jobs_utils._wait_for_next_task(job_id=42, current_task_id=0)
+
+        snapshot_read.assert_called_once_with(42)
+        wait.assert_called_once_with(jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS)
+
+
+class TestInitialLogStreamSnapshot:
+    """Checks the wait loop before the first stream-target snapshot appears."""
+
+    def test_cancellation_stops_before_second_snapshot(self, monkeypatch):
+        snapshot_read = mock.Mock(side_effect=[
+            managed_job_state.JobLogStreamSnapshot(1, None, None, None, None,
+                                                   'first'),
+            AssertionError('re-read snapshot after cancellation'),
+        ])
+        wait = mock.Mock(side_effect=asyncio.CancelledError())
+        monkeypatch.setattr(jobs_utils,
+                            '_sleep_log_follow_wait',
+                            wait,
+                            raising=False)
+        monkeypatch.setattr(
+            jobs_utils.time, 'sleep',
+            mock.Mock(side_effect=AssertionError('used raw sleep')))
+
+        with pytest.raises(asyncio.CancelledError):
+            jobs_utils._wait_for_initial_log_stream_snapshot(snapshot_read)
+
+        snapshot_read.assert_called_once_with()
+        wait.assert_called_once_with(1)
 
 
 class TestStreamLogsByIdLifecycle:
@@ -328,6 +379,67 @@ class TestStreamLogsByIdLifecycle:
         handle_lookup.assert_called_once_with('pool-cluster')
         assert backend.tail_calls == 1
         assert backend.status_calls == 1
+
+    def test_cancellation_while_log_target_is_not_ready_stops_before_refresh(
+            self, monkeypatch):
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        snapshot = managed_job_state.JobLogStreamSnapshot(
+            0, managed_job_state.ManagedJobStatus.STARTING, None, None, None,
+            'first')
+        snapshot_read = mock.Mock(side_effect=[
+            snapshot,
+            AssertionError('re-read snapshot after cancellation'),
+        ])
+        handle_lookup = mock.Mock(return_value=None)
+        generate_cluster_name = mock.Mock(return_value='generated-cluster')
+        backend = _FakeBackend()
+        wait = mock.Mock(side_effect=asyncio.CancelledError())
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks',
+                            mock.Mock(return_value=1))
+        monkeypatch.setattr(
+            managed_job_state, 'get_status',
+            mock.Mock(
+                side_effect=AssertionError('polled status after cancellation')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_latest_task_id_status',
+            mock.Mock(side_effect=AssertionError('scalar latest-task poll '
+                                                 'used')))
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils, 'read_provision_status_from_log',
+                            mock.Mock(return_value=(0, None)))
+        monkeypatch.setattr(jobs_utils, 'generate_managed_job_cluster_name',
+                            generate_cluster_name)
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', handle_lookup)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils,
+                            '_sleep_log_follow_wait',
+                            wait,
+                            raising=False)
+        monkeypatch.setattr(
+            jobs_utils.time, 'sleep',
+            mock.Mock(side_effect=AssertionError('used raw sleep')))
+
+        with pytest.raises(asyncio.CancelledError):
+            jobs_utils.stream_logs_by_id(42, follow=True)
+
+        snapshot_read.assert_called_once_with(42)
+        generate_cluster_name.assert_called_once_with('first', 42)
+        handle_lookup.assert_called_once_with('generated-cluster')
+        wait.assert_called_once_with(jobs_utils._PROVISION_LOG_POLL_GAP_SECONDS)
+        assert backend.tail_calls == 0
+        assert backend.status_calls == 0
 
     def test_filtered_task_snapshot_stops_on_requested_task_terminal_state(
             self, monkeypatch):
