@@ -1,6 +1,12 @@
 import { useEffect, useRef } from 'react';
 
-export function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
+export function useVisibleRefreshInterval(
+  enabled,
+  intervalMs,
+  onRefresh,
+  options = {}
+) {
+  const { initialDelayMs = intervalMs } = options;
   const onRefreshRef = useRef(onRefresh);
   const cadenceAnchorRef = useRef(null);
   const nextIntervalDueAtRef = useRef(null);
@@ -72,7 +78,11 @@ export function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
       scheduleNextRefresh(nextDueAt);
     };
 
-    cadenceAnchorRef.current = window.performance.now() + intervalMs;
+    const initialDelay = Math.max(
+      0,
+      Number.isFinite(initialDelayMs) ? initialDelayMs : intervalMs
+    );
+    cadenceAnchorRef.current = window.performance.now() + initialDelay;
     scheduleNextRefresh(cadenceAnchorRef.current);
     window.document.addEventListener(
       'visibilitychange',
@@ -88,5 +98,5 @@ export function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
         handleVisibilityChange
       );
     };
-  }, [enabled, intervalMs]);
+  }, [enabled, initialDelayMs, intervalMs]);
 }

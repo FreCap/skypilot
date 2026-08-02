@@ -116,4 +116,54 @@ describe('useVisibleRefreshInterval', () => {
 
     unmount();
   });
+
+  it('supports an aligned first tick without losing the cadence boundary', () => {
+    const onRefresh = jest.fn();
+    const { unmount } = renderHook(() =>
+      useVisibleRefreshInterval(true, 1000, onRefresh, {
+        initialDelayMs: 400,
+      })
+    );
+
+    expect(jest.getTimerCount()).toBe(1);
+
+    act(() => {
+      jest.advanceTimersByTime(399);
+    });
+    expect(onRefresh).not.toHaveBeenCalled();
+
+    act(() => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(onRefresh).toHaveBeenLastCalledWith('interval');
+
+    act(() => {
+      setDocumentVisibility('hidden');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(jest.getTimerCount()).toBe(0);
+
+    act(() => {
+      jest.advanceTimersByTime(1600);
+      setDocumentVisibility('visible');
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(2);
+    expect(onRefresh).toHaveBeenLastCalledWith('visibilitychange');
+    expect(jest.getTimerCount()).toBe(1);
+
+    act(() => {
+      jest.advanceTimersByTime(1399);
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(3);
+    expect(onRefresh).toHaveBeenLastCalledWith('interval');
+
+    unmount();
+  });
 });
