@@ -1,15 +1,10 @@
-"""Utils for building pip wheels.
+"""Build and validate SkyPilot's internal two-wheel worker bundle.
 
-This module is used for building the wheel for SkyPilot under `~/.sky/wheels`,
-and the wheel will be used for installing the SkyPilot on the cluster nodes.
-
-The generated folder is like:
-    ~/.sky/wheels/<hash_of_wheel>/sky-<version>-py3-none-any.whl
-
-Whenever a new wheel is built, the old ones will be removed.
-
-The ray up yaml templates under sky/templates depend on the naming of the wheel.
+The bundle is transferred to cluster nodes as one directory.  It contains the
+internal SkyPilot wheel, the independently owned worker-runtime wheel, and a
+canonical manifest that binds both wheel hashes.
 """
+
 import hashlib
 import os
 import pathlib
@@ -18,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 import colorama
 import filelock
@@ -27,6 +23,8 @@ import sky
 from sky import sky_logging
 from sky.backends import backend_utils
 from sky.server import common
+from sky.setup_files import dependencies
+from sky.setup_files import worker_runtime_packaging as runtime_packaging
 from sky.utils import directory_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -40,287 +38,371 @@ SKY_PACKAGE_PATH = pathlib.Path(directory_utils.get_sky_dir())
 _PACKAGE_WHEEL_NAME = 'skypilot'
 _WHEEL_PATTERN = (f'{_PACKAGE_WHEEL_NAME}-'
                   f'{version.parse(sky.__version__)}-*.whl')
+_WORKER_RUNTIME_PROJECT = (SKY_PACKAGE_PATH.parent / 'addons' /
+                           'submission-containment' / 'python-runtime')
+_WORKER_RUNTIME_RESOURCE = (SKY_PACKAGE_PATH / 'skylet' / 'runtime_wheels' /
+                            'v1')
+_INTERNAL_SOURCE_DIGEST_DOMAIN = b'SKYPILOT_INTERNAL_SKY_SOURCE_V1\0'
+_CACHE_DIRECTORY_PATTERN = re.compile(
+    r'(?:[0-9a-f]{32}|[0-9a-f]{64}|main-[0-9a-f]{64})')
 
 
 def _remove_stale_wheels(latest_wheel_dir: pathlib.Path) -> None:
-    """Remove all wheels except the latest one."""
-    for f in WHEEL_DIR.iterdir():
-        if f != latest_wheel_dir:
-            if f.is_dir() and not f.is_symlink():
-                shutil.rmtree(f, ignore_errors=True)
+    """Remove all cached artifacts except the latest complete bundle."""
+    if not WHEEL_DIR.exists():
+        return
+    for path in WHEEL_DIR.iterdir():
+        if path == latest_wheel_dir:
+            continue
+        if (path.is_dir() and not path.is_symlink() and
+                _CACHE_DIRECTORY_PATTERN.fullmatch(path.name) is not None):
+            shutil.rmtree(path, ignore_errors=True)
 
 
-def _get_latest_wheel() -> pathlib.Path:
-    wheel_name = f'**/{_WHEEL_PATTERN}'
+def _stamped_init_content() -> str:
+    content = (SKY_PACKAGE_PATH / '__init__.py').read_text()
+    content = re.sub(r'_SKYPILOT_COMMIT_SHA = [\'\"](.*?)[\'\"]',
+                     f'_SKYPILOT_COMMIT_SHA = \'{sky.__commit__}\'', content)
+    commit_timestamp = sky.__commit_timestamp__ or ''
+    content = re.sub(r'_SKYPILOT_COMMIT_TIMESTAMP = [\'\"](.*?)[\'\"]',
+                     f'_SKYPILOT_COMMIT_TIMESTAMP = \'{commit_timestamp}\'',
+                     content)
+    if sky.__build__ is not None:
+        content = re.sub(r'_SKYPILOT_COMMIT_COUNT = [\'\"](.*?)[\'\"]',
+                         f'_SKYPILOT_COMMIT_COUNT = \'{sky.__build__}\'',
+                         content)
+    return content
+
+
+def _normalized_setup_content() -> str:
+    setup_path = SKY_PACKAGE_PATH / 'setup_files' / 'setup.py'
+    # Internal workers always install the stable distribution identity, even
+    # when the API server itself came from skypilot-nightly.
+    return re.sub(r'\bname=[\'\"](.*?)[\'\"],',
+                  f'name=\'{_PACKAGE_WHEEL_NAME}\',', setup_path.read_text())
+
+
+def _internal_manifest_content() -> str:
+    manifest_path = SKY_PACKAGE_PATH / 'setup_files' / 'MANIFEST.in'
+    release_only_paths = ('sky/dashboard/out', 'sky/skylet/runtime_wheels')
+    lines = [
+        line for line in manifest_path.read_text().splitlines(keepends=True)
+        if not any(path in line for path in release_only_paths)
+    ]
+    lines.append('prune sky/skylet/runtime_wheels\n')
+    return ''.join(lines)
+
+
+def _stage_internal_sky_source(build_root: pathlib.Path) -> None:
+    """Stages the main wheel while excluding its nested runtime resource."""
+    staged_sky = build_root / 'sky'
+    staged_sky.mkdir()
+    for item in SKY_PACKAGE_PATH.iterdir():
+        target = staged_sky / item.name
+        if item.name == '__init__.py':
+            continue
+        if item.name == 'skylet' and _WORKER_RUNTIME_RESOURCE.exists():
+            target.mkdir()
+            for skylet_item in item.iterdir():
+                if skylet_item.name == 'runtime_wheels':
+                    continue
+                (target / skylet_item.name).symlink_to(
+                    skylet_item, target_is_directory=skylet_item.is_dir())
+        else:
+            target.symlink_to(item, target_is_directory=item.is_dir())
+
+    templates = SKY_PACKAGE_PATH.parent / 'sky_templates'
+    if templates.exists():
+        (build_root / 'sky_templates').symlink_to(templates,
+                                                  target_is_directory=True)
+
+    (build_root / 'setup.py').write_text(_normalized_setup_content())
+    setup_files = SKY_PACKAGE_PATH / 'setup_files'
+    for source in setup_files.iterdir():
+        if not source.is_file() or source.name == 'setup.py':
+            continue
+        destination = build_root / source.name
+        if source.name == 'MANIFEST.in':
+            destination.write_text(_internal_manifest_content())
+        else:
+            shutil.copyfile(source, destination)
+    (staged_sky / '__init__.py').write_text(_stamped_init_content())
+
+
+def _run_pip_wheel(build_root: pathlib.Path, output_dir: pathlib.Path) -> None:
+    """Runs the existing main-wheel build with deterministic process inputs."""
+    env = os.environ.copy()
+    env['SOURCE_DATE_EPOCH'] = '0'
+    env['PYTHONHASHSEED'] = '0'
     try:
-        latest_wheel = max(WHEEL_DIR.glob(wheel_name), key=os.path.getctime)
-    except ValueError:
-        raise FileNotFoundError(
-            'Could not find built SkyPilot wheels with glob pattern '
-            f'{wheel_name} under {WHEEL_DIR!r}') from None
-    return latest_wheel
+        subprocess.run([
+            sys.executable, '-m', 'pip', 'wheel', '--no-deps',
+            str(build_root) + os.sep, '--wheel-dir',
+            str(output_dir)
+        ],
+                       capture_output=True,
+                       check=True,
+                       text=True,
+                       env=env)
+    except subprocess.CalledProcessError as error:
+        error_msg = error.stderr
+        if 'No module named pip' in error_msg:
+            if shutil.which('uv'):
+                msg = ('pip module not found. Since you have UV installed, '
+                       'you can install pip by running:\n'
+                       '  uv pip install pip')
+            elif shutil.which('conda'):
+                msg = ('pip module not found. Since you have conda installed, '
+                       'you can install pip by running:\n'
+                       '  conda install pip')
+            else:
+                msg = ('pip module not found. Please install pip for your '
+                       f'Python environment ({sys.executable}).')
+        else:
+            msg = f'pip wheel command failed. Error: {error_msg}'
+        raise RuntimeError('Failed to build pip wheel for SkyPilot.\n' +
+                           msg) from error
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f'Failed to build pip wheel for SkyPilot. '
+            f'Python executable not found: {sys.executable}') from error
+
+
+def _run_build_py(build_root: pathlib.Path, output_dir: pathlib.Path) -> None:
+    """Projects exactly the files setuptools will place in the main wheel."""
+    env = os.environ.copy()
+    env['PYTHONHASHSEED'] = '0'
+    try:
+        subprocess.run([
+            sys.executable, 'setup.py', '--no-user-cfg', 'build_py', '--force',
+            '--build-lib',
+            str(output_dir)
+        ],
+                       cwd=build_root,
+                       capture_output=True,
+                       check=True,
+                       text=True,
+                       env=env)
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        stderr = getattr(error, 'stderr', None)
+        raise RuntimeError('Failed to project SkyPilot wheel inputs. '
+                           f'Error: {stderr or error}') from error
+
+
+def _check_running_version() -> None:
+    version_on_disk = common.get_skypilot_version_on_disk()
+    if version_on_disk == sky.__version__:
+        return
+    logger.warning(
+        'Wheel build: The installed SkyPilot version is different from the '
+        'running code.\n'
+        f'{colorama.Style.DIM}'
+        f'running version: {sky.__version__}\n'
+        f'installed version: {version_on_disk}\n'
+        f'{colorama.Style.RESET_ALL}'
+        f'{colorama.Fore.YELLOW}'
+        'Please restart the local API server by running:\n'
+        f'{colorama.Style.BRIGHT}sky api stop; sky api start'
+        f'{colorama.Style.RESET_ALL}')
+    raise RuntimeError('The installed SkyPilot version is different from '
+                       'the running code. Please restart the SkyPilot API '
+                       'server with: sky api stop; sky api start')
+
+
+def _build_internal_sky_wheel(output_dir: pathlib.Path) -> pathlib.Path:
+    """Builds an internal main wheel with no nested standalone-wheel copy."""
+    _check_running_version()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as build_root_str:
+        build_root = pathlib.Path(build_root_str)
+        _stage_internal_sky_source(build_root)
+        _run_pip_wheel(build_root, output_dir)
+
+    wheels = list(output_dir.glob(_WHEEL_PATTERN))
+    if len(wheels) != 1:
+        raise RuntimeError(
+            f'Failed to find exactly one SkyPilot wheel under {output_dir} '
+            f'with glob pattern {_WHEEL_PATTERN!r}. '
+            f'Found: {list(map(str, output_dir.glob("*")))}.')
+    wheel_path = wheels[0]
+    try:
+        with zipfile.ZipFile(wheel_path) as wheel:
+            if any(
+                    name.startswith('sky/skylet/runtime_wheels/')
+                    for name in wheel.namelist()):
+                raise RuntimeError(
+                    'Internal SkyPilot wheel contains the opaque runtime '
+                    'resource')
+    except zipfile.BadZipFile as error:
+        raise RuntimeError(
+            'Internal SkyPilot wheel is not a valid ZIP') from error
+    return wheel_path
 
 
 def _build_sky_wheel() -> pathlib.Path:
-    """Build a wheel for SkyPilot and return the path to the wheel."""
-    # Double check that the installed code is actually the same version as the
-    # running code. If not, the wheel we build will not match _WHEEL_PATTERN.
-    # See https://github.com/skypilot-org/skypilot/issues/5311.
-    version_on_disk = common.get_skypilot_version_on_disk()
-    if version_on_disk != sky.__version__:
-        logger.warning(
-            'Wheel build: The installed SkyPilot version is different from the '
-            'running code.\n'
-            f'{colorama.Style.DIM}'
-            f'running version: {sky.__version__}\n'
-            f'installed version: {version_on_disk}\n'
-            f'{colorama.Style.RESET_ALL}'
-            # The following message only applies to local API server. We have no
-            # way to tell from here if this is a remote or local API server. But
-            # we expect this to happen much more commonly to a local API server,
-            # so just print the hint regardless.
-            f'{colorama.Fore.YELLOW}'
-            'Please restart the local API server by running:\n'
-            f'{colorama.Style.BRIGHT}sky api stop; sky api start'
-            f'{colorama.Style.RESET_ALL}')
-        raise RuntimeError('The installed SkyPilot version is different from '
-                           'the running code. Please restart the SkyPilot API '
-                           'server with: sky api stop; sky api start')
+    """Builds one internal main wheel for private compatibility callers."""
+    WHEEL_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as output_dir_str:
+        wheel = _build_internal_sky_wheel(pathlib.Path(output_dir_str))
+        digest = runtime_packaging.sha256_file(wheel)
+        destination_dir = WHEEL_DIR / f'main-{digest}'
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / wheel.name
+        if not destination.exists():
+            shutil.copyfile(wheel, destination)
+    return destination
 
-    with tempfile.TemporaryDirectory() as tmp_dir_str:
-        # prepare files
-        tmp_dir = pathlib.Path(tmp_dir_str)
-        sky_tmp_dir = tmp_dir / 'sky'
-        sky_tmp_dir.mkdir()
-        for item in SKY_PACKAGE_PATH.iterdir():
-            target = sky_tmp_dir / item.name
-            if item.name != '__init__.py':
-                # We do not symlink `sky/__init__.py` as we need to
-                # modify the commit hash in the file later.
-                # Symlink other files/folders.
-                target.symlink_to(item, target_is_directory=item.is_dir())
 
-        # Symlink sky_templates directory from repo root
-        sky_templates_src = SKY_PACKAGE_PATH.parent / 'sky_templates'
-        if sky_templates_src.exists():
-            sky_templates_target = tmp_dir / 'sky_templates'
-            sky_templates_target.symlink_to(sky_templates_src,
-                                            target_is_directory=True)
-        setup_files_dir = SKY_PACKAGE_PATH / 'setup_files'
+def _normalized_internal_source_records() -> list[tuple[str, bytes]]:
+    """Returns the normalized, release-shaped internal-wheel inputs."""
+    with tempfile.TemporaryDirectory() as scratch_str:
+        scratch = pathlib.Path(scratch_str)
+        build_root = scratch / 'build-root'
+        build_root.mkdir()
+        _stage_internal_sky_source(build_root)
+        projection = scratch / 'build-py'
+        _run_build_py(build_root, projection)
 
-        setup_content = (setup_files_dir / 'setup.py').read_text()
-        # Replace the package name with skypilot. This is important as the
-        # package could be installed with pip install skypilot-nightly.
-        setup_content = re.sub(r'\bname=[\'"](.*?)[\'"],',
-                               f'name=\'{_PACKAGE_WHEEL_NAME}\',',
-                               setup_content)
-        (tmp_dir / 'setup.py').write_text(setup_content)
+        records: list[tuple[str, bytes]] = []
+        for path in sorted(projection.rglob('*')):
+            if path.is_dir():
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError(
+                    f'Invalid projected internal wheel input: {path}')
+            records.append(
+                (f'build-py/{path.relative_to(projection).as_posix()}',
+                 path.read_bytes()))
 
-        for f in setup_files_dir.iterdir():
-            if f.is_file() and f.name != 'setup.py':
-                shutil.copy(str(f), str(tmp_dir))
-                if f.name == 'MANIFEST.in':
-                    # Remove the line `sky/dashboard/out`, so we do not
-                    # include the dashboard files in the internal wheel
-                    import fileinput  # pylint: disable=import-outside-toplevel
-                    with fileinput.input(tmp_dir / f.name,
-                                         inplace=True) as file:
-                        for line in file:
-                            if 'sky/dashboard/out' not in line:
-                                print(line, end='')
+        # build_py captures packages and package data.  These two normalized
+        # root files additionally bind metadata, package discovery, entrypoints,
+        # and the package-data selection that controls the final wheel.
+        for name in ('setup.py', 'MANIFEST.in'):
+            path = build_root / name
+            records.append((f'build-control/{name}', path.read_bytes()))
+        return sorted(records, key=lambda item: item[0])
 
-        init_file_path = SKY_PACKAGE_PATH / '__init__.py'
-        init_file_content = init_file_path.read_text()
-        # Replace the commit hash with the current commit hash.
-        init_file_content = re.sub(
-            r'_SKYPILOT_COMMIT_SHA = [\'"](.*?)[\'"]',
-            f'_SKYPILOT_COMMIT_SHA = \'{sky.__commit__}\'', init_file_content)
-        # Always replace the timestamp placeholder. An empty stamp is an
-        # explicit absence marker that prevents an installed wheel from
-        # deriving provenance from an unrelated ambient Git checkout.
-        commit_timestamp = sky.__commit_timestamp__ or ''
-        init_file_content = re.sub(
-            r'_SKYPILOT_COMMIT_TIMESTAMP = [\'"](.*?)[\'"]',
-            f'_SKYPILOT_COMMIT_TIMESTAMP = \'{commit_timestamp}\'',
-            init_file_content)
-        if sky.__build__ is not None:
-            # setup.py runs outside the source checkout, so it cannot discover
-            # the commit count itself. Stamp the running build just like the
-            # commit SHA so cluster-side wheels retain the build identity.
-            init_file_content = re.sub(
-                r'_SKYPILOT_COMMIT_COUNT = [\'"](.*?)[\'"]',
-                f'_SKYPILOT_COMMIT_COUNT = \'{sky.__build__}\'',
-                init_file_content)
-        (tmp_dir / 'sky' / '__init__.py').write_text(init_file_content)
 
-        # It is important to normalize the path, otherwise 'pip wheel' would
-        # treat the directory as a file and generate an empty wheel.
-        norm_path = str(tmp_dir) + os.sep
-        # TODO(#5046): Consider adding native UV support for building wheels.
-        # Use `python -m pip` instead of `pip3` for better compatibility across
-        # different environments (conda, venv, UV, system Python, etc.)
-        #
-        # Ensure reproducible wheel builds across processes and machines:
-        # Without these, API server replicas produce wheels with different
-        # hashes for identical source, which may cause unnecessary wheel
-        # reinstallations on sky clusters, as
-        # SKYPILOT_WHEEL_INSTALLATION_COMMANDS check for the wheel hash.
-        env = os.environ.copy()
-        # SOURCE_DATE_EPOCH is a standardized env var for reproducible builds
-        # (https://reproducible-builds.org/docs/source-date-epoch/). Forces
-        # pip to use a fixed timestamp in zip entries instead of file mtimes.
-        env['SOURCE_DATE_EPOCH'] = '0'
-        # PYTHONHASHSEED=0 makes pip emit Requires-Dist metadata in
-        # deterministic order (dict/set iteration depends on hash seed).
-        env['PYTHONHASHSEED'] = '0'
-        try:
-            subprocess.run([
-                sys.executable, '-m', 'pip', 'wheel', '--no-deps', norm_path,
-                '--wheel-dir',
-                str(tmp_dir)
-            ],
-                           capture_output=True,
-                           check=True,
-                           text=True,
-                           env=env)
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr
-            if 'No module named pip' in error_msg:
-                # pip module not found - provide helpful suggestions based on
-                # the available package managers
-                if shutil.which('uv'):
-                    msg = ('pip module not found. Since you have UV installed, '
-                           'you can install pip by running:\n'
-                           '  uv pip install pip')
-                elif shutil.which('conda'):
-                    msg = (
-                        'pip module not found. Since you have conda installed, '
-                        'you can install pip by running:\n'
-                        '  conda install pip')
-                else:
-                    msg = ('pip module not found. Please install pip for your '
-                           f'Python environment ({sys.executable}).')
-            else:
-                # Other pip errors
-                msg = f'pip wheel command failed. Error: {error_msg}'
-            raise RuntimeError('Failed to build pip wheel for SkyPilot.\n' +
-                               msg) from e
-        except FileNotFoundError as e:
-            # Python executable not found (extremely rare)
-            raise RuntimeError(
-                f'Failed to build pip wheel for SkyPilot. '
-                f'Python executable not found: {sys.executable}') from e
+def _normalized_internal_source_digest(
+        worker_record: runtime_packaging.WheelRecord,
+        worker_provenance: bytes) -> str:
+    digest = hashlib.sha256(_INTERNAL_SOURCE_DIGEST_DOMAIN)
+    records = _normalized_internal_source_records()
+    records.extend([
+        ('worker-runtime-provenance', worker_provenance),
+        ('worker-runtime-record',
+         runtime_packaging.canonical_json_bytes(worker_record.to_dict())),
+    ])
+    for name, contents in sorted(records, key=lambda item: item[0]):
+        name_bytes = name.encode()
+        digest.update(len(name_bytes).to_bytes(8, 'big'))
+        digest.update(name_bytes)
+        digest.update(len(contents).to_bytes(8, 'big'))
+        digest.update(contents)
+    return digest.hexdigest()
 
-        try:
-            wheel_path = next(tmp_dir.glob(_WHEEL_PATTERN))
-        except StopIteration:
-            raise RuntimeError(
-                f'Failed to find pip wheel for SkyPilot under {tmp_dir} with '
-                f'glob pattern {_WHEEL_PATTERN!r}. '
-                f'Found: {list(map(str, tmp_dir.glob("*")))}. '
-                'No wheel file is generated.') from None
 
-        # Use a unique temporary dir per wheel hash, because there may be many
-        # concurrent 'sky launch' happening.  The path should be stable if the
-        # wheel content hash doesn't change.
-        with open(wheel_path, 'rb') as f:
-            contents = f.read()
-        hash_of_latest_wheel = hashlib.md5(contents,
-                                           usedforsecurity=False).hexdigest()
+def _resolve_worker_runtime_wheel(
+    output_dir: pathlib.Path
+) -> tuple[pathlib.Path, runtime_packaging.WheelRecord, bytes]:
+    expected_version = (dependencies.COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION)
+    if _WORKER_RUNTIME_PROJECT.is_dir():
+        repo_root = SKY_PACKAGE_PATH.parent
+        wheel = runtime_packaging.build_worker_runtime_wheel(
+            repo_root, output_dir)
+        lock_path = (_WORKER_RUNTIME_PROJECT /
+                     runtime_packaging.WORKER_RUNTIME_LOCK_FILENAME)
+        record = runtime_packaging.verify_worker_runtime_lock(
+            repo_root, wheel, lock_path)
+        provenance = runtime_packaging.canonical_json_bytes({
+            'filename': record.filename,
+            'sha256': record.sha256,
+            'size': record.size,
+            'version': expected_version,
+        })
+        return wheel, record, provenance
 
-        wheel_dir = WHEEL_DIR / hash_of_latest_wheel
-        wheel_dir.mkdir(parents=True, exist_ok=True)
-        # shutil.move will fail when the file already exists and is being
-        # moved across filesystems.
-        if not os.path.exists(
-                os.path.join(wheel_dir, os.path.basename(wheel_path))):
-            shutil.move(str(wheel_path), wheel_dir)
-        return wheel_dir / wheel_path.name
+    wheel = runtime_packaging.load_release_worker_runtime_artifact(
+        _WORKER_RUNTIME_RESOURCE, expected_version)
+    manifest_path = (_WORKER_RUNTIME_RESOURCE /
+                     runtime_packaging.WORKER_RUNTIME_RESOURCE_MANIFEST)
+    return (wheel, runtime_packaging.WheelRecord.from_path(wheel),
+            manifest_path.read_bytes())
+
+
+def _find_cached_bundle(
+    source_digest: str,
+    worker_record: runtime_packaging.WheelRecord,
+) -> pathlib.Path | None:
+    if not WHEEL_DIR.exists():
+        return None
+    matches = []
+    for candidate in sorted(WHEEL_DIR.iterdir()):
+        manifest_path = candidate / runtime_packaging.INTERNAL_BUNDLE_MANIFEST
+        if not manifest_path.is_file():
+            continue
+        manifest = runtime_packaging.InternalBundleManifest.from_bytes(
+            manifest_path.read_bytes())
+        if (manifest.source_input_sha256 != source_digest or
+                manifest.wheels[1] != worker_record):
+            continue
+        runtime_packaging.verify_internal_bundle(
+            candidate,
+            expected_digest=candidate.name,
+            expected_source_input_sha256=source_digest,
+            expected_worker_record=worker_record)
+        matches.append(candidate)
+    if len(matches) > 1:
+        raise ValueError('multiple cached bundles match the same source inputs')
+    return matches[0] if matches else None
 
 
 def build_sky_wheel() -> tuple[pathlib.Path, str]:
-    """Build a wheel for SkyPilot, or reuse a cached wheel.
+    """Builds or reuses the exact three-file internal worker bundle.
 
-    Caller is responsible for removing the wheel.
+    Caller is responsible for removing the returned temporary directory.
 
     Returns:
-        A tuple of (wheel path, wheel hash):
-        - wheel_path: A temporary path to a directory holding the wheel; path
-        is guaranteed unique per wheel content hash.
-        - wheel_hash: The wheel content hash.
+        A tuple of (bundle directory, bundle SHA-256).  The directory contains
+        exactly the internal main wheel, standalone runtime wheel, and
+        canonical manifest.
     """
-
-    def _get_latest_modification_time(path: pathlib.Path) -> float | None:
-        max_time = -1.
-        if not path.exists():
-            return max_time
-        for root, dirs, files in os.walk(path):
-            # Prune __pycache__ directories to prevent walking into them and
-            # exclude them from processing
-            if '__pycache__' in dirs:
-                dirs.remove('__pycache__')
-            # Filter out .pyc files
-            filtered_files = [f for f in files if not f.endswith('.pyc')]
-            # Process remaining directories and files
-            for entry in (*dirs, *filtered_files):
-                entry_path = os.path.join(root, entry)
-                try:
-                    mtime = os.path.getmtime(entry_path)
-                    if mtime > max_time:
-                        max_time = mtime
-                except OSError:
-                    # Handle cases where file might have been deleted after
-                    # listing
-                    return None
-        return max_time
-
-    # This lock prevents that the wheel is updated while being copied.
-    # Although the current caller already uses a lock, we still lock it here
-    # to guarantee inherent consistency.
     with filelock.FileLock(_WHEEL_LOCK_PATH):  # pylint: disable=E0110
-        # This implements a classic "compare, update and clone" consistency
-        # protocol. "compare, update and clone" has to be atomic to avoid
-        # race conditions.
-        last_modification_time = _get_latest_modification_time(SKY_PACKAGE_PATH)
-        # Also check sky_templates directory modification time
-        sky_templates_path = SKY_PACKAGE_PATH.parent / 'sky_templates'
-        if sky_templates_path.exists():
-            sky_templates_mtime = _get_latest_modification_time(
-                sky_templates_path)
-            if (last_modification_time is not None and
-                    sky_templates_mtime is not None):
-                last_modification_time = max(last_modification_time,
-                                             sky_templates_mtime)
-            elif last_modification_time is None:
-                last_modification_time = sky_templates_mtime
-        last_wheel_modification_time = _get_latest_modification_time(WHEEL_DIR)
+        WHEEL_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as build_dir_str:
+            build_dir = pathlib.Path(build_dir_str)
+            worker_wheel, worker_record, worker_provenance = (
+                _resolve_worker_runtime_wheel(build_dir))
+            source_digest = _normalized_internal_source_digest(
+                worker_record, worker_provenance)
+            bundle = _find_cached_bundle(source_digest, worker_record)
+            if bundle is None:
+                main_wheel = _build_internal_sky_wheel(build_dir / 'main')
+                manifest = runtime_packaging.make_internal_bundle_manifest(
+                    source_digest, main_wheel, worker_wheel)
+                bundle = runtime_packaging.materialize_internal_bundle(
+                    WHEEL_DIR, manifest, main_wheel, worker_wheel)
 
-        # Only build wheels if the wheel is outdated, wheel does not exist
-        # for the requested version, or files were deleted during checking.
-        if ((last_modification_time is None or
-             last_wheel_modification_time is None) or
-            (last_wheel_modification_time < last_modification_time) or
-                not any(WHEEL_DIR.glob(f'**/{_WHEEL_PATTERN}'))):
-            if not WHEEL_DIR.exists():
-                WHEEL_DIR.mkdir(parents=True, exist_ok=True)
-            latest_wheel = _build_sky_wheel()
-        else:
-            latest_wheel = _get_latest_wheel()
+        _, wheel_hash = runtime_packaging.verify_internal_bundle(
+            bundle,
+            expected_digest=bundle.name,
+            expected_source_input_sha256=source_digest,
+            expected_worker_record=worker_record)
+        _remove_stale_wheels(bundle)
 
-        # We remove all wheels except the latest one for garbage collection.
-        # Otherwise stale wheels will accumulate over time.
-        # TODO(romilb): If the user switches versions every alternate launch,
-        #  the wheel will be rebuilt every time. At the risk of adding
-        #  complexity, we can consider TTL caching wheels by version here.
-        _remove_stale_wheels(latest_wheel.parent)
-
-        wheel_hash = latest_wheel.parent.name
-
-        # Use a unique temporary dir per wheel hash, because there may be many
-        # concurrent 'sky launch' happening.  The path should be stable if the
-        # wheel content hash doesn't change.
         temp_wheel_dir = pathlib.Path(tempfile.gettempdir()) / wheel_hash
-        temp_wheel_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(latest_wheel, temp_wheel_dir)
+        if temp_wheel_dir.exists():
+            runtime_packaging.verify_internal_bundle(
+                temp_wheel_dir,
+                expected_digest=wheel_hash,
+                expected_source_input_sha256=source_digest,
+                expected_worker_record=worker_record)
+        else:
+            shutil.copytree(bundle, temp_wheel_dir)
+            runtime_packaging.verify_internal_bundle(
+                temp_wheel_dir,
+                expected_digest=wheel_hash,
+                expected_source_input_sha256=source_digest,
+                expected_worker_record=worker_record)
 
     return temp_wheel_dir.absolute(), wheel_hash

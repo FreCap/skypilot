@@ -221,7 +221,12 @@ if __name__ == '__main__':
         # (templates/*.j2 and wheel_utils.py).
         name='skypilot',
         version=find_version(),
-        packages=setuptools.find_packages(),
+        packages=setuptools.find_packages(include=(
+            'sky',
+            'sky.*',
+            'sky_templates',
+            'sky_templates.*',
+        )),
         author='SkyPilot Team',
         license='Apache 2.0',
         readme='README.md',
