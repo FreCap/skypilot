@@ -6,12 +6,12 @@ import dataclasses
 import uuid
 
 import pytest
+import test_serve_resource_action_down_execution_config
+import test_serve_resource_action_launch_execution_config
 
 from sky.serve import resource_action_state
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
-from tests.unit_tests import test_serve_resource_action_down_execution_config
-from tests.unit_tests import test_serve_resource_action_launch_execution_config
 
 down_config_fixtures = test_serve_resource_action_down_execution_config
 launch_config_fixtures = test_serve_resource_action_launch_execution_config

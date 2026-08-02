@@ -154,6 +154,7 @@ def test_direct_prepare_preserves_launch_client_boundaries(
                         health_check)
     monkeypatch.setattr(sdk, '_prepared_launch_request_in_current_context',
                         _prepare_in_context)
+    monkeypatch.setattr(usage_lib.messages.usage, 'entrypoint', None)
 
     assert sdk.prepare_launch_request(sky.Task(run='echo hello')) is prepared
     health_check.assert_called_once_with(False, '127.0.0.1')

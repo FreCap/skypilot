@@ -8,14 +8,14 @@ import datetime
 import uuid
 
 import pytest
+import test_serve_resource_action_down_execution_config
+import test_serve_resource_action_execution_foundation
+import test_serve_resource_action_skylet_policy
 
 from sky.serve import resource_action_progress as progress
 from sky.serve import resource_actions as values
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import resource_actions as kernel
-from tests.unit_tests import test_serve_resource_action_down_execution_config
-from tests.unit_tests import test_serve_resource_action_execution_foundation
-from tests.unit_tests import test_serve_resource_action_skylet_policy
 
 down_config_fixtures = test_serve_resource_action_down_execution_config
 foundation = test_serve_resource_action_execution_foundation

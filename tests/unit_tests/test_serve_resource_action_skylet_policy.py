@@ -5,9 +5,9 @@ import dataclasses
 import json
 
 import pytest
+import test_serve_resource_action_launch_execution_config
 
 from sky.serve import resource_actions as actions
-from tests.unit_tests import test_serve_resource_action_launch_execution_config
 
 launch_config_fixtures = test_serve_resource_action_launch_execution_config
 _SUBMISSION_KEY = '11111111-1111-4111-8111-111111111111'

@@ -5,11 +5,11 @@
 import copy
 
 import pytest
+import test_serve_resource_action_progress as fixtures
 
 from sky.server.requests import resource_actions as kernel_actions
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import encoders
-from tests.unit_tests import test_serve_resource_action_progress as fixtures
 
 _PRIVATE_REQUEST_NAMES = (
     'sky.serve_resource_action_launch',

@@ -2960,7 +2960,7 @@ class TestMigrationChainPG:
 
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '032')
             with engine.connect() as connection:
                 row = connection.execute(
                     sqlalchemy.text(
@@ -2997,7 +2997,7 @@ class TestMigrationChainPG:
             alembic_command.downgrade(config, '031')
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '032')
             with engine.connect() as connection:
                 assert connection.execute(
                     sqlalchemy.text(
