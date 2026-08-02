@@ -684,6 +684,103 @@ def test_api006_attempt_constraints_reject_invalid_boundary_and_progress_shape(
                         1).values(**values))
 
 
+def test_active_provider_io_rejects_bounded_progress_hash_mismatch(
+        action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    store.materialize(action.action_id, 1, 1, request)
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        store.commit_intent_with_progress(request.request_id,
+                                          _typed_progress(item, store), 0)
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                        action.action_id,
+                        request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                        1).values(provider_progress_sha256='0' * 64))
+        with pytest.raises(actions.InvariantViolation,
+                           match='Active provider progress hash'):
+            store.record_submission(request.request_id, None)
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+
+
+def test_terminal_reducer_classifies_bounded_progress_hash_mismatch(
+        action_database):
+    engine, backend, store = action_database
+    action = _admit(engine, store, _new_action())
+    request = _request(action.action_id)
+    materialized = store.materialize(action.action_id, 1, 1, request)
+    assert materialized is not None and materialized.created
+    item = _claim(backend, request.request_id)
+    claim_token = storage.activate_execution_claim(item.request_id,
+                                                   item.execution_generation,
+                                                   item.claim_token)
+    try:
+        store.commit_intent_with_progress(request.request_id,
+                                          _typed_progress(item, store), 0)
+        assert backend.transition_request_terminal(
+            request.request_id, requests.RequestStatus.FAILED, 'handler_failed')
+    finally:
+        storage.deactivate_execution_claim(claim_token)
+    declared_hash = '0' * 64
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.RESOURCE_ACTION_ATTEMPTS).where(
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.action_id ==
+                action.action_id,
+                request_postgres.RESOURCE_ACTION_ATTEMPTS.c.attempt ==
+                1).values(provider_progress_sha256=declared_hash))
+    request_input = actions.ActionRequestInput.from_request(
+        action.action_id, 1, request)
+    reducer_calls = []
+
+    def reducer(unused_connection, unused_action, attempt_record,
+                unused_context):
+        del unused_connection, unused_action, unused_context
+        reducer_calls.append(attempt_record)
+        assert attempt_record.provider_progress is not None
+        assert attempt_record.provider_progress_sha256 == declared_hash
+        assert actions.canonical_sha256(
+            attempt_record.provider_progress) != declared_hash
+        return actions.ActionReduction(kernel_state=actions.KernelState.BLOCKED,
+                                       typed_outcome={
+                                           'version': 1,
+                                           'disposition': 'terminal_error',
+                                           'provider_operation_id': None,
+                                       },
+                                       result={
+                                           'version': 1,
+                                           'classification': 'invalid_journal',
+                                       })
+
+    with engine.begin() as connection:
+        settled = store.reduce_in_transaction(connection, action.action_id, 1,
+                                              materialized.action.revision,
+                                              request_input, reducer)
+    assert len(reducer_calls) == 1
+    assert settled.action.kernel_state is actions.KernelState.BLOCKED
+    assert settled.attempt.provider_progress_sha256 == declared_hash
+
+    def replay_reducer(*unused_args):
+        del unused_args
+        raise AssertionError('settled replay invoked reducer')
+
+    with engine.begin() as connection:
+        replayed = store.reduce_in_transaction(connection, action.action_id, 1,
+                                               materialized.action.revision,
+                                               request_input, replay_reducer)
+    assert replayed.replayed
+    assert replayed.attempt.provider_progress_sha256 == declared_hash
+
+
 def test_claim_journal_and_retry_reduction_replay_keep_deadline(
         action_database):
     engine, backend, store = action_database

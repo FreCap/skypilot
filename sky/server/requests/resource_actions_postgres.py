@@ -145,7 +145,15 @@ def _action_record(row: Mapping[str, Any]) -> actions.ActionRecord:
 
 
 def _attempt_record(row: Mapping[str, Any]) -> actions.AttemptRecord:
-    """Decode and revalidate one durable attempt row."""
+    """Decode one outer-bounded durable attempt row.
+
+    API006's PostgreSQL CHECK owns the bounded object/null/revision/hash-text
+    shape.  Deliberately preserve a declared hash that differs from the stored
+    canonical progress bytes: the domain reducer must classify that locked raw
+    journal as invalid and persist its terminal evidence, rather than having
+    the generic queue quarantine it before reduction.  Active mutation paths
+    still pass the snapshot through the domain progress contract before I/O.
+    """
     try:
         action_id = uuid.UUID(str(_mapping_value(row, 'action_id')))
         attempt_value = _mapping_value(row, 'attempt')
@@ -206,10 +214,7 @@ def _attempt_record(row: Mapping[str, Any]) -> actions.AttemptRecord:
                 isinstance(progress_revision, bool) or progress_revision < 0):
             raise ValueError('provider progress revision is negative')
         if ((provider_progress is None) != (provider_progress_sha256 is None) or
-            (provider_progress is None) != (progress_revision == 0) or
-            (provider_progress is not None and
-             actions.canonical_sha256(provider_progress)
-             != provider_progress_sha256)):
+            (provider_progress is None) != (progress_revision == 0)):
             raise ValueError('provider progress/hash/revision shape mismatch')
         terminal_state = row.get('request_terminal_state')
         admitted_at = _timestamp(_mapping_value(row, 'admitted_at'),
@@ -595,6 +600,13 @@ class PostgresResourceActionStore:
                 raise actions.ActionConflict(
                     'A fresh retry cursor requires the exact predecessor '
                     'pre-I/O shape.')
+        elif (actions.canonical_sha256(predecessor.provider_progress)
+              != predecessor.provider_progress_sha256):
+            # Hash-mismatched raw evidence may be retained only by a blocked
+            # invalid-journal outcome; it can never authorize a retry seed.
+            raise actions.ActionConflict(
+                'Retry predecessor provider progress hash differs from its '
+                'retained bytes.')
         try:
             seed_value = self._provider_progress_contract.retry_seed(
                 action, predecessor)
@@ -618,6 +630,17 @@ class PostgresResourceActionStore:
         attempt: actions.AttemptRecord,
         execution_fence: actions.AttemptExecutionFence | None,
     ) -> None:
+        if (attempt.mutation_boundary is not actions.MutationBoundary.SETTLED
+                and attempt.provider_progress is not None and
+                actions.canonical_sha256(attempt.provider_progress)
+                != attempt.provider_progress_sha256):
+            # Only terminal reduction may consume a bounded mismatch and
+            # classify it as invalid. An active request must never continue
+            # provider I/O from such a journal, even if a buggy domain
+            # contract forgets to compare the declared hash.
+            raise actions.InvariantViolation(
+                'Active provider progress hash differs from its retained '
+                'bytes.')
         try:
             self._provider_progress_contract.validate_attempt_snapshot(
                 action, predecessor, attempt, execution_fence)
