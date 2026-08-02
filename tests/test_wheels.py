@@ -225,9 +225,22 @@ def test_release_wheel_embeds_runtime_without_publishing_it(tmp_path):
 
     main_wheel = next(publication_dir.glob('skypilot-*.whl'))
     nested_name = ('sky/skylet/runtime_wheels/v1/' + runtime_wheel.name)
+    renderer_prefix = (
+        'sky/serve/resource_action_artifacts/kubernetes_renderer_v1/')
+    renderer_source = (_REPO_ROOT / renderer_prefix)
     with zipfile.ZipFile(main_wheel) as wheel:
         names = wheel.namelist()
         assert wheel.read(nested_name) == runtime_wheel.read_bytes()
+        renderer_names = sorted(
+            name for name in names if name.startswith(renderer_prefix))
+        assert renderer_names == [
+            renderer_prefix + path.name
+            for path in sorted(renderer_source.glob('*.json'))
+        ]
+        assert len(renderer_names) == 5
+        for name in renderer_names:
+            assert wheel.read(name) == (renderer_source /
+                                        Path(name).name).read_bytes()
         assert not any(
             name.startswith('skypilot_worker_runtime/') for name in names)
         metadata_name = next(

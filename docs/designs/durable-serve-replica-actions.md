@@ -9,17 +9,21 @@ claim-fenced progress/reduction validation. The Serve-owned pure progress
 validator/reducer, exact launch/down execution configurations, completed and
 partial-launch down bases, strict private return codecs, and fail-closed
 request-result persistence are implemented and focused pure/PostgreSQL-tested.
+The five packaged pinned Kubernetes renderer artifacts, closed renderer
+input/seed, exact three-body/capsule cutover, effect-free staged renderer, and
+pure request/admitted normalizers are implemented and locally verified.
 The four private handlers remain deliberately fail closed before provider I/O.
 The activation contract now admits API005 only for legacy-controller shadow
 and requires API007 for private-handler dispatch readiness and
 `shadow -> authoritative`; API006 remains a progress substrate and cannot
 authorize M4. This is a fail-closed contract correction, not provider-runtime
 or authority evidence.
-Provider rendering and normalization, manager/runtime admission, dispatcher
-wiring, live provider I/O, atomic Serve projection, and runtime shadow
-instrumentation remain open. Authority is disabled, no service has been
-promoted, and the named legacy thread/map/retry-clock owners remain in place;
-the restructuring has not yet earned its claimed operational payoff.
+Manager/runtime integration and live qualification of that renderer,
+transport/preflight normalization, admission, dispatcher wiring, live provider
+I/O, atomic Serve projection, and runtime shadow instrumentation remain open.
+Authority is disabled, no service has been promoted, and the named legacy
+thread/map/retry-clock owners remain in place; the restructuring has not yet
+earned its claimed operational payoff.
 
 Foundation merge commit `93aec0c8a4f2e1a80ed35640c9d424bea3f9e580` was built as
 immutable image
@@ -46,8 +50,9 @@ controller with the authority worker explicitly disabled. The final dark
 checkpoint retained API007, Serve033, global-user-state 028, and capacity001;
 all eight action-family tables and all Serve service/replica/cluster tables
 had zero rows. This verifies the corrected activation and renderer contract
-can be shipped dark; renderer execution, provider I/O, and authority remain
-unimplemented and unproved.
+can be shipped dark. That historical image did not contain or exercise the
+later pure-renderer implementation; runtime renderer integration, provider
+I/O, and authority remain unproved.
 
 Last updated: 2026-08-02
 
@@ -482,9 +487,10 @@ measure at most 60,000 bytes. The corrected implementation now freezes the
 completed-launch case and all 20 legal partial-launch cases with exact
 realistic/candidate-maximal byte/hash goldens and enforces that limit in tests.
 This closes only the immutable down-spec graph measurement; it does not supply
-the still-missing runtime renderer/normalizer or the complete live progress,
-outcome, worker-attestation, and preflight-envelope representability pass, so
-authority remains disabled.
+the still-missing runtime integration and live qualification of the
+implemented renderer/normalizers or the complete live progress, outcome,
+worker-attestation, and preflight-envelope representability pass, so authority
+remains disabled.
 
 Provider progress is attempt-local storage for one action-wide monotonic
 provider cursor. Materializing attempt `n+1` locks the action and settled
@@ -2360,14 +2366,14 @@ The open implementation stack is:
 
 PR #1191 is deliberately not titled or described as M5 removal. In its current
 preparatory form it preserves legacy/shadow behavior and cannot merge. It must
-remain draft until M4 implements the renderer, dispatcher, provider I/O,
-reducer projection, and recovery; `PLA-GAP-005` is closed; at least 24 hours
-and 100 launches plus 100 downs establish clean live evidence with zero
-unresolved divergence; every crash-boundary canary passes; the compatible
-rollback window closes; and all applicable `PLA-M5-*` source, test, telemetry,
-and release-window gates pass. The draft must then be amended to actually
-delete the isolated legacy runtime and fallbacks, with final-steady-state
-tests, before it is eligible to merge.
+remain draft until M4 integrates and live-qualifies the implemented renderer,
+dispatcher, provider I/O, reducer projection, and recovery; `PLA-GAP-005` is
+closed; at least 24 hours and 100 launches plus 100 downs establish clean live
+evidence with zero unresolved divergence; every crash-boundary canary passes;
+the compatible rollback window closes; and all applicable `PLA-M5-*` source,
+test, telemetry, and release-window gates pass. The draft must then be amended
+to actually delete the isolated legacy runtime and fallbacks, with
+final-steady-state tests, before it is eligible to merge.
 
 ### M0: bounded canonical design
 
@@ -2515,9 +2521,10 @@ M2 foundation verification evidence through 2026-08-02:
   action-specific success proof. The stricter frozen Kubernetes scope, exact
   launch and down execution configurations, completed-launch basis, all 20
   legal partial-launch cleanup shapes, and their full-spec byte/hash goldens
-  are now implemented and locally verified. These are immutable contract and
-  persistence foundations; no provider renderer, normalizer, or runtime
-  mutation path consumes them yet; and
+  are now implemented and locally verified. The five exact packaged artifacts,
+  pure staged renderer, exact body/capsule cutover, and request/admitted
+  normalizers now consume those launch values in an effect-free construction
+  path. No manager/runtime mutation path consumes the result yet; and
 - the PostgreSQL typed shadow store plus Serve033 coverage/cohort and promotion
   suites pass locally, including exact parent/child replay, retry-chain
   closure, reference fencing, coverage-only attempts, bounded canonical
@@ -2536,10 +2543,10 @@ admission: no manager currently creates and discards the preparation
 capability, calls the canonicalization/preflight client, or routes a real
 legacy or action request through this primitive.
 
-Manager/runtime admission, legacy SDK instrumentation, provider rendering and
-normalization, provider identity propagation/readback, atomic action-to-Serve
-projection, and live shadow evaluation remain M2 gates. No service is eligible
-for authority.
+Manager/runtime admission, legacy SDK instrumentation, runtime integration and
+live qualification of provider rendering/normalization, provider identity
+propagation/readback, atomic action-to-Serve projection, and live shadow
+evaluation remain M2 gates. No service is eligible for authority.
 
 ### M3: dark dispatcher and recovery
 
@@ -2568,10 +2575,10 @@ for authority.
   but their implementations intentionally raise before reading provider
   credentials or crossing a provider-I/O boundary. This is a safety fence, not
   a working provider path.
-- Dispatcher invocation, provider rendering/normalization, pre-I/O admission,
-  provider checkpoint writes, request-to-reducer wiring, and atomic Serve
-  projection remain dark. No synthetic or canary action has executed provider
-  I/O through M3.
+- Dispatcher and runtime invocation of the implemented pure
+  renderer/normalizers, pre-I/O admission, provider checkpoint writes,
+  request-to-reducer wiring, and atomic Serve projection remain dark. No
+  synthetic or canary action has executed provider I/O through M3.
 
 M3 foundation verification evidence on 2026-08-02:
 
@@ -2596,11 +2603,24 @@ M3 foundation verification evidence on 2026-08-02:
   focused generic request PostgreSQL/SQLite cases pass and prove strict round
   trip, exact request-name binding, and fail-closed persistence for null or
   malformed private returns; and
+- the 60-case focused renderer/artifact/normalizer matrix and complete
+  1,543-case `test_serve_resource_action*.py` matrix pass, the latter with the
+  real PostgreSQL test URL. They cover the five packaged artifact preimages,
+  descriptor-bound nonblocking regular-file resolution, exact staged
+  call/input inventory, atomic
+  exact-body/full-spec golden cutover, pure request/admitted normalization, and
+  completed-capsule revalidation. The built-wheel test embeds all five
+  artifacts byte-for-byte. Runtime executable and source-AST seals pass on
+  CPython 3.10.20, 3.11.15, 3.12.13, 3.13.14, 3.14.3, and the CI image's
+  3.14.6 after making nested code-object traversal identity-unique and using
+  `Instruction.positions.lineno` with an exact-integer `starts_line` fallback;
+  the exact one-fingerprint-per-minor allowlist remains fail closed; and
 - these results verify pure contracts and dark persistence only. They provide
-  no renderer/normalizer, live preflight, provider mutation/readback, runtime
-  dispatcher, atomic Serve projection, shadow-parity, or crash-canary evidence.
-  The reducer's maximum-attempt disposition is implemented, but emission of
-  the named `attempt_domain_exhausted` operational event remains open.
+  no runtime integration or live qualification of the pure renderer and
+  normalizers, live preflight, provider mutation/readback, runtime dispatcher,
+  atomic Serve projection, shadow-parity, or crash-canary evidence. The
+  reducer's maximum-attempt disposition is implemented, but emission of the
+  named `attempt_domain_exhausted` operational event remains open.
 
 ### M4: per-service authority
 
@@ -3035,17 +3055,19 @@ write typed outcomes.
   primitive, legacy launch/down instrumentation, and the owner-fenced atomic
   action/replica/capacity/event projection on top of the implemented Serve033
   stores and promotion/retention protocol.
-- The candidate provider renderer and normalizer, exact live preflight,
-  real private-handler submit/observe/readback/checkpoint implementation,
-  dispatcher and reducer invocation, partial-launch cleanup execution, and
-  `attempt_domain_exhausted` event emission. The pure cursor/reducer,
-  lineage-safe generic store, strict codecs, execution configurations,
-  quiescence construction, and realistic/candidate-maximal full-spec goldens
-  are implemented; capped live rendered bodies and preflight envelopes still
-  require measurement. Runtime private-handler shadow and provider dispatch
-  must consume the API007-only `private_handler_dispatch_ready` fence
-  immediately before dispatch. Authority remains disabled until the runtime
-  and live gates pass.
+- Runtime/preflight integration, cohort binding, candidate-maximal measurement,
+  and canary/live qualification of the implemented provider renderer and
+  normalizers; exact live preflight; real private-handler
+  submit/observe/readback/checkpoint implementation; dispatcher and reducer
+  invocation; partial-launch cleanup execution; and
+  `attempt_domain_exhausted` event emission. The pure renderer/normalizers,
+  cursor/reducer, lineage-safe generic store, strict codecs, execution
+  configurations, quiescence construction, and realistic/candidate-maximal
+  full-spec goldens are implemented; capped live rendered bodies and preflight
+  envelopes still require measurement. Runtime private-handler shadow and
+  provider dispatch must consume the API007-only
+  `private_handler_dispatch_ready` fence immediately before dispatch.
+  Authority remains disabled until the runtime and live gates pass.
 - The dark API -> ordinary executor -> controller rollout and current-chart
   compatible-image rollback are verified above. Still open are rendered/live
   activation of the dedicated versioned authority-worker Helm cohort, exact

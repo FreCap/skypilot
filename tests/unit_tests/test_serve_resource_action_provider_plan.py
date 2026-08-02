@@ -5,7 +5,9 @@
 import builtins
 import copy
 import dataclasses
+import hashlib
 import operator
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,9 @@ from sky.serve import resource_actions as actions
 
 _CLUSTER_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
+_RENDERER_ARTIFACT_ROOT = (Path(__file__).resolve().parents[2] / 'sky' /
+                           'serve' / 'resource_action_artifacts' /
+                           'kubernetes_renderer_v1')
 _PREREQUISITE_ROLE_KINDS = (
     ('authority_release_namespace', 'Namespace'),
     ('target_namespace', 'Namespace'),
@@ -345,6 +350,148 @@ def _identity_labels() -> list[dict]:
     }]
 
 
+def _renderer_request_body(
+    role: str,
+    *,
+    namespace: str = 'serve-canary',
+    provider_cluster_name: str = 'svc-replica',
+    cleaned_user: str = 'effectiveexamplecom',
+    original_user: str = 'effective@example.com',
+    cluster_uuid: str = _CLUSTER_UUID,
+    replica_uuid: str = _REPLICA_UUID,
+    workload_service_account: str = 'serve-workload',
+    workload_image: str = 'registry.example/runtime:approved@sha256:' +
+    '1' * 64,
+    image_pull_policy: str = 'Always',
+    replica_id_text: str = '7',
+    pod_cpu_request: str = '0.5',
+    pod_cpu_limit: str = '0.5',
+    pod_memory_request: str = '1.23G',
+    pod_memory_limit: str = '1.23G',
+) -> dict:
+    workload_name = f'{provider_cluster_name}-head'
+    name = (f'{workload_name}-ssh'
+            if role == 'head_ssh_service' else workload_name)
+    labels = {
+        'skypilot-cluster-name': provider_cluster_name,
+        'skypilot-user': cleaned_user,
+        'skypilot.co/cluster-record-uuid': cluster_uuid,
+        'skypilot.co/serve-replica-incarnation': replica_uuid,
+    }
+    if role == 'head_pod':
+        labels['component'] = workload_name
+    else:
+        labels['service-role'] = role
+    metadata = {
+        'labels': labels,
+        'name': name,
+        'namespace': namespace,
+    }
+    selector = {
+        'component': workload_name,
+        'skypilot-cluster-name': provider_cluster_name,
+        'skypilot.co/cluster-record-uuid': cluster_uuid,
+        'skypilot.co/serve-replica-incarnation': replica_uuid,
+    }
+    if role == 'head_ssh_service':
+        kind = 'Service'
+        spec = {
+            'internalTrafficPolicy': 'Cluster',
+            'ports': [{
+                'port': 22,
+                'protocol': 'TCP',
+                'targetPort': 22,
+            }],
+            'selector': selector,
+            'sessionAffinity': 'None',
+            'type': 'ClusterIP',
+        }
+    elif role == 'head_service':
+        kind = 'Service'
+        spec = {
+            'clusterIP': 'None',
+            'internalTrafficPolicy': 'Cluster',
+            'selector': selector,
+            'sessionAffinity': 'None',
+            'type': 'ClusterIP',
+        }
+    else:
+        kind = 'Pod'
+        metadata['annotations'] = {'skypilot-user': original_user}
+        spec = {
+            'automountServiceAccountToken': False,
+            'containers': [{
+                'env': [{
+                    'name': 'SKYPILOT_SERVE_REPLICA_ID',
+                    'value': replica_id_text,
+                }],
+                'image': workload_image,
+                'imagePullPolicy': image_pull_policy,
+                'name': 'ray-node',
+                'ports': [{
+                    'containerPort': port,
+                    'protocol': 'TCP',
+                } for port in (10001, 10002, 10003, 10004, 46590)],
+                'resources': {
+                    'limits': {
+                        'cpu': pod_cpu_limit,
+                        'memory': pod_memory_limit,
+                    },
+                    'requests': {
+                        'cpu': pod_cpu_request,
+                        'memory': pod_memory_request,
+                    },
+                },
+                'terminationMessagePath': '/dev/termination-log',
+                'terminationMessagePolicy': 'File',
+            }],
+            'dnsPolicy': 'ClusterFirst',
+            'enableServiceLinks': True,
+            'preemptionPolicy': 'PreemptLowerPriority',
+            'priority': 0,
+            'restartPolicy': 'Always',
+            'schedulerName': 'default-scheduler',
+            'securityContext': {},
+            'serviceAccount': workload_service_account,
+            'serviceAccountName': workload_service_account,
+            'terminationGracePeriodSeconds': 30,
+            'tolerations': [{
+                'effect': 'NoExecute',
+                'key': 'node.kubernetes.io/not-ready',
+                'operator': 'Exists',
+                'tolerationSeconds': 300,
+            }, {
+                'effect': 'NoExecute',
+                'key': 'node.kubernetes.io/unreachable',
+                'operator': 'Exists',
+                'tolerationSeconds': 300,
+            }],
+        }
+    return {
+        'apiVersion': 'v1',
+        'kind': kind,
+        'metadata': metadata,
+        'spec': spec,
+    }
+
+
+def _renderer_requested_semantic(role: str, request_body: dict) -> dict:
+    semantic = copy.deepcopy(request_body)
+    if role == 'head_service':
+        del semantic['spec']['clusterIP']
+    return semantic
+
+
+def _renderer_artifact_ref(role: str) -> dict:
+    path = _RENDERER_ARTIFACT_ROOT / f'{role}.json'
+    raw = path.read_bytes()
+    return {
+        'repo_path': str(path.relative_to(_RENDERER_ARTIFACT_ROOT.parents[3])),
+        'byte_size': len(raw),
+        'sha256': hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def _object_plan(role: str) -> dict:
     role_contracts = {
         'head_ssh_service': (0, 'Service', 'svc-replica-head-ssh'),
@@ -353,22 +500,8 @@ def _object_plan(role: str) -> dict:
     }
     sequence, kind, name = role_contracts[role]
     labels = _identity_labels()
-    body_labels = {label['key']: label['value'] for label in labels}
-    body_labels['role-specific'] = role
-    request_body = {
-        'apiVersion': 'v1',
-        'kind': kind,
-        'metadata': {
-            'namespace': 'serve-canary',
-            'name': name,
-            'labels': body_labels,
-        },
-        'spec': {
-            'reviewedProfile': 'direct-pod-v1'
-        },
-    }
-    requested_semantic = copy.deepcopy(request_body)
-    requested_semantic['admissionDefaults'] = {'explicit': True}
+    request_body = _renderer_request_body(role)
+    requested_semantic = _renderer_requested_semantic(role, request_body)
     return {
         'sequence': sequence,
         'role': role,
@@ -384,19 +517,20 @@ def _object_plan(role: str) -> dict:
             actions.canonical_sha256(requested_semantic),
         'comparison_contract': 'kubernetes_admitted_object_v1',
         'normalization_profile':
-            _artifact('contracts/admitted-object-normalization.json'),
+            _renderer_artifact_ref('admitted_object_normalization'),
     }
 
 
 def _renderer() -> dict:
     return {
         'contract': 'serve_prebooted_direct_pod_v1',
-        'outer_template': _artifact('renderer/outer.j2', '1'),
-        'node_fragment': _artifact('renderer/node.yaml', '2'),
-        'binding_schema': _artifact('renderer/bindings.json', '3'),
-        'config_access_inventory': _artifact('renderer/config.json', '4'),
-        'admitted_object_normalization': _artifact('renderer/normalize.py',
-                                                   '5'),
+        'outer_template': _renderer_artifact_ref('outer_template'),
+        'node_fragment': _renderer_artifact_ref('node_fragment'),
+        'binding_schema': _renderer_artifact_ref('binding_schema'),
+        'config_access_inventory':
+            _renderer_artifact_ref('config_access_inventory'),
+        'admitted_object_normalization':
+            _renderer_artifact_ref('admitted_object_normalization'),
         'source': _source(),
     }
 
@@ -959,7 +1093,7 @@ def test_prerequisite_is_closed_and_requires_typed_direct_spec() -> None:
 
 @pytest.mark.parametrize('role',
                          ['head_ssh_service', 'head_service', 'head_pod'])
-def test_object_plan_roundtrip_exact_identity_and_extra_body_labels(
+def test_object_plan_roundtrip_exact_identity_and_role_labels(
         role: str) -> None:
     raw = _object_plan(role)
     parsed = actions.ProviderKubernetesObjectPlanV1.from_value(raw)
@@ -967,8 +1101,13 @@ def test_object_plan_roundtrip_exact_identity_and_extra_body_labels(
     assert parsed.canonical_value() == raw
     assert parsed.request_body_sha256 == parsed.request_body.sha256
     assert parsed.requested_semantic_sha256 == parsed.requested_semantic.sha256
-    assert parsed.request_body.canonical_value(
-    )['metadata']['labels']['role-specific'] == role
+    body = parsed.request_body.canonical_value()
+    labels = body['metadata']['labels']
+    assert len(labels) == 5
+    if role == 'head_pod':
+        assert labels['component'] == body['metadata']['name']
+    else:
+        assert labels['service-role'] == role
     assert parsed.sha256 == actions.canonical_sha256(raw)
     assert actions.ProviderKubernetesObjectPlanV1.from_value(
         parsed.canonical_value()).canonical_bytes == parsed.canonical_bytes
@@ -1067,6 +1206,27 @@ def test_object_plan_rejects_request_body_identity_mismatch(
         target = target[key]
     target[path[-1]] = value
     _rehash_request_body(raw)
+    with pytest.raises(ValueError, match='request body'):
+        actions.ProviderKubernetesObjectPlanV1.from_value(raw)
+
+
+@pytest.mark.parametrize(('role', 'mutation'), [
+    ('head_pod', 'extra'),
+    ('head_service', 'missing'),
+    ('head_ssh_service', 'mis_role'),
+])
+def test_object_plan_rejects_nonexact_role_specific_body_labels(
+        role: str, mutation: str) -> None:
+    raw = _object_plan(role)
+    labels = raw['request_body']['metadata']['labels']
+    if mutation == 'extra':
+        labels['extra'] = 'not-reviewed'
+    elif mutation == 'missing':
+        del labels['skypilot-user']
+    else:
+        labels['service-role'] = 'head_service'
+    _rehash_request_body(raw)
+
     with pytest.raises(ValueError, match='request body'):
         actions.ProviderKubernetesObjectPlanV1.from_value(raw)
 
@@ -1197,8 +1357,10 @@ def test_renderer_roundtrip_and_accepts_equal_or_swapped_refs_at_leaf() -> None:
     swapped['outer_template'], swapped['node_fragment'] = (
         swapped['node_fragment'], swapped['outer_template'])
     swapped_refs = actions.ProviderKubernetesRendererV1.from_value(swapped)
-    assert swapped_refs.outer_template.repo_path == 'renderer/node.yaml'
-    assert swapped_refs.node_fragment.repo_path == 'renderer/outer.j2'
+    assert swapped_refs.outer_template.repo_path == _renderer_artifact_ref(
+        'node_fragment')['repo_path']
+    assert swapped_refs.node_fragment.repo_path == _renderer_artifact_ref(
+        'outer_template')['repo_path']
 
 
 @pytest.mark.parametrize(('field', 'value'), [

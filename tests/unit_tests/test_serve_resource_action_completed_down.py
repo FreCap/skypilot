@@ -4,6 +4,7 @@ import copy
 import dataclasses
 
 import pytest
+import test_serve_resource_action_provider_plan as plan_fixtures
 
 from sky.serve import resource_actions as actions
 
@@ -13,7 +14,7 @@ _OBSERVED_AT = '2026-08-01T05:06:07.123456Z'
 _EXPECTED_SSH_RESOLVED_BYTES = (
     b'{"kind":"Service","name":"svc-replica-head-ssh","namespace":'
     b'"serve-canary","observed_semantic_sha256":'
-    b'"ede587f0b94eba52aa8eb05c2b4d5af3152507f4cbd3b9727857b36fdeb53df9",'
+    b'"a92c2d8ce8a2e111bf5db9e1bbf2030c6e14801bce41418c2164afeecb89df78",'
     b'"role":"head_ssh_service","server_allocations":[{"allocator":'
     b'"api_server","json_pointer":"/spec/clusterIP","value":"10.0.0.7"},'
     b'{"allocator":"api_server","json_pointer":"/spec/clusterIPs","value":'
@@ -213,22 +214,11 @@ def _object_plan(role: str) -> dict:
     }
     sequence, kind, name = contracts[role]
     labels = _identity_labels()
-    body_labels = {item['key']: item['value'] for item in labels}
-    body_labels['role-specific'] = role
-    request_body = {
-        'apiVersion': 'v1',
-        'kind': kind,
-        'metadata': {
-            'namespace': 'serve-canary',
-            'name': name,
-            'labels': body_labels,
-        },
-        'spec': {
-            'reviewedProfile': 'direct-pod-v1'
-        },
-    }
-    requested_semantic = copy.deepcopy(request_body)
-    requested_semantic['admissionDefaults'] = {'explicit': True}
+    request_body = plan_fixtures._renderer_request_body(role)
+    assert request_body['kind'] == kind
+    assert request_body['metadata']['name'] == name
+    requested_semantic = plan_fixtures._renderer_requested_semantic(
+        role, request_body)
     return {
         'sequence': sequence,
         'role': role,
@@ -243,7 +233,8 @@ def _object_plan(role: str) -> dict:
         'requested_semantic_sha256':
             actions.canonical_sha256(requested_semantic),
         'comparison_contract': 'kubernetes_admitted_object_v1',
-        'normalization_profile': _artifact(),
+        'normalization_profile': plan_fixtures._renderer_artifact_ref(
+            'admitted_object_normalization'),
     }
 
 
@@ -407,7 +398,7 @@ def test_resolved_object_roundtrip_hash_and_role_allocations(role: str) -> None:
     if role == 'head_ssh_service':
         assert parsed.canonical_bytes == _EXPECTED_SSH_RESOLVED_BYTES
         assert parsed.sha256 == (
-            '560339a1985755ab966b5077238b681bcd551ec794bce8bc13cffcb12fde0deb')
+            '0e45c179103a59afd8445ede0f15cd1ab9b3fc627568e808b72197fbe40a0c95')
 
 
 def test_resolved_pod_allows_unscheduled_partial_but_marks_it_incomplete(
@@ -473,7 +464,7 @@ def test_partial_target_accepts_every_committed_prefix(
     if committed_count == 2:
         assert len(parsed.canonical_bytes) == 1_476
         assert parsed.sha256 == (
-            'b7313adc3b1a189ed50e4f40233f8e3002315a0b3d90b0ffa7d07aff41acd508')
+            '343168b2cf2e347291b15f762705637fe4edd6493907a091b0a1b8553e44824a')
 
 
 def test_resolved_slot_rejects_nullability_role_order_and_nonprefix() -> None:
@@ -615,9 +606,9 @@ def test_completed_cleanup_roundtrip_hash_handle_and_delete_projection(
 
     assert parsed.canonical_value() == raw
     assert parsed.sha256 == actions.canonical_sha256(raw)
-    assert len(parsed.canonical_bytes) == 7_152
+    assert len(parsed.canonical_bytes) == 11_090
     assert parsed.sha256 == (
-        '49d6435cf094c3fb4410e1b4405560854c8e0be37b9213db163ce038e88e3e5f')
+        '5784474fb9150b407b0e7fc1b9f20042c82bfccfab3004474875dec8eef83679')
     assert actions.ProviderKubernetesCleanupTargetV1.from_value(
         parsed.canonical_value()).canonical_bytes == parsed.canonical_bytes
     assert [item.role.value for item in parsed.objects
