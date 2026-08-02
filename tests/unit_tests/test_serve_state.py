@@ -413,6 +413,98 @@ def test_resource_action_common_columns_default_to_inert(_mock_serve_db):
                for name in serve_state._ACTION_OWNED_REPLICA_COLUMNS)
 
 
+def test_replica_teardown_identity_snapshot_distinguishes_legacy_and_action(
+        _mock_serve_db):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    replica = _replica(1)
+    assert serve_state.add_or_update_replica('svc', 1, replica)
+
+    assert serve_state.get_replica_resource_action_identities('svc',
+                                                              [1, 2]) == {
+                                                                  1: None
+                                                              }
+    snapshot = serve_state.get_replica_info_with_resource_action_identity(
+        'svc', 1)
+    assert snapshot is not None
+    legacy_info, legacy_identity = snapshot
+    assert legacy_info.cluster_name == 'svc-1'
+    assert legacy_identity is None
+
+    replica_incarnation = uuid.uuid4()
+    cluster_record_uuid = uuid.uuid4()
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1).values(
+                    replica_incarnation=replica_incarnation,
+                    desired_generation=3,
+                    sky_cluster_record_uuid=cluster_record_uuid))
+        session.commit()
+
+    action_identity = serve_state.get_replica_resource_action_identity('svc', 1)
+    assert action_identity == serve_state.ReplicaResourceActionIdentity(
+        replica_id=1,
+        cluster_name='svc-1',
+        replica_incarnation=replica_incarnation,
+        desired_generation=3,
+        sky_cluster_record_uuid=cluster_record_uuid)
+    action_snapshot = (
+        serve_state.get_replica_info_with_resource_action_identity('svc', 1))
+    assert action_snapshot is not None
+    assert action_snapshot[0].cluster_name == 'svc-1'
+    assert action_snapshot[1] == action_identity
+
+
+@pytest.mark.parametrize('invalid_values, message', [
+    ({
+        'replica_incarnation': uuid.uuid4()
+    }, 'partial or invalid'),
+    ({
+        'launch_action_id': uuid.uuid4()
+    }, 'legacy replica row has resource-action links'),
+    ({
+        'replica_incarnation': uuid.uuid4(),
+        'desired_generation': 1,
+        'sky_cluster_record_uuid': uuid.uuid4(),
+        'launch_action_id': uuid.uuid4(),
+        'launch_shadow_coverage_id': uuid.uuid4(),
+    }, 'competing launch action owners'),
+])
+def test_replica_teardown_identity_snapshot_rejects_invalid_rows(
+        _mock_serve_db, invalid_values, message):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1).values(
+                    **invalid_values))
+        session.commit()
+
+    with pytest.raises(serve_state.MalformedReplicaResourceActionIdentityError,
+                       match=message):
+        serve_state.get_replica_resource_action_identities('svc', [1])
+
+
+def test_replica_teardown_snapshot_rejects_divergent_physical_column(
+        _mock_serve_db):
+    _add_minimal_service('svc', service_hash='incarnation-a')
+    assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == 1).values(
+                    cluster_name='replacement-cluster'))
+        session.commit()
+
+    with pytest.raises(serve_state.MalformedReplicaResourceActionIdentityError,
+                       match='JSON state differs'):
+        serve_state.get_replica_info_with_resource_action_identity('svc', 1)
+
+
 def test_all_generic_replica_upserts_preserve_action_owned_columns(
         _mock_serve_db):
     service_hash = 'incarnation-a'

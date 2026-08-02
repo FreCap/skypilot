@@ -1,5 +1,6 @@
 """The database for services information."""
 import collections
+import dataclasses
 import enum
 import json
 import pickle
@@ -183,6 +184,21 @@ class OrphanedStorageCleanupIntentsError(RuntimeError):
 
 class OrphanedVersionRecordsError(RuntimeError):
     """Fresh registration found predecessor version cleanup inventory."""
+
+
+class MalformedReplicaResourceActionIdentityError(RuntimeError):
+    """A replica row has an unsafe partial resource-action identity."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplicaResourceActionIdentity:
+    """Exact persisted resource identity used to fence replica teardown."""
+
+    replica_id: int
+    cluster_name: str
+    replica_incarnation: uuid.UUID
+    desired_generation: int
+    sky_cluster_record_uuid: uuid.UUID
 
 
 def _ephemeral_storage_generation_from_yaml(
@@ -3019,6 +3035,158 @@ def remove_replicas(
                     replicas_table.c.replica_id.in_(chunk)))
         session.commit()
     return True
+
+
+def _replica_resource_action_identity_from_row(
+    row: sqlalchemy.engine.Row,) -> ReplicaResourceActionIdentity | None:
+    """Decode one no-pickle identity row and reject partial commitments."""
+    values = row._mapping  # pylint: disable=protected-access
+    identity_values = (
+        values['replica_incarnation'],
+        values['desired_generation'],
+        values['sky_cluster_record_uuid'],
+    )
+    link_names = (
+        'launch_action_id',
+        'down_action_id',
+        'launch_shadow_coverage_id',
+        'down_shadow_coverage_id',
+        'launch_shadow_sample_id',
+        'down_shadow_sample_id',
+    )
+    link_values = {name: values[name] for name in link_names}
+    if all(value is None for value in identity_values):
+        if any(value is not None for value in link_values.values()):
+            raise MalformedReplicaResourceActionIdentityError(
+                'A legacy replica row has resource-action links.')
+        return None
+    replica_incarnation, desired_generation, cluster_record_uuid = (
+        identity_values)
+    if (not isinstance(replica_incarnation, uuid.UUID) or
+            type(desired_generation) is not int or desired_generation <= 0 or
+            not isinstance(cluster_record_uuid, uuid.UUID)):
+        raise MalformedReplicaResourceActionIdentityError(
+            'A replica row has a partial or invalid resource-action identity.')
+    for name, value in link_values.items():
+        if value is not None and not isinstance(value, uuid.UUID):
+            raise MalformedReplicaResourceActionIdentityError(
+                f'A replica row has an invalid {name}.')
+    launch_coverage = link_values['launch_shadow_coverage_id']
+    down_coverage = link_values['down_shadow_coverage_id']
+    if (link_values['launch_action_id'] is not None and
+            launch_coverage is not None):
+        raise MalformedReplicaResourceActionIdentityError(
+            'A replica row has competing launch action owners.')
+    if (link_values['down_action_id'] is not None and
+            down_coverage is not None):
+        raise MalformedReplicaResourceActionIdentityError(
+            'A replica row has competing down action owners.')
+    if (link_values['launch_shadow_sample_id'] is not None and
+            link_values['launch_shadow_sample_id'] != launch_coverage):
+        raise MalformedReplicaResourceActionIdentityError(
+            'A replica row has an unbound launch shadow sample.')
+    if (link_values['down_shadow_sample_id'] is not None and
+            link_values['down_shadow_sample_id'] != down_coverage):
+        raise MalformedReplicaResourceActionIdentityError(
+            'A replica row has an unbound down shadow sample.')
+    replica_id = values['replica_id']
+    cluster_name = values['cluster_name']
+    if (type(replica_id) is not int or replica_id < 0 or
+            not isinstance(cluster_name, str) or not cluster_name):
+        raise MalformedReplicaResourceActionIdentityError(
+            'A replica row has an invalid physical target.')
+    return ReplicaResourceActionIdentity(
+        replica_id=replica_id,
+        cluster_name=cluster_name,
+        replica_incarnation=replica_incarnation,
+        desired_generation=desired_generation,
+        sky_cluster_record_uuid=cluster_record_uuid,
+    )
+
+
+def get_replica_resource_action_identities(
+    service_name: str,
+    replica_ids: list[int],
+) -> dict[int, ReplicaResourceActionIdentity | None]:
+    """Read exact action-aware teardown identities without deserializing rows.
+
+    Legacy all-null rows map to ``None`` and missing rows are omitted.  Any
+    partial identity or contradictory action/shadow linkage fails the entire
+    snapshot closed so a caller cannot fall back to an unsafe name-only
+    teardown for an action-owned resource.
+    """
+    replica_ids = list(dict.fromkeys(replica_ids))
+    if not replica_ids:
+        return {}
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.replica_id,
+                replicas_table.c.cluster_name,
+                replicas_table.c.replica_incarnation,
+                replicas_table.c.desired_generation,
+                replicas_table.c.sky_cluster_record_uuid,
+                replicas_table.c.launch_action_id,
+                replicas_table.c.down_action_id,
+                replicas_table.c.launch_shadow_coverage_id,
+                replicas_table.c.down_shadow_coverage_id,
+                replicas_table.c.launch_shadow_sample_id,
+                replicas_table.c.down_shadow_sample_id,
+            ).where(replicas_table.c.service_name == service_name,
+                    replicas_table.c.replica_id.in_(replica_ids))).fetchall()
+    identities: dict[int, ReplicaResourceActionIdentity | None] = {}
+    for row in rows:
+        identity = _replica_resource_action_identity_from_row(row)
+        replica_id = row._mapping['replica_id']  # pylint: disable=protected-access
+        identities[replica_id] = identity
+    return identities
+
+
+def get_replica_resource_action_identity(
+    service_name: str,
+    replica_id: int,
+) -> ReplicaResourceActionIdentity | None:
+    """Read one exact action-aware identity; return None for legacy/missing."""
+    return get_replica_resource_action_identities(service_name,
+                                                  [replica_id]).get(replica_id)
+
+
+def get_replica_info_with_resource_action_identity(
+    service_name: str,
+    replica_id: int,
+) -> tuple['replica_managers.ReplicaInfo', ReplicaResourceActionIdentity |
+           None] | None:
+    """Atomically snapshot one replica projection and its teardown fence."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.replica_id,
+                replicas_table.c.cluster_name,
+                replicas_table.c.replica_state_version,
+                replicas_table.c.replica_state,
+                replicas_table.c.replica_incarnation,
+                replicas_table.c.desired_generation,
+                replicas_table.c.sky_cluster_record_uuid,
+                replicas_table.c.launch_action_id,
+                replicas_table.c.down_action_id,
+                replicas_table.c.launch_shadow_coverage_id,
+                replicas_table.c.down_shadow_coverage_id,
+                replicas_table.c.launch_shadow_sample_id,
+                replicas_table.c.down_shadow_sample_id,
+            ).where(replicas_table.c.service_name == service_name,
+                    replicas_table.c.replica_id == replica_id)).fetchone()
+    if row is None:
+        return None
+    values = row._mapping  # pylint: disable=protected-access
+    info = _replica_from_state(values['replica_state_version'],
+                               values['replica_state'])
+    if (info.replica_id != replica_id or
+            info.cluster_name != values['cluster_name']):
+        raise MalformedReplicaResourceActionIdentityError(
+            'Replica JSON state differs from its physical target columns.')
+    return info, _replica_resource_action_identity_from_row(row)
 
 
 def get_replica_info_from_id(

@@ -914,7 +914,8 @@ def terminate_cluster(cluster_name: str,
                       max_retry: int = 3,
                       drain_deadline: float | None = None,
                       drain_complete: Callable[[], bool] | None = None,
-                      continue_guard: Callable[[], bool] | None = None) -> None:
+                      continue_guard: Callable[[], bool] | None = None,
+                      expected_cluster_record_uuid: str | None = None) -> None:
     """Terminate the sky serve replica cluster."""
     from sky import core  # pylint: disable=import-outside-toplevel
 
@@ -956,7 +957,9 @@ def terminate_cluster(cluster_name: str,
                 skypilot_config.local_active_workspace_ctx(cluster_workspace)
                 if cluster_workspace else contextlib.nullcontext())
             with workspace_ctx:
-                core.down(cluster_name)
+                core.down(
+                    cluster_name,
+                    _expected_cluster_record_uuid=expected_cluster_record_uuid)
             logger.info(f'Replica cluster {cluster_name} terminated.')
             return
         except exceptions.ClusterDoesNotExist:
@@ -964,6 +967,11 @@ def terminate_cluster(cluster_name: str,
             logger.info(
                 f'Replica cluster {cluster_name} is already terminated.')
             return
+        except global_user_state.ClusterRecordIdentityConflictError:
+            # A different/null durable identity is not a transient provider
+            # failure. Never turn the exact action fence into repeated
+            # name-only teardown attempts.
+            raise
         except Exception as e:  # pylint: disable=broad-except
             if retry_cnt >= max_retry:
                 raise RuntimeError('Failed to terminate the sky serve replica '
@@ -1182,9 +1190,17 @@ class ReplicaManager:
             self._workspace = serve_utils.resolve_service_workspace(
                 service_name, service_record,
                 skypilot_config.get_active_workspace())
+            resource_action_mode = service_record.get('resource_action_mode',
+                                                      'legacy')
         else:
             self._workspace = (skypilot_config.get_active_workspace() or
                                constants.SKYPILOT_DEFAULT_WORKSPACE)
+            resource_action_mode = 'legacy'
+        if resource_action_mode not in ('legacy', 'shadow', 'authoritative'):
+            raise RuntimeError(
+                f'Service {service_name!r} has an invalid resource-action '
+                'mode.')
+        self._resource_action_mode = resource_action_mode
         self._resource_scope = resource_scope
         self._service_hash = service_hash
         self._controller_owner = ((controller_pid,
@@ -4167,9 +4183,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f' {replica_id}.\n')
 
         logger.info(f'Terminating replica {replica_id}...')
-        info = serve_state.get_replica_info_from_id(self._service_name,
-                                                    replica_id)
-        assert info is not None
+        if hasattr(self, '_resource_action_mode'):
+            teardown_snapshot = (
+                serve_state.get_replica_info_with_resource_action_identity(
+                    self._service_name, replica_id))
+            assert teardown_snapshot is not None
+            info, resource_action_identity = teardown_snapshot
+        else:
+            # Compatibility for lightweight embedders/tests constructed with
+            # ``__new__``. Every normally initialized manager takes the
+            # atomic action-aware snapshot above.
+            info = serve_state.get_replica_info_from_id(self._service_name,
+                                                        replica_id)
+            assert info is not None
+            resource_action_identity = None
+        expected_cluster_record_uuid = (
+            str(resource_action_identity.sky_cluster_record_uuid)
+            if resource_action_identity is not None else None)
 
         # A controller restart loses the in-memory down worker.  Once a
         # logical retirement crossed the durable teardown boundary, its
@@ -4254,6 +4284,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             kwargs={
                 'drain_deadline': drain_deadline,
                 'drain_complete': drain_complete,
+                'expected_cluster_record_uuid': expected_cluster_record_uuid,
             },
         )
         self._down_thread_pool[replica_id] = t

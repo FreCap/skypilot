@@ -2704,6 +2704,24 @@ def _terminate_failed_services_locked(
         if info.cluster_name in existing_cluster_names
     ]
     if to_terminate:
+        try:
+            teardown_identities = (
+                serve_state.get_replica_resource_action_identities(
+                    service_name, [info.replica_id for info in to_terminate]))
+            if set(teardown_identities) != {
+                    info.replica_id for info in to_terminate
+            }:
+                raise RuntimeError(
+                    'Replica inventory changed while snapshotting teardown '
+                    'identities.')
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                f'Failed to prove replica teardown identities for service '
+                f'{service_name!r}: {common_utils.format_exception(e)}')
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because its durable replica teardown '
+                    'identities could not be verified; cleanup inventory was '
+                    f'retained for retry.{colorama.Style.RESET_ALL}')
         # Imported here to break the circular dependency: replica_managers
         # imports serve_utils at module load.
         # pylint: disable=import-outside-toplevel
@@ -2727,10 +2745,14 @@ def _terminate_failed_services_locked(
             log_file_name = generate_replica_log_file_name(
                 service_name, info.replica_id, resource_scope)
             try:
+                identity = teardown_identities[info.replica_id]
                 replica_managers.terminate_cluster(
                     info.cluster_name,
                     log_file_name,
-                    continue_guard=(_worker_still_owns))
+                    continue_guard=(_worker_still_owns),
+                    expected_cluster_record_uuid=(str(
+                        identity.sky_cluster_record_uuid) if identity
+                                                  is not None else None))
                 return None
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate replica cluster '
@@ -2917,6 +2939,22 @@ def _terminate_orphaned_service_children_impl(
             info for info in replica_infos
             if info.cluster_name in existing_cluster_names
         ]
+        try:
+            teardown_identities = (
+                serve_state.get_replica_resource_action_identities(
+                    service_name, [info.replica_id for info in to_terminate]))
+            if set(teardown_identities) != {
+                    info.replica_id for info in to_terminate
+            }:
+                raise RuntimeError(
+                    'Replica inventory changed while snapshotting teardown '
+                    'identities.')
+        except Exception as e:  # pylint: disable=broad-except
+            return (f'{colorama.Fore.YELLOW}orphaned service '
+                    f'{service_name!r} could not be purged because durable '
+                    'replica teardown identities could not be verified: '
+                    f'{common_utils.format_exception(e)}.'
+                    f'{colorama.Style.RESET_ALL}')
         termination_failures = []
         for info in to_terminate:
             if not _still_orphaned():
@@ -2924,11 +2962,15 @@ def _terminate_orphaned_service_children_impl(
                     service_name,
                     'ownership lost before orphan replica cleanup')
             try:
+                identity = teardown_identities[info.replica_id]
                 replica_managers.terminate_cluster(
                     info.cluster_name,
                     generate_replica_log_file_name(service_name,
                                                    info.replica_id),
-                    continue_guard=_still_orphaned)
+                    continue_guard=_still_orphaned,
+                    expected_cluster_record_uuid=(str(
+                        identity.sky_cluster_record_uuid) if identity
+                                                  is not None else None))
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate orphan replica cluster '
                              f'{info.cluster_name!r}: '
