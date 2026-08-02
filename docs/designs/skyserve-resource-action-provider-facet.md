@@ -18,9 +18,10 @@ remains disabled. Activation evidence rejects API006 as an authority head:
 API005 is limited to legacy-controller shadow, while API007 gates
 private-handler dispatch readiness and `shadow -> authoritative`. This does
 not claim M4 or provider-authoritative rollout. The candidate v1 artifacts are
-packaged but have not been accepted into or exercised by an executor cohort;
-the eventual canary-namespace, persisted 201/409, scheduler, and runtime gates
-remain incomplete.
+packaged and present in a dark ordinary-role deployment, but have not been
+accepted into or exercised by an executor cohort; the eventual
+canary-namespace, persisted 201/409, scheduler, and runtime gates remain
+incomplete.
 
 Source commit `a836825ef9c219563bb2abc740707c825c26edc5` and immutable
 image digest
@@ -41,6 +42,20 @@ zero current restarts while authority remained disabled and every action and
 Serve graph table had zero rows at the final checkpoint. This is deployability
 evidence for the contract correction, not renderer or provider-runtime
 evidence.
+
+The pure-renderer merge commit
+`0e894c2a5d7186d15b10d62bbfdb8283201e4e63` was built from a clean detached
+checkout, published as immutable tag `resource-actions-0e894c2a5` and digest
+`sha256:b21f0e7cc39f62a21bc5887406f941d0b298d8fc277f0b5abb8b1f170c88b198`,
+and deployed dark in Helm revisions 74--76. At the 20:30:53 UTC stable
+checkpoint, all six ordinary-role Pods were ready at that exact image ID with
+zero restarts and reported the exact merge commit. Both API Pods also reported
+the packaged 23,710-byte config-access inventory at SHA256
+`19901e8e0491a4e9f957f7ff2a1244fc1baff132c37015c9e8e726af2d538f13`.
+Authority remained disabled and absent, every action and Serve graph count was
+zero, and the four schema heads were unchanged. This proves dark packaging and
+ordinary-role deployability only; no renderer entrypoint, executor cohort,
+provider I/O, shadow comparison, or authority path was exercised.
 
 Last updated: 2026-08-02
 
@@ -6212,6 +6227,11 @@ exact merge commit `4f024b60f2fc71852fa8fb9747390f4d3917b03f`, and digest
 (`renderer-contract`). In the rows below, `prior` means the compatible digest
 running that ordinary role immediately before its staged replacement.
 
+The pure-renderer artifact used immutable tag `resource-actions-0e894c2a5`,
+exact merge commit `0e894c2a5d7186d15b10d62bbfdb8283201e4e63`, and digest
+`sha256:b21f0e7cc39f62a21bc5887406f941d0b298d8fc277f0b5abb8b1f170c88b198`
+(`renderer`).
+
 | Revision | Purpose | API / executor / controller | Migration result | Heads after checkpoint |
 |---|---|---|---|---|
 | 57 | Observed baseline | old / old / old | prior rollout | 027 / Serve032 / API004 |
@@ -6225,6 +6245,9 @@ running that ordinary role immediately before its staged replacement.
 | 71 | Renderer-contract API/migration stage | renderer-contract / prior / prior | succeeded, 16:14:43–16:15:51 UTC | retained 028 / Serve033 / API007 / capacity001 |
 | 72 | Renderer-contract ordinary-executor stage | renderer-contract / renderer-contract / prior | succeeded, 16:23:29–16:23:40 UTC | retained 028 / Serve033 / API007 / capacity001 |
 | 73 | Renderer-contract controller/final stage | renderer-contract / renderer-contract / renderer-contract | succeeded, 16:28:09–16:28:57 UTC | retained 028 / Serve033 / API007 / capacity001 |
+| 74 | Pure-renderer API/migration stage | renderer / renderer-contract / renderer-contract | succeeded, 20:13:56–20:14:33 UTC | retained 028 / Serve033 / API007 / capacity001 |
+| 75 | Pure-renderer ordinary-executor stage | renderer / renderer / renderer-contract | succeeded, 20:21:03–20:21:13 UTC | retained 028 / Serve033 / API007 / capacity001 |
+| 76 | Pure-renderer controller/final stage | renderer / renderer / renderer | succeeded, 20:26:10–20:26:21 UTC | retained 028 / Serve033 / API007 / capacity001 |
 
 Every revision 57--64 checkpoint converged the changed role to 2/2 at the
 intended digest with zero restarts. All eight action/shadow/coverage/cohort
@@ -6254,6 +6277,26 @@ explicitly false and no matching workload resource existed. Karpenter churn
 occurred during the rollout, but no mixed-version Pod remained at the final
 checkpoint. This checkpoint starts no shadow, provider-I/O,
 crash-canary, or M4 evidence window.
+
+At the revision-76 stable checkpoint, all three ordinary Deployments reported
+2/2 ready, updated, and available replicas. All six active Pods had zero
+restarts, no deletion timestamp, the exact `renderer` image ID, and embedded
+commit `0e894c2a5d7186d15b10d62bbfdb8283201e4e63`. Both API replicas byte-checked
+the packaged config-access inventory at its frozen size and SHA256. PostgreSQL
+retained API007, Serve033, global-user-state 028, and capacity001. The eight
+action-family tables, correlated API requests, services, replicas, and
+clusters all had zero rows. `resourceActions.authorityWorker.enabled=false`,
+and the only Deployments were the ordinary API, executor, and controller
+roles. A 20-minute role-log scan found no traceback, exception, error, fatal,
+crash, or failed match after excluding the API CLI's expected local-server
+startup message.
+
+Karpenter capacity provisioning and consolidation caused transient pending,
+surge, and terminating Pods during revisions 74--76. Each stage retained ready
+old-role capacity until replacements were ready and then converged to exactly
+two Pods at the intended digest. This is ordinary rolling-update recovery
+evidence only. With no action, shadow, provider session, provider I/O, or
+authority worker, revision 76 does not start an M3/M4 qualification window.
 
 On `boltz-test`, every authority-worker Deployment, versioned ServiceAccount,
 selector Service, purpose Secret projection, static-manifest projection, and
