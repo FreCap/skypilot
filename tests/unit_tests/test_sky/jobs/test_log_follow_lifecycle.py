@@ -47,7 +47,7 @@ class TestWaitForNextTask:
         sleep = mock.Mock()
         monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
                             snapshot_read)
-        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         result = jobs_utils._wait_for_next_task(job_id=42, current_task_id=0)
 
@@ -63,7 +63,7 @@ class TestWaitForNextTask:
         sleep = mock.Mock()
         monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
                             snapshot_read)
-        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         result = jobs_utils._wait_for_next_task(job_id=42, current_task_id=0)
 
@@ -85,7 +85,7 @@ class TestWaitForNextTask:
         sleep = mock.Mock()
         monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
                             snapshot_read)
-        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         result = jobs_utils._wait_for_next_task(job_id=42, current_task_id=0)
 
@@ -185,7 +185,7 @@ class TestStreamLogsByIdLifecycle:
         monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
                             mock.Mock(return_value=backend))
         monkeypatch.setattr(
-            jobs_utils.time, 'sleep',
+            jobs_utils, '_sleep_log_follow_wait',
             mock.Mock(side_effect=AssertionError('snapshot mode waited')))
 
         message, exit_code = jobs_utils.stream_logs_by_id(42, follow=False)
@@ -265,7 +265,7 @@ class TestStreamLogsByIdLifecycle:
                             mock.Mock(return_value=backend))
         monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
                             mock.Mock(return_value=False))
-        monkeypatch.setattr(jobs_utils.time, 'sleep', mock.Mock())
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', mock.Mock())
 
         message, exit_code = jobs_utils.stream_logs_by_id(42, follow=True)
 
@@ -319,7 +319,7 @@ class TestStreamLogsByIdLifecycle:
                             mock.Mock(return_value=backend))
         monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
                             mock.Mock(return_value=False))
-        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42, follow=True)
 
@@ -482,7 +482,7 @@ class TestStreamLogsByIdLifecycle:
         monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
                             mock.Mock(return_value=False))
         monkeypatch.setattr(
-            jobs_utils.time, 'sleep',
+            jobs_utils, '_sleep_log_follow_wait',
             mock.Mock(side_effect=AssertionError('waited on a later task')))
 
         message, exit_code = jobs_utils.stream_logs_by_id(42,
@@ -576,7 +576,7 @@ class TestStreamLogsByIdLifecycle:
                             mock.Mock(return_value=backend))
         monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
                             mock.Mock(return_value=False))
-        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42, follow=True)
 
@@ -643,7 +643,7 @@ class TestStreamLogsByIdLifecycle:
             mock.Mock(side_effect=AssertionError('whole-job status poll used')))
         monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
                             snapshot_read)
-        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42,
                                                           follow=False,
@@ -700,7 +700,7 @@ class TestStreamLogsByIdLifecycle:
         ])
         monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
                             snapshot_read)
-        monkeypatch.setattr(jobs_utils.time, 'sleep', sleep)
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42,
                                                           follow=False,
