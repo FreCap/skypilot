@@ -1177,6 +1177,7 @@ class TestDemandLaunchBudget(unittest.TestCase):
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = [location]
         placer.active_locations.return_value = [location]
+        placer.ranked_active_locations.return_value = [location]
         placer.select_next_location.return_value = location
         manager = _make_manager(placer)
         budget = replica_managers._ZeroCostDemandBudget(
@@ -1943,6 +1944,7 @@ class TestDemandPlacementGate(unittest.TestCase):
         # This fixture isolates the broker grant gate.  Keep the independent
         # speculative-placement gate inert by reporting no active locations.
         placer.active_locations.return_value = []
+        placer.ranked_active_locations.return_value = []
         selected = _make_location('us-east-1', 'paid', use_spot=True)
         placer.select_next_location.return_value = selected
         manager = _make_manager(placer)
