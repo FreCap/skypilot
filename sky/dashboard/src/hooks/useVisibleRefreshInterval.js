@@ -2,7 +2,8 @@ import { useEffect, useRef } from 'react';
 
 export function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
   const onRefreshRef = useRef(onRefresh);
-  const lastVisibilityRefreshAtRef = useRef(null);
+  const cadenceAnchorRef = useRef(null);
+  const nextIntervalDueAtRef = useRef(null);
 
   useEffect(() => {
     onRefreshRef.current = onRefresh;
@@ -10,51 +11,82 @@ export function useVisibleRefreshInterval(enabled, intervalMs, onRefresh) {
 
   useEffect(() => {
     if (!enabled || !intervalMs) {
-      lastVisibilityRefreshAtRef.current = null;
+      nextIntervalDueAtRef.current = null;
       return undefined;
     }
 
-    const maybeRefresh = (source) => {
+    let timeoutId = null;
+
+    const clearScheduledRefresh = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+
+    const nextCadenceTickAfter = (referenceTime) => {
+      const anchor = cadenceAnchorRef.current;
+      if (anchor === null || referenceTime < anchor) {
+        return anchor;
+      }
+
+      const elapsed = referenceTime - anchor;
+      const completedIntervals = Math.floor(elapsed / intervalMs) + 1;
+      return anchor + completedIntervals * intervalMs;
+    };
+
+    const scheduleNextRefresh = (dueAt) => {
+      nextIntervalDueAtRef.current = dueAt;
+      clearScheduledRefresh();
       if (window.document.visibilityState !== 'visible') {
         return;
       }
 
-      const now = window.performance.now();
-      if (
-        source === 'interval' &&
-        lastVisibilityRefreshAtRef.current !== null &&
-        now - lastVisibilityRefreshAtRef.current < intervalMs
-      ) {
-        return;
-      }
-
-      const handled = onRefreshRef.current(source);
-      if (source === 'visibilitychange' && handled !== false) {
-        lastVisibilityRefreshAtRef.current = now;
-      }
+      timeoutId = window.setTimeout(
+        () => {
+          timeoutId = null;
+          const now = window.performance.now();
+          if (window.document.visibilityState !== 'visible') {
+            scheduleNextRefresh(nextCadenceTickAfter(now));
+            return;
+          }
+          void onRefreshRef.current('interval');
+          scheduleNextRefresh(nextCadenceTickAfter(now));
+        },
+        Math.max(0, dueAt - window.performance.now())
+      );
     };
 
     const handleVisibilityChange = () => {
-      if (window.document.visibilityState === 'visible') {
-        maybeRefresh('visibilitychange');
+      if (window.document.visibilityState !== 'visible') {
+        clearScheduledRefresh();
+        return;
       }
+
+      const handled = onRefreshRef.current('visibilitychange');
+      const now = window.performance.now();
+      const nextDueAt =
+        handled === false
+          ? nextCadenceTickAfter(now)
+          : nextCadenceTickAfter(now + intervalMs - 1);
+      scheduleNextRefresh(nextDueAt);
     };
 
-    const interval = setInterval(() => {
-      maybeRefresh('interval');
-    }, intervalMs);
+    cadenceAnchorRef.current = window.performance.now() + intervalMs;
+    scheduleNextRefresh(cadenceAnchorRef.current);
     window.document.addEventListener(
       'visibilitychange',
       handleVisibilityChange
     );
 
     return () => {
-      lastVisibilityRefreshAtRef.current = null;
+      cadenceAnchorRef.current = null;
+      nextIntervalDueAtRef.current = null;
+      clearScheduledRefresh();
       window.document.removeEventListener(
         'visibilitychange',
         handleVisibilityChange
       );
-      clearInterval(interval);
     };
   }, [enabled, intervalMs]);
 }
