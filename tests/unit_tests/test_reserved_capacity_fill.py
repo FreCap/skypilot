@@ -2178,7 +2178,12 @@ class TestReplicaManagerInitIntact(unittest.TestCase):
                                      initial_delay_seconds=60,
                                      endpoint_probe_interval_seconds=10,
                                      post_data=None)
-        manager = replica_managers.ReplicaManager('svc', spec, version=3)
+        # This regression test exercises the initializer itself, not persisted
+        # service lookup.  Do not couple it to the developer's live Serve DB.
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_service_from_name',
+                               return_value=None):
+            manager = replica_managers.ReplicaManager('svc', spec, version=3)
         self.assertEqual(manager.latest_version, 3)
         self.assertIsNone(manager.spot_placer)
 
