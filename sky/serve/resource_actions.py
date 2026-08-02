@@ -3743,6 +3743,549 @@ def _validate_provider_kubernetes_role_allocations_v1(
     return allocations
 
 
+_PROVIDER_KUBERNETES_RESOLVED_BINDING_ROWS_V1 = (
+    ('head_labels', 'object'),
+    ('head_name', 'string'),
+    ('head_pod_labels', 'object'),
+    ('head_pod_name', 'string'),
+    ('head_service_selector', 'object'),
+    ('head_ssh_labels', 'object'),
+    ('head_ssh_name', 'string'),
+    ('image_pull_policy', 'string'),
+    ('original_user', 'string'),
+    ('pod_cpu_limit', 'string'),
+    ('pod_cpu_request', 'string'),
+    ('pod_memory_limit', 'string'),
+    ('pod_memory_request', 'string'),
+    ('replica_id_text', 'string'),
+    ('target_namespace', 'string'),
+    ('workload_image', 'string'),
+    ('workload_service_account', 'string'),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedProviderKubernetesBindingV1(_CanonicalContract):
+    """One position-bound result from the frozen renderer binding table."""
+
+    sequence: int
+    name: str
+    json_type: str
+    value: CanonicalJsonValue
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'sequence', 'name', 'json_type', 'value'})
+
+    def __post_init__(self) -> None:
+        sequence = _nonnegative_integer(
+            self.sequence,
+            name='resolved Kubernetes binding sequence',
+            maximum=len(_PROVIDER_KUBERNETES_RESOLVED_BINDING_ROWS_V1) - 1)
+        if type(self.name) is not str or type(self.json_type) is not str:
+            raise TypeError('resolved Kubernetes binding name and json_type '
+                            'must be text.')
+        expected_name, expected_json_type = (
+            _PROVIDER_KUBERNETES_RESOLVED_BINDING_ROWS_V1[sequence])
+        if (self.name, self.json_type) != (expected_name, expected_json_type):
+            raise ValueError('resolved Kubernetes binding does not match its '
+                             'frozen table row.')
+        if type(self.value) is not CanonicalJsonValue:
+            raise TypeError('resolved Kubernetes binding value must be an '
+                            'exact CanonicalJsonValue.')
+        raw_value = self.value.canonical_value()
+        expected_value_type = {
+            'string': str,
+            'object': dict,
+            'array': list,
+        }[expected_json_type]
+        if type(raw_value) is not expected_value_type:
+            raise TypeError('resolved Kubernetes binding value does not match '
+                            'its declared JSON type.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ResolvedProviderKubernetesBindingV1:
+        raw = _closed_object_shallow(value,
+                                     name='resolved Kubernetes binding',
+                                     keys=cls._KEYS)
+        return cls(sequence=raw['sequence'],
+                   name=raw['name'],
+                   json_type=raw['json_type'],
+                   value=CanonicalJsonValue.from_value(raw['value']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'sequence': self.sequence,
+            'name': self.name,
+            'json_type': self.json_type,
+            'value': self.value.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedProviderKubernetesBindingSetV1(_CanonicalContract):
+    """Exact complete result of renderer-input binding resolution."""
+
+    version: int
+    contract: str
+    bindings: tuple[ResolvedProviderKubernetesBindingV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'contract', 'bindings'})
+    _CONTRACT: ClassVar[
+        str] = 'skypilot.serve.prebooted-direct-pod.resolved-bindings.v1'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='resolved Kubernetes binding set version')
+        if type(self.contract) is not str:
+            raise TypeError('resolved Kubernetes binding set contract must be '
+                            'text.')
+        if self.contract != self._CONTRACT:
+            raise ValueError('resolved Kubernetes binding set contract is '
+                             'unsupported.')
+        if type(self.bindings) is not tuple:
+            raise TypeError('resolved Kubernetes binding set bindings must be '
+                            'a tuple.')
+        if (len(self.bindings)
+                != len(_PROVIDER_KUBERNETES_RESOLVED_BINDING_ROWS_V1) or any(
+                    type(binding) is not ResolvedProviderKubernetesBindingV1
+                    for binding in self.bindings)):
+            raise ValueError('resolved Kubernetes binding set must contain '
+                             'exactly 17 typed bindings.')
+        if tuple(binding.sequence for binding in self.bindings) != tuple(
+                range(17)):
+            raise ValueError('resolved Kubernetes bindings are not in exact '
+                             'table order.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ResolvedProviderKubernetesBindingSetV1:
+        raw = _closed_object_shallow(value,
+                                     name='resolved Kubernetes binding set',
+                                     keys=cls._KEYS)
+        raw_bindings = raw['bindings']
+        if type(raw_bindings) is not list:
+            raise TypeError('resolved Kubernetes binding set bindings must be '
+                            'a list.')
+        return cls(version=raw['version'],
+                   contract=raw['contract'],
+                   bindings=tuple(
+                       ResolvedProviderKubernetesBindingV1.from_value(binding)
+                       for binding in raw_bindings))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'contract': self._CONTRACT,
+            'bindings': [
+                binding.canonical_value() for binding in self.bindings
+            ],
+        }
+
+
+_PROVIDER_KUBERNETES_IDENTITY_LABEL_KEYS_V1 = frozenset({
+    'skypilot-cluster-name',
+    'skypilot.co/cluster-record-uuid',
+    'skypilot.co/serve-replica-incarnation',
+})
+_PROVIDER_KUBERNETES_SELECTOR_KEYS_V1 = frozenset({
+    'component',
+    'skypilot-cluster-name',
+    'skypilot.co/cluster-record-uuid',
+    'skypilot.co/serve-replica-incarnation',
+})
+
+
+def _validate_provider_kubernetes_body_metadata_v1(
+        role: ProviderObjectRoleV1,
+        body: JsonObject) -> tuple[JsonObject, JsonObject]:
+    """Validate exact common metadata and return metadata plus labels."""
+
+    if set(body) != {'apiVersion', 'kind', 'metadata', 'spec'}:
+        raise ValueError('validated Kubernetes body top-level shape is not '
+                         'exact.')
+    expected_kind = ('Pod'
+                     if role is ProviderObjectRoleV1.HEAD_POD else 'Service')
+    if body['apiVersion'] != 'v1' or body['kind'] != expected_kind:
+        raise ValueError('validated Kubernetes body apiVersion or kind does '
+                         'not match its role.')
+    expected_metadata_keys = (frozenset({
+        'annotations', 'labels', 'name', 'namespace'
+    }) if role is ProviderObjectRoleV1.HEAD_POD else frozenset(
+        {'labels', 'name', 'namespace'}))
+    if (type(body['metadata']) is not dict or
+            set(body['metadata']) != expected_metadata_keys):
+        raise ValueError('validated Kubernetes body metadata is not exact.')
+    metadata = body['metadata']
+    labels = metadata['labels']
+    expected_role_label = ('component' if role is ProviderObjectRoleV1.HEAD_POD
+                           else 'service-role')
+    expected_label_keys = (_PROVIDER_KUBERNETES_IDENTITY_LABEL_KEYS_V1 |
+                           {'skypilot-user', expected_role_label})
+    labels = _closed_object_shallow(labels,
+                                    name='validated Kubernetes body labels',
+                                    keys=expected_label_keys)
+    name = _dns_label(metadata['name'],
+                      name='validated Kubernetes body metadata.name')
+    _dns_label(metadata['namespace'],
+               name='validated Kubernetes body metadata.namespace')
+    provider_cluster_name = _dns_label(
+        labels['skypilot-cluster-name'],
+        name='validated Kubernetes body cluster-name label')
+    cleaned_user = _text(labels['skypilot-user'],
+                         name='validated Kubernetes body user label')
+    del cleaned_user
+    for key in ('skypilot.co/cluster-record-uuid',
+                'skypilot.co/serve-replica-incarnation'):
+        _uuid(labels[key], name=f'validated Kubernetes body label {key}')
+    workload_name = f'{provider_cluster_name}-head'
+    if role is ProviderObjectRoleV1.HEAD_POD:
+        if labels['component'] != workload_name or name != workload_name:
+            raise ValueError('validated Kubernetes Pod name and component '
+                             'label do not match its cluster label.')
+        annotations = _closed_object_shallow(
+            metadata['annotations'],
+            name='validated Kubernetes Pod annotations',
+            keys=frozenset({'skypilot-user'}))
+        _text(annotations['skypilot-user'],
+              name='validated Kubernetes Pod user annotation')
+    else:
+        if labels['service-role'] != role.value:
+            raise ValueError('validated Kubernetes Service role label does '
+                             'not match its role.')
+        expected_name = (f'{workload_name}-ssh'
+                         if role is ProviderObjectRoleV1.HEAD_SSH_SERVICE else
+                         workload_name)
+        if name != expected_name:
+            raise ValueError('validated Kubernetes Service name does not '
+                             'match its cluster label and role.')
+    spec = body['spec']
+    if type(spec) is not dict:
+        raise TypeError('validated Kubernetes body spec must be an object.')
+    return dict(metadata), dict(labels)
+
+
+def _validate_provider_kubernetes_service_body_v1(role: ProviderObjectRoleV1,
+                                                  body: JsonObject,
+                                                  labels: JsonObject) -> None:
+    """Validate one exact renderer-owned Service request body."""
+
+    base_keys = {'type', 'sessionAffinity', 'internalTrafficPolicy', 'selector'}
+    expected_keys = (base_keys | {'ports'} if role
+                     is ProviderObjectRoleV1.HEAD_SSH_SERVICE else base_keys |
+                     {'clusterIP'})
+    spec = _closed_object_shallow(body['spec'],
+                                  name='validated Kubernetes Service spec',
+                                  keys=frozenset(expected_keys))
+    if (spec['type'] != 'ClusterIP' or spec['sessionAffinity'] != 'None' or
+            spec['internalTrafficPolicy'] != 'Cluster'):
+        raise ValueError('validated Kubernetes Service defaults are not '
+                         'exact.')
+    selector = _closed_object_shallow(
+        spec['selector'],
+        name='validated Kubernetes Service selector',
+        keys=_PROVIDER_KUBERNETES_SELECTOR_KEYS_V1)
+    expected_selector = {
+        key: (body['metadata']['name'] if key == 'component' and
+              role is ProviderObjectRoleV1.HEAD_SERVICE else
+              body['metadata']['name'][:-len('-ssh')] if key == 'component' else
+              labels[key]) for key in _PROVIDER_KUBERNETES_SELECTOR_KEYS_V1
+    }
+    if dict(selector) != expected_selector:
+        raise ValueError('validated Kubernetes Service selector does not '
+                         'match its identity labels and workload name.')
+    if role is ProviderObjectRoleV1.HEAD_SSH_SERVICE:
+        if spec['ports'] != [{
+                'protocol': 'TCP',
+                'port': 22,
+                'targetPort': 22,
+        }]:
+            raise ValueError('validated Kubernetes SSH Service port is not '
+                             'exact.')
+    elif spec['clusterIP'] != 'None':
+        raise ValueError('validated Kubernetes head Service clusterIP intent '
+                         'must be None.')
+
+
+def _validate_provider_kubernetes_pod_body_v1(body: JsonObject) -> None:
+    """Validate one exact renderer-owned Pod request body."""
+
+    spec = _closed_object_shallow(
+        body['spec'],
+        name='validated Kubernetes Pod spec',
+        keys=frozenset({
+            'automountServiceAccountToken', 'containers', 'dnsPolicy',
+            'enableServiceLinks', 'preemptionPolicy', 'priority',
+            'restartPolicy', 'schedulerName', 'securityContext',
+            'serviceAccount', 'serviceAccountName',
+            'terminationGracePeriodSeconds', 'tolerations'
+        }))
+    if (spec['automountServiceAccountToken'] is not False or
+            spec['dnsPolicy'] != 'ClusterFirst' or
+            spec['enableServiceLinks'] is not True or
+            spec['preemptionPolicy'] != 'PreemptLowerPriority' or
+            type(spec['priority']) is not int or spec['priority'] != 0 or
+            spec['restartPolicy'] != 'Always' or
+            spec['schedulerName'] != 'default-scheduler' or
+            spec['securityContext'] != {} or
+            type(spec['terminationGracePeriodSeconds']) is not int or
+            spec['terminationGracePeriodSeconds'] != 30):
+        raise ValueError('validated Kubernetes Pod defaults are not exact.')
+    service_account = _dns_label(spec['serviceAccount'],
+                                 name='validated Kubernetes Pod serviceAccount')
+    if spec['serviceAccountName'] != service_account:
+        raise ValueError('validated Kubernetes Pod service-account fields '
+                         'must be byte-equal.')
+    expected_tolerations = [{
+        'effect': 'NoExecute',
+        'key': 'node.kubernetes.io/not-ready',
+        'operator': 'Exists',
+        'tolerationSeconds': 300,
+    }, {
+        'effect': 'NoExecute',
+        'key': 'node.kubernetes.io/unreachable',
+        'operator': 'Exists',
+        'tolerationSeconds': 300,
+    }]
+    if spec['tolerations'] != expected_tolerations:
+        raise ValueError('validated Kubernetes Pod tolerations are not exact.')
+    containers = spec['containers']
+    if type(containers) is not list or len(containers) != 1:
+        raise ValueError('validated Kubernetes Pod must contain exactly one '
+                         'container.')
+    container = _closed_object_shallow(
+        containers[0],
+        name='validated Kubernetes Pod container',
+        keys=frozenset({
+            'env', 'image', 'imagePullPolicy', 'name', 'ports', 'resources',
+            'terminationMessagePath', 'terminationMessagePolicy'
+        }))
+    if (container['name'] != 'ray-node' or
+            container['imagePullPolicy'] != 'Always' or
+            container['terminationMessagePath'] != '/dev/termination-log' or
+            container['terminationMessagePolicy'] != 'File'):
+        raise ValueError('validated Kubernetes Pod container literals are '
+                         'not exact.')
+    image = _text(container['image'],
+                  name='validated Kubernetes Pod container image')
+    try:
+        canonical_image = container_image_models.validate_oci_reference(
+            image, 'validated Kubernetes Pod container image')
+        _, image_digest = container_image_models.split_digest(canonical_image)
+    except (TypeError, ValueError) as e:
+        raise ValueError('validated Kubernetes Pod container image is not a '
+                         'canonical OCI reference.') from e
+    if canonical_image != image or image_digest is None:
+        raise ValueError('validated Kubernetes Pod container image must be '
+                         'digest-pinned.')
+    environment = container['env']
+    if type(environment) is not list:
+        raise ValueError('validated Kubernetes Pod replica environment entry '
+                         'is not exact.')
+    replica_environment = [
+        entry for entry in environment if type(entry) is dict and
+        entry.get('name') == 'SKYPILOT_SERVE_REPLICA_ID'
+    ]
+    if len(environment) != 1 or len(replica_environment) != 1:
+        raise ValueError('validated Kubernetes Pod replica environment entry '
+                         'is not exact.')
+    replica_entry, = replica_environment
+    if set(replica_entry) != {'name', 'value'}:
+        raise ValueError('validated Kubernetes Pod replica environment entry '
+                         'is not exact.')
+    _decimal_integer_text(
+        replica_entry['value'],
+        name='validated Kubernetes Pod replica environment value')
+    expected_ports = [{
+        'containerPort': port,
+        'protocol': 'TCP'
+    } for port in (10001, 10002, 10003, 10004, 46590)]
+    if container['ports'] != expected_ports:
+        raise ValueError('validated Kubernetes Pod management and application '
+                         'ports are invalid.')
+    resources = _closed_object_shallow(
+        container['resources'],
+        name='validated Kubernetes Pod resources',
+        keys=frozenset({'limits', 'requests'}))
+    limits = _closed_object_shallow(
+        resources['limits'],
+        name='validated Kubernetes Pod resource limits',
+        keys=frozenset({'cpu', 'memory'}))
+    requests = _closed_object_shallow(
+        resources['requests'],
+        name='validated Kubernetes Pod resource requests',
+        keys=frozenset({'cpu', 'memory'}))
+    if dict(limits) != dict(requests):
+        raise ValueError('validated Kubernetes Pod resource requests and '
+                         'limits must be byte-equal.')
+    _canonical_positive_decimal_text(
+        requests['cpu'], name='validated Kubernetes Pod CPU request')
+    memory = _text(requests['memory'],
+                   name='validated Kubernetes Pod memory request')
+    if not memory.endswith('G'):
+        raise ValueError('validated Kubernetes Pod memory must use a G '
+                         'suffix.')
+    _canonical_positive_decimal_text(
+        memory[:-1], name='validated Kubernetes Pod memory request')
+
+
+@dataclasses.dataclass(frozen=True)
+class ValidatedKubernetesServeThreeObjectBodyV1(_CanonicalContract):
+    """One schema-valid request body tagged with its direct-Pod role."""
+
+    role: ProviderObjectRoleV1
+    body: CanonicalJsonObject
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'role', 'body'})
+
+    def __post_init__(self) -> None:
+        if type(self.role) is not ProviderObjectRoleV1:
+            raise TypeError('validated Kubernetes body role must be an exact '
+                            'ProviderObjectRoleV1.')
+        if type(self.body) is not CanonicalJsonObject:
+            raise TypeError('validated Kubernetes body must be an exact '
+                            'CanonicalJsonObject.')
+        raw_body = self.body.canonical_value()
+        _, labels = _validate_provider_kubernetes_body_metadata_v1(
+            self.role, raw_body)
+        if self.role is ProviderObjectRoleV1.HEAD_POD:
+            _validate_provider_kubernetes_pod_body_v1(raw_body)
+        else:
+            _validate_provider_kubernetes_service_body_v1(
+                self.role, raw_body, labels)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> ValidatedKubernetesServeThreeObjectBodyV1:
+        raw = _closed_object_shallow(value,
+                                     name='validated Kubernetes body',
+                                     keys=cls._KEYS)
+        return cls(role=_enum_value(ProviderObjectRoleV1,
+                                    raw['role'],
+                                    name='validated Kubernetes body role'),
+                   body=CanonicalJsonObject.from_value(raw['body']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'role': self.role.value,
+            'body': self.body.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesRequestNormalizationV1(_CanonicalContract):
+    """Projected semantic request plus its role-specific allocation intent."""
+
+    requested_semantic: CanonicalJsonObject
+    requested_allocation_intent: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'requested_semantic', 'requested_allocation_intent'})
+    _INTENTS: ClassVar[frozenset[str]] = frozenset({
+        'allocate_single_stack_cluster_ip', 'headless_single_stack',
+        'schedule_one_node'
+    })
+
+    def __post_init__(self) -> None:
+        if type(self.requested_semantic) is not CanonicalJsonObject:
+            raise TypeError('request normalization semantic must be an exact '
+                            'CanonicalJsonObject.')
+        if type(self.requested_allocation_intent) is not str:
+            raise TypeError('request normalization allocation intent must be '
+                            'text.')
+        if self.requested_allocation_intent not in self._INTENTS:
+            raise ValueError('request normalization allocation intent is '
+                             'unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderKubernetesRequestNormalizationV1:
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes request normalization',
+                                     keys=cls._KEYS)
+        return cls(
+            requested_semantic=CanonicalJsonObject.from_value(
+                raw['requested_semantic']),
+            requested_allocation_intent=raw['requested_allocation_intent'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'requested_semantic': self.requested_semantic.canonical_value(),
+            'requested_allocation_intent': self.requested_allocation_intent,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesAdmittedNormalizationV1(_CanonicalContract):
+    """Projected admitted semantic plus separated server allocations."""
+
+    admitted_semantic: CanonicalJsonObject
+    server_allocations: tuple[ProviderKubernetesServerAllocationV1, ...]
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'admitted_semantic', 'server_allocations'})
+
+    def __post_init__(self) -> None:
+        if type(self.admitted_semantic) is not CanonicalJsonObject:
+            raise TypeError('admitted normalization semantic must be an exact '
+                            'CanonicalJsonObject.')
+        if type(self.server_allocations) is not tuple:
+            raise TypeError('admitted normalization server_allocations must '
+                            'be a tuple.')
+        allocations = self.server_allocations
+        if any(
+                type(allocation) is not ProviderKubernetesServerAllocationV1
+                for allocation in allocations):
+            raise TypeError('admitted normalization must contain exact typed '
+                            'server allocations.')
+        pointers = tuple(allocation.json_pointer for allocation in allocations)
+        if pointers == _PROVIDER_KUBERNETES_SERVICE_ALLOCATION_POINTERS_V1:
+            cluster_ip = allocations[0].value.canonical_value()
+            role = (ProviderObjectRoleV1.HEAD_SERVICE if cluster_ip == 'None'
+                    else ProviderObjectRoleV1.HEAD_SSH_SERVICE)
+            _validate_provider_kubernetes_role_allocations_v1(
+                role,
+                allocations,
+                name='admitted normalization server_allocations')
+        elif pointers in ((), _PROVIDER_KUBERNETES_POD_ALLOCATION_POINTERS_V1):
+            _validate_provider_kubernetes_role_allocations_v1(
+                ProviderObjectRoleV1.HEAD_POD,
+                allocations,
+                name='admitted normalization server_allocations')
+        else:
+            raise ValueError('admitted normalization server allocations have '
+                             'an invalid atomic shape.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> ProviderKubernetesAdmittedNormalizationV1:
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes admitted normalization',
+                                     keys=cls._KEYS)
+        raw_allocations = raw['server_allocations']
+        if type(raw_allocations) is not list:
+            raise TypeError('admitted normalization server_allocations must '
+                            'be a list.')
+        return cls(
+            admitted_semantic=CanonicalJsonObject.from_value(
+                raw['admitted_semantic']),
+            server_allocations=tuple(
+                ProviderKubernetesServerAllocationV1.from_value(allocation)
+                for allocation in raw_allocations))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'admitted_semantic': self.admitted_semantic.canonical_value(),
+            'server_allocations': [
+                allocation.canonical_value()
+                for allocation in self.server_allocations
+            ],
+        }
+
+
 @dataclasses.dataclass(frozen=True)
 class ProviderKubernetesResolvedObjectV1(_CanonicalContract):
     """One write-once admitted Kubernetes object commitment."""
@@ -6338,23 +6881,15 @@ class ProviderKubernetesObjectPlanV1(_CanonicalContract):
     def _validate_request_body(self, required_labels: Mapping[str,
                                                               str]) -> None:
         body = self.request_body.canonical_value()
-        if body.get('apiVersion') != self.api_version:
-            raise ValueError('object plan request body apiVersion does not '
-                             'match.')
-        if body.get('kind') != self.kind.value:
-            raise ValueError('object plan request body kind does not match.')
-        metadata = body.get('metadata')
-        if not isinstance(metadata, dict):
-            raise ValueError('object plan request body metadata must be an '
-                             'object.')
+        try:
+            metadata, body_labels = (
+                _validate_provider_kubernetes_body_metadata_v1(self.role, body))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f'object plan request body: {error}') from error
         if (metadata.get('namespace') != self.namespace or
                 metadata.get('name') != self.name):
             raise ValueError('object plan request body metadata identity does '
                              'not match.')
-        body_labels = metadata.get('labels')
-        if not isinstance(body_labels, dict):
-            raise ValueError('object plan request body metadata.labels must be '
-                             'an object.')
         if any(
                 body_labels.get(key) != value
                 for key, value in required_labels.items()):
@@ -9189,6 +9724,475 @@ class ProviderKubernetesDownMutationContractV1(_CanonicalContract):
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderKubernetesExecutionCapsuleSeedV1(_CanonicalContract):
+    """Closed policy-free launch capsule fields available before rendering."""
+
+    version: int
+    implementation_contract: str
+    executor_cohort: ProviderAuthorityWorkerCohortV1
+    config_projection: ProviderKubernetesConfigProjectionV1
+    config_projection_sha256: str
+    scope: ProviderKubernetesScopeV1
+    principals: ProviderKubernetesPrincipalsV1
+    prerequisites: tuple[ProviderKubernetesPrerequisiteV1, ...]
+    request_identity: ProviderKubernetesRequestIdentityV1
+    resources: ProviderKubernetesResourceContractV1
+    renderer: ProviderKubernetesRendererV1
+    post_provision: ProviderKubernetesPostProvisionV1
+    endpoint: ProviderKubernetesEndpointContractV1
+    scheduling: ProviderKubernetesSchedulingContractV1
+    storage: ProviderKubernetesStorageContractV1
+    metadata: ProviderKubernetesMetadataContractV1
+    security: ProviderKubernetesSecurityContractV1
+    topology: ProviderPodTopologyV1
+    mutation_contract: ProviderKubernetesLaunchMutationContractV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'implementation_contract', 'executor_cohort',
+        'config_projection', 'config_projection_sha256', 'scope', 'principals',
+        'prerequisites', 'request_identity', 'resources', 'renderer',
+        'post_provision', 'endpoint', 'scheduling', 'storage', 'metadata',
+        'security', 'topology', 'mutation_contract'
+    })
+    _IMPLEMENTATION_CONTRACT: ClassVar[
+        str] = 'kubernetes_serve_prebooted_runtime_v1'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='launch execution capsule seed version')
+        if type(self.implementation_contract) is not str:
+            raise TypeError('launch execution capsule seed '
+                            'implementation_contract must be text.')
+        if self.implementation_contract != self._IMPLEMENTATION_CONTRACT:
+            raise ValueError('launch execution capsule seed '
+                             'implementation_contract is unsupported.')
+        child_types: tuple[tuple[str, type[Any]], ...] = (
+            ('executor_cohort', ProviderAuthorityWorkerCohortV1),
+            ('config_projection', ProviderKubernetesConfigProjectionV1),
+            ('scope', ProviderKubernetesScopeV1),
+            ('principals', ProviderKubernetesPrincipalsV1),
+            ('request_identity', ProviderKubernetesRequestIdentityV1),
+            ('resources', ProviderKubernetesResourceContractV1),
+            ('renderer', ProviderKubernetesRendererV1),
+            ('post_provision', ProviderKubernetesPostProvisionV1),
+            ('endpoint', ProviderKubernetesEndpointContractV1),
+            ('scheduling', ProviderKubernetesSchedulingContractV1),
+            ('storage', ProviderKubernetesStorageContractV1),
+            ('metadata', ProviderKubernetesMetadataContractV1),
+            ('security', ProviderKubernetesSecurityContractV1),
+            ('topology', ProviderPodTopologyV1),
+            ('mutation_contract', ProviderKubernetesLaunchMutationContractV1),
+        )
+        for field, expected_type in child_types:
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'launch execution capsule seed {field} has '
+                                'an invalid type.')
+        object.__setattr__(
+            self, 'prerequisites',
+            _provider_kubernetes_prerequisite_inventory_tuple(
+                self.prerequisites,
+                name='launch execution capsule seed prerequisites'))
+        projection_sha256 = _sha256(
+            self.config_projection_sha256,
+            name='launch execution capsule seed config_projection_sha256')
+        object.__setattr__(self, 'config_projection_sha256', projection_sha256)
+        if projection_sha256 != self.config_projection.sha256:
+            raise ValueError('launch execution capsule seed config projection '
+                             'hash does not match.')
+        if (self.renderer.source.canonical_bytes !=
+                self.post_provision.job_submission.run_source.canonical_bytes):
+            raise ValueError('launch execution capsule seed renderer and run '
+                             'source must be byte-equal.')
+        if (self.config_projection.config_access_inventory.canonical_bytes
+                != self.renderer.config_access_inventory.canonical_bytes):
+            raise ValueError('launch execution capsule seed config-access '
+                             'inventory bindings must be byte-equal.')
+        self._validate_internal_projection()
+        _ = self.canonical_bytes
+
+    def _validate_internal_projection(self) -> None:
+        """Validate every cross-field projection which does not need objects."""
+
+        config = self.config_projection
+        scope = self.scope
+        principals = self.principals
+        if not scope.in_cluster:
+            raise ValueError('launch execution capsule seed scope must be '
+                             'in-cluster.')
+        target_namespaces = (
+            scope.namespace,
+            config.target_namespace,
+            principals.workload.namespace,
+            principals.caller_authorization.rules.namespace,
+        )
+        if any(namespace != scope.namespace for namespace in target_namespaces):
+            raise ValueError('launch execution capsule seed target namespaces '
+                             'are not byte-equal.')
+
+        caller_scope = (
+            scope.caller_service_account_namespace,
+            scope.caller_service_account_name,
+            scope.caller_service_account_uid,
+        )
+        caller_principal = (principals.caller.namespace, principals.caller.name,
+                            principals.caller.uid)
+        workload_scope = (
+            scope.workload_service_account_namespace,
+            scope.workload_service_account_name,
+            scope.workload_service_account_uid,
+        )
+        workload_principal = (principals.workload.namespace,
+                              principals.workload.name, principals.workload.uid)
+        if (caller_scope != caller_principal or
+                workload_scope != workload_principal):
+            raise ValueError('launch execution capsule seed principals do not '
+                             'match the Kubernetes scope.')
+
+        by_role = {item.role: item for item in self.prerequisites}
+        authority_namespace = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.AUTHORITY_RELEASE_NAMESPACE]
+        target_namespace = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.TARGET_NAMESPACE]
+        kube_system_namespace = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.KUBE_SYSTEM_NAMESPACE]
+        if (authority_namespace.name != self.executor_cohort.manifest.namespace
+                or authority_namespace.name != principals.caller.namespace or
+                self.executor_cohort.manifest.service_account_name
+                != principals.caller.name or
+                self.executor_cohort.service_account_uid
+                != principals.caller.uid):
+            raise ValueError('launch execution capsule seed authority cohort, '
+                             'Namespace, and caller principal do not match.')
+        if (target_namespace.name != scope.namespace or
+                target_namespace.uid != scope.target_namespace_uid or
+                kube_system_namespace.name != 'kube-system' or
+                kube_system_namespace.uid != scope.kube_system_namespace_uid):
+            raise ValueError('launch execution capsule seed Namespace '
+                             'prerequisites do not match the Kubernetes scope.')
+        for role, principal in (
+            (ProviderKubernetesPrerequisiteRoleV1.CALLER_SERVICE_ACCOUNT,
+             principals.caller),
+            (ProviderKubernetesPrerequisiteRoleV1.WORKLOAD_SERVICE_ACCOUNT,
+             principals.workload),
+        ):
+            prerequisite = by_role[role]
+            if type(prerequisite.spec) is not (
+                    ProviderKubernetesServiceAccountPrerequisiteSpecV1):
+                raise ValueError('launch execution capsule seed '
+                                 'ServiceAccount prerequisite has an invalid '
+                                 'spec.')
+            if (prerequisite.spec.projection.canonical_bytes
+                    != principal.canonical_bytes):
+                raise ValueError('launch execution capsule seed '
+                                 'ServiceAccount prerequisite does not match '
+                                 'its principal.')
+
+        for projected in self.endpoint.prerequisite_projection:
+            if projected.canonical_bytes != by_role[
+                    projected.role].canonical_bytes:
+                raise ValueError('launch execution capsule seed endpoint '
+                                 'prerequisite projection is not byte-equal to '
+                                 'the full inventory.')
+        network_policy = by_role[
+            ProviderKubernetesPrerequisiteRoleV1.ENDPOINT_NETWORK_POLICY]
+        if network_policy.namespace != scope.namespace:
+            raise ValueError('launch execution capsule seed NetworkPolicy '
+                             'namespace does not match the target namespace.')
+        for caller in self.endpoint.required_callers:
+            if (caller.namespace != authority_namespace.name or
+                    caller.namespace_uid != authority_namespace.uid):
+                raise ValueError('launch execution capsule seed endpoint '
+                                 'caller Namespace does not match authority '
+                                 'release.')
+
+        resource_contract = self.resources
+        if (config.port_mode != resource_contract.port_mode or
+                self.endpoint.mode != resource_contract.port_mode or
+                self.endpoint.application_port
+                != resource_contract.application_port or
+                self.topology.application_port
+                != resource_contract.application_port or
+                self.topology.resources_ports
+                != resource_contract.resources_ports or
+                self.scheduling.node_count != self.topology.node_count or
+                self.scheduling.use_spot):
+            raise ValueError('launch execution capsule seed resource, '
+                             'topology, endpoint, and scheduling projections '
+                             'do not match.')
+
+        scheduling_fields = ('runtime_class_name', 'priority_class_name',
+                             'queue', 'kueue', 'dws', 'autoscaler',
+                             'detected_network_type')
+        if any(
+                getattr(config, field) != getattr(self.scheduling, field)
+                for field in scheduling_fields):
+            raise ValueError('launch execution capsule seed scheduling '
+                             'projection does not match config.')
+        storage_fields = ('persistent_volumes', 'object_stores', 'file_mounts',
+                          'workdir', 'fuse', 'docker_cache', 'auto_mounts')
+        if any(
+                getattr(config, field) != getattr(self.storage, field)
+                for field in storage_fields):
+            raise ValueError('launch execution capsule seed storage '
+                             'projection does not match config.')
+        metadata_fields = ('global_labels', 'custom_pod_config',
+                           'custom_metadata')
+        if any(
+                getattr(config, field) != getattr(self.metadata, field)
+                for field in metadata_fields):
+            raise ValueError('launch execution capsule seed metadata '
+                             'projection does not match config.')
+        security_fields = ('tls_material', 'managed_secrets', 'task_secrets',
+                           'service_account_bootstrap', 'rbac_bootstrap')
+        if any(
+                getattr(config, field) != getattr(self.security, field)
+                for field in security_fields):
+            raise ValueError('launch execution capsule seed security '
+                             'projection does not match config.')
+
+        cleaned_user = self.request_identity.cleaned_user
+        for topology_object in self.topology.mutable_objects:
+            labels = {
+                label.key: label.value for label in topology_object.labels
+            }
+            expected_labels = {
+                key: labels.get(key)
+                for key in _PROVIDER_KUBERNETES_IDENTITY_LABEL_KEYS_V1
+            }
+            expected_labels['skypilot-user'] = cleaned_user
+            if topology_object.role is ProviderObjectRoleV1.HEAD_POD:
+                expected_labels['component'] = topology_object.name
+            else:
+                expected_labels['service-role'] = topology_object.role.value
+            if labels != expected_labels:
+                raise ValueError('launch execution capsule seed topology role '
+                                 'label map is not exact.')
+
+        manifest_digest = (
+            resource_contract.image.qualification.oci_manifest_digest)
+        if any(binding.workload_image_digest != manifest_digest
+               for binding in self.post_provision.runtime_artifacts):
+            raise ValueError('launch execution capsule seed runtime artifact '
+                             'image digests do not match the workload image.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderKubernetesExecutionCapsuleSeedV1:
+        _bounded_canonical_json_bytes(
+            value,
+            name='Kubernetes launch execution capsule seed',
+            require_object=True,
+            allow_empty_strings=True)
+        raw = _closed_object_shallow(
+            value,
+            name='Kubernetes launch execution capsule seed',
+            keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            implementation_contract=raw['implementation_contract'],
+            executor_cohort=ProviderAuthorityWorkerCohortV1.from_value(
+                raw['executor_cohort']),
+            config_projection=ProviderKubernetesConfigProjectionV1.from_value(
+                raw['config_projection']),
+            config_projection_sha256=raw['config_projection_sha256'],
+            scope=ProviderKubernetesScopeV1.from_value(raw['scope']),
+            principals=ProviderKubernetesPrincipalsV1.from_value(
+                raw['principals']),
+            prerequisites=_provider_kubernetes_prerequisite_inventory_from_value(
+                raw['prerequisites'],
+                name='launch execution capsule seed prerequisites'),
+            request_identity=ProviderKubernetesRequestIdentityV1.from_value(
+                raw['request_identity']),
+            resources=ProviderKubernetesResourceContractV1.from_value(
+                raw['resources']),
+            renderer=ProviderKubernetesRendererV1.from_value(raw['renderer']),
+            post_provision=ProviderKubernetesPostProvisionV1.from_value(
+                raw['post_provision']),
+            endpoint=ProviderKubernetesEndpointContractV1.from_value(
+                raw['endpoint']),
+            scheduling=ProviderKubernetesSchedulingContractV1.from_value(
+                raw['scheduling']),
+            storage=ProviderKubernetesStorageContractV1.from_value(
+                raw['storage']),
+            metadata=ProviderKubernetesMetadataContractV1.from_value(
+                raw['metadata']),
+            security=ProviderKubernetesSecurityContractV1.from_value(
+                raw['security']),
+            topology=ProviderPodTopologyV1.from_value(raw['topology']),
+            mutation_contract=(
+                ProviderKubernetesLaunchMutationContractV1.from_value(
+                    raw['mutation_contract'])))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'implementation_contract': self._IMPLEMENTATION_CONTRACT,
+            'executor_cohort': self.executor_cohort.canonical_value(),
+            'config_projection': self.config_projection.canonical_value(),
+            'config_projection_sha256': self.config_projection_sha256,
+            'scope': self.scope.canonical_value(),
+            'principals': self.principals.canonical_value(),
+            'prerequisites': [
+                item.canonical_value() for item in self.prerequisites
+            ],
+            'request_identity': self.request_identity.canonical_value(),
+            'resources': self.resources.canonical_value(),
+            'renderer': self.renderer.canonical_value(),
+            'post_provision': self.post_provision.canonical_value(),
+            'endpoint': self.endpoint.canonical_value(),
+            'scheduling': self.scheduling.canonical_value(),
+            'storage': self.storage.canonical_value(),
+            'metadata': self.metadata.canonical_value(),
+            'security': self.security.canonical_value(),
+            'topology': self.topology.canonical_value(),
+            'mutation_contract': self.mutation_contract.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesRendererInputV1(_CanonicalContract):
+    """Sole closed pointer root accepted by the pure Kubernetes renderer."""
+
+    version: int
+    contract: str
+    resource_identity: ProviderResourceIdentityV1
+    sky_cluster_name: str
+    sky_cluster_record_uuid: uuid.UUID
+    name_basis: ProviderWorkloadNameBasisV1
+    seed: ProviderKubernetesExecutionCapsuleSeedV1
+    retained_source: ProviderLaunchContentSourceV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'contract', 'resource_identity', 'sky_cluster_name',
+        'sky_cluster_record_uuid', 'name_basis', 'seed', 'retained_source'
+    })
+    _CONTRACT: ClassVar[str] = 'validated_launch_spec_v1'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Kubernetes renderer input version')
+        if type(self.contract) is not str:
+            raise TypeError('Kubernetes renderer input contract must be text.')
+        if self.contract != self._CONTRACT:
+            raise ValueError('Kubernetes renderer input contract is '
+                             'unsupported.')
+        for field, expected_type in (
+            ('resource_identity', ProviderResourceIdentityV1),
+            ('name_basis', ProviderWorkloadNameBasisV1),
+            ('seed', ProviderKubernetesExecutionCapsuleSeedV1),
+            ('retained_source', ProviderLaunchContentSourceV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'Kubernetes renderer input {field} has an '
+                                'invalid type.')
+        object.__setattr__(
+            self, 'sky_cluster_name',
+            _text(self.sky_cluster_name,
+                  name='Kubernetes renderer input sky_cluster_name'))
+        object.__setattr__(
+            self, 'sky_cluster_record_uuid',
+            _uuid(self.sky_cluster_record_uuid,
+                  name='Kubernetes renderer input sky_cluster_record_uuid'))
+        expected_basis = ProviderWorkloadNameBasisV1(
+            version=1,
+            display_name=self.sky_cluster_name,
+            frozen_user_hash=self.seed.request_identity.frozen_user_hash,
+            max_length=42,
+            cluster_name_hash_length=8)
+        if (self.sky_cluster_name != self.name_basis.display_name or
+                self.name_basis.canonical_bytes
+                != expected_basis.canonical_bytes):
+            raise ValueError('Kubernetes renderer input name basis does not '
+                             'match its independently copied inputs.')
+        sources = (
+            self.retained_source.canonical_bytes,
+            self.seed.renderer.source.canonical_bytes,
+            self.seed.post_provision.job_submission.run_source.canonical_bytes,
+        )
+        if len(set(sources)) != 1:
+            raise ValueError('Kubernetes renderer input source copies must be '
+                             'byte-equal.')
+        if (self.retained_source.service_incarnation
+                != self.resource_identity.service_incarnation):
+            raise ValueError('Kubernetes renderer input retained source does '
+                             'not match the resource service incarnation.')
+        self._validate_topology_identity()
+        _ = self.canonical_bytes
+
+    def _validate_topology_identity(self) -> None:
+        """Bind seed topology fields to independently copied input identity."""
+
+        provider_cluster_name = self.name_basis.provider_cluster_name
+        workload_name = self.name_basis.workload_name
+        cluster_uuid = str(self.sky_cluster_record_uuid)
+        replica_uuid = str(self.resource_identity.replica_incarnation)
+        cleaned_user = self.seed.request_identity.cleaned_user
+        expected = (
+            (ProviderObjectRoleV1.HEAD_SSH_SERVICE, f'{workload_name}-ssh', {
+                'service-role': 'head_ssh_service',
+                'skypilot-cluster-name': provider_cluster_name,
+                'skypilot-user': cleaned_user,
+                'skypilot.co/cluster-record-uuid': cluster_uuid,
+                'skypilot.co/serve-replica-incarnation': replica_uuid,
+            }),
+            (ProviderObjectRoleV1.HEAD_SERVICE, workload_name, {
+                'service-role': 'head_service',
+                'skypilot-cluster-name': provider_cluster_name,
+                'skypilot-user': cleaned_user,
+                'skypilot.co/cluster-record-uuid': cluster_uuid,
+                'skypilot.co/serve-replica-incarnation': replica_uuid,
+            }),
+            (ProviderObjectRoleV1.HEAD_POD, workload_name, {
+                'component': workload_name,
+                'skypilot-cluster-name': provider_cluster_name,
+                'skypilot-user': cleaned_user,
+                'skypilot.co/cluster-record-uuid': cluster_uuid,
+                'skypilot.co/serve-replica-incarnation': replica_uuid,
+            }),
+        )
+        actual = tuple((item.role, item.name, {
+            label.key: label.value for label in item.labels
+        }) for item in self.seed.topology.mutable_objects)
+        if actual != expected:
+            raise ValueError('Kubernetes renderer input topology names or '
+                             'labels do not match its independent identity.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderKubernetesRendererInputV1:
+        _bounded_canonical_json_bytes(value,
+                                      name='Kubernetes renderer input',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='Kubernetes renderer input',
+                                     keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            contract=raw['contract'],
+            resource_identity=ProviderResourceIdentityV1.from_value(
+                raw['resource_identity']),
+            sky_cluster_name=raw['sky_cluster_name'],
+            sky_cluster_record_uuid=_uuid(
+                raw['sky_cluster_record_uuid'],
+                name='Kubernetes renderer input sky_cluster_record_uuid'),
+            name_basis=ProviderWorkloadNameBasisV1.from_value(
+                raw['name_basis']),
+            seed=ProviderKubernetesExecutionCapsuleSeedV1.from_value(
+                raw['seed']),
+            retained_source=ProviderLaunchContentSourceV1.from_value(
+                raw['retained_source']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'contract': self._CONTRACT,
+            'resource_identity': self.resource_identity.canonical_value(),
+            'sky_cluster_name': self.sky_cluster_name,
+            'sky_cluster_record_uuid': str(self.sky_cluster_record_uuid),
+            'name_basis': self.name_basis.canonical_value(),
+            'seed': self.seed.canonical_value(),
+            'retained_source': self.retained_source.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderKubernetesExecutionCapsuleV1(_CanonicalContract):
     """Closed policy-free launch execution preimage for direct Pod actuation."""
 
@@ -9290,6 +10294,26 @@ class ProviderKubernetesExecutionCapsuleV1(_CanonicalContract):
                 != self.renderer.config_access_inventory.canonical_bytes):
             raise ValueError('launch execution capsule config-access inventory '
                              'bindings must be byte-equal.')
+        ProviderKubernetesExecutionCapsuleSeedV1(
+            version=self.version,
+            implementation_contract=self.implementation_contract,
+            executor_cohort=self.executor_cohort,
+            config_projection=self.config_projection,
+            config_projection_sha256=self.config_projection_sha256,
+            scope=self.scope,
+            principals=self.principals,
+            prerequisites=self.prerequisites,
+            request_identity=self.request_identity,
+            resources=self.resources,
+            renderer=self.renderer,
+            post_provision=self.post_provision,
+            endpoint=self.endpoint,
+            scheduling=self.scheduling,
+            storage=self.storage,
+            metadata=self.metadata,
+            security=self.security,
+            topology=self.topology,
+            mutation_contract=self.mutation_contract)
         normalization = self.renderer.admitted_object_normalization.canonical_bytes
         if any(item.normalization_profile.canonical_bytes != normalization
                for item in self.objects):
@@ -9477,17 +10501,10 @@ class ProviderKubernetesExecutionCapsuleV1(_CanonicalContract):
             if actual_identity_labels != expected_identity_labels:
                 raise ValueError('launch execution capsule object identity '
                                  'labels do not match topology.')
+            ValidatedKubernetesServeThreeObjectBodyV1(
+                role=object_plan.role, body=object_plan.request_body)
             body = object_plan.request_body.canonical_value()
-            if set(body) != {'apiVersion', 'kind', 'metadata', 'spec'}:
-                raise ValueError('launch execution capsule object request '
-                                 'body is not exact.')
             metadata = body['metadata']
-            expected_metadata_keys = {'namespace', 'name', 'labels'}
-            if object_plan.role is ProviderObjectRoleV1.HEAD_POD:
-                expected_metadata_keys.add('annotations')
-            if set(metadata) != expected_metadata_keys:
-                raise ValueError('launch execution capsule object metadata '
-                                 'is not exact.')
             if (metadata['labels'] != topology_labels or
                     topology_labels.get('skypilot-user') != cleaned_user):
                 raise ValueError('launch execution capsule object body labels '
@@ -9496,19 +10513,7 @@ class ProviderKubernetesExecutionCapsuleV1(_CanonicalContract):
             if object_plan.role is ProviderObjectRoleV1.HEAD_POD:
                 self._validate_head_pod_projection(spec, metadata,
                                                    original_user)
-            elif object_plan.role is ProviderObjectRoleV1.HEAD_SSH_SERVICE:
-                expected_ports = ({
-                    'protocol': 'TCP',
-                    'port': 22,
-                    'targetPort': 22
-                },)
-                if (set(spec) != {'ports'} or
-                        tuple(spec['ports']) != expected_ports):
-                    raise ValueError('launch execution capsule SSH Service '
-                                     'request is not exact.')
-            elif set(spec) != {'clusterIP'} or spec['clusterIP'] != 'None':
-                raise ValueError('launch execution capsule headless Service '
-                                 'request is not exact.')
+            self._validate_requested_semantic_projection(object_plan, body)
 
         manifest_digest = resource_contract.image.qualification.oci_manifest_digest
         if any(binding.workload_image_digest != manifest_digest
@@ -9519,29 +10524,16 @@ class ProviderKubernetesExecutionCapsuleV1(_CanonicalContract):
     def _validate_head_pod_projection(self, spec: JsonObject,
                                       metadata: JsonObject,
                                       original_user: str) -> None:
-        """Validate the capsule-owned direct-Pod request copies."""
+        """Validate the capsule-owned dynamic direct-Pod request copies."""
 
         if metadata.get('annotations') != {'skypilot-user': original_user}:
             raise ValueError('launch execution capsule Pod user annotation '
                              'does not match request identity.')
-        if set(spec) != {
-                'serviceAccountName', 'automountServiceAccountToken',
-                'containers'
-        }:
-            raise ValueError('launch execution capsule Pod spec is not exact.')
-        if (spec['serviceAccountName'] != self.principals.workload.name or
-                spec['automountServiceAccountToken'] is not False or
-                type(spec['containers']) is not list or
-                len(spec['containers']) != 1):
-            raise ValueError('launch execution capsule Pod principal or '
-                             'container shape does not match.')
+        if (spec['serviceAccount'] != self.principals.workload.name or
+                spec['serviceAccountName'] != self.principals.workload.name):
+            raise ValueError('launch execution capsule Pod principal does not '
+                             'match.')
         container = spec['containers'][0]
-        if type(container) is not dict:
-            raise ValueError('launch execution capsule Pod container is not '
-                             'an object.')
-        expected_container_keys = {
-            'name', 'image', 'imagePullPolicy', 'resources', 'env', 'ports'
-        }
         qualification = self.resources.image.qualification
         expected_resources = {
             'requests': {
@@ -9553,30 +10545,28 @@ class ProviderKubernetesExecutionCapsuleV1(_CanonicalContract):
                 'memory': self.resources.pod_memory_limit,
             },
         }
-        if (set(container) != expected_container_keys or
-                container['name'] != 'ray-node' or
-                container['image'] != qualification.requested_reference or
+        if (container['image'] != qualification.requested_reference or
                 container['imagePullPolicy'] != self.resources.image_pull_policy
                 or container['resources'] != expected_resources):
             raise ValueError('launch execution capsule Pod image or resource '
                              'projection does not match.')
-        env = container['env']
-        if (type(env) is not list or len(env) != 1 or
-                type(env[0]) is not dict or set(env[0]) != {'name', 'value'} or
-                env[0]['name'] != 'SKYPILOT_SERVE_REPLICA_ID'):
-            raise ValueError('launch execution capsule Pod replica environment '
-                             'entry is not exact.')
-        _decimal_integer_text(env[0]['value'],
-                              name='launch execution capsule replica ID')
-        ports = container['ports']
-        if ports != [{
-                'containerPort': port
-        } for port in (10001, 10002, 10003, 10004, 46590)]:
-            raise ValueError('launch execution capsule Pod management and '
-                             'application ports are invalid.')
         if self.post_provision.management_port != '46590':
             raise ValueError('launch execution capsule management port does '
                              'not match the Pod request.')
+
+    @staticmethod
+    def _validate_requested_semantic_projection(
+            object_plan: ProviderKubernetesObjectPlanV1,
+            request_body: JsonObject) -> None:
+        """Require the exact request-side allocation projection for one role."""
+
+        expected_semantic = request_body
+        if object_plan.role is ProviderObjectRoleV1.HEAD_SERVICE:
+            del expected_semantic['spec']['clusterIP']
+        if (object_plan.requested_semantic.canonical_bytes
+                != canonical_json_bytes(expected_semantic)):
+            raise ValueError('launch execution capsule requested semantic does '
+                             'not match the exact request normalization.')
 
     @classmethod
     def from_value(cls, value: Any) -> ProviderKubernetesExecutionCapsuleV1:

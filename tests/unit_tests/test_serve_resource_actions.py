@@ -226,9 +226,9 @@ def test_launch_invocation_literal_golden_bytes_hash_and_action_id() -> None:
         _launch_invocation())
     assert invocation.canonical_bytes == actions.canonical_json_bytes(
         invocation.canonical_value())
-    assert len(invocation.canonical_bytes) == 49_821
+    assert len(invocation.canonical_bytes) == 52_889
     assert invocation.sha256 == (
-        '16b2165cf70aa3c0e99b088342e6197fcb8e2eba437d205372c42498d77b7c96')
+        '3f907c130c9685df8edf5f91006f59684a86a40562e4ccdfbbb76f9062d30c61')
     assert invocation.action_id == uuid.UUID(
         'a1fa64dd-eea2-59db-b7b6-733d8001a086')
     assert invocation.launch is not None
@@ -241,9 +241,9 @@ def test_down_invocation_literal_golden_bytes_hash_and_action_id() -> None:
         _down_invocation())
     assert invocation.canonical_bytes == actions.canonical_json_bytes(
         invocation.canonical_value())
-    assert len(invocation.canonical_bytes) == 38_423
+    assert len(invocation.canonical_bytes) == 41_166
     assert invocation.sha256 == (
-        '8f3c55acd0f199b88acefbead76e6e2e4219fdb80fce484221c6f80a1f901929')
+        '51a3546648a400772c8743a96c3bded08385c4da6e74b97b5eec06917d190b9e')
     assert invocation.action_id == uuid.UUID(
         '324a4cdd-4640-57ae-aea8-b3f65851f735')
 
@@ -340,7 +340,7 @@ def test_locator_and_plan_literal_golden_bytes_and_hashes() -> None:
         plan.canonical_value())
     assert len(plan.canonical_bytes) == 3_756
     assert plan.sha256 == (
-        'd80e71dbe94a2409b8b1c1fe2445e9022537bc96516ac727b37d48d0b4459000')
+        '47563a773ef3cafaa7ba5e2524db71f98caf8074626eeaf09b6e3d4e9690c1fa')
 
 
 def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
@@ -349,16 +349,16 @@ def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
                        b',"provider_plan":' +
                        launch.provider_plan.canonical_bytes + b',"version":1}')
     assert launch.canonical_bytes == expected_launch
-    assert len(launch.canonical_bytes) == 53_621
+    assert len(launch.canonical_bytes) == 56_689
     assert launch.sha256 == (
-        '97d3bf9736498dae488bb7503f8f6d1ddd8445382716b278dbd59e21eb6afa4c')
+        '51868b94c4d1edb1805da8dc71b397c8462fb9f59ccf9192c61296a40604d4de')
     assert launch.action_id == uuid.UUID('a1fa64dd-eea2-59db-b7b6-733d8001a086')
     assert len(launch.canonical_bytes) <= 60_000
 
     down = actions.ServeReplicaActionSpecV1.from_value(_down_spec())
     assert (len(down.canonical_bytes), down.sha256) == (
-        42_345,
-        '3a3e01c448377b43f20defc3e2f683e4c02aebebb496ae4485eaf3b39cc950f9')
+        45_088,
+        '5be7dc540da44ce9fe9a9c3a392c16efd5cf1752f381bae7c66db14ac2aacd4f')
     assert len(down.canonical_bytes) <= 60_000
 
 
@@ -550,7 +550,7 @@ def test_action_spec_cleanup_down_is_the_only_child_invocation_exception(
     assert cleanup.requested_target == spec.invocation.requested_target
     assert cleanup.legacy_down_request.workspace == 'boltz-test'
     assert cleanup.sha256 == (
-        'a84fd1151b110d6b4dbb45b2905f2435d6fdb10d234f0a2683e86e5ea88a4f9e')
+        '4711563acb5a99d29457d2b90f22ff52afe34440777c675d8fe2e7f277956d04')
     spec.validate_shadow_child_invocation(
         actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, cleanup)
 
@@ -582,7 +582,7 @@ def test_action_spec_completed_down_stays_below_rollout_and_parser_bounds(
     spec = actions.ServeReplicaActionSpecV1.from_value(value)
 
     assert spec.canonical_bytes == actions.canonical_json_bytes(value)
-    assert len(spec.canonical_bytes) == 42_345
+    assert len(spec.canonical_bytes) == 45_088
     assert len(spec.canonical_bytes) <= 60_000
     assert len(spec.canonical_bytes) <= 65_536
 

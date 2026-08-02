@@ -206,60 +206,27 @@ def _canonical_object_plan(role: str, topology_item: dict,
         'skypilot.co/cluster-record-uuid',
         'skypilot.co/serve-replica-incarnation',
     )]
-    metadata = {
-        'namespace': 'serve-canary',
-        'name': topology_item['name'],
-        'labels': topology_labels,
-    }
-    if role == 'head_pod':
-        metadata['annotations'] = {
-            'skypilot-user': request_identity['original_user']
-        }
-        spec = {
-            'serviceAccountName': 'serve-workload',
-            'automountServiceAccountToken': False,
-            'containers': [{
-                'name': 'ray-node',
-                'image': resources['image']['qualification']
-                         ['requested_reference'],
-                'imagePullPolicy': resources['image_pull_policy'],
-                'resources': {
-                    'requests': {
-                        'cpu': resources['pod_cpu_request'],
-                        'memory': resources['pod_memory_request'],
-                    },
-                    'limits': {
-                        'cpu': resources['pod_cpu_limit'],
-                        'memory': resources['pod_memory_limit'],
-                    },
-                },
-                'env': [{
-                    'name': 'SKYPILOT_SERVE_REPLICA_ID',
-                    'value': '7',
-                }],
-                'ports': [{
-                    'containerPort': port
-                } for port in (10001, 10002, 10003, 10004, 46590)],
-            }],
-        }
-    elif role == 'head_ssh_service':
-        spec = {
-            'ports': [{
-                'protocol': 'TCP',
-                'port': 22,
-                'targetPort': 22,
-            }]
-        }
-    else:
-        spec = {'clusterIP': 'None'}
-    request_body = {
-        'apiVersion': 'v1',
-        'kind': topology_item['kind'],
-        'metadata': metadata,
-        'spec': spec,
-    }
-    requested_semantic = copy.deepcopy(request_body)
-    requested_semantic['admissionDefaults'] = {'explicit': True}
+    request_body = plan_fixtures._renderer_request_body(
+        role,
+        namespace='serve-canary',
+        provider_cluster_name=topology_labels['skypilot-cluster-name'],
+        cleaned_user=request_identity['cleaned_user'],
+        original_user=request_identity['original_user'],
+        cluster_uuid=topology_labels['skypilot.co/cluster-record-uuid'],
+        replica_uuid=topology_labels['skypilot.co/serve-replica-incarnation'],
+        workload_service_account='serve-workload',
+        workload_image=resources['image']['qualification']
+        ['requested_reference'],
+        image_pull_policy=resources['image_pull_policy'],
+        replica_id_text='7',
+        pod_cpu_request=resources['pod_cpu_request'],
+        pod_cpu_limit=resources['pod_cpu_limit'],
+        pod_memory_request=resources['pod_memory_request'],
+        pod_memory_limit=resources['pod_memory_limit'])
+    assert request_body['metadata']['name'] == topology_item['name']
+    assert request_body['metadata']['labels'] == topology_labels
+    requested_semantic = plan_fixtures._renderer_requested_semantic(
+        role, request_body)
     item['request_body'] = request_body
     item['request_body_sha256'] = actions.canonical_sha256(request_body)
     item['requested_semantic'] = requested_semantic
@@ -581,12 +548,12 @@ def test_launch_capsule_and_execution_config_have_fixed_canonical_bytes(
         capsule.canonical_value()) == capsule
     assert actions.ProviderKubernetesExecutionConfigV1.from_value(
         config.canonical_value()) == config
-    assert len(capsule.canonical_bytes) == 34362
+    assert len(capsule.canonical_bytes) == 37430
     assert capsule.sha256 == (
-        '0d9e435486120d9e95dfee2590ff473045cbe1f3980998961fdc635c83debfeb')
-    assert len(config.canonical_bytes) == 42664
+        'e5728dbba47b2812acb32d4eaffeeaa617822df9d769b66fcddf2674d6ff5d97')
+    assert len(config.canonical_bytes) == 45732
     assert config.sha256 == (
-        '2d194ab2e98b682025f3939492b6b8e17b5b0a5f66fd1a7f0a2230eb00e38017')
+        'e787007ef20518414b8f9f544281752b1a382c867eeb17169278ed348954546b')
 
 
 @pytest.mark.parametrize('mutation,match', [
@@ -802,7 +769,7 @@ def test_capsule_rejects_caller_selected_role_final_label_maps() -> None:
         'service-role'] = 'caller-controlled'
     raw['objects'][0]['request_body_sha256'] = actions.canonical_sha256(
         raw['objects'][0]['request_body'])
-    with pytest.raises(ValueError, match='role label map is not exact'):
+    with pytest.raises(ValueError, match='request body'):
         actions.ProviderKubernetesExecutionCapsuleV1.from_value(raw)
 
     raw = _capsule_raw()
@@ -814,7 +781,7 @@ def test_capsule_rejects_caller_selected_role_final_label_maps() -> None:
         'zz-caller'] = 'raw-input'
     raw['objects'][2]['request_body_sha256'] = actions.canonical_sha256(
         raw['objects'][2]['request_body'])
-    with pytest.raises(ValueError, match='role label map is not exact'):
+    with pytest.raises(ValueError, match='request body'):
         actions.ProviderKubernetesExecutionCapsuleV1.from_value(raw)
 
 
@@ -846,6 +813,11 @@ def test_execution_config_replays_projected_request_identity() -> None:
                 'skypilot-user'] = 'Other.User'
         object_plan['request_body_sha256'] = actions.canonical_sha256(
             object_plan['request_body'])
+        requested_semantic = plan_fixtures._renderer_requested_semantic(
+            object_plan['role'], object_plan['request_body'])
+        object_plan['requested_semantic'] = requested_semantic
+        object_plan['requested_semantic_sha256'] = actions.canonical_sha256(
+            requested_semantic)
     crossed_capsule = actions.ProviderKubernetesExecutionCapsuleV1.from_value(
         raw)
     base_subject = _subject()

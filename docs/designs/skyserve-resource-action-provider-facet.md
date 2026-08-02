@@ -7,17 +7,20 @@ contract foundations are implemented. As of 2026-08-02, the exact three-object
 unreleased flattened v1 scaffold is rejected. Immutable launch and down
 invocations/execution configurations, completed and partial down bases, the
 closed API006 progress/lineage/reduction contract, and strict private-handler
-return codecs are implemented and locally verified. The provider renderer,
-admitted-object and live transport normalizers, live preflight, runtime
-admission/session, request-handler dispatcher, provider observation/effect
-capture, and live provider authority are not implemented. Authority remains
-disabled. Activation evidence now rejects API006 as an authority head: API005
-is limited to legacy-controller shadow, while API007 gates private-handler
-dispatch readiness and `shadow -> authoritative`. This correction does not
-claim M4 or provider-authoritative rollout. A candidate v1 three-object body,
-admission-normalization, and renderer-artifact format is now frozen from
-non-persisting `boltz-test` server-side dry-run evidence; renderer code and the
-eventual canary-namespace/201/409 qualification gates remain incomplete.
+return codecs are implemented and locally verified. The five pinned renderer
+artifacts, closed renderer input/seed, exact three-object body and atomic
+capsule-validator cutover, effect-free staged renderer, and pure request and
+admitted-object normalizers are also implemented and locally verified. Live
+transport normalization, preflight, manager/runtime admission and session,
+request-handler dispatch, provider observation/effect capture, canary cohort
+qualification, and live provider authority are not implemented. Authority
+remains disabled. Activation evidence rejects API006 as an authority head:
+API005 is limited to legacy-controller shadow, while API007 gates
+private-handler dispatch readiness and `shadow -> authoritative`. This does
+not claim M4 or provider-authoritative rollout. The candidate v1 artifacts are
+packaged but have not been accepted into or exercised by an executor cohort;
+the eventual canary-namespace, persisted 201/409, scheduler, and runtime gates
+remain incomplete.
 
 Source commit `a836825ef9c219563bb2abc740707c825c26edc5` and immutable
 image digest
@@ -1420,15 +1423,25 @@ four-stage sequence. In stage 3 the staged constructor invokes
 validated-body transient and does not invoke the validator a second time. This
 staged constructor is required before a renderer artifact can be accepted.
 
-### Candidate renderer artifact formats
+### Packaged candidate renderer artifact formats
 
 All five renderer artifacts are RFC 8259 JSON encoded as canonical UTF-8 by the
 repository canonicalizer: object keys are sorted, insignificant whitespace is
 absent, duplicate keys/nonfinite numbers are invalid, and the raw artifact is
 the compact canonical JSON followed by exactly one LF byte. They are data, not
-Jinja, Python, YAML, or executable source. These format contracts do not claim
-that candidate artifact bytes have
-been accepted into an executor-cohort inventory.
+Jinja, Python, YAML, or executable source. The exact checked-in candidate bytes
+are:
+
+| Role | Bytes | Raw SHA-256, including one final LF |
+|---|---:|---|
+| `outer_template` | 972 | `769039b9c25956833032fb670148797c3ba74cd5a12253faf1e99443a27444b8` |
+| `node_fragment` | 1,632 | `2000b68c74ccb6710e43b03963cf31f40c35ec879743977a3e3ba6ff3baa43db` |
+| `binding_schema` | 4,520 | `2c64a3ed8ee6ac3108fbf13d509ef348c73937d60473b5f697b24ee077611aef` |
+| `config_access_inventory` | 23,710 | `19901e8e0491a4e9f957f7ff2a1244fc1baff132c37015c9e8e726af2d538f13` |
+| `admitted_object_normalization` | 3,033 | `3ab35d775ff1324587c1c10854d5de8572ce127a8541dc08d85349be06e8f850` |
+
+Packaging and local resolution of these bytes do not claim that they have been
+accepted into an executor-cohort inventory.
 
 `outer_template` has schema ID
 `skypilot.serve.prebooted-direct-pod.outer-template.v1` and exactly these
@@ -1570,9 +1583,9 @@ duplicate-free array of qualified callable names. The five literal entries are:
 | 3 / `config_access_inventory` | `skypilot.serve.prebooted-direct-pod.config-access-inventory.v1` | `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1`, `sky.serve.resource_action_renderer.validate_provider_kubernetes_config_access_inventory_v1` |
 | 4 / `admitted_object_normalization` | `skypilot.kubernetes.admitted-object-normalization.v1` | `sky.serve.resource_action_provider_artifacts.normalize_kubernetes_admitted_object_v1`, `sky.serve.resource_action_provider_artifacts.normalize_kubernetes_request_object_v1`, `sky.serve.resource_action_renderer.build_provider_kubernetes_object_plans_v1`, `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1` |
 
-Those qualified renderer/normalizer callables are reserved
-implementation names, not claims that the current branch defines them.
-Acceptance requires that import/AST resolution finds exactly those names.
+Those qualified renderer/normalizer callables are implemented. Acceptance
+tests import-resolve and AST-check exactly those names and reject another
+public renderer entrypoint, call edge, project helper, or input access.
 
 An entrypoint has exact shape `{sequence,phase,qualified_name}`. The exact phase
 order and qualified names are:
@@ -1768,11 +1781,28 @@ cannot broaden them.
 "skypilot_config","unpinned_filesystem_path"]`. The artifact resolver's sole
 filesystem authority is descriptor-safe resolution of the five exact
 `repo_path`/`byte_size`/`sha256` references read at input-access sequences
-13–17 beneath the installed package root; it rejects symlinks, path escape,
+13–17 beneath the installed distribution root that contains the imported
+top-level `sky/` package; it rejects symlinks, path escape,
 nonregular files, size/hash drift, and every caller-supplied or discovered path.
 That bounded content-addressed read is not `ambient_filesystem` or
 `unpinned_filesystem_path`. A missing or extra artifact role, input access,
 callable, graph edge, provider operation, or forbidden-source literal rejects.
+
+For these five v1 renderer members, `ProviderRepoArtifactRefV1.repo_path` is a
+repository-root-relative canonical POSIX path, not a path relative to the
+`sky/` package directory. The exact role-to-path map is
+`sky/serve/resource_action_artifacts/kubernetes_renderer_v1/outer_template.json`,
+`node_fragment.json`, `binding_schema.json`, `config_access_inventory.json`,
+and `admitted_object_normalization.json` under that same directory. At runtime
+the resolver derives that distribution root only from the imported regular
+`sky` package location, opens from the root descriptor, and requires the
+complete role-exact path; it does not scan or discover another `sys.path`
+entry. A path with another prefix or basename rejects even if its bytes, size,
+and hash match an approved member. Packaging adds the exact
+`recursive-include sky/serve/resource_action_artifacts/kubernetes_renderer_v1 *.json`
+rule and a built-wheel content test for all five paths. This renderer-specific
+rule does not narrow the general-purpose `ProviderRepoArtifactRefV1` value
+type.
 
 `admitted_object_normalization` has schema ID
 `skypilot.kubernetes.admitted-object-normalization.v1` and exact keys `schema`,
@@ -1985,37 +2015,40 @@ set, `render` its sole consumer, both normalizers receive the exact resolved
 normalization member explicitly, and every object plan copies that member's
 artifact reference byte-for-byte.
 
-This paragraph is normative, not evidence that those artifacts currently
-exist. The present branch still has no accepted renderer, node fragment,
-binding schema, or config-access inventory that executes this body contract.
-The existing capsule body validators also implement the older minimal request
-shape through minimal/fake `admissionDefaults` fixture bodies and must be
-updated and tested against this exact schema before a renderer can be
-represented. That old shape uses the same v1 capsule and
-`kubernetes_admitted_object_v1` comparison identifiers; accepting both would
-make the identifier ambiguous, while replacing it with persisted represented
-launches would make those capsules unreadable. There is therefore no dual
-acceptance, fallback reader, or shape sniffing under this v1 identifier.
+The table and matrix above remain normative acceptance requirements. The five
+artifacts, staged renderer, exact body validator, typed request/admitted
+normalizers, and completed-capsule revalidation now exist. The four focused
+files `test_serve_resource_action_renderer.py`,
+`test_serve_resource_action_renderer_artifacts.py`,
+`test_serve_resource_action_renderer_values.py`, and
+`test_serve_resource_action_provider_artifacts.py` collect and pass 60 local
+cases. They pin the five raw byte preimages, resolve artifacts from the
+descriptor-bound imported package, reject non-regular initializer and artifact
+leaves without blocking (including FIFO regressions), close the 11-entrypoint
+call graph and 51 RendererInput accesses with runtime code-object and CI AST
+checks, exercise
+the exact three object roles, and cover the pure allocation normalizers. This
+is local pure-code evidence, not executor-cohort, candidate-maximal, or live
+Kubernetes acceptance.
 
-The renderer implementation and fixture cutover is atomic. Before any image
-containing the new validator/renderer acceptance can run, a consistent
-read-only PostgreSQL preflight must prove zero persisted represented launch
-specs, actions, attempts, and representation links that could contain the old
-body shape. A nonzero or indeterminate result aborts and requires a new
+The code and fixture side of the same-v1 cutover completed atomically: every
+minimal/fake `admissionDefaults` fixture and validator acceptance was removed
+in the same change that added the exact three bodies, and no reader accepts
+both shapes. Before any image containing that cutover runs, a consistent
+read-only PostgreSQL preflight must still prove zero persisted represented
+launch specs, actions, attempts, and representation links that could contain
+the old body shape. A nonzero or indeterminate result aborts and requires a new
 comparison version or separately reviewed offline migration; code does not
-rewrite or delete such rows. The currently dark runtime and empty `boltz-test`
-resource-action graph make this cutover eligible, but the recorded observation
-does not replace the deployment-time preflight. The same implementation change
-removes every old `admissionDefaults` fixture/validator acceptance while adding
-the exact three-body fixtures and validator; no intermediate build accepts
-both. Until all five artifacts resolve by exact
-repository path/size/hash, realistic plus maximal goldens pass, and the same
-dry-run comparison repeats byte-exactly in the eventual canary namespace,
-launch normalization returns `unrepresented_execution_config`, remains
-shadow-only, and sends no action-owned provider bytes. The generic Jinja/config
-path is not a substitute and is ineligible for authority. Persisted 201/409,
-scheduler, runtime, P2, and P3 evidence remain separate later gates and are not
-claimed by these dry-runs.
+rewrite or delete such rows. The previously observed empty `boltz-test`
+resource-action graph makes the cutover eligible but does not replace this
+deployment-time preflight, staged deployment of every reader/writer, or a new
+final checkpoint. Until the implemented artifacts are cohort-bound, realistic
+plus candidate-maximal goldens pass, and the same dry-run comparison repeats
+byte-exactly in the eventual canary namespace, runtime launch normalization
+returns `unrepresented_execution_config`, remains shadow-only, and sends no
+action-owned provider bytes. The generic Jinja/config path is not a substitute
+and is ineligible for authority. Persisted 201/409, scheduler, runtime, P2, and
+P3 evidence remain separate later gates and are not claimed by these tests.
 
 For the initial authoritative `pod_cluster_v1` cohort, `cloud` is
 `kubernetes`, the `kubernetes` block is nonnull, and `workload_kind` is exactly
@@ -5730,6 +5763,30 @@ launch/down spec goldens; every measured canonical spec remained below the
 65,536-byte bound. The resolved-target tests require all three canonical roles
 and reject the pre-release flattened wire.
 
+Further P1 pure-renderer verification evidence on 2026-08-02: the five exact
+LF-terminated artifacts, typed resolver wrappers, closed renderer input/seed,
+17-binding set, exact three-body validator, pure request/admitted normalizers,
+object-plan builder, and completed-capsule revalidation are implemented. The
+60-case focused renderer/artifact/normalizer matrix passes; the complete
+1,543-case `test_serve_resource_action*.py` matrix passes with the real
+PostgreSQL test URL, including the atomically replaced launch/down body and
+full-spec byte/hash goldens. The release-wheel test proves all five files are
+embedded byte-for-byte. Descriptor traversal is bound to the opened regular
+imported `sky` package and rejects symlinks, size/hash drift, or path
+substitution. Runtime code-object checks plus source-AST tests close the staged
+call graph, declared input accesses including zero-access entrypoints, extra
+project helpers, executable imports, and forbidden ambient sources. The
+validator scans each nested code-object identity exactly once and derives
+source positions from `Instruction.positions.lineno`, with an exact-integer
+`starts_line` fallback. Exact executable and AST seals pass on CPython 3.10.20,
+3.11.15, 3.12.13, 3.13.14, 3.14.3, and the CI image's 3.14.6; this closes the
+portability defect exposed by 3.14's boolean `starts_line` and repeated nested
+`LOAD_CONST` references without widening the one-fingerprint-per-minor
+allowlist. This
+evidence is effect-free: it does not run preflight, create a provider client,
+dispatch a private handler, persist a 201/409 result, or qualify an executor
+cohort.
+
 Further P1 progress and return-envelope verification evidence on 2026-08-02:
 the pure Serve-owned API006 contract parses and validates launch/down cursors,
 checks monotonic transitions and attempt/execution attestations, derives only a
@@ -5743,8 +5800,9 @@ Strict encoders/decoders are registered only for
 runs verify that null, malformed, or hash-invalid returns terminalize failed
 instead of persisting a successful null/untyped result. This evidence is for
 immutable values and persistence behavior only: it does not implement or prove
-the renderer, normalizer, preflight, runtime admission/session, dispatcher,
-provider I/O, shadow parity, or live authority.
+runtime integration or live qualification of the implemented pure renderer
+and normalizers, preflight, runtime admission/session, dispatcher, provider
+I/O, shadow parity, or live authority.
 
 First-deployment cutover evidence completed on 2026-08-02. The read-only
 `boltz-test` baseline at Helm revision 57 had API004, upstream
@@ -5875,8 +5933,10 @@ Contract tests must cover:
   absence from all Pod/Service port lists, and literal `podip`
   `open_ports()`/`cleanup_ports()` no-op assertions with zero Service,
   Ingress, LoadBalancer, patch, or other provider calls;
-- missing, unreadable, hash-drifted, or behavior-drifted candidate renderer,
-  binding-schema, or admitted-object-normalizer artifacts return exactly
+- missing, unreadable, hash-drifted, or behavior-drifted candidate
+  `outer_template`, `node_fragment`, `binding_schema`,
+  `config_access_inventory`, or `admitted_object_normalization` artifacts
+  return exactly
   `unrepresented_execution_config`, preserve shadow-only routing, and emit no
   action-owned provider bytes; realistic and candidate-maximal artifact goldens
   are required before that gate can open;
@@ -6382,23 +6442,22 @@ absence result through a public API.
 - The current branch has no accepted five-artifact `pod_cluster_v1` renderer
   cohort or canary-qualified `kubernetes_admitted_object_v1` normalizer, so
   `unrepresented_execution_config` and shadow-only routing remain mandatory.
-  Add the five pinned artifacts in the exact formats above plus
-  realistic/candidate-maximal body
-  goldens, prebooted runtime, action-keyed Skylet, mutation-trace,
-  handle/endpoint, and observation fixtures against real Kubernetes, then
-  exercise the exact 12-role in-cluster principal/authorization/admission/
-  network preflight plus both launch LB Deployment-to-ServiceAccount projections
-  on the selected Boltz canary path, and verify the down preflight performs zero
-  LB Deployment GETs.
-- Before accepting that renderer, implement and retain the atomic same-v1 body
-  cutover gate: prove zero persisted represented launch graph under the pinned
-  old writer, remove all minimal/fake `admissionDefaults` acceptance in the
-  same build that adds the exact three bodies, and deploy every reader/writer
-  before representation resumes. No dual-shape compatibility is permitted.
-- Implement the provider renderer and admitted-object normalizer, then bind the
-  already-implemented launch/down invocation and execution-config contracts to
-  complete preflight seeds, the controller/executor dual policy-absence proof
-  sequence, the preparation/counted-slot gate, and exact partial
+  Bind and live-qualify the five implemented pinned artifacts with
+  realistic/candidate-maximal body goldens, prebooted runtime, action-keyed
+  Skylet, mutation-trace, handle/endpoint, and observation fixtures against
+  real Kubernetes. Then exercise the exact 12-role in-cluster
+  principal/authorization/admission/network preflight plus both launch LB
+  Deployment-to-ServiceAccount projections on the selected Boltz canary path,
+  and verify the down preflight performs zero LB Deployment GETs.
+- The code/fixture side of the atomic same-v1 body cutover is complete and has
+  no dual-shape compatibility. Before accepting the renderer, retain the
+  deployment gate: prove a zero persisted represented launch graph under the
+  pinned old writer, deploy every reader/writer containing the exact-body
+  validator, and repeat the zero-row checkpoint before representation resumes.
+- Integrate the implemented provider renderer and admitted-object normalizer
+  with the already-implemented launch/down invocation and execution-config
+  contracts, complete preflight seeds, controller/executor dual policy-absence
+  proof sequence, preparation/counted-slot gate, and exact partial
   UID-qualified adoption/deletion. Neither execution config currently has a
   runtime consumer capable of provider mutation.
 - Before the live Kubernetes normalizer is implemented, freeze exact server-URL
