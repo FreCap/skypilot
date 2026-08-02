@@ -1357,17 +1357,24 @@ async def prepare_request_async(
     """
     role_filter.reject_non_admin_pod_config(auth_user, request_body)
     if auth_user is not None:
-        assert auth_user.name is not None
+        # Authenticated requests historically did not require either submitted
+        # identity field because both are replaced below.
+        submitted_user_hash = request_body.env_vars.get(
+            constants.USER_ID_ENV_VAR, '')
+    else:
+        # Preserve the legacy no-auth requirement for a submitted user hash.
+        submitted_user_hash = request_body.env_vars[constants.USER_ID_ENV_VAR]
+    submitted_original_user = request_body.env_vars.get(constants.USER_ENV_VAR,
+                                                        submitted_user_hash)
+    effective_original_user, user_id = (
+        server_common.resolve_effective_request_identity(
+            auth_user, submitted_original_user, submitted_user_hash))
+    if auth_user is not None:
         # Use the authenticated user identity as the single source of truth
         # if present.
-        user_id = auth_user.id
         # Set user identity for executors.
         request_body.env_vars[constants.USER_ID_ENV_VAR] = user_id
-        request_body.env_vars[constants.USER_ENV_VAR] = auth_user.name
-    else:
-        # Fallback to legacy environment variable based identity if no
-        # authentication is set.
-        user_id = request_body.env_vars[constants.USER_ID_ENV_VAR]
+        request_body.env_vars[constants.USER_ENV_VAR] = effective_original_user
     actor_type: str | None
     if is_skypilot_system:
         user_id = constants.SKYPILOT_SYSTEM_USER_ID
@@ -1378,10 +1385,10 @@ async def prepare_request_async(
                         name=user_id,
                         user_type=models.UserType.SYSTEM.value))
     elif auth_user is not None:
-        actor_name = auth_user.name or auth_user.id
+        actor_name = effective_original_user or user_id
         actor_type = auth_user.user_type
     else:
-        actor_name = request_body.env_vars.get(constants.USER_ENV_VAR, user_id)
+        actor_name = effective_original_user
         actor_type = None
     # Capture the client's API version from the FastAPI dispatch context
     # into the request body so it survives the process boundary into the

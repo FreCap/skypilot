@@ -23,15 +23,17 @@ foundational runtime/job/endpoint leaves now include the closed Skylet job-spec,
 submit-request, retained-evidence, and policy-boundary-proof leaves and are
 independently verified; the policy-free request-identity, scheduling, storage,
 metadata, security, object-mutation-effect, and exact launch/down mutation
-contract leaves are implemented and independently verified, while contextual
-action-bound submit comparison, launch-only server-effective identity
-canonicalization/projector and down-current-identity absence, enclosing capsule
+contract leaves are implemented and independently verified; the launch-only
+server-effective identity wire contracts, shared resolver, no-enqueue endpoint,
+store validation, and bounded client are implemented and independently
+verified, while manager integration, contextual action-bound submit comparison,
+identity-to-source projector, down-current-identity absence, enclosing capsule
 and execution-config composition, and live preflight remain pending; shared
 leaf-validator, named raw-field, and bounded canonical-JSON exact-type
 hardening is implemented and independently verified; runtime provider
 propagation, observation, and shadow instrumentation remain pending
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 Canonical owner: this file governs only the provider-mutation and observation
 seam for `docs/designs/durable-serve-replica-actions.md`. It does not supersede
@@ -4746,14 +4748,26 @@ raw fields, direct sites, wrapper embeddings, and canonical wrappers named
 above; it does not claim exact raw-subclass rejection in unrelated legacy
 canonicalizing parsers or every direct DTO constructor.
 
-First-deployment cutover evidence on 2026-08-01: read-only `boltz-test`
-inspection found API schema 004, Serve 031, global-user-state 027, and no API or
-Serve resource-action tables. Helm revision 51 has every role on baseline
-digest
-`sha256:a5afbd26e62ebe2f6990b2f311a59caaf3ef2901f2eab5d6dddd46527320f00a`,
-whose recorded source baseline predates the resource-action DTO module. This
-proves the flattened local scaffold is not present there; the post-migration
-zero-row/link/mode snapshot remains a mandatory rollout artifact.
+Further P1 launch-identity verification evidence on 2026-08-02: fixed
+canonical byte-size/hash fixtures cover the closed input, context, request,
+proof, and response chain. Focused tests cover exact scalar types and bounds,
+constant-time capability/store validation, one-session/no-mutation behavior,
+post-auth and explicit no-auth identity replacement, exact raw HTTP statuses,
+OAuth nonredirecting 401 behavior, a 65,536-byte body/response cap, fail-closed
+missing middleware state, and one byte-identical 100 ms retry only for reset,
+timeout, or exact 503. Independent adversarial review accepted the corrected
+full-value user-hash check and middleware boundary. This evidence does not
+claim manager-side capability generation/discard, source projection, admission
+binding, or any caller of the still-dark client.
+
+First-deployment cutover evidence refreshed on 2026-08-02: read-only
+`boltz-test` inspection found API schema 004, upstream request-classification
+Serve 032, global-user-state 027, and no Serve resource-action tables. Helm
+revision 56 has every role on baseline digest
+`sha256:6753d5fb3ccac8d6436a436a99870410248e62f03ecad08741ebd4510d1f5e18`.
+This proves the unshipped feature Serve032/033 catalog is not present there;
+the post-migration zero-row/link/mode snapshot remains a mandatory rollout
+artifact.
 
 ### P2: live shadow observation
 

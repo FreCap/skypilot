@@ -312,6 +312,30 @@ class TestOriginalOAuth2ProxyMiddleware:
             assert 'oauth2/start' in response.headers['location']
 
     @pytest.mark.asyncio
+    async def test_launch_identity_canonicalizer_never_redirects_auth_failure(
+            self, middleware_enabled, mock_request, mock_call_next):
+        mock_request.state.auth_user = None
+        mock_request.url.path = (
+            '/internal/resource-actions/v1/launch-identity/canonicalize')
+        mock_response = mock.Mock()
+        mock_response.status = http.HTTPStatus.UNAUTHORIZED
+        mock_response_ctx = mock.AsyncMock()
+        mock_response_ctx.__aenter__.return_value = mock_response
+        mock_response_ctx.__aexit__.return_value = None
+
+        with mock.patch('aiohttp.ClientSession') as mock_session_class:
+            mock_session = mock.Mock()
+            mock_session.request.return_value = mock_response_ctx
+            mock_session_class.return_value.__aenter__.return_value = mock_session
+            mock_session_class.return_value.__aexit__.return_value = None
+            response = await middleware_enabled.authenticate(
+                mock_request, mock_call_next)
+
+        assert response.status_code == http.HTTPStatus.UNAUTHORIZED
+        assert 'location' not in response.headers
+        assert b'Authentication is required' in response.body
+
+    @pytest.mark.asyncio
     async def test_authenticate_health_endpoint_bypass(self, middleware_enabled,
                                                        mock_call_next):
         """Test that health endpoints bypass auth when unauthorized."""

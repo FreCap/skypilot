@@ -43,6 +43,7 @@ _UTC_TIMESTAMP_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:'
                                r'[0-9]{2}\.[0-9]{6}Z$')
 _DECIMAL_INTEGER_RE = re.compile(r'^(?:0|[1-9][0-9]{0,18})$')
 _DECIMAL_PORT_RE = re.compile(r'^[1-9][0-9]{0,4}$')
+_USER_HASH_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9-]*$')
 _CANONICAL_POSITIVE_DECIMAL_RE = re.compile(
     r'^(?:[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]{0,2}[1-9])$')
 _MAX_CANONICAL_JSON_CONTAINER_DEPTH = 16
@@ -481,6 +482,13 @@ def _canonical_positive_decimal_text(value: Any, *, name: str) -> str:
 def _sha256(value: Any, *, name: str) -> str:
     if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f'{name} must be lowercase SHA-256 hex.')
+    return value
+
+
+def _lower_hex_32_bytes(value: Any, *, name: str) -> str:
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(
+            f'{name} must be exactly 64 lowercase hexadecimal characters.')
     return value
 
 
@@ -1145,9 +1153,8 @@ class ProviderWorkloadNameBasisV1(_CanonicalContract):
     _CLUSTER_NAME_HASH_LENGTH: ClassVar[int] = 8
     # Reserve one display-name character and the two separating dashes when a
     # long display name needs its collision-resistant hash.
-    _MAX_FROZEN_USER_HASH_LENGTH: ClassVar[int] = (_MAX_LENGTH -
-                                                   _CLUSTER_NAME_HASH_LENGTH -
-                                                   3)
+    MAX_FROZEN_USER_HASH_LENGTH: ClassVar[int] = (_MAX_LENGTH -
+                                                  _CLUSTER_NAME_HASH_LENGTH - 3)
 
     def __post_init__(self) -> None:
         _version_one(self.version, name='workload name basis version')
@@ -1160,7 +1167,7 @@ class ProviderWorkloadNameBasisV1(_CanonicalContract):
             self, 'frozen_user_hash',
             _text(self.frozen_user_hash,
                   name='workload_name_basis.frozen_user_hash',
-                  maximum_bytes=self._MAX_FROZEN_USER_HASH_LENGTH))
+                  maximum_bytes=self.MAX_FROZEN_USER_HASH_LENGTH))
         if (not isinstance(self.max_length, int) or
                 isinstance(self.max_length, bool) or
                 self.max_length != self._MAX_LENGTH):
@@ -2031,7 +2038,18 @@ class ProviderResourceIdentityV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls, value: Any) -> 'ProviderResourceIdentityV1':
-        raw = _closed_object(value, name='resource_identity', keys=cls._KEYS)
+        raw = _closed_object_shallow(value,
+                                     name='resource_identity',
+                                     keys=cls._KEYS)
+        _text(raw['service_hash'], name='resource_identity.service_hash')
+        _uuid(raw['service_incarnation'],
+              name='resource_identity.service_incarnation')
+        _nonnegative_integer(raw['replica_id'],
+                             name='resource_identity.replica_id')
+        _uuid(raw['replica_incarnation'],
+              name='resource_identity.replica_incarnation')
+        _positive_integer(raw['desired_generation'],
+                          name='resource_identity.desired_generation')
         return cls(service_hash=raw['service_hash'],
                    service_incarnation=_uuid(
                        raw['service_incarnation'],
@@ -2373,6 +2391,428 @@ class WorkerCohortReferenceInputV1(_CanonicalContract):
                 self.desired_generation != coverage.desired_generation or
                 self.action_type is not coverage.action_type):
             raise ValueError('cohort reference does not match coverage.')
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchIdentityCanonicalizationInputV1(_CanonicalContract):
+    """Pre-auth launch identity inputs sent to the private canonicalizer."""
+
+    version: int
+    contract: str
+    service_name: str
+    resource_identity: ProviderResourceIdentityV1
+    prepared_original_user: str
+    prepared_user_hash: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'contract', 'service_name', 'resource_identity',
+        'prepared_original_user', 'prepared_user_hash'
+    })
+    _CONTRACT: ClassVar[str] = 'api_server_effective_launch_identity_v1'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='launch identity canonicalization input version')
+        if type(self.contract) is not str:
+            raise TypeError(
+                'launch identity canonicalization input contract must be text.')
+        if self.contract != self._CONTRACT:
+            raise ValueError(
+                'launch identity canonicalization input contract is unsupported.'
+            )
+        object.__setattr__(
+            self, 'service_name',
+            _text(self.service_name,
+                  name='launch identity canonicalization input service_name',
+                  maximum_bytes=_MAX_SERVICE_NAME_BYTES))
+        if type(self.resource_identity) is not ProviderResourceIdentityV1:
+            raise TypeError('launch identity canonicalization input resource '
+                            'identity has an invalid type.')
+        for field in ('prepared_original_user', 'prepared_user_hash'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field),
+                      name=f'launch identity canonicalization input {field}'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls, value: Any) -> 'ProviderLaunchIdentityCanonicalizationInputV1':
+        raw = _closed_object_shallow(
+            value,
+            name='launch identity canonicalization input',
+            keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   contract=raw['contract'],
+                   service_name=raw['service_name'],
+                   resource_identity=ProviderResourceIdentityV1.from_value(
+                       raw['resource_identity']),
+                   prepared_original_user=raw['prepared_original_user'],
+                   prepared_user_hash=raw['prepared_user_hash'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'contract': self._CONTRACT,
+            'service_name': self.service_name,
+            'resource_identity': self.resource_identity.canonical_value(),
+            'prepared_original_user': self.prepared_original_user,
+            'prepared_user_hash': self.prepared_user_hash,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchIdentityCanonicalizationContextV1(_CanonicalContract):
+    """Exact PREPARING reference context for launch identity resolution."""
+
+    version: int
+    decision_id: uuid.UUID
+    cohort_id: str
+    action_type: kernel_actions.ActionKind
+    controller_owner_fence: str
+    lifecycle_epoch: int
+    preparation_reference_revision: int
+    reference_state: WorkerCohortReferenceState
+    preparation_capability_sha256: str
+    input: ProviderLaunchIdentityCanonicalizationInputV1
+    input_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'decision_id', 'cohort_id', 'action_type',
+        'controller_owner_fence', 'lifecycle_epoch',
+        'preparation_reference_revision', 'reference_state',
+        'preparation_capability_sha256', 'input', 'input_sha256'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='launch identity canonicalization context version')
+        decision_id = _uuid(
+            self.decision_id,
+            name='launch identity canonicalization context decision_id')
+        object.__setattr__(self, 'decision_id', decision_id)
+        object.__setattr__(
+            self, 'cohort_id',
+            _dns_label(
+                self.cohort_id,
+                name='launch identity canonicalization context cohort_id'))
+        action_type = _action_kind(
+            self.action_type,
+            name='launch identity canonicalization context action_type')
+        if action_type is not kernel_actions.ActionKind.LAUNCH:
+            raise ValueError(
+                'launch identity canonicalization context requires launch.')
+        object.__setattr__(self, 'action_type', action_type)
+        object.__setattr__(
+            self, 'controller_owner_fence',
+            _text(self.controller_owner_fence,
+                  name=('launch identity canonicalization context '
+                        'controller_owner_fence')))
+        object.__setattr__(
+            self, 'lifecycle_epoch',
+            _positive_integer(
+                self.lifecycle_epoch,
+                name='launch identity canonicalization context lifecycle_epoch')
+        )
+        _version_one(self.preparation_reference_revision,
+                     name=('launch identity canonicalization context '
+                           'preparation_reference_revision'))
+        reference_state = _enum_value(
+            WorkerCohortReferenceState,
+            self.reference_state,
+            name='launch identity canonicalization context reference_state')
+        if reference_state is not WorkerCohortReferenceState.PREPARING:
+            raise ValueError(
+                'launch identity canonicalization context requires '
+                'a PREPARING reference.')
+        object.__setattr__(self, 'reference_state', reference_state)
+        object.__setattr__(
+            self, 'preparation_capability_sha256',
+            _sha256(self.preparation_capability_sha256,
+                    name=('launch identity canonicalization context '
+                          'preparation_capability_sha256')))
+        if type(self.input
+               ) is not ProviderLaunchIdentityCanonicalizationInputV1:
+            raise TypeError(
+                'launch identity canonicalization context input has '
+                'an invalid type.')
+        object.__setattr__(
+            self, 'input_sha256',
+            _sha256(
+                self.input_sha256,
+                name='launch identity canonicalization context input_sha256'))
+        if self.input_sha256 != self.input.sha256:
+            raise ValueError('launch identity canonicalization context input '
+                             'hash does not match.')
+        expected_decision_id = self.input.resource_identity.action_identity(
+            kernel_actions.ActionKind.LAUNCH).action_id
+        if decision_id != expected_decision_id:
+            raise ValueError(
+                'launch identity canonicalization context decision '
+                'ID does not match its resource identity.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls,
+            value: Any) -> 'ProviderLaunchIdentityCanonicalizationContextV1':
+        raw = _closed_object_shallow(
+            value,
+            name='launch identity canonicalization context',
+            keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            decision_id=raw['decision_id'],
+            cohort_id=raw['cohort_id'],
+            action_type=raw['action_type'],
+            controller_owner_fence=raw['controller_owner_fence'],
+            lifecycle_epoch=raw['lifecycle_epoch'],
+            preparation_reference_revision=raw[
+                'preparation_reference_revision'],
+            reference_state=raw['reference_state'],
+            preparation_capability_sha256=raw['preparation_capability_sha256'],
+            input=ProviderLaunchIdentityCanonicalizationInputV1.from_value(
+                raw['input']),
+            input_sha256=raw['input_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'decision_id': str(self.decision_id),
+            'cohort_id': self.cohort_id,
+            'action_type': kernel_actions.ActionKind.LAUNCH.value,
+            'controller_owner_fence': self.controller_owner_fence,
+            'lifecycle_epoch': self.lifecycle_epoch,
+            'preparation_reference_revision': 1,
+            'reference_state': WorkerCohortReferenceState.PREPARING.value,
+            'preparation_capability_sha256': self.preparation_capability_sha256,
+            'input': self.input.canonical_value(),
+            'input_sha256': self.input_sha256,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchIdentityCanonicalizationRequestV1(_CanonicalContract):
+    """Closed no-enqueue launch identity canonicalization request."""
+
+    version: int
+    context: ProviderLaunchIdentityCanonicalizationContextV1
+    context_sha256: str
+    preparation_capability: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'context', 'context_sha256', 'preparation_capability'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='launch identity canonicalization request version')
+        if type(self.context
+               ) is not ProviderLaunchIdentityCanonicalizationContextV1:
+            raise TypeError('launch identity canonicalization request context '
+                            'has an invalid type.')
+        object.__setattr__(
+            self, 'context_sha256',
+            _sha256(
+                self.context_sha256,
+                name='launch identity canonicalization request context_sha256'))
+        if self.context_sha256 != self.context.sha256:
+            raise ValueError('launch identity canonicalization request context '
+                             'hash does not match.')
+        capability = _lower_hex_32_bytes(
+            self.preparation_capability,
+            name=('launch identity canonicalization request '
+                  'preparation_capability'))
+        object.__setattr__(self, 'preparation_capability', capability)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls,
+            value: Any) -> 'ProviderLaunchIdentityCanonicalizationRequestV1':
+        raw = _closed_object_shallow(
+            value,
+            name='launch identity canonicalization request',
+            keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            context=ProviderLaunchIdentityCanonicalizationContextV1.from_value(
+                raw['context']),
+            context_sha256=raw['context_sha256'],
+            preparation_capability=raw['preparation_capability'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'context': self.context.canonical_value(),
+            'context_sha256': self.context_sha256,
+            'preparation_capability': self.preparation_capability,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchIdentityCanonicalizationProofV1(_CanonicalContract):
+    """Retained API-side effective identity proof without the capability."""
+
+    version: int
+    boundary: str
+    context: ProviderLaunchIdentityCanonicalizationContextV1
+    context_sha256: str
+    effective_original_user: str
+    effective_user_hash: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'boundary', 'context', 'context_sha256',
+        'effective_original_user', 'effective_user_hash'
+    })
+    _BOUNDARY: ClassVar[str] = 'api_server_post_auth_no_enqueue'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='launch identity canonicalization proof version')
+        if type(self.boundary) is not str:
+            raise TypeError(
+                'launch identity canonicalization proof boundary must be text.')
+        if self.boundary != self._BOUNDARY:
+            raise ValueError(
+                'launch identity canonicalization proof boundary is unsupported.'
+            )
+        if type(self.context
+               ) is not ProviderLaunchIdentityCanonicalizationContextV1:
+            raise TypeError(
+                'launch identity canonicalization proof context has '
+                'an invalid type.')
+        object.__setattr__(
+            self, 'context_sha256',
+            _sha256(
+                self.context_sha256,
+                name='launch identity canonicalization proof context_sha256'))
+        if self.context_sha256 != self.context.sha256:
+            raise ValueError('launch identity canonicalization proof context '
+                             'hash does not match.')
+        effective_original_user = _text(
+            self.effective_original_user,
+            name=('launch identity canonicalization proof '
+                  'effective_original_user'))
+        if not effective_original_user.isascii():
+            raise ValueError('launch identity canonicalization proof effective '
+                             'username must be ASCII.')
+        object.__setattr__(self, 'effective_original_user',
+                           effective_original_user)
+        effective_user_hash = _text(
+            self.effective_user_hash,
+            name='launch identity canonicalization proof effective_user_hash',
+            maximum_bytes=(
+                ProviderWorkloadNameBasisV1.MAX_FROZEN_USER_HASH_LENGTH))
+        # ``common_utils.is_valid_user_hash()`` intentionally preserves a
+        # broad legacy ``re.match(...$)`` contract.  This durable proof must
+        # consume the complete value so a trailing newline cannot survive into
+        # a name basis that correctly rejects it later.
+        if _USER_HASH_RE.fullmatch(effective_user_hash) is None:
+            raise ValueError('launch identity canonicalization proof effective '
+                             'user hash is invalid.')
+        object.__setattr__(self, 'effective_user_hash', effective_user_hash)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls, value: Any) -> 'ProviderLaunchIdentityCanonicalizationProofV1':
+        raw = _closed_object_shallow(
+            value,
+            name='launch identity canonicalization proof',
+            keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            boundary=raw['boundary'],
+            context=ProviderLaunchIdentityCanonicalizationContextV1.from_value(
+                raw['context']),
+            context_sha256=raw['context_sha256'],
+            effective_original_user=raw['effective_original_user'],
+            effective_user_hash=raw['effective_user_hash'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'boundary': self._BOUNDARY,
+            'context': self.context.canonical_value(),
+            'context_sha256': self.context_sha256,
+            'effective_original_user': self.effective_original_user,
+            'effective_user_hash': self.effective_user_hash,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchIdentityCanonicalizationResponseV1(_CanonicalContract):
+    """Closed response echoing the exact decision, context, and proof hashes."""
+
+    version: int
+    decision_id: uuid.UUID
+    context_sha256: str
+    proof: ProviderLaunchIdentityCanonicalizationProofV1
+    proof_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'decision_id', 'context_sha256', 'proof', 'proof_sha256'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='launch identity canonicalization response version')
+        decision_id = _uuid(
+            self.decision_id,
+            name='launch identity canonicalization response decision_id')
+        object.__setattr__(self, 'decision_id', decision_id)
+        object.__setattr__(
+            self, 'context_sha256',
+            _sha256(
+                self.context_sha256,
+                name='launch identity canonicalization response context_sha256')
+        )
+        if type(self.proof
+               ) is not ProviderLaunchIdentityCanonicalizationProofV1:
+            raise TypeError(
+                'launch identity canonicalization response proof has '
+                'an invalid type.')
+        object.__setattr__(
+            self, 'proof_sha256',
+            _sha256(
+                self.proof_sha256,
+                name='launch identity canonicalization response proof_sha256'))
+        if decision_id != self.proof.context.decision_id:
+            raise ValueError(
+                'launch identity canonicalization response decision '
+                'ID does not match its proof.')
+        if self.context_sha256 != self.proof.context_sha256:
+            raise ValueError(
+                'launch identity canonicalization response context '
+                'hash does not match its proof.')
+        if self.proof_sha256 != self.proof.sha256:
+            raise ValueError('launch identity canonicalization response proof '
+                             'hash does not match.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls,
+            value: Any) -> 'ProviderLaunchIdentityCanonicalizationResponseV1':
+        raw = _closed_object_shallow(
+            value,
+            name='launch identity canonicalization response',
+            keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            decision_id=raw['decision_id'],
+            context_sha256=raw['context_sha256'],
+            proof=ProviderLaunchIdentityCanonicalizationProofV1.from_value(
+                raw['proof']),
+            proof_sha256=raw['proof_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'decision_id': str(self.decision_id),
+            'context_sha256': self.context_sha256,
+            'proof': self.proof.canonical_value(),
+            'proof_sha256': self.proof_sha256,
+        }
 
 
 @dataclasses.dataclass(frozen=True)

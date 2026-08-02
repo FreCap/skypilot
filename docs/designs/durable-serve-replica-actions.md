@@ -5,9 +5,12 @@ review; M1a inert schema and dark M1b typed store implemented and locally
 verified; the frozen M2 Serve032 foundation, cluster identity, immutable
 provider contracts, typed shadow store, additive Serve033 coverage schema and
 promotion audit, and generic API006 progress substrate are implemented and
-locally verified; the Serve033 preparation-capability commitment schema/typed-
-store delta is implemented and locally verified, while runtime capability
-generation and endpoint validation remain pending; the immutable effect-origin,
+locally verified; the Serve033 preparation-capability commitment schema/typed
+store, closed launch-identity wire contracts, shared effective-identity
+resolver, capability-fenced no-enqueue endpoint, and bounded authenticated
+client are implemented and locally verified, while manager-side CSPRNG
+generation/reference creation, client wiring, and raw-capability discard remain
+pending; the immutable effect-origin,
 closed handler-return,
 pre-I/O representability, and reducer-owned quiescence contract is frozen in
 design while its Serve validator/reducer, dedicated return codec, and shadow-
@@ -16,7 +19,7 @@ preparation/admission
 handshake and execution-config boundary are in progress; runtime shadow
 instrumentation pending
 
-Last updated: 2026-07-31
+Last updated: 2026-08-02
 
 Canonical owner: this file. The provider-side companion is
 `docs/designs/provider-lifecycle-actuation.md`.
@@ -2335,8 +2338,14 @@ M2 foundation verification evidence on 2026-08-01:
   preparation-capability SHA-256 commitment. Typed reference decoding,
   persistence, exact adoption, binding, launch/down fixture coverage, invalid-
   row rejection, and lost-migration-acknowledgement catalog convergence pass
-  locally. This evidence does not claim runtime CSPRNG generation, raw-
-  capability discard, or endpoint validation;
+  locally. The closed request/context/proof/response contracts, one-session
+  read validator, direct post-auth endpoint, shared queued-request resolver,
+  exact status/body/auth behavior, and bounded client transport also pass
+  focused contract, PostgreSQL, endpoint, OAuth, executor, and retry tests. An
+  adversarial review accepted the corrected full-value user-hash validation
+  and fail-closed middleware-state boundary. This evidence does not claim
+  manager-side CSPRNG generation, preparation-cell ownership/discard, or use of
+  the still-dark client by a manager;
 - global-user-state revision 028 installs a nullable portable cluster-record
   UUID and partial unique index, leaves historical rows null, and provides the
   PostgreSQL-only exact insert/adopt/reject primitive without changing ordinary
@@ -2709,8 +2718,8 @@ write typed outcomes.
   then the profile is shadow-only and promotion-blocking.
 - Build and push the immutable canary image for `boltz-test`. AWS/ECR auth and
   read-only cluster access through the dedicated SSM hop are verified; the
-  current rollback baseline is Helm revision 51 with all roles pinned to
-  `sha256:a5afbd26e62ebe2f6990b2f311a59caaf3ef2901f2eab5d6dddd46527320f00a`.
+  current rollback baseline is Helm revision 56 with all roles pinned to
+  `sha256:6753d5fb3ccac8d6436a436a99870410248e62f03ecad08741ebd4510d1f5e18`.
 - Measured shadow sample minimums and the first canary service selection.
 - A separate decision on whether central principal convergence is worth its
   operational cost; it must not silently re-enter M1-M4.

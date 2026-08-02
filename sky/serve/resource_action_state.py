@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 import dataclasses
 import datetime
+import hashlib
+import hmac
 import json
 from typing import Any
 import unicodedata
@@ -244,6 +246,10 @@ class WorkerCohortReferenceRecord:
 class WorkerCohortReferenceTransition:
     record: WorkerCohortReferenceRecord
     adopted: bool = False
+
+
+class PreparationCapabilityMismatch(Exception):
+    """The presented preparation capability does not match its commitment."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1613,6 +1619,87 @@ class PostgresServeResourceActionStateStore:
                     state_schema.WORKER_COHORT_REFS.c.decision_id ==
                     parsed)).mappings().first()
         return None if row is None else _worker_cohort_reference_record(row)
+
+    def validate_launch_identity_canonicalization(
+        self,
+        request: actions.ProviderLaunchIdentityCanonicalizationRequestV1,
+    ) -> WorkerCohortReferenceRecord:
+        """Read-validate one capability-fenced launch identity request.
+
+        This optimistic boundary grants no mutation authority. Admission later
+        locks and revalidates the same reference, service, and owner fences.
+        """
+        if type(request) is not (
+                actions.ProviderLaunchIdentityCanonicalizationRequestV1):
+            raise TypeError('canonicalization request has an invalid type.')
+        context = request.context
+        resource_identity = context.input.resource_identity
+        expected_decision_id = resource_identity.action_identity(
+            kernel_actions.ActionKind.LAUNCH).action_id
+        if context.decision_id != expected_decision_id:
+            raise ValueError('canonicalization decision identity is invalid.')
+
+        capability_digest = hashlib.sha256(
+            bytes.fromhex(request.preparation_capability)).hexdigest()
+        with orm.Session(self._database()) as session:
+            reference_row = session.execute(
+                sqlalchemy.select(state_schema.WORKER_COHORT_REFS).where(
+                    state_schema.WORKER_COHORT_REFS.c.decision_id ==
+                    context.decision_id)).mappings().first()
+            service_row = session.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    context.input.service_name)).mappings().first()
+
+        if reference_row is None:
+            raise kernel_actions.ClaimLost(
+                'Launch preparation reference does not exist.')
+        reference = _worker_cohort_reference_record(reference_row)
+        capability_matches = hmac.compare_digest(
+            capability_digest, context.preparation_capability_sha256)
+        capability_matches &= hmac.compare_digest(
+            capability_digest,
+            reference.reference.preparation_capability_sha256)
+        capability_matches &= hmac.compare_digest(
+            context.preparation_capability_sha256,
+            reference.reference.preparation_capability_sha256)
+        if not capability_matches:
+            raise PreparationCapabilityMismatch(
+                'Preparation capability does not match its commitment.')
+
+        expected_reference = actions.WorkerCohortReferenceInputV1(
+            version=1,
+            decision_id=context.decision_id,
+            cohort_id=context.cohort_id,
+            service_hash=resource_identity.service_hash,
+            replica_incarnation=resource_identity.replica_incarnation,
+            desired_generation=resource_identity.desired_generation,
+            action_type=kernel_actions.ActionKind.LAUNCH,
+            controller_owner_fence=context.controller_owner_fence,
+            lifecycle_epoch=context.lifecycle_epoch,
+            preparation_capability_sha256=(
+                context.preparation_capability_sha256))
+        if (reference.reference != expected_reference or
+                reference.reference_state
+                is not actions.WorkerCohortReferenceState.PREPARING or
+                reference.revision != context.preparation_reference_revision or
+                reference.revision != 1):
+            raise kernel_actions.ClaimLost(
+                'Launch preparation reference context is stale or unequal.')
+
+        if service_row is None:
+            raise kernel_actions.ClaimLost(
+                'Launch preparation service does not exist.')
+        controller_pid = service_row['controller_pid']
+        controller_ip = service_row['controller_ip']
+        if (service_row['hash'] != resource_identity.service_hash or
+                controller_pid is None or controller_ip is None or
+                f'{controller_pid}:{controller_ip}'
+                != context.controller_owner_fence or
+                service_row['lifecycle_epoch'] != context.lifecycle_epoch):
+            raise kernel_actions.ClaimLost(
+                'Launch preparation service context is stale or unequal.')
+        return reference
 
     def bind_worker_cohort_reference_in_session(
         self,

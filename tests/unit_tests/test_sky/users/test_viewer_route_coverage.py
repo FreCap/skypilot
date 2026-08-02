@@ -88,6 +88,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/{service_name}/versions', 'GET'),
     ('/serve/{service_name}/versions/elect', 'POST'),
     ('/serve/{service_name}/load-balancer/high-availability', 'POST'),
+    ('/internal/resource-actions/v1/launch-identity/canonicalize', 'POST'),
     # --- Managed container image writes ---
     ('/images/publications', 'POST'),
     ('/images/artifacts/{image_id}/prepare', 'POST'),

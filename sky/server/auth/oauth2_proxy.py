@@ -31,6 +31,9 @@ HOP_BY_HOP_HEADERS = frozenset({
     'transfer-encoding',
     'upgrade',
 })
+_NO_REDIRECT_AUTH_PATHS = frozenset({
+    '/internal/resource-actions/v1/launch-identity/canonicalize',
+})
 
 
 @middleware_utils.websocket_aware
@@ -162,6 +165,10 @@ class OAuth2ProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
                 request.state.auth_user = auth_user
                 return await call_next(request)
             elif auth_response.status == http.HTTPStatus.UNAUTHORIZED:
+                if request.url.path in _NO_REDIRECT_AUTH_PATHS:
+                    return fastapi.responses.JSONResponse(
+                        status_code=http.HTTPStatus.UNAUTHORIZED,
+                        content={'detail': 'Authentication is required.'})
                 # For /api/health, we should allow unauthenticated requests to
                 # not break healthz check.
                 # TODO(aylei): remove this to an aggregated login middleware

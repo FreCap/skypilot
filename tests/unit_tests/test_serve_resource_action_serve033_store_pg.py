@@ -3,6 +3,7 @@
 
 import dataclasses
 import datetime
+import hashlib
 import os
 import shutil
 import uuid
@@ -326,6 +327,50 @@ def _reference(
         controller_owner_fence=owner_fence,
         lifecycle_epoch=4,
         preparation_capability_sha256=capability_sha256)
+
+
+def _launch_identity_request(
+    identity: actions.CoverageDecisionIdentityV1,
+    capability: str,
+    *,
+    owner_fence: str = '123:10.0.0.1',
+    lifecycle_epoch: int = 4,
+    capability_sha256: str | None = None,
+) -> actions.ProviderLaunchIdentityCanonicalizationRequestV1:
+    assert identity.action_type is kernel_actions.ActionKind.LAUNCH
+    resource_identity = actions.ProviderResourceIdentityV1(
+        service_hash=identity.service_hash,
+        service_incarnation=identity.service_incarnation,
+        replica_id=identity.replica_id,
+        replica_incarnation=identity.replica_incarnation,
+        desired_generation=identity.desired_generation)
+    canonical_input = actions.ProviderLaunchIdentityCanonicalizationInputV1(
+        version=1,
+        contract='api_server_effective_launch_identity_v1',
+        service_name='svc',
+        resource_identity=resource_identity,
+        prepared_original_user='prepared@example.com',
+        prepared_user_hash='prepared-hash')
+    if capability_sha256 is None:
+        capability_sha256 = hashlib.sha256(
+            bytes.fromhex(capability)).hexdigest()
+    context = actions.ProviderLaunchIdentityCanonicalizationContextV1(
+        version=1,
+        decision_id=identity.decision_id,
+        cohort_id='authority-v1',
+        action_type=kernel_actions.ActionKind.LAUNCH,
+        controller_owner_fence=owner_fence,
+        lifecycle_epoch=lifecycle_epoch,
+        preparation_reference_revision=1,
+        reference_state=actions.WorkerCohortReferenceState.PREPARING,
+        preparation_capability_sha256=capability_sha256,
+        input=canonical_input,
+        input_sha256=canonical_input.sha256)
+    return actions.ProviderLaunchIdentityCanonicalizationRequestV1(
+        version=1,
+        context=context,
+        context_sha256=context.sha256,
+        preparation_capability=capability)
 
 
 def _insert_request(
@@ -689,6 +734,105 @@ def test_reference_reader_rejects_invalid_capability_commitment(
     with pytest.raises(kernel_actions.InvariantViolation,
                        match='Invalid Serve worker cohort reference row'):
         store.get_worker_cohort_reference(reference.decision_id)
+
+
+def test_launch_identity_validation_is_one_session_read_only_and_exact(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    _add_shadow_service(engine)
+    _accept_cohort(engine, store)
+    identity = _coverage_identity()
+    capability = '12' * 32
+    commitment = hashlib.sha256(bytes.fromhex(capability)).hexdigest()
+    reference = _reference(identity,
+                           owner_fence='123:10.0.0.1',
+                           capability_sha256=commitment)
+    store.prepare_worker_cohort_reference(reference)
+    before = store.get_worker_cohort_reference(identity.decision_id)
+    checkouts = 0
+
+    def _count_checkout(*_args) -> None:
+        nonlocal checkouts
+        checkouts += 1
+
+    sqlalchemy.event.listen(engine, 'checkout', _count_checkout)
+    try:
+        validated = store.validate_launch_identity_canonicalization(
+            _launch_identity_request(identity, capability))
+    finally:
+        sqlalchemy.event.remove(engine, 'checkout', _count_checkout)
+    assert checkouts == 1
+    assert validated == before
+    assert store.get_worker_cohort_reference(identity.decision_id) == before
+
+
+@pytest.mark.parametrize('request_factory,error_type', [
+    (lambda identity: _launch_identity_request(identity, '34' * 32),
+     resource_action_state.PreparationCapabilityMismatch),
+    (lambda identity: _launch_identity_request(
+        identity, '12' * 32, capability_sha256='0' * 64),
+     resource_action_state.PreparationCapabilityMismatch),
+    (lambda identity: _launch_identity_request(
+        identity, '12' * 32, owner_fence='other-owner'),
+     kernel_actions.ClaimLost),
+    (lambda identity: _launch_identity_request(
+        identity, '12' * 32, lifecycle_epoch=5), kernel_actions.ClaimLost),
+])
+def test_launch_identity_validation_rejects_capability_and_context_drift(
+        serve033_store, request_factory, error_type) -> None:
+    engine, store = serve033_store
+    _add_shadow_service(engine)
+    _accept_cohort(engine, store)
+    identity = _coverage_identity()
+    capability = '12' * 32
+    reference = _reference(identity,
+                           owner_fence='123:10.0.0.1',
+                           capability_sha256=hashlib.sha256(
+                               bytes.fromhex(capability)).hexdigest())
+    store.prepare_worker_cohort_reference(reference)
+
+    with pytest.raises(error_type):
+        store.validate_launch_identity_canonicalization(
+            request_factory(identity))
+
+
+def test_launch_identity_validation_rejects_unknown_active_and_stale_service(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    _add_shadow_service(engine)
+    _accept_cohort(engine, store)
+    identity = _coverage_identity()
+    capability = '12' * 32
+    reference = _reference(identity,
+                           owner_fence='123:10.0.0.1',
+                           capability_sha256=hashlib.sha256(
+                               bytes.fromhex(capability)).hexdigest())
+    store.prepare_worker_cohort_reference(reference)
+
+    unknown = _coverage_identity(replica_id=8, generation=4)
+    with pytest.raises(kernel_actions.ClaimLost, match='does not exist'):
+        store.validate_launch_identity_canonicalization(
+            _launch_identity_request(unknown, capability))
+
+    with orm.Session(engine) as session, session.begin():
+        store.bind_worker_cohort_reference_in_session(
+            session, reference, 1,
+            actions.WorkerCohortReferenceState.SHADOW_ACTIVE)
+    with pytest.raises(kernel_actions.ClaimLost, match='stale or unequal'):
+        store.validate_launch_identity_canonicalization(
+            _launch_identity_request(identity, capability))
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                resource_action_state_schema.WORKER_COHORT_REFS).values(
+                    reference_state='PREPARING', revision=1, bound_at=None))
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.services_table).values(controller_pid=999))
+    with pytest.raises(kernel_actions.ClaimLost, match='service context'):
+        store.validate_launch_identity_canonicalization(
+            _launch_identity_request(identity, capability))
 
 
 def test_coverage_is_immutable_deterministic_and_revalidates_raw_rows(

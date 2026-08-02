@@ -251,6 +251,148 @@ async def test_prepare_request_rejects_non_admin_pod_config(mock_svc):
 
 
 @pytest.fixture()
+def prepare_request_identity_spies(monkeypatch):
+    prepared_request = mock.Mock()
+    prepared_request.log_path = mock.Mock()
+    request_constructor = mock.Mock(return_value=prepared_request)
+    initial_context = mock.Mock(return_value='event-context')
+    add_or_update_user = mock.Mock(return_value=True)
+    monkeypatch.setattr(executor.api_requests, 'Request', request_constructor)
+    monkeypatch.setattr(executor.api_requests, 'create_if_not_exists_async',
+                        mock.AsyncMock(return_value=True))
+    monkeypatch.setattr(executor.role_filter, 'reject_non_admin_pod_config',
+                        mock.Mock())
+    monkeypatch.setattr(executor.event_models, 'initial_context',
+                        initial_context)
+    monkeypatch.setattr(executor.global_user_state, 'add_or_update_user',
+                        add_or_update_user)
+    monkeypatch.setattr(executor.versions, 'get_remote_api_version',
+                        mock.Mock(return_value=None))
+    return request_constructor, initial_context, add_or_update_user
+
+
+async def _prepare_identity_request(env_vars,
+                                    spies,
+                                    *,
+                                    auth_user=None,
+                                    is_skypilot_system=False):
+    body = payloads.RequestBody(env_vars=env_vars)
+    request_constructor, _, _ = spies
+    await executor.prepare_request_async(
+        request_id='identity-request',
+        request_name=request_names.RequestName.CHECK,
+        request_body=body,
+        func=lambda: None,
+        auth_user=auth_user,
+        is_skypilot_system=is_skypilot_system)
+    return body, request_constructor.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_replaces_submitted_authenticated_identity(
+        prepare_request_identity_spies):
+    auth_user = models.User(id='AUTH-HASH',
+                            name='Authenticated Name',
+                            user_type=models.UserType.SSO.value)
+    body, request_kwargs = await _prepare_identity_request(
+        {
+            constants.USER_ID_ENV_VAR: 'spoofed-hash',
+            constants.USER_ENV_VAR: 'spoofed-name',
+            'UNRELATED': 'preserved',
+        },
+        prepare_request_identity_spies,
+        auth_user=auth_user)
+
+    assert body.env_vars == {
+        constants.USER_ID_ENV_VAR: 'auth-hash',
+        constants.USER_ENV_VAR: 'Authenticated Name',
+        'UNRELATED': 'preserved',
+    }
+    assert request_kwargs['user_id'] == 'auth-hash'
+    _, initial_context, _ = prepare_request_identity_spies
+    initial_context.assert_called_once_with(
+        request_names.RequestName.CHECK,
+        actor_name='Authenticated Name',
+        actor_type=models.UserType.SSO.value,
+        cluster_name=None)
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_authenticated_identity_does_not_require_env_pair(
+        prepare_request_identity_spies):
+    body, request_kwargs = await _prepare_identity_request(
+        {'UNRELATED': 'preserved'},
+        prepare_request_identity_spies,
+        auth_user=models.User(id='authenticated-hash', name='Auth Name'))
+
+    assert body.env_vars == {
+        constants.USER_ID_ENV_VAR: 'authenticated-hash',
+        constants.USER_ENV_VAR: 'Auth Name',
+        'UNRELATED': 'preserved',
+    }
+    assert request_kwargs['user_id'] == 'authenticated-hash'
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_preserves_submitted_no_auth_identity(
+        prepare_request_identity_spies):
+    submitted_env = {
+        constants.USER_ID_ENV_VAR: 'submitted-hash',
+        constants.USER_ENV_VAR: 'submitted-name',
+        'UNRELATED': 'preserved',
+    }
+    body, request_kwargs = await _prepare_identity_request(
+        submitted_env, prepare_request_identity_spies)
+
+    assert body.env_vars == submitted_env
+    assert request_kwargs['user_id'] == 'submitted-hash'
+    _, initial_context, _ = prepare_request_identity_spies
+    initial_context.assert_called_once_with(request_names.RequestName.CHECK,
+                                            actor_name='submitted-name',
+                                            actor_type=None,
+                                            cluster_name=None)
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_no_auth_missing_name_keeps_env_unmodified(
+        prepare_request_identity_spies):
+    body, request_kwargs = await _prepare_identity_request(
+        {constants.USER_ID_ENV_VAR: 'submitted-hash'},
+        prepare_request_identity_spies)
+
+    assert body.env_vars == {constants.USER_ID_ENV_VAR: 'submitted-hash'}
+    assert request_kwargs['user_id'] == 'submitted-hash'
+    _, initial_context, _ = prepare_request_identity_spies
+    assert initial_context.call_args.kwargs['actor_name'] == 'submitted-hash'
+
+
+@pytest.mark.asyncio
+async def test_prepare_system_request_keeps_auth_env_but_uses_system_actor(
+        prepare_request_identity_spies):
+    body, request_kwargs = await _prepare_identity_request(
+        {},
+        prepare_request_identity_spies,
+        auth_user=models.User(id='authenticated-hash', name='Auth Name'),
+        is_skypilot_system=True)
+
+    assert body.env_vars == {
+        constants.USER_ID_ENV_VAR: 'authenticated-hash',
+        constants.USER_ENV_VAR: 'Auth Name',
+    }
+    assert request_kwargs['user_id'] == constants.SKYPILOT_SYSTEM_USER_ID
+    _, initial_context, add_or_update_user = prepare_request_identity_spies
+    initial_context.assert_called_once_with(
+        request_names.RequestName.CHECK,
+        actor_name=constants.SKYPILOT_SYSTEM_USER_ID,
+        actor_type=models.UserType.SYSTEM.value,
+        cluster_name=None)
+    system_user = add_or_update_user.call_args.args[0]
+    assert system_user.id == constants.SKYPILOT_SYSTEM_USER_ID
+    assert system_user.name == constants.SKYPILOT_SYSTEM_USER_ID
+    assert system_user.user_type == models.UserType.SYSTEM.value
+
+
+@pytest.fixture()
 def mock_skypilot_config(tmp_path):
     config_content = """
 aws:
