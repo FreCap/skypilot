@@ -1012,6 +1012,50 @@ class TestJobGroupRecovery:
         job_controller._monitor_job_group_task.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_job_group_launch_failure_cleanup_preserves_original_error(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:1]
+        mock_dag.primary_tasks = []
+        executor = MagicMock()
+        executor.launch = AsyncMock(side_effect=RuntimeError('launch failed'))
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            return_value=('cluster-0', executor))
+        job_controller._monitor_job_group_task = AsyncMock(return_value=True)
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        async def cleanup(cluster_names):
+            assert cluster_names == ['cluster-0']
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            cleanup_finished.set()
+
+        job_controller._cleanup_job_group_clusters = AsyncMock(
+            side_effect=cleanup)
+        statuses = AsyncMock(return_value=[])
+
+        with patch.object(controller_lib.managed_job_runtime,
+                          'is_registered',
+                          return_value=False), patch.object(
+                              controller_lib.managed_job_state,
+                              'get_all_task_ids_statuses_async', statuses):
+            run_task = asyncio.create_task(job_controller._run_job_group())
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            assert not run_task.done()
+            allow_cleanup.set()
+            with pytest.raises(RuntimeError, match='launch failed'):
+                await run_task
+
+        assert cleanup_finished.is_set()
+        job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
+            ['cluster-0'])
+        job_controller._monitor_job_group_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_job_group_barrier_reads_one_ordered_handle_snapshot(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)
@@ -1343,6 +1387,87 @@ class TestJobGroupRecovery:
                                  match='monitor coordinator failed'):
             await job_controller._run_job_group()
 
+        job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
+            ['cluster-0', 'cluster-1'])
+
+    @pytest.mark.asyncio
+    async def test_job_group_monitor_failure_cleanup_preserves_original_error(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:2]
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock()]
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), ('cluster-1',
+                                                       executors[1])])
+
+        all_started = asyncio.Event()
+        child_cleanup_started = asyncio.Event()
+        allow_child_cleanup = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        started = set()
+        child_cleanup = set()
+        cancelled = set()
+
+        async def monitor(task_id, *_args):
+            started.add(task_id)
+            if len(started) == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                child_cleanup.add(task_id)
+                if len(child_cleanup) == 2:
+                    child_cleanup_started.set()
+                await allow_child_cleanup.wait()
+                cancelled.add(task_id)
+                raise
+
+        async def fail_wait(*_args, **_kwargs):
+            await all_started.wait()
+            raise RuntimeError('monitor coordinator failed')
+
+        async def cleanup(cluster_names):
+            assert cluster_names == ['cluster-0', 'cluster-1']
+            assert cancelled == {0, 1}
+            cleanup_started.set()
+            await allow_cleanup.wait()
+
+        job_controller._monitor_job_group_task = monitor
+        job_controller._cleanup_job_group_clusters = AsyncMock(
+            side_effect=cleanup)
+        statuses = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+            (1, managed_job_state.ManagedJobStatus.RUNNING),
+        ])
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handles_from_cluster_names', return_value={
+                        'cluster-0': MagicMock(),
+                        'cluster-1': MagicMock(),
+                    }), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task', return_value=['127.0.0.1']), \
+                patch.object(controller_lib.asyncio, 'wait', side_effect=fail_wait):
+            run_task = asyncio.create_task(job_controller._run_job_group())
+            await asyncio.wait_for(child_cleanup_started.wait(), timeout=1)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            assert not run_task.done()
+            allow_child_cleanup.set()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            assert not run_task.done()
+            allow_cleanup.set()
+            with pytest.raises(RuntimeError,
+                               match='monitor coordinator failed'):
+                await run_task
+
+        assert cancelled == {0, 1}
         job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
             ['cluster-0', 'cluster-1'])
 
