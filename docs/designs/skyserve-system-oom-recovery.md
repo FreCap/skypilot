@@ -7,7 +7,7 @@ rewritten; production activation is blocked_
 _Last updated: 2026-08-02_
 
 _Design baseline: `origin/improvements` at
-`f214ca669ef68b58aec9ba6511d6cacae4fcddc4`_
+`7d4b4413e4da31e42c352c9438904982e1ddfe3a`_
 
 ## Context and decision
 
