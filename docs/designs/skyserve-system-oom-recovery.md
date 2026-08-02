@@ -1,7 +1,7 @@
 # SkyServe System OOM Recovery
 
-_Status: corrected per-job capability architecture pending exact acceptance
-review; the inert runtime foundation is merged; #1182 and draft #1183 must be
+_Status: per-job capability architecture accepted after exact adversarial
+review; the inert runtime foundation is merged; #1182 and draft #1183 are being
 rewritten; production activation is blocked_
 
 _Last updated: 2026-08-02_
@@ -1062,7 +1062,9 @@ place as a draft directly above #1182_
 This accepts only authorization document v3, removes authorization-document
 readers v1/v2, removes the direct-shell Docker parser and runtime
 marker/capability v1 reader, and removes status-only old-runtime compatibility
-after the minimum version makes it unreachable. It retains runtime profile 2,
+after the minimum version makes it unreachable. It also removes the temporary
+all-fields-absent-v13 rollback reader after every such row has been rewritten
+into complete valid v13 state. It retains runtime profile 2,
 the unchanged API-v1 local job table/protobuf fields, `OwnedContainerSpec`,
 supervisor marker/capability v2, one driver replay, controller reducer, and
 unchanged legacy lifecycle integration.
@@ -1150,7 +1152,10 @@ touches an
 the v13 version label; rewritten #1182 recognizes only that all-fields-absent
 rollback shape as ordinary on a later re-upgrade. Partial bundles remain
 malformed. This compatibility reader is temporary and #1183 removes it once
-rewritten #1182 is the rollback floor.
+rewritten #1182 is the rollback floor. After any rollback/re-upgrade exercise,
+#1182 owner-fenced rewrites every surviving all-fields-absent ordinary row into
+a complete valid v13 bundle; #1183 cannot deploy until an all-row audit reports
+zero compatibility-shaped rows.
 
 An already-generated driver remains bounded to one replay after authorization
 removal. Therefore rolling below #1182 before active `CAPABLE` and unresolved
@@ -1205,7 +1210,9 @@ action evidence, because this feature creates none.
   the existing teardown owner without aborting the fleet read.
 - Rollback tests prove a partial-v13 or quarantined row blocks v12 startup until
   legacy cleanup deletes it; only a complete valid `ORDINARY` v13 row may be
-  rewritten into the all-fields-absent compatibility shape.
+  rewritten into the all-fields-absent compatibility shape. Re-upgrade tests
+  prove #1182 rewrites that shape into complete valid v13 state before #1183,
+  whose reader rejects the removed shape.
 - Reducer tables/property tests cover duplicate, stale, skipped, reordered,
   malformed, terminal, teardown, preemption, restart, and fresh-probe events.
 - Launch tests crash before/after intent CAS, API-endpoint nonce consumption,
@@ -1330,7 +1337,8 @@ recorded here and in both stacked PR descriptions:
 
 1. A consistent replica-state audit reports zero active unresolved/capable
    authorization-v1/v2 intents and zero ambiguous/unlinked candidate/capable
-   replicas, quarantined rows, or partial-v13 bundles. Every active
+   replicas, quarantined rows, partial-v13 bundles, or all-fields-absent-v13
+   rollback shapes. Every active
    authorization-v3 `CAPABLE` replica has its exact ordinary launch request ID,
    service job ID, runtime profile 2, and matching supervisor-marker/capability
    v2.
@@ -1367,9 +1375,10 @@ recorded here and in both stacked PR descriptions:
    controls persist `ORDINARY` without the CAPABLE barrier.
 7. The supported rollback target is rewritten #1182 on the unchanged legacy
    lifecycle. Terraform/Terragrunt-owned rollback/re-upgrade, authorization
-   removal, zero-active-capable/unresolved-candidate/quarantined/partial-v13
-   all-row audit, legacy teardown adoption, and mixed-provider operation have
-   passed without direct-shell compatibility.
+   removal, complete-v13 rewrite, zero-active-capable/unresolved-candidate/
+   quarantined/partial-v13/all-fields-absent-v13 all-row audit, legacy teardown
+   adoption, and mixed-provider operation have passed without direct-shell
+   compatibility.
 
 ## Open gates and unresolved decisions
 
