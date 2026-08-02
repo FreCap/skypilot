@@ -264,7 +264,7 @@ class ProviderKubernetesObjectEvidenceV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesObjectEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesObjectEvidenceV1:
         raw = _closed_object(value,
                              name='Kubernetes object observation',
                              keys=cls._KEYS)
@@ -401,7 +401,7 @@ class ProviderPodObservationEvidenceV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderPodObservationEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderPodObservationEvidenceV1:
         raw = _closed_object(value,
                              name='Pod observation evidence',
                              keys=cls._KEYS)
@@ -586,7 +586,7 @@ class ProviderLifecycleObservationV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLifecycleObservationV1':
+    def from_value(cls, value: Any) -> ProviderLifecycleObservationV1:
         raw = _closed_object(value,
                              name='provider lifecycle observation',
                              keys=cls._KEYS)
@@ -642,7 +642,7 @@ class ProviderLifecycleObservationV1(_CanonicalContract):
                 self.resolved_target.requested_target_sha256 != target.sha256):
             raise ValueError('resolved observation target is crossed.')
 
-    def validate_action_context(self, context: '_ActionContext') -> None:
+    def validate_action_context(self, context: _ActionContext) -> None:
         """Bind observation scope, object plans, and labels to one action."""
 
         target = context.requested_target
@@ -726,7 +726,7 @@ class ProviderRuntimeArtifactMeasurementV1(_CanonicalContract):
                     name='runtime_measurement.observed_tree_sha256'))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderRuntimeArtifactMeasurementV1':
+    def from_value(cls, value: Any) -> ProviderRuntimeArtifactMeasurementV1:
         raw = _closed_object(value,
                              name='runtime artifact measurement',
                              keys=cls._KEYS)
@@ -770,7 +770,7 @@ class ProviderKubernetesRuntimeEvidenceV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesRuntimeEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesRuntimeEvidenceV1:
         raw = _closed_object(value,
                              name='Kubernetes runtime evidence',
                              keys=cls._KEYS)
@@ -834,7 +834,7 @@ class ProviderKubernetesEndpointEvidenceV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesEndpointEvidenceV1:
         raw = _closed_object(value,
                              name='Kubernetes endpoint evidence',
                              keys=cls._KEYS)
@@ -912,7 +912,7 @@ class ProviderAuthorityWorkerAttemptAttestationV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls,
-                   value: Any) -> 'ProviderAuthorityWorkerAttemptAttestationV1':
+                   value: Any) -> ProviderAuthorityWorkerAttemptAttestationV1:
         raw = _closed_object(value,
                              name='authority-worker attempt attestation',
                              keys=cls._KEYS)
@@ -1000,7 +1000,7 @@ class ProviderLaunchEffectClaimV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchEffectClaimV1':
+    def from_value(cls, value: Any) -> ProviderLaunchEffectClaimV1:
         raw = _closed_object(value, name='launch effect claim', keys=cls._KEYS)
         return cls(
             version=raw['version'],
@@ -1068,8 +1068,7 @@ class ProviderLaunchCommittedEffectEvidenceV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderLaunchCommittedEffectEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderLaunchCommittedEffectEvidenceV1:
         if type(value) is not dict:
             raise TypeError('launch committed effect must be a JSON object.')
         evidence_kind = value.get('evidence_kind')
@@ -1408,7 +1407,7 @@ class ProviderLaunchProgressV1(_CanonicalContract):
     }
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchProgressV1':
+    def from_value(cls, value: Any) -> ProviderLaunchProgressV1:
         if type(value) is not dict:
             raise TypeError('launch progress cursor must be a JSON object.')
         try:
@@ -1650,7 +1649,7 @@ class ProviderLaunchProgressV1(_CanonicalContract):
                                  'ready present observation of the exact '
                                  'target.')
 
-    def validate_action_context(self, context: '_ActionContext') -> None:
+    def validate_action_context(self, context: _ActionContext) -> None:
         if context.action_kind is not kernel_actions.ActionKind.LAUNCH:
             raise ValueError('launch cursor is bound to a non-launch action.')
         for effect in self.committed_effects:
@@ -1732,7 +1731,7 @@ class ProviderLaunchProgressV1(_CanonicalContract):
             if observation is not None:
                 observation.validate_action_context(context)
 
-    def validate_successor(self, successor: 'ProviderLaunchProgressV1') -> None:
+    def validate_successor(self, successor: ProviderLaunchProgressV1) -> None:
         if self.canonical_bytes == successor.canonical_bytes:
             return
         old_effects = self.committed_effects
@@ -1876,7 +1875,7 @@ class ProviderKubernetesDeleteObjectV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesDeleteObjectV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesDeleteObjectV1:
         raw = _closed_object(value,
                              name='Kubernetes delete object',
                              keys=cls._KEYS)
@@ -1924,7 +1923,7 @@ class ProviderKubernetesDeleteTargetV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesDeleteTargetV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesDeleteTargetV1:
         raw = _closed_object(value,
                              name='Kubernetes delete target',
                              keys=cls._KEYS)
@@ -2003,7 +2002,7 @@ class ProviderKubernetesDeleteTargetV1(_CanonicalContract):
 
     def validate_monotonic_successor(
         self,
-        successor: 'ProviderKubernetesDeleteTargetV1',
+        successor: ProviderKubernetesDeleteTargetV1,
         deleted_role: provider_values.ProviderObjectRoleV1 | None = None
     ) -> None:
         if (self.requested_target_sha256 != successor.requested_target_sha256 or
@@ -2047,7 +2046,7 @@ class ProviderClusterRecordRemovalEvidenceV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderClusterRecordRemovalEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderClusterRecordRemovalEvidenceV1:
         raw = _closed_object(value,
                              name='cluster-record removal evidence',
                              keys=cls._KEYS)
@@ -2114,7 +2113,7 @@ class ProviderDownProgressV1(_CanonicalContract):
     }
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderDownProgressV1':
+    def from_value(cls, value: Any) -> ProviderDownProgressV1:
         if type(value) is not dict:
             raise TypeError('down progress cursor must be a JSON object.')
         try:
@@ -2197,7 +2196,7 @@ class ProviderDownProgressV1(_CanonicalContract):
                     != self.expected_handle.canonical_bytes):
                 raise ValueError('removed handle differs from expected handle.')
 
-    def validate_action_context(self, context: '_ActionContext') -> None:
+    def validate_action_context(self, context: _ActionContext) -> None:
         if context.action_kind is not kernel_actions.ActionKind.DOWN:
             raise ValueError('down cursor is bound to a non-down action.')
         if self.delete_target.requested_target_sha256 != (
@@ -2272,7 +2271,7 @@ class ProviderDownProgressV1(_CanonicalContract):
                 raise ValueError('removed handle differs from the exact '
                                  'cleanup handle commitment.')
 
-    def validate_successor(self, successor: 'ProviderDownProgressV1') -> None:
+    def validate_successor(self, successor: ProviderDownProgressV1) -> None:
         if self.canonical_bytes == successor.canonical_bytes:
             return
         edge = (self.phase, successor.phase)
@@ -2380,7 +2379,7 @@ class ProviderLifecycleProgressV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLifecycleProgressV1':
+    def from_value(cls, value: Any) -> ProviderLifecycleProgressV1:
         raw = _closed_object(value,
                              name='provider lifecycle progress',
                              keys=cls._KEYS)
@@ -2419,7 +2418,7 @@ class ProviderLifecycleProgressV1(_CanonicalContract):
     def is_succeeded(self) -> bool:
         return self.cursor.phase.value == 'SUCCEEDED'
 
-    def validate_action_context(self, context: '_ActionContext') -> None:
+    def validate_action_context(self, context: _ActionContext) -> None:
         if self.action_kind is not context.action_kind:
             raise ValueError('provider progress action kind differs from its '
                              'immutable action.')
@@ -2428,7 +2427,7 @@ class ProviderLifecycleProgressV1(_CanonicalContract):
         self.cursor.validate_action_context(context)
 
     def validate_successor(self,
-                           successor: 'ProviderLifecycleProgressV1') -> None:
+                           successor: ProviderLifecycleProgressV1) -> None:
         if type(self.cursor) is not type(successor.cursor):
             raise ValueError('provider progress successor changed action kind.')
         if type(self.cursor) is ProviderLaunchProgressV1:
@@ -2465,8 +2464,7 @@ class _ActionContext:
         None)
 
     @classmethod
-    def from_record(cls,
-                    action: kernel_actions.ActionRecord) -> '_ActionContext':
+    def from_record(cls, action: kernel_actions.ActionRecord) -> _ActionContext:
         if action.domain != 'serve' or action.resource_type != 'replica':
             raise ValueError('provider progress requires a Serve replica '
                              'action.')
@@ -2995,8 +2993,7 @@ class ProviderLaunchEffectDefinitiveNoEffectV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderLaunchEffectDefinitiveNoEffectV1':
+    def from_value(cls, value: Any) -> ProviderLaunchEffectDefinitiveNoEffectV1:
         if type(value) is not dict:
             raise TypeError('definitive no-effect proof must be an object.')
         proof_kind = value.get('proof_kind')
@@ -3156,7 +3153,7 @@ class ProviderLaunchNoEffectResolutionV1(_CanonicalContract):
     })
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchNoEffectResolutionV1':
+    def from_value(cls, value: Any) -> ProviderLaunchNoEffectResolutionV1:
         raw = _closed_object(value,
                              name='launch no-effect resolution',
                              keys=cls._KEYS)
@@ -3224,7 +3221,7 @@ class ProviderLaunchNoEffectResolutionV1(_CanonicalContract):
                         cursor: ProviderLaunchProgressV1,
                         action_id: uuid.UUID,
                         attempt: int,
-                        context: '_ActionContext | None' = None) -> None:
+                        context: _ActionContext | None = None) -> None:
         if (not cursor.is_intent or
                 cursor.current_intent_sequence != self.effect_sequence or
                 cursor.intent_origin is None or
@@ -3314,7 +3311,7 @@ class ProviderLaunchEffectQuiescenceV1(_CanonicalContract):
         {'intent_origin', 'resolution_origin'}))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchEffectQuiescenceV1':
+    def from_value(cls, value: Any) -> ProviderLaunchEffectQuiescenceV1:
         if type(value) is not dict:
             raise TypeError('launch quiescence effect must be an object.')
         resolution = value.get('resolution')
@@ -3382,7 +3379,7 @@ class ProviderLaunchEffectQuiescenceV1(_CanonicalContract):
     @classmethod
     def from_committed(
         cls, evidence: ProviderLaunchCommittedEffectEvidenceV1
-    ) -> 'ProviderLaunchEffectQuiescenceV1':
+    ) -> ProviderLaunchEffectQuiescenceV1:
         value = {
             'version': 1,
             'effect_sequence': evidence.effect_sequence,
@@ -3399,7 +3396,7 @@ class ProviderLaunchEffectQuiescenceV1(_CanonicalContract):
     @classmethod
     def from_resolution(
         cls, resolution: ProviderLaunchNoEffectResolutionV1
-    ) -> 'ProviderLaunchEffectQuiescenceV1':
+    ) -> ProviderLaunchEffectQuiescenceV1:
         value = {
             'version': 1,
             'effect_sequence': resolution.effect_sequence,
@@ -3467,7 +3464,7 @@ class ProviderLaunchSupersessionQuiescenceV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchSupersessionQuiescenceV1':
+    def from_value(cls, value: Any) -> ProviderLaunchSupersessionQuiescenceV1:
         raw = _closed_object(value,
                              name='launch supersession quiescence',
                              keys=cls._KEYS)
@@ -3661,7 +3658,7 @@ class ServeReplicaActionProviderResultV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeReplicaActionProviderResultV1':
+    def from_value(cls, value: Any) -> ServeReplicaActionProviderResultV1:
         raw = _closed_object(value,
                              name='Serve replica action provider result',
                              keys=cls._KEYS)
@@ -3701,7 +3698,7 @@ class ServeReplicaActionProviderResultV1(_CanonicalContract):
 
     def with_provider_operation_id(
             self,
-            operation_id: str | None) -> 'ServeReplicaActionProviderResultV1':
+            operation_id: str | None) -> ServeReplicaActionProviderResultV1:
         value = self.canonical_value()
         value['provider_operation_id'] = operation_id
         return type(self).from_value(value)
@@ -3802,7 +3799,7 @@ class ServeReplicaActionHandlerTerminalResultV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls,
-                   value: Any) -> 'ServeReplicaActionHandlerTerminalResultV1':
+                   value: Any) -> ServeReplicaActionHandlerTerminalResultV1:
         raw = _closed_object(value,
                              name='Serve handler terminal result',
                              keys=cls._KEYS)
@@ -3893,7 +3890,7 @@ class ServeReplicaActionRequestReturnV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeReplicaActionRequestReturnV1':
+    def from_value(cls, value: Any) -> ServeReplicaActionRequestReturnV1:
         raw = _closed_object(value,
                              name='Serve resource-action request return',
                              keys=cls._KEYS)
@@ -3950,7 +3947,7 @@ class ServeLaunchNoIoAttemptProjectionV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeLaunchNoIoAttemptProjectionV1':
+    def from_value(cls, value: Any) -> ServeLaunchNoIoAttemptProjectionV1:
         raw = _closed_object(value,
                              name='launch no-I/O attempt projection',
                              keys=cls._KEYS)
@@ -4035,7 +4032,7 @@ class ServeLaunchNoIoPrefixV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeLaunchNoIoPrefixV1':
+    def from_value(cls, value: Any) -> ServeLaunchNoIoPrefixV1:
         raw = _closed_object(value, name='launch no-I/O prefix', keys=cls._KEYS)
         _version_one(raw['version'], name='no-I/O prefix version')
         current = (None if raw['current_attempt'] is None else
@@ -4049,9 +4046,9 @@ class ServeLaunchNoIoPrefixV1(_CanonicalContract):
     @classmethod
     def append(
         cls,
-        previous: 'ServeLaunchNoIoPrefixV1 | None',
+        previous: ServeLaunchNoIoPrefixV1 | None,
         current: ServeLaunchNoIoAttemptProjectionV1,
-    ) -> 'ServeLaunchNoIoPrefixV1':
+    ) -> ServeLaunchNoIoPrefixV1:
         expected_attempt = 1 if previous is None else previous.count + 1
         if current.attempt != expected_attempt:
             raise ValueError('no-I/O prefix append is not the immediate '
@@ -4115,7 +4112,7 @@ class ServeReplicaActionHandlerOutcomeV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeReplicaActionHandlerOutcomeV1':
+    def from_value(cls, value: Any) -> ServeReplicaActionHandlerOutcomeV1:
         raw = _closed_object(value,
                              name='Serve handler action outcome',
                              keys=cls._KEYS)
@@ -4232,7 +4229,7 @@ class ServeReplicaActionRequestFallbackEvidenceV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls,
-                   value: Any) -> 'ServeReplicaActionRequestFallbackEvidenceV1':
+                   value: Any) -> ServeReplicaActionRequestFallbackEvidenceV1:
         raw = _closed_object(value,
                              name='request fallback evidence',
                              keys=cls._KEYS)
@@ -4308,7 +4305,7 @@ class ServeReplicaActionRequestFallbackOutcomeV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls,
-                   value: Any) -> 'ServeReplicaActionRequestFallbackOutcomeV1':
+                   value: Any) -> ServeReplicaActionRequestFallbackOutcomeV1:
         raw = _closed_object(value,
                              name='Serve request fallback outcome',
                              keys=cls._KEYS)

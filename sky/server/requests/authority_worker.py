@@ -103,7 +103,7 @@ class AuthorityWorkerRoutingConfig:
     image: str
 
     @classmethod
-    def from_value(cls, value: Any) -> 'AuthorityWorkerRoutingConfig':
+    def from_value(cls, value: Any) -> AuthorityWorkerRoutingConfig:
         if type(value) is not dict:
             raise TypeError('Authority routing config must be an object.')
         if frozenset(value) != _ROUTING_CONFIG_KEYS:

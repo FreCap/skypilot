@@ -732,7 +732,7 @@ def _bounded_canonical_json_bytes(value: Any,
             destination[destination_key] = detached_container
             child_tasks = [(child, detached_container, index)
                            for index, child in enumerate(children)]
-        elif item_type is dict:
+        else:
             member_count = len(item)
             if member_count > _MAX_LIST_ITEMS:
                 raise ValueError(f'{name} containers may contain at most '
@@ -789,7 +789,7 @@ class CanonicalJsonValue:
             _bounded_canonical_json_bytes(value, name='canonical JSON value'))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'CanonicalJsonValue':
+    def from_value(cls, value: Any) -> CanonicalJsonValue:
         return cls(value)
 
     def canonical_value(self) -> Any:
@@ -817,7 +817,7 @@ class CanonicalJsonObject(CanonicalJsonValue):
         super().__init__(value)
 
     @classmethod
-    def from_value(cls, value: Any) -> 'CanonicalJsonObject':
+    def from_value(cls, value: Any) -> CanonicalJsonObject:
         return cls(value)
 
     def canonical_value(self) -> JsonObject:
@@ -875,7 +875,7 @@ class _ProviderKubernetesServerOriginV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> '_ProviderKubernetesServerOriginV1':
+    def from_value(cls, value: Any) -> _ProviderKubernetesServerOriginV1:
         raw = _closed_object(value,
                              name='kubernetes server origin',
                              keys=cls._KEYS)
@@ -927,7 +927,7 @@ class ProviderKubernetesTransportIdentityV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesTransportIdentityV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesTransportIdentityV1:
         raw = _closed_object(value,
                              name='kubernetes transport identity',
                              keys=cls._KEYS)
@@ -1027,7 +1027,7 @@ class ProviderKubernetesScopeV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesScopeV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesScopeV1:
         raw = _closed_object(value,
                              name='kubernetes scope identity',
                              keys=cls._KEYS)
@@ -1117,7 +1117,7 @@ class ProviderKubernetesScopeReadV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesScopeReadV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesScopeReadV1:
         raw = _closed_object(value,
                              name='kubernetes scope read',
                              keys=cls._KEYS)
@@ -1185,7 +1185,7 @@ class ProviderWorkloadNameBasisV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderWorkloadNameBasisV1':
+    def from_value(cls, value: Any) -> ProviderWorkloadNameBasisV1:
         raw = _closed_object(value,
                              name='provider workload name basis',
                              keys=cls._KEYS)
@@ -1245,7 +1245,7 @@ class ProviderRepoArtifactRefV1:
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderRepoArtifactRefV1':
+    def from_value(cls, value: Any) -> ProviderRepoArtifactRefV1:
         raw = _closed_object_shallow(value,
                                      name='artifact reference',
                                      keys=cls._KEYS)
@@ -1303,7 +1303,7 @@ class ProviderOCIImageQualificationV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderOCIImageQualificationV1':
+    def from_value(cls, value: Any) -> ProviderOCIImageQualificationV1:
         raw = _closed_object(value,
                              name='OCI image qualification',
                              keys=cls._KEYS)
@@ -1397,7 +1397,7 @@ class ProviderRuntimeImageIdentityV1(_CanonicalContract):
                              'config digest.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderRuntimeImageIdentityV1':
+    def from_value(cls, value: Any) -> ProviderRuntimeImageIdentityV1:
         raw = _closed_object(value,
                              name='runtime image identity',
                              keys=cls._KEYS)
@@ -1432,7 +1432,7 @@ class ProviderAuthorityWorkerImageV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerImageV1':
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerImageV1:
         raw = _closed_object(value, name='worker image', keys=cls._KEYS)
         return cls(qualification=ProviderOCIImageQualificationV1.from_value(
             raw['qualification']),
@@ -1500,8 +1500,7 @@ class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderAuthorityWorkerCohortManifestV1':
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerCohortManifestV1:
         raw = _closed_object(value,
                              name='authority-worker cohort manifest',
                              keys=cls._KEYS)
@@ -1574,7 +1573,7 @@ class ProviderAuthorityWorkerCohortV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerCohortV1':
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerCohortV1:
         raw = _closed_object(value,
                              name='authority-worker cohort identity',
                              keys=cls._KEYS)
@@ -1625,7 +1624,7 @@ class ProviderKubernetesControllerOwnerV1(_CanonicalContract):
                            _text(self.uid, name='controller_owner.uid'))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesControllerOwnerV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesControllerOwnerV1:
         raw = _closed_object(value, name='controller owner', keys=cls._KEYS)
         return cls(**raw)
 
@@ -1720,7 +1719,7 @@ class ProviderAuthorityWorkerIdentityV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerIdentityV1':
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerIdentityV1:
         raw = _closed_object(value,
                              name='authority-worker identity',
                              keys=cls._KEYS)
@@ -1849,7 +1848,7 @@ class ProviderAuthorityWorkerRegistrationV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderAuthorityWorkerRegistrationV1':
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerRegistrationV1:
         raw = _closed_object(value,
                              name='authority-worker registration',
                              keys=cls._KEYS)
@@ -1911,8 +1910,7 @@ class ProviderAuthorityWorkerRegistrationSetV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderAuthorityWorkerRegistrationSetV1':
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerRegistrationSetV1:
         raw = _closed_object(value,
                              name='authority-worker registration set',
                              keys=cls._KEYS)
@@ -2038,7 +2036,7 @@ class ProviderResourceIdentityV1(_CanonicalContract):
                               name='resource_identity.desired_generation'))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderResourceIdentityV1':
+    def from_value(cls, value: Any) -> ProviderResourceIdentityV1:
         raw = _closed_object_shallow(value,
                                      name='resource_identity',
                                      keys=cls._KEYS)
@@ -2124,7 +2122,7 @@ class CoverageDecisionIdentityV1(_CanonicalContract):
             _action_kind(self.action_type, name='coverage.action_type'))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'CoverageDecisionIdentityV1':
+    def from_value(cls, value: Any) -> CoverageDecisionIdentityV1:
         raw = _closed_object(value,
                              name='coverage decision identity',
                              keys=cls._KEYS)
@@ -2261,7 +2259,7 @@ class CoverageDecisionV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'CoverageDecisionV1':
+    def from_value(cls, value: Any) -> CoverageDecisionV1:
         raw = _closed_object(value, name='coverage decision', keys=cls._KEYS)
         return cls(**raw)
 
@@ -2356,7 +2354,7 @@ class WorkerCohortReferenceInputV1(_CanonicalContract):
                           'preparation_capability_sha256')))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'WorkerCohortReferenceInputV1':
+    def from_value(cls, value: Any) -> WorkerCohortReferenceInputV1:
         shallow = _closed_object_shallow(value,
                                          name='worker cohort reference input',
                                          keys=cls._KEYS)
@@ -2437,8 +2435,8 @@ class ProviderLaunchIdentityCanonicalizationInputV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(
-            cls, value: Any) -> 'ProviderLaunchIdentityCanonicalizationInputV1':
+    def from_value(cls,
+                   value: Any) -> ProviderLaunchIdentityCanonicalizationInputV1:
         raw = _closed_object_shallow(
             value,
             name='launch identity canonicalization input',
@@ -2555,8 +2553,7 @@ class ProviderLaunchIdentityCanonicalizationContextV1(_CanonicalContract):
 
     @classmethod
     def from_value(
-            cls,
-            value: Any) -> 'ProviderLaunchIdentityCanonicalizationContextV1':
+            cls, value: Any) -> ProviderLaunchIdentityCanonicalizationContextV1:
         raw = _closed_object_shallow(
             value,
             name='launch identity canonicalization context',
@@ -2628,8 +2625,7 @@ class ProviderLaunchIdentityCanonicalizationRequestV1(_CanonicalContract):
 
     @classmethod
     def from_value(
-            cls,
-            value: Any) -> 'ProviderLaunchIdentityCanonicalizationRequestV1':
+            cls, value: Any) -> ProviderLaunchIdentityCanonicalizationRequestV1:
         raw = _closed_object_shallow(
             value,
             name='launch identity canonicalization request',
@@ -2715,8 +2711,8 @@ class ProviderLaunchIdentityCanonicalizationProofV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(
-            cls, value: Any) -> 'ProviderLaunchIdentityCanonicalizationProofV1':
+    def from_value(cls,
+                   value: Any) -> ProviderLaunchIdentityCanonicalizationProofV1:
         raw = _closed_object_shallow(
             value,
             name='launch identity canonicalization proof',
@@ -2793,7 +2789,7 @@ class ProviderLaunchIdentityCanonicalizationResponseV1(_CanonicalContract):
     @classmethod
     def from_value(
             cls,
-            value: Any) -> 'ProviderLaunchIdentityCanonicalizationResponseV1':
+            value: Any) -> ProviderLaunchIdentityCanonicalizationResponseV1:
         raw = _closed_object_shallow(
             value,
             name='launch identity canonicalization response',
@@ -2931,7 +2927,7 @@ class CoverageAttemptV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'CoverageAttemptV1':
+    def from_value(cls, value: Any) -> CoverageAttemptV1:
         raw = _closed_object(value, name='coverage attempt', keys=cls._KEYS)
         return cls(**raw)
 
@@ -3041,7 +3037,7 @@ class ProviderKubernetesLocatorV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesLocatorV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesLocatorV1:
         _bounded_canonical_json_bytes(value,
                                       name='Kubernetes locator',
                                       require_object=True)
@@ -3125,7 +3121,7 @@ class ProviderLocatorV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLocatorV1':
+    def from_value(cls, value: Any) -> ProviderLocatorV1:
         _bounded_canonical_json_bytes(value,
                                       name='provider locator',
                                       require_object=True)
@@ -3181,7 +3177,7 @@ class ResolvedProviderTargetV1(_CanonicalContract):
     requested_target_sha256: str
     provider_resource_id: str | None
     workload_uid: str | None
-    kubernetes_objects: tuple['ProviderKubernetesResolvedObjectV1', ...]
+    kubernetes_objects: tuple[ProviderKubernetesResolvedObjectV1, ...]
     provider_operation_id: str | None
     resolved_at: str
 
@@ -3230,7 +3226,7 @@ class ResolvedProviderTargetV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ResolvedProviderTargetV1':
+    def from_value(cls, value: Any) -> ResolvedProviderTargetV1:
         raw = _closed_object(value, name='resolved target', keys=cls._KEYS)
         objects = raw['kubernetes_objects']
         if type(objects) is not list:
@@ -3290,7 +3286,7 @@ class ProviderAcceleratorV1(_CanonicalContract):
             _positive_integer(self.count, name='accelerator.count'))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderAcceleratorV1':
+    def from_value(cls, value: Any) -> ProviderAcceleratorV1:
         raw = _closed_object(value, name='accelerator', keys=cls._KEYS)
         return cls(**raw)
 
@@ -3322,7 +3318,7 @@ class ProviderLabelV1(_CanonicalContract):
                   maximum_bytes=_MAX_SHORT_TEXT_BYTES))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLabelV1':
+    def from_value(cls, value: Any) -> ProviderLabelV1:
         raw = _closed_object_shallow(value, name='label', keys=cls._KEYS)
         return cls(**raw)
 
@@ -3437,7 +3433,7 @@ class ProviderPodTopologyMutableObjectV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderPodTopologyMutableObjectV1':
+    def from_value(cls, value: Any) -> ProviderPodTopologyMutableObjectV1:
         raw = _closed_object(value,
                              name='topology mutable object',
                              keys=cls._KEYS)
@@ -3550,7 +3546,7 @@ class ProviderPodTopologyV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderPodTopologyV1':
+    def from_value(cls, value: Any) -> ProviderPodTopologyV1:
         raw = _closed_object(value, name='pod topology', keys=cls._KEYS)
         resources_ports = raw['resources_ports']
         mutable_objects = raw['mutable_objects']
@@ -3646,7 +3642,7 @@ class ProviderKubernetesServerAllocationV1(_CanonicalContract):
             raise ValueError('ipFamilyPolicy allocation must be SingleStack.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesServerAllocationV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesServerAllocationV1:
         shallow = _closed_object_shallow(value,
                                          name='server allocation',
                                          keys=cls._KEYS)
@@ -3800,7 +3796,7 @@ class ProviderKubernetesResolvedObjectV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesResolvedObjectV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesResolvedObjectV1:
         shallow = _closed_object_shallow(value,
                                          name='Kubernetes resolved object',
                                          keys=cls._KEYS)
@@ -3911,7 +3907,7 @@ class ProviderKubernetesResolvedObjectSlotV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesResolvedObjectSlotV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesResolvedObjectSlotV1:
         shallow = _closed_object_shallow(value,
                                          name='Kubernetes resolved object slot',
                                          keys=cls._KEYS)
@@ -3976,7 +3972,7 @@ class PartialResolvedProviderTargetV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'PartialResolvedProviderTargetV1':
+    def from_value(cls, value: Any) -> PartialResolvedProviderTargetV1:
         shallow = _closed_object_shallow(value,
                                          name='partial resolved target',
                                          keys=cls._KEYS)
@@ -4079,8 +4075,7 @@ class ProviderKubernetesHandleProviderConfigV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesHandleProviderConfigV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesHandleProviderConfigV1:
         shallow = _closed_object_shallow(
             value, name='Kubernetes handle provider config', keys=cls._KEYS)
         return cls(**shallow)
@@ -4159,7 +4154,7 @@ class ProviderKubernetesHandleV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesHandleV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesHandleV1:
         shallow = _closed_object_shallow(value,
                                          name='Kubernetes handle',
                                          keys=cls._KEYS)
@@ -4207,7 +4202,7 @@ class ProviderKubernetesHandleV1(_CanonicalContract):
                              'resources.')
 
     def validate_workspace_identity(
-            self, workspace: 'ProviderWorkspaceIdentityV1') -> None:
+            self, workspace: ProviderWorkspaceIdentityV1) -> None:
         if (self.provider_config.scope_sha256
                 != workspace.kubernetes_scope.sha256 or
                 self.provider_config.namespace
@@ -4242,7 +4237,7 @@ class ProviderPodImageV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderPodImageV1':
+    def from_value(cls, value: Any) -> ProviderPodImageV1:
         raw = _closed_object(value, name='pod image', keys=cls._KEYS)
         return cls(source=raw['source'],
                    qualification=ProviderOCIImageQualificationV1.from_value(
@@ -4353,7 +4348,7 @@ class ProviderKubernetesResourceContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesResourceContractV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesResourceContractV1:
         raw = _closed_object(value,
                              name='Kubernetes resource contract',
                              keys=cls._KEYS)
@@ -4507,7 +4502,7 @@ class ProviderKubernetesConfigProjectionV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesConfigProjectionV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesConfigProjectionV1:
         raw = _closed_object(value, name='config projection', keys=cls._KEYS)
         normalized = dict(raw)
         for field in cls._EMPTY_FIELDS:
@@ -4557,7 +4552,7 @@ class ProviderPolicyModeEvidenceV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderPolicyModeEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderPolicyModeEvidenceV1:
         raw = _closed_object(value, name='policy modes', keys=cls._KEYS)
         return cls(**raw)
 
@@ -4609,7 +4604,7 @@ class ProviderPolicyBoundaryProofV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderPolicyBoundaryProofV1':
+    def from_value(cls, value: Any) -> ProviderPolicyBoundaryProofV1:
         raw = _closed_object(value,
                              name='policy boundary proof',
                              keys=cls._KEYS)
@@ -4653,7 +4648,7 @@ class ProviderAnnotationV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderAnnotationV1':
+    def from_value(cls, value: Any) -> ProviderAnnotationV1:
         raw = _closed_object_shallow(value, name='annotation', keys=cls._KEYS)
         return cls(**raw)
 
@@ -4758,8 +4753,8 @@ class ProviderKubernetesServiceAccountProjectionV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(
-            cls, value: Any) -> 'ProviderKubernetesServiceAccountProjectionV1':
+    def from_value(cls,
+                   value: Any) -> ProviderKubernetesServiceAccountProjectionV1:
         raw = _closed_object_shallow(value,
                                      name='service-account projection',
                                      keys=cls._KEYS)
@@ -4954,8 +4949,8 @@ class ProviderKubernetesNamespacePrerequisiteSpecV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(
-            cls, value: Any) -> 'ProviderKubernetesNamespacePrerequisiteSpecV1':
+    def from_value(cls,
+                   value: Any) -> ProviderKubernetesNamespacePrerequisiteSpecV1:
         raw = _closed_object_shallow(value,
                                      name='Namespace prerequisite spec',
                                      keys=cls._KEYS)
@@ -5009,7 +5004,7 @@ class ProviderKubernetesServiceAccountPrerequisiteSpecV1(_CanonicalContract):
     @classmethod
     def from_value(
             cls,
-            value: Any) -> 'ProviderKubernetesServiceAccountPrerequisiteSpecV1':
+            value: Any) -> ProviderKubernetesServiceAccountPrerequisiteSpecV1:
         raw = _closed_object_shallow(value,
                                      name='ServiceAccount prerequisite spec',
                                      keys=cls._KEYS)
@@ -5245,7 +5240,7 @@ class ProviderKubernetesPrerequisiteV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesPrerequisiteV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesPrerequisiteV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes prerequisite',
                                      keys=cls._KEYS)
@@ -5377,7 +5372,7 @@ class ProviderKubernetesSelfIdentityV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesSelfIdentityV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesSelfIdentityV1:
         raw = _closed_object(value, name='self identity', keys=cls._KEYS)
         groups = raw['groups']
         extra_keys = raw['extra_keys']
@@ -5521,7 +5516,7 @@ class ProviderKubernetesResourceRuleV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesResourceRuleV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesResourceRuleV1:
         raw = _closed_object(value, name='resource rule', keys=cls._KEYS)
         for field in cls._KEYS:
             if not isinstance(raw[field], list):
@@ -5557,7 +5552,7 @@ class ProviderKubernetesNonResourceRuleV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesNonResourceRuleV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesNonResourceRuleV1:
         raw = _closed_object(value, name='nonresource rule', keys=cls._KEYS)
         if not isinstance(raw['urls'], list) or not isinstance(
                 raw['verbs'], list):
@@ -5613,7 +5608,7 @@ class ProviderKubernetesRulesReviewV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesRulesReviewV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesRulesReviewV1:
         raw = _closed_object(value, name='rules review', keys=cls._KEYS)
         if not isinstance(raw['resource_rules'], list):
             raise TypeError('rules review resource_rules must be a list.')
@@ -5687,7 +5682,7 @@ class ProviderKubernetesResourceAccessV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesResourceAccessV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesResourceAccessV1:
         raw = _closed_object(value, name='resource access', keys=cls._KEYS)
         return cls(**raw)
 
@@ -5717,7 +5712,7 @@ class ProviderKubernetesNonResourceAccessV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesNonResourceAccessV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesNonResourceAccessV1:
         raw = _closed_object(value, name='nonresource access', keys=cls._KEYS)
         return cls(**raw)
 
@@ -5768,7 +5763,7 @@ class ProviderKubernetesAccessDecisionV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesAccessDecisionV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesAccessDecisionV1:
         raw = _closed_object(value, name='access decision', keys=cls._KEYS)
         return cls(
             check_sequence=raw['check_sequence'],
@@ -5852,7 +5847,7 @@ class ProviderKubernetesAuthorizationEvidenceV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesAuthorizationEvidenceV1':
+                   value: Any) -> ProviderKubernetesAuthorizationEvidenceV1:
         raw = _closed_object(value,
                              name='authorization evidence',
                              keys=cls._KEYS)
@@ -5938,7 +5933,7 @@ class ProviderKubernetesPrincipalsV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesPrincipalsV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesPrincipalsV1:
         raw = _closed_object(value,
                              name='Kubernetes principals',
                              keys=cls._KEYS)
@@ -6034,7 +6029,7 @@ class ProviderPodResourceSnapshotV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderPodResourceSnapshotV1':
+    def from_value(cls, value: Any) -> ProviderPodResourceSnapshotV1:
         raw = _closed_object(value, name='resource snapshot', keys=cls._KEYS)
         ports = raw['ports']
         labels = raw['labels']
@@ -6122,7 +6117,7 @@ class ProviderLaunchContentSourceV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchContentSourceV1':
+    def from_value(cls, value: Any) -> ProviderLaunchContentSourceV1:
         _bounded_canonical_json_bytes(value,
                                       name='launch content source',
                                       require_object=True)
@@ -6188,7 +6183,7 @@ class ProviderLaunchSourceV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchSourceV1':
+    def from_value(cls, value: Any) -> ProviderLaunchSourceV1:
         _bounded_canonical_json_bytes(value,
                                       name='launch source',
                                       require_object=True)
@@ -6367,7 +6362,7 @@ class ProviderKubernetesObjectPlanV1(_CanonicalContract):
                              'identity label.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesObjectPlanV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesObjectPlanV1:
         shallow = _closed_object_shallow(value,
                                          name='Kubernetes object plan',
                                          keys=cls._KEYS)
@@ -6440,7 +6435,7 @@ class ProviderWorkspaceIdentityV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderWorkspaceIdentityV1':
+    def from_value(cls, value: Any) -> ProviderWorkspaceIdentityV1:
         shallow = _closed_object_shallow(value,
                                          name='workspace identity',
                                          keys=cls._KEYS)
@@ -6513,7 +6508,7 @@ class ProviderKubernetesCleanupObjectV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesCleanupObjectV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesCleanupObjectV1:
         shallow = _closed_object_shallow(value,
                                          name='Kubernetes cleanup object',
                                          keys=cls._KEYS)
@@ -6852,7 +6847,7 @@ class ProviderKubernetesCleanupTargetV1(_CanonicalContract):
                              'object commitments.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesCleanupTargetV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesCleanupTargetV1:
         shallow = _closed_object_shallow(value,
                                          name='Kubernetes cleanup target',
                                          keys=cls._KEYS)
@@ -7110,7 +7105,7 @@ class CompletedLaunchBasisV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'CompletedLaunchBasisV1':
+    def from_value(cls, value: Any) -> CompletedLaunchBasisV1:
         _bounded_canonical_json_bytes(value,
                                       name='completed launch basis',
                                       require_object=True,
@@ -7248,7 +7243,7 @@ class PartialLaunchCleanupBasisV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'PartialLaunchCleanupBasisV1':
+    def from_value(cls, value: Any) -> PartialLaunchCleanupBasisV1:
         _bounded_canonical_json_bytes(value,
                                       name='partial launch cleanup basis',
                                       require_object=True,
@@ -7413,7 +7408,7 @@ class ProviderKubernetesRendererV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesRendererV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesRendererV1:
         raw = _closed_object(value, name='Kubernetes renderer', keys=cls._KEYS)
         return cls(
             contract=raw['contract'],
@@ -7495,7 +7490,7 @@ class ProviderWorkloadArtifactBindingV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderWorkloadArtifactBindingV1':
+    def from_value(cls, value: Any) -> ProviderWorkloadArtifactBindingV1:
         raw = _closed_object(value,
                              name='workload artifact binding',
                              keys=cls._KEYS)
@@ -7553,7 +7548,7 @@ class ProviderSkyletJobContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderSkyletJobContractV1':
+    def from_value(cls, value: Any) -> ProviderSkyletJobContractV1:
         raw = _closed_object(value, name='Skylet job contract', keys=cls._KEYS)
         return cls(
             schema_id=raw['schema_id'],
@@ -7645,7 +7640,7 @@ class ProviderSkyletJobSpecV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderSkyletJobSpecV1':
+    def from_value(cls, value: Any) -> ProviderSkyletJobSpecV1:
         raw = _closed_object(value, name='Skylet job spec', keys=cls._KEYS)
         environment = _closed_object(raw['environment'],
                                      name='Skylet job spec environment',
@@ -7728,7 +7723,7 @@ class ProviderSkyletSubmitRequestV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderSkyletSubmitRequestV1':
+    def from_value(cls, value: Any) -> ProviderSkyletSubmitRequestV1:
         raw = _closed_object(value,
                              name='Skylet submit request',
                              keys=cls._KEYS)
@@ -7857,7 +7852,7 @@ class ProviderSkyletJobEvidenceV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderSkyletJobEvidenceV1':
+    def from_value(cls, value: Any) -> ProviderSkyletJobEvidenceV1:
         raw = _closed_object(value, name='Skylet job evidence', keys=cls._KEYS)
         return cls(
             protocol=raw['protocol'],
@@ -7932,7 +7927,7 @@ class ProviderSkyletDurabilityContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderSkyletDurabilityContractV1':
+    def from_value(cls, value: Any) -> ProviderSkyletDurabilityContractV1:
         raw = _closed_object(value,
                              name='Skylet durability contract',
                              keys=cls._KEYS)
@@ -7995,8 +7990,8 @@ class ProviderKubernetesProvisionRuntimeMetadataV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(
-            cls, value: Any) -> 'ProviderKubernetesProvisionRuntimeMetadataV1':
+    def from_value(cls,
+                   value: Any) -> ProviderKubernetesProvisionRuntimeMetadataV1:
         raw = _closed_object(value,
                              name='provision runtime metadata',
                              keys=cls._KEYS)
@@ -8038,7 +8033,7 @@ class ProviderKubernetesJobSubmissionV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesJobSubmissionV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesJobSubmissionV1:
         raw = _closed_object(value, name='job submission', keys=cls._KEYS)
         return cls(protocol=raw['protocol'],
                    submission_key_source=raw['submission_key_source'],
@@ -8128,7 +8123,7 @@ class ProviderKubernetesPostProvisionV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesPostProvisionV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesPostProvisionV1:
         raw = _closed_object(value,
                              name='Kubernetes post-provision contract',
                              keys=cls._KEYS)
@@ -8266,7 +8261,7 @@ class ProviderKubernetesEndpointCallerWorkloadV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesEndpointCallerWorkloadV1':
+                   value: Any) -> ProviderKubernetesEndpointCallerWorkloadV1:
         raw = _closed_object_shallow(value,
                                      name='endpoint caller workload',
                                      keys=cls._KEYS)
@@ -8361,7 +8356,7 @@ class ProviderKubernetesEndpointCallerV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointCallerV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesEndpointCallerV1:
         raw = _closed_object_shallow(value,
                                      name='endpoint caller',
                                      keys=cls._KEYS)
@@ -8534,7 +8529,7 @@ class ProviderKubernetesEndpointContractV1(_CanonicalContract):
             raise ValueError('endpoint caller Deployments must be distinct.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesEndpointContractV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesEndpointContractV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes endpoint contract',
                                      keys=cls._KEYS)
@@ -8603,7 +8598,7 @@ class ProviderKubernetesRequestIdentityV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesRequestIdentityV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesRequestIdentityV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes request identity',
                                      keys=cls._KEYS)
@@ -8700,7 +8695,7 @@ class ProviderKubernetesSchedulingContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesSchedulingContractV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesSchedulingContractV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes scheduling contract',
                                      keys=cls._KEYS)
@@ -8779,7 +8774,7 @@ class ProviderKubernetesStorageContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesStorageContractV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesStorageContractV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes storage contract',
                                      keys=cls._KEYS)
@@ -8838,7 +8833,7 @@ class ProviderKubernetesMetadataContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesMetadataContractV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesMetadataContractV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes metadata contract',
                                      keys=cls._KEYS)
@@ -8897,7 +8892,7 @@ class ProviderKubernetesSecurityContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesSecurityContractV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesSecurityContractV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes security contract',
                                      keys=cls._KEYS)
@@ -8955,8 +8950,7 @@ class ProviderKubernetesObjectMutationEffectV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesObjectMutationEffectV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesObjectMutationEffectV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes object mutation effect',
                                      keys=cls._KEYS)
@@ -9059,7 +9053,7 @@ class ProviderKubernetesLaunchMutationContractV1(_CanonicalContract):
 
     @classmethod
     def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesLaunchMutationContractV1':
+                   value: Any) -> ProviderKubernetesLaunchMutationContractV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes launch mutation contract',
                                      keys=cls._KEYS)
@@ -9156,8 +9150,7 @@ class ProviderKubernetesDownMutationContractV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesDownMutationContractV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesDownMutationContractV1:
         raw = _closed_object_shallow(value,
                                      name='Kubernetes down mutation contract',
                                      keys=cls._KEYS)
@@ -9586,7 +9579,7 @@ class ProviderKubernetesExecutionCapsuleV1(_CanonicalContract):
                              'not match the Pod request.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesExecutionCapsuleV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesExecutionCapsuleV1:
         _bounded_canonical_json_bytes(
             value,
             name='Kubernetes launch execution capsule',
@@ -9758,7 +9751,7 @@ class ProviderLaunchPolicySubjectV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchPolicySubjectV1':
+    def from_value(cls, value: Any) -> ProviderLaunchPolicySubjectV1:
         _bounded_canonical_json_bytes(value,
                                       name='launch policy subject',
                                       require_object=True,
@@ -10032,7 +10025,7 @@ class ProviderKubernetesExecutionConfigV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderKubernetesExecutionConfigV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesExecutionConfigV1:
         _bounded_canonical_json_bytes(value,
                                       name='Kubernetes launch execution config',
                                       require_object=True,
@@ -10216,8 +10209,7 @@ class ProviderKubernetesDownExecutionCapsuleV1(_CanonicalContract):
                              'not match the current Kubernetes scope.')
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesDownExecutionCapsuleV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesDownExecutionCapsuleV1:
         _bounded_canonical_json_bytes(value,
                                       name='Kubernetes down execution capsule',
                                       require_object=True,
@@ -10324,7 +10316,7 @@ class ProviderDownPolicySubjectV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderDownPolicySubjectV1':
+    def from_value(cls, value: Any) -> ProviderDownPolicySubjectV1:
         _bounded_canonical_json_bytes(value,
                                       name='down policy subject',
                                       require_object=True,
@@ -10502,8 +10494,7 @@ class ProviderKubernetesDownExecutionConfigV1(_CanonicalContract):
                              'byte-equal to its outer projection.')
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ProviderKubernetesDownExecutionConfigV1':
+    def from_value(cls, value: Any) -> ProviderKubernetesDownExecutionConfigV1:
         _bounded_canonical_json_bytes(value,
                                       name='Kubernetes down execution config',
                                       require_object=True,
@@ -10637,7 +10628,7 @@ class ProviderLaunchInvocationV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchInvocationV1':
+    def from_value(cls, value: Any) -> ProviderLaunchInvocationV1:
         _bounded_canonical_json_bytes(value,
                                       name='launch invocation',
                                       require_object=True,
@@ -10761,7 +10752,7 @@ class ProviderDownInvocationV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderDownInvocationV1':
+    def from_value(cls, value: Any) -> ProviderDownInvocationV1:
         _bounded_canonical_json_bytes(value,
                                       name='down invocation',
                                       require_object=True,
@@ -10913,7 +10904,7 @@ class ProviderLifecycleInvocationV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLifecycleInvocationV1':
+    def from_value(cls, value: Any) -> ProviderLifecycleInvocationV1:
         # Preserve the action-kind discriminator's exact wire-type error before
         # walking the remainder of a potentially hostile nested envelope.
         shallow = _closed_object_shallow(value,
@@ -11068,14 +11059,14 @@ class ProviderLifecycleInvocationV1(_CanonicalContract):
                              'decision/resource/service/replica/generation/'
                              'action/owner/lifecycle field.')
 
-    def as_launch(self) -> 'ProviderLaunchLifecycleInvocationV1':
+    def as_launch(self) -> ProviderLaunchLifecycleInvocationV1:
         """Return a statically refined launch view with identical bytes."""
 
         self.require_launch()
         return ProviderLaunchLifecycleInvocationV1.from_value(
             self.canonical_value())
 
-    def as_down(self) -> 'ProviderDownLifecycleInvocationV1':
+    def as_down(self) -> ProviderDownLifecycleInvocationV1:
         """Return a statically refined down view with identical bytes."""
 
         self.require_down()
@@ -11107,7 +11098,7 @@ class ProviderLaunchLifecycleInvocationV1(ProviderLifecycleInvocationV1):
             raise ValueError('refined launch invocation requires launch kind.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLaunchLifecycleInvocationV1':
+    def from_value(cls, value: Any) -> ProviderLaunchLifecycleInvocationV1:
         base = ProviderLifecycleInvocationV1.from_value(value)
         base.require_launch()
         return cls(version=base.version,
@@ -11134,7 +11125,7 @@ class ProviderDownLifecycleInvocationV1(ProviderLifecycleInvocationV1):
             raise ValueError('refined down invocation requires down kind.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderDownLifecycleInvocationV1':
+    def from_value(cls, value: Any) -> ProviderDownLifecycleInvocationV1:
         base = ProviderLifecycleInvocationV1.from_value(value)
         base.require_down()
         return cls(version=base.version,
@@ -11186,7 +11177,7 @@ class ServeLegacyDownRequestV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeLegacyDownRequestV1':
+    def from_value(cls, value: Any) -> ServeLegacyDownRequestV1:
         raw = _closed_object(value,
                              name='legacy cleanup down request',
                              keys=cls._KEYS)
@@ -11310,8 +11301,7 @@ class ServeLegacyLaunchCleanupDownInvocationV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls,
-                   value: Any) -> 'ServeLegacyLaunchCleanupDownInvocationV1':
+    def from_value(cls, value: Any) -> ServeLegacyLaunchCleanupDownInvocationV1:
         raw = _closed_object(value,
                              name='legacy launch cleanup invocation',
                              keys=cls._KEYS)
@@ -11448,7 +11438,7 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLifecyclePlanV1':
+    def from_value(cls, value: Any) -> ProviderLifecyclePlanV1:
         raw = _closed_action_kind_object(value,
                                          name='provider lifecycle plan',
                                          keys=cls._KEYS,
@@ -11566,7 +11556,7 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
         _ = self.canonical_bytes
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeReplicaActionSpecV1':
+    def from_value(cls, value: Any) -> ServeReplicaActionSpecV1:
         raw = _closed_object(value,
                              name='Serve replica action spec',
                              keys=cls._KEYS)
@@ -11692,7 +11682,7 @@ class ProviderErrorV1(_CanonicalContract):
                            name='provider_error.normalized_message'))
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderErrorV1':
+    def from_value(cls, value: Any) -> ProviderErrorV1:
         raw = _closed_object(value, name='provider error', keys=cls._KEYS)
         return cls(category=_enum_value(ProviderErrorCategory,
                                         raw['category'],
@@ -11753,7 +11743,7 @@ class ProviderSubmissionV1(_CanonicalContract):
                                  'submission evidence.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderSubmissionV1':
+    def from_value(cls, value: Any) -> ProviderSubmissionV1:
         raw = _closed_object(value, name='provider submission', keys=cls._KEYS)
         error = (None if raw['normalized_error'] is None else
                  ProviderErrorV1.from_value(raw['normalized_error']))
@@ -11883,7 +11873,7 @@ class ProviderLifecycleObservationV1(_CanonicalContract):
                                  'complete resolved identity evidence.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ProviderLifecycleObservationV1':
+    def from_value(cls, value: Any) -> ProviderLifecycleObservationV1:
         raw = _closed_object(value,
                              name='provider lifecycle observation',
                              keys=cls._KEYS)
@@ -12027,7 +12017,7 @@ class ServeReplicaActionOutcomeV1(_CanonicalContract):
             raise ValueError('outcome operation IDs conflict.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeReplicaActionOutcomeV1':
+    def from_value(cls, value: Any) -> ServeReplicaActionOutcomeV1:
         raw = _closed_object(value,
                              name='Serve replica action outcome',
                              keys=cls._KEYS)
@@ -12177,7 +12167,7 @@ class ServeShadowProjectionV1(_CanonicalContract):
             raise ValueError('down projection must have capacity_outcome=null.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeShadowProjectionV1':
+    def from_value(cls, value: Any) -> ServeShadowProjectionV1:
         raw = _closed_action_kind_object(
             value,
             name='Serve shadow projection',
@@ -12270,7 +12260,7 @@ class ServeShadowRetryDecisionV1(_CanonicalContract):
             raise ValueError('observe decision requires observation_required.')
 
     @classmethod
-    def from_value(cls, value: Any) -> 'ServeShadowRetryDecisionV1':
+    def from_value(cls, value: Any) -> ServeShadowRetryDecisionV1:
         raw = _closed_object(value,
                              name='Serve shadow retry decision',
                              keys=cls._KEYS)

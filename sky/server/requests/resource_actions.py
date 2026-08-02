@@ -371,7 +371,7 @@ class ActionRequestInput:
 
     @classmethod
     def from_request(cls, action_id: uuid.UUID | str, attempt: int,
-                     request: 'requests_lib.Request') -> 'ActionRequestInput':
+                     request: requests_lib.Request) -> ActionRequestInput:
         parsed_action_id = _uuid(action_id, name='action_id')
         expected_request_id = request_id_for_attempt(parsed_action_id, attempt)
         if request.request_id != expected_request_id:
@@ -568,7 +568,7 @@ class ActionReduction:
     retry_after_seconds: int | None = None
     terminal_disposition: str | None = None
 
-    def normalized(self) -> 'ActionReduction':
+    def normalized(self) -> ActionReduction:
         if self.kernel_state not in (KernelState.READY, KernelState.BLOCKED,
                                      KernelState.TERMINAL):
             raise ValueError('A reduction must target READY, BLOCKED, or '

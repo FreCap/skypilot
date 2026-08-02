@@ -1318,6 +1318,26 @@
                 }
             }
         },
+        "requestStore": {
+            "type": "object",
+            "required": [
+                "backend",
+                "cutoverGatePath"
+            ],
+            "properties": {
+                "backend": {
+                    "type": "string",
+                    "enum": [
+                        "sqlite",
+                        "postgres"
+                    ]
+                },
+                "cutoverGatePath": {
+                    "type": "string",
+                    "minLength": 1
+                }
+            }
+        },
         "resourceActions": {
             "type": "object",
             "properties": {
@@ -1341,18 +1361,11 @@
                         "cohorts": {
                             "type": "array",
                             "items": {
-                                "type": "object",
-                                "required": [
-                                    "id",
-                                    "replicas",
-                                    "image",
-                                    "imagePullPolicy"
-                                ],
                                 "properties": {
                                     "id": {
                                         "type": "string",
-                                        "minLength": 1,
-                                        "maxLength": 63
+                                        "maxLength": 63,
+                                        "minLength": 1
                                     },
                                     "image": {
                                         "type": "string",
@@ -1372,13 +1385,13 @@
                         },
                         "healthPort": {
                             "type": "integer",
-                            "minimum": 1,
-                            "maximum": 65535
+                            "maximum": 65535,
+                            "minimum": 1
                         },
                         "preflightPort": {
                             "type": "integer",
-                            "minimum": 1,
-                            "maximum": 65535
+                            "maximum": 65535,
+                            "minimum": 1
                         },
                         "retirementTombstones": {
                             "type": "array",
@@ -1404,26 +1417,6 @@
                             }
                         }
                     }
-                }
-            }
-        },
-        "requestStore": {
-            "type": "object",
-            "required": [
-                "backend",
-                "cutoverGatePath"
-            ],
-            "properties": {
-                "backend": {
-                    "type": "string",
-                    "enum": [
-                        "sqlite",
-                        "postgres"
-                    ]
-                },
-                "cutoverGatePath": {
-                    "type": "string",
-                    "minLength": 1
                 }
             }
         },
