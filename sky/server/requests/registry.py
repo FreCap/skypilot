@@ -237,11 +237,27 @@ def register_builtin_handlers() -> None:
         try:
             for module_name in _BUILTIN_HANDLER_MODULES:
                 _register_module_handlers(module_name)
+            _register_resource_action_authority_handlers()
             _register_daemon_handlers()
             _register_payload_types()
             _BUILTINS_REGISTERED = True
         finally:
             _BUILTINS_REGISTRATION_IN_PROGRESS = False
+
+
+def _register_resource_action_authority_handlers() -> None:
+    """Register the closed private inventory outside the public scanner."""
+    module = importlib.import_module('sky.serve.resource_action_handlers')
+    for handler_name in RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST:
+        handler = getattr(module, handler_name)
+        register_handler(
+            handler,
+            name=handler_name,
+            execution_class=ExecutionClass.NORMAL,
+            replay_policy=ReplayPolicy.NEVER,
+            cancellation_policy=CancellationPolicy.FENCED_PROCESS,
+            claim_scope=HandlerClaimScope.RESOURCE_ACTION_AUTHORITY,
+        )
 
 
 def _register_daemon_handlers() -> None:

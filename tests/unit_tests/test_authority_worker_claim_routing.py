@@ -79,6 +79,29 @@ def test_private_registration_requires_exact_closed_metadata(
         registry.register_handler(_handler, name=private_name)
 
 
+def test_builtin_private_inventory_is_exact_and_fails_before_provider_io(
+        isolated_registry) -> None:
+    del isolated_registry
+    registry._register_resource_action_authority_handlers()
+
+    registrations = tuple(
+        registration for registration in registry.registered_handlers()
+        if registration.claim_scope is
+        registry.HandlerClaimScope.RESOURCE_ACTION_AUTHORITY)
+    assert tuple(registration.name for registration in registrations) == (
+        registry.RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST)
+    for registration in registrations:
+        assert registration.execution_class is registry.ExecutionClass.NORMAL
+        assert registration.replay_policy is registry.ReplayPolicy.NEVER
+        assert registration.cancellation_policy is (
+            registry.CancellationPolicy.FENCED_PROCESS)
+        assert registration.aliases == ()
+        with pytest.raises(RuntimeError, match='promotion gates'):
+            registration.func(untrusted='payload')
+
+    authority_worker.require_private_handler_inventory()
+
+
 def test_supported_handlers_exclude_private_from_ordinary_roles(
         isolated_registry) -> None:
     del isolated_registry
