@@ -2085,6 +2085,7 @@ def _withdraw_ineligible_frontier_waiters_in_session(
     service_hash: str,
     service_claims: list[tuple[int, str]],
     frontier_limit: int,
+    frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
 ) -> None:
     """Remove waiters on every card whose exploration frontier is full."""
     owned_by_frontier: dict[paid_capacity.FrontierKey,
@@ -2109,8 +2110,12 @@ def _withdraw_ineligible_frontier_waiters_in_session(
         else:
             owned_pool_keys = (owned_by_frontier.get(parsed, set()) |
                                unknown_owned_pool_keys)
+        effective_limit = frontier_limit
+        if parsed is not None and frontier_limits_by_key is not None:
+            effective_limit = frontier_limits_by_key.get(
+                parsed, effective_limit)
         if (pool_key not in owned_pool_keys and
-                len(owned_pool_keys) >= frontier_limit):
+                len(owned_pool_keys) >= effective_limit):
             withdraw.append(pool_key)
     if withdraw:
         session.execute(
@@ -2138,6 +2143,7 @@ def _reconcile_ineligible_paid_capacity_waiters(
     *,
     service_limit: int | None,
     frontier_limit: int | None,
+    frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None,
 ) -> bool:
     """Withdraw newly ineligible waiters without holding any pool lock."""
@@ -2160,7 +2166,7 @@ def _reconcile_ineligible_paid_capacity_waiters(
         elif frontier_limit is not None:
             _withdraw_ineligible_frontier_waiters_in_session(
                 session, service_name, service_hash, service_claims,
-                frontier_limit)
+                frontier_limit, frontier_limits_by_key)
         session.commit()
     return True
 
@@ -2316,6 +2322,8 @@ def try_add_replica_with_paid_capacity_claim(
     expected_controller_owner: tuple[int | None, str | None] | None,
     frontier_key: paid_capacity.FrontierKey | None = None,
     frontier_limit: int | None = None,
+    frontier_default_limit: int | None = None,
+    frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
 ) -> str:
     """Atomically persist one replica and its global paid-capacity claim."""
     engine = _db_manager.get_engine()
@@ -2332,6 +2340,12 @@ def try_add_replica_with_paid_capacity_claim(
             raise ValueError('Paid-capacity service limit must be positive.')
         if frontier_limit is not None and frontier_limit <= 0:
             raise ValueError('Paid-capacity frontier must be positive.')
+        if frontier_default_limit is not None and frontier_default_limit <= 0:
+            raise ValueError('Paid-capacity default frontier must be positive.')
+        if frontier_limits_by_key is not None and any(
+                limit <= 0 for limit in frontier_limits_by_key.values()):
+            raise ValueError(
+                'Paid-capacity per-card frontiers must be positive.')
         if (frontier_key is None) != (frontier_limit is None):
             raise ValueError(
                 'Paid-capacity frontier key and limit must be set together.')
@@ -2381,7 +2395,8 @@ def try_add_replica_with_paid_capacity_claim(
                     len(frontier_owned_pool_keys) >= frontier_limit):
                 _withdraw_ineligible_frontier_waiters_in_session(
                     session, service_name, service_hash, service_claims,
-                    frontier_limit)
+                    frontier_default_limit or frontier_limit,
+                    frontier_limits_by_key)
                 session.commit()
                 return 'feedback_pending'
         _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
@@ -2537,7 +2552,8 @@ def try_add_replica_with_paid_capacity_claim(
                 service_name,
                 service_hash,
                 service_limit=service_limit,
-                frontier_limit=frontier_limit,
+                frontier_limit=frontier_default_limit or frontier_limit,
+                frontier_limits_by_key=frontier_limits_by_key,
                 expected_controller_owner=expected_controller_owner)
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
