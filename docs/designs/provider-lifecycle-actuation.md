@@ -7122,14 +7122,30 @@ state transitions.
 Assignment and every destructive admission source must use the same
 coordinator before the first behavior promotion. Migrating only assignment or
 only ordinary queue retirement does not close the race and is forbidden.
-Queue scale-down and cost rebalance use `GRACEFUL`, which refuses any live
-binding. Purge, update replacement, service down, preemption, launch failure,
-user-job failure, readiness failure, and failed-cleanup re-drive use `FORCED`
-only after their existing domain transition proves that the worker must leave
-service. `FORCED` closes admission even when a prior assignment still needs
-managed-job recovery; it does not silently declare that remote attempt absent.
-The final `_terminate_replica()` boundary rejects every version-1 pool effect
-that lacks the exact close token.
+Queue scale-down and retirement of a live cost-rebalance incumbent use
+`GRACEFUL`, which refuses any live binding. Cleanup of a failed cost-rebalance
+replacement, purge, update replacement, service down, preemption, launch
+failure, user-job failure, readiness failure, and failed-cleanup re-drive use
+`FORCED` only after their existing domain transition proves that the worker
+must leave service. `FORCED` closes admission even when a prior assignment
+still needs managed-job recovery; it does not silently declare that remote
+attempt absent.
+
+The final authority check lives in `terminate_cluster()`, below
+`_terminate_replica()`, because failed-service cleanup, orphan cleanup,
+controller cleanup, and failed-launch compensation can call that provider-down
+boundary directly. A version-1 call carries a typed service hash, worker
+incarnation, and close token. Immediately before every `core.down()` retry,
+the boundary resolves the exact replica row and rejects an absent, stale,
+reopened, or mismatched authority. A coordinated replica row with no parent
+service is quarantined and cannot be terminated from cluster name alone.
+
+The storage-level `remove_replica()` and `remove_replicas()` boundaries
+similarly require the exact close token, zero capacity-consuming assignments,
+and same-call exact absence proof for coordinated workers. Service deletion
+requires zero coordinated child rows. This covers bulk deletion of absent
+logical launches and never-started or placement-benched rows as well as normal
+teardown completion. Version-0 callers retain their characterized signatures.
 
 ##### Durable identity and additive schema
 
@@ -7147,8 +7163,6 @@ only dormant fields and indexes.
 
 - `pool_worker_incarnation TEXT NULL`, a canonical random UUID assigned once
   to an exact live worker during activation;
-- `pool_submission_runtime_incarnation TEXT NULL`, the last freshly probed
-  keyed-Skylet process UUID accepted for this worker;
 - `pool_admission_closed BOOLEAN NOT NULL DEFAULT FALSE`;
 - `pool_retirement_token TEXT NULL`.
 
@@ -7171,11 +7185,21 @@ are rejected, while version-0 rows remain nullable until activation backfill.
 For a coordinated row, `pool_admission_closed = FALSE` requires a null
 retirement token and `TRUE` requires a canonical non-null token.
 
+Version-1 provisioning does not reuse a worker row across ambiguous failed
+provider attempts. Failed-launch compensation force-closes the never-ready row,
+uses its token through `terminate_cluster()`, proves absence, and deletes the
+row. A retry is a new durable birth with a new worker incarnation. This
+replaces the current in-function `launch_cluster()` cleanup-and-retry loop for
+coordinated pools and prevents a stale cleanup for an earlier attempt from
+destroying a later READY worker under the same identity. Version-0 launch
+retry remains characterized until M5-S3.
+
 `job_info` adds:
 
 - `pool_worker_incarnation TEXT NULL`;
 - `pool_assignment_operation_id TEXT NULL`;
 - `pool_assignment_payload_digest TEXT NULL`;
+- `pool_assignment_precondition_deadline FLOAT NULL`;
 - `pool_assignment_state TEXT NULL`.
 
 The closed non-null state set is `INTENT`, `BOUND`, `QUARANTINED`, and
@@ -7187,11 +7211,22 @@ partial lookup index covers `(pool, pool_hash, pool_worker_incarnation)` for
 the three capacity-consuming states.
 
 Additive checks require every non-null assignment state to have a service hash,
-worker incarnation, operation ID, and payload digest. `INTENT` requires a null
-remote job ID and `BOUND` requires a non-null remote job ID. Reassignment from
-`RELEASED` clears the prior remote ID in the same transaction that writes the
-new `INTENT`. Legacy rows with a null assignment state continue to satisfy the
-checks before activation.
+worker incarnation, operation ID, payload digest, and finite absolute
+precondition deadline. `INTENT` requires a null remote job ID and `BOUND`
+requires a non-null remote job ID. Reassignment from `RELEASED` clears the
+prior remote ID in the same transaction that writes the new `INTENT`. Legacy
+rows with a null assignment state continue to satisfy the checks before
+activation.
+
+API-requests revision `005` adds nullable
+`internal_identity_version INTEGER` and `internal_identity_digest TEXT` fields
+to `api_requests`, with a check that both are null or both are non-null. The
+signed internal create path stores version `1` and a SHA-256 digest of the
+complete canonical identity tuple in the same transaction that creates the
+request and queue row. Ordinary and legacy rows keep both null. The immutable
+digest remains on `api_requests` after terminal execution removes its queue
+row, so a late lost-response retry never depends on deleted priority or
+precondition columns.
 
 No second role-capability column is added. The exact releases advertise
 separately versioned internal-exec and coordinator capability tokens, including
@@ -7207,10 +7242,13 @@ stored in these fields.
 
 ##### Stable request and remote effect key
 
-The caller generates the random assignment operation UUID before planning so
-the stable run timestamp and candidate-specific payload can include it. The
-UUID gains authority only when it is committed with the `INTENT`, before any
-HTTP or remote job effect. It is simultaneously:
+The caller generates the random assignment operation UUID and one absolute
+precondition deadline before planning so the stable run timestamp and
+candidate-specific payload can include them. The deadline is validated against
+the database clock when committed and then stored on `job_info`; recovery never
+recomputes it from `time.time()`. The UUID and deadline gain authority only
+when committed with the `INTENT`, before any HTTP or remote job effect. The
+UUID is simultaneously:
 
 1. the pool assignment operation ID;
 2. the private internal `/exec` request ID; and
@@ -7225,6 +7263,12 @@ the caller returns to ranking and derives a new body from the already uploaded
 mount identity. Retrying an accepted intent must rebuild the exact digest or
 return `QUARANTINED`; a retry may not silently submit changed work under the
 same operation ID.
+
+Private `/exec` accepts the stored absolute deadline directly. It does not call
+the public timeout-to-deadline serializer, which derives a fresh wall-clock
+value on every request. The request identity digest therefore remains exact
+across response loss, controller restart, queue deletion, and later duplicate
+lookup.
 
 Controller generation headers remain fencing metadata and never authorize this
 private mode. Release M5-S1 provisions a dedicated internal-controller HMAC
@@ -7246,9 +7290,11 @@ producer version, and canonical JSON; execution class; target cluster;
 schedule type; queue priority and retry flags; ignore-return-value flag;
 file-mount blob identity; and precondition type, payload, and deadline. On a
 duplicate ID, every tuple field must match. An exact match returns the existing
-request without overwriting or enqueueing it. Any mismatch returns `409`,
-preserves the original row, and quarantines the pool intent. SQLite and
-ordinary API requests keep create-once behavior.
+request only when the recomputed identity digest equals the immutable digest
+on `api_requests`; it never relies on the possibly deleted queue row and never
+overwrites or enqueues again. Any mismatch returns `409`, preserves the
+original row, and quarantines the pool intent. SQLite and ordinary API requests
+keep create-once behavior.
 
 Skylet version `41` adds new `GetKeyedSubmissionCapability`, `AddJobKeyed`,
 `QueueJobKeyed`, and `GetJobBySubmissionKey` RPC methods. It does not add
@@ -7292,17 +7338,30 @@ intent. A crash after rename but before the transaction leaves an
 unauthoritative exact artifact that a retry verifies and reuses. A crash after
 the transaction leaves a durable `QUEUED` row that recovery schedules.
 
-The keyed pending row has `QUEUED`, `LAUNCHING`, `RUNNING`, and terminal launch
+The keyed pending row has `QUEUED`, `LAUNCHING`, `STARTED`, and terminal launch
 states plus a random driver token embedded in the process command. Before
-spawn, one transaction moves `QUEUED` to `LAUNCHING`. After spawn, another CAS
-stores the PID and moves to `RUNNING`. Recovery under the same per-job lock
-searches only the exact driver token: one matching process is adopted, proved
-absence permits one spawn, and multiple or mismatched processes quarantine the
-submission. Repeated queue calls return success only for the one matching
-queue digest and recoverable state; a mismatch is a hard error and never
-overwrites a file, inserts a second pending row, or launches another process.
-Exact lookup returns job ID, both stored digests, queue state, and the current
-runtime incarnation.
+spawn, one transaction moves `QUEUED` to `LAUNCHING`. The spawned command is a
+small Skylet wrapper, not the user driver directly. Its first action, before
+setup, Ray submission, script execution, or any other job effect, opens the
+local database, verifies the exact token and `LAUNCHING` state under
+`BEGIN IMMEDIATE`, and durably changes the row to `STARTED` with its PID and
+process-start identity. Only after that commit may it exec the existing driver
+command. The parent's post-spawn PID write is diagnostic and is not the
+authority receipt.
+
+Recovery under the same per-job lock searches only for the exact driver token.
+While no `STARTED` receipt exists, one matching wrapper is awaited or adopted;
+multiple or mismatched processes quarantine the submission. Proved process
+absence permits one spawn only because the wrapper contract guarantees that
+no job effect can precede the receipt. Once `STARTED` exists, process absence
+never permits another spawn. Recovery instead combines the receipt with exact
+terminal job status: terminal evidence closes the pending launch state, while
+missing or nonterminal evidence fails or quarantines the attempt for the
+existing higher-level recovery owner. Repeated queue calls return success only
+for the one matching queue digest and recoverable state; a mismatch is a hard
+error and never overwrites a file, inserts a second pending row, or launches
+another process. Exact lookup returns job ID, both stored digests, queue state,
+driver receipt, and the current runtime incarnation.
 
 Internal keyed execution requires these versioned gRPC methods and a fresh
 runtime-incarnation proof on every effect. It must not fall back to legacy RPC
@@ -7320,11 +7379,11 @@ readiness, immutable launched resources, display metadata, and task resource
 alternatives, but these observations never become authority. The pure planner
 returns only the exact service hash, replica ID, worker incarnation, replica
 state version, cluster name, selected task resource alternative, freshly
-probed remote runtime incarnation, operation UUID, and prepared exec payload
-digest. Its module has the low-state import boundary specified above. Missing
-or ambiguous observations yield `RETRY` or `INCOMPATIBLE`, never a guessed
-reservation. Display metadata is projected after commit and is not an input
-to fencing, capacity, recovery, or teardown.
+generated operation UUID, absolute precondition deadline, and prepared exec
+payload digest. Its module has the low-state import boundary specified above.
+Missing or ambiguous observations yield `RETRY` or `INCOMPATIBLE`, never a
+guessed reservation. Display metadata is projected after commit and is not an
+input to fencing, capacity, recovery, or teardown.
 
 The PostgreSQL transaction locks in this order:
 
@@ -7345,8 +7404,8 @@ fail-closed one-job-per-worker behavior.
 
 For one winning worker, the same commit:
 
-- stores worker incarnation, operation ID, payload digest, and `INTENT`;
-- records the freshly probed Skylet runtime incarnation on the replica;
+- stores worker incarnation, operation ID, payload digest, absolute deadline,
+  and `INTENT`;
 - stores the selected cluster name; and
 - replaces heterogeneous `spot.full_resources` with the exact selected
   alternative.
@@ -7381,13 +7440,12 @@ Every `BOUND` row represents one exact remote task attempt. The normal terminal
 reducer locks current leadership, the exact `job_info` row, and the relevant
 `spot` task rows in the common order. It verifies operation ID, remote job ID,
 service hash, worker incarnation, and an exact terminal, cancelled, or
-proved-absent remote observation before changing `BOUND` to `RELEASED`. A
-serial multi-task job cannot bind its next task until the prior task is
-released. A remote job group releases worker capacity only after every
-required member has an exact terminal observation or exact absence proof.
-Crashing after the `spot` terminal write but before release leaves capacity
-consumed; recovery queries the exact remote ID and re-drives the reducer. A
-terminal `spot` state alone never releases capacity.
+proved-absent remote observation before changing `BOUND` to `RELEASED`. Pools
+accept one task at a time and do not accept parallel job groups. A serial
+multi-task job cannot bind its next task until the prior task's one exact
+remote ID is released. Crashing after the `spot` terminal write but before
+release leaves capacity consumed; recovery queries the exact remote ID and
+re-drives the reducer. A terminal `spot` state alone never releases capacity.
 
 Cancellation and reassignment use the same reducer and release capacity only
 after the exact API request and remote job are cancelled or absence is proved.
@@ -7435,9 +7493,13 @@ reducer releases each matching assignment using that absence proof before the
 replica row is deleted. If teardown fails or absence is ambiguous, the closed
 worker and every capacity-consuming assignment remain durable. No source may
 clear the close flag, replace the token, or delete the row to make progress.
-The final `_terminate_replica()` boundary requires the exact service hash,
-worker incarnation, and close token for every version-1 effect, regardless of
-which higher-level source requested it.
+Both `_terminate_replica()` and every direct caller must pass the exact service
+hash, worker incarnation, and close token to `terminate_cluster()`. The lower
+boundary requires them for every coordinated effect, regardless of which
+higher-level source requested it. Controller `_cleanup()`, failed-service
+purge, and orphan cleanup must close each exact row before creating a teardown
+thread. A version-1 orphan is an invariant violation and remains quarantined;
+legacy orphan cleanup is allowed only for rows without a worker incarnation.
 
 Activation refuses a legacy service with a null resource scope or any worker
 whose external cluster name is not incarnation-scoped. This prevents a stale
@@ -7464,18 +7526,26 @@ Point-in-time fleet and capability checks are necessary but not sufficient: a
 previous binary can start late and ignore a Python fence. Serve `033` and
 spot-jobs `027` therefore install PostgreSQL writer-fence triggers. Every
 coordinator transaction sets the transaction-local marker
-`skypilot.pool_coordination_writer` to the exact value `m5-v1`. For a
-version-1 service, triggers reject an insert, update, or delete of its replica
-row; an assignment-field update of its `job_info` row; a selected-resource
-update of its `spot` rows; and an update or delete of the service coordination
-row unless the marker matches. Future coordination contracts use a different
-marker. This is a compatibility epoch, not an authentication secret.
+`skypilot.pool_coordination_writer` to the exact value `m5-v1`. For a service
+at transition version `-1` or active version `1`, triggers reject every
+`services` update or delete; every child `replicas` insert, update, or delete;
+and any replica update or delete whose old or new worker incarnation is
+nonnull, unless the marker matches. The `job_info` trigger guards changes or
+deletion involving `pool`, `pool_hash`, `current_cluster_name`,
+`job_id_on_pool_cluster`, worker incarnation, operation ID, payload digest, or
+assignment state when either the old or new pool is protected. The `spot`
+trigger guards selected `full_resources` changes and deletion of rows backing
+a capacity-consuming protected assignment. Future coordination contracts use
+a different marker. This is a compatibility epoch, not an authentication
+secret.
 
 Every assignment path performs one of those guarded durable writes before
 `sdk.exec` or Skylet mutation. Every destructive source performs the guarded
 close CAS before scheduling a thread, calling `sky.down`, or invoking a
 provider. A transaction without the marker fails before the external effect.
 Activation is forbidden until tests prove that ordering for every source.
+The lower `terminate_cluster()` and replica-deletion checks remain mandatory;
+they cover direct legacy callers that previously had no fresh pre-effect write.
 The migration revision alone is not a writer barrier because existing schema
 helpers intentionally tolerate newer additive revisions. The triggers remain
 the durable enforcement boundary if a stale process appears after image and
@@ -7497,7 +7567,10 @@ schema presence. It requires:
    destructive source performs its guarded write before an external effect;
    and
 7. no version-0 teardown admitted before quiescence remains scheduled,
-   running, or ambiguous.
+   running, or ambiguous; and
+8. no inherited launch thread or launch API request remains, every legacy
+   replica is READY or terminal with exact absence proof, and no `PENDING` or
+   `PROVISIONING` row can be backfilled.
 
 Under the exclusive compatibility lock, activation first commits service
 version `-1`. It then starts a second transaction, locks the authoritative
@@ -7506,7 +7579,9 @@ one replica, records exact existing remote IDs as `BOUND`, marks historical
 bindings `RELEASED`, and closes replicas that are already nonassignable.
 It waits for every previously admitted version-0 teardown to prove exact
 absence and clear its row before this mapping; an in-flight legacy effect is
-never adopted into a new retirement token.
+never adopted into a new retirement token. It also refuses any orphaned child
+row, inherited launch request or thread, or nonterminal provisioning row rather
+than guessing that it cannot later create or delete infrastructure.
 Missing, duplicate, cross-incarnation, or resource-ambiguous mapping aborts the
 second transaction and leaves the durable service at `-1` for diagnosis.
 Version `1` is written last in the successful second commit. If the activator
@@ -7541,8 +7616,8 @@ activation/deactivation command, and shadow comparison. Every service remains
 version `0`; no activation is permitted. It has its own merge, deploy, and
 monitoring gate before any source migration.
 
-M5-S3 migrates assignment, normal terminal release, serial and grouped-task
-release, and every graceful and forced destructive source one bounded change
+M5-S3 migrates assignment, normal terminal release, serial-task release, and
+every graceful and forced destructive source one bounded change
 at a time. Each source change merges, deploys, and proves its version-0 shadow
 or compatibility behavior before the next one. Only after repository search,
 the executable removal manifest, pre-effect writer-order tests, and live
@@ -7565,20 +7640,24 @@ The design is not promotable without all of the following:
   recreation, worker UUID mismatch, replica-ID reuse, and worker-name reuse
   perform zero writes and zero effects;
 - terminal and cancelling jobs cannot acquire an assignment;
-- normal terminal completion, cancellation, forced exact absence, serial-task
-  advance, and grouped-task completion release exactly one matching `BOUND`
-  attempt, while a terminal `spot` write alone retains capacity;
+- normal terminal completion, cancellation, forced exact absence, and
+  serial-task advance release exactly one matching `BOUND` attempt, while a
+  terminal `spot` write alone retains capacity and pool job groups remain
+  rejected;
 - queue scale-down, cost rebalance, purge, update replacement, service down,
   preemption, launch failure, user-job failure, readiness failure, and failed
   cleanup all close the exact worker before scheduling or producing a
   destructive effect;
 - fault injection after assignment commit, after HTTP acceptance, after
-  Skylet add, after Skylet queue-file rename, before and after driver spawn,
-  before remote-ID binding, after retirement commit, and before teardown all
-  converge without duplicate effects;
+  Skylet add, after Skylet queue-file rename, before driver spawn, after spawn
+  before the wrapper receipt, after the receipt before job effect, before
+  remote-ID binding, after retirement commit, and before teardown all converge
+  without duplicate effects;
 - duplicate internal request IDs and submission keys return the one matching
   object, while payload, user, handler, cluster, add-digest, and queue-digest
   conflicts fail closed;
+- response-loss retries reuse the exact stored absolute precondition deadline
+  and identity digest before and after terminal queue-row deletion;
 - an absent or garbage-collected API request recovers only through exact Skylet
   key and digest lookup;
 - forged HMACs, replayed timestamps, caller-supplied leader headers, public
@@ -7589,9 +7668,13 @@ The design is not promotable without all of the following:
 - writer triggers reject representative old assignment SQL and every old
   destructive transition before an external effect, even when a stale process
   starts after the activation fleet check;
+- `terminate_cluster()` and replica deletion reject missing or stale close
+  authority for `_terminate_replica()`, controller cleanup, both purge paths,
+  failed-launch compensation, and direct bulk deletion; coordinated orphan
+  rows remain quarantined;
 - activation backfill rejects every ambiguous legacy mapping, capability gap,
-  old role process, old Skylet, legacy resource namespace, or admitted
-  version-0 retirement;
+  old role process, old Skylet, legacy resource namespace, admitted version-0
+  retirement, inherited launch request, or pending or provisioning worker;
 - deactivation refuses active bindings, unresolved effects, and incomplete
   retirement;
 - deterministic multi-worker and multi-job lock ordering passes deadlock and

@@ -16252,9 +16252,37 @@ artifacts:
     operation: direct_worker_teardown_admission
   runtime_affecting: true
   locators:
+  - kind: python_ast_pattern
+    path: sky/serve/service.py
+    symbol: _cleanup
+    pattern: replica_managers.terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/service.py
+    symbol: _cleanup
+    call: serve_state.remove_replicas
+  - kind: python_call_within
+    path: sky/serve/service.py
+    symbol: _cleanup
+    call: _remove_replica
+  - kind: python_call_within
+    path: sky/serve/service.py
+    symbol: _run_cleanup_and_finalize_locked
+    call: serve_state.remove_service_completely
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: core.down
   - kind: python_call_within
     path: sky/serve/replica_managers.py
     symbol: SkyPilotReplicaManager._reconcile_failed_cleanup
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._recover_replica_operations
     call: self._terminate_replica
   - kind: python_call_within
     path: sky/serve/replica_managers.py
@@ -16301,9 +16329,33 @@ artifacts:
     symbol: SkyPilotReplicaManager._probe_all_replicas
     call: self._terminate_replica
   - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._handle_sky_down_finish
+    call: self._remove_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager.scale_down_logically_batch
+    call: self._remove_replicas
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._refresh_thread_pool
+    call: self._remove_replica
+  - kind: python_call_within
     path: sky/serve/serve_utils.py
     symbol: _terminate_failed_services_locked
     call: replica_managers.terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_failed_services_locked
+    call: serve_state.remove_service_completely
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_orphaned_service_children_impl
+    call: replica_managers.terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_orphaned_service_children_impl
+    call: serve_state.remove_orphaned_service_children
   replacement: PoolWorkerCoordinator graceful or forced close admission plus exact-token teardown re-drive
   dependencies:
   - PLA-M5-015
