@@ -117,6 +117,14 @@ def test_sqlite_catalog_is_inert_and_ordinary_updates_preserve_identity(
                 global_user_state.cluster_table.c.name ==
                 'sqlite-action-aware')).first() is None
 
+    with pytest.raises(RuntimeError, match='requires.*PostgreSQL'):
+        global_user_state.remove_cluster(
+            name,
+            terminate=True,
+            expected_cluster_record_uuid=_RECORD_UUID,
+            expected_cluster_handle=_MinimalHandle('updated'),
+        )
+
 
 def test_sqlite_partial_unique_index_rejects_duplicate_nonnull_identity(
         sqlite_state) -> None:

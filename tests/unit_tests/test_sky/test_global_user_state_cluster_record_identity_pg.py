@@ -259,6 +259,156 @@ def test_action_aware_cluster_upsert_is_atomic_and_ordinary_updates_preserve(
         )
 
 
+def test_action_aware_cluster_snapshot_is_exact_and_transaction_owned(
+        full_state_database) -> None:
+    handle = _MinimalHandle('snapshot')
+    global_user_state.add_or_update_cluster(
+        'snapshot-row',
+        handle,
+        requested_resources=set(),
+        ready=False,
+        cluster_record_uuid=_RECORD_UUID,
+    )
+    with orm.Session(full_state_database) as session:
+        snapshot = (global_user_state._read_cluster_record_identity_in_session(
+            session, 'snapshot-row', _RECORD_UUID))
+        assert snapshot is not None
+        assert snapshot.cluster_name == 'snapshot-row'
+        assert snapshot.cluster_record_uuid == _RECORD_UUID
+        assert snapshot.serialized_handle
+        assert snapshot.handle.marker == 'snapshot'
+        session.rollback()
+
+    with orm.Session(full_state_database) as session:
+        assert (global_user_state._read_cluster_record_identity_in_session(
+            session, 'missing-row', _OTHER_UUID) is None)
+
+
+def test_action_aware_cluster_snapshot_rejects_incompatible_rows(
+        full_state_database) -> None:
+    global_user_state.add_or_update_cluster(
+        'committed-row',
+        _MinimalHandle('committed'),
+        requested_resources=set(),
+        ready=False,
+        cluster_record_uuid=_RECORD_UUID,
+    )
+    global_user_state.add_or_update_cluster(
+        'legacy-row',
+        _MinimalHandle('legacy'),
+        requested_resources=set(),
+        ready=False,
+    )
+    with orm.Session(full_state_database) as session:
+        with pytest.raises(global_user_state.ClusterRecordIdentityConflictError,
+                           match='incompatible'):
+            global_user_state._read_cluster_record_identity_in_session(
+                session, 'committed-row', _OTHER_UUID)
+        session.rollback()
+    with orm.Session(full_state_database) as session:
+        with pytest.raises(global_user_state.ClusterRecordIdentityConflictError,
+                           match='null'):
+            global_user_state._read_cluster_record_identity_in_session(
+                session, 'legacy-row', _OTHER_UUID)
+
+
+def test_expected_identity_removal_exactly_deletes_and_adopts_absence(
+        full_state_database) -> None:
+    assert full_state_database is not None
+    handle = _MinimalHandle('remove-exact')
+    global_user_state.add_or_update_cluster(
+        'remove-row',
+        handle,
+        requested_resources=set(),
+        ready=True,
+        cluster_record_uuid=_RECORD_UUID,
+    )
+
+    outcome = global_user_state.remove_cluster(
+        'remove-row',
+        terminate=True,
+        expected_cluster_record_uuid=_RECORD_UUID,
+        expected_cluster_handle=handle,
+    )
+    assert outcome is global_user_state.ClusterRecordRemovalOutcome.REMOVED_EXACT
+    assert global_user_state.get_cluster_from_name('remove-row') is None
+
+    replay = global_user_state.remove_cluster(
+        'remove-row',
+        terminate=True,
+        expected_cluster_record_uuid=_RECORD_UUID,
+        expected_cluster_handle=handle,
+    )
+    assert replay is global_user_state.ClusterRecordRemovalOutcome.ALREADY_ABSENT
+
+
+def test_expected_identity_removal_rejects_handle_or_identity_replacement(
+        full_state_database) -> None:
+    assert full_state_database is not None
+    handle = _MinimalHandle('original')
+    global_user_state.add_or_update_cluster(
+        'protected-row',
+        handle,
+        requested_resources=set(),
+        ready=True,
+        cluster_record_uuid=_RECORD_UUID,
+    )
+
+    with pytest.raises(global_user_state.ClusterRecordIdentityConflictError,
+                       match='different persisted handle'):
+        global_user_state.remove_cluster(
+            'protected-row',
+            terminate=True,
+            expected_cluster_record_uuid=_RECORD_UUID,
+            expected_cluster_handle=_MinimalHandle('replacement'),
+        )
+    with pytest.raises(global_user_state.ClusterRecordIdentityConflictError,
+                       match='incompatible'):
+        global_user_state.remove_cluster(
+            'protected-row',
+            terminate=True,
+            expected_cluster_record_uuid=_OTHER_UUID,
+            expected_cluster_handle=handle,
+        )
+    with pytest.raises(global_user_state.ClusterRecordIdentityConflictError,
+                       match='unexpectedly has a row'):
+        global_user_state.remove_cluster(
+            'protected-row',
+            terminate=True,
+            expected_cluster_record_uuid=_RECORD_UUID,
+            expected_cluster_handle=None,
+        )
+    retained = global_user_state.get_cluster_from_name('protected-row')
+    assert retained is not None
+    assert retained['handle'].marker == 'original'
+
+
+def test_expected_identity_removal_requires_closed_action_fence(
+        full_state_database) -> None:
+    assert full_state_database is not None
+    with pytest.raises(ValueError, match='explicit expected handle'):
+        global_user_state.remove_cluster(
+            'missing-row',
+            terminate=True,
+            expected_cluster_record_uuid=_RECORD_UUID,
+        )
+    with pytest.raises(ValueError, match='requires terminate=True'):
+        global_user_state.remove_cluster(
+            'missing-row',
+            terminate=False,
+            expected_cluster_record_uuid=_RECORD_UUID,
+            expected_cluster_handle=None,
+        )
+    with pytest.raises(ValueError, match='mutually exclusive'):
+        global_user_state.remove_cluster(
+            'missing-row',
+            terminate=True,
+            existing_cluster_hash='legacy-hash',
+            expected_cluster_record_uuid=_RECORD_UUID,
+            expected_cluster_handle=None,
+        )
+
+
 def test_action_aware_upsert_and_inverse_uuid_claim_do_not_deadlock(
         full_state_database, monkeypatch) -> None:
     global_user_state.add_or_update_cluster(
