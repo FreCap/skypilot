@@ -24,6 +24,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.skylet import constants
 from sky.skylet import job_lib_codegen
+from sky.skylet import keyed_submission_state
 from sky.skylet import runtime_utils
 from sky.utils import common_utils
 from sky.utils import message_utils
@@ -128,6 +129,9 @@ def create_table(cursor, conn):
                                  value_to_replace_existing_entries='{}')
     db_utils.add_column_to_table(cursor, conn, 'jobs', 'exit_codes',
                                  'TEXT DEFAULT NULL')
+    if not keyed_submission_state.create_tables(cursor, conn):
+        logger.warning('Keyed submission schema is unavailable; continuing '
+                       'with the legacy job schema.')
     conn.commit()
 
 

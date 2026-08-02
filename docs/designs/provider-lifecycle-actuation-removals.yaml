@@ -213,6 +213,66 @@ coverage_gaps:
     every candidate producer and every inventoried plugin route; close only after each producer has a
     freshness class, typed runtime projection, stable-input and intentional-delta conformance, live
     qualification where provider mutation is affected, and no promoted route can reach a second callback
+- id: PLA-GAP-005
+  milestone: M5
+  responsibility: Name and implement one generation-fenced pooled-worker provider actuation owner with
+    pre-effect target identity, authoritative object query, and signed no-later-create closure receipts
+  candidate_locators:
+  - kind: python_symbol
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+  - kind: python_symbol
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+  - kind: python_symbol
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: CloudVmRayBackend.teardown_no_lock
+  - kind: python_symbol
+    path: sky/provision/provisioner.py
+    symbol: bulk_provision
+  - kind: python_symbol
+    path: sky/provision/provisioner.py
+    symbol: teardown_cluster
+  owner: M5-S4 pooled-worker provider actuation qualification
+  reason: No current provider implementation owns every create retry behind a generation fence or can
+    issue the operation-closing receipt required to rule out a late create, so coordinated pool
+    activation and final removal of version-0 launch or teardown ownership remain unsafe
+  closure_gate: Update the canonical design with one named pilot provider and exact target and object
+    schemas, sole-credential egress owner, retry ledger, issuer keys, authoritative query, signed
+    generation and operation closure, live conformance, and deployment evidence; replace this gap with
+    exact implementation and compatibility artifacts before any coordinated birth or M5 removal gate
+- id: PLA-GAP-006
+  milestone: M5
+  responsibility: Implement and qualify LOCAL_CGROUP_V2_DIRECT_V1 submission containment with a
+    root-owned supervisor, durable prepare ledger, control and payload principal separation,
+    submission-scoped payload event channel, race-free direct launch, crash-recoverable natural
+    completion, durable no-later-launch seal, recursive cgroup kill and empty proof, reaping, and
+    permanent retirement
+  candidate_locators:
+  - kind: python_symbol
+    path: sky/skylet/job_lib.py
+    symbol: JobScheduler.schedule_step
+  - kind: python_symbol
+    path: sky/skylet/job_lib.py
+    symbol: cancel_jobs
+  - kind: python_symbol
+    path: sky/backends/task_codegen.py
+    symbol: RayCodeGen
+  - kind: python_symbol
+    path: sky/backends/task_codegen.py
+    symbol: SlurmCodeGen
+  owner: M5-S0 and M5-S3 submission containment qualification
+  reason: Current Skylet cancellation owns a local process shape while Ray and Slurm can execute work
+    in runtime-owned processes or allocations outside that shape; no current direct executor provides
+    the durable seal, recursive absence receipt, and escape isolation required before pool capacity can
+    be released safely
+  closure_gate: Merge and deploy the dormant containment supervisor and direct single-node executor;
+    pass executable prepare and never-launched response-loss, shim-to-payload UID handoff, bounded
+    request-ack IPC isolation, gate-closed failed-launch sealing, channel-loss completion and
+    cancellation ordering, daemon escape, fork race, crash recovery, reaping,
+    retirement, legacy compatibility, and Ray and Slurm rejection conformance; and replace this gap
+    with exact implementation and rollout evidence before coordinated birth or the M5 assignment and
+    teardown removal gates
 artifacts:
 - id: PLA-M1-001
   milestone: M1
@@ -15479,12 +15539,16 @@ artifacts:
     - id: m5_serve_request_runtime_rollback_window_closed
       satisfied: false
       evidence: []
+    - id: m5_s4_pilot_provider_actuation_and_receipt_qualified
+      satisfied: false
+      evidence: []
     schema:
     - id: serve_request_helpers_own_no_schema
       satisfied: true
       evidence:
       - The in-process Serve request helpers own no database schema.
-  retained_references: []
+  retained_references:
+  - PLA-GAP-005
   evidence: {}
   blocker: null
 - id: PLA-M5-002
@@ -16178,6 +16242,181 @@ artifacts:
       evidence:
       - The legacy Serve retry-loop symbols own no database schema.
   retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-015
+  milestone: M5
+  introduced_by: 2801510cd08aeca8ad88a90831d62580e3a9712c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: managed_job_pool
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: legacy_worker_assignment
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: filelock.FileLock
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: managed_job_state.update_job_full_resources
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: managed_job_state.set_current_cluster_name
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: managed_job_state.set_job_infra
+  replacement: PoolWorkerCoordinator assignment transaction plus explicitly named PostgreSQL version-0 and SQLite compatibility implementations
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_central_postgresql_legacy_pool_assignment_body
+      satisfied: false
+      evidence: []
+    test:
+    - id: pool_assignment_retirement_capacity_and_identity_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_central_postgresql_legacy_pool_assignment_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: pool_worker_coordinator_assignment_rollback_window_closed
+      satisfied: false
+      evidence: []
+    - id: zero_legacy_version_0_production_pool_inventory
+      satisfied: false
+      evidence: []
+    - id: m5_s4_pilot_provider_actuation_and_receipt_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_direct_submission_containment_qualified
+      satisfied: false
+      evidence: []
+    schema:
+    - id: legacy_pool_assignment_body_owns_no_schema
+      satisfied: true
+      evidence:
+      - The filesystem-locked assignment body owns no database schema.
+  retained_references:
+  - PLA-GAP-005
+  - PLA-GAP-006
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M5-016
+  milestone: M5
+  introduced_by: cddfef839c60432da7c1b20660cb83757f476e70
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: managed_job_pool
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: direct_worker_teardown_admission
+  runtime_affecting: true
+  locators:
+  - kind: python_ast_pattern
+    path: sky/serve/service.py
+    symbol: _cleanup
+    pattern: replica_managers.terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/service.py
+    symbol: _cleanup
+    call: serve_state.remove_replicas
+  - kind: python_call_within
+    path: sky/serve/service.py
+    symbol: _cleanup
+    call: _remove_replica
+  - kind: python_call_within
+    path: sky/serve/service.py
+    symbol: _run_cleanup_and_finalize_locked
+    call: serve_state.remove_service_completely
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._handle_sky_down_finish
+    call: self._remove_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager.scale_down_logically_batch
+    call: self._remove_replicas
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._refresh_thread_pool
+    call: self._remove_replica
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_failed_services_locked
+    call: replica_managers.terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_failed_services_locked
+    call: serve_state.remove_service_completely
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_orphaned_service_children_impl
+    call: replica_managers.terminate_cluster
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_orphaned_service_children_impl
+    call: serve_state.remove_orphaned_service_children
+  replacement: Distinct coordinated-pool termination and removal adapters plus an explicitly named PostgreSQL version-0 teardown compatibility implementation
+  dependencies:
+  - PLA-M5-015
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_unfenced_central_postgresql_pool_teardown_admission
+      satisfied: false
+      evidence: []
+    test:
+    - id: every_pool_teardown_source_closes_admission_before_effect
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_unfenced_pool_teardown_admission_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: pool_worker_coordinator_teardown_rollback_window_closed
+      satisfied: false
+      evidence: []
+    - id: zero_legacy_version_0_production_pool_inventory
+      satisfied: false
+      evidence: []
+    - id: m5_s4_pilot_provider_actuation_and_receipt_qualified
+      satisfied: false
+      evidence: []
+    - id: m5_direct_submission_containment_qualified
+      satisfied: false
+      evidence: []
+    schema:
+    - id: direct_pool_teardown_admission_owns_no_schema
+      satisfied: true
+      evidence:
+      - The direct in-process teardown admission paths own no database schema.
+  retained_references:
+  - PLA-GAP-005
+  - PLA-GAP-006
+  - docs/designs/provider-lifecycle-actuation.md
   evidence: {}
   blocker: null
 - id: PLA-M6-001
