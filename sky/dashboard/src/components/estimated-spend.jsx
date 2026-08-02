@@ -579,58 +579,85 @@ export function EstimatedSpend() {
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
   const requestState = useRef({ generation: 0, active: null });
 
-  const fetchData = useCallback(async () => {
-    const requestKey = JSON.stringify([
-      dateRange.startDate,
-      dateRange.endDate,
-      dateRange.days,
-      groupBy,
-    ]);
-    if (requestState.current.active?.key === requestKey) return;
+  const fetchData = useCallback(
+    (options = {}) => {
+      const { kind = 'automatic', showLoading = false } = options;
+      const requestKey = JSON.stringify([
+        dateRange.startDate,
+        dateRange.endDate,
+        dateRange.days,
+        groupBy,
+      ]);
 
-    const generation = ++requestState.current.generation;
-    requestState.current.active = { key: requestKey, generation };
-    setLoading(true);
-    setError(null);
-    try {
-      const role = await getCurrentUserRole();
-      if (generation !== requestState.current.generation) return;
-      if (role.roleFetchFailed) {
-        setForbidden(false);
-        // A failed role lookup is an error, not a permission denial: keep
-        // the error UI so the next refresh cycle retries.
-        throw new Error('Failed to fetch current role');
+      const activeRequest = requestState.current.active;
+      if (activeRequest?.key === requestKey) {
+        const shouldReuse =
+          kind === 'automatic' ||
+          activeRequest.kind === kind ||
+          (kind === 'visibility' && activeRequest.kind === 'manual');
+        if (shouldReuse) {
+          return activeRequest.promise;
+        }
       }
-      if (role.role !== 'admin') {
-        setForbidden(true);
-        setData(null);
-        return;
+
+      const generation = ++requestState.current.generation;
+      const owner = {
+        key: requestKey,
+        generation,
+        kind,
+        promise: null,
+      };
+      requestState.current.active = owner;
+      if (showLoading) {
+        setLoading(true);
       }
-      setForbidden(false);
-      const estimate = await getEstimatedSpend(dateRange.days, groupBy, {
-        startDate: dateRange.startDate,
-        endDate: dateRange.endDate,
-      });
-      if (generation !== requestState.current.generation) return;
-      setData(estimate);
-      setLastFetchedAt(new Date());
-    } catch (fetchError) {
-      if (generation !== requestState.current.generation) return;
-      if (fetchError.status === 403) {
-        setForbidden(true);
-      } else {
-        setForbidden(false);
-        setError(fetchError);
-      }
-    } finally {
-      if (generation === requestState.current.generation) {
-        setLoading(false);
-      }
-      if (requestState.current.active?.generation === generation) {
-        requestState.current.active = null;
-      }
-    }
-  }, [dateRange.days, dateRange.endDate, dateRange.startDate, groupBy]);
+      setError(null);
+
+      owner.promise = (async () => {
+        try {
+          const role = await getCurrentUserRole();
+          if (generation !== requestState.current.generation) return;
+          if (role.roleFetchFailed) {
+            setForbidden(false);
+            // A failed role lookup is an error, not a permission denial: keep
+            // the error UI so the next refresh cycle retries.
+            throw new Error('Failed to fetch current role');
+          }
+          if (role.role !== 'admin') {
+            setForbidden(true);
+            setData(null);
+            return;
+          }
+          setForbidden(false);
+          const estimate = await getEstimatedSpend(dateRange.days, groupBy, {
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+          });
+          if (generation !== requestState.current.generation) return;
+          setData(estimate);
+          setLastFetchedAt(new Date());
+        } catch (fetchError) {
+          if (generation !== requestState.current.generation) return;
+          if (fetchError.status === 403) {
+            setForbidden(true);
+          } else {
+            setForbidden(false);
+            setError(fetchError);
+          }
+        } finally {
+          if (generation === requestState.current.generation && showLoading) {
+            setLoading(false);
+          }
+          if (requestState.current.active === owner) {
+            requestState.current.active = null;
+          }
+        }
+      })();
+
+      return owner.promise;
+    },
+    [dateRange.days, dateRange.endDate, dateRange.startDate, groupBy]
+  );
 
   const selectPreset = useCallback((option) => {
     const nextRange = rangeForPreset(option);
@@ -660,14 +687,29 @@ export function EstimatedSpend() {
   );
 
   useEffect(() => {
-    fetchData();
+    void fetchData({ kind: 'initial', showLoading: true });
     const state = requestState.current;
     return () => {
       state.generation += 1;
       state.active = null;
     };
   }, [fetchData]);
-  useVisibleRefreshInterval(true, AUTO_REFRESH_MS, fetchData);
+
+  const refreshWhenVisible = useCallback(
+    (source) => {
+      void fetchData({
+        kind: source === 'visibilitychange' ? 'visibility' : 'automatic',
+        showLoading: false,
+      });
+    },
+    [fetchData]
+  );
+
+  const handleManualRefresh = useCallback(() => {
+    void fetchData({ kind: 'manual', showLoading: true });
+  }, [fetchData]);
+
+  useVisibleRefreshInterval(true, AUTO_REFRESH_MS, refreshWhenVisible);
 
   const chartData = useMemo(() => {
     const days = data?.days || [];
@@ -894,7 +936,11 @@ export function EstimatedSpend() {
               Apply
             </Button>
           </form>
-          <Button variant="outline" onClick={fetchData} disabled={loading}>
+          <Button
+            variant="outline"
+            onClick={handleManualRefresh}
+            disabled={loading}
+          >
             <RefreshCw
               className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`}
             />

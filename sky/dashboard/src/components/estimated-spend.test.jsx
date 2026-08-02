@@ -257,6 +257,49 @@ test('coalesces interval refreshes while the same request is pending', async () 
   jest.useRealTimers();
 });
 
+test('manual refresh supersedes a slow automatic refresh', async () => {
+  jest.useFakeTimers();
+  const automaticRefresh = deferred();
+  const manualRefresh = deferred();
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpend
+    .mockResolvedValueOnce(response(30, 30))
+    .mockImplementationOnce(() => automaticRefresh.promise)
+    .mockImplementationOnce(() => manualRefresh.promise);
+
+  render(<EstimatedSpend />);
+
+  try {
+    expect(await screen.findAllByText('$30.00')).toHaveLength(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve();
+    });
+    expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
+
+    const refreshButton = screen.getByRole('button', { name: /refresh/i });
+    expect(refreshButton).toBeEnabled();
+    fireEvent.click(refreshButton);
+    await waitFor(() => expect(getEstimatedSpend).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      manualRefresh.resolve(response(30, 90));
+      await manualRefresh.promise;
+    });
+    expect(await screen.findAllByText('$90.00')).toHaveLength(2);
+
+    await act(async () => {
+      automaticRefresh.resolve(response(30, 60));
+      await automaticRefresh.promise;
+    });
+    expect(screen.getAllByText('$90.00')).toHaveLength(2);
+    expect(screen.queryAllByText('$60.00')).toHaveLength(0);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
 test('pauses hidden refreshes and refreshes once on visibility restore', async () => {
   const visibilityDescriptor = Object.getOwnPropertyDescriptor(
     window.document,
