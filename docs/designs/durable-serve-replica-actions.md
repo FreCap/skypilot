@@ -10,18 +10,27 @@ validator/reducer, exact launch/down execution configurations, completed and
 partial-launch down bases, strict private return codecs, and fail-closed
 request-result persistence are implemented and focused pure/PostgreSQL-tested.
 The four private handlers remain deliberately fail closed before provider I/O.
+The activation contract now admits API005 only for legacy-controller shadow
+and requires API007 for private-handler dispatch readiness and
+`shadow -> authoritative`; API006 remains a progress substrate and cannot
+authorize M4. This is a fail-closed contract correction, not provider-runtime
+or authority evidence.
 Provider rendering and normalization, manager/runtime admission, dispatcher
 wiring, live provider I/O, atomic Serve projection, and runtime shadow
 instrumentation remain open. Authority is disabled, no service has been
 promoted, and the named legacy thread/map/retry-clock owners remain in place;
 the restructuring has not yet earned its claimed operational payoff.
 
-Source commit `a836825ef9c219563bb2abc740707c825c26edc5` was built as
+Foundation merge commit `93aec0c8a4f2e1a80ed35640c9d424bea3f9e580` was built as
 immutable image
-`sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`
+`sha256:8bc1295d5cb873861576aaf0806665e89b2d325194da8dd61fa5752f0593d174`
 and exercised on `boltz-test` through a staged dark API -> ordinary executor ->
-controller rollout, current-chart compatible-image rollback with retained
-additive schema, and staged re-upgrade. Every stage kept
+controller rollout. The earlier source artifact at commit
+`a836825ef9c219563bb2abc740707c825c26edc5` and digest
+`sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`
+also completed a current-chart compatible-image rollback with retained
+additive schema and staged re-upgrade before the exact merged artifact was
+deployed. Every stage kept
 `resourceActions.authorityWorker.enabled=false`, converged or retained
 global-user-state 028, Serve033, and API007, and left all action, shadow,
 coverage, and cohort tables empty. This is binary/schema/mixed-version rollback
@@ -2304,10 +2313,12 @@ Promotion requires:
 service name, service-incarnation hash, lifecycle epoch, and (for authority)
 the database timestamp that opened the current shadow window. It carries the
 three independent schema heads, approved image and named inventory
-fingerprints, and a database-clock `verified_at`. `legacy -> shadow` requires
-`API005`, `Serve033`, and global-user-state `028`; `shadow -> authoritative`
-requires `API007`, `Serve033`, and global-user-state `028`. The transition
-rejects evidence for another fence/window,
+fingerprints, and a database-clock `verified_at`. Legacy-controller-only
+`legacy -> shadow` requires `API005`, `Serve033`, and global-user-state `028`;
+private-handler shadow/provider dispatch readiness and
+`shadow -> authoritative` require `API007`, `Serve033`, and global-user-state
+`028`. API006 is the progress substrate only and is not accepted as activation
+evidence. The transition rejects evidence for another fence/window,
 evidence from the database future, or evidence older than five minutes. A
 `legacy -> shadow` transition requires a null candidate-window binding and no
 live replica lacking the canonical incarnation/generation/cluster UUID triple
@@ -2683,13 +2694,15 @@ Database principal topology and credentials are unchanged by this program.
 
 ### `boltz-test` dark rollout evidence (2026-08-02)
 
-The tested artifact used ECR immutable tag `resource-actions-a836825ef`, source
+The first tested artifact used ECR immutable tag `resource-actions-a836825ef`, source
 commit `a836825ef9c219563bb2abc740707c825c26edc5`, and digest
 `sha256:c5f1306f91c7fe2db151c34131ca4cd39be9beba3d21d170f5757996338f375e`
 (`new`). The compatible baseline digest was
 `sha256:d05257c3018c570861104c6c0a509c92d29af93df2d167a58e50d6748a1590a1`
-(`old`). The eventual PR head may be rebased beyond the deployed source commit;
-this evidence remains scoped to the artifact above.
+(`old`). After PR #1190 merged, immutable tag `resource-actions-93aec0c8a`,
+exact merge commit `93aec0c8a4f2e1a80ed35640c9d424bea3f9e580`, and digest
+`sha256:8bc1295d5cb873861576aaf0806665e89b2d325194da8dd61fa5752f0593d174`
+(`merged`) were built from a clean checkout and deployed separately.
 
 | Helm revision | Started (UTC) | Purpose | API / executor / controller | Migration job (UTC) | Heads after checkpoint |
 |---|---|---|---|---|---|
@@ -2701,6 +2714,9 @@ this evidence remains scoped to the artifact above.
 | 62 | 10:36:06 | Re-upgrade stage 1: API | new / old / old | 10:36:15–10:36:26, succeeded | retained 028 / Serve033 / API007 |
 | 63 | 10:42:39 | Re-upgrade stage 2: ordinary executor | new / new / old | 10:42:48–10:43:00, succeeded | retained 028 / Serve033 / API007 |
 | 64 | 10:46:23 | Re-upgrade stage 3: controller; final | new / new / new | 10:46:32–10:47:04, succeeded | retained 028 / Serve033 / API007 |
+| 65 | 13:26:30 | Exact-merge stage 1: API | merged / new / new | 13:26:40–13:27:49, succeeded | retained 028 / Serve033 / API007 |
+| 66 | 13:34:59 | Exact-merge stage 2: ordinary executor | merged / merged / new | 13:35:09–13:35:21, succeeded | retained 028 / Serve033 / API007 |
+| 67 | 13:40:08 | Exact-merge stage 3: controller; final | merged / merged / merged | 13:40:18–13:40:28, succeeded | retained 028 / Serve033 / API007 |
 
 Each checkpoint was held until every changed role converged to exactly 2/2
 ready replicas at the intended digest with zero container restarts. The final
@@ -2720,6 +2736,25 @@ At every checkpoint, all eight action-family tables remained empty:
 `serve_resource_action_shadow_coverage_attempts`. No authority-worker
 Deployment, ServiceAccount, Service, Secret, NetworkPolicy, Role, or RoleBinding
 was present.
+
+At the revision-67 stable checkpoint, all six ordinary-role Pods reported the
+exact `merged` image ID, 2/2 replicas were ready and available for each role,
+and every current container had zero restarts. Services, Serve replicas, and
+clusters remained zero. All 18 API requests were retained (11 `SUCCEEDED`, six
+`RUNNING`, and one `FAILED` from ordinary processing), and the post-deployment
+role-log scan contained no traceback, exception, critical, or error match. The
+API007, Serve033, and global-user-state/capacity 028/001 heads were unchanged,
+all eight action-family tables remained empty, and authority-worker resources
+remained absent.
+
+The exact-merge rollout also encountered Karpenter churn: the 13:26–13:44 UTC
+event window recorded 40 aggregated `FailedScheduling` events, six evictions,
+three taint-manager evictions, and startup/drain readiness failures while
+replacement nodes and Pods converged. Each stage retained an old ready replica
+until its replacement became ready; the final checkpoint recovered every role
+to 2/2 with zero restarts. This remains ordinary Deployment recovery evidence,
+not action crash-canary, shadow-parity, or M4 soak evidence. No M4 candidate
+window starts from this dark rollout.
 
 The rollout encountered ordinary Kubernetes infrastructure churn. Across the
 10:05–10:49 UTC event window the selected role/migration objects accumulated
@@ -2972,8 +3007,10 @@ write typed outcomes.
   lineage-safe generic store, strict codecs, execution configurations,
   quiescence construction, and realistic/candidate-maximal full-spec goldens
   are implemented; capped live rendered bodies and preflight envelopes still
-  require measurement. Authority remains disabled until the runtime and live
-  gates pass.
+  require measurement. Runtime private-handler shadow and provider dispatch
+  must consume the API007-only `private_handler_dispatch_ready` fence
+  immediately before dispatch. Authority remains disabled until the runtime
+  and live gates pass.
 - The dark API -> ordinary executor -> controller rollout and current-chart
   compatible-image rollback are verified above. Still open are rendered/live
   activation of the dedicated versioned authority-worker Helm cohort, exact

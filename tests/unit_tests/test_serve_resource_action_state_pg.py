@@ -654,7 +654,7 @@ def _gate_evidence(
         old_controller_processes_drained=True,
         all_processes_on_approved_image=True,
         approved_image_digest='sha256:' + '1' * 64,
-        api_schema_revision=(('006' if authority_ready else '005')
+        api_schema_revision=(('007' if authority_ready else '005')
                              if api_revision is None else api_revision),
         serve_schema_revision='033',
         global_user_state_schema_revision=global_revision,
@@ -1593,6 +1593,17 @@ def test_activation_is_exact_fresh_and_has_a_hard_24_hour_window(
     _add_service(engine, 'legacy')
     with pytest.raises(ValueError, match='global-user-state'):
         _gate_evidence(authority_ready=False, global_revision='027')
+    with pytest.raises(kernel_actions.ActionConflict,
+                       match='requires API revision 005'):
+        store.transition_service_mode('svc',
+                                      _SERVICE_UUID,
+                                      _OWNER,
+                                      actions.ResourceActionMode.LEGACY,
+                                      actions.ResourceActionMode.SHADOW,
+                                      gate_evidence=_gate_evidence(
+                                          authority_ready=False,
+                                          api_revision='007'),
+                                      expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
     with pytest.raises(kernel_actions.ActionConflict, match='must not bind'):
         store.transition_service_mode(
             'svc',

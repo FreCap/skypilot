@@ -11,7 +11,13 @@ return codecs are implemented and locally verified. The provider renderer,
 admitted-object and live transport normalizers, live preflight, runtime
 admission/session, request-handler dispatcher, provider observation/effect
 capture, and live provider authority are not implemented. Authority remains
-disabled, and this status does not claim M4 or provider-authoritative rollout.
+disabled. Activation evidence now rejects API006 as an authority head: API005
+is limited to legacy-controller shadow, while API007 gates private-handler
+dispatch readiness and `shadow -> authoritative`. This correction does not
+claim M4 or provider-authoritative rollout. A candidate v1 three-object body,
+admission-normalization, and renderer-artifact format is now frozen from
+non-persisting `boltz-test` server-side dry-run evidence; renderer code and the
+eventual canary-namespace/201/409 qualification gates remain incomplete.
 
 Source commit `a836825ef9c219563bb2abc740707c825c26edc5` and immutable
 image digest
@@ -1091,7 +1097,9 @@ mapping: `head_ssh_service` requires and removes terminal `-head-ssh`, while
 `head_service` and `head_pod` require and remove terminal `-head`. It recomputes
 both body/preimage hashes and requires `request_body.apiVersion`, `kind`, and
 `metadata.{namespace,name}` to equal the plan. The body `metadata.labels` is a
-canonical object containing at least the three required key/value pairs.
+canonical object whose complete role-specific key set and values are closed
+below; the three required identity pairs are a subset, not permission for extra
+labels.
 
 The leaf validates `requested_semantic` as bounded canonical JSON and its hash,
 but cannot claim to execute an artifact by hash. Preflight construction and the
@@ -1103,20 +1111,103 @@ in role order, names equal to its workload-name basis/topology, every role's
 complete body label map equal to that topology entry, and every plan's
 `normalization_profile` byte-equal to
 `renderer.admitted_object_normalization`. The Pod body omits `spec.nodeName`;
-the exact body contract is:
+the exact body contract is the literal
+`KubernetesServeThreeObjectBodySchemaV1` below. Its schema ID is
+`skypilot.kubernetes.serve-three-object-body.v1`, version is integer 1,
+API version is `v1`, and its exact role order is `head_ssh_service`,
+`head_service`, `head_pod`. All listed keys are required, no unlisted key is
+accepted, and every value has the displayed JSON type and literal. A field
+described as absent is absent, not JSON null, an empty collection, or an empty
+string. `request_body` is the role-valid request form in the table;
+`requested_semantic` is the same body after the allocation projection defined
+below. An admitted body is valid only when that same projection returns
+byte-equal semantic bytes plus one role-valid allocation tuple.
 
 | Role | Exact request-body bindings |
 |---|---|
-| `head_pod` | `/spec/nodeName` key absent; `/spec/containers` has exactly one entry and `/spec/containers/0/name="ray-node"`; its `image` equals the digest-qualified workload image and `imagePullPolicy="Always"`; its resource requests/limits contain exactly the frozen CPU and memory translations with no accelerator or ephemeral-storage entry; `/spec/serviceAccountName` equals the frozen workload ServiceAccount and `/spec/automountServiceAccountToken=false` |
-| `head_ssh_service` | `/spec/ports` is exactly the singleton `[{"protocol":"TCP","port":22,"targetPort":22}]`; requested `/spec/clusterIP` is absent so the API server allocates it |
-| `head_service` | `/spec/clusterIP="None"`; `/spec/ports` key is absent, not null or an empty list |
+| `head_pod` | `/spec/nodeName` is absent. The exact spec keys are `automountServiceAccountToken`, `containers`, `dnsPolicy`, `enableServiceLinks`, `preemptionPolicy`, `priority`, `restartPolicy`, `schedulerName`, `securityContext`, `serviceAccount`, `serviceAccountName`, `terminationGracePeriodSeconds`, and `tolerations`. Both service-account fields equal the frozen workload ServiceAccount; automount is false. The literal defaults are `dnsPolicy="ClusterFirst"`, `enableServiceLinks=true`, `preemptionPolicy="PreemptLowerPriority"`, `priority=0`, `restartPolicy="Always"`, `schedulerName="default-scheduler"`, `securityContext={}`, and `terminationGracePeriodSeconds=30`. Tolerations are exactly, in order, the `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` `Exists`/`NoExecute` entries with integer `tolerationSeconds=300`. |
+| `head_pod` container | `/spec/containers` has exactly one entry. Its exact keys are `env`, `image`, `imagePullPolicy`, `name`, `ports`, `resources`, `terminationMessagePath`, and `terminationMessagePolicy`; name is `ray-node`, image is the digest-qualified workload image, pull policy is `Always`, termination path is `/dev/termination-log`, and termination policy is `File`. Resources contain exactly the frozen CPU and memory requests/limits with no accelerator or ephemeral-storage entry. The five ports are exactly `10001`, `10002`, `10003`, `10004`, and `46590` in that order, and each entry explicitly contains `protocol="TCP"`. |
+| both Services | The shared exact spec keys are `type="ClusterIP"`, `sessionAffinity="None"`, `internalTrafficPolicy="Cluster"`, and `selector`. The nonempty selector is byte-derived from the head-Pod topology labels and contains exactly `component`, `skypilot-cluster-name`, `skypilot.co/cluster-record-uuid`, and `skypilot.co/serve-replica-incarnation`; its complete map is byte-equal on both Services, and every entry equals the head Pod's corresponding label. |
+| `head_ssh_service` | In addition to the shared Service keys, `/spec/ports` is exactly the singleton `[{"protocol":"TCP","port":22,"targetPort":22}]`. Requested `clusterIP`, `clusterIPs`, `ipFamilies`, and `ipFamilyPolicy` are all absent so the API server allocates the quartet. |
+| `head_service` | In addition to the shared Service keys, `/spec/clusterIP="None"`. Requested `clusterIPs`, `ipFamilies`, and `ipFamilyPolicy` are absent. `/spec/ports` is absent, not null or an empty list. |
+
+Every role has top-level keys exactly `apiVersion`, `kind`, `metadata`, and
+`spec`. Service metadata has exactly `labels`, `name`, and `namespace`; its
+`annotations` key is absent. Pod metadata has exactly `annotations`, `labels`,
+`name`, and `namespace`. Let `B` be the renderer input's exact
+`ProviderWorkloadNameBasisV1`, copied byte-for-byte from
+`requested_target.kubernetes.name_basis`. The staged-input validator reconstructs
+an expected basis with `display_name=sky_cluster_name`,
+`frozen_user_hash=seed.request_identity.frozen_user_hash`, `max_length=42`, and
+`cluster_name_hash_length=8`, and requires its canonical bytes to equal `B`.
+The independently copied renderer-input `sky_cluster_name` must also be
+byte-equal to `B.display_name`. Let `C = B.provider_cluster_name` and
+`W = B.workload_name`, using the existing
+`ProviderWorkloadNameBasisV1` properties rather than a second cleaner or naming
+algorithm. Thus `W = C + "-head"`. Let `U` be the frozen cleaned user, `O` the
+frozen original user, `R` the lowercase canonical text of the renderer input's
+`sky_cluster_record_uuid`, `I` the lowercase canonical text of
+`resource_identity.replica_incarnation`, and `P = W`. The SSH Service name is
+exactly `W + "-ssh"`; the head Service and Pod names are exactly `W`. All three
+topology name fields, all three `skypilot-cluster-name` labels, both selector
+copies, all three cluster-record labels, and all three replica-incarnation
+labels must be byte-equal to these derived values before rendering. The
+complete metadata maps are:
+
+```text
+head_ssh_service labels = {
+  "service-role": "head_ssh_service",
+  "skypilot-cluster-name": C,
+  "skypilot-user": U,
+  "skypilot.co/cluster-record-uuid": R,
+  "skypilot.co/serve-replica-incarnation": I
+}
+head_service labels = {
+  "service-role": "head_service",
+  "skypilot-cluster-name": C,
+  "skypilot-user": U,
+  "skypilot.co/cluster-record-uuid": R,
+  "skypilot.co/serve-replica-incarnation": I
+}
+head_pod labels = {
+  "component": P,
+  "skypilot-cluster-name": C,
+  "skypilot-user": U,
+  "skypilot.co/cluster-record-uuid": R,
+  "skypilot.co/serve-replica-incarnation": I
+}
+head_pod annotations = {"skypilot-user": O}
+```
+
+Those are exact five-key label maps. No `app`, legacy Ray, Helm, admission,
+queue, scheduling, or provider label is implicit. The two Service specs have no
+container or environment field. The sole Pod container's `env` array has
+exactly one entry, in that position, with exact key set `name`, `value` and
+value `{"name":"SKYPILOT_SERVE_REPLICA_ID","value":DecimalIntegerText}`.
+`valueFrom` is absent. Each container-port entry has exactly `containerPort`
+and `protocol`; the SSH Service port entry has exactly `port`, `protocol`, and
+`targetPort`. `resources` has exactly `limits` and `requests`, and each of those
+has exactly `cpu` and `memory`. These closed nested key sets apply before any
+hash is computed.
+
+The selector is a semantic requirement, not cosmetic metadata. The Pod's
+role-specific `component` label names the exact head Pod; the three identity
+labels prevent a Service from selecting an older same-display-name
+incarnation. `skypilot-user` is intentionally not a selector key. A missing,
+null, or empty selector rejects even though CoreV1 accepts those shapes.
+
+The only empty collection in the request specs is the required Pod
+`securityContext={}` literal. In particular, head-Service `ports` and the
+unrequested allocation fields are absent. The SSH Service's allocation fields
+are absent rather than null or empty. The Pod's scheduler `nodeName` is absent.
+Canonical construction happens directly as JSON; a YAML decoder's
+null/empty/omitted equivalences are not part of the contract.
 
 The `ray-node` env list is inspected by name, never by a numeric index. It has
 exactly one `SKYPILOT_SERVE_REPLICA_ID` entry whose scalar `value` is the
 canonical `DecimalIntegerText` from the launch invocation and job spec;
 `valueFrom` is absent. Missing, duplicate, wrong-value, or `valueFrom` forms
-reject. Other entries are only the byte-exact fixed nonsecret renderer-owned
-runtime env preimage.
+reject; any other env entry also rejects.
 
 The management-port position is intentionally fixed:
 `/spec/containers/0/ports/4/containerPort` is JSON integer `46590`. The
@@ -1129,35 +1220,792 @@ the head Service has no port list at all. In `podip` mode `open_ports()` and
 their literal no-op branches and emit no Service, Ingress, LoadBalancer, patch,
 or other provider mutation.
 
-`kubernetes_admitted_object_v1` must be implemented by the checked-in, pinned
-`normalization_profile`. It removes only `status`, the enumerated server-owned
-metadata fields (`uid`, `resourceVersion`, `generation`, creation/deletion
-timestamps, and `managedFields`), and scheduler-assigned Pod `/spec/nodeName`.
-It retains every other label, annotation, owner reference, finalizer,
+`kubernetes_admitted_object_v1` has two distinct entrypoints; a common function
+that first demands the admitted allocation shape is invalid for request-side
+construction.
+
+The `admitted_object_normalization` member of
+`ResolvedProviderKubernetesRendererArtifactSetV1` has the closed type
+`ResolvedProviderKubernetesNormalizationArtifactV1 =
+{artifact_ref:ProviderRepoArtifactRefV1,
+contract:KubernetesAdmittedObjectNormalizationV1}`. `contract` is the parsed,
+schema-validated canonical document defined below; `artifact_ref` is the exact
+pinned reference whose bytes produced it. Neither field may be reconstructed
+or obtained from a global, closure, path argument, or ambient read.
+
+The exact request-normalizer signature is
+`normalize_kubernetes_request_object_v1(role, validated_request_body,
+normalization_artifact)`. `normalization_artifact` must be that exact typed
+`ResolvedProviderKubernetesNormalizationArtifactV1` member, and the entrypoint
+uses its `contract`; it accepts no omitted, raw-dict, reference-only, or
+wrong-role artifact argument. `validated_request_body` must be an exact
+`ValidatedKubernetesServeThreeObjectBodyV1` transient produced by
+`validate_kubernetes_serve_three_object_body_v1`; that preceding validator, not
+the request normalizer, enforces `KubernetesServeThreeObjectBodySchemaV1`. The
+request normalizer returns `{requested_semantic,
+requested_allocation_intent}` and accepts only these role-exact request
+allocation shapes:
+
+| Role | Required present allocation fields | Required absent allocation fields | Intent | Semantic removal |
+|---|---|---|---|---|
+| `head_ssh_service` | none | all four Service allocation pointers | `allocate_single_stack_cluster_ip` | none |
+| `head_service` | `clusterIP="None"` only | `clusterIPs`, `ipFamilies`, `ipFamilyPolicy` | `headless_single_stack` | `clusterIP` |
+| `head_pod` | none | `nodeName` | `schedule_one_node` | none |
+
+It does not fabricate an absent field, require a complete Service quartet, or
+return server allocations. `requested_allocation_intent` is a literal scalar
+from the table, not an allocation value. Request normalization removes only the
+one displayed present head-Service intent field; every other request byte is
+retained.
+
+The exact admitted-normalizer signature is
+`normalize_kubernetes_admitted_object_v1(role, admitted_object,
+normalization_artifact, *, require_pod_node_name)`. Its
+`normalization_artifact` requirement is identical to the request normalizer's
+and it uses that typed member's `contract`. It returns
+`{admitted_semantic, server_allocations}`. Before invoking it, the session
+requires `metadata.deletionTimestamp` to be absent or JSON null; a nonnull value
+is a conflict and is never hidden by stripping. The request schema requires the
+key absent. After that gate, admitted normalization removes only top-level
+`status` and metadata `uid`, `resourceVersion`, `generation`,
+`creationTimestamp`, `deletionTimestamp`, and `managedFields`. Each Service
+must contain all four allocation pointers atomically before any is removed; a
+missing or partial quartet conflicts. The Pod may omit `nodeName` only in the
+documented unscheduled partial-evidence phase, otherwise it returns exactly one
+validated scheduler allocation. The transform removes the complete role-valid
+allocation set from the semantic output and returns the serializable ordered
+allocation entries defined below. `require_pod_node_name` is required,
+keyword-only, and accepted only when `type(value) is bool`; it has no default,
+and integers, truthy objects, and every non-built-in Boolean representation
+reject before object normalization. `False` permits the Pod allocation array to
+contain zero or exactly one `nodeName`; `True` requires exactly one. Both values
+leave each Service's exactly-four allocation requirement unchanged. Partial
+progress/cleanup reads pass `False`; construction of `ResolvedProviderTargetV1`
+and every `OBJECTS_EXACT` read pass `True`. No other default is inserted, removed,
+sorted, coerced, or rewritten; array order is retained.
+
+The comparator requires request `requested_semantic` and admitted
+`admitted_semantic` canonical bytes to be equal and independently validates the
+request intent against the admitted allocation tuple. In particular, the
+head-Service request's one-field `None` intent is not parsed as a malformed
+partial admitted quartet, and an admitted `None` quartet cannot authorize an
+SSH Service request.
+
+The contract identifier `kubernetes_admitted_object_v1` names only this
+request/admitted split and projected-semantic behavior. A removed provisional
+profile/interpreter reinjected the requested head-Service `clusterIP="None"`
+into its semantic result while claiming that same identifier. That transform
+was nonconforming, could not bind an approved inventory or produce object-plan
+hashes, and must not be restored. For the retained evidence body below, its
+nonconforming no-LF hash was
+`6f56a60c19a22958840c5caffb8a613246107d085d8c5a7dad13f08034fa6ecb`;
+the canonical projected no-LF hash is
+`b9f6e3e86df0c26dfe4da1576fe58ba9fd07af0c75c06be920bc5ac65520dd15`.
+No authority or shadow-parity evidence may mix those domains.
+
+The renderer therefore sets every retained admission default explicitly. The
+profile retains every other label, annotation, owner reference, finalizer,
 container, init container, volume, service-account, security, scheduling,
-image, port, selector, and spec field. The renderer sets every controllable
-Pod/Service default explicitly. The profile permits only its literal reviewed
-Kubernetes Pod defaults and the enumerated server allocations: Service
-`clusterIP`, `clusterIPs`, `ipFamilies`, and `ipFamilyPolicy`, plus Pod
-`nodeName`. Service allocations are recorded on first read. Pod `nodeName` may
-be absent while scheduling and then append exactly one nonempty value; once
-recorded it is write-once. A complete `ResolvedProviderTargetV1` and
-`OBJECTS_EXACT` require that value, while partial evidence may retain the Pod
-UID before assignment. Every later read requires every recorded allocation to
-match. An injected sidecar/init container/volume/image pull secret,
-label, annotation, owner reference, finalizer, or any unreviewed path/value is a
-conflict. Both a 201 response readback and a 409 readback must normalize to the
-stored requested semantic bytes, with only those typed allocations separated.
-Raw request/readback JSON equality is never used.
+image, port, selector, and spec field. Service allocations are recorded on
+first read. Pod `nodeName` may be absent while scheduling and then append
+exactly one nonempty value; once recorded it is write-once. A complete
+`ResolvedProviderTargetV1` and `OBJECTS_EXACT` require that value, while partial
+evidence may retain the Pod UID before assignment. Every later read requires
+every recorded allocation to match. An injected sidecar/init container/volume,
+image pull secret, label, annotation, owner reference, finalizer, or any
+unreviewed path/value is a conflict. Both a 201 response readback and a 409
+readback must normalize to the stored requested semantic bytes, with only those
+typed allocations separated. Raw request/readback JSON equality is never used.
+
+### Pre-object renderer input and staged capsule construction
+
+Rendering cannot consume the completed capsule because that capsule already
+contains the three expected object bodies. The pre-object constructor therefore
+uses these two closed DTOs:
+
+```text
+ProviderKubernetesExecutionCapsuleSeedV1 = {
+  version: 1,
+  implementation_contract: "kubernetes_serve_prebooted_runtime_v1",
+  executor_cohort: ProviderAuthorityWorkerCohortV1,
+  config_projection: ProviderKubernetesConfigProjectionV1,
+  config_projection_sha256: Sha256,
+  scope: ProviderKubernetesScopeV1,
+  principals: ProviderKubernetesPrincipalsV1,
+  prerequisites: ProviderKubernetesPrerequisiteInventoryV1,
+  request_identity: ProviderKubernetesRequestIdentityV1,
+  resources: ProviderKubernetesResourceContractV1,
+  renderer: ProviderKubernetesRendererV1,
+  post_provision: ProviderKubernetesPostProvisionV1,
+  endpoint: ProviderKubernetesEndpointContractV1,
+  scheduling: ProviderKubernetesSchedulingContractV1,
+  storage: ProviderKubernetesStorageContractV1,
+  metadata: ProviderKubernetesMetadataContractV1,
+  security: ProviderKubernetesSecurityContractV1,
+  topology: ProviderPodTopologyV1,
+  mutation_contract: ProviderKubernetesLaunchMutationContractV1
+}
+
+ProviderKubernetesRendererInputV1 = {
+  version: 1,
+  contract: "validated_launch_spec_v1",
+  resource_identity: ProviderResourceIdentityV1,
+  sky_cluster_name: Text,
+  sky_cluster_record_uuid: UUID,
+  name_basis: ProviderWorkloadNameBasisV1,
+  seed: ProviderKubernetesExecutionCapsuleSeedV1,
+  retained_source: ProviderLaunchContentSourceV1
+}
+```
+
+The seed key set is exactly the completed
+`ProviderKubernetesExecutionCapsuleV1` key set minus `objects`; it has no null
+placeholder, object hash, object-plan reference, or backpointer. The renderer
+input has exactly the eight displayed keys. `sky_cluster_name`, `name_basis`,
+and `sky_cluster_record_uuid` are copied byte-for-byte from
+`requested_target.sky_cluster_name`,
+`requested_target.kubernetes.name_basis`, and
+`requested_target.sky_cluster_record_uuid` before the target is omitted from the
+policy-free input. Its canonical JSON document is the
+sole RFC 6901 pointer root: every binding pointer below starts at this object,
+so `/seed/scope/namespace` and `/resource_identity/replica_id` are
+unambiguous. `validated_launch_spec_v1` means the resource identity and every
+seed child have passed their existing pure leaf validation and all seed-only
+cross-field comparisons; it is a literal contract value, not a claimed boolean
+or caller-selected label. It additionally requires
+`retained_source == seed.renderer.source ==
+seed.post_provision.job_submission.run_source` by canonical bytes. It
+reconstructs `name_basis` from `sky_cluster_name` and
+`seed.request_identity.frozen_user_hash` exactly as specified above, requires
+`sky_cluster_name == name_basis.display_name`,
+`retained_source.service_incarnation == resource_identity.service_incarnation`,
+and requires the resource identity's replica incarnation and the independently
+copied cluster-record UUID to equal every corresponding seed topology label.
+It also requires the exact `C`/`W` topology names and labels above. A
+self-consistent topology cannot supply its own naming or cluster identity.
+
+Construction is nonrecursive and has exactly four stages:
+
+1. Build and fully validate `ProviderKubernetesRendererInputV1` without any
+   object plan.
+2. Resolve the five pinned artifacts, resolve only the allowed bindings from
+   the renderer-input root into the closed 17-entry typed binding set, and emit
+   exactly three request bodies. Neither the renderer nor a transform can read
+   an `objects` field because none exists.
+3. Validate each body with `KubernetesServeThreeObjectBodySchemaV1`, run the
+   request-side normalization entrypoint with the resolved typed normalization
+   artifact, and construct the three object plans, their complete requested
+   semantic preimages, both hashes, and the byte-equal normalization artifact
+   references.
+4. Copy every seed field unchanged, append those typed object plans, construct
+   `ProviderKubernetesExecutionCapsuleV1`, and rerun its complete contextual
+   validation. Any mismatch fails construction; it never triggers a rerender
+   from the completed capsule.
+
+The stored full capsule is thus an output and later comparison operand, never a
+renderer input. The public staged constructor and the ten public leaves named
+in the config-access inventory below are the only project entrypoints in this
+four-stage sequence. In stage 3 the staged constructor invokes
+`body_validate` before `request_normalize`; the latter consumes the typed
+validated-body transient and does not invoke the validator a second time. This
+staged constructor is required before a renderer artifact can be accepted.
+
+### Candidate renderer artifact formats
+
+All five renderer artifacts are RFC 8259 JSON encoded as canonical UTF-8 by the
+repository canonicalizer: object keys are sorted, insignificant whitespace is
+absent, duplicate keys/nonfinite numbers are invalid, and the raw artifact is
+the compact canonical JSON followed by exactly one LF byte. They are data, not
+Jinja, Python, YAML, or executable source. These format contracts do not claim
+that candidate artifact bytes have
+been accepted into an executor-cohort inventory.
+
+`outer_template` has schema ID
+`skypilot.serve.prebooted-direct-pod.outer-template.v1` and exactly these
+top-level keys:
+
+```text
+{
+  schema: "skypilot.serve.prebooted-direct-pod.outer-template.v1",
+  contract: "serve_prebooted_direct_pod_v1",
+  object_order: ["head_ssh_service", "head_service", "head_pod"],
+  service_templates: [
+    {role: "head_ssh_service", body: RendererTemplateValueV1},
+    {role: "head_service", body: RendererTemplateValueV1}
+  ],
+  pod_fragment_role: "node_fragment"
+}
+```
+
+`node_fragment` has schema ID
+`skypilot.serve.prebooted-direct-pod.node-fragment.v1` and exact shape
+`{schema, role:"head_pod", body:RendererTemplateValueV1}`. The two Service
+bodies and Pod body encode exactly
+`KubernetesServeThreeObjectBodySchemaV1`. A `RendererTemplateValueV1` is an
+ordinary canonical JSON value or the exact whole-value marker
+`{"$binding":BindingName}`. `$binding` is reserved anywhere else; string
+interpolation, conditionals, loops, includes, merge keys, and partially bound
+strings are invalid. The renderer substitutes each marker with the complete
+typed JSON value, appends the one node-fragment body after the two Service
+bodies, and emits exactly the displayed role order.
+
+`binding_schema` has schema ID
+`skypilot.serve.prebooted-direct-pod.bindings.v1` and exact top-level keys
+`schema`, `input_contract`, `marker_key`, `bindings`,
+`forbidden_source_pointers`, and `output_contract`.
+`input_contract="validated_launch_spec_v1"`, `marker_key="$binding"`, and
+`output_contract="KubernetesServeThreeObjectBodySchemaV1"`.
+`forbidden_source_pointers` is exactly
+`["/retained_source","/seed/post_provision/job_submission/run_source",
+"/seed/renderer"]` for binding resolution. The staged-input validator may
+compare those source copies and resolve renderer artifact references, but none
+may supply a manifest value.
+
+Each binding is the exact JSON object
+`{name,source_pointer,transform,json_type,targets}`. `name` matches
+`[a-z][a-z0-9_]{0,63}`. `source_pointer` is one absolute RFC 6901 pointer into
+the canonical `ProviderKubernetesRendererInputV1` root. `json_type` is one of
+`string`, `object`, or `array`. `targets` is a nonempty array of exact objects
+`{artifact_role,pointer}`; the pointer is rooted at the parsed artifact named by
+`artifact_role`. The binding array is strictly increasing by UTF-8 binding
+name. Each target array is sorted first by the five-role artifact sequence and
+then by pointer bytes. JSON duplicate object keys, duplicate binding names,
+duplicate target pairs within or across bindings, an unlisted marker, a listed
+target without the matching marker, or an unused binding all reject before
+rendering. Repeated use of one binding is permitted only through its explicitly
+listed distinct targets.
+
+The exact binding array is:
+
+In the table, `outer_template:/x` is only a compact rendering of the literal
+JSON target `{"artifact_role":"outer_template","pointer":"/x"}`; artifact
+files contain the object form, never the colon shorthand.
+
+| Binding | Source pointer | Transform / type | Exact targets |
+|---|---|---|---|
+| `head_labels` | `/seed/topology/mutable_objects/1/labels` | `label_pairs_to_exact_object_v1` / object | `outer_template:/service_templates/1/body/metadata/labels` |
+| `head_name` | `/seed/topology/mutable_objects/1/name` | `copy_v1` / string | `outer_template:/service_templates/1/body/metadata/name` |
+| `head_pod_labels` | `/seed/topology/mutable_objects/2/labels` | `label_pairs_to_exact_object_v1` / object | `node_fragment:/body/metadata/labels` |
+| `head_pod_name` | `/seed/topology/mutable_objects/2/name` | `copy_v1` / string | `node_fragment:/body/metadata/name` |
+| `head_service_selector` | `/seed/topology/mutable_objects/2/labels` | `head_service_selector_v1` / object | `outer_template:/service_templates/0/body/spec/selector`, `outer_template:/service_templates/1/body/spec/selector` |
+| `head_ssh_labels` | `/seed/topology/mutable_objects/0/labels` | `label_pairs_to_exact_object_v1` / object | `outer_template:/service_templates/0/body/metadata/labels` |
+| `head_ssh_name` | `/seed/topology/mutable_objects/0/name` | `copy_v1` / string | `outer_template:/service_templates/0/body/metadata/name` |
+| `image_pull_policy` | `/seed/resources/image_pull_policy` | `copy_v1` / string | `node_fragment:/body/spec/containers/0/imagePullPolicy` |
+| `original_user` | `/seed/request_identity/original_user` | `copy_v1` / string | `node_fragment:/body/metadata/annotations/skypilot-user` |
+| `pod_cpu_limit` | `/seed/resources/pod_cpu_limit` | `copy_v1` / string | `node_fragment:/body/spec/containers/0/resources/limits/cpu` |
+| `pod_cpu_request` | `/seed/resources/pod_cpu_request` | `copy_v1` / string | `node_fragment:/body/spec/containers/0/resources/requests/cpu` |
+| `pod_memory_limit` | `/seed/resources/pod_memory_limit` | `copy_v1` / string | `node_fragment:/body/spec/containers/0/resources/limits/memory` |
+| `pod_memory_request` | `/seed/resources/pod_memory_request` | `copy_v1` / string | `node_fragment:/body/spec/containers/0/resources/requests/memory` |
+| `replica_id_text` | `/resource_identity/replica_id` | `decimal_integer_text_v1` / string | `node_fragment:/body/spec/containers/0/env/0/value` |
+| `target_namespace` | `/seed/scope/namespace` | `copy_v1` / string | `outer_template:/service_templates/0/body/metadata/namespace`, `outer_template:/service_templates/1/body/metadata/namespace`, `node_fragment:/body/metadata/namespace` |
+| `workload_image` | `/seed/resources/image/qualification/requested_reference` | `copy_v1` / string | `node_fragment:/body/spec/containers/0/image` |
+| `workload_service_account` | `/seed/principals/workload/name` | `copy_v1` / string | `node_fragment:/body/spec/serviceAccount`, `node_fragment:/body/spec/serviceAccountName` |
+
+`copy_v1` copies the already-canonical value without coercion.
+`decimal_integer_text_v1` accepts only the validated nonnegative integer and
+emits its base-10 form with no sign or leading zero except `0`.
+`label_pairs_to_exact_object_v1` requires the role-exact ordered label-pair
+array, rejects duplicate/missing/extra/mis-role entries, and emits the complete
+five-key object above. `head_service_selector_v1` accepts only the exact
+head-Pod label-pair array and emits exactly `component`,
+`skypilot-cluster-name`, `skypilot.co/cluster-record-uuid`, and
+`skypilot.co/serve-replica-incarnation`. Source pointers may repeat only where
+the table explicitly uses different transforms. The retained source is
+byte-compared during staged-input validation but intentionally has no binding.
+
+Binding resolution returns the closed typed value
+`ResolvedProviderKubernetesBindingSetV1 =
+{version:1,contract:"skypilot.serve.prebooted-direct-pod.resolved-bindings.v1",
+bindings:[ResolvedProviderKubernetesBindingV1]}`. Each binding entry has exactly
+`{sequence,name,json_type,value}`: `sequence` is its zero-based position in the
+17-row name-sorted binding table, `name` and `json_type` are byte-equal to that
+row, and `value` is canonical JSON of exactly that declared type produced by
+applying the row's transform to its validated input pointer. The array contains
+exactly all 17 rows in table order, with no missing, extra, duplicate, or
+untyped value. `render_provider_kubernetes_objects_v1` invokes
+`resolve_provider_kubernetes_bindings_v1`, receives this value as the sole
+`resolved_bindings` transient, and substitutes only those typed values at the
+targets in the already-resolved binding schema. Rendering cannot re-read a
+binding source or invoke a transform itself.
+
+`config_access_inventory` has schema ID
+`skypilot.serve.prebooted-direct-pod.config-access-inventory.v1` and exact keys
+`schema`, `artifact_roles`, `entrypoints`, `call_graph`, `input_access`,
+`transient_flow`, `provider_operations`, and `forbidden_sources`. Every
+collection below is an array, never a JSON object used as an unordered map.
+Every entry has a required integer `sequence` equal to its zero-based array
+position.
+
+The resolved config-inventory member uses the implementation contract
+`ResolvedProviderKubernetesConfigAccessInventoryArtifactV1 =
+{artifact_ref:ProviderRepoArtifactRefV1,
+raw_artifact:RawCanonicalRendererArtifactBytesV1,
+inventory:ProviderKubernetesConfigAccessInventoryV1}`. The raw wrapper proves
+the pinned file is compact canonical RFC 8259 JSON followed by exactly one LF,
+and the typed inventory parser enforces the closed schema below. It must not be
+parsed through `CanonicalJsonObject`: that generic value contract rejects empty
+text, while every exact CoreV1 object-session entry intentionally has
+`api_group=""`. The typed parser permits that empty literal only at those exact
+CoreV1 `api_group` fields; an empty string anywhere else remains invalid.
+
+An artifact-role entry has exact shape
+`{sequence,role,schema_id,consumers}`. `consumers` is a nonempty sorted,
+duplicate-free array of qualified callable names. The five literal entries are:
+
+| Sequence / role | Schema ID | Consumers |
+|---|---|---|
+| 0 / `outer_template` | `skypilot.serve.prebooted-direct-pod.outer-template.v1` | `sky.serve.resource_action_renderer.render_provider_kubernetes_objects_v1`, `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1` |
+| 1 / `node_fragment` | `skypilot.serve.prebooted-direct-pod.node-fragment.v1` | `sky.serve.resource_action_renderer.render_provider_kubernetes_objects_v1`, `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1` |
+| 2 / `binding_schema` | `skypilot.serve.prebooted-direct-pod.bindings.v1` | `sky.serve.resource_action_renderer.resolve_provider_kubernetes_bindings_v1`, `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1` |
+| 3 / `config_access_inventory` | `skypilot.serve.prebooted-direct-pod.config-access-inventory.v1` | `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1`, `sky.serve.resource_action_renderer.validate_provider_kubernetes_config_access_inventory_v1` |
+| 4 / `admitted_object_normalization` | `skypilot.kubernetes.admitted-object-normalization.v1` | `sky.serve.resource_action_provider_artifacts.normalize_kubernetes_admitted_object_v1`, `sky.serve.resource_action_provider_artifacts.normalize_kubernetes_request_object_v1`, `sky.serve.resource_action_renderer.build_provider_kubernetes_object_plans_v1`, `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1` |
+
+Those qualified renderer/normalizer callables are reserved
+implementation names, not claims that the current branch defines them.
+Acceptance requires that import/AST resolution finds exactly those names.
+
+An entrypoint has exact shape `{sequence,phase,qualified_name}`. The exact phase
+order and qualified names are:
+
+| Sequence / phase | Qualified name |
+|---|---|
+| 0 / `staged_construct` | `sky.serve.resource_action_renderer.construct_provider_kubernetes_execution_capsule_v1` |
+| 1 / `input_validate` | `sky.serve.resource_action_renderer.validate_provider_kubernetes_renderer_input_v1` |
+| 2 / `artifact_resolve` | `sky.serve.resource_action_renderer.resolve_provider_kubernetes_renderer_artifacts_v1` |
+| 3 / `inventory_validate` | `sky.serve.resource_action_renderer.validate_provider_kubernetes_config_access_inventory_v1` |
+| 4 / `binding_resolve` | `sky.serve.resource_action_renderer.resolve_provider_kubernetes_bindings_v1` |
+| 5 / `render` | `sky.serve.resource_action_renderer.render_provider_kubernetes_objects_v1` |
+| 6 / `body_validate` | `sky.serve.resource_action_renderer.validate_kubernetes_serve_three_object_body_v1` |
+| 7 / `request_normalize` | `sky.serve.resource_action_provider_artifacts.normalize_kubernetes_request_object_v1` |
+| 8 / `object_plan_build` | `sky.serve.resource_action_renderer.build_provider_kubernetes_object_plans_v1` |
+| 9 / `capsule_assemble` | `sky.serve.resource_action_renderer.assemble_and_revalidate_provider_kubernetes_execution_capsule_v1` |
+| 10 / `admitted_normalize` | `sky.serve.resource_action_provider_artifacts.normalize_kubernetes_admitted_object_v1` |
+
+A call-graph entry has exact shape `{sequence,caller,callees}`. There is exactly
+one entry per entrypoint in that same sequence. `caller` and every callee are
+the exact qualified names above. A callee array is duplicate-free and ordered
+by required invocation order, not lexical order. The complete graph is:
+
+| Sequence / caller phase | Exact callee phase array |
+|---|---|
+| 0 / `staged_construct` | [`input_validate`, `artifact_resolve`, `inventory_validate`, `render`, `body_validate`, `request_normalize`, `object_plan_build`, `capsule_assemble`] |
+| 1 / `input_validate` | [] |
+| 2 / `artifact_resolve` | [] |
+| 3 / `inventory_validate` | [] |
+| 4 / `binding_resolve` | [] |
+| 5 / `render` | [`binding_resolve`] |
+| 6 / `body_validate` | [] |
+| 7 / `request_normalize` | [] |
+| 8 / `object_plan_build` | [] |
+| 9 / `capsule_assemble` | [] |
+| 10 / `admitted_normalize` | [] |
+
+The phase tokens in this graph serialize as their table-mapped qualified names;
+they are not a second alias accepted by the artifact. The first candidate may
+use no additional project-qualified helper. Standard-library operations and
+the already-closed canonical DTO constructors/serializers are language and
+contract primitives, not ambient project helpers; they may not read config,
+environment, filesystem paths other than the artifact resolver's five pinned
+references, provider clients, or mutable global state. Any additional
+project-qualified callable requires a design/inventory update and new
+fingerprint before acceptance.
+The staged constructor passes the resolver's typed
+`admitted_object_normalization` member directly to both normalizers and to
+`object_plan_build`; the normalizers consume its `contract`, while
+`object_plan_build` copies its `artifact_ref` byte-for-byte into every plan's
+`normalization_profile`. No one may resolve that reference again, capture the
+contract in a closure, consult a module global, or insert an unlisted adapter
+or helper between these entrypoints. `render` obtains `resolved_bindings` only
+as the direct typed result of its listed `binding_resolve` callee.
+
+An input-access entry has exact shape
+`{sequence,consumer,source_pointer,disposition,use,binding_names}`.
+`source_pointer` is rooted at `ProviderKubernetesRendererInputV1` and
+`input_access` inventories only semantic reads from that root. Passing the
+already-typed root or a transient value along a listed call edge is not an
+unlisted semantic read. Transient artifacts, bindings, bodies, normalizations,
+plans, and the completed capsule are closed separately by `transient_flow`
+below.
+`binding_names` is sorted and nonempty only for `use="manifest_binding"`; it is
+empty otherwise. The array is sorted by consumer entrypoint sequence then
+pointer bytes. The complete 51-entry sequence is:
+
+| Seq. | Consumer phase | Pointer | Disposition / use | Binding names |
+|---:|---|---|---|---|
+| 0 | `staged_construct` | `/contract` | `fixed` / `root_contract` | `[]` |
+| 1 | `staged_construct` | `/version` | `fixed` / `root_contract` | `[]` |
+| 2 | `input_validate` | `/name_basis` | `embedded` / `name_basis_recompute` | `[]` |
+| 3 | `input_validate` | `/resource_identity` | `embedded` / `resource_identity_fence` | `[]` |
+| 4 | `input_validate` | `/retained_source` | `embedded` / `byte_equal_source` | `[]` |
+| 5 | `input_validate` | `/seed/post_provision/job_submission/run_source` | `embedded` / `byte_equal_source` | `[]` |
+| 6 | `input_validate` | `/seed/renderer/source` | `embedded` / `byte_equal_source` | `[]` |
+| 7 | `input_validate` | `/seed/request_identity/cleaned_user` | `embedded` / `request_identity_projection` | `[]` |
+| 8 | `input_validate` | `/seed/request_identity/frozen_user_hash` | `embedded` / `request_identity_projection` | `[]` |
+| 9 | `input_validate` | `/seed/request_identity/original_user` | `embedded` / `request_identity_projection` | `[]` |
+| 10 | `input_validate` | `/seed/topology/mutable_objects` | `embedded` / `topology_identity` | `[]` |
+| 11 | `input_validate` | `/sky_cluster_name` | `embedded` / `display_name_projection` | `[]` |
+| 12 | `input_validate` | `/sky_cluster_record_uuid` | `embedded` / `cluster_record_identity` | `[]` |
+| 13 | `artifact_resolve` | `/seed/renderer/admitted_object_normalization` | `content_addressed` / `artifact_ref` | `[]` |
+| 14 | `artifact_resolve` | `/seed/renderer/binding_schema` | `content_addressed` / `artifact_ref` | `[]` |
+| 15 | `artifact_resolve` | `/seed/renderer/config_access_inventory` | `content_addressed` / `artifact_ref` | `[]` |
+| 16 | `artifact_resolve` | `/seed/renderer/node_fragment` | `content_addressed` / `artifact_ref` | `[]` |
+| 17 | `artifact_resolve` | `/seed/renderer/outer_template` | `content_addressed` / `artifact_ref` | `[]` |
+| 18 | `binding_resolve` | `/resource_identity/replica_id` | `embedded` / `manifest_binding` | `["replica_id_text"]` |
+| 19 | `binding_resolve` | `/seed/principals/workload/name` | `embedded` / `manifest_binding` | `["workload_service_account"]` |
+| 20 | `binding_resolve` | `/seed/request_identity/original_user` | `embedded` / `manifest_binding` | `["original_user"]` |
+| 21 | `binding_resolve` | `/seed/resources/image/qualification/requested_reference` | `embedded` / `manifest_binding` | `["workload_image"]` |
+| 22 | `binding_resolve` | `/seed/resources/image_pull_policy` | `embedded` / `manifest_binding` | `["image_pull_policy"]` |
+| 23 | `binding_resolve` | `/seed/resources/pod_cpu_limit` | `embedded` / `manifest_binding` | `["pod_cpu_limit"]` |
+| 24 | `binding_resolve` | `/seed/resources/pod_cpu_request` | `embedded` / `manifest_binding` | `["pod_cpu_request"]` |
+| 25 | `binding_resolve` | `/seed/resources/pod_memory_limit` | `embedded` / `manifest_binding` | `["pod_memory_limit"]` |
+| 26 | `binding_resolve` | `/seed/resources/pod_memory_request` | `embedded` / `manifest_binding` | `["pod_memory_request"]` |
+| 27 | `binding_resolve` | `/seed/scope/namespace` | `embedded` / `manifest_binding` | `["target_namespace"]` |
+| 28 | `binding_resolve` | `/seed/topology/mutable_objects/0/labels` | `embedded` / `manifest_binding` | `["head_ssh_labels"]` |
+| 29 | `binding_resolve` | `/seed/topology/mutable_objects/0/name` | `embedded` / `manifest_binding` | `["head_ssh_name"]` |
+| 30 | `binding_resolve` | `/seed/topology/mutable_objects/1/labels` | `embedded` / `manifest_binding` | `["head_labels"]` |
+| 31 | `binding_resolve` | `/seed/topology/mutable_objects/1/name` | `embedded` / `manifest_binding` | `["head_name"]` |
+| 32 | `binding_resolve` | `/seed/topology/mutable_objects/2/labels` | `embedded` / `manifest_binding` | `["head_pod_labels","head_service_selector"]` |
+| 33 | `binding_resolve` | `/seed/topology/mutable_objects/2/name` | `embedded` / `manifest_binding` | `["head_pod_name"]` |
+| 34 | `body_validate` | `/resource_identity/replica_id` | `embedded` / `body_expected_value` | `[]` |
+| 35 | `body_validate` | `/seed/principals/workload/name` | `embedded` / `body_expected_value` | `[]` |
+| 36 | `body_validate` | `/seed/request_identity/original_user` | `embedded` / `body_expected_value` | `[]` |
+| 37 | `body_validate` | `/seed/resources/image/qualification/requested_reference` | `embedded` / `body_expected_value` | `[]` |
+| 38 | `body_validate` | `/seed/resources/image_pull_policy` | `embedded` / `body_expected_value` | `[]` |
+| 39 | `body_validate` | `/seed/resources/pod_cpu_limit` | `embedded` / `body_expected_value` | `[]` |
+| 40 | `body_validate` | `/seed/resources/pod_cpu_request` | `embedded` / `body_expected_value` | `[]` |
+| 41 | `body_validate` | `/seed/resources/pod_memory_limit` | `embedded` / `body_expected_value` | `[]` |
+| 42 | `body_validate` | `/seed/resources/pod_memory_request` | `embedded` / `body_expected_value` | `[]` |
+| 43 | `body_validate` | `/seed/scope/namespace` | `embedded` / `body_expected_value` | `[]` |
+| 44 | `body_validate` | `/seed/topology/mutable_objects/0/labels` | `embedded` / `body_expected_value` | `[]` |
+| 45 | `body_validate` | `/seed/topology/mutable_objects/0/name` | `embedded` / `body_expected_value` | `[]` |
+| 46 | `body_validate` | `/seed/topology/mutable_objects/1/labels` | `embedded` / `body_expected_value` | `[]` |
+| 47 | `body_validate` | `/seed/topology/mutable_objects/1/name` | `embedded` / `body_expected_value` | `[]` |
+| 48 | `body_validate` | `/seed/topology/mutable_objects/2/labels` | `embedded` / `body_expected_value` | `[]` |
+| 49 | `body_validate` | `/seed/topology/mutable_objects/2/name` | `embedded` / `body_expected_value` | `[]` |
+| 50 | `capsule_assemble` | `/seed` | `embedded` / `seed_copy` | `[]` |
+
+The `consumer` field contains the qualified name for the displayed phase, not
+the phase shorthand. Uniqueness is by `(consumer,source_pointer)`; the displayed
+cross-consumer repeats are required independent checks, not implicit shared
+access. A binding name not byte-equal to the binding artifact, or an access to
+another renderer-input pointer, rejects.
+
+`transient_flow` covers every non-`RendererInput` value crossing an entrypoint
+edge. An entry has exact shape
+`{sequence,name,producer,consumers,value_contract,cardinality}`; producer and
+consumers are exact qualified entrypoint names, consumers are ordered by their
+entrypoint sequence, and the exact array is:
+
+| Sequence / name | Producer | Consumers | Value contract / cardinality |
+|---|---|---|---|
+| 0 / `resolved_artifacts` | `artifact_resolve` | [`inventory_validate`, `binding_resolve`, `render`, `request_normalize`, `object_plan_build`, `admitted_normalize`] | `ResolvedProviderKubernetesRendererArtifactSetV1` / `exactly_5` |
+| 1 / `resolved_bindings` | `binding_resolve` | [`render`] | `ResolvedProviderKubernetesBindingSetV1` / `exactly_17_name_sorted_unique` |
+| 2 / `rendered_bodies` | `render` | [`body_validate`] | `CanonicalJsonObject` / `exactly_3_role_ordered` |
+| 3 / `validated_bodies` | `body_validate` | [`request_normalize`, `object_plan_build`] | `ValidatedKubernetesServeThreeObjectBodyV1` / `exactly_3_role_ordered` |
+| 4 / `request_normalizations` | `request_normalize` | [`object_plan_build`] | `ProviderKubernetesRequestNormalizationV1` / `exactly_3_role_ordered` |
+| 5 / `object_plans` | `object_plan_build` | [`capsule_assemble`] | `ProviderKubernetesObjectPlanV1` / `exactly_3_role_ordered` |
+| 6 / `completed_capsule` | `capsule_assemble` | [`staged_construct`] | `ProviderKubernetesExecutionCapsuleV1` / `exactly_1` |
+
+For `resolved_artifacts`, a consumer receives either the complete typed set or
+the exact named member required by its signature. Direct typed member
+projection is part of this one producer flow, not an eighth transient:
+normalizers receive `admitted_object_normalization`, and `object_plan_build`
+receives that same member to copy its reference. No consumer may project an
+unlisted member or convert a member to an untyped mapping.
+
+No transient entry may carry a client, callback, credential, ambient or
+unpinned filesystem path, environment view, completed-capsule backpointer, or
+untyped dict in place of its displayed canonical contract. The only path
+fields are the five already-validated pinned `ProviderRepoArtifactRefV1`
+members inside `resolved_artifacts`; consumers may copy the exact
+`admitted_object_normalization.artifact_ref` but cannot resolve or replace it.
+Missing, extra, reordered, or multiply produced transient entries reject.
+
+`provider_operations` is the exact object
+`{renderer:[],normalizer:[],object_session:[...],preflight_contracts:[...]}`.
+The empty arrays are literal proof that rendering and normalization perform no
+Kubernetes/provider I/O. An object-session entry has exact shape
+`{sequence,phase,role,api_group,api_version,resource,verb,scope,result_use}`.
+Entries are serialized phase-major using phase order below, then role order
+`head_ssh_service`, `head_service`, `head_pod`; sequence is
+`phase_index * 3 + role_index`:
+
+| Phase index / phase | Verb | Result use |
+|---|---|---|
+| 0 / `create` | `create` | `admitted_readback` |
+| 1 / `readback_201` | `get` | `exact_compare` |
+| 2 / `readback_409` | `get` | `exact_adopt_or_conflict` |
+| 3 / `observe` | `get` | `reconcile` |
+| 4 / `delete` | `delete` | `uid_precondition` |
+
+For both Service roles each expanded entry has `api_group=""`,
+`api_version="v1"`, `resource="services"`, and `scope="Namespaced"`; for the
+Pod role it instead has `resource="pods"` with the other three literals
+unchanged. Thus the array has exactly 15 entries. No list, watch, patch, update,
+deletecollection, proxy, exec, port-forward, or other resource entry exists.
+
+Each preflight-contract entry has exact shape
+`{sequence,action_kind,access_matrix_artifact_role,comparison}` and the array is
+exactly `launch/launch_access_matrix` then `down/down_access_matrix`, both with
+`comparison="complete_byte_equal"`. Their separately content-addressed
+matrices own prerequisite and authorization-review operations; this inventory
+cannot broaden them.
+
+`forbidden_sources` is the exact sorted array
+`["ambient_filesystem","ambient_kubernetes_context","capsule_objects",
+"credentials","custom_provisioner","environment","generic_jinja",
+"global_user_state","provider_discovery","proxy","raw_kubeconfig","secret",
+"skypilot_config","unpinned_filesystem_path"]`. The artifact resolver's sole
+filesystem authority is descriptor-safe resolution of the five exact
+`repo_path`/`byte_size`/`sha256` references read at input-access sequences
+13–17 beneath the installed package root; it rejects symlinks, path escape,
+nonregular files, size/hash drift, and every caller-supplied or discovered path.
+That bounded content-addressed read is not `ambient_filesystem` or
+`unpinned_filesystem_path`. A missing or extra artifact role, input access,
+callable, graph edge, provider operation, or forbidden-source literal rejects.
+
+`admitted_object_normalization` has schema ID
+`skypilot.kubernetes.admitted-object-normalization.v1` and exact keys `schema`,
+`comparison_contract`, `request_schema`, `readback_preconditions`,
+`strip_top_level`, `strip_metadata`, `request_allocation_rules`,
+`admitted_parameters`, `admitted_allocation_rules`, `array_order`,
+`unknown_path`, and `retained_defaults`. The sole readback
+precondition is the closed object
+`{pointer:"/metadata/deletionTimestamp",allowed:["absent",null]}` and is
+evaluated before any strip. `comparison_contract` is
+`kubernetes_admitted_object_v1`, `request_schema` is
+`KubernetesServeThreeObjectBodySchemaV1`, `strip_top_level` is exactly
+`["status"]`, `strip_metadata` is exactly `["uid","resourceVersion",
+"generation","creationTimestamp","deletionTimestamp","managedFields"]`,
+`array_order="preserve"`, `unknown_path="conflict"`, and
+`retained_defaults="all_explicit_in_request"`.
+
+`admitted_parameters` is exactly
+`[{sequence:0,name:"require_pod_node_name",kind:"keyword_only",
+type:"builtin_bool",required:true,default:"absent"}]`. The public admitted
+normalizer signature is exactly
+`normalize_kubernetes_admitted_object_v1(role, admitted_object,
+normalization_artifact, *, require_pod_node_name)`, where
+`normalization_artifact` is the required typed
+`ResolvedProviderKubernetesNormalizationArtifactV1` member defined above.
+`admitted_parameters` inventories caller-selected normalization behavior, not
+that fixed artifact dependency. Omission of `require_pod_node_name` raises the
+language's missing-required-keyword
+error, and the entrypoint then requires `type(require_pod_node_name) is bool`
+before inspecting either object. The artifact cannot supply, override, or
+default that invocation value.
+
+A request-allocation rule is the exact object
+`{sequence,role,kind,present,absent,intent,semantic_removals}`. `present` entries
+have exact shape `{sequence,json_pointer,value}`; the other two pointer arrays
+are ordered, duplicate-free string arrays. The complete serializable array is:
+
+```text
+[
+  {sequence: 0, role: "head_ssh_service", kind: "Service",
+   present: [],
+   absent: ["/spec/clusterIP", "/spec/clusterIPs", "/spec/ipFamilies",
+            "/spec/ipFamilyPolicy"],
+   intent: "allocate_single_stack_cluster_ip", semantic_removals: []},
+  {sequence: 1, role: "head_service", kind: "Service",
+   present: [{sequence: 0, json_pointer: "/spec/clusterIP", value: "None"}],
+   absent: ["/spec/clusterIPs", "/spec/ipFamilies",
+            "/spec/ipFamilyPolicy"],
+   intent: "headless_single_stack",
+   semantic_removals: ["/spec/clusterIP"]},
+  {sequence: 2, role: "head_pod", kind: "Pod",
+   present: [], absent: ["/spec/nodeName"],
+   intent: "schedule_one_node", semantic_removals: []}
+]
+```
+
+An admitted-allocation rule is the exact object
+`{sequence,role,kind,cardinality,parameter_cardinality,entries,constraints}`.
+`parameter_cardinality` is null for Services. For the Pod it is the exact
+object `{parameter:"require_pod_node_name",false_value:"zero_or_1",
+true_value:"exactly_1"}`. Each entry is
+`{sequence,json_pointer,allocator,value_schema}`. The complete array is:
+
+```text
+[
+  {sequence: 0, role: "head_ssh_service", kind: "Service",
+   cardinality: "exactly_4", parameter_cardinality: null,
+   entries: [
+     {sequence: 0, json_pointer: "/spec/clusterIP",
+      allocator: "api_server", value_schema: "canonical_ip_text"},
+     {sequence: 1, json_pointer: "/spec/clusterIPs",
+      allocator: "api_server", value_schema: "singleton_cluster_ip"},
+     {sequence: 2, json_pointer: "/spec/ipFamilies",
+      allocator: "api_server", value_schema: "singleton_matching_ip_family"},
+     {sequence: 3, json_pointer: "/spec/ipFamilyPolicy",
+      allocator: "api_server", value_schema: "literal_SingleStack"}],
+   constraints: ["clusterIPs_0_equals_clusterIP",
+                 "ipFamilies_0_matches_clusterIP"]},
+  {sequence: 1, role: "head_service", kind: "Service",
+   cardinality: "exactly_4", parameter_cardinality: null,
+   entries: [
+     {sequence: 0, json_pointer: "/spec/clusterIP",
+      allocator: "api_server", value_schema: "literal_None"},
+     {sequence: 1, json_pointer: "/spec/clusterIPs",
+      allocator: "api_server", value_schema: "singleton_literal_None"},
+     {sequence: 2, json_pointer: "/spec/ipFamilies",
+      allocator: "api_server", value_schema: "singleton_IPv4_or_IPv6"},
+     {sequence: 3, json_pointer: "/spec/ipFamilyPolicy",
+      allocator: "api_server", value_schema: "literal_SingleStack"}],
+   constraints: ["clusterIP_and_clusterIPs_0_are_None"]},
+  {sequence: 2, role: "head_pod", kind: "Pod",
+   cardinality: null,
+   parameter_cardinality: {parameter: "require_pod_node_name",
+                           false_value: "zero_or_1",
+                           true_value: "exactly_1"},
+   entries: [{sequence: 0, json_pointer: "/spec/nodeName",
+              allocator: "scheduler",
+              value_schema: "kubernetes_dns_subdomain"}],
+   constraints: ["absent_only_in_unscheduled_partial_evidence",
+                 "write_once_when_present"]}
+]
+```
+
+The admitted result serializes `server_allocations` as the ordered array of
+`{json_pointer,allocator,value}` entries after applying the selected rule; it
+never serializes pointers as JSON object keys. Services return exactly four
+entries. Pod returns zero or one when `require_pod_node_name` is exactly false
+and exactly one when it is exactly true. The checked
+interpreter implements only these closed arrays; the artifact cannot name a
+callable, predicate, regex, patch, or arbitrary JSON Pointer outside them.
+
+### `boltz-test` server-side dry-run evidence (2026-08-02)
+
+At 13:47-14:50 UTC, Kubernetes context `boltz-test` reported server
+`v1.33.13-eks-8f14419`. The retained Service readbacks have API-server capture
+timestamp `2026-08-02T14:18:42Z`; the corrected `1G` Pod readback has timestamp
+`2026-08-02T14:50:08Z`. Only `dryRun=All` creates were submitted; follow-up GETs
+returned NotFound for all three probe names. The future
+`skypilot-actions-canary` namespace did not exist, so the representative
+candidate used the release's deployed `skypilot-ha-workloads` namespace and
+its `skypilot-service-account`. This freezes the candidate body/default schema
+but is not the eventual canary-namespace activation proof.
+
+The exact retained requests, raw dry-run readbacks, hashes, normalized hash
+domains, and reproduction commands are under
+[`docs/designs/evidence/skyserve-resource-action-renderer-v1/`](evidence/skyserve-resource-action-renderer-v1/README.md).
+The six raw JSON files and their byte commitments are:
+
+| Evidence file | Bytes | Raw SHA-256, including one final LF |
+|---|---:|---|
+| `head_ssh_service.request.json` | 764 | `97c3e83ff160245ef3d8c7a66d7cb99ef9e765768395105f626cccc8abb91e98` |
+| `head_ssh_service.dryrun.json` | 987 | `a91e2b9f3c0dd2ddc69f0fd838997ecc611caf16ffd77c43e2aa2e78b6ff2560` |
+| `head_service.request.json` | 720 | `441f855dc0baddd66bbe0d45c8cb709e17ad34df6bbb8fc70b0a0eb7b4f086e5` |
+| `head_service.dryrun.json` | 912 | `13bff0588a85daa28a3cba9ad49e80f345a119a4d8152ea3946e040e8a193b52` |
+| `head_pod.request.json` | 1,655 | `c5aa3dfe8232a364151da16c650252b4da3b7962a7a636626b168393f93ed937` |
+| `head_pod.dryrun.json` | 1,811 | `5254c4578f335f4c35015091dd0f512a9c27b7646120e30638d9347d07915316` |
+
+Repository/evidence artifact hashes cover the raw file including LF. Persisted
+`CanonicalJsonObject.sha256` covers compact canonical JSON without LF. After
+the role-distinct allocation projections, the no-LF semantic hashes are
+`01f85e19668f5ce16850181367f80ad4bb83d2ba2b3db1e314cbf023f583f2c3`
+for SSH Service,
+`b9f6e3e86df0c26dfe4da1576fe58ba9fd07af0c75c06be920bc5ac65520dd15`
+for head Service, and
+`eb037b6c53d4900a22532126b08a20eff9144f755a2bbb9e3c24da57d51ddb38`
+for Pod. The evidence README reproduces both domains and exact-compares request
+and admitted semantic files; a test that hashes the LF-terminated jq output as
+the persisted semantic is invalid.
+
+The minimal Pod admission added exactly container
+`terminationMessagePath=/dev/termination-log`,
+`terminationMessagePolicy=File`, and `protocol=TCP` on all five ports, plus Pod
+`dnsPolicy=ClusterFirst`, `enableServiceLinks=true`,
+`preemptionPolicy=PreemptLowerPriority`, `priority=0`, `restartPolicy=Always`,
+`schedulerName=default-scheduler`, `securityContext={}`, the duplicate
+`serviceAccount` scalar, `terminationGracePeriodSeconds=30`, and the two
+300-second NoExecute tolerations displayed above. Replaying the request with
+every retained default explicit produced the same retained admitted body after
+removing status and server metadata. No sidecar, init container, volume,
+secret/token projection, extra label/annotation, resource, or scheduling field
+was injected.
+
+The SSH Service returned the complete allocation quartet with an IPv4 address
+and `SingleStack`, plus retained defaults `type=ClusterIP`,
+`sessionAffinity=None`, and `internalTrafficPolicy=Cluster`. The selected
+headless Service returned `clusterIP=None`, `clusterIPs=[None]`, IPv4, and
+`SingleStack` plus those same retained defaults. Dry-run allocation used a
+synthetic address and is evidence of quartet shape, never a reusable allocation
+value.
+
+Selector and null/empty probes were decisive. A headless Service with the
+nonempty exact selector returned IPv4/`SingleStack`; with selector absent,
+`{}`, or null it instead returned `[IPv4,IPv6]` and `RequireDualStack`, which is
+outside the frozen v1 allocation contract. Absent, empty, and null head-Service
+ports all serialized as absent. Null SSH `clusterIP`, empty `clusterIPs`, and an
+absent allocation quartet all triggered allocation. Therefore the request
+schema requires the nonempty exact selector and one canonical absence form; it
+does not rely on API coercion of null or empty values.
+
+### Required renderer-contract tests
+
+No renderer test currently authorizes provider I/O. Before any candidate
+artifact inventory is accepted, one focused suite covers every one of the five
+artifact roles and a separate object matrix covers every one of the three
+object roles:
+
+| Artifact role | Required positive coverage | Required rejection coverage |
+|---|---|---|
+| `outer_template` | exact top-level keys, role order, both complete Service bodies, every literal default and marker target | extra/missing/reordered role, YAML/Jinja/string interpolation, stray marker, selector omission |
+| `node_fragment` | exact Pod metadata/spec/container/env/ports/resources/defaults and marker targets | sidecar/init/volume/secret, extra label/annotation/env, reordered port/toleration, omitted retained default |
+| `binding_schema` | all 17 sorted bindings, 16 distinct sources, every exact target, transforms and output types | duplicate name/key/target, unsorted array, absent/extra/unused marker, forbidden/invalid pointer, coercion, capsule-object read |
+| `config_access_inventory` | five artifact entries, 11 entrypoints, exact staged call graph, all 51 RendererInput-root accesses, all seven transient-flow entries including the closed 17-binding set, explicit typed normalization-artifact consumers, empty renderer/normalizer I/O, 15 object-session entries and both preflight contracts | missing/extra access, transient, callable, artifact argument, or edge; wildcard, provider discovery, unlisted helper, closure/global contract capture, ambient/unpinned filesystem, forbidden source, list/watch/patch/update/proxy/exec |
+| `admitted_object_normalization` | both exact normalizer signatures with the resolved typed artifact argument, all three request rules, all three admitted rules, full Service quartets, required keyword-only exact built-in Boolean parameter, Pod false zero/one and true exactly-one scheduler allocation, deletion precondition, persisted no-LF hashes | omitted/raw/reference-only/wrong-role artifact, omitted/defaulted/non-Boolean parameter, truthy integer/object, request/admitted shape crossover, partial quartet, reinsertion of head `clusterIP`, allocation reorder/duplicate, nonnull deletion timestamp, injected retained field |
+
+The object matrix contains realistic and maximal goldens for
+`head_ssh_service`, `head_service`, and `head_pod`; it exact-checks closed
+top-level/metadata/nested key sets, role label maps, Service annotation/env
+absence, the Pod's sole annotation/env entry, both selector copies, request
+intent, admitted allocations, and request/readback semantic byte equality. A
+five-artifact-role test is not a substitute for these three object-role
+goldens, or vice versa. The selector absent/empty/null/exact dry-run probe and
+both LF/no-LF hash domains are regression fixtures. Staged-constructor tests
+also mutate each of the eight renderer-input keys, independently drift the
+copied Sky cluster name, reconstructed name basis, and cluster-record UUID, and
+prove exact `sky_cluster_name == B.display_name`,
+`C = B.provider_cluster_name`, `W = B.workload_name`, topology-name, label, and
+selector equality before any artifact or provider operation. They also prove
+that `binding_resolve` is the sole producer of the complete typed 17-binding
+set, `render` its sole consumer, both normalizers receive the exact resolved
+normalization member explicitly, and every object plan copies that member's
+artifact reference byte-for-byte.
 
 This paragraph is normative, not evidence that those artifacts currently
-exist. The present branch has only structural artifact-reference and object-
-metadata leaves; it has no checked-in candidate renderer, binding schema, or
-admitted-object normalizer that executes this body contract. Until all three
-resolve by exact repository path/size/hash and realistic plus maximal goldens
-pass, launch normalization returns `unrepresented_execution_config`, remains
+exist. The present branch still has no accepted renderer, node fragment,
+binding schema, or config-access inventory that executes this body contract.
+The existing capsule body validators also implement the older minimal request
+shape through minimal/fake `admissionDefaults` fixture bodies and must be
+updated and tested against this exact schema before a renderer can be
+represented. That old shape uses the same v1 capsule and
+`kubernetes_admitted_object_v1` comparison identifiers; accepting both would
+make the identifier ambiguous, while replacing it with persisted represented
+launches would make those capsules unreadable. There is therefore no dual
+acceptance, fallback reader, or shape sniffing under this v1 identifier.
+
+The renderer implementation and fixture cutover is atomic. Before any image
+containing the new validator/renderer acceptance can run, a consistent
+read-only PostgreSQL preflight must prove zero persisted represented launch
+specs, actions, attempts, and representation links that could contain the old
+body shape. A nonzero or indeterminate result aborts and requires a new
+comparison version or separately reviewed offline migration; code does not
+rewrite or delete such rows. The currently dark runtime and empty `boltz-test`
+resource-action graph make this cutover eligible, but the recorded observation
+does not replace the deployment-time preflight. The same implementation change
+removes every old `admissionDefaults` fixture/validator acceptance while adding
+the exact three-body fixtures and validator; no intermediate build accepts
+both. Until all five artifacts resolve by exact
+repository path/size/hash, realistic plus maximal goldens pass, and the same
+dry-run comparison repeats byte-exactly in the eventual canary namespace,
+launch normalization returns `unrepresented_execution_config`, remains
 shadow-only, and sends no action-owned provider bytes. The generic Jinja/config
-path is not a substitute and is ineligible for authority.
+path is not a substitute and is ineligible for authority. Persisted 201/409,
+scheduler, runtime, P2, and P3 evidence remain separate later gates and are not
+claimed by these dry-runs.
 
 For the initial authoritative `pod_cluster_v1` cohort, `cloud` is
 `kubernetes`, the `kubernetes` block is nonnull, and `workload_kind` is exactly
@@ -3919,11 +4767,15 @@ Every null, empty collection, and literal in
 with an ambient default. Every renderer, binding, normalization, inventory, and
 runtime artifact has a retrievable repository path, byte size, and hash within
 the exact approved executor-cohort image; no bare private hash is a preimage.
-The action-aware candidate renderer is pure over its policy-free capsule plus the retained
-source. It emits exactly the three stored `objects` bodies; it does not call the
-generic config writer/bootstrap path or rediscover user/workspace, image,
-CPU/GPU labels, RuntimeClass, storage, queue, service account, SSH identity,
-port mode, pod config, mounts, or credentials.
+The action-aware candidate renderer is pure over the closed pre-object
+`ProviderKubernetesRendererInputV1`, whose seed contains the policy-free
+capsule fields, alongside the enclosing frozen resource identity and retained
+source. No `objects` field exists at render time; the emitted bodies are later
+appended to the unchanged seed and must compare byte-equal to the completed
+capsule's three expectations. It does not call the generic config writer/bootstrap
+path or rediscover user/workspace, image, CPU/GPU labels, RuntimeClass, storage,
+queue, service account, SSH identity, port mode, pod config, mounts, or
+credentials.
 If the current template cannot be reconstructed under those constraints, the
 decision is not representable and remains shadow-only.
 
@@ -4742,6 +5594,11 @@ mutation is permitted afterward.
   normalizer, prebooted runtime/job/endpoint contract, and checked-in access/
   call inventory. Restrict v1 normalization to the location-pinned canary
   candidate above.
+- Cut the same-ID renderer body contract over atomically: add the exact
+  three-body validator/artifacts and remove every minimal/fake
+  `admissionDefaults` fixture and acceptance in the same change. Gate its first
+  execution on the read-only zero-persisted-represented-launch preflight above;
+  never implement dual `kubernetes_admitted_object_v1` shape acceptance.
 - Add the policy-free execution capsule, typed policy subject/proofs, closed
   Kubernetes review/prerequisite projections, exact same-client facade
   inventory, versioned worker cohort/image identity, launch/down execution
@@ -4958,6 +5815,12 @@ Contract tests must cover:
   roles, the first-deployment preflight passes only with legacy service modes
   and absent/empty operational tables, and the cutover changes hashes/goldens
   without changing deterministic action UUIDs;
+- the same-ID renderer cutover preflight passes only with zero persisted
+  represented launch specs/actions/attempts/links, fails closed on every
+  nonzero, missing, or indeterminate query result, and the resulting build
+  accepts the exact three-body fixtures while rejecting every old minimal/fake
+  `admissionDefaults` body; no tested build or parser accepts both shapes under
+  `kubernetes_admitted_object_v1`;
 - canonical plan/locator bytes and identity mismatch rejection;
 - exact built-in acceptance and subclass rejection at the shared text, hash,
   integer, timestamp, enum, UUID, and action-kind helpers; exact-Boolean
@@ -5007,6 +5870,9 @@ Contract tests must cover:
   `unrepresented_execution_config`, preserve shadow-only routing, and emit no
   action-owned provider bytes; realistic and candidate-maximal artifact goldens
   are required before that gate can open;
+- config-inventory artifact tests parse the typed/raw canonical wrapper rather
+  than `CanonicalJsonObject`, accept `api_group=""` only for the exact CoreV1
+  object-session entries, and reject that empty literal at every other field;
 - exact retained-source verification, both policy boundaries absent,
   byte-equal pre/post projections, and deterministic precedence for every
   closed not-representable reason;
@@ -5233,6 +6099,19 @@ uses only a compatible image that preserves nonnull cluster-record UUIDs as
 write-once commitments and preserves nonterminal shadow/action state. It does
 not run provider compensation or schema down. After first authority, rollback
 to a pre-action-aware image is unsupported.
+
+The renderer-body change is also a same-v1 atomic cutover. Keep representation
+and every provider route disabled while all potential readers/writers move to
+the one image that simultaneously removes the minimal/fake
+`admissionDefaults` acceptance and adds the exact three-body contract. With the
+old image still pinned as the sole possible writer, run and retain the
+consistent read-only zero-persisted-represented-launch preflight defined above;
+only after every relevant role runs the new digest may representation resume.
+The existing dark runtime and empty `boltz-test` graph are evidence that this
+gate can pass, not permission to skip it. Any old row or mixed writer aborts the
+cutover; v1 never has a dual-shape window. After a new-shape represented capsule
+is persisted, rollback is limited to an image that reads only that same exact
+shape and cannot restore the old fixture contract.
 
 The dark binary/schema rollout and compatible-image rollback now have live
 `boltz-test` evidence. `resourceActions.authorityWorker.enabled` nevertheless
@@ -5462,20 +6341,28 @@ absence result through a public API.
 - M4/provider authority is not reached. Keep the authority worker and every
   provider-authoritative route disabled until the remaining gates below are
   implemented and verified; immutable specs, progress, and codecs alone do not
-  authorize provider I/O.
+  authorize provider I/O. Private-handler shadow and the live dispatcher must
+  consume the API007-only activation fence immediately before provider
+  dispatch; the pure readiness predicate does not itself enable a route.
 - Exact inventory of existing providers that can propagate a stable
   cluster-record UUID/incarnation before launch; multi-node/compound launch is
   ineligible until all effects have one exact observable target contract.
-- The current branch has no checked-in candidate `pod_cluster_v1` renderer,
-  binding schema, or `kubernetes_admitted_object_v1` normalizer, so
+- The current branch has no accepted five-artifact `pod_cluster_v1` renderer
+  cohort or canary-qualified `kubernetes_admitted_object_v1` normalizer, so
   `unrepresented_execution_config` and shadow-only routing remain mandatory.
-  Add those three pinned artifacts plus realistic/candidate-maximal body
+  Add the five pinned artifacts in the exact formats above plus
+  realistic/candidate-maximal body
   goldens, prebooted runtime, action-keyed Skylet, mutation-trace,
   handle/endpoint, and observation fixtures against real Kubernetes, then
   exercise the exact 12-role in-cluster principal/authorization/admission/
   network preflight plus both launch LB Deployment-to-ServiceAccount projections
   on the selected Boltz canary path, and verify the down preflight performs zero
   LB Deployment GETs.
+- Before accepting that renderer, implement and retain the atomic same-v1 body
+  cutover gate: prove zero persisted represented launch graph under the pinned
+  old writer, remove all minimal/fake `admissionDefaults` acceptance in the
+  same build that adds the exact three bodies, and deploy every reader/writer
+  before representation resumes. No dual-shape compatibility is permitted.
 - Implement the provider renderer and admitted-object normalizer, then bind the
   already-implemented launch/down invocation and execution-config contracts to
   complete preflight seeds, the controller/executor dual policy-absence proof

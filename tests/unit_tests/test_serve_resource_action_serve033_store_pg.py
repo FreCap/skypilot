@@ -517,10 +517,24 @@ def test_store_and_activation_contract_fail_closed_on_old_dialects() -> None:
         resource_action_state.PostgresServeResourceActionStateStore(
             sqlalchemy.create_engine('sqlite://'))
 
-    _activation_evidence(api_revision='005', serve_revision='033')
-    _activation_evidence(api_revision='006', serve_revision='033')
+    legacy_shadow = _activation_evidence(api_revision='005',
+                                         serve_revision='033')
+    assert legacy_shadow.shadow_ready
+    assert not legacy_shadow.private_handler_dispatch_ready
+    private_dispatch = _activation_evidence(api_revision='007',
+                                            serve_revision='033',
+                                            authority_ready=True)
+    assert private_dispatch.private_handler_dispatch_ready
+    assert private_dispatch.authority_ready
     with pytest.raises(ValueError, match='Serve schema revision 033'):
-        _activation_evidence(api_revision='006', serve_revision='032')
+        _activation_evidence(api_revision='007', serve_revision='032')
+
+
+def test_api006_cannot_authorize_m4() -> None:
+    with pytest.raises(ValueError, match='API schema revision 005 or 007'):
+        _activation_evidence(api_revision='006',
+                             serve_revision='033',
+                             authority_ready=True)
 
 
 def test_worker_cohort_exact_adoption_freshness_and_legal_lifecycle(
@@ -1254,7 +1268,7 @@ def test_authority_transition_requires_locked_inventory_hash_equality(
                                       actions.ResourceActionMode.SHADOW,
                                       actions.ResourceActionMode.AUTHORITATIVE,
                                       gate_evidence=_activation_evidence(
-                                          api_revision='006',
+                                          api_revision='007',
                                           serve_revision='033',
                                           authority_ready=True,
                                           candidate_since=candidate_since,
@@ -1267,7 +1281,7 @@ def test_authority_transition_requires_locked_inventory_hash_equality(
         actions.ResourceActionMode.SHADOW,
         actions.ResourceActionMode.AUTHORITATIVE,
         gate_evidence=_activation_evidence(
-            api_revision='006',
+            api_revision='007',
             serve_revision='033',
             authority_ready=True,
             candidate_since=candidate_since,
