@@ -16180,6 +16180,163 @@ artifacts:
   retained_references: []
   evidence: {}
   blocker: null
+- id: PLA-M5-015
+  milestone: M5
+  introduced_by: 2801510cd08aeca8ad88a90831d62580e3a9712c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: managed_job_pool
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: legacy_worker_assignment
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: filelock.FileLock
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: managed_job_state.update_job_full_resources
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: managed_job_state.set_current_cluster_name
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: get_next_cluster_name
+    call: managed_job_state.set_job_infra
+  replacement: PoolWorkerCoordinator assignment transaction plus an explicitly named SQLite compatibility implementation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_central_postgresql_legacy_pool_assignment_body
+      satisfied: false
+      evidence: []
+    test:
+    - id: pool_assignment_retirement_capacity_and_identity_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_central_postgresql_legacy_pool_assignment_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: pool_worker_coordinator_assignment_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: legacy_pool_assignment_body_owns_no_schema
+      satisfied: true
+      evidence:
+      - The filesystem-locked assignment body owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M5-016
+  milestone: M5
+  introduced_by: cddfef839c60432da7c1b20660cb83757f476e70
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: managed_job_pool
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: direct_worker_teardown_admission
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._reconcile_failed_cleanup
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._clean_up_skipped_cost_rebalance_redrive
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._defer_scale_down_until_idle
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._reconcile_legacy_uncertain_logical_retirements
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._finish_logical_retirement
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._refresh_wait_for_idle
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager.scale_down
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager.scale_down_logically_batch
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._handle_preemption
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._refresh_thread_pool
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._handle_job_status_results
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._probe_all_replicas
+    call: self._terminate_replica
+  - kind: python_call_within
+    path: sky/serve/serve_utils.py
+    symbol: _terminate_failed_services_locked
+    call: replica_managers.terminate_cluster
+  replacement: PoolWorkerCoordinator graceful or forced close admission plus exact-token teardown re-drive
+  dependencies:
+  - PLA-M5-015
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_unfenced_central_postgresql_pool_teardown_admission
+      satisfied: false
+      evidence: []
+    test:
+    - id: every_pool_teardown_source_closes_admission_before_effect
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_unfenced_pool_teardown_admission_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: pool_worker_coordinator_teardown_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: direct_pool_teardown_admission_owns_no_schema
+      satisfied: true
+      evidence:
+      - The direct in-process teardown admission paths own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
 - id: PLA-M6-001
   milestone: M6
   introduced_by: ba244fc1f7a4b50bad9ac0d95f48873c9d5644d1

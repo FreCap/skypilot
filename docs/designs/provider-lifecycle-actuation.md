@@ -7073,10 +7073,10 @@ widening legacy authority.
 
 This subsection is the canonical design for the first M5 runtime seam. It is
 not permission to activate the seam until every staged capability and rollout
-gate below is satisfied. The first promoted behavior is intentionally limited
-to central-PostgreSQL worker assignment and ordinary queue-driven worker
-retirement. SQLite and every other pool lifecycle decision retain their
-characterized behavior until a later reviewed promotion.
+gate below is satisfied. Early releases may shadow central-PostgreSQL worker
+assignment and ordinary queue-driven retirement, but no pool may enter version
+`1` until every destructive admission source closes the exact worker first.
+SQLite retains its characterized behavior until a later reviewed promotion.
 
 The current race crosses two nominal owners. Managed-job placement takes a
 per-service filesystem lock, reads a replica snapshot, selects a worker, and
@@ -7099,30 +7099,37 @@ the same effect and cannot publish a different binding.
 ##### Responsibility and public contract
 
 `PoolWorkerCoordinator` is a provider-neutral lifecycle owner, not a new
-provider interface or a generic workflow framework. It exposes two closed,
-typed decisions:
+provider interface or a generic workflow framework. Its pure DTOs and ranking
+live in a low-state module that imports no `serve_utils`, `replica_managers`,
+`jobs.state`, SDK, server implementation, or provider object. A storage adapter
+exposes three closed, typed decisions:
 
 - `try_assign_job()` returns `ASSIGNED`, `NO_CAPACITY`, `RETRY`, `FENCED`, or
   `INCOMPATIBLE` plus an immutable assignment intent only for `ASSIGNED`;
-- `try_claim_worker_retirement()` returns `ADMITTED`, `BUSY`, `RETRY`,
-  `FENCED`, or `INCOMPATIBLE` plus an immutable retirement intent only for
-  `ADMITTED`.
+- `try_close_worker_admission()` accepts `GRACEFUL` or `FORCED` and returns
+  `ADMITTED`, `BUSY`, `RETRY`, `FENCED`, or `INCOMPATIBLE` plus an immutable
+  retirement intent only for `ADMITTED`; and
+- `try_release_assignment()` returns `RELEASED`, `RETRY`, or `FENCED` after an
+  exact remote attempt reaches a terminal or proved-absent state.
 
-Neither method raises normal scheduling outcomes as exceptions. Neither method
+None of these methods raises normal scheduling outcomes as exceptions. None
 calls a provider, the API server, Skylet, SSH, `sdk.exec`, `sky.down`, or a
 thread join while its database transaction is open. Provider and remote
 runtime objects remain observations passed into pure candidate planning. The
 coordinator owns only admission, durable intent, exact identity checks, and
 state transitions.
 
-Assignment and retirement must use the same coordinator in the first behavior
-promotion. Migrating only one caller does not close the race and is forbidden.
-Ordinary queue-driven retirement is the first retirement caller because it is
-the path that currently acts on an unlocked idle snapshot. Cost rebalance,
-purge, update, service down, preemption, and failed-cleanup admission remain
-explicit later M5 promotions; each must either enter this owner or document a
-stronger exact-incarnation fence before the PostgreSQL legacy path can be
-removed.
+Assignment and every destructive admission source must use the same
+coordinator before the first behavior promotion. Migrating only assignment or
+only ordinary queue retirement does not close the race and is forbidden.
+Queue scale-down and cost rebalance use `GRACEFUL`, which refuses any live
+binding. Purge, update replacement, service down, preemption, launch failure,
+user-job failure, readiness failure, and failed-cleanup re-drive use `FORCED`
+only after their existing domain transition proves that the worker must leave
+service. `FORCED` closes admission even when a prior assignment still needs
+managed-job recovery; it does not silently declare that remote attempt absent.
+The final `_terminate_replica()` boundary rejects every version-1 pool effect
+that lacks the exact close token.
 
 ##### Durable identity and additive schema
 
@@ -7140,9 +7147,10 @@ only dormant fields and indexes.
 
 - `pool_worker_incarnation TEXT NULL`, a canonical random UUID assigned once
   to an exact live worker during activation;
+- `pool_submission_runtime_incarnation TEXT NULL`, the last freshly probed
+  keyed-Skylet process UUID accepted for this worker;
 - `pool_admission_closed BOOLEAN NOT NULL DEFAULT FALSE`;
-- `pool_retirement_token TEXT NULL`; and
-- `pool_retirement_claimed_at FLOAT NULL`.
+- `pool_retirement_token TEXT NULL`.
 
 The worker identity is `(services.hash, pool_worker_incarnation)`. Replica ID
 and cluster name are retained as checked attributes but are not identity:
@@ -7152,14 +7160,23 @@ non-null worker incarnations. Ordinary replica upserts must never overwrite an
 existing worker incarnation, admission fence, or retirement token from an
 `excluded` row.
 
+Version-1 worker identity is allocated at durable row birth, before external
+launch begins, in the same transaction that inserts the replica row. Recovery
+of that same row and exact external cluster preserves the UUID. A retry that
+has not created an external cluster also preserves it. A replacement may mint
+a new UUID only after exact absence of the prior external cluster is proved and
+the old row is deleted; reinserting a reused replica ID is a new birth. A
+nonnull incarnation is immutable in place. Fresh version-1 rows without one
+are rejected, while version-0 rows remain nullable until activation backfill.
+For a coordinated row, `pool_admission_closed = FALSE` requires a null
+retirement token and `TRUE` requires a canonical non-null token.
+
 `job_info` adds:
 
 - `pool_worker_incarnation TEXT NULL`;
-- `pool_assignment_generation BIGINT NOT NULL DEFAULT 0`;
 - `pool_assignment_operation_id TEXT NULL`;
 - `pool_assignment_payload_digest TEXT NULL`;
-- `pool_assignment_state TEXT NULL`; and
-- `pool_assignment_updated_at FLOAT NULL`.
+- `pool_assignment_state TEXT NULL`.
 
 The closed non-null state set is `INTENT`, `BOUND`, `QUARANTINED`, and
 `RELEASED`. `INTENT`, `BOUND`, and `QUARANTINED` consume worker capacity and
@@ -7169,14 +7186,19 @@ block retirement. `RELEASED` retains routing history but grants no authority.
 partial lookup index covers `(pool, pool_hash, pool_worker_incarnation)` for
 the three capacity-consuming states.
 
-`api_server_instances` adds a non-null JSONB capability map. The exact M5
-release advertises separately versioned support for coordinator admission,
-stable internal exec requests, and remote submission-key propagation, plus an
-implementation digest. `api_requests` adds a nullable retention owner for an
-internal pool operation. Request GC must not remove a row while that owner is
-set. The coordinator clears the owner only after the remote ID is durably
-bound or the operation is proved effect-free and released. Quarantined rows
-remain retained.
+Additive checks require every non-null assignment state to have a service hash,
+worker incarnation, operation ID, and payload digest. `INTENT` requires a null
+remote job ID and `BOUND` requires a non-null remote job ID. Reassignment from
+`RELEASED` clears the prior remote ID in the same transaction that writes the
+new `INTENT`. Legacy rows with a null assignment state continue to satisfy the
+checks before activation.
+
+No second role-capability column is added. The exact releases advertise
+separately versioned internal-exec and coordinator capability tokens, including
+their implementation digest, through the existing
+`api_server_instances.supported_handlers` and
+`supported_payload_versions` fields. Old processes publish neither token and
+therefore block activation.
 
 All UUID text is parsed and re-emitted in canonical RFC 4122 form before use.
 Malformed, nil, predictable, or mismatched values fail closed. Tokens,
@@ -7185,45 +7207,106 @@ stored in these fields.
 
 ##### Stable request and remote effect key
 
-The assignment operation ID is a random UUID generated and committed with the
-`INTENT` before any HTTP or remote job effect. It is simultaneously:
+The caller generates the random assignment operation UUID before planning so
+the stable run timestamp and candidate-specific payload can include it. The
+UUID gains authority only when it is committed with the `INTENT`, before any
+HTTP or remote job effect. It is simultaneously:
 
 1. the pool assignment operation ID;
 2. the private internal `/exec` request ID; and
 3. the Skylet submission key.
 
-After a pure planner proposes one exact worker, the SDK prepares an immutable,
-candidate-specific `ExecBody` outside the coordinator transaction, including
-the selected cluster name and any file-mount upload, then computes its
-canonical effect-bearing payload digest. The transaction stores that digest.
-If locked revalidation rejects the proposal, the caller returns to planning
-and prepares a new body for the next proposal. Retrying an accepted intent must
-rebuild the exact digest or return `QUARANTINED`; a retry may not silently
-submit changed work under the same operation ID.
+File mounts are uploaded once before candidate ranking. After a pure planner
+proposes one exact worker, the SDK derives an immutable candidate-specific
+`ExecBody` outside the coordinator transaction by adding the selected cluster
+name, then computes its canonical effect-bearing payload digest. The
+transaction stores that digest. If locked revalidation rejects the proposal,
+the caller returns to ranking and derives a new body from the already uploaded
+mount identity. Retrying an accepted intent must rebuild the exact digest or
+return `QUARANTINED`; a retry may not silently submit changed work under the
+same operation ID.
 
-Only an authenticated, current PostgreSQL controller origin may request a
-stable internal ID. The normal public SDK cannot override request IDs. The
-`/exec` handler validates a canonical UUID and replaces the middleware's random
-ID only after authentication and controller-origin verification. The response
-must echo the exact accepted ID. A mismatch is an incompatible-server failure,
-not permission to retry with a fresh ID.
+Controller generation headers remain fencing metadata and never authorize this
+private mode. Release M5-S1 provisions a dedicated internal-controller HMAC
+key to API and controller roles only. The controller signs method, path,
+authenticated user ID, operation UUID, canonical payload digest, current
+leader UUID and generation, and a bounded timestamp. After ordinary
+authentication, the `/exec` handler verifies the HMAC, signed user, current
+PostgreSQL leadership, timestamp, and body digest, then validates a canonical
+UUID and replaces the middleware's random ID. The normal public SDK and
+user-creatable service accounts cannot obtain the key or override request IDs.
+Signatures are never logged or persisted and support a two-key rotation
+window. The response must echo the exact accepted ID. A mismatch is an
+incompatible-server failure, not permission to retry with a fresh ID.
 
-PostgreSQL request creation becomes create-or-return only for this internal
-mode. On a duplicate ID it compares authenticated user, handler, target
-cluster, schedule class, precondition, and canonical payload JSON. An exact
-match returns the existing request without overwriting or enqueueing it. Any
-mismatch returns `409`, preserves the original row, and quarantines the pool
-intent. SQLite and ordinary API requests keep create-once behavior.
+PostgreSQL request creation becomes create-or-return only for this signed
+internal mode. `InternalPoolExecIdentityV1` is the canonical equivalence tuple:
+authenticated user; request and handler names; payload type, format, version,
+producer version, and canonical JSON; execution class; target cluster;
+schedule type; queue priority and retry flags; ignore-return-value flag;
+file-mount blob identity; and precondition type, payload, and deadline. On a
+duplicate ID, every tuple field must match. An exact match returns the existing
+request without overwriting or enqueueing it. Any mismatch returns `409`,
+preserves the original row, and quarantines the pool intent. SQLite and
+ordinary API requests keep create-once behavior.
 
-Skylet version `41` adds `submission_key` to `AddJob`, an immutable add digest,
-an immutable queue digest, and an exact lookup by `(username,
-submission_key)`. The local job database enforces a partial unique index on
-that pair. Repeated `AddJob` returns the existing job ID only when the digest
-matches. Repeated `QueueJob` is a no-op only when its job ID and queue digest
-match, whether the job is pending, running, or terminal. A mismatch is a hard
-error and never mutates or enqueues a second job. Internal keyed execution
-requires gRPC and a capability-proven Skylet; it must not fall back to the
-legacy SSH add/queue path.
+Skylet version `41` adds new `GetKeyedSubmissionCapability`, `AddJobKeyed`,
+`QueueJobKeyed`, and `GetJobBySubmissionKey` RPC methods. It does not add
+optional authority fields to the existing mutation methods: an old Skylet must
+return `UNIMPLEMENTED` before mutation rather than ignore an unknown proto3
+field. At process start, the keyed service generates a random runtime-
+incarnation UUID. A capability request contains a fresh caller nonce; the
+response echoes it and returns protocol version, implementation digest, local
+schema version, and runtime UUID. Before each add, queue, or lookup effect, the
+caller obtains that response and sends its exact runtime UUID and echoed nonce
+with the mutation. A mismatch fails before mutation. A retry re-probes,
+performs exact keyed lookup in the persistent job database, and adopts or
+proves absence before accepting a new runtime UUID.
+
+The local job database stores a submission key, add digest, queue digest, and
+queue state and enforces a partial unique index on `(username,
+submission_key)` plus one pending row per job ID. The add digest is the
+canonical hash of username, job name, stable run timestamp, resources, and
+metadata. `AddJobKeyed` holds one SQLite write transaction through insert,
+exact-conflict comparison, log-directory derivation, and log-directory update.
+A repeated add returns the existing job ID and log directory only when every
+field and digest match.
+
+Both digests use SHA-256 over a versioned, length-prefixed canonical encoding,
+not Python `repr`, pickle, map iteration order, or protobuf wire defaults.
+JSON objects use sorted keys and normalized UTF-8, resource fields use the
+canonical task YAML projection, and protobuf inputs use deterministic
+serialization. A future field or normalization change requires a new digest
+version and RPC version.
+
+The queue digest is the canonical hash of job ID, codegen bytes or the exact
+uploaded script bytes, script path, remote log directory, and deterministic
+managed-job proto bytes. `QueueJobKeyed` takes the per-job file lock before any
+file or database mutation. It atomically writes code through temporary-file
+rename, then uses one `BEGIN IMMEDIATE` transaction to compare or initialize
+the queue digest, insert the unique pending row with launch state `QUEUED`, and
+change the job status from `INIT` to `PENDING`. A matching retry verifies or
+repairs a missing pre-launch artifact and invokes the scheduler; it is not a
+no-op merely because a digest exists. A crash before rename leaves no database
+intent. A crash after rename but before the transaction leaves an
+unauthoritative exact artifact that a retry verifies and reuses. A crash after
+the transaction leaves a durable `QUEUED` row that recovery schedules.
+
+The keyed pending row has `QUEUED`, `LAUNCHING`, `RUNNING`, and terminal launch
+states plus a random driver token embedded in the process command. Before
+spawn, one transaction moves `QUEUED` to `LAUNCHING`. After spawn, another CAS
+stores the PID and moves to `RUNNING`. Recovery under the same per-job lock
+searches only the exact driver token: one matching process is adopted, proved
+absence permits one spawn, and multiple or mismatched processes quarantine the
+submission. Repeated queue calls return success only for the one matching
+queue digest and recoverable state; a mismatch is a hard error and never
+overwrites a file, inserts a second pending row, or launches another process.
+Exact lookup returns job ID, both stored digests, queue state, and the current
+runtime incarnation.
+
+Internal keyed execution requires these versioned gRPC methods and a fresh
+runtime-incarnation proof on every effect. It must not fall back to legacy RPC
+methods or the SSH add/queue path.
 
 This remote idempotency is required even though the API request row is durable.
 The unary Skylet client retries ambiguous transport failures, and current
@@ -7232,12 +7315,16 @@ alone would merely move the lost-response window to the worker.
 
 ##### Assignment transaction
 
-Slow observation happens before the transaction. One bounded snapshot ranks
-candidate replicas, and one immutable proposal carries the exact service hash,
-replica ID, worker incarnation, replica state version, cluster name, readiness,
-immutable launched resources, infrastructure display fields, selected task
-resource alternative, and prepared exec payload digest. Missing or ambiguous
-observations yield `RETRY` or `INCOMPATIBLE`, never a guessed reservation.
+Slow observation happens before the transaction. A planner input may contain
+readiness, immutable launched resources, display metadata, and task resource
+alternatives, but these observations never become authority. The pure planner
+returns only the exact service hash, replica ID, worker incarnation, replica
+state version, cluster name, selected task resource alternative, freshly
+probed remote runtime incarnation, operation UUID, and prepared exec payload
+digest. Its module has the low-state import boundary specified above. Missing
+or ambiguous observations yield `RETRY` or `INCOMPATIBLE`, never a guessed
+reservation. Display metadata is projected after commit and is not an input
+to fencing, capacity, recovery, or teardown.
 
 The PostgreSQL transaction locks in this order:
 
@@ -7258,23 +7345,24 @@ fail-closed one-job-per-worker behavior.
 
 For one winning worker, the same commit:
 
-- increments `pool_assignment_generation`;
 - stores worker incarnation, operation ID, payload digest, and `INTENT`;
-- stores the selected cluster name and infrastructure display fields; and
+- records the freshly probed Skylet runtime incarnation on the replica;
+- stores the selected cluster name; and
 - replaces heterogeneous `spot.full_resources` with the exact selected
   alternative.
 
 No partial binding is externally visible. A terminal or cancelling job, an
-already capacity-consuming assignment generation, stale controller ownership,
-or changed service or worker incarnation cannot win.
+already capacity-consuming assignment, stale controller ownership, or changed
+service or worker incarnation cannot win.
 
 After commit, any controller incarnation may submit or observe the same
 operation ID, but only the current owner may publish progress. `sdk.exec`
 submits the prepared body with that ID, and `sdk.get(operation_id)` supplies
 the exact remote job ID. The `BOUND` compare-and-set locks the current
-leadership and job row and checks assignment generation, operation ID, service
-hash, and worker incarnation. A stale controller can create or observe the
-same idempotent effect but cannot bind a different result.
+leadership and job row and checks operation ID, service hash, worker
+incarnation, payload digest, and returned request ID. A stale controller can
+create or observe the same idempotent effect but cannot bind a different
+result.
 
 Recovery of `INTENT` is deterministic:
 
@@ -7284,31 +7372,54 @@ Recovery of `INTENT` is deterministic:
 - a failed, cancelled, or missing request triggers exact Skylet lookup by the
   same submission key;
 - exactly one digest-matching remote job is adopted;
-- proved absence permits a new assignment generation only after the old
-  generation is marked `RELEASED`; and
+- proved absence permits a new assignment only after the old operation is
+  marked `RELEASED`; and
 - multiple, mismatched, or unprovable effects become `QUARANTINED` and keep the
   worker unavailable for retirement or new capacity.
 
-Cancellation and reassignment release capacity only after the exact API
-request and remote job are cancelled or absence is proved. Routing fields and
-the old operation identity remain as history. A replacement assignment uses a
-new generation and random operation ID.
+Every `BOUND` row represents one exact remote task attempt. The normal terminal
+reducer locks current leadership, the exact `job_info` row, and the relevant
+`spot` task rows in the common order. It verifies operation ID, remote job ID,
+service hash, worker incarnation, and an exact terminal, cancelled, or
+proved-absent remote observation before changing `BOUND` to `RELEASED`. A
+serial multi-task job cannot bind its next task until the prior task is
+released. A remote job group releases worker capacity only after every
+required member has an exact terminal observation or exact absence proof.
+Crashing after the `spot` terminal write but before release leaves capacity
+consumed; recovery queries the exact remote ID and re-drives the reducer. A
+terminal `spot` state alone never releases capacity.
+
+Cancellation and reassignment use the same reducer and release capacity only
+after the exact API request and remote job are cancelled or absence is proved.
+Routing fields may remain for diagnostics, but the mutable job row contains
+only its current or latest assignment. This design does not claim a durable
+history of prior operation identities. A replacement may overwrite the
+released assignment fields only with a new random operation ID after the old
+state is `RELEASED`.
 
 ##### Retirement transaction and re-drive
 
-Autoscaling may continue to rank idle candidates from a cheap snapshot, but
-that ranking grants no teardown authority. Immediately before ordinary
-queue-driven scale-down, the coordinator locks the exact service and candidate
-worker in the common order, verifies the service controller owner, service
-hash, lifecycle epoch, replica ID, cluster name, replica state version, worker
-incarnation, and current eligibility, then locks all exact capacity-consuming
-job bindings in job-ID order.
+Autoscaling and every other destructive source may continue to rank candidates
+from cheap snapshots, but that ranking grants no teardown authority. Before a
+source schedules, records, or invokes a destructive effect, it calls
+`try_close_worker_admission()` for the exact worker. The coordinator locks the
+service and worker in the common order, verifies current controller ownership,
+service hash, lifecycle epoch, replica ID, cluster name, replica state version,
+worker incarnation, and source-specific domain transition, then locks all
+capacity-consuming job bindings in job-ID order.
 
-Any such binding returns `BUSY` without mutation. Otherwise one commit sets
-`pool_admission_closed`, a random retirement token, and its claim time. This is
-the irrevocable retirement admission point. Assignment winning first makes
-retirement busy; retirement winning first makes the worker unavailable to
-assignment. Exactly one side can win.
+`GRACEFUL` is used only by queue scale-down and cost rebalance. Any
+capacity-consuming binding returns `BUSY` without mutation. `FORCED` is used by
+purge, update replacement, service down, preemption, launch failure, user-job
+failure, readiness failure, and failed-cleanup re-drive after their existing
+domain transition proves that the worker must leave service. It closes
+admission even when a binding remains, but it neither releases capacity nor
+claims that the remote attempt is absent. For either admitted mode, one commit
+sets `pool_admission_closed` and a random `pool_retirement_token`. Assignment
+winning first makes graceful retirement busy; closing admission first makes
+the worker unavailable to every later assignment. A forced close may win over
+a live assignment only because the domain has already required replacement or
+shutdown, and managed-job recovery retains ownership of that exact attempt.
 
 Only after commit may the existing teardown worker run. It carries the exact
 service hash, worker incarnation, and retirement token and revalidates them
@@ -7319,18 +7430,27 @@ cleanup regardless of the obsolete autoscaler selection epoch. An admitted
 worker is never reopened; success removes its exact replica row, while failure
 retains the closed row for retry and readback.
 
+After forced teardown proves exact external absence, the owner-fenced recovery
+reducer releases each matching assignment using that absence proof before the
+replica row is deleted. If teardown fails or absence is ambiguous, the closed
+worker and every capacity-consuming assignment remain durable. No source may
+clear the close flag, replace the token, or delete the row to make progress.
+The final `_terminate_replica()` boundary requires the exact service hash,
+worker incarnation, and close token for every version-1 effect, regardless of
+which higher-level source requested it.
+
 Activation refuses a legacy service with a null resource scope or any worker
 whose external cluster name is not incarnation-scoped. This prevents a stale
 retirement token from targeting a same-name successor. Service deletion and
 purge may not remove an admitted replica row until cleanup proves exact
-absence.
+absence and the matching assignments are released.
 
 ##### Compatibility activation and rollback
 
-Release A is additive and dormant. It applies Serve `033`, spot-jobs `027`,
-API-requests `005`, API version `69`, and Skylet `41`; advertises capability;
-and leaves every service at coordination version `0`. PostgreSQL version-0
-paths preserve existing decisions and writes. SQLite branches before
+The four releases below are additive and dormant until M5-S3 activation. They
+apply Skylet `41`, API-requests `005`, API version `69`, Serve `033`, and
+spot-jobs `027` in separate merge, deploy, and monitoring gates. PostgreSQL
+version-0 paths preserve existing decisions and writes. SQLite branches before
 coordinator entry and retains its existing filesystem-lock path exactly.
 
 Every capable PostgreSQL version-0 assignment and ordinary retirement entry
@@ -7340,6 +7460,27 @@ legacy read-and-write critical section. It does not hold that lock through
 of the same lock. This temporary compatibility guard closes the old-operation
 window while the activation transaction backfills authority.
 
+Point-in-time fleet and capability checks are necessary but not sufficient: a
+previous binary can start late and ignore a Python fence. Serve `033` and
+spot-jobs `027` therefore install PostgreSQL writer-fence triggers. Every
+coordinator transaction sets the transaction-local marker
+`skypilot.pool_coordination_writer` to the exact value `m5-v1`. For a
+version-1 service, triggers reject an insert, update, or delete of its replica
+row; an assignment-field update of its `job_info` row; a selected-resource
+update of its `spot` rows; and an update or delete of the service coordination
+row unless the marker matches. Future coordination contracts use a different
+marker. This is a compatibility epoch, not an authentication secret.
+
+Every assignment path performs one of those guarded durable writes before
+`sdk.exec` or Skylet mutation. Every destructive source performs the guarded
+close CAS before scheduling a thread, calling `sky.down`, or invoking a
+provider. A transaction without the marker fails before the external effect.
+Activation is forbidden until tests prove that ordering for every source.
+The migration revision alone is not a writer barrier because existing schema
+helpers intentionally tolerate newer additive revisions. The triggers remain
+the durable enforcement boundary if a stale process appears after image and
+lease inspection.
+
 Activation is an explicit operator action, never an automatic consequence of
 schema presence. It requires:
 
@@ -7348,52 +7489,69 @@ schema presence. It requires:
 2. Kubernetes evidence that every role pod uses that same immutable image and
    no predecessor pod or controller child remains;
 3. every ready target worker to prove Skylet `41`, keyed gRPC add, queue, and
-   lookup support with no SSH fallback;
+   lookup support, return one fresh runtime incarnation, and reject a request
+   bound to a prior runtime incarnation, with no SSH fallback;
 4. no ambiguous `(worker, NULL remote ID)` legacy assignment; and
-5. a non-null service resource scope and exact service hash.
+5. a non-null service resource scope and exact service hash;
+6. repository and executable-manifest evidence that every assignment and
+   destructive source performs its guarded write before an external effect;
+   and
+7. no version-0 teardown admitted before quiescence remains scheduled,
+   running, or ambiguous.
 
 Under the exclusive compatibility lock, activation first commits service
 version `-1`. It then starts a second transaction, locks the authoritative
 rows, assigns worker UUIDs, maps every nonterminal legacy binding to exactly
 one replica, records exact existing remote IDs as `BOUND`, marks historical
 bindings `RELEASED`, and closes replicas that are already nonassignable.
+It waits for every previously admitted version-0 teardown to prove exact
+absence and clear its row before this mapping; an in-flight legacy effect is
+never adopted into a new retirement token.
 Missing, duplicate, cross-incarnation, or resource-ambiguous mapping aborts the
 second transaction and leaves the durable service at `-1` for diagnosis.
 Version `1` is written last in the successful second commit. If the activator
 crashes, its session lock is released and calls observing `-1` return `RETRY`
 without mutation.
 
-Before any service reaches version `1`, rolling back Release A is behaviorally
-safe and leaves additive columns inert. After activation, an old binary is
-unsafe because it ignores durable admission fences. Deactivation requires the
-capable image, the exclusive compatibility lock, zero `INTENT`, `BOUND`, or
-`QUARANTINED` assignments, no admitted retirement lacking exact absence, and
-an empty request-retention hold set. It commits `-1`, proves those conditions
-again under row locks in a second transaction, then commits `0`. Only after
-every service is version `0`
-and the capable fleet has drained may an old image roll out. Otherwise rollback
-is a forward fix.
+Before any service reaches version `1`, rolling back these releases is
+behaviorally safe and leaves additive columns inert. After activation, an old
+binary is unsafe even though its guarded writes fail. Deactivation requires
+the capable image, the exclusive compatibility lock, zero `INTENT`, `BOUND`, or
+`QUARANTINED` assignments, and no admitted retirement lacking exact absence.
+It commits `-1`, proves those conditions again under row locks in a second
+transaction, then commits `0`. Only after every service is version `0` and the
+capable fleet has drained may an old image roll out. Otherwise rollback is a
+forward fix.
 
 ##### Milestones and removal gates
 
-M5-S0 adds Skylet keyed add, queue, and lookup behavior, exact local migration,
-and compatibility tests. No central caller sends a key.
+M5-S0 adds only Skylet `41` keyed add, queue, lookup, exact local migration, and
+compatibility tests. No central caller sends a key. It merges, deploys, and
+completes a worker compatibility monitoring gate before M5-S1 begins.
 
-M5-S1 adds stable internal exec create-or-return, request retention, role
-capabilities, prepared payload hashing, and response-ID verification. No pool
-service activates.
+M5-S1 adds only API-requests `005`, API version `69`, HMAC-authorized stable
+internal exec create-or-return, existing-field role capability advertisement,
+prepared payload hashing, and response-ID verification. No pool caller sends a
+key and no pool service activates. It has its own merge, deploy, and monitoring
+gate.
 
-M5-S2 adds the dormant coordinator schema, planners, transactions, legacy
-advisory guard, activation/deactivation command, and recovery reducer. It then
-activates one new, otherwise idle PostgreSQL test pool and migrates assignment
-plus ordinary queue-driven retirement together.
+M5-S2 adds Serve `033`, spot-jobs `027`, the dormant coordinator schema, pure
+planner, transactions, writer triggers, legacy advisory guard,
+activation/deactivation command, and shadow comparison. Every service remains
+version `0`; no activation is permitted. It has its own merge, deploy, and
+monitoring gate before any source migration.
 
-M5-S3 qualifies existing nonlegacy pools and migrates the remaining retirement
-admission sources one at a time. The PostgreSQL `get_next_cluster_name()`
-filesystem-lock scheduling body and every direct pool teardown admission are
-removed only after repository search and the executable removal manifest prove
-that all version-1 calls enter the coordinator. SQLite retains a separately
-named compatibility implementation rather than an implicit fallthrough.
+M5-S3 migrates assignment, normal terminal release, serial and grouped-task
+release, and every graceful and forced destructive source one bounded change
+at a time. Each source change merges, deploys, and proves its version-0 shadow
+or compatibility behavior before the next one. Only after repository search,
+the executable removal manifest, pre-effect writer-order tests, and live
+quiescence prove complete coverage may one new otherwise-idle PostgreSQL test
+pool activate at version `1`. Existing pools remain version `0` until that
+qualification passes. The PostgreSQL `get_next_cluster_name()` filesystem-lock
+scheduling body and every direct pool teardown admission are removed only
+after those gates. SQLite retains a separately named compatibility
+implementation rather than an implicit fallthrough.
 
 ##### Required verification
 
@@ -7407,20 +7565,40 @@ The design is not promotable without all of the following:
   recreation, worker UUID mismatch, replica-ID reuse, and worker-name reuse
   perform zero writes and zero effects;
 - terminal and cancelling jobs cannot acquire an assignment;
+- normal terminal completion, cancellation, forced exact absence, serial-task
+  advance, and grouped-task completion release exactly one matching `BOUND`
+  attempt, while a terminal `spot` write alone retains capacity;
+- queue scale-down, cost rebalance, purge, update replacement, service down,
+  preemption, launch failure, user-job failure, readiness failure, and failed
+  cleanup all close the exact worker before scheduling or producing a
+  destructive effect;
 - fault injection after assignment commit, after HTTP acceptance, after
-  Skylet add, after Skylet queue, before remote-ID binding, after retirement
-  commit, and before teardown all converge without duplicate effects;
+  Skylet add, after Skylet queue-file rename, before and after driver spawn,
+  before remote-ID binding, after retirement commit, and before teardown all
+  converge without duplicate effects;
 - duplicate internal request IDs and submission keys return the one matching
   object, while payload, user, handler, cluster, add-digest, and queue-digest
   conflicts fail closed;
-- request GC retains unresolved intents and releases only an exact completed
-  owner;
+- an absent or garbage-collected API request recovers only through exact Skylet
+  key and digest lookup;
+- forged HMACs, replayed timestamps, caller-supplied leader headers, public
+  service accounts, and response-ID mismatches cannot select a private request
+  ID;
+- legacy Skylets return `UNIMPLEMENTED` for the new methods, and a keyed request
+  bound to a prior process runtime performs no mutation after restart;
+- writer triggers reject representative old assignment SQL and every old
+  destructive transition before an external effect, even when a stale process
+  starts after the activation fleet check;
 - activation backfill rejects every ambiguous legacy mapping, capability gap,
-  old role process, old Skylet, or legacy resource namespace;
+  old role process, old Skylet, legacy resource namespace, or admitted
+  version-0 retirement;
 - deactivation refuses active bindings, unresolved effects, and incomplete
   retirement;
 - deterministic multi-worker and multi-job lock ordering passes deadlock and
   retry tests;
+- planner import tests enforce the low-state dependency boundary, and proposal
+  serialization contains no provider objects, SDK objects, readiness snapshot,
+  or display metadata;
 - no provider, SDK, SSH, Skylet, file upload, log sync, or thread wait occurs
   inside a coordinator transaction; and
 - feature-off PostgreSQL and every SQLite test preserve legacy return values,
@@ -7600,6 +7778,8 @@ still incomplete until the code is deleted and the row reaches `removed`.
 | local or controller SQLite cluster provisioning and teardown retry loops | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and repository inventory finds no supported SQLite caller |
 | central-PostgreSQL Serve in-memory replica request retry ownership and duplicate scheduling loops | M5 action runtime owns mechanics | lifecycle-epoch, same-name recreation, rollout, scale, and failed-cleanup tests pass |
 | local or controller SQLite Serve retry and scheduling ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite Serve qualification is retired |
+| central-PostgreSQL pool assignment inside `get_next_cluster_name()` under a service `FileLock` | `PoolWorkerCoordinator` owns exact worker reservation and selected-resource binding while SQLite has an explicitly named compatibility implementation | assignment, retirement, capacity, identity, crash recovery, writer-fence, and exact-effect tests pass, one release records no legacy PostgreSQL entry, and PLA-M5-015 reaches `removed` |
+| direct central-PostgreSQL pool teardown admission through `_terminate_replica()` callers and failed-service purge | every graceful and forced source closes the exact worker through `PoolWorkerCoordinator` before scheduling or producing a destructive effect | every inventoried source passes pre-effect close-token and stale-incarnation tests, one release records no unfenced admission, and PLA-M5-016 reaches `removed` |
 | central-PostgreSQL managed-job process-local recovery and cleanup retry ownership | M6 action runtime owns mechanics | controller handoff, preemption, cancellation, and cleanup conformance passes |
 | controller-local SQLite managed-job recovery and cleanup ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite jobs qualification is retired |
 | direct child status transport in `sky.jobs.utils.get_job_status()` | `ChildWorkloadObservationV1` owns the read-only child-status call while managed jobs retain recovery and terminal-state policy | the exact managed-job status and transient-error corpus passes, and the function contains no direct `backend.get_job_status` call outside the adapter |
